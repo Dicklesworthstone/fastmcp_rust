@@ -99,7 +99,7 @@ jobs:
             "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ASCII "${{ matrix.asset }}.zip.sha256"
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: dist/*
