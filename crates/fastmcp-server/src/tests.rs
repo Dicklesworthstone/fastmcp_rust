@@ -1,0 +1,892 @@
+//! Comprehensive tests for the MCP server using Lab runtime patterns.
+//!
+//! These tests verify:
+//! - Request/response cycle
+//! - Tool invocation with cancellation
+//! - Resource reading with budget exhaustion
+//! - Multi-handler registration
+//! - Error handling
+
+use std::collections::HashMap;
+
+use asupersync::{Budget, Cx};
+use fastmcp_core::{McpContext, McpError, McpResult};
+use fastmcp_protocol::{
+    CallToolParams, ClientCapabilities, ClientInfo, Content, GetPromptParams, InitializeParams,
+    Prompt, PromptArgument, PromptMessage, ReadResourceParams, Resource, ResourceContent, Role,
+    ServerCapabilities, ServerInfo, Tool,
+};
+
+use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
+use crate::router::Router;
+use crate::session::Session;
+
+// ============================================================================
+// Test Tool Handlers
+// ============================================================================
+
+/// A simple tool that greets a user.
+struct GreetTool;
+
+impl ToolHandler for GreetTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "greet".to_string(),
+            description: Some("Greets a user by name".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let name = arguments
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("World");
+        Ok(vec![Content::Text {
+            text: format!("Hello, {name}!"),
+        }])
+    }
+}
+
+/// A tool that checks cancellation.
+struct CancellationCheckTool;
+
+impl ToolHandler for CancellationCheckTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "cancellation_check".to_string(),
+            description: Some("Tool that checks cancellation status".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // Check for cancellation
+        if ctx.is_cancelled() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(vec![Content::Text {
+            text: "Not cancelled".to_string(),
+        }])
+    }
+}
+
+/// A tool that simulates slow work.
+struct SlowTool;
+
+impl ToolHandler for SlowTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "slow_tool".to_string(),
+            description: Some("Simulates a slow operation".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // Simulate work with checkpoint checks
+        for i in 0..5 {
+            if ctx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+            // Normally we'd do work here
+            let _ = i;
+        }
+        Ok(vec![Content::Text {
+            text: "Slow work completed".to_string(),
+        }])
+    }
+}
+
+/// A tool that returns an error.
+struct ErrorTool;
+
+impl ToolHandler for ErrorTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "error_tool".to_string(),
+            description: Some("Always returns an error".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Err(McpError::internal_error("Intentional error for testing"))
+    }
+}
+
+// ============================================================================
+// Test Resource Handlers
+// ============================================================================
+
+/// A simple static resource.
+struct StaticResource {
+    uri: String,
+    content: String,
+}
+
+impl ResourceHandler for StaticResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.uri.clone(),
+            name: "Static Resource".to_string(),
+            description: Some("A static test resource".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent {
+            uri: self.uri.clone(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some(self.content.clone()),
+            blob: None,
+        }])
+    }
+}
+
+/// A resource that checks cancellation.
+struct CancellableResource;
+
+impl ResourceHandler for CancellableResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "resource://cancellable".to_string(),
+            name: "Cancellable Resource".to_string(),
+            description: Some("A resource that checks cancellation".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        if ctx.is_cancelled() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(vec![ResourceContent {
+            uri: "resource://cancellable".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Resource content".to_string()),
+            blob: None,
+        }])
+    }
+}
+
+// ============================================================================
+// Test Prompt Handlers
+// ============================================================================
+
+/// A simple greeting prompt.
+struct GreetingPrompt;
+
+impl PromptHandler for GreetingPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: "greeting".to_string(),
+            description: Some("A simple greeting prompt".to_string()),
+            arguments: vec![PromptArgument {
+                name: "name".to_string(),
+                description: Some("Name to greet".to_string()),
+                required: true,
+            }],
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        let name = arguments.get("name").map_or("User", String::as_str);
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: format!("Please greet {name} warmly."),
+            },
+        }])
+    }
+}
+
+// ============================================================================
+// Router Tests
+// ============================================================================
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    /// Creates a test router with all handlers registered.
+    fn create_test_router() -> Router {
+        let mut router = Router::new();
+
+        // Register tools
+        router.add_tool(GreetTool);
+        router.add_tool(CancellationCheckTool);
+        router.add_tool(SlowTool);
+        router.add_tool(ErrorTool);
+
+        // Register resources
+        router.add_resource(StaticResource {
+            uri: "resource://test".to_string(),
+            content: "Test content".to_string(),
+        });
+        router.add_resource(CancellableResource);
+
+        // Register prompts
+        router.add_prompt(GreetingPrompt);
+
+        router
+    }
+
+    /// Creates a test session.
+    fn create_test_session() -> Session {
+        Session::new(
+            ServerInfo {
+                name: "test-server".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        )
+    }
+
+    #[test]
+    fn test_router_tool_list() {
+        let router = create_test_router();
+        let tools = router.tools();
+
+        assert_eq!(tools.len(), 4);
+
+        let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(tool_names.contains(&"greet"));
+        assert!(tool_names.contains(&"cancellation_check"));
+        assert!(tool_names.contains(&"slow_tool"));
+        assert!(tool_names.contains(&"error_tool"));
+    }
+
+    #[test]
+    fn test_router_resource_list() {
+        let router = create_test_router();
+        let resources = router.resources();
+
+        assert_eq!(resources.len(), 2);
+
+        let resource_uris: Vec<_> = resources.iter().map(|r| r.uri.as_str()).collect();
+        assert!(resource_uris.contains(&"resource://test"));
+        assert!(resource_uris.contains(&"resource://cancellable"));
+    }
+
+    #[test]
+    fn test_router_prompt_list() {
+        let router = create_test_router();
+        let prompts = router.prompts();
+
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "greeting");
+    }
+
+    #[test]
+    fn test_handle_initialize() {
+        let router = create_test_router();
+        let mut session = create_test_session();
+        let cx = Cx::for_testing();
+
+        let params = InitializeParams {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+        };
+
+        let result = router.handle_initialize(&cx, &mut session, params, Some("Test instructions"));
+
+        assert!(result.is_ok());
+        let init_result = result.unwrap();
+        assert_eq!(init_result.server_info.name, "test-server");
+        assert_eq!(
+            init_result.instructions,
+            Some("Test instructions".to_string())
+        );
+        assert!(session.is_initialized());
+    }
+
+    #[test]
+    fn test_handle_tools_call_success() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice"})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(!call_result.is_error);
+        assert_eq!(call_result.content.len(), 1);
+
+        if let Content::Text { text } = &call_result.content[0] {
+            assert_eq!(text, "Hello, Alice!");
+        } else {
+            panic!("Expected text content");
+        }
+    }
+
+    #[test]
+    fn test_handle_tools_call_not_found() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = CallToolParams {
+            name: "nonexistent".to_string(),
+            arguments: None,
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_handle_tools_call_with_error() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = CallToolParams {
+            name: "error_tool".to_string(),
+            arguments: None,
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        // Tool errors are returned as content with is_error=true
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(call_result.is_error);
+        assert_eq!(call_result.content.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_tools_call_with_cancellation() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let budget = Budget::INFINITE;
+
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice"})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        // Request should be cancelled before handler runs
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_tools_call_with_exhausted_budget() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::unlimited().with_poll_quota(0);
+
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice"})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        // Request should fail due to exhausted budget
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("budget") || err.message.contains("exhausted"));
+    }
+
+    #[test]
+    fn test_handle_resources_read_success() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = ReadResourceParams {
+            uri: "resource://test".to_string(),
+            meta: None,
+        };
+
+        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+
+        assert!(result.is_ok());
+        let read_result = result.unwrap();
+        assert_eq!(read_result.contents.len(), 1);
+        assert_eq!(
+            read_result.contents[0].text,
+            Some("Test content".to_string())
+        );
+    }
+
+    #[test]
+    fn test_handle_resources_read_not_found() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = ReadResourceParams {
+            uri: "resource://nonexistent".to_string(),
+            meta: None,
+        };
+
+        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_resources_read_with_cancellation() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let budget = Budget::INFINITE;
+
+        let params = ReadResourceParams {
+            uri: "resource://test".to_string(),
+            meta: None,
+        };
+
+        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+
+        // Should be cancelled
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_prompts_get_success() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = GetPromptParams {
+            name: "greeting".to_string(),
+            arguments: Some({
+                let mut map = HashMap::new();
+                map.insert("name".to_string(), "Bob".to_string());
+                map
+            }),
+            meta: None,
+        };
+
+        let result = router.handle_prompts_get(&cx, 1, params, &budget, None);
+
+        assert!(result.is_ok());
+        let get_result = result.unwrap();
+        assert_eq!(get_result.messages.len(), 1);
+
+        if let Content::Text { text } = &get_result.messages[0].content {
+            assert!(text.contains("Bob"));
+        } else {
+            panic!("Expected text content");
+        }
+    }
+
+    #[test]
+    fn test_handle_prompts_get_not_found() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let params = GetPromptParams {
+            name: "nonexistent".to_string(),
+            arguments: None,
+            meta: None,
+        };
+
+        let result = router.handle_prompts_get(&cx, 1, params, &budget, None);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_tools_call_validation_missing_required() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // greet tool requires 'name' field, so passing empty object should fail validation
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("validation") || err.message.contains("required"));
+    }
+
+    #[test]
+    fn test_handle_tools_call_validation_wrong_type() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // greet tool expects 'name' to be a string, not a number
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": 123})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("validation") || err.message.contains("type"));
+    }
+
+    #[test]
+    fn test_handle_tools_call_validation_passes() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Valid arguments that satisfy the schema
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice"})),
+            meta: None,
+        };
+
+        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(!call_result.is_error);
+    }
+}
+
+// ============================================================================
+// Session Tests
+// ============================================================================
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn test_session_creation() {
+        let session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        assert!(!session.is_initialized());
+        assert!(session.client_info().is_none());
+        assert!(session.client_capabilities().is_none());
+        assert!(session.protocol_version().is_none());
+    }
+
+    #[test]
+    fn test_session_initialization() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        session.initialize(
+            ClientInfo {
+                name: "client".to_string(),
+                version: "2.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        assert!(session.is_initialized());
+        assert_eq!(session.client_info().unwrap().name, "client");
+        assert_eq!(session.protocol_version(), Some("2024-11-05"));
+    }
+}
+
+// ============================================================================
+// Cancellation Tests
+// ============================================================================
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_observes_cancellation() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+
+        // Initially not cancelled
+        assert!(!ctx.is_cancelled());
+
+        // Set cancellation
+        cx.set_cancel_requested(true);
+
+        // Now tool should observe cancellation
+        assert!(ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_checkpoint_fails_when_cancelled() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+
+        // Checkpoint succeeds initially
+        assert!(ctx.checkpoint().is_ok());
+
+        // Set cancellation
+        cx.set_cancel_requested(true);
+
+        // Checkpoint now fails
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_masked_section_defers_cancellation() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+
+        cx.set_cancel_requested(true);
+
+        // Inside masked section, checkpoint should succeed
+        ctx.masked(|| {
+            assert!(ctx.checkpoint().is_ok());
+        });
+
+        // Outside masked section, checkpoint should fail
+        assert!(ctx.checkpoint().is_err());
+    }
+}
+
+// ============================================================================
+// Budget Tests
+// ============================================================================
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn test_infinite_budget_not_exhausted() {
+        let budget = Budget::INFINITE;
+        assert!(!budget.is_exhausted());
+    }
+
+    #[test]
+    fn test_exhausted_budget() {
+        let budget = Budget::unlimited().with_poll_quota(0);
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn test_deadline_budget() {
+        // A budget with a deadline far in the future
+        let budget = Budget::with_deadline_secs(3600);
+        assert!(!budget.is_exhausted());
+    }
+}
+
+// ============================================================================
+// Handler Definition Tests
+// ============================================================================
+
+#[cfg(test)]
+mod handler_definition_tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_definition() {
+        let tool = GreetTool;
+        let def = tool.definition();
+
+        assert_eq!(def.name, "greet");
+        assert!(def.description.is_some());
+        assert!(def.input_schema["type"] == "object");
+    }
+
+    #[test]
+    fn test_resource_definition() {
+        let resource = StaticResource {
+            uri: "resource://foo".to_string(),
+            content: "bar".to_string(),
+        };
+        let def = resource.definition();
+
+        assert_eq!(def.uri, "resource://foo");
+        assert_eq!(def.mime_type, Some("text/plain".to_string()));
+    }
+
+    #[test]
+    fn test_prompt_definition() {
+        let prompt = GreetingPrompt;
+        let def = prompt.definition();
+
+        assert_eq!(def.name, "greeting");
+        assert!(!def.arguments.is_empty());
+        assert_eq!(def.arguments.len(), 1);
+    }
+}
+
+// ============================================================================
+// Multiple Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod multi_handler_tests {
+    use super::*;
+
+    /// Second greeting tool with different behavior.
+    struct FormalGreetTool;
+
+    impl ToolHandler for FormalGreetTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "formal_greet".to_string(),
+                description: Some("Formally greets a user".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    }
+                }),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Sir/Madam");
+            Ok(vec![Content::Text {
+                text: format!("Good day, {name}."),
+            }])
+        }
+    }
+
+    #[test]
+    fn test_multiple_tools() {
+        let mut router = Router::new();
+        router.add_tool(GreetTool);
+        router.add_tool(FormalGreetTool);
+
+        let tools = router.tools();
+        assert_eq!(tools.len(), 2);
+
+        // Call both tools
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let result1 = router.handle_tools_call(
+            &cx,
+            1,
+            CallToolParams {
+                name: "greet".to_string(),
+                arguments: Some(serde_json::json!({"name": "Alice"})),
+                meta: None,
+            },
+            &budget,
+            None,
+        );
+        assert!(result1.is_ok());
+
+        let result2 = router.handle_tools_call(
+            &cx,
+            2,
+            CallToolParams {
+                name: "formal_greet".to_string(),
+                arguments: Some(serde_json::json!({"name": "Alice"})),
+                meta: None,
+            },
+            &budget,
+            None,
+        );
+        assert!(result2.is_ok());
+
+        // Verify different outputs
+        if let Content::Text { text: text1 } = &result1.unwrap().content[0] {
+            if let Content::Text { text: text2 } = &result2.unwrap().content[0] {
+                assert_eq!(text1, "Hello, Alice!");
+                assert_eq!(text2, "Good day, Alice.");
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiple_resources() {
+        let mut router = Router::new();
+        router.add_resource(StaticResource {
+            uri: "resource://a".to_string(),
+            content: "Content A".to_string(),
+        });
+        router.add_resource(StaticResource {
+            uri: "resource://b".to_string(),
+            content: "Content B".to_string(),
+        });
+
+        let resources = router.resources();
+        assert_eq!(resources.len(), 2);
+
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        let result_a = router.handle_resources_read(
+            &cx,
+            1,
+            &ReadResourceParams {
+                uri: "resource://a".to_string(),
+                meta: None,
+            },
+            &budget,
+            None,
+        );
+        let result_b = router.handle_resources_read(
+            &cx,
+            2,
+            &ReadResourceParams {
+                uri: "resource://b".to_string(),
+                meta: None,
+            },
+            &budget,
+            None,
+        );
+
+        assert_eq!(
+            result_a.unwrap().contents[0].text,
+            Some("Content A".to_string())
+        );
+        assert_eq!(
+            result_b.unwrap().contents[0].text,
+            Some("Content B".to_string())
+        );
+    }
+}

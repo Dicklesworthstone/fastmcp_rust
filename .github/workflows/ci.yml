@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            ../asupersync -> ../asupersync/target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+          workspaces: |
+            . -> target
+            ../asupersync -> ../asupersync/target
+
+      - name: Run tests
+        run: cargo test --all-features --verbose
+
+      - name: Run doc tests
+        run: cargo test --doc
+
+  check:
+    name: Check (all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check all targets
+        run: cargo check --all-targets --all-features
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit || true  # Don't fail CI on advisories in deps
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [lint, test, check]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            ../asupersync -> ../asupersync/target
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastmcp-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/fastmcp*
+            !target/${{ matrix.target }}/release/*.d
+          if-no-files-found: ignore
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: Minimum Rust Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+
+      # Using nightly since edition 2024 requires it
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check MSRV
+        run: cargo check --all-targets

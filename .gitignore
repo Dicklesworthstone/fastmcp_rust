@@ -1,0 +1,48 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+a.out
+
+# Cargo.lock is included for reproducible builds
+# (uncomment if this is a library-only workspace)
+# Cargo.lock
+
+# Legacy source (reference only, not shipped)
+/legacy_fastmcp/
+
+# Planning/porting docs (internal only)
+EXISTING_FASTMCP_STRUCTURE.md
+PLAN_TO_PORT_FASTMCP_TO_RUST.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Beads issue tracker (local)
+.beads/
+.bv/
+
+# Large original images (webp versions are committed)
+*_illustration.png
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+coverage/

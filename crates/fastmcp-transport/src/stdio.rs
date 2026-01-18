@@ -1,0 +1,562 @@
+//! Standard I/O transport for MCP.
+//!
+//! This is the primary transport for MCP servers running as subprocess.
+//! Uses newline-delimited JSON (NDJSON) framing.
+//!
+//! # Cancel-Safety
+//!
+//! The stdio transport integrates with asupersync's capability context:
+//! - Checks `cx.is_cancel_requested()` before blocking operations
+//! - Uses async I/O wrappers that integrate with cancellation
+//! - Properly handles EOF as transport closure
+//!
+//! # Async I/O Integration
+//!
+//! This module provides two transport implementations:
+//!
+//! - [`StdioTransport`]: Generic transport for any `Read`/`Write` types (for testing)
+//! - [`AsyncStdioTransport`]: Production transport using async I/O wrappers
+//!
+//! # Example
+//!
+//! ```ignore
+//! use fastmcp_transport::{AsyncStdioTransport, Transport};
+//! use asupersync::Cx;
+//!
+//! fn main() {
+//!     let mut transport = AsyncStdioTransport::new();
+//!     let cx = Cx::for_testing();
+//!
+//!     loop {
+//!         match transport.recv(&cx) {
+//!             Ok(msg) => handle_message(msg),
+//!             Err(TransportError::Closed) => break,
+//!             Err(TransportError::Cancelled) => break,
+//!             Err(e) => eprintln!("Error: {}", e),
+//!         }
+//!     }
+//! }
+//! ```
+
+use std::io::{BufRead, BufReader, Read, Write};
+
+use asupersync::Cx;
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+
+use crate::async_io::{AsyncLineReader, AsyncStdout};
+use crate::{Codec, SendPermit, Transport, TransportError, TwoPhaseTransport};
+
+/// Stdio transport implementation.
+///
+/// Reads from stdin and writes to stdout using NDJSON framing.
+/// Integrates with asupersync for cancel-correct operation.
+///
+/// # Wire Format
+///
+/// Messages are newline-delimited JSON:
+/// - Each message is serialized as a single line of JSON
+/// - Lines are terminated by `\n` (LF, not CRLF)
+/// - Empty lines are ignored
+/// - UTF-8 encoding is required
+pub struct StdioTransport<R, W> {
+    reader: BufReader<R>,
+    writer: W,
+    codec: Codec,
+    line_buffer: String,
+}
+
+impl<R: Read, W: Write> StdioTransport<R, W> {
+    /// Creates a new stdio transport with custom reader/writer.
+    ///
+    /// This is useful for testing with mock I/O.
+    #[must_use]
+    pub fn new(reader: R, writer: W) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+            codec: Codec::new(),
+            line_buffer: String::with_capacity(4096),
+        }
+    }
+
+    /// Encodes and sends a message, appending newline.
+    fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        let bytes = match message {
+            JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
+            JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
+        };
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Reads a line from the reader, handling EOF.
+    fn read_line(&mut self) -> Result<&str, TransportError> {
+        self.line_buffer.clear();
+        let bytes_read = self.reader.read_line(&mut self.line_buffer)?;
+
+        if bytes_read == 0 {
+            return Err(TransportError::Closed);
+        }
+
+        // Trim trailing newline
+        let line = self
+            .line_buffer
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
+        Ok(line)
+    }
+}
+
+impl StdioTransport<std::io::Stdin, std::io::Stdout> {
+    /// Creates a transport using standard stdin/stdout.
+    ///
+    /// This is the primary constructor for MCP servers running as subprocess.
+    #[must_use]
+    pub fn stdio() -> Self {
+        Self::new(std::io::stdin(), std::io::stdout())
+    }
+}
+
+impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        // Check for cancellation before I/O
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        self.write_message(message)
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        // Check for cancellation before blocking read
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        // Read lines until we get a non-empty one
+        loop {
+            let line = self.read_line()?;
+
+            // Skip empty lines
+            if line.is_empty() {
+                // Check cancellation between reads
+                if cx.is_cancel_requested() {
+                    return Err(TransportError::Cancelled);
+                }
+                continue;
+            }
+
+            // Parse the JSON message
+            let message: JsonRpcMessage = serde_json::from_str(line)
+                .map_err(|e| TransportError::Codec(crate::CodecError::Json(e)))?;
+
+            return Ok(message);
+        }
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+/// Helper to create request/response without cloning for internal use.
+impl<R: Read, W: Write> StdioTransport<R, W> {
+    /// Send a request directly (avoids clone in trait method).
+    pub fn send_request_direct(
+        &mut self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+        let bytes = self.codec.encode_request(request)?;
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Send a response directly (avoids clone in trait method).
+    pub fn send_response_direct(
+        &mut self,
+        cx: &Cx,
+        response: &JsonRpcResponse,
+    ) -> Result<(), TransportError> {
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+        let bytes = self.codec.encode_response(response)?;
+        self.writer.write_all(&bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+impl<R: Read, W: Write> TwoPhaseTransport for StdioTransport<R, W> {
+    type Writer = W;
+
+    fn reserve_send(&mut self, cx: &Cx) -> Result<SendPermit<'_, Self::Writer>, TransportError> {
+        // Check cancellation - this is the cancellation point
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        // Return permit that allows the send to proceed
+        Ok(SendPermit::new(&mut self.writer, &self.codec))
+    }
+}
+
+// =============================================================================
+// AsyncStdioTransport - Production async I/O transport
+// =============================================================================
+
+/// Async stdio transport with integrated cancellation support.
+///
+/// This is the production transport for MCP servers. It uses async I/O
+/// wrappers that integrate with asupersync's capability context for
+/// proper cancellation handling.
+///
+/// # Cancel-Safety
+///
+/// - Checks `cx.is_cancel_requested()` before and during blocking I/O
+/// - Returns `TransportError::Cancelled` when cancellation is detected
+/// - Integrates with asupersync's structured concurrency model
+///
+/// # Example
+///
+/// ```ignore
+/// use fastmcp_transport::{AsyncStdioTransport, Transport};
+/// use asupersync::Cx;
+///
+/// let mut transport = AsyncStdioTransport::new();
+/// let cx = Cx::for_testing();
+///
+/// // Receive messages until EOF or cancellation
+/// loop {
+///     match transport.recv(&cx) {
+///         Ok(msg) => process_message(msg),
+///         Err(TransportError::Closed) => break,
+///         Err(TransportError::Cancelled) => {
+///             eprintln!("Request cancelled");
+///             break;
+///         }
+///         Err(e) => return Err(e),
+///     }
+/// }
+/// ```
+pub struct AsyncStdioTransport {
+    reader: AsyncLineReader,
+    writer: AsyncStdout,
+    codec: Codec,
+}
+
+impl AsyncStdioTransport {
+    /// Creates a new async stdio transport.
+    ///
+    /// This is the primary constructor for MCP servers running as subprocess.
+    /// Uses async I/O wrappers that integrate with asupersync's cancellation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            reader: AsyncLineReader::new(),
+            writer: AsyncStdout::new(),
+            codec: Codec::new(),
+        }
+    }
+}
+
+impl Default for AsyncStdioTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for AsyncStdioTransport {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        // Check for cancellation before I/O
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let bytes = match message {
+            JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
+            JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
+        };
+
+        // Use async-aware write with cancellation checking
+        self.writer.write_all_sync(cx, &bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })?;
+
+        self.writer.flush_sync(cx).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })?;
+
+        Ok(())
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        // Check for cancellation before blocking read
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        // Read non-empty line with cancellation checking
+        let line = self
+            .reader
+            .read_non_empty_line(cx)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    TransportError::Cancelled
+                } else {
+                    TransportError::Io(e)
+                }
+            })?
+            .ok_or(TransportError::Closed)?;
+
+        // Parse the JSON message
+        let message: JsonRpcMessage = serde_json::from_str(&line)
+            .map_err(|e| TransportError::Codec(crate::CodecError::Json(e)))?;
+
+        Ok(message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        let cx = Cx::for_testing(); // Use test context for close - no cancellation
+        self.writer.flush_sync(&cx)?;
+        Ok(())
+    }
+}
+
+impl AsyncStdioTransport {
+    /// Send a request directly (avoids clone in trait method).
+    pub fn send_request_direct(
+        &mut self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let bytes = self.codec.encode_request(request)?;
+
+        self.writer.write_all_sync(cx, &bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })?;
+
+        self.writer.flush_sync(cx).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })
+    }
+
+    /// Send a response directly (avoids clone in trait method).
+    pub fn send_response_direct(
+        &mut self,
+        cx: &Cx,
+        response: &JsonRpcResponse,
+    ) -> Result<(), TransportError> {
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        let bytes = self.codec.encode_response(response)?;
+
+        self.writer.write_all_sync(cx, &bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })?;
+
+        self.writer.flush_sync(cx).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                TransportError::Cancelled
+            } else {
+                TransportError::Io(e)
+            }
+        })
+    }
+}
+
+impl TwoPhaseTransport for AsyncStdioTransport {
+    type Writer = AsyncStdout;
+
+    fn reserve_send(&mut self, cx: &Cx) -> Result<SendPermit<'_, Self::Writer>, TransportError> {
+        // Check cancellation - this is the cancellation point
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+
+        // Return permit that allows the send to proceed
+        // The commit phase uses Write trait impl which bypasses cancellation checks
+        Ok(SendPermit::new(&mut self.writer, &self.codec))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_send_receive_roundtrip() {
+        // Create a transport with a buffer as both reader and writer
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        // Use Cx::for_testing() for unit tests
+        let cx = Cx::for_testing();
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "test");
+            }
+            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn test_send_message() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::new("test/method", None, 1i64);
+        transport.send_request_direct(&cx, &request).unwrap();
+    }
+
+    #[test]
+    fn test_eof_returns_closed() {
+        // Empty input = immediate EOF
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn test_skip_empty_lines() {
+        // Input with empty lines before the actual message
+        let input = b"\n\n{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "test");
+            }
+            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn test_cancellation_on_recv() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn test_cancellation_on_send() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let request = JsonRpcRequest::new("test/method", None, 1i64);
+        let result = transport.send_request_direct(&cx, &request);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn test_two_phase_send_success() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+
+        // Reserve a send slot
+        let permit = transport.reserve_send(&cx).unwrap();
+
+        // Send a request via the permit
+        let request = JsonRpcRequest::new("test/method", None, 1i64);
+        permit.send_request(&request).unwrap();
+    }
+
+    #[test]
+    fn test_two_phase_send_cancellation_on_reserve() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        // Reservation should fail when cancelled
+        let result = transport.reserve_send(&cx);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn test_two_phase_send_message() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+
+        // Reserve and send using the generic send method
+        let permit = transport.reserve_send(&cx).unwrap();
+        let request = JsonRpcRequest::new("test/method", None, 1i64);
+        let message = JsonRpcMessage::Request(request);
+        permit.send(&message).unwrap();
+    }
+}

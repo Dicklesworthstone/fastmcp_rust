@@ -1,0 +1,21 @@
+[package]
+name = "fastmcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fast, cancel-correct MCP framework for Rust"
+
+[dependencies]
+fastmcp-core.workspace = true
+fastmcp-protocol.workspace = true
+fastmcp-transport.workspace = true
+fastmcp-server.workspace = true
+fastmcp-client.workspace = true
+fastmcp-macros.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

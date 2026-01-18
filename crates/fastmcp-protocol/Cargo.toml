@@ -1,0 +1,15 @@
+[package]
+name = "fastmcp-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MCP protocol types and JSON-RPC implementation"
+
+[dependencies]
+fastmcp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fastmcp",
+    "crates/fastmcp-core",
+    "crates/fastmcp-transport",
+    "crates/fastmcp-protocol",
+    "crates/fastmcp-server",
+    "crates/fastmcp-client",
+    "crates/fastmcp-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Runtime (our own)
+asupersync = { path = "../asupersync" }
+
+# Serialization (only these)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging (facade only, zero-cost when disabled)
+log = "0.4"
+
+# Internal crates
+fastmcp = { path = "crates/fastmcp" }
+fastmcp-core = { path = "crates/fastmcp-core" }
+fastmcp-transport = { path = "crates/fastmcp-transport" }
+fastmcp-protocol = { path = "crates/fastmcp-protocol" }
+fastmcp-server = { path = "crates/fastmcp-server" }
+fastmcp-client = { path = "crates/fastmcp-client" }
+fastmcp-macros = { path = "crates/fastmcp-macros" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow these during early development
+doc_markdown = "allow"
+missing_const_for_fn = "allow"
+doc_link_with_quotes = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

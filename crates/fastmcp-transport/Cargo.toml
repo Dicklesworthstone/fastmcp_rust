@@ -1,0 +1,17 @@
+[package]
+name = "fastmcp-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Transport layer (stdio, SSE, WebSocket) for FastMCP"
+
+[dependencies]
+fastmcp-core.workspace = true
+fastmcp-protocol.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

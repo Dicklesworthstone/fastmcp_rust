@@ -1,0 +1,19 @@
+[package]
+name = "fastmcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MCP server implementation for FastMCP"
+
+[dependencies]
+fastmcp-core.workspace = true
+fastmcp-protocol.workspace = true
+fastmcp-transport.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
