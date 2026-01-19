@@ -50,10 +50,10 @@ jobs:
             artifact: fastmcp.exe
             asset: fastmcp-windows-amd64.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: ../asupersync
@@ -112,7 +112,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v4
         with:
@@ -150,10 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     if: "!contains(needs.release.outputs.version, '-')"  # Skip prereleases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: ../asupersync
