@@ -94,6 +94,7 @@ pub mod targets {
 /// }
 /// ```
 #[inline]
+#[must_use]
 pub fn is_enabled(level: Level, target: &str) -> bool {
     log::log_enabled!(target: target, level)
 }

@@ -69,11 +69,13 @@ fn noop(_ctx: &McpContext) -> String {
 }
 
 #[tool(description = "Echo back the input")]
+#[allow(clippy::needless_pass_by_value)]  // Macro requires String
 fn bench_echo(_ctx: &McpContext, message: String) -> String {
     message
 }
 
 #[tool(description = "Parse and return JSON")]
+#[allow(clippy::needless_pass_by_value)]  // Macro requires String
 fn json_roundtrip(_ctx: &McpContext, data: String) -> String {
     // Parse then re-serialize
     match serde_json::from_str::<serde_json::Value>(&data) {
@@ -88,6 +90,7 @@ fn bench_data(_ctx: &McpContext) -> String {
 }
 
 #[prompt(description = "Benchmark prompt")]
+#[allow(clippy::needless_pass_by_value)]  // Macro requires String
 fn bench_prompt(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
     vec![PromptMessage {
         role: Role::User,
@@ -218,15 +221,15 @@ fn bench_json_serialization() {
 }
 
 fn bench_protocol_types() {
-    println!("\n=== Protocol Type Operations ===");
-
     use fastmcp_protocol::{CallToolParams, Content, InitializeParams, JsonRpcRequest, Tool};
+
+    println!("\n=== Protocol Type Operations ===");
 
     // Initialize params
     benchmark("InitializeParams create", 100_000, || {
         let _ = InitializeParams {
             protocol_version: "2024-11-05".to_string(),
-            capabilities: Default::default(),
+            capabilities: fastmcp_protocol::ClientCapabilities::default(),
             client_info: fastmcp_protocol::ClientInfo {
                 name: "test".to_string(),
                 version: "1.0".to_string(),
@@ -267,9 +270,9 @@ fn bench_protocol_types() {
 }
 
 fn bench_transport_codec() {
-    println!("\n=== Transport Codec ===");
-
     use fastmcp_transport::Codec;
+
+    println!("\n=== Transport Codec ===");
 
     // Create test messages
     let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -359,12 +362,12 @@ fn bench_context_operations() {
 }
 
 fn bench_memory_usage() {
-    println!("\n=== Memory Usage (size_of) ===");
-
     use fastmcp_protocol::{
         CallToolParams, CallToolResult, Content, InitializeParams, JsonRpcMessage, JsonRpcRequest,
         JsonRpcResponse, Tool,
     };
+
+    println!("\n=== Memory Usage (size_of) ===");
 
     println!(
         "McpContext:       {:>4} bytes",
@@ -402,9 +405,9 @@ fn bench_memory_usage() {
 }
 
 fn bench_schema_validation() {
-    println!("\n=== Schema Validation ===");
-
     use fastmcp_protocol::schema::validate;
+
+    println!("\n=== Schema Validation ===");
 
     // Simple schema
     let simple_schema = serde_json::json!({
