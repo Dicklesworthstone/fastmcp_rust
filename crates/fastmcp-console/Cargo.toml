@@ -1,0 +1,28 @@
+[package]
+name = "fastmcp-console"
+version = "0.1.0"
+edition = "2024"
+description = "Rich console output for FastMCP servers"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
+
+[dependencies]
+rich_rust = { workspace = true }
+log = { workspace = true, features = ["std"] }
+regex = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+fastmcp-core = { workspace = true }
+fastmcp-protocol = { workspace = true }
+strip-ansi-escapes = "0.2"
+
+[features]
+default = []
+full = ["rich_rust/full"]
+syntax = ["rich_rust/syntax"]
+markdown = ["rich_rust/markdown"]
+json = ["rich_rust/json"]
+
+[lints]
+workspace = true

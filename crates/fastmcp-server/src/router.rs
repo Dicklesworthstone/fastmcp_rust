@@ -81,6 +81,24 @@ impl Router {
         self.prompts.values().map(|h| h.definition()).collect()
     }
 
+    /// Returns the number of registered tools.
+    #[must_use]
+    pub fn tools_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Returns the number of registered resources.
+    #[must_use]
+    pub fn resources_count(&self) -> usize {
+        self.resources.len()
+    }
+
+    /// Returns the number of registered prompts.
+    #[must_use]
+    pub fn prompts_count(&self) -> usize {
+        self.prompts.len()
+    }
+
     /// Gets a tool handler by name.
     #[must_use]
     pub fn get_tool(&self, name: &str) -> Option<&BoxedToolHandler> {

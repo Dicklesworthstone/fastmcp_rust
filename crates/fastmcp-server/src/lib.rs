@@ -46,6 +46,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use asupersync::{Budget, Cx};
+use fastmcp_console::{banner::StartupBanner, console};
 use fastmcp_core::logging::{error, info, targets};
 use fastmcp_core::McpError;
 use fastmcp_protocol::{
@@ -122,6 +123,27 @@ impl Server {
     pub fn run_stdio_with_cx(self, cx: &Cx) -> ! {
         let mut transport = StdioTransport::stdio();
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+
+        if !banner_suppressed() {
+            let render_banner = || {
+                let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
+                    .tools(self.router.tools_count())
+                    .resources(self.router.resources_count())
+                    .prompts(self.router.prompts_count())
+                    .transport("stdio");
+
+                if let Some(desc) = self.instructions.as_deref().filter(|d| !d.is_empty()) {
+                    banner = banner.description(desc);
+                }
+
+                banner.render(console());
+            };
+
+            if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render_banner))
+            {
+                eprintln!("Warning: banner rendering failed: {err:?}");
+            }
+        }
 
         // Create a notification sender that writes to a separate stdout handle.
         // This allows progress notifications to be sent during handler execution
@@ -329,6 +351,12 @@ impl Server {
             _ => Err(McpError::method_not_found(method)),
         }
     }
+}
+
+fn banner_suppressed() -> bool {
+    std::env::var("FASTMCP_NO_BANNER")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Parses required parameters from JSON.

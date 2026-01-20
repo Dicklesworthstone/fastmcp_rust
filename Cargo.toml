@@ -8,6 +8,7 @@ members = [
     "crates/fastmcp-server",
     "crates/fastmcp-client",
     "crates/fastmcp-macros",
+    "crates/fastmcp-console",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Runtime (our own)
 asupersync = { path = "../asupersync" }
+rich_rust = { path = "../rich_rust" }
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +37,7 @@ fastmcp-protocol = { path = "crates/fastmcp-protocol" }
 fastmcp-server = { path = "crates/fastmcp-server" }
 fastmcp-client = { path = "crates/fastmcp-client" }
 fastmcp-macros = { path = "crates/fastmcp-macros" }
+fastmcp-console = { path = "crates/fastmcp-console" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
