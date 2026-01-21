@@ -12,6 +12,7 @@ pub mod status; // Request logging
 // pub mod progress;    // Progress indicators
 pub mod diagnostics; // Error formatting
 pub mod error; // Error boundary wrapper
+pub mod handlers; // Unified handler registry display
 pub mod logging; // Rich log formatter
 pub mod stats; // Runtime metrics
 pub mod tables; // Info tables
@@ -24,5 +25,6 @@ pub use client::RequestResponseRenderer;
 pub use config::ConsoleConfig;
 pub use detection::{DisplayContext, is_agent_context, should_enable_rich};
 pub use error::ErrorBoundary;
+pub use handlers::{HandlerRegistryRenderer, ServerCapabilities};
 pub use rich_rust;
 pub use theme::theme;

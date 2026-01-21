@@ -319,8 +319,9 @@ impl RequestResponseRenderer {
         } else {
             "OK"
         };
+        // Use escaped brackets to avoid rich markup interpretation
         console.print(&format!(
-            "{} [{}] {}",
+            "{} \\[{}\\] {}",
             request.method,
             status,
             self.format_duration(duration)
