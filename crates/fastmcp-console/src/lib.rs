@@ -13,7 +13,7 @@ pub mod status; // Request logging
 pub mod diagnostics; // Error formatting
 pub mod error; // Error boundary wrapper
 pub mod handlers; // Unified handler registry display
-pub mod logging; // Rich log formatter
+pub mod logging; // Rich log formatter (RichLogFormatter, RichLogger)
 pub mod stats; // Runtime metrics
 pub mod tables; // Info tables
 pub mod testing; // Test utilities

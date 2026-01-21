@@ -16,9 +16,16 @@ serde_json = { workspace = true }
 fastmcp-core = { workspace = true }
 fastmcp-protocol = { workspace = true }
 strip-ansi-escapes = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = { workspace = true }
+
+[[example]]
+name = "test_server"
+path = "examples/test_server.rs"
 
 [features]
 default = []

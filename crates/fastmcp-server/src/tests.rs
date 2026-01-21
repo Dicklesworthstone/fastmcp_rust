@@ -890,3 +890,107 @@ mod multi_handler_tests {
         );
     }
 }
+
+// ============================================================================
+// Console Config Integration Tests
+// ============================================================================
+
+mod console_config_tests {
+    use crate::{BannerStyle, ConsoleConfig, Server, TrafficVerbosity};
+
+    #[test]
+    fn test_server_default_console_config() {
+        let server = Server::new("test", "1.0.0").build();
+        let config = server.console_config();
+
+        // Default config should show banner
+        assert!(config.show_banner);
+        assert_eq!(config.banner_style, BannerStyle::Full);
+    }
+
+    #[test]
+    fn test_server_with_console_config() {
+        let config = ConsoleConfig::new()
+            .with_banner(BannerStyle::Compact)
+            .plain_mode();
+
+        let server = Server::new("test", "1.0.0")
+            .with_console_config(config)
+            .build();
+
+        assert_eq!(server.console_config().banner_style, BannerStyle::Compact);
+        assert!(server.console_config().force_plain);
+    }
+
+    #[test]
+    fn test_server_without_banner() {
+        let server = Server::new("test", "1.0.0").without_banner().build();
+
+        assert!(!server.console_config().show_banner);
+        assert_eq!(server.console_config().banner_style, BannerStyle::None);
+    }
+
+    #[test]
+    fn test_server_with_banner_style() {
+        let server = Server::new("test", "1.0.0")
+            .with_banner(BannerStyle::Minimal)
+            .build();
+
+        assert!(server.console_config().show_banner);
+        assert_eq!(server.console_config().banner_style, BannerStyle::Minimal);
+    }
+
+    #[test]
+    fn test_server_with_traffic_logging() {
+        let server = Server::new("test", "1.0.0")
+            .with_traffic_logging(TrafficVerbosity::Summary)
+            .build();
+
+        assert!(server.console_config().show_request_traffic);
+        assert_eq!(
+            server.console_config().traffic_verbosity,
+            TrafficVerbosity::Summary
+        );
+    }
+
+    #[test]
+    fn test_server_with_periodic_stats() {
+        let server = Server::new("test", "1.0.0")
+            .with_periodic_stats(30)
+            .build();
+
+        assert!(server.console_config().show_stats_periodic);
+        assert_eq!(server.console_config().stats_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_server_plain_mode() {
+        let server = Server::new("test", "1.0.0").plain_mode().build();
+
+        assert!(server.console_config().force_plain);
+    }
+
+    #[test]
+    fn test_server_force_color() {
+        let server = Server::new("test", "1.0.0").force_color().build();
+
+        assert_eq!(server.console_config().force_color, Some(true));
+    }
+
+    #[test]
+    fn test_console_config_chaining() {
+        let server = Server::new("test", "1.0.0")
+            .with_banner(BannerStyle::Compact)
+            .with_traffic_logging(TrafficVerbosity::Headers)
+            .with_periodic_stats(60)
+            .plain_mode()
+            .build();
+
+        let config = server.console_config();
+        assert_eq!(config.banner_style, BannerStyle::Compact);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Headers);
+        assert!(config.show_stats_periodic);
+        assert_eq!(config.stats_interval_secs, 60);
+        assert!(config.force_plain);
+    }
+}

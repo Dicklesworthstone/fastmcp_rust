@@ -35,6 +35,7 @@ mod session;
 mod tests;
 
 pub use builder::ServerBuilder;
+pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
     BoxFuture, ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
@@ -48,15 +49,84 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asupersync::{Budget, Cx};
+use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_console::{banner::StartupBanner, console};
 use fastmcp_core::logging::{error, info, targets};
 use fastmcp_core::McpError;
+use log::Level;
 use fastmcp_protocol::{
     CallToolParams, GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage,
     JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListResourcesParams, ListToolsParams,
     Prompt, ReadResourceParams, RequestId, Resource, ServerCapabilities, ServerInfo, Tool,
 };
 use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
+
+/// Logging configuration for the server.
+#[derive(Debug, Clone)]
+pub struct LoggingConfig {
+    /// Minimum log level (default: INFO).
+    pub level: Level,
+    /// Show timestamps in logs (default: true).
+    pub timestamps: bool,
+    /// Show module targets in logs (default: true).
+    pub targets: bool,
+    /// Show file:line in logs (default: false).
+    pub file_line: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: Level::Info,
+            timestamps: true,
+            targets: true,
+            file_line: false,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Create logging config from environment variables.
+    ///
+    /// Respects:
+    /// - `FASTMCP_LOG`: Log level (error, warn, info, debug, trace)
+    /// - `FASTMCP_LOG_TIMESTAMPS`: Show timestamps (0/false to disable)
+    /// - `FASTMCP_LOG_TARGETS`: Show targets (0/false to disable)
+    /// - `FASTMCP_LOG_FILE_LINE`: Show file:line (1/true to enable)
+    #[must_use]
+    pub fn from_env() -> Self {
+        let level = std::env::var("FASTMCP_LOG")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "error" => Some(Level::Error),
+                "warn" | "warning" => Some(Level::Warn),
+                "info" => Some(Level::Info),
+                "debug" => Some(Level::Debug),
+                "trace" => Some(Level::Trace),
+                _ => None,
+            })
+            .unwrap_or(Level::Info);
+
+        let timestamps = std::env::var("FASTMCP_LOG_TIMESTAMPS")
+            .map(|s| !matches!(s.to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let targets = std::env::var("FASTMCP_LOG_TARGETS")
+            .map(|s| !matches!(s.to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let file_line = std::env::var("FASTMCP_LOG_FILE_LINE")
+            .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        Self {
+            level,
+            timestamps,
+            targets,
+            file_line,
+        }
+    }
+}
 
 /// An MCP server instance.
 ///
@@ -71,6 +141,10 @@ pub struct Server {
     request_timeout_secs: u64,
     /// Runtime statistics collector (None = disabled).
     stats: Option<ServerStats>,
+    /// Logging configuration.
+    logging: LoggingConfig,
+    /// Console configuration for rich output.
+    console_config: ConsoleConfig,
 }
 
 impl Server {
@@ -139,6 +213,60 @@ impl Server {
         renderer.render_panel(&snapshot, console());
     }
 
+    /// Returns the console configuration.
+    #[must_use]
+    pub fn console_config(&self) -> &ConsoleConfig {
+        &self.console_config
+    }
+
+    /// Renders the startup banner based on console configuration.
+    fn render_startup_banner(&self) {
+        let render = || {
+            let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
+                .tools(self.router.tools_count())
+                .resources(self.router.resources_count())
+                .prompts(self.router.prompts_count())
+                .transport("stdio");
+
+            if let Some(desc) = self.instructions.as_deref().filter(|d| !d.is_empty()) {
+                banner = banner.description(desc);
+            }
+
+            // Apply banner style from config
+            match self.console_config.banner_style {
+                BannerStyle::Full => banner.render(console()),
+                BannerStyle::Compact | BannerStyle::Minimal => {
+                    // Compact/Minimal: render without the large logo
+                    banner.no_logo().render(console());
+                }
+                BannerStyle::None => {} // Already checked show_banner, but be safe
+            }
+        };
+
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
+            eprintln!("Warning: banner rendering failed: {err:?}");
+        }
+    }
+
+    /// Initializes rich logging based on server configuration.
+    ///
+    /// This should be called early in the startup sequence, before any
+    /// log output is generated. If initialization fails (e.g., logger
+    /// already set), a warning is printed to stderr.
+    fn init_rich_logging(&self) {
+        let result = RichLoggerBuilder::new()
+            .level(self.logging.level)
+            .with_timestamps(self.logging.timestamps)
+            .with_targets(self.logging.targets)
+            .with_file_line(self.logging.file_line)
+            .init();
+
+        if let Err(e) = result {
+            // Logger already initialized (likely by user code), not an error
+            eprintln!("Note: Rich logging not initialized (logger already set): {e}");
+        }
+    }
+
     /// Runs the server on stdio transport.
     ///
     /// This is the primary way to run MCP servers as subprocesses.
@@ -153,6 +281,9 @@ impl Server {
     ///
     /// This allows integration with a real asupersync runtime.
     pub fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+        // Initialize rich logging first, before any log output
+        self.init_rich_logging();
+
         let mut transport = StdioTransport::stdio();
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
 
@@ -161,25 +292,9 @@ impl Server {
             stats.connection_opened();
         }
 
-        if !banner_suppressed() {
-            let render_banner = || {
-                let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
-                    .tools(self.router.tools_count())
-                    .resources(self.router.resources_count())
-                    .prompts(self.router.prompts_count())
-                    .transport("stdio");
-
-                if let Some(desc) = self.instructions.as_deref().filter(|d| !d.is_empty()) {
-                    banner = banner.description(desc);
-                }
-
-                banner.render(console());
-            };
-
-            if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render_banner))
-            {
-                eprintln!("Warning: banner rendering failed: {err:?}");
-            }
+        // Render startup banner if enabled (respects both config and legacy env var)
+        if self.console_config.show_banner && !banner_suppressed() {
+            self.render_startup_banner();
         }
 
         // Create a notification sender that writes to a separate stdout handle.
@@ -434,6 +549,9 @@ impl Server {
     }
 }
 
+/// Checks if banner should be suppressed via environment variable.
+///
+/// This is a legacy check. Prefer using `ConsoleConfig` for banner control.
 fn banner_suppressed() -> bool {
     std::env::var("FASTMCP_NO_BANNER")
         .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))

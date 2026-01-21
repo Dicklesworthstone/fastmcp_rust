@@ -1,11 +1,13 @@
 //! Server builder for configuring MCP servers.
 
+use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_protocol::{
     PromptsCapability, ResourcesCapability, ServerCapabilities, ServerInfo, ToolsCapability,
 };
+use log::{Level, LevelFilter};
 
-use crate::{PromptHandler, ResourceHandler, Router, Server, ToolHandler};
+use crate::{LoggingConfig, PromptHandler, ResourceHandler, Router, Server, ToolHandler};
 
 /// Default request timeout in seconds.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -20,6 +22,10 @@ pub struct ServerBuilder {
     request_timeout_secs: u64,
     /// Whether to enable statistics collection.
     stats_enabled: bool,
+    /// Logging configuration.
+    logging: LoggingConfig,
+    /// Console configuration for rich output.
+    console_config: ConsoleConfig,
 }
 
 impl ServerBuilder {
@@ -27,6 +33,9 @@ impl ServerBuilder {
     ///
     /// Statistics collection is enabled by default. Use [`without_stats`](Self::without_stats)
     /// to disable it for performance-critical scenarios.
+    ///
+    /// Console configuration defaults to environment-based settings. Use
+    /// [`with_console_config`](Self::with_console_config) for programmatic control.
     #[must_use]
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
@@ -39,6 +48,8 @@ impl ServerBuilder {
             instructions: None,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             stats_enabled: true,
+            logging: LoggingConfig::from_env(),
+            console_config: ConsoleConfig::from_env(),
         }
     }
 
@@ -95,6 +106,139 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the log level.
+    ///
+    /// Default is read from `FASTMCP_LOG` environment variable, or `INFO` if not set.
+    #[must_use]
+    pub fn log_level(mut self, level: Level) -> Self {
+        self.logging.level = level;
+        self
+    }
+
+    /// Sets the log level from a filter.
+    #[must_use]
+    pub fn log_level_filter(mut self, filter: LevelFilter) -> Self {
+        self.logging.level = filter.to_level().unwrap_or(Level::Info);
+        self
+    }
+
+    /// Sets whether to show timestamps in logs.
+    ///
+    /// Default is `true`.
+    #[must_use]
+    pub fn log_timestamps(mut self, show: bool) -> Self {
+        self.logging.timestamps = show;
+        self
+    }
+
+    /// Sets whether to show target/module paths in logs.
+    ///
+    /// Default is `true`.
+    #[must_use]
+    pub fn log_targets(mut self, show: bool) -> Self {
+        self.logging.targets = show;
+        self
+    }
+
+    /// Sets the full logging configuration.
+    #[must_use]
+    pub fn logging(mut self, config: LoggingConfig) -> Self {
+        self.logging = config;
+        self
+    }
+
+    // ─────────────────────────────────────────────────
+    // Console Configuration
+    // ─────────────────────────────────────────────────
+
+    /// Sets the complete console configuration.
+    ///
+    /// This provides full control over all console output settings including
+    /// banner, traffic logging, periodic stats, and error formatting.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastmcp_console::config::{ConsoleConfig, BannerStyle};
+    ///
+    /// Server::new("demo", "1.0.0")
+    ///     .with_console_config(
+    ///         ConsoleConfig::new()
+    ///             .with_banner(BannerStyle::Compact)
+    ///             .plain_mode()
+    ///     )
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_console_config(mut self, config: ConsoleConfig) -> Self {
+        self.console_config = config;
+        self
+    }
+
+    /// Sets the banner style.
+    ///
+    /// Controls how the startup banner is displayed.
+    /// Default is `BannerStyle::Full`.
+    #[must_use]
+    pub fn with_banner(mut self, style: BannerStyle) -> Self {
+        self.console_config = self.console_config.with_banner(style);
+        self
+    }
+
+    /// Disables the startup banner.
+    #[must_use]
+    pub fn without_banner(mut self) -> Self {
+        self.console_config = self.console_config.without_banner();
+        self
+    }
+
+    /// Enables request/response traffic logging.
+    ///
+    /// Controls the verbosity of traffic logging:
+    /// - `None`: No traffic logging (default)
+    /// - `Summary`: Method name and timing only
+    /// - `Headers`: Include metadata/headers
+    /// - `Full`: Full request/response bodies
+    #[must_use]
+    pub fn with_traffic_logging(mut self, verbosity: TrafficVerbosity) -> Self {
+        self.console_config = self.console_config.with_traffic(verbosity);
+        self
+    }
+
+    /// Enables periodic statistics display.
+    ///
+    /// When enabled, statistics will be printed to stderr at the specified
+    /// interval. Requires stats collection to be enabled (the default).
+    #[must_use]
+    pub fn with_periodic_stats(mut self, interval_secs: u64) -> Self {
+        self.console_config = self.console_config.with_periodic_stats(interval_secs);
+        self
+    }
+
+    /// Forces plain text output (no colors/styling).
+    ///
+    /// Useful for CI environments, logging to files, or when running
+    /// as an MCP server where rich output might interfere with the
+    /// JSON-RPC protocol.
+    #[must_use]
+    pub fn plain_mode(mut self) -> Self {
+        self.console_config = self.console_config.plain_mode();
+        self
+    }
+
+    /// Forces color output even in non-TTY environments.
+    #[must_use]
+    pub fn force_color(mut self) -> Self {
+        self.console_config = self.console_config.force_color(true);
+        self
+    }
+
+    /// Returns a reference to the current console configuration.
+    #[must_use]
+    pub fn console_config(&self) -> &ConsoleConfig {
+        &self.console_config
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -109,6 +253,8 @@ impl ServerBuilder {
             } else {
                 None
             },
+            logging: self.logging,
+            console_config: self.console_config,
         }
     }
 }
