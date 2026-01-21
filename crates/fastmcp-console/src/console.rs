@@ -1,4 +1,18 @@
-//! Configured Console wrapper
+//! Console wrapper for rich stderr output.
+//!
+//! `FastMcpConsole` is the core output surface for fastmcp-console. It wraps
+//! a `rich_rust::Console` configured to write to stderr, and it automatically
+//! falls back to plain text when running in agent contexts.
+//!
+//! # Quick Example
+//!
+//! ```rust,ignore
+//! use fastmcp_console::console::FastMcpConsole;
+//!
+//! let console = FastMcpConsole::new();
+//! console.rule(Some("FastMCP Console"));
+//! console.print("Ready.");
+//! ```
 
 use crate::theme::FastMcpTheme;
 use rich_rust::prelude::*;
@@ -6,7 +20,20 @@ use rich_rust::renderables::Renderable;
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 
-/// FastMCP console for rich output to stderr
+/// FastMCP console for rich output to stderr.
+///
+/// This type centralizes rich-vs-plain output behavior and exposes
+/// convenience methods for printing tables, panels, and styled text.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use fastmcp_console::console::FastMcpConsole;
+/// use rich_rust::prelude::Style;
+///
+/// let console = FastMcpConsole::new();
+/// console.print_styled("Server started", Style::new().bold());
+/// ```
 pub struct FastMcpConsole {
     inner: Mutex<Console>,
     enabled: bool,
@@ -73,17 +100,17 @@ impl FastMcpConsole {
     // State Queries
     // ─────────────────────────────────────────────────
 
-    /// Check if rich output is enabled
+    /// Check if rich output is enabled.
     pub fn is_rich(&self) -> bool {
         self.enabled
     }
 
-    /// Get the theme
+    /// Get the theme used for standard styling.
     pub fn theme(&self) -> &FastMcpTheme {
         self.theme
     }
 
-    /// Get terminal width (or default 80)
+    /// Get terminal width (or default 80).
     pub fn width(&self) -> usize {
         if let Ok(c) = self.inner.lock() {
             c.width()
@@ -92,7 +119,7 @@ impl FastMcpConsole {
         }
     }
 
-    /// Get terminal height (or default 24)
+    /// Get terminal height (or default 24).
     pub fn height(&self) -> usize {
         if let Ok(c) = self.inner.lock() {
             c.height()
@@ -105,7 +132,7 @@ impl FastMcpConsole {
     // Output Methods
     // ─────────────────────────────────────────────────
 
-    /// Print styled text (auto-detects markup)
+    /// Print styled text (auto-detects markup).
     pub fn print(&self, content: &str) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -116,12 +143,12 @@ impl FastMcpConsole {
         }
     }
 
-    /// Print plain text (no markup processing ever)
+    /// Print plain text (no markup processing ever).
     pub fn print_plain(&self, text: &str) {
         eprintln!("{text}");
     }
 
-    /// Print a renderable
+    /// Print a renderable.
     pub fn render<R: Renderable>(&self, renderable: &R) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -133,7 +160,7 @@ impl FastMcpConsole {
         }
     }
 
-    /// Print a renderable with plain-text fallback closure
+    /// Print a renderable with plain-text fallback closure.
     pub fn render_or<F>(&self, render_op: F, plain_fallback: &str)
     where
         F: FnOnce(&Console),
@@ -151,7 +178,7 @@ impl FastMcpConsole {
     // Convenience Methods
     // ─────────────────────────────────────────────────
 
-    /// Print a horizontal rule
+    /// Print a horizontal rule.
     pub fn rule(&self, title: Option<&str>) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -171,12 +198,12 @@ impl FastMcpConsole {
         }
     }
 
-    /// Print a blank line
+    /// Print a blank line.
     pub fn newline(&self) {
         eprintln!();
     }
 
-    /// Print styled text with a specific style
+    /// Print styled text with a specific style.
     pub fn print_styled(&self, text: &str, style: Style) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -187,7 +214,7 @@ impl FastMcpConsole {
         }
     }
 
-    /// Print a table (with plain fallback)
+    /// Print a table (with plain fallback).
     pub fn print_table(&self, table: &Table, plain_fallback: &str) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -198,7 +225,7 @@ impl FastMcpConsole {
         }
     }
 
-    /// Print a panel (with plain fallback)
+    /// Print a panel (with plain fallback).
     pub fn print_panel(&self, panel: &Panel, plain_fallback: &str) {
         if self.enabled {
             if let Ok(console) = self.inner.lock() {
@@ -222,14 +249,30 @@ impl Default for FastMcpConsole {
 
 static CONSOLE: OnceLock<FastMcpConsole> = OnceLock::new();
 
-/// Get the global FastMCP console instance
+/// Get the global FastMCP console instance.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let console = fastmcp_console::console::console();
+/// console.print("Hello from global console");
+/// ```
 #[must_use]
 pub fn console() -> &'static FastMcpConsole {
     CONSOLE.get_or_init(FastMcpConsole::new)
 }
 
-/// Initialize the global console with specific settings
-/// Must be called before any output; returns error if already initialized
+/// Initialize the global console with specific settings.
+///
+/// Must be called before any output; returns error if already initialized.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use fastmcp_console::console::init_console;
+///
+/// init_console(false).expect("console already initialized");
+/// ```
 pub fn init_console(enabled: bool) -> Result<(), &'static str> {
     CONSOLE
         .set(FastMcpConsole::with_enabled(enabled))
@@ -240,7 +283,7 @@ pub fn init_console(enabled: bool) -> Result<(), &'static str> {
 // Helpers
 // ─────────────────────────────────────────────────────────
 
-/// Strip markup tags from text (for plain output)
+/// Strip markup tags from text (for plain output).
 #[must_use]
 pub fn strip_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

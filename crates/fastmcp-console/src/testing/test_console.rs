@@ -144,9 +144,12 @@ impl TestConsole {
     pub fn assert_line_count(&self, expected: usize) {
         let actual = self.output().len();
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "Expected {} lines but got {}. Actual output:\n{}",
-            expected, actual, self.output_string()
+            expected,
+            actual,
+            self.output_string()
         );
     }
 

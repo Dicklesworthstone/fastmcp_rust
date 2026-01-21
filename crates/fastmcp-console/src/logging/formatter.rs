@@ -115,7 +115,12 @@ impl RichLogFormatter {
         }
 
         if self.should_use_rich() {
-            let dim_hex = self.theme.text_dim.triplet.map(|t| t.hex()).unwrap_or_default();
+            let dim_hex = self
+                .theme
+                .text_dim
+                .triplet
+                .map(|t| t.hex())
+                .unwrap_or_default();
             Some(format!("[{dim_hex}]{timestamp}[/]"))
         } else {
             Some(timestamp.to_string())
@@ -134,7 +139,12 @@ impl RichLogFormatter {
         let target = self.truncate_text(target);
 
         if self.should_use_rich() {
-            let muted_hex = self.theme.text_muted.triplet.map(|t| t.hex()).unwrap_or_default();
+            let muted_hex = self
+                .theme
+                .text_muted
+                .triplet
+                .map(|t| t.hex())
+                .unwrap_or_default();
             Some(format!("[{muted_hex}]{target}[/]"))
         } else {
             Some(target.to_string())
@@ -149,7 +159,12 @@ impl RichLogFormatter {
         }
 
         if self.should_use_rich() {
-            let dim_hex = self.theme.text_dim.triplet.map(|t| t.hex()).unwrap_or_default();
+            let dim_hex = self
+                .theme
+                .text_dim
+                .triplet
+                .map(|t| t.hex())
+                .unwrap_or_default();
             fields
                 .iter()
                 .map(|(k, v)| format!("[{dim_hex}]{k}[/]={v}"))
@@ -172,10 +187,7 @@ impl RichLogFormatter {
             .timestamp
             .as_deref()
             .and_then(|ts| self.format_timestamp(ts));
-        let target = event
-            .target
-            .as_deref()
-            .and_then(|t| self.format_target(t));
+        let target = event.target.as_deref().and_then(|t| self.format_target(t));
         let message = self.truncate_text(&event.message);
 
         let mut fields = event.fields.clone();
@@ -419,7 +431,10 @@ mod tests {
         assert_eq!(ts, Some("2026-01-21 12:00:00".to_string()));
 
         let formatter_no_ts = formatter.with_timestamp(false);
-        assert_eq!(formatter_no_ts.format_timestamp("2026-01-21 12:00:00"), None);
+        assert_eq!(
+            formatter_no_ts.format_timestamp("2026-01-21 12:00:00"),
+            None
+        );
     }
 
     #[test]

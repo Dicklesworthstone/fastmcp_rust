@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use fastmcp_protocol::{Prompt, PromptArgument, Resource, Tool};
-use rich_rust::prelude::*;
 use rich_rust::r#box::ROUNDED;
+use rich_rust::prelude::*;
 use rich_rust::text::OverflowMethod;
 use serde_json::Value;
 
@@ -216,7 +216,10 @@ impl ToolTableRenderer {
         if desc.len() <= self.max_description_width {
             desc.to_string()
         } else {
-            format!("{}...", &desc[..self.max_description_width.saturating_sub(3)])
+            format!(
+                "{}...",
+                &desc[..self.max_description_width.saturating_sub(3)]
+            )
         }
     }
 
@@ -247,7 +250,11 @@ impl ToolTableRenderer {
         } else {
             console.print("Parameters:");
             for param in &params {
-                let req = if param.required { "required" } else { "optional" };
+                let req = if param.required {
+                    "required"
+                } else {
+                    "optional"
+                };
                 console.print(&format!(
                     "  - {}: {} ({}) - {}",
                     param.name,
@@ -350,9 +357,18 @@ impl ResourceTableRenderer {
 
             if self.show_mime_type {
                 let mime = resource.mime_type.as_deref().unwrap_or("-");
-                table.add_row_cells([resource.name.as_str(), formatted_uri.as_str(), truncated_desc.as_str(), mime]);
+                table.add_row_cells([
+                    resource.name.as_str(),
+                    formatted_uri.as_str(),
+                    truncated_desc.as_str(),
+                    mime,
+                ]);
             } else {
-                table.add_row_cells([resource.name.as_str(), formatted_uri.as_str(), truncated_desc.as_str()]);
+                table.add_row_cells([
+                    resource.name.as_str(),
+                    formatted_uri.as_str(),
+                    truncated_desc.as_str(),
+                ]);
             }
         }
 
@@ -367,10 +383,7 @@ impl ResourceTableRenderer {
         }
 
         console.print(&format!("\n[bold cyan]{}[/]", resource.name));
-        console.print(&format!(
-            "[dim]URI:[/] {}",
-            self.format_uri(&resource.uri)
-        ));
+        console.print(&format!("[dim]URI:[/] {}", self.format_uri(&resource.uri)));
         console.print(&format!(
             "[dim]Description:[/] {}",
             resource.description.as_deref().unwrap_or("No description")
@@ -407,10 +420,7 @@ impl ResourceTableRenderer {
         }
 
         // Build tree
-        let root = TreeNode::with_icon(
-            "📄",
-            format!("[bold]Resources[/] ({})", resources.len()),
-        );
+        let root = TreeNode::with_icon("📄", format!("[bold]Resources[/] ({})", resources.len()));
 
         // Sort group keys for consistent ordering
         let mut sorted_keys: Vec<_> = groups.keys().cloned().collect();
@@ -418,18 +428,13 @@ impl ResourceTableRenderer {
 
         let root = sorted_keys.into_iter().fold(root, |root, prefix| {
             let group_resources = groups.get(&prefix).unwrap();
-            let group_node = TreeNode::new(format!(
-                "[cyan]{}[/] ({})",
-                prefix,
-                group_resources.len()
-            ));
+            let group_node =
+                TreeNode::new(format!("[cyan]{}[/] ({})", prefix, group_resources.len()));
 
             // Add each resource as a child
             let group_node = group_resources.iter().fold(group_node, |node, resource| {
                 let name_part = self.extract_uri_path(&resource.uri);
-                let desc = self.truncate_description(
-                    resource.description.as_deref().unwrap_or(""),
-                );
+                let desc = self.truncate_description(resource.description.as_deref().unwrap_or(""));
                 let leaf_label = if desc.is_empty() {
                     self.format_uri(&name_part)
                 } else {
@@ -508,7 +513,10 @@ impl ResourceTableRenderer {
         if desc.len() <= self.max_description_width {
             desc.to_string()
         } else {
-            format!("{}...", &desc[..self.max_description_width.saturating_sub(3)])
+            format!(
+                "{}...",
+                &desc[..self.max_description_width.saturating_sub(3)]
+            )
         }
     }
 
@@ -517,7 +525,10 @@ impl ResourceTableRenderer {
         console.print(&"=".repeat(40));
         for resource in resources {
             let desc = resource.description.as_deref().unwrap_or("-");
-            console.print(&format!("  {} ({}) - {}", resource.name, resource.uri, desc));
+            console.print(&format!(
+                "  {} ({}) - {}",
+                resource.name, resource.uri, desc
+            ));
         }
     }
 
@@ -685,7 +696,10 @@ impl PromptTableRenderer {
         if desc.len() <= self.max_description_width {
             desc.to_string()
         } else {
-            format!("{}...", &desc[..self.max_description_width.saturating_sub(3)])
+            format!(
+                "{}...",
+                &desc[..self.max_description_width.saturating_sub(3)]
+            )
         }
     }
 
@@ -961,12 +975,10 @@ mod tests {
             max_description_width: 20,
         };
 
+        assert_eq!(renderer.truncate_description("Short"), "Short");
         assert_eq!(
-            renderer.truncate_description("Short"),
-            "Short"
-        );
-        assert_eq!(
-            renderer.truncate_description("This is a very long description that should be truncated"),
+            renderer
+                .truncate_description("This is a very long description that should be truncated"),
             "This is a very lo..."
         );
     }
@@ -1014,7 +1026,10 @@ mod tests {
     fn test_uri_path_extraction() {
         let renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
 
-        assert_eq!(renderer.extract_uri_path("file://config.json"), "config.json");
+        assert_eq!(
+            renderer.extract_uri_path("file://config.json"),
+            "config.json"
+        );
         assert_eq!(renderer.extract_uri_path("db://users/{id}"), "users/{id}");
         assert_eq!(renderer.extract_uri_path("config:settings"), "settings");
     }

@@ -372,10 +372,7 @@ mod tests {
         let boundary = ErrorBoundary::new(&console);
 
         let result: Result<i32, McpError> = Err(McpError::internal_error("test"));
-        assert_eq!(
-            boundary.wrap_with_context(result, "Loading config"),
-            None
-        );
+        assert_eq!(boundary.wrap_with_context(result, "Loading config"), None);
         assert_eq!(boundary.error_count(), 1);
     }
 

@@ -59,19 +59,42 @@ impl RequestLog {
             RequestStatus::Cancelled(d) => ("⊘", &theme.warning_style, Some(d)),
         };
 
-        let id_str = self.id.as_ref()
-            .map(|id| format!(" [{}]#{}[/]", theme.text_dim.triplet.unwrap_or_default().hex(), id))
+        let id_str = self
+            .id
+            .as_ref()
+            .map(|id| {
+                format!(
+                    " [{}]#{}[/]",
+                    theme.text_dim.triplet.unwrap_or_default().hex(),
+                    id
+                )
+            })
             .unwrap_or_default();
 
         let duration_str = duration
-            .map(|d| format!(" [{}]{}[/]", theme.text_muted.triplet.unwrap_or_default().hex(), format_duration(*d)))
+            .map(|d| {
+                format!(
+                    " [{}]{}[/]",
+                    theme.text_muted.triplet.unwrap_or_default().hex(),
+                    format_duration(*d)
+                )
+            })
             .unwrap_or_default();
 
         console.print(&format!(
             "[{}]{}[/] [{}]{}[/]{}{}",
-            style.color.as_ref().map(|c| c.triplet.unwrap_or_default().hex()).unwrap_or_default(),
+            style
+                .color
+                .as_ref()
+                .map(|c| c.triplet.unwrap_or_default().hex())
+                .unwrap_or_default(),
             icon,
-            theme.key_style.color.as_ref().map(|c| c.triplet.unwrap_or_default().hex()).unwrap_or_default(),
+            theme
+                .key_style
+                .color
+                .as_ref()
+                .map(|c| c.triplet.unwrap_or_default().hex())
+                .unwrap_or_default(),
             self.method,
             id_str,
             duration_str
@@ -98,7 +121,9 @@ impl RequestLog {
             .map(|d| format!(" ({})", format_duration(*d)))
             .unwrap_or_default();
 
-        let id_str = self.id.as_ref()
+        let id_str = self
+            .id
+            .as_ref()
             .map(|id| format!(" #{}", id))
             .unwrap_or_default();
 

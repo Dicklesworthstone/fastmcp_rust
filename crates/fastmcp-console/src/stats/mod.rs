@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod renderer;
@@ -89,9 +89,7 @@ impl ServerStats {
         self.inner
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .total_connections
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.total_connections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a closed client connection.
@@ -115,7 +113,9 @@ impl ServerStats {
 
     /// Add to the received byte counter.
     pub fn add_bytes_received(&self, bytes: u64) {
-        self.inner.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        self.inner
+            .bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Add to the sent byte counter.
@@ -171,9 +171,7 @@ impl ServerStats {
         }
 
         if method.contains("list") {
-            self.inner
-                .list_operations
-                .fetch_add(1, Ordering::Relaxed);
+            self.inner.list_operations.fetch_add(1, Ordering::Relaxed);
         }
 
         let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);

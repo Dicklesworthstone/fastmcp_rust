@@ -1,9 +1,9 @@
 //! Error/warning formatting
 
-use rich_rust::prelude::*;
-use fastmcp_core::{McpError, McpErrorCode};
 use crate::console::FastMcpConsole;
 use crate::theme::FastMcpTheme;
+use fastmcp_core::{McpError, McpErrorCode};
+use rich_rust::prelude::*;
 
 /// Renders errors in a beautiful, informative format
 pub struct RichErrorRenderer {
@@ -72,7 +72,12 @@ impl RichErrorRenderer {
         }
     }
 
-    fn render_header(&self, category: ErrorCategory, theme: &FastMcpTheme, console: &FastMcpConsole) {
+    fn render_header(
+        &self,
+        category: ErrorCategory,
+        theme: &FastMcpTheme,
+        console: &FastMcpConsole,
+    ) {
         let (icon, label, style) = match category {
             ErrorCategory::Connection => ("🔌", "Connection Error", theme.error_style.clone()),
             ErrorCategory::Protocol => ("📋", "Protocol Error", theme.error_style.clone()),
@@ -84,8 +89,7 @@ impl RichErrorRenderer {
         };
 
         // Use Text::from to convert format! string to Text
-        let rule = Rule::with_title(Text::from(format!("{} {}", icon, label)))
-            .style(style);
+        let rule = Rule::with_title(Text::from(format!("{} {}", icon, label))).style(style);
         console.render(&rule);
     }
 
@@ -98,14 +102,14 @@ impl RichErrorRenderer {
         } else {
             message.clone()
         };
-        
+
         // Add data context if present
         let content = if let Some(data) = &error.data {
-             if let Ok(pretty) = serde_json::to_string_pretty(data) {
-                 format!("{}\n\n[dim]Context:[/]\n{}", content, pretty)
-             } else {
-                 content
-             }
+            if let Ok(pretty) = serde_json::to_string_pretty(data) {
+                format!("{}\n\n[dim]Context:[/]\n{}", content, pretty)
+            } else {
+                content
+            }
         } else {
             content
         };
@@ -117,7 +121,12 @@ impl RichErrorRenderer {
         console.render(&panel);
     }
 
-    fn render_suggestions(&self, suggestions: &[String], _theme: &FastMcpTheme, console: &FastMcpConsole) {
+    fn render_suggestions(
+        &self,
+        suggestions: &[String],
+        _theme: &FastMcpTheme,
+        console: &FastMcpConsole,
+    ) {
         console.print("\n[bold cyan]💡 Suggestions:[/]");
         for (i, suggestion) in suggestions.iter().enumerate() {
             console.print(&format!("  [dim]{}.[/] {}", i + 1, suggestion));
@@ -126,31 +135,29 @@ impl RichErrorRenderer {
 
     fn get_suggestions(&self, error: &McpError) -> Option<Vec<String>> {
         match error.code {
-            McpErrorCode::MethodNotFound => {
-                Some(vec![
-                    "Verify the method name is correct".to_string(),
-                    "Check that the handler is registered".to_string(),
-                    "Run with RUST_LOG=debug for more details".to_string(),
-                ])
-            },
-            McpErrorCode::ParseError => {
-                Some(vec![
-                    "Validate the JSON structure".to_string(),
-                    "Ensure text encoding is UTF-8".to_string(),
-                ])
-            },
-             McpErrorCode::ResourceNotFound => {
-                Some(vec![
-                    "Verify the resource URI".to_string(),
-                    "Check if the resource provider is active".to_string(),
-                ])
-            },
+            McpErrorCode::MethodNotFound => Some(vec![
+                "Verify the method name is correct".to_string(),
+                "Check that the handler is registered".to_string(),
+                "Run with RUST_LOG=debug for more details".to_string(),
+            ]),
+            McpErrorCode::ParseError => Some(vec![
+                "Validate the JSON structure".to_string(),
+                "Ensure text encoding is UTF-8".to_string(),
+            ]),
+            McpErrorCode::ResourceNotFound => Some(vec![
+                "Verify the resource URI".to_string(),
+                "Check if the resource provider is active".to_string(),
+            ]),
             _ => None,
         }
     }
 
     fn render_plain(&self, error: &McpError, console: &FastMcpConsole) {
-        console.print_plain(&format!("ERROR [{}]: {}", i32::from(error.code), error.message));
+        console.print_plain(&format!(
+            "ERROR [{}]: {}",
+            i32::from(error.code),
+            error.message
+        ));
         if let Some(data) = &error.data {
             console.print_plain(&format!("Context: {:?}", data));
         }
@@ -177,7 +184,12 @@ impl RichErrorRenderer {
         // Backtrace if available
         if let Some(bt) = backtrace {
             // Fix hex call
-            let label_color = theme.label_style.color.as_ref().map(|c| c.triplet.unwrap_or_default().hex()).unwrap_or_default();
+            let label_color = theme
+                .label_style
+                .color
+                .as_ref()
+                .map(|c| c.triplet.unwrap_or_default().hex())
+                .unwrap_or_default();
             console.print(&format!("\n[{}]Backtrace:[/] инструкция", label_color));
 
             // Syntax-highlight the backtrace (if syntax feature enabled)

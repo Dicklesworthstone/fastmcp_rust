@@ -6,12 +6,12 @@
 use std::fmt;
 
 use time::{OffsetDateTime, format_description};
-use tracing::{Event, Subscriber};
 use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, Layer};
-use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::console::{FastMcpConsole, strip_markup};
 use crate::detection::DisplayContext;
@@ -105,7 +105,10 @@ where
         event.record(&mut collector);
 
         if let Some(scope) = ctx.event_scope(event) {
-            let spans: Vec<String> = scope.from_root().map(|span| span.name().to_string()).collect();
+            let spans: Vec<String> = scope
+                .from_root()
+                .map(|span| span.name().to_string())
+                .collect();
             if !spans.is_empty() {
                 collector
                     .fields

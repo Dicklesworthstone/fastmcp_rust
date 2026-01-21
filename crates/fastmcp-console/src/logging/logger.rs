@@ -256,20 +256,62 @@ mod tests {
         let logger = RichLogger::new(Level::Info);
 
         // Info and above should be enabled
-        assert!(logger.enabled(&log::Metadata::builder().level(Level::Error).target("test").build()));
-        assert!(logger.enabled(&log::Metadata::builder().level(Level::Warn).target("test").build()));
-        assert!(logger.enabled(&log::Metadata::builder().level(Level::Info).target("test").build()));
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Error)
+                    .target("test")
+                    .build()
+            )
+        );
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Warn)
+                    .target("test")
+                    .build()
+            )
+        );
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Info)
+                    .target("test")
+                    .build()
+            )
+        );
 
         // Debug and Trace should be disabled
-        assert!(!logger.enabled(&log::Metadata::builder().level(Level::Debug).target("test").build()));
-        assert!(!logger.enabled(&log::Metadata::builder().level(Level::Trace).target("test").build()));
+        assert!(
+            !logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Debug)
+                    .target("test")
+                    .build()
+            )
+        );
+        assert!(
+            !logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Trace)
+                    .target("test")
+                    .build()
+            )
+        );
     }
 
     #[test]
     fn test_rich_logger_new() {
         let logger = RichLogger::new(Level::Debug);
         // Should not panic
-        assert!(logger.enabled(&log::Metadata::builder().level(Level::Debug).target("test").build()));
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Debug)
+                    .target("test")
+                    .build()
+            )
+        );
     }
 
     #[test]
@@ -326,7 +368,14 @@ mod tests {
             .build();
 
         // Logger should be configured
-        assert!(logger.enabled(&log::Metadata::builder().level(Level::Debug).target("test").build()));
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(Level::Debug)
+                    .target("test")
+                    .build()
+            )
+        );
         assert!(!logger.show_timestamps);
     }
 

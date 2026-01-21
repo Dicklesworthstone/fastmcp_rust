@@ -5,15 +5,16 @@
 
 use std::io::{self, BufRead, Write};
 
+use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::config::{BannerStyle, ConsoleConfig};
 use fastmcp_console::console;
 use fastmcp_console::detection::DisplayContext;
-use fastmcp_console::banner::StartupBanner;
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC request.
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<serde_json::Value>,
     method: String,
@@ -103,7 +104,7 @@ fn main() {
     let config = ConsoleConfig::from_env();
 
     // Log context detection to stderr (human-readable output)
-    eprintln!("[test_server] Context: {:?}", context);
+    eprintln!("[test_server] Context: {context:?}");
     eprintln!("[test_server] Banner style: {:?}", config.banner_style);
 
     // Show startup banner if enabled
@@ -120,18 +121,18 @@ fn main() {
             Ok(l) if l.trim().is_empty() => continue,
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[test_server] Read error: {}", e);
+                eprintln!("[test_server] Read error: {e}");
                 break;
             }
         };
 
-        eprintln!("[test_server] Received: {}", line);
+        eprintln!("[test_server] Received: {line}");
 
         // Parse request
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[test_server] Parse error: {}", e);
+                eprintln!("[test_server] Parse error: {e}");
                 continue;
             }
         };
@@ -141,10 +142,10 @@ fn main() {
 
         // Write response
         let response_json = serde_json::to_string(&response).expect("serialize response");
-        eprintln!("[test_server] Sending: {}", response_json);
+        eprintln!("[test_server] Sending: {response_json}");
 
         let mut stdout = stdout.lock();
-        writeln!(stdout, "{}", response_json).expect("write response");
+        writeln!(stdout, "{response_json}").expect("write response");
         stdout.flush().expect("flush stdout");
     }
 
@@ -184,7 +185,7 @@ fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
         "ping" => Ok(serde_json::json!({})),
         _ => Err(JsonRpcError {
             code: -32601,
-            message: format!("Method not found: {}", request.method),
+            message: format!("Method not found: {}", &request.method),
         }),
     };
 
@@ -204,6 +205,7 @@ fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn handle_initialize() -> Result<serde_json::Value, JsonRpcError> {
     let result = InitializeResult {
         protocol_version: "2024-11-05".to_string(),
@@ -218,6 +220,7 @@ fn handle_initialize() -> Result<serde_json::Value, JsonRpcError> {
     Ok(serde_json::to_value(result).expect("serialize"))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn handle_tools_list() -> Result<serde_json::Value, JsonRpcError> {
     let result = ListToolsResult {
         tools: vec![ToolDef {
@@ -235,16 +238,21 @@ fn handle_tools_list() -> Result<serde_json::Value, JsonRpcError> {
     Ok(serde_json::to_value(result).expect("serialize"))
 }
 
-fn handle_tools_call(params: Option<&serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
+fn handle_tools_call(
+    params: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, JsonRpcError> {
     let params = params.ok_or_else(|| JsonRpcError {
         code: -32602,
         message: "Missing parameters".to_string(),
     })?;
 
-    let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: -32602,
-        message: "Missing tool name".to_string(),
-    })?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing tool name".to_string(),
+        })?;
 
     match name {
         "echo" => {
@@ -265,7 +273,7 @@ fn handle_tools_call(params: Option<&serde_json::Value>) -> Result<serde_json::V
         }
         _ => Err(JsonRpcError {
             code: -32001,
-            message: format!("Unknown tool: {}", name),
+            message: format!("Unknown tool: {name}"),
         }),
     }
 }

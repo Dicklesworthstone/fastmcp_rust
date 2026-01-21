@@ -123,7 +123,8 @@ impl HandlerRegistryRenderer {
         // Resources section
         if !capabilities.resources.is_empty() {
             console.print("");
-            self.resource_renderer.render(&capabilities.resources, console);
+            self.resource_renderer
+                .render(&capabilities.resources, console);
         }
 
         // Prompts section
@@ -280,7 +281,8 @@ impl HandlerRegistryRenderer {
 
         if !capabilities.resources.is_empty() {
             console.print("");
-            self.resource_renderer.render(&capabilities.resources, console);
+            self.resource_renderer
+                .render(&capabilities.resources, console);
         }
 
         if !capabilities.prompts.is_empty() {

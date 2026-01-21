@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use fastmcp_console::client::ClientInfoRenderer;
 use fastmcp_console::config::ConsoleConfig;
 use fastmcp_console::detection::DisplayContext;
 use fastmcp_console::diagnostics::RichErrorRenderer;
@@ -16,7 +17,6 @@ use fastmcp_console::stats::{ServerStats, StatsRenderer};
 use fastmcp_console::tables::{PromptTableRenderer, ResourceTableRenderer, ToolTableRenderer};
 use fastmcp_console::testing::TestConsole;
 use fastmcp_console::theme::theme;
-use fastmcp_console::client::ClientInfoRenderer;
 use fastmcp_core::McpError;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, RootsCapability};
 
@@ -334,7 +334,11 @@ fn test_stats_collection_integrates_with_renderer() {
     for i in 0..100 {
         let success = i % 10 != 0; // 90% success rate
         let latency = Duration::from_millis(10 + (i % 50));
-        let method = if i % 2 == 0 { "tools/call" } else { "resources/read" };
+        let method = if i % 2 == 0 {
+            "tools/call"
+        } else {
+            "resources/read"
+        };
         stats.record_request(method, latency, success);
     }
 

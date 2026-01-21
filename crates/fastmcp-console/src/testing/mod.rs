@@ -23,8 +23,8 @@
 //! }
 //! ```
 
-mod test_console;
 mod snapshots;
+mod test_console;
 
-pub use test_console::TestConsole;
 pub use snapshots::SnapshotTest;
+pub use test_console::TestConsole;

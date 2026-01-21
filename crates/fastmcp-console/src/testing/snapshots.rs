@@ -191,7 +191,11 @@ impl SnapshotTest {
                     e
                 )
             });
-            eprintln!("Updated raw snapshot: {} -> {}", self.name, snapshot_path.display());
+            eprintln!(
+                "Updated raw snapshot: {} -> {}",
+                self.name,
+                snapshot_path.display()
+            );
             return;
         }
 
@@ -204,8 +208,7 @@ impl SnapshotTest {
             );
         }
 
-        let expected =
-            fs::read_to_string(&snapshot_path).expect("Failed to read raw snapshot");
+        let expected = fs::read_to_string(&snapshot_path).expect("Failed to read raw snapshot");
 
         if actual != expected {
             let diff = self.generate_diff(&expected, &actual);
@@ -253,9 +256,8 @@ impl SnapshotTest {
         });
 
         let path = self.snapshot_path();
-        fs::write(&path, content).unwrap_or_else(|e| {
-            panic!("Failed to write snapshot '{}': {}", path.display(), e)
-        });
+        fs::write(&path, content)
+            .unwrap_or_else(|e| panic!("Failed to write snapshot '{}': {}", path.display(), e));
 
         eprintln!("Updated snapshot: {} -> {}", self.name, path.display());
     }
@@ -540,15 +542,17 @@ mod tests {
     #[test]
     fn test_truncate_for_display() {
         assert_eq!(truncate_for_display("short", 10), "short");
-        assert_eq!(truncate_for_display("a longer string that needs truncation", 20).len(), 17);
+        assert_eq!(
+            truncate_for_display("a longer string that needs truncation", 20).len(),
+            17
+        );
     }
 
     #[test]
     fn test_snapshot_exists() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
 
-        let snap = SnapshotTest::new("exists_test")
-            .with_snapshot_dir(temp_dir.path());
+        let snap = SnapshotTest::new("exists_test").with_snapshot_dir(temp_dir.path());
 
         assert!(!snap.snapshot_exists());
 
@@ -557,8 +561,7 @@ mod tests {
         snap_create.assert_snapshot_string("content");
 
         // Now it should exist
-        let snap_check = SnapshotTest::new("exists_test")
-            .with_snapshot_dir(temp_dir.path());
+        let snap_check = SnapshotTest::new("exists_test").with_snapshot_dir(temp_dir.path());
         assert!(snap_check.snapshot_exists());
     }
 }

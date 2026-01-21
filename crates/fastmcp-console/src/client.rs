@@ -354,7 +354,9 @@ mod tests {
         let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
         let caps = ClientCapabilities {
             sampling: None,
-            roots: Some(RootsCapability { list_changed: false }),
+            roots: Some(RootsCapability {
+                list_changed: false,
+            }),
         };
         assert_eq!(renderer.format_capabilities(&caps), "roots");
     }
