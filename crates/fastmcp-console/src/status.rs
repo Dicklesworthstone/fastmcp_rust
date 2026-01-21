@@ -1,7 +1,7 @@
 //! Status/progress output
 
-use rich_rust::prelude::*;
 use std::time::{Duration, Instant};
+
 use crate::console::FastMcpConsole;
 
 /// Format for displaying request/response activity

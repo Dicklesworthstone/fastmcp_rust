@@ -17,6 +17,9 @@ fastmcp-core = { workspace = true }
 fastmcp-protocol = { workspace = true }
 strip-ansi-escapes = "0.2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
 full = ["rich_rust/full"]

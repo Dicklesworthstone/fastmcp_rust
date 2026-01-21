@@ -6,19 +6,23 @@ pub mod detection;
 pub mod theme;
 
 // Modules will be added as they are implemented:
-pub mod banner;      // Startup banner
-pub mod status;      // Request logging
+pub mod banner; // Startup banner
+pub mod client; // Client info rendering
+pub mod status; // Request logging
 // pub mod progress;    // Progress indicators
 pub mod diagnostics; // Error formatting
-pub mod logging;     // Rich log formatter
-pub mod tables;      // Info tables
-pub mod stats;       // Runtime metrics
-pub mod testing;     // Test utilities
+pub mod error; // Error boundary wrapper
+pub mod logging; // Rich log formatter
+pub mod stats; // Runtime metrics
+pub mod tables; // Info tables
+pub mod testing; // Test utilities
 
 pub use console::console;
 pub mod config;
 
+pub use client::RequestResponseRenderer;
 pub use config::ConsoleConfig;
-pub use detection::{is_agent_context, should_enable_rich, DisplayContext};
+pub use detection::{DisplayContext, is_agent_context, should_enable_rich};
+pub use error::ErrorBoundary;
 pub use rich_rust;
 pub use theme::theme;

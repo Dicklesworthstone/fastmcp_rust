@@ -1,7 +1,7 @@
 //! Rich log formatting
 
 use log::{Level, Log, Metadata, Record};
-use rich_rust::prelude::*;
+
 use crate::console::FastMcpConsole;
 
 /// Rich-formatted log output to stderr

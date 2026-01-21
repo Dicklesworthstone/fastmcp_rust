@@ -202,6 +202,7 @@ impl RichErrorRenderer {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum ErrorCategory {
     Connection,
     Protocol,
