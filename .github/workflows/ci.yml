@@ -40,8 +40,15 @@ jobs:
 
       - name: Override dependency paths for CI
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -86,8 +93,15 @@ jobs:
       - name: Override dependency paths for CI (Unix)
         if: runner.os != 'Windows'
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - name: Override dependency paths for CI (Windows)
         if: runner.os == 'Windows'
@@ -133,8 +147,15 @@ jobs:
 
       - name: Override dependency paths for CI
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -169,8 +190,15 @@ jobs:
 
       - name: Override dependency paths for CI
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -213,8 +241,15 @@ jobs:
       - name: Override dependency paths for CI (Unix)
         if: runner.os != 'Windows'
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - name: Override dependency paths for CI (Windows)
         if: runner.os == 'Windows'
@@ -268,8 +303,15 @@ jobs:
 
       - name: Override dependency paths for CI
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
 
       - uses: dtolnay/rust-toolchain@nightly
 

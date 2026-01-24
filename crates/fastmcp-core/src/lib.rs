@@ -1,7 +1,7 @@
 //! Core types and traits for FastMCP.
 //!
 //! This crate provides the fundamental building blocks:
-//! - [`McpContext`] wrapping asupersync's [`Cx`](asupersync::Cx)
+//! - [`McpContext`] wrapping asupersync's [`Cx`]
 //! - Error types for MCP operations
 //! - Core traits for tool, resource, and prompt handlers
 //!

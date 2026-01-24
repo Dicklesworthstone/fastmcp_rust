@@ -17,7 +17,7 @@ use std::fmt;
 /// Error returned when JSON Schema validation fails.
 #[derive(Debug, Clone)]
 pub struct ValidationError {
-    /// Path to the invalid value (e.g., "root.foo.bar" or "root[0]").
+    /// Path to the invalid value (e.g., `root.foo.bar` or `root[0]`).
     pub path: String,
     /// Description of what went wrong.
     pub message: String,

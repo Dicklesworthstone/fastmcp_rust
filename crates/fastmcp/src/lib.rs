@@ -32,12 +32,12 @@
 //!
 //! FastMCP is organized into focused crates:
 //!
-//! - [`fastmcp-core`]: Core types and asupersync integration
-//! - [`fastmcp-protocol`]: MCP protocol types and JSON-RPC
-//! - [`fastmcp-transport`]: Transport implementations (stdio, SSE)
-//! - [`fastmcp-server`]: Server implementation
-//! - [`fastmcp-client`]: Client implementation
-//! - [`fastmcp-macros`]: Procedural macros (#[tool], #[resource], #[prompt])
+//! - `fastmcp-core`: Core types and asupersync integration
+//! - `fastmcp-protocol`: MCP protocol types and JSON-RPC
+//! - `fastmcp-transport`: Transport implementations (stdio, SSE)
+//! - `fastmcp-server`: Server implementation
+//! - `fastmcp-client`: Client implementation
+//! - `fastmcp-macros`: Procedural macros (#[tool], #[resource], #[prompt])
 //!
 //! # Asupersync Integration
 //!
