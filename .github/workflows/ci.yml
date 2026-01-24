@@ -30,7 +30,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -40,7 +51,8 @@ jobs:
         with:
           workspaces: |
             . -> target
-            ../asupersync -> ../asupersync/target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -63,7 +75,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+
+      - name: Override dependency paths for CI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          (Get-Content Cargo.toml) -replace 'path = "../asupersync"', 'path = "deps/asupersync"' | Set-Content Cargo.toml
+          (Get-Content Cargo.toml) -replace 'path = "../rich_rust"', 'path = "deps/rich_rust"' | Set-Content Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -72,7 +103,8 @@ jobs:
           key: ${{ matrix.os }}
           workspaces: |
             . -> target
-            ../asupersync -> ../asupersync/target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Run tests
         run: cargo test --all-features --verbose
@@ -91,11 +123,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check all targets
         run: cargo check --all-targets --all-features
@@ -111,7 +159,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -143,7 +202,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+
+      - name: Override dependency paths for CI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          (Get-Content Cargo.toml) -replace 'path = "../asupersync"', 'path = "deps/asupersync"' | Set-Content Cargo.toml
+          (Get-Content Cargo.toml) -replace 'path = "../rich_rust"', 'path = "deps/rich_rust"' | Set-Content Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -154,7 +232,8 @@ jobs:
           key: release-${{ matrix.target }}
           workspaces: |
             . -> target
-            ../asupersync -> ../asupersync/target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -179,11 +258,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features
@@ -201,12 +296,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Dicklesworthstone/asupersync
-          path: ../asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
+          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
 
       # Using nightly since edition 2024 requires it
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check MSRV
         run: cargo check --all-targets
