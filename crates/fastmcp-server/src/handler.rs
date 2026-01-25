@@ -13,7 +13,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use fastmcp_core::{McpContext, McpResult, NotificationSender, ProgressReporter};
+use fastmcp_core::{
+    McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
+};
 use fastmcp_protocol::{
     Content, JsonRpcRequest, ProgressParams, ProgressToken, Prompt, PromptMessage, Resource,
     ResourceContent, Tool,
@@ -123,6 +125,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// By default, implement `call()` for synchronous execution. For async tools,
 /// override `call_async()` instead. The router always calls `call_async()`,
 /// which defaults to running `call()` in an async block.
+///
+/// # Return Type
+///
+/// Async handlers return `McpOutcome<Vec<Content>>`, a 4-valued type supporting:
+/// - `Ok(content)` - Successful result
+/// - `Err(McpError)` - Recoverable error
+/// - `Cancelled` - Request was cancelled
+/// - `Panicked` - Unrecoverable failure
 pub trait ToolHandler: Send + Sync {
     /// Returns the tool definition.
     fn definition(&self) -> Tool;
@@ -130,7 +140,8 @@ pub trait ToolHandler: Send + Sync {
     /// Calls the tool synchronously with the given arguments.
     ///
     /// This is the default implementation point. Override this for simple
-    /// synchronous tools.
+    /// synchronous tools. Returns `McpResult` which is converted to `McpOutcome`
+    /// by the async wrapper.
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>>;
 
     /// Calls the tool asynchronously with the given arguments.
@@ -138,13 +149,22 @@ pub trait ToolHandler: Send + Sync {
     /// Override this for tools that need true async execution (e.g., I/O-bound
     /// operations, database queries, HTTP requests).
     ///
-    /// The default implementation delegates to the sync `call()` method.
+    /// Returns `McpOutcome` to properly represent all four states: success,
+    /// error, cancellation, and panic.
+    ///
+    /// The default implementation delegates to the sync `call()` method and
+    /// converts the `McpResult` to `McpOutcome`.
     fn call_async<'a>(
         &'a self,
         ctx: &'a McpContext,
         arguments: serde_json::Value,
-    ) -> BoxFuture<'a, McpResult<Vec<Content>>> {
-        Box::pin(async move { self.call(ctx, arguments) })
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            match self.call(ctx, arguments) {
+                Ok(v) => Outcome::Ok(v),
+                Err(e) => Outcome::Err(e),
+            }
+        })
     }
 }
 
@@ -157,6 +177,10 @@ pub trait ToolHandler: Send + Sync {
 /// By default, implement `read()` for synchronous execution. For async resources,
 /// override `read_async()` instead. The router always calls `read_async()`,
 /// which defaults to running `read()` in an async block.
+///
+/// # Return Type
+///
+/// Async handlers return `McpOutcome<Vec<ResourceContent>>`, a 4-valued type.
 pub trait ResourceHandler: Send + Sync {
     /// Returns the resource definition.
     fn definition(&self) -> Resource;
@@ -164,7 +188,8 @@ pub trait ResourceHandler: Send + Sync {
     /// Reads the resource content synchronously.
     ///
     /// This is the default implementation point. Override this for simple
-    /// synchronous resources.
+    /// synchronous resources. Returns `McpResult` which is converted to `McpOutcome`
+    /// by the async wrapper.
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>>;
 
     /// Reads the resource content asynchronously.
@@ -172,12 +197,19 @@ pub trait ResourceHandler: Send + Sync {
     /// Override this for resources that need true async execution (e.g., file I/O,
     /// database queries, remote fetches).
     ///
+    /// Returns `McpOutcome` to properly represent all four states.
+    ///
     /// The default implementation delegates to the sync `read()` method.
     fn read_async<'a>(
         &'a self,
         ctx: &'a McpContext,
-    ) -> BoxFuture<'a, McpResult<Vec<ResourceContent>>> {
-        Box::pin(async move { self.read(ctx) })
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        Box::pin(async move {
+            match self.read(ctx) {
+                Ok(v) => Outcome::Ok(v),
+                Err(e) => Outcome::Err(e),
+            }
+        })
     }
 }
 
@@ -190,6 +222,10 @@ pub trait ResourceHandler: Send + Sync {
 /// By default, implement `get()` for synchronous execution. For async prompts,
 /// override `get_async()` instead. The router always calls `get_async()`,
 /// which defaults to running `get()` in an async block.
+///
+/// # Return Type
+///
+/// Async handlers return `McpOutcome<Vec<PromptMessage>>`, a 4-valued type.
 pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
@@ -197,7 +233,8 @@ pub trait PromptHandler: Send + Sync {
     /// Gets the prompt messages synchronously with the given arguments.
     ///
     /// This is the default implementation point. Override this for simple
-    /// synchronous prompts.
+    /// synchronous prompts. Returns `McpResult` which is converted to `McpOutcome`
+    /// by the async wrapper.
     fn get(
         &self,
         ctx: &McpContext,
@@ -209,13 +246,20 @@ pub trait PromptHandler: Send + Sync {
     /// Override this for prompts that need true async execution (e.g., template
     /// fetching, dynamic content generation).
     ///
+    /// Returns `McpOutcome` to properly represent all four states.
+    ///
     /// The default implementation delegates to the sync `get()` method.
     fn get_async<'a>(
         &'a self,
         ctx: &'a McpContext,
         arguments: std::collections::HashMap<String, String>,
-    ) -> BoxFuture<'a, McpResult<Vec<PromptMessage>>> {
-        Box::pin(async move { self.get(ctx, arguments) })
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        Box::pin(async move {
+            match self.get(ctx, arguments) {
+                Ok(v) => Outcome::Ok(v),
+                Err(e) => Outcome::Err(e),
+            }
+        })
     }
 }
 

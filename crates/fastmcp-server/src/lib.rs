@@ -44,20 +44,22 @@ pub use handler::{
 pub use router::{NotificationSender, Router};
 pub use session::Session;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use asupersync::{Budget, Cx};
+use asupersync::{Budget, CancelKind, Cx};
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_console::{banner::StartupBanner, console};
-use fastmcp_core::McpError;
 use fastmcp_core::logging::{error, info, targets};
+use fastmcp_core::{McpError, McpErrorCode};
 use fastmcp_protocol::{
-    CallToolParams, GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams,
-    ListResourcesParams, ListToolsParams, Prompt, ReadResourceParams, RequestId, Resource,
-    ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
+    CallToolParams, CancelledParams, GetPromptParams, InitializeParams, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, Prompt, ReadResourceParams,
+    RequestId, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, SubscribeResourceParams,
+    Tool, UnsubscribeResourceParams,
 };
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
@@ -148,6 +150,8 @@ pub struct Server {
     logging: LoggingConfig,
     /// Console configuration for rich output.
     console_config: ConsoleConfig,
+    /// Active requests by JSON-RPC request ID.
+    active_requests: Mutex<HashMap<RequestId, Cx>>,
 }
 
 impl Server {
@@ -293,7 +297,8 @@ impl Server {
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
 
-        let mut transport = StdioTransport::stdio();
+        let transport = StdioTransport::stdio();
+        let shared = SharedTransport::new(transport);
 
         // Create a notification sender that writes to a separate stdout handle.
         // This allows progress notifications to be sent during handler execution
@@ -302,8 +307,8 @@ impl Server {
 
         self.run_loop(
             cx,
-            |cx| transport.recv(cx),
-            |cx, message| transport.send(cx, message),
+            |cx| shared.recv(cx),
+            |cx, message| shared.send(cx, message),
             notification_sender,
         )
     }
@@ -493,6 +498,7 @@ impl Server {
     ) -> Option<JsonRpcResponse> {
         let id = request.id.clone();
         let method = request.method.clone();
+        let is_notification = id.is_none();
 
         // Start timing for stats
         let start_time = Instant::now();
@@ -510,22 +516,30 @@ impl Server {
                 stats.record_request(&method, start_time.elapsed(), false);
             }
             // If it's a notification, we don't send an error response
-            if id.is_none() {
-                return None;
-            }
+            let response_id = id.clone()?;
             return Some(JsonRpcResponse::error(
-                id,
+                Some(response_id),
                 JsonRpcError {
-                    code: -32000,
+                    code: McpErrorCode::RequestCancelled.into(),
                     message: "Request budget exhausted".to_string(),
                     data: None,
                 },
             ));
         }
 
+        let request_cx = if is_notification {
+            cx.clone()
+        } else {
+            Cx::for_testing_with_budget(budget)
+        };
+
+        let _active_guard = id.clone().map(|request_id| {
+            ActiveRequestGuard::new(&self.active_requests, request_id, request_cx.clone())
+        });
+
         // Dispatch based on method, passing the budget and notification sender
         let result = self.dispatch_method(
-            cx,
+            &request_cx,
             session,
             &method,
             request.params,
@@ -547,7 +561,7 @@ impl Server {
         }
 
         // If it's a notification (no ID), we must not reply
-        if id.is_none() {
+        if is_notification {
             if let Err(e) = result {
                 fastmcp_core::logging::error!(
                     target: targets::HANDLER,
@@ -588,7 +602,7 @@ impl Server {
     }
 
     /// Dispatches a request to the appropriate handler.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn dispatch_method(
         &self,
         cx: &Cx,
@@ -606,7 +620,10 @@ impl Server {
 
         // Check budget before dispatch (for poll-based exhaustion)
         if budget.is_exhausted() {
-            return Err(McpError::internal_error("Request budget exhausted"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request budget exhausted",
+            ));
         }
 
         // Check initialization state
@@ -631,6 +648,11 @@ impl Server {
             }
             "initialized" => {
                 // Notification, no response needed (but we send empty ok)
+                Ok(serde_json::Value::Null)
+            }
+            "notifications/cancelled" => {
+                let params: CancelledParams = parse_params(params)?;
+                self.handle_cancelled_notification(params);
                 Ok(serde_json::Value::Null)
             }
             "tools/list" => {
@@ -670,6 +692,19 @@ impl Server {
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
+            "resources/subscribe" => {
+                let params: SubscribeResourceParams = parse_params(params)?;
+                if self.router.get_resource(&params.uri).is_none() {
+                    return Err(McpError::resource_not_found(&params.uri));
+                }
+                session.subscribe_resource(params.uri);
+                Ok(serde_json::json!({}))
+            }
+            "resources/unsubscribe" => {
+                let params: UnsubscribeResourceParams = parse_params(params)?;
+                session.unsubscribe_resource(&params.uri);
+                Ok(serde_json::json!({}))
+            }
             "prompts/list" => {
                 let params: ListPromptsParams = parse_params_or_default(params)?;
                 let result = self.router.handle_prompts_list(cx, params)?;
@@ -692,6 +727,66 @@ impl Server {
             }
             _ => Err(McpError::method_not_found(method)),
         }
+    }
+
+    fn handle_cancelled_notification(&self, params: CancelledParams) {
+        let reason = params.reason.as_deref().unwrap_or("unspecified");
+        let await_cleanup = params.await_cleanup.unwrap_or(false);
+        info!(
+            target: targets::SESSION,
+            "Cancellation requested for requestId={} (reason: {}, await_cleanup={})",
+            params.request_id,
+            reason,
+            await_cleanup
+        );
+        if await_cleanup {
+            fastmcp_core::logging::warn!(
+                target: targets::SESSION,
+                "await_cleanup requested but not supported without per-request regions"
+            );
+        }
+        let cx = {
+            let guard = self
+                .active_requests
+                .lock()
+                .expect("active_requests lock poisoned");
+            guard.get(&params.request_id).cloned()
+        };
+        if let Some(cx) = cx {
+            cx.cancel_with(CancelKind::User, None);
+        } else {
+            fastmcp_core::logging::warn!(
+                target: targets::SESSION,
+                "No active request found for cancellation requestId={}",
+                params.request_id
+            );
+        }
+    }
+}
+
+struct ActiveRequestGuard<'a> {
+    map: &'a Mutex<HashMap<RequestId, Cx>>,
+    id: RequestId,
+}
+
+impl<'a> ActiveRequestGuard<'a> {
+    fn new(map: &'a Mutex<HashMap<RequestId, Cx>>, id: RequestId, cx: Cx) -> Self {
+        let mut guard = map.lock().expect("active_requests lock poisoned");
+        if guard.insert(id.clone(), cx).is_some() {
+            fastmcp_core::logging::warn!(
+                target: targets::SESSION,
+                "Active request replaced for requestId={}",
+                id
+            );
+        }
+        Self { map, id }
+    }
+}
+
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.map.lock().expect("active_requests lock poisoned");
+        guard.remove(&self.id);
     }
 }
 
@@ -735,9 +830,16 @@ fn request_id_to_u64(id: Option<&RequestId>) -> u64 {
     }
 }
 
-#[derive(Clone)]
 struct SharedTransport<T> {
     inner: Arc<Mutex<T>>,
+}
+
+impl<T> Clone for SharedTransport<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<T: Transport> SharedTransport<T> {
@@ -759,10 +861,7 @@ impl<T: Transport> SharedTransport<T> {
 }
 
 fn transport_lock_error() -> TransportError {
-    TransportError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "transport lock poisoned",
-    ))
+    TransportError::Io(std::io::Error::other("transport lock poisoned"))
 }
 
 fn create_transport_notification_sender<T>(transport: SharedTransport<T>) -> NotificationSender

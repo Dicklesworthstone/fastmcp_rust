@@ -1,5 +1,7 @@
 //! MCP session management.
 
+use std::collections::HashSet;
+
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
 
 /// An MCP session between client and server.
@@ -19,6 +21,8 @@ pub struct Session {
     server_capabilities: ServerCapabilities,
     /// Negotiated protocol version.
     protocol_version: Option<String>,
+    /// Resource subscriptions for this session.
+    resource_subscriptions: HashSet<String>,
 }
 
 impl Session {
@@ -32,6 +36,7 @@ impl Session {
             server_info,
             server_capabilities,
             protocol_version: None,
+            resource_subscriptions: HashSet::new(),
         }
     }
 
@@ -82,5 +87,21 @@ impl Session {
     #[must_use]
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_deref()
+    }
+
+    /// Subscribes to a resource URI for this session.
+    pub fn subscribe_resource(&mut self, uri: String) {
+        self.resource_subscriptions.insert(uri);
+    }
+
+    /// Unsubscribes from a resource URI for this session.
+    pub fn unsubscribe_resource(&mut self, uri: &str) {
+        self.resource_subscriptions.remove(uri);
+    }
+
+    /// Returns true if this session is subscribed to the given resource URI.
+    #[must_use]
+    pub fn is_resource_subscribed(&self, uri: &str) -> bool {
+        self.resource_subscriptions.contains(uri)
     }
 }

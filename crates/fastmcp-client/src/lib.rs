@@ -35,12 +35,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
-    ProgressParams, ProgressToken, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult,
-    RequestMeta, Resource, ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
+    CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo, Content,
+    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
+    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+    ListToolsResult, PROTOCOL_VERSION, ProgressParams, ProgressToken, Prompt, PromptMessage,
+    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
+    ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
 };
 
 /// Callback for receiving progress notifications during tool execution.
@@ -245,6 +246,28 @@ impl Client {
             .map_err(transport_error_to_mcp)?;
 
         Ok(())
+    }
+
+    /// Sends a cancellation notification for a previously issued request.
+    ///
+    /// Set `await_cleanup` to request that the server wait for any cleanup
+    /// before acknowledging completion (best-effort; server-dependent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification cannot be sent.
+    pub fn cancel_request(
+        &mut self,
+        request_id: impl Into<RequestId>,
+        reason: Option<String>,
+        await_cleanup: bool,
+    ) -> McpResult<()> {
+        let params = CancelledParams {
+            request_id: request_id.into(),
+            reason,
+            await_cleanup: if await_cleanup { Some(true) } else { None },
+        };
+        self.send_notification("notifications/cancelled", params)
     }
 
     /// Receives a response from the transport.

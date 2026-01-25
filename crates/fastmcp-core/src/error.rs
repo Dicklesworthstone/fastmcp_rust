@@ -196,6 +196,21 @@ impl From<serde_json::Error> for McpError {
 /// Result type alias for MCP operations.
 pub type McpResult<T> = Result<T, McpError>;
 
+/// Outcome type alias for MCP operations with 4-valued returns.
+///
+/// This is the preferred return type for handler functions as it properly
+/// represents all possible states: success, error, cancellation, and panic.
+///
+/// # Mapping to JSON-RPC
+///
+/// | Outcome | JSON-RPC Response |
+/// |---------|-------------------|
+/// | `Ok(value)` | `{"result": value}` |
+/// | `Err(McpError)` | `{"error": {"code": ..., "message": ...}}` |
+/// | `Cancelled` | `{"error": {"code": -32005, "message": "Request cancelled"}}` |
+/// | `Panicked` | `{"error": {"code": -32603, "message": "Internal error"}}` |
+pub type McpOutcome<T> = Outcome<T, McpError>;
+
 // === Outcome Integration ===
 
 use asupersync::Outcome;

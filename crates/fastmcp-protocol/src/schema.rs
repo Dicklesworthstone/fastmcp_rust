@@ -286,11 +286,37 @@ fn validate_array(
     path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Validate items
+    // Validate prefixItems (tuple validation)
+    let mut prefix_len = 0;
+    if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array()) {
+        prefix_len = prefix_items.len();
+        for (i, item_schema) in prefix_items.iter().enumerate() {
+            if let Some(item) = arr.get(i) {
+                let item_path = format!("{path}[{i}]");
+                validate_internal(item_schema, item, &item_path, errors);
+            }
+        }
+    }
+
+    // Validate items (remaining items or all items)
     if let Some(items_schema) = schema.get("items") {
-        for (i, item) in arr.iter().enumerate() {
-            let item_path = format!("{path}[{i}]");
-            validate_internal(items_schema, item, &item_path, errors);
+        // If items is an array (Draft 4-7 tuple), treat as prefixItems fallback if prefixItems absent
+        if items_schema.is_array() && prefix_len == 0 {
+            if let Some(items_arr) = items_schema.as_array() {
+                for (i, item_schema) in items_arr.iter().enumerate() {
+                    if let Some(item) = arr.get(i) {
+                        let item_path = format!("{path}[{i}]");
+                        validate_internal(item_schema, item, &item_path, errors);
+                    }
+                }
+                // In older drafts, 'additionalItems' controls the rest. We skip that for simplicity unless needed.
+            }
+        } else if items_schema.is_object() || items_schema.is_boolean() {
+            // Validate items starting from where prefixItems left off
+            for (i, item) in arr.iter().enumerate().skip(prefix_len) {
+                let item_path = format!("{path}[{i}]");
+                validate_internal(items_schema, item, &item_path, errors);
+            }
         }
     }
 

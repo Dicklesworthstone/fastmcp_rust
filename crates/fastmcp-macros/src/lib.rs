@@ -100,6 +100,34 @@ fn is_option_type(ty: &Type) -> bool {
     false
 }
 
+/// Returns the inner type if `ty` is `Option<T>`.
+fn option_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if the type is `String`.
+fn is_string_type(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        return type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "String");
+    }
+    false
+}
+
 /// Converts a snake_case identifier to PascalCase.
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -402,11 +430,13 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type, Option<String>)> = Vec::new();
     let mut required_params: Vec<String> = Vec::new();
+    let mut expects_context = false;
 
     for (i, arg) in input_fn.sig.inputs.iter().enumerate() {
         if let FnArg::Typed(pat_type) = arg {
             // Skip the first parameter if it looks like a context
             if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
+                expects_context = true;
                 continue;
             }
 
@@ -488,14 +518,28 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate the call expression (async functions are executed via block_on)
     let call_expr = if is_async {
-        quote! {
-            fastmcp_core::runtime::block_on(async move {
-                #fn_name(ctx, #(#param_names),*).await
-            })
+        if expects_context {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name(ctx, #(#param_names),*).await
+                })
+            }
+        } else {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name(#(#param_names),*).await
+                })
+            }
         }
     } else {
-        quote! {
-            #fn_name(ctx, #(#param_names),*)
+        if expects_context {
+            quote! {
+                #fn_name(ctx, #(#param_names),*)
+            }
+        } else {
+            quote! {
+                #fn_name(#(#param_names),*)
+            }
         }
     };
 
@@ -649,16 +693,38 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         |desc| quote! { Some(#desc.to_string()) },
     );
 
+    // Check if the function expects a context argument
+    let mut expects_context = false;
+    if let Some(FnArg::Typed(pat_type)) = input_fn.sig.inputs.first() {
+        if is_mcp_context_ref(pat_type.ty.as_ref()) {
+            expects_context = true;
+        }
+    }
+
     let is_async = input_fn.sig.asyncness.is_some();
     let call_expr = if is_async {
-        quote! {
-            fastmcp_core::runtime::block_on(async move {
-                #fn_name(ctx).await
-            })
+        if expects_context {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name(ctx).await
+                })
+            }
+        } else {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name().await
+                })
+            }
         }
     } else {
-        quote! {
-            #fn_name(ctx)
+        if expects_context {
+            quote! {
+                #fn_name(ctx)
+            }
+        } else {
+            quote! {
+                #fn_name()
+            }
         }
     };
 
@@ -750,6 +816,7 @@ impl Parse for PromptAttrs {
 /// - `name` - Override the prompt name (default: function name)
 /// - `description` - Prompt description (default: doc comment)
 #[proc_macro_attribute]
+#[allow(clippy::too_many_lines)]
 pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = parse_macro_input!(attr as PromptAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
@@ -774,11 +841,13 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Parse parameters for prompt arguments (skip first if it's &McpContext)
     let mut prompt_args: Vec<TokenStream2> = Vec::new();
+    let mut expects_context = false;
 
     for (i, arg) in input_fn.sig.inputs.iter().enumerate() {
         if let FnArg::Typed(pat_type) = arg {
             // Skip the context parameter
             if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
+                expects_context = true;
                 continue;
             }
 
@@ -829,14 +898,28 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let is_async = input_fn.sig.asyncness.is_some();
     let call_expr = if is_async {
-        quote! {
-            fastmcp_core::runtime::block_on(async move {
-                #fn_name(ctx, #(#param_names),*).await
-            })
+        if expects_context {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name(ctx, #(#param_names),*).await
+                })
+            }
+        } else {
+            quote! {
+                fastmcp_core::runtime::block_on(async move {
+                    #fn_name(#(#param_names),*).await
+                })
+            }
         }
     } else {
-        quote! {
-            #fn_name(ctx, #(#param_names),*)
+        if expects_context {
+            quote! {
+                #fn_name(ctx, #(#param_names),*)
+            }
+        } else {
+            quote! {
+                #fn_name(#(#param_names),*)
+            }
         }
     };
 

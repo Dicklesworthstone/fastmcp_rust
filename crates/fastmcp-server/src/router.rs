@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use asupersync::{Budget, Cx};
+use asupersync::{Budget, Cx, Outcome};
 use fastmcp_core::logging::{debug, targets, trace};
-use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult, block_on};
+use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, block_on};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, Content, GetPromptParams, GetPromptResult, InitializeParams,
     InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
@@ -216,7 +216,10 @@ impl Router {
 
         // Check budget exhaustion
         if budget.is_exhausted() {
-            return Err(McpError::internal_error("Request budget exhausted"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request budget exhausted",
+            ));
         }
 
         // Find the tool handler
@@ -255,14 +258,14 @@ impl Router {
             _ => McpContext::new(cx.clone(), request_id),
         };
 
-        // Call the handler asynchronously
-        let result = block_on(handler.call_async(&ctx, arguments));
-        match result {
-            Ok(content) => Ok(CallToolResult {
+        // Call the handler asynchronously - returns McpOutcome (4-valued)
+        let outcome = block_on(handler.call_async(&ctx, arguments));
+        match outcome {
+            Outcome::Ok(content) => Ok(CallToolResult {
                 content,
                 is_error: false,
             }),
-            Err(e) => {
+            Outcome::Err(e) => {
                 // If the request was cancelled, propagate the error as a JSON-RPC error.
                 if matches!(e.code, McpErrorCode::RequestCancelled) {
                     return Err(e);
@@ -273,6 +276,17 @@ impl Router {
                     content: vec![Content::Text { text: e.message }],
                     is_error: true,
                 })
+            }
+            Outcome::Cancelled(_) => {
+                // Cancelled requests are reported as JSON-RPC errors
+                Err(McpError::request_cancelled())
+            }
+            Outcome::Panicked(payload) => {
+                // Panics become internal errors
+                Err(McpError::internal_error(format!(
+                    "Handler panic: {}",
+                    payload.message()
+                )))
             }
         }
     }
@@ -326,7 +340,10 @@ impl Router {
 
         // Check budget exhaustion
         if budget.is_exhausted() {
-            return Err(McpError::internal_error("Request budget exhausted"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request budget exhausted",
+            ));
         }
 
         // Find the resource handler
@@ -350,8 +367,11 @@ impl Router {
             _ => McpContext::new(cx.clone(), request_id),
         };
 
-        // Read the resource asynchronously
-        let contents = block_on(handler.read_async(&ctx))?;
+        // Read the resource asynchronously - returns McpOutcome (4-valued)
+        let outcome = block_on(handler.read_async(&ctx));
+
+        // Convert 4-valued Outcome to McpResult for JSON-RPC response
+        let contents = outcome.into_mcp_result()?;
 
         Ok(ReadResourceResult { contents })
     }
@@ -395,7 +415,10 @@ impl Router {
 
         // Check budget exhaustion
         if budget.is_exhausted() {
-            return Err(McpError::internal_error("Request budget exhausted"));
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request budget exhausted",
+            ));
         }
 
         // Find the prompt handler
@@ -421,9 +444,12 @@ impl Router {
             _ => McpContext::new(cx.clone(), request_id),
         };
 
-        // Get the prompt asynchronously
+        // Get the prompt asynchronously - returns McpOutcome (4-valued)
         let arguments = params.arguments.unwrap_or_default();
-        let messages = block_on(handler.get_async(&ctx, arguments))?;
+        let outcome = block_on(handler.get_async(&ctx, arguments));
+
+        // Convert 4-valued Outcome to McpResult for JSON-RPC response
+        let messages = outcome.into_mcp_result()?;
 
         Ok(GetPromptResult {
             description: handler.definition().description,

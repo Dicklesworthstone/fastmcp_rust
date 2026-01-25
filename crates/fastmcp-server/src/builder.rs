@@ -1,5 +1,8 @@
 //! Server builder for configuring MCP servers.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_protocol::{
@@ -264,6 +267,7 @@ impl ServerBuilder {
             },
             logging: self.logging,
             console_config: self.console_config,
+            active_requests: Mutex::new(HashMap::new()),
         }
     }
 }

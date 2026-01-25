@@ -270,7 +270,7 @@ fn render_logo(console: &FastMcpConsole, theme: &FastMcpTheme) {
 fn gradient_text(text: &str, start: &Color, end: &Color) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let line_count = lines.len().max(1);
-    let mut result = String::new();
+    let mut result = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
         let t = if line_count > 1 {
@@ -280,10 +280,10 @@ fn gradient_text(text: &str, start: &Color, end: &Color) -> String {
         };
 
         let color = interpolate_colors(start, end, t);
-        result.push_str(&format!("[{}]{}[/]\n", color_hex(&color), line));
+        result.push(format!("[{}]{}[/]", color_hex(&color), line));
     }
 
-    result
+    result.join("\n")
 }
 
 /// Linear interpolation between two colors.

@@ -145,7 +145,13 @@ impl FastMcpConsole {
 
     /// Print plain text (no markup processing ever).
     pub fn print_plain(&self, text: &str) {
-        eprintln!("{text}");
+        if let Ok(console) = self.inner.lock() {
+            // Use print_styled with default style to bypass markup interpretation
+            // while still using the console's configured writer
+            console.print_styled(text, Style::new());
+        } else {
+            eprintln!("{text}");
+        }
     }
 
     /// Print a renderable.

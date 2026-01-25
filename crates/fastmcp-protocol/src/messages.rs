@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::jsonrpc::RequestId;
 use crate::types::{
     ClientCapabilities, ClientInfo, Content, Prompt, PromptMessage, Resource, ResourceContent,
     ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
@@ -284,6 +285,22 @@ pub struct SetLogLevelParams {
 // ============================================================================
 // Notifications
 // ============================================================================
+
+/// Cancelled notification params.
+///
+/// Sent by either party to request cancellation of an in-progress request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelledParams {
+    /// The ID of the request to cancel.
+    #[serde(rename = "requestId")]
+    pub request_id: RequestId,
+    /// Optional reason for cancellation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether the sender wants to await cleanup completion.
+    #[serde(rename = "awaitCleanup", skip_serializing_if = "Option::is_none")]
+    pub await_cleanup: Option<bool>,
+}
 
 /// Progress notification params.
 ///

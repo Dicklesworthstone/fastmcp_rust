@@ -35,7 +35,9 @@ pub use context::{
     CancelledError, IntoOutcome, McpContext, NoOpNotificationSender, NotificationSender,
     ProgressReporter,
 };
-pub use error::{McpError, McpErrorCode, McpResult, OutcomeExt, ResultExt, cancelled, err, ok};
+pub use error::{
+    McpError, McpErrorCode, McpOutcome, McpResult, OutcomeExt, ResultExt, cancelled, err, ok,
+};
 pub use runtime::block_on;
 
 // Re-export key asupersync types for convenience

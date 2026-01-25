@@ -361,7 +361,6 @@ impl<W: Write> SseWriter<W> {
 pub struct SseReader<R> {
     reader: BufReader<R>,
     line_buffer: String,
-    codec: Codec,
 }
 
 impl<R: Read> SseReader<R> {
@@ -371,7 +370,6 @@ impl<R: Read> SseReader<R> {
         Self {
             reader: BufReader::new(reader),
             line_buffer: String::with_capacity(4096),
-            codec: Codec::new(),
         }
     }
 

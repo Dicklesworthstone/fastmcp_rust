@@ -12,14 +12,15 @@ use std::collections::HashMap;
 use asupersync::{Budget, Cx};
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::{
-    CallToolParams, ClientCapabilities, ClientInfo, Content, GetPromptParams, InitializeParams,
-    Prompt, PromptArgument, PromptMessage, ReadResourceParams, Resource, ResourceContent,
-    ResourceTemplate, Role, ServerCapabilities, ServerInfo, Tool,
+    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    InitializeParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams, RequestId,
+    Resource, ResourceContent, ResourceTemplate, Role, ServerCapabilities, ServerInfo, Tool,
 };
 
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
 use crate::router::Router;
 use crate::session::Session;
+use crate::{NotificationSender, Server};
 
 // ============================================================================
 // Test Tool Handlers
@@ -304,6 +305,114 @@ mod router_tests {
 
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "greeting");
+    }
+
+    #[test]
+    fn test_notification_does_not_return_response() {
+        let server = Server::new("test-server", "1.0.0").build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let sender: NotificationSender = std::sync::Arc::new(|_| {});
+        let params = CancelledParams {
+            request_id: RequestId::Number(1),
+            reason: Some("unit test".to_string()),
+            await_cleanup: None,
+        };
+        let request = fastmcp_protocol::JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::to_value(params).unwrap()),
+        );
+
+        let response = server.handle_request(&cx, &mut session, request, &sender);
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn test_cancelled_notification_marks_request_cancelled() {
+        let server = Server::new("test-server", "1.0.0").build();
+        let request_id = RequestId::Number(99);
+        let cx = Cx::for_testing();
+
+        {
+            let mut guard = server
+                .active_requests
+                .lock()
+                .expect("active_requests lock poisoned");
+            guard.insert(request_id.clone(), cx.clone());
+        }
+
+        let params = CancelledParams {
+            request_id: request_id.clone(),
+            reason: Some("test cancellation".to_string()),
+            await_cleanup: None,
+        };
+        server.handle_cancelled_notification(params);
+
+        assert!(cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_resources_subscribe_and_unsubscribe() {
+        let server = Server::new("test-server", "1.0.0")
+            .resource(StaticResource {
+                uri: "resource://test".to_string(),
+                content: "Test content".to_string(),
+            })
+            .build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let sender: NotificationSender = std::sync::Arc::new(|_| {});
+        let subscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: "resource://test".to_string(),
+                })
+                .unwrap(),
+            ),
+            1i64,
+        );
+        let response = server
+            .handle_request(&cx, &mut session, subscribe, &sender)
+            .expect("response");
+        assert!(response.error.is_none());
+        assert!(session.is_resource_subscribed("resource://test"));
+
+        let unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: "resource://test".to_string(),
+                })
+                .unwrap(),
+            ),
+            2i64,
+        );
+        let response = server
+            .handle_request(&cx, &mut session, unsubscribe, &sender)
+            .expect("response");
+        assert!(response.error.is_none());
+        assert!(!session.is_resource_subscribed("resource://test"));
     }
 
     #[test]

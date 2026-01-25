@@ -259,7 +259,7 @@ impl RequestResponseRenderer {
     }
 
     fn render_request_plain(&self, request: &JsonRpcRequest, console: &FastMcpConsole) {
-        console.print(&format!(
+        console.print_plain(&format!(
             "-> {} (id={})",
             request.method,
             self.format_id(&request.id)
@@ -291,7 +291,7 @@ impl RequestResponseRenderer {
             String::new()
         };
 
-        console.print(&format!(
+        console.print_plain(&format!(
             "<- {} (id={}){}",
             status,
             self.format_id(&response.id),
@@ -319,9 +319,8 @@ impl RequestResponseRenderer {
         } else {
             "OK"
         };
-        // Use escaped brackets to avoid rich markup interpretation
-        console.print(&format!(
-            "{} \\[{}\\] {}",
+        console.print_plain(&format!(
+            "{} [{}] {}",
             request.method,
             status,
             self.format_duration(duration)
@@ -336,16 +335,16 @@ impl RequestResponseRenderer {
     ) {
         let json_str = serde_json::to_string_pretty(value).unwrap_or_default();
         let preview = self.truncate_string(&json_str);
-        console.print(&format!("  {}:", label));
+        console.print_plain(&format!("  {}:", label));
         for line in preview.lines() {
-            console.print(&format!("    {}", line));
+            console.print_plain(&format!("    {}", line));
         }
     }
 
     fn render_error_preview_plain(&self, error: &JsonRpcError, console: &FastMcpConsole) {
-        console.print(&format!("  Error {}: {}", error.code, error.message));
+        console.print_plain(&format!("  Error {}: {}", error.code, error.message));
         if let Some(data) = &error.data {
-            console.print(&format!(
+            console.print_plain(&format!(
                 "  Data: {}",
                 self.truncate_string(&data.to_string())
             ));

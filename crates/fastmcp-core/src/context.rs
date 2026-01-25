@@ -242,7 +242,7 @@ impl McpContext {
     /// Handlers should check this periodically and exit early if true.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cx.is_cancel_requested()
+        self.cx.is_cancel_requested() || self.cx.budget().is_exhausted()
     }
 
     /// Cooperative cancellation checkpoint.
@@ -267,6 +267,9 @@ impl McpContext {
     /// }
     /// ```
     pub fn checkpoint(&self) -> Result<(), CancelledError> {
+        if self.cx.budget().is_exhausted() {
+            return Err(CancelledError);
+        }
         self.cx.checkpoint().map_err(|_| CancelledError)
     }
 
@@ -392,6 +395,15 @@ mod tests {
         let ctx = McpContext::new(cx, 1);
 
         // Should fail when cancelled
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_mcp_context_checkpoint_budget_exhausted() {
+        let cx = Cx::for_testing_with_budget(Budget::ZERO);
+        let ctx = McpContext::new(cx, 1);
+
+        // Should fail when budget is exhausted
         assert!(ctx.checkpoint().is_err());
     }
 

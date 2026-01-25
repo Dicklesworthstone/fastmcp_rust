@@ -48,6 +48,8 @@ use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 /// WebSocket frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsFrameType {
+    /// Continuation frame (for fragmented messages).
+    Continuation,
     /// Text frame containing UTF-8 data (used for JSON-RPC).
     Text,
     /// Binary frame.
@@ -64,6 +66,7 @@ impl WsFrameType {
     /// Returns the opcode for this frame type.
     fn opcode(&self) -> u8 {
         match self {
+            WsFrameType::Continuation => 0x00,
             WsFrameType::Text => 0x01,
             WsFrameType::Binary => 0x02,
             WsFrameType::Close => 0x08,
@@ -75,6 +78,7 @@ impl WsFrameType {
     /// Parses a frame type from an opcode.
     fn from_opcode(opcode: u8) -> Option<Self> {
         match opcode {
+            0x00 => Some(WsFrameType::Continuation),
             0x01 => Some(WsFrameType::Text),
             0x02 => Some(WsFrameType::Binary),
             0x08 => Some(WsFrameType::Close),
@@ -288,6 +292,7 @@ pub struct WsTransport<R, W> {
     reader: WsReader<R>,
     writer: WsWriter<W>,
     codec: Codec,
+    fragment_buffer: Vec<u8>,
 }
 
 impl<R: Read, W: Write> WsTransport<R, W> {
@@ -297,6 +302,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
             reader: WsReader::new(reader),
             writer: WsWriter::new(writer),
             codec: Codec::new(),
+            fragment_buffer: Vec::new(),
         }
     }
 
@@ -340,6 +346,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     /// Receives the next JSON-RPC message from the WebSocket.
     ///
     /// Handles control frames (ping/pong) automatically.
+    /// Handles message fragmentation (Continuation frames).
     ///
     /// # Cancel-Safety
     ///
@@ -360,24 +367,39 @@ impl<R: Read, W: Write> WsTransport<R, W> {
 
             match frame.frame_type {
                 WsFrameType::Text => {
-                    // Parse JSON-RPC message
-                    let text = frame.as_text().map_err(|e| {
-                        TransportError::Io(std::io::Error::new(
+                    if !self.fragment_buffer.is_empty() {
+                        return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8: {e}"),
-                        ))
-                    })?;
-
-                    // Add newline for codec and decode
-                    let mut input = text.as_bytes().to_vec();
-                    input.push(b'\n');
-
-                    let messages = self.codec.decode(&input)?;
-                    if let Some(msg) = messages.into_iter().next() {
-                        return Ok(msg);
+                            "Received Text frame while inside fragmented message",
+                        )));
                     }
 
-                    // No complete message yet (shouldn't happen with WebSocket frames)
+                    if frame.fin {
+                        // Complete message in single frame
+                        return self.decode_message(frame.payload);
+                    }
+
+                    // Start of fragmented message
+                    self.fragment_buffer.extend(frame.payload);
+                    continue;
+                }
+                WsFrameType::Continuation => {
+                    if self.fragment_buffer.is_empty() {
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Received Continuation frame without start frame",
+                        )));
+                    }
+
+                    self.fragment_buffer.extend(frame.payload);
+
+                    if frame.fin {
+                        // End of fragmented message
+                        let payload = std::mem::take(&mut self.fragment_buffer);
+                        return self.decode_message(payload);
+                    }
+
+                    // More fragments to come
                     continue;
                 }
                 WsFrameType::Binary => {
@@ -399,6 +421,32 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                 }
             }
         }
+    }
+
+    /// Decodes a payload into a JSON-RPC message.
+    fn decode_message(&mut self, payload: Vec<u8>) -> Result<JsonRpcMessage, TransportError> {
+        // Parse JSON-RPC message
+        let text = String::from_utf8(payload).map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid UTF-8: {e}"),
+            ))
+        })?;
+
+        // Add newline for codec and decode
+        let mut input = text.as_bytes().to_vec();
+        input.push(b'\n');
+
+        let messages = self.codec.decode(&input)?;
+        if let Some(msg) = messages.into_iter().next() {
+            return Ok(msg);
+        }
+
+        // This shouldn't happen for a complete message unless it was empty or just whitespace
+        Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Received empty message",
+        )))
     }
 
     /// Sends a close frame and shuts down the connection.
@@ -537,6 +585,7 @@ pub struct WsClientTransport<R, W> {
     reader: WsReader<R>,
     writer: WsClientWriter<W>,
     codec: Codec,
+    fragment_buffer: Vec<u8>,
 }
 
 impl<R: Read, W: Write> WsClientTransport<R, W> {
@@ -546,6 +595,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
             reader: WsReader::new(reader),
             writer: WsClientWriter::new(writer),
             codec: Codec::new(),
+            fragment_buffer: Vec::new(),
         }
     }
 
@@ -611,24 +661,39 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
 
             match frame.frame_type {
                 WsFrameType::Text => {
-                    // Parse JSON-RPC message
-                    let text = frame.as_text().map_err(|e| {
-                        TransportError::Io(std::io::Error::new(
+                    if !self.fragment_buffer.is_empty() {
+                        return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Invalid UTF-8: {e}"),
-                        ))
-                    })?;
-
-                    // Add newline for codec and decode
-                    let mut input = text.as_bytes().to_vec();
-                    input.push(b'\n');
-
-                    let messages = self.codec.decode(&input)?;
-                    if let Some(msg) = messages.into_iter().next() {
-                        return Ok(msg);
+                            "Received Text frame while inside fragmented message",
+                        )));
                     }
 
-                    // No complete message yet (shouldn't happen with WebSocket frames)
+                    if frame.fin {
+                        // Complete message in single frame
+                        return self.decode_message(frame.payload);
+                    }
+
+                    // Start of fragmented message
+                    self.fragment_buffer.extend(frame.payload);
+                    continue;
+                }
+                WsFrameType::Continuation => {
+                    if self.fragment_buffer.is_empty() {
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Received Continuation frame without start frame",
+                        )));
+                    }
+
+                    self.fragment_buffer.extend(frame.payload);
+
+                    if frame.fin {
+                        // End of fragmented message
+                        let payload = std::mem::take(&mut self.fragment_buffer);
+                        return self.decode_message(payload);
+                    }
+
+                    // More fragments to come
                     continue;
                 }
                 WsFrameType::Binary => {
@@ -648,6 +713,29 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                 }
             }
         }
+    }
+
+    /// Decodes a payload into a JSON-RPC message.
+    fn decode_message(&mut self, payload: Vec<u8>) -> Result<JsonRpcMessage, TransportError> {
+        let text = String::from_utf8(payload).map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid UTF-8: {e}"),
+            ))
+        })?;
+
+        let mut input = text.as_bytes().to_vec();
+        input.push(b'\n');
+
+        let messages = self.codec.decode(&input)?;
+        if let Some(msg) = messages.into_iter().next() {
+            return Ok(msg);
+        }
+
+        Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Received empty message",
+        )))
     }
 
     /// Sends a close frame.

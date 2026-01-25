@@ -54,8 +54,8 @@
 // Re-export core types
 pub use fastmcp_core::{
     Budget, CancelledError, Cx, IntoOutcome, LabConfig, LabRuntime, McpContext, McpError,
-    McpErrorCode, McpResult, Outcome, OutcomeExt, RegionId, ResultExt, Scope, TaskId, cancelled,
-    err, ok,
+    McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt, RegionId, ResultExt, Scope, TaskId,
+    cancelled, err, ok,
 };
 
 // Re-export logging module
@@ -63,14 +63,14 @@ pub use fastmcp_core::logging;
 
 // Re-export protocol types
 pub use fastmcp_protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcError, JsonRpcMessage,
-    JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
+    CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo, Content,
+    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
     ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
     ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, PROTOCOL_VERSION, Prompt,
     PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
     ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
-    Tool, ToolsCapability,
+    SubscribeResourceParams, Tool, ToolsCapability, UnsubscribeResourceParams,
 };
 
 // Re-export transport types
@@ -102,6 +102,7 @@ pub mod prelude {
         // Context and errors
         McpContext,
         McpError,
+        McpOutcome,
         McpResult,
         // Outcome types (4-valued result)
         Outcome,

@@ -224,38 +224,38 @@ impl ToolTableRenderer {
     }
 
     fn render_plain(&self, tools: &[Tool], console: &FastMcpConsole) {
-        console.print(&format!("Registered Tools ({})", tools.len()));
-        console.print(&"=".repeat(40));
+        console.print_plain(&format!("Registered Tools ({})", tools.len()));
+        console.print_plain(&"=".repeat(40));
         for tool in tools {
             let desc = tool.description.as_deref().unwrap_or("-");
             if self.show_parameters {
                 let params = self.format_parameters(&tool.input_schema);
-                console.print(&format!("  {} - {} [{}]", tool.name, desc, params));
+                console.print_plain(&format!("  {} - {} [{}]", tool.name, desc, params));
             } else {
-                console.print(&format!("  {} - {}", tool.name, desc));
+                console.print_plain(&format!("  {} - {}", tool.name, desc));
             }
         }
     }
 
     fn render_detail_plain(&self, tool: &Tool, console: &FastMcpConsole) {
-        console.print(&format!("Tool: {}", tool.name));
-        console.print(&format!(
+        console.print_plain(&format!("Tool: {}", tool.name));
+        console.print_plain(&format!(
             "Description: {}",
             tool.description.as_deref().unwrap_or("No description")
         ));
 
         let params = self.extract_parameters(&tool.input_schema);
         if params.is_empty() {
-            console.print("Parameters: none");
+            console.print_plain("Parameters: none");
         } else {
-            console.print("Parameters:");
+            console.print_plain("Parameters:");
             for param in &params {
                 let req = if param.required {
                     "required"
                 } else {
                     "optional"
                 };
-                console.print(&format!(
+                console.print_plain(&format!(
                     "  - {}: {} ({}) - {}",
                     param.name,
                     param.type_name,
@@ -321,7 +321,7 @@ impl ResourceTableRenderer {
             if self.should_use_rich(console) {
                 console.print("[dim]No resources registered[/]");
             } else {
-                console.print("No resources registered");
+                console.print_plain("No resources registered");
             }
             return;
         }
@@ -402,7 +402,7 @@ impl ResourceTableRenderer {
             if self.should_use_rich(console) {
                 console.print("[dim]No resources registered[/]");
             } else {
-                console.print("No resources registered");
+                console.print_plain("No resources registered");
             }
             return;
         }
@@ -459,25 +459,46 @@ impl ResourceTableRenderer {
             return uri.to_string();
         }
 
-        // Highlight template placeholders {name} in yellow
-        let mut result = String::new();
-        let mut chars = uri.chars().peekable();
+        let mut result = String::with_capacity(uri.len() + 20); // Pre-alloc some extra for markup
+        let mut buffer = String::new();
+        let mut in_template = false;
 
-        while let Some(c) = chars.next() {
-            if c == '{' {
-                result.push_str("[yellow]{");
-                // Consume until closing brace
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    result.push(next);
-                    if next == '}' {
-                        result.push_str("[/]");
-                        break;
-                    }
+        for c in uri.chars() {
+            if in_template {
+                buffer.push(c);
+                if c == '}' {
+                    // Valid template part end
+                    result.push_str("[yellow]");
+                    result.push_str(&buffer);
+                    result.push_str("[/]");
+                    buffer.clear();
+                    in_template = false;
+                } else if c == '{' {
+                    // Nested '{' found, treat previous buffer as literal text
+                    // (URI templates don't support nesting, so assume previous '{' was literal)
+                    // But wait, '{' inside a template is invalid unless escaped.
+                    // Let's just flush the buffer up to the new '{' as literal.
+                    // Actually, simpler: if we hit another '{', assume the previous one was just a char.
+                    // But we already consumed it.
+                    // Let's flush everything except the new char.
+                    result.push_str(&buffer[..buffer.len() - 1]); // Flush previous part
+                    // Keep the new '{' in buffer (buffer now contains just "{")
+                    buffer.clear();
+                    buffer.push('{');
                 }
             } else {
-                result.push(c);
+                if c == '{' {
+                    in_template = true;
+                    buffer.push(c);
+                } else {
+                    result.push(c);
+                }
             }
+        }
+
+        // Flush any remaining buffer (unclosed template)
+        if in_template {
+            result.push_str(&buffer);
         }
 
         result
@@ -521,11 +542,11 @@ impl ResourceTableRenderer {
     }
 
     fn render_plain(&self, resources: &[Resource], console: &FastMcpConsole) {
-        console.print(&format!("Registered Resources ({})", resources.len()));
-        console.print(&"=".repeat(40));
+        console.print_plain(&format!("Registered Resources ({})", resources.len()));
+        console.print_plain(&"=".repeat(40));
         for resource in resources {
             let desc = resource.description.as_deref().unwrap_or("-");
-            console.print(&format!(
+            console.print_plain(&format!(
                 "  {} ({}) - {}",
                 resource.name, resource.uri, desc
             ));
@@ -533,14 +554,14 @@ impl ResourceTableRenderer {
     }
 
     fn render_detail_plain(&self, resource: &Resource, console: &FastMcpConsole) {
-        console.print(&format!("Resource: {}", resource.name));
-        console.print(&format!("URI: {}", resource.uri));
-        console.print(&format!(
+        console.print_plain(&format!("Resource: {}", resource.name));
+        console.print_plain(&format!("URI: {}", resource.uri));
+        console.print_plain(&format!(
             "Description: {}",
             resource.description.as_deref().unwrap_or("No description")
         ));
         if let Some(mime) = &resource.mime_type {
-            console.print(&format!("MIME Type: {}", mime));
+            console.print_plain(&format!("MIME Type: {}", mime));
         }
     }
 }
@@ -590,7 +611,7 @@ impl PromptTableRenderer {
             if self.should_use_rich(console) {
                 console.print("[dim]No prompts registered[/]");
             } else {
-                console.print("No prompts registered");
+                console.print_plain("No prompts registered");
             }
             return;
         }
@@ -704,33 +725,33 @@ impl PromptTableRenderer {
     }
 
     fn render_plain(&self, prompts: &[Prompt], console: &FastMcpConsole) {
-        console.print(&format!("Registered Prompts ({})", prompts.len()));
-        console.print(&"=".repeat(40));
+        console.print_plain(&format!("Registered Prompts ({})", prompts.len()));
+        console.print_plain(&"=".repeat(40));
         for prompt in prompts {
             let desc = prompt.description.as_deref().unwrap_or("-");
             if self.show_arguments {
                 let args = self.format_arguments(&prompt.arguments);
-                console.print(&format!("  {} - {} [{}]", prompt.name, desc, args));
+                console.print_plain(&format!("  {} - {} [{}]", prompt.name, desc, args));
             } else {
-                console.print(&format!("  {} - {}", prompt.name, desc));
+                console.print_plain(&format!("  {} - {}", prompt.name, desc));
             }
         }
     }
 
     fn render_detail_plain(&self, prompt: &Prompt, console: &FastMcpConsole) {
-        console.print(&format!("Prompt: {}", prompt.name));
-        console.print(&format!(
+        console.print_plain(&format!("Prompt: {}", prompt.name));
+        console.print_plain(&format!(
             "Description: {}",
             prompt.description.as_deref().unwrap_or("No description")
         ));
 
         if prompt.arguments.is_empty() {
-            console.print("Arguments: none");
+            console.print_plain("Arguments: none");
         } else {
-            console.print("Arguments:");
+            console.print_plain("Arguments:");
             for arg in &prompt.arguments {
                 let req = if arg.required { "required" } else { "optional" };
-                console.print(&format!(
+                console.print_plain(&format!(
                     "  - {} ({}) - {}",
                     arg.name,
                     req,
