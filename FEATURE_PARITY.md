@@ -8,7 +8,7 @@
 
 The FastMCP Rust port implements the **core MCP protocol functionality** but is **NOT a complete port** of the Python FastMCP library. The Rust version focuses on the fundamental MCP server/client implementation with asupersync integration, while omitting many advanced features present in the Python version.
 
-**Estimated Feature Parity: ~35-40%** of Python FastMCP functionality
+**Estimated Feature Parity: ~48%** of Python FastMCP functionality
 
 ---
 
@@ -38,7 +38,7 @@ The FastMCP Rust port implements the **core MCP protocol functionality** but is 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Middleware pipeline** | ✅ | ❌ | No middleware system |
-| **Lifecycle hooks (lifespan)** | ✅ | ❌ | No lifespan management |
+| **Lifecycle hooks (lifespan)** | ✅ | ✅ | `on_startup()` / `on_shutdown()` |
 | **Authentication providers** | ✅ | ❌ | No auth system |
 | **Dynamic enable/disable** | ✅ | ❌ | No visibility control |
 | **Component versioning** | ✅ | ❌ | No version support |
@@ -83,8 +83,8 @@ The FastMCP Rust port implements the **core MCP protocol functionality** but is 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Stdio transport** | ✅ | ✅ | Full implementation |
-| **SSE transport** | ✅ | 🟡 | Module exists, ~700 lines, not integrated |
-| **WebSocket transport** | ✅ | 🟡 | Module exists, ~700 lines, not integrated |
+| **SSE transport** | ✅ | ✅ | `run_sse()` integrated via SseServerTransport |
+| **WebSocket transport** | ✅ | ✅ | `run_websocket()` integrated via WsTransport |
 | **HTTP transport** | ✅ | ❌ | No HTTP server |
 | **Streamable HTTP** | ✅ | ❌ | Not implemented |
 
@@ -169,7 +169,7 @@ The FastMCP Rust port implements the **core MCP protocol functionality** but is 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Logging via context** | ✅ | 🟡 | Methods exist but not wired to client |
-| **Session state (get/set)** | ✅ | ❌ | No session state |
+| **Session state (get/set)** | ✅ | ✅ | `ctx.get_state()` / `ctx.set_state()` |
 | **Resource reading from handler** | ✅ | ❌ | Not in McpContext |
 | **Tool calling from handler** | ✅ | ❌ | Not in McpContext |
 | **MCP capabilities access** | ✅ | ❌ | Not exposed |
@@ -323,16 +323,13 @@ The Python FastMCP has a comprehensive middleware system:
 3. **Background Tasks** - No Docket/SEP-1686 support
 4. **Resource Templates** - URI matching not implemented
 5. **Proxy/Composition** - Cannot proxy to other MCP servers
-6. **SSE/WebSocket Integration** - Code exists but not wired up
 
 ### Moderate Missing Features
 
 7. **Dependency Injection** - No Depends() system
-8. **Session State** - No get_state/set_state
-9. **Lifecycle Hooks** - No lifespan management
-10. **Sampling/Completions** - No LLM sampling support
-11. **Dynamic Enable/Disable** - No visibility control
-12. **Component Versioning** - No version support
+8. **Sampling/Completions** - No LLM sampling support
+9. **Dynamic Enable/Disable** - No visibility control
+10. **Component Versioning** - No version support
 
 ### Lower Priority Missing Features
 
@@ -361,9 +358,7 @@ The following were explicitly excluded from the port:
 ### To Achieve Basic Feature Parity (~60%)
 
 1. Implement URI template matching for resources
-2. Wire up SSE transport
-3. Add basic middleware hooks
-4. Implement session state
+2. Add basic middleware hooks
 
 ### To Achieve Good Feature Parity (~80%)
 
@@ -376,15 +371,14 @@ The following were explicitly excluded from the port:
 
 9. All middleware types
 10. Full dependency injection
-11. Lifecycle hooks
-12. All contrib modules
-13. MCPConfig file format
+11. All contrib modules
+12. MCPConfig file format
 
 ---
 
 ## Conclusion
 
-The FastMCP Rust port successfully implements the **core MCP protocol** with excellent cancel-correctness via asupersync. However, it represents only about **35-40% of the Python FastMCP feature set**.
+The FastMCP Rust port successfully implements the **core MCP protocol** with excellent cancel-correctness via asupersync. It currently represents about **48% of the Python FastMCP feature set**, with SSE/WebSocket transports, lifecycle hooks, and session state now integrated.
 
 The port is suitable for:
 - Simple MCP servers with basic tools/resources/prompts

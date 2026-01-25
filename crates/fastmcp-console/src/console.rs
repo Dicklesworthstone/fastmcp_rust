@@ -77,16 +77,19 @@ impl FastMcpConsole {
     /// Create with custom writer (for testing)
     #[must_use]
     pub fn with_writer<W: Write + Send + 'static>(writer: W, enabled: bool) -> Self {
-        let inner = Console::builder()
+        let mut builder = Console::builder()
             .file(Box::new(writer))
-            .no_color()
             .markup(enabled)
             .emoji(enabled);
 
+        if !enabled {
+            builder = builder.no_color();
+        }
+
         let inner = if enabled {
-            inner.force_terminal(true).build()
+            builder.force_terminal(true).build()
         } else {
-            inner.no_color().build()
+            builder.build()
         };
 
         Self {
@@ -146,9 +149,11 @@ impl FastMcpConsole {
     /// Print plain text (no markup processing ever).
     pub fn print_plain(&self, text: &str) {
         if let Ok(console) = self.inner.lock() {
-            // Use print_styled with default style to bypass markup interpretation
-            // while still using the console's configured writer
-            console.print_styled(text, Style::new());
+            // Escape brackets with backslash (rich markup escape sequence)
+            // to prevent markup interpretation, then print through the console's
+            // configured writer
+            let escaped = text.replace('[', "\\[").replace(']', "\\]");
+            console.print(&escaped);
         } else {
             eprintln!("{text}");
         }

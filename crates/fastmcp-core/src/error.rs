@@ -44,11 +44,11 @@ impl From<McpErrorCode> for i32 {
             McpErrorCode::InvalidParams => -32602,
             McpErrorCode::InternalError => -32603,
             // MCP-specific codes (use server error range -32000 to -32099)
-            McpErrorCode::ToolExecutionError => -32001,
-            McpErrorCode::ResourceNotFound => -32002,
-            McpErrorCode::ResourceForbidden => -32003,
-            McpErrorCode::PromptNotFound => -32004,
-            McpErrorCode::RequestCancelled => -32005,
+            McpErrorCode::ToolExecutionError => -32000,
+            McpErrorCode::ResourceNotFound => -32001,
+            McpErrorCode::ResourceForbidden => -32002,
+            McpErrorCode::PromptNotFound => -32003,
+            McpErrorCode::RequestCancelled => -32004,
             McpErrorCode::Custom(code) => code,
         }
     }
@@ -62,11 +62,11 @@ impl From<i32> for McpErrorCode {
             -32601 => McpErrorCode::MethodNotFound,
             -32602 => McpErrorCode::InvalidParams,
             -32603 => McpErrorCode::InternalError,
-            -32001 => McpErrorCode::ToolExecutionError,
-            -32002 => McpErrorCode::ResourceNotFound,
-            -32003 => McpErrorCode::ResourceForbidden,
-            -32004 => McpErrorCode::PromptNotFound,
-            -32005 => McpErrorCode::RequestCancelled,
+            -32000 => McpErrorCode::ToolExecutionError,
+            -32001 => McpErrorCode::ResourceNotFound,
+            -32002 => McpErrorCode::ResourceForbidden,
+            -32003 => McpErrorCode::PromptNotFound,
+            -32004 => McpErrorCode::RequestCancelled,
             code => McpErrorCode::Custom(code),
         }
     }
@@ -207,7 +207,7 @@ pub type McpResult<T> = Result<T, McpError>;
 /// |---------|-------------------|
 /// | `Ok(value)` | `{"result": value}` |
 /// | `Err(McpError)` | `{"error": {"code": ..., "message": ...}}` |
-/// | `Cancelled` | `{"error": {"code": -32005, "message": "Request cancelled"}}` |
+/// | `Cancelled` | `{"error": {"code": -32004, "message": "Request cancelled"}}` |
 /// | `Panicked` | `{"error": {"code": -32603, "message": "Internal error"}}` |
 pub type McpOutcome<T> = Outcome<T, McpError>;
 
@@ -313,11 +313,11 @@ mod tests {
         assert_eq!(i32::from(McpErrorCode::MethodNotFound), -32601);
         assert_eq!(i32::from(McpErrorCode::InvalidParams), -32602);
         assert_eq!(i32::from(McpErrorCode::InternalError), -32603);
-        assert_eq!(i32::from(McpErrorCode::ToolExecutionError), -32001);
-        assert_eq!(i32::from(McpErrorCode::ResourceNotFound), -32002);
-        assert_eq!(i32::from(McpErrorCode::ResourceForbidden), -32003);
-        assert_eq!(i32::from(McpErrorCode::PromptNotFound), -32004);
-        assert_eq!(i32::from(McpErrorCode::RequestCancelled), -32005);
+        assert_eq!(i32::from(McpErrorCode::ToolExecutionError), -32000);
+        assert_eq!(i32::from(McpErrorCode::ResourceNotFound), -32001);
+        assert_eq!(i32::from(McpErrorCode::ResourceForbidden), -32002);
+        assert_eq!(i32::from(McpErrorCode::PromptNotFound), -32003);
+        assert_eq!(i32::from(McpErrorCode::RequestCancelled), -32004);
     }
 
     #[test]

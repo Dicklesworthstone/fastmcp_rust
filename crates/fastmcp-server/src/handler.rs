@@ -9,16 +9,17 @@
 //! the sync versions. This allows gradual migration to async without breaking
 //! existing code.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use fastmcp_core::{
-    McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
+    McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter, SessionState,
 };
 use fastmcp_protocol::{
     Content, JsonRpcRequest, ProgressParams, ProgressToken, Prompt, PromptMessage, Resource,
-    ResourceContent, Tool,
+    ResourceContent, ResourceTemplate, Tool,
 };
 
 // ============================================================================
@@ -94,27 +95,36 @@ where
     }
 }
 
-/// Helper to create an McpContext with progress reporting if a token is provided.
+/// Helper to create an McpContext with optional progress reporting and session state.
 pub fn create_context_with_progress<F>(
     cx: asupersync::Cx,
     request_id: u64,
     progress_token: Option<ProgressToken>,
+    state: Option<SessionState>,
     send_fn: F,
 ) -> McpContext
 where
     F: Fn(JsonRpcRequest) + Send + Sync + 'static,
 {
-    match progress_token {
-        Some(token) => {
+    match (progress_token, state) {
+        (Some(token), Some(state)) => {
+            let sender = ProgressNotificationSender::new(token, send_fn);
+            McpContext::with_state_and_progress(cx, request_id, state, sender.into_reporter())
+        }
+        (Some(token), None) => {
             let sender = ProgressNotificationSender::new(token, send_fn);
             McpContext::with_progress(cx, request_id, sender.into_reporter())
         }
-        None => McpContext::new(cx, request_id),
+        (None, Some(state)) => McpContext::with_state(cx, request_id, state),
+        (None, None) => McpContext::new(cx, request_id),
     }
 }
 
 /// A boxed future for async handler results.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// URI template parameters extracted from a matched resource URI.
+pub type UriParams = HashMap<String, String>;
 
 /// Handler for a tool.
 ///
@@ -175,7 +185,8 @@ pub trait ToolHandler: Send + Sync {
 /// # Sync vs Async
 ///
 /// By default, implement `read()` for synchronous execution. For async resources,
-/// override `read_async()` instead. The router always calls `read_async()`,
+/// override `read_async()` instead. The router uses `read_async_with_uri()` so
+/// implementations can access matched URI parameters when needed.
 /// which defaults to running `read()` in an async block.
 ///
 /// # Return Type
@@ -185,12 +196,50 @@ pub trait ResourceHandler: Send + Sync {
     /// Returns the resource definition.
     fn definition(&self) -> Resource;
 
+    /// Returns the resource template definition, if this resource uses a URI template.
+    fn template(&self) -> Option<ResourceTemplate> {
+        None
+    }
+
     /// Reads the resource content synchronously.
     ///
     /// This is the default implementation point. Override this for simple
     /// synchronous resources. Returns `McpResult` which is converted to `McpOutcome`
     /// by the async wrapper.
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>>;
+
+    /// Reads the resource content synchronously with the matched URI and parameters.
+    ///
+    /// Default implementation ignores URI params and delegates to `read()`.
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        _uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<Vec<ResourceContent>> {
+        self.read(ctx)
+    }
+
+    /// Reads the resource content asynchronously with the matched URI and parameters.
+    ///
+    /// Default implementation delegates to the sync `read_with_uri()` method.
+    fn read_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        Box::pin(async move {
+            if params.is_empty() {
+                self.read_async(ctx).await
+            } else {
+                match self.read_with_uri(ctx, uri, params) {
+                    Ok(v) => Outcome::Ok(v),
+                    Err(e) => Outcome::Err(e),
+                }
+            }
+        })
+    }
 
     /// Reads the resource content asynchronously.
     ///

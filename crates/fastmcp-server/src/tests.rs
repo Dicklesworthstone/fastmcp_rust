@@ -10,14 +10,14 @@
 use std::collections::HashMap;
 
 use asupersync::{Budget, Cx};
-use fastmcp_core::{McpContext, McpError, McpResult};
+use fastmcp_core::{McpContext, McpError, McpResult, SessionState};
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, GetPromptParams,
     InitializeParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams, RequestId,
     Resource, ResourceContent, ResourceTemplate, Role, ServerCapabilities, ServerInfo, Tool,
 };
 
-use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
+use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
 use crate::router::Router;
 use crate::session::Session;
 use crate::{NotificationSender, Server};
@@ -178,6 +178,52 @@ impl ResourceHandler for CancellableResource {
     }
 }
 
+/// A resource with a URI template that echoes the matched parameter.
+struct TemplateResource;
+
+impl ResourceHandler for TemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "resource://{id}".to_string(),
+            name: "Template Resource".to_string(),
+            description: Some("Template resource for tests".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "resource://{id}".to_string(),
+            name: "Template Resource".to_string(),
+            description: Some("Template resource for tests".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        })
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Err(McpError::invalid_params(
+            "uri parameters required for template resource",
+        ))
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let id = params
+            .get("id")
+            .ok_or_else(|| McpError::invalid_params("missing uri parameter: id"))?;
+        Ok(vec![ResourceContent {
+            uri: uri.to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some(format!("Template {id}")),
+            blob: None,
+        }])
+    }
+}
+
 // ============================================================================
 // Test Prompt Handlers
 // ============================================================================
@@ -237,12 +283,13 @@ mod router_tests {
             content: "Test content".to_string(),
         });
         router.add_resource(CancellableResource);
+        router.add_resource(TemplateResource);
 
         // Register resource templates
         router.add_resource_template(ResourceTemplate {
-            uri_template: "resource://{id}".to_string(),
-            name: "Template Resource".to_string(),
-            description: Some("Resource template for tests".to_string()),
+            uri_template: "resource://{name}".to_string(),
+            name: "Manual Template".to_string(),
+            description: Some("Resource template for manual listing".to_string()),
             mime_type: Some("text/plain".to_string()),
         });
 
@@ -294,8 +341,14 @@ mod router_tests {
         let router = create_test_router();
         let templates = router.resource_templates();
 
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].uri_template, "resource://{id}");
+        assert_eq!(templates.len(), 2);
+
+        let template_uris: Vec<_> = templates
+            .iter()
+            .map(|template| template.uri_template.as_str())
+            .collect();
+        assert!(template_uris.contains(&"resource://{id}"));
+        assert!(template_uris.contains(&"resource://{name}"));
     }
 
     #[test]
@@ -454,7 +507,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -480,7 +533,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -499,7 +552,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -521,7 +574,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -539,7 +592,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         // Request should fail due to exhausted budget
         assert!(result.is_err());
@@ -558,7 +611,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+        let result =
+            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None);
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -570,17 +624,41 @@ mod router_tests {
     }
 
     #[test]
-    fn test_handle_resources_read_not_found() {
+    fn test_handle_resources_read_template_match() {
         let router = create_test_router();
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://nonexistent".to_string(),
+            uri: "resource://abc".to_string(),
             meta: None,
         };
 
-        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+        let result =
+            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None);
+
+        assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
+        let read_result = result.unwrap();
+        assert_eq!(
+            read_result.contents[0].text,
+            Some("Template abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_handle_resources_read_not_found() {
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Use a scheme that doesn't match any registered resources or templates
+        let params = ReadResourceParams {
+            uri: "file://nonexistent".to_string(),
+            meta: None,
+        };
+
+        let result =
+            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None);
 
         assert!(result.is_err());
     }
@@ -597,7 +675,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(&cx, 1, &params, &budget, None);
+        let result =
+            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None);
 
         // Should be cancelled
         assert!(result.is_err());
@@ -619,7 +698,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(&cx, 1, params, &budget, None);
+        let result = router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -644,7 +723,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(&cx, 1, params, &budget, None);
+        let result = router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_err());
     }
@@ -662,7 +741,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -682,7 +761,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -702,7 +781,7 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, None);
+        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -941,6 +1020,7 @@ mod multi_handler_tests {
                 meta: None,
             },
             &budget,
+            SessionState::new(),
             None,
         );
         assert!(result1.is_ok());
@@ -954,6 +1034,7 @@ mod multi_handler_tests {
                 meta: None,
             },
             &budget,
+            SessionState::new(),
             None,
         );
         assert!(result2.is_ok());
@@ -993,6 +1074,7 @@ mod multi_handler_tests {
                 meta: None,
             },
             &budget,
+            SessionState::new(),
             None,
         );
         let result_b = router.handle_resources_read(
@@ -1003,6 +1085,7 @@ mod multi_handler_tests {
                 meta: None,
             },
             &budget,
+            SessionState::new(),
             None,
         );
 
@@ -1014,6 +1097,116 @@ mod multi_handler_tests {
             result_b.unwrap().contents[0].text,
             Some("Content B".to_string())
         );
+    }
+}
+
+// ============================================================================
+// Session State Tests
+// ============================================================================
+
+mod session_state_tests {
+    use super::*;
+
+    /// Tool that increments a counter in session state.
+    struct CounterTool;
+
+    impl ToolHandler for CounterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "increment".to_string(),
+                description: Some("Increments a counter in session state".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let count: i32 = ctx.get_state("counter").unwrap_or(0);
+            let new_count = count + 1;
+            ctx.set_state("counter", new_count);
+            Ok(vec![Content::Text {
+                text: format!("Counter: {new_count}"),
+            }])
+        }
+    }
+
+    #[test]
+    fn test_session_state_persists_across_calls() {
+        let mut router = Router::new();
+        router.add_tool(CounterTool);
+
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Create a shared session state
+        let state = SessionState::new();
+
+        // First call - counter should be 1
+        let params = CallToolParams {
+            name: "increment".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let result1 =
+            router.handle_tools_call(&cx, 1, params.clone(), &budget, state.clone(), None);
+        assert!(result1.is_ok());
+        if let Content::Text { text } = &result1.unwrap().content[0] {
+            assert_eq!(text, "Counter: 1");
+        }
+
+        // Second call with same state - counter should be 2
+        let result2 =
+            router.handle_tools_call(&cx, 2, params.clone(), &budget, state.clone(), None);
+        assert!(result2.is_ok());
+        if let Content::Text { text } = &result2.unwrap().content[0] {
+            assert_eq!(text, "Counter: 2");
+        }
+
+        // Third call - counter should be 3
+        let result3 = router.handle_tools_call(&cx, 3, params, &budget, state.clone(), None);
+        assert!(result3.is_ok());
+        if let Content::Text { text } = &result3.unwrap().content[0] {
+            assert_eq!(text, "Counter: 3");
+        }
+    }
+
+    #[test]
+    fn test_different_session_states_are_independent() {
+        let mut router = Router::new();
+        router.add_tool(CounterTool);
+
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Create two separate session states
+        let state1 = SessionState::new();
+        let state2 = SessionState::new();
+
+        let params = CallToolParams {
+            name: "increment".to_string(),
+            arguments: None,
+            meta: None,
+        };
+
+        // Call with state1 twice
+        router
+            .handle_tools_call(&cx, 1, params.clone(), &budget, state1.clone(), None)
+            .unwrap();
+        let result1 = router
+            .handle_tools_call(&cx, 2, params.clone(), &budget, state1.clone(), None)
+            .unwrap();
+
+        // Call with state2 once
+        let result2 = router
+            .handle_tools_call(&cx, 3, params, &budget, state2.clone(), None)
+            .unwrap();
+
+        // state1 should have counter=2, state2 should have counter=1
+        if let Content::Text { text } = &result1.content[0] {
+            assert_eq!(text, "Counter: 2");
+        }
+        if let Content::Text { text } = &result2.content[0] {
+            assert_eq!(text, "Counter: 1");
+        }
     }
 }
 
@@ -1116,5 +1309,112 @@ mod console_config_tests {
         assert!(config.show_stats_periodic);
         assert_eq!(config.stats_interval_secs, 60);
         assert!(config.force_plain);
+    }
+}
+
+/// Tests for lifecycle hooks (on_startup, on_shutdown).
+mod lifespan_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn test_on_startup_hook_builder() {
+        let startup_called = Arc::new(AtomicBool::new(false));
+        let startup_called_clone = startup_called.clone();
+
+        let server = Server::new("test", "1.0.0")
+            .on_startup(move || {
+                startup_called_clone.store(true, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+            .build();
+
+        // The hook is stored but not called until run
+        // Verify that the lifespan is stored (we can't call run_startup_hook directly
+        // since it's private, but we verify the builder works)
+        assert!(!startup_called.load(Ordering::SeqCst));
+
+        // Manually trigger the startup hook via the public interface
+        // (In production, this would be called by run_loop)
+        let startup_success = server.run_startup_hook();
+        assert!(startup_success);
+        assert!(startup_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_on_shutdown_hook_builder() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_called_clone = shutdown_called.clone();
+
+        let server = Server::new("test", "1.0.0")
+            .on_shutdown(move || {
+                shutdown_called_clone.store(true, Ordering::SeqCst);
+            })
+            .build();
+
+        // The hook is stored but not called until shutdown
+        assert!(!shutdown_called.load(Ordering::SeqCst));
+
+        // Manually trigger the shutdown hook
+        server.run_shutdown_hook();
+        assert!(shutdown_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_startup_hook_failure() {
+        let server = Server::new("test", "1.0.0")
+            .on_startup(|| Err(std::io::Error::other("startup failed")))
+            .build();
+
+        // Startup should return false on failure
+        let startup_success = server.run_startup_hook();
+        assert!(!startup_success);
+    }
+
+    #[test]
+    fn test_no_hooks_is_ok() {
+        let server = Server::new("test", "1.0.0").build();
+
+        // No hooks configured should be fine
+        let startup_success = server.run_startup_hook();
+        assert!(startup_success);
+
+        // Shutdown hook should also be a no-op
+        server.run_shutdown_hook();
+    }
+
+    #[test]
+    fn test_hooks_only_run_once() {
+        let startup_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let startup_count_clone = startup_count.clone();
+
+        let shutdown_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let shutdown_count_clone = shutdown_count.clone();
+
+        let server = Server::new("test", "1.0.0")
+            .on_startup(move || {
+                startup_count_clone.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+            .on_shutdown(move || {
+                shutdown_count_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .build();
+
+        // Call startup multiple times
+        server.run_startup_hook();
+        server.run_startup_hook();
+        server.run_startup_hook();
+
+        // Should only have run once (hook is taken)
+        assert_eq!(startup_count.load(Ordering::SeqCst), 1);
+
+        // Same for shutdown
+        server.run_shutdown_hook();
+        server.run_shutdown_hook();
+        server.run_shutdown_hook();
+
+        assert_eq!(shutdown_count.load(Ordering::SeqCst), 1);
     }
 }

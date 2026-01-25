@@ -369,3 +369,109 @@ pub struct LogMessageParams {
     /// Log message data.
     pub data: serde_json::Value,
 }
+
+// ============================================================================
+// Background Tasks (Docket/SEP-1686)
+// ============================================================================
+
+use crate::types::{TaskId, TaskInfo, TaskResult, TaskStatus};
+
+/// tasks/list request params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListTasksParams {
+    /// Cursor for pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Filter by task status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+}
+
+/// tasks/list response result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTasksResult {
+    /// List of tasks.
+    pub tasks: Vec<TaskInfo>,
+    /// Next cursor for pagination.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// tasks/get request params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTaskParams {
+    /// Task ID to retrieve.
+    pub id: TaskId,
+}
+
+/// tasks/get response result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTaskResult {
+    /// Task information.
+    pub task: TaskInfo,
+    /// Task result (if completed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+}
+
+/// tasks/cancel request params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelTaskParams {
+    /// Task ID to cancel.
+    pub id: TaskId,
+    /// Reason for cancellation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// tasks/cancel response result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelTaskResult {
+    /// Whether the cancellation was successful.
+    pub cancelled: bool,
+    /// Updated task information.
+    pub task: TaskInfo,
+}
+
+/// tasks/submit request params.
+///
+/// Used to submit a new background task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTaskParams {
+    /// Task type identifier.
+    #[serde(rename = "taskType")]
+    pub task_type: String,
+    /// Task parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// tasks/submit response result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTaskResult {
+    /// Created task information.
+    pub task: TaskInfo,
+}
+
+/// Task status change notification params.
+///
+/// Sent from server to client when a task status changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStatusNotificationParams {
+    /// Task ID.
+    pub id: TaskId,
+    /// New task status.
+    pub status: TaskStatus,
+    /// Progress (0.0 to 1.0, if known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
+    /// Progress message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Error message (if failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Task result (if completed successfully).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+}

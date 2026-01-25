@@ -26,11 +26,15 @@
 // Allow dead code during Phase 0 development
 #![allow(dead_code)]
 
+mod auth;
+pub mod combinator;
 mod context;
 mod error;
 pub mod logging;
 pub mod runtime;
+mod state;
 
+pub use auth::{AUTH_STATE_KEY, AccessToken, AuthContext};
 pub use context::{
     CancelledError, IntoOutcome, McpContext, NoOpNotificationSender, NotificationSender,
     ProgressReporter,
@@ -39,6 +43,7 @@ pub use error::{
     McpError, McpErrorCode, McpOutcome, McpResult, OutcomeExt, ResultExt, cancelled, err, ok,
 };
 pub use runtime::block_on;
+pub use state::SessionState;
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, LabConfig, LabRuntime, Outcome, RegionId, Scope, TaskId};

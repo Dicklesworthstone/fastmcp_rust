@@ -128,6 +128,29 @@ fn is_string_type(ty: &Type) -> bool {
     false
 }
 
+/// Extracts template parameter names from a URI template string.
+fn extract_template_params(uri: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut chars = uri.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut name = String::new();
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+                name.push(next);
+            }
+            if !name.is_empty() {
+                params.push(name);
+            }
+        }
+    }
+
+    params
+}
+
 /// Converts a snake_case identifier to PascalCase.
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -252,6 +275,199 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
             // Convert via ToString or Debug as fallback
             let text = format!("{}", result);
             Ok(vec![fastmcp_protocol::Content::Text { text }])
+        },
+    }
+}
+
+// ============================================================================
+// Prompt Return Type Analysis
+// ============================================================================
+
+/// Represents return type strategies for prompt handlers.
+enum PromptReturnTypeKind {
+    /// Returns Vec<PromptMessage> directly
+    VecPromptMessage,
+    /// Returns Result<Vec<PromptMessage>, E>
+    ResultVecPromptMessage,
+    /// Returns McpResult<Vec<PromptMessage>>
+    McpResultVecPromptMessage,
+    /// Unknown type - will fail at compile time
+    Other,
+}
+
+/// Analyzes a prompt function's return type.
+fn analyze_prompt_return_type(output: &syn::ReturnType) -> PromptReturnTypeKind {
+    match output {
+        syn::ReturnType::Default => PromptReturnTypeKind::Other, // () not valid for prompts
+        syn::ReturnType::Type(_, ty) => analyze_prompt_type(ty),
+    }
+}
+
+/// Analyzes a type for prompt return type classification.
+fn analyze_prompt_type(ty: &Type) -> PromptReturnTypeKind {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let type_name = segment.ident.to_string();
+
+            match type_name.as_str() {
+                "Vec" => {
+                    // Check if it's Vec<PromptMessage>
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(Type::Path(inner_path))) =
+                            args.args.first()
+                        {
+                            if inner_path
+                                .path
+                                .segments
+                                .last()
+                                .is_some_and(|s| s.ident == "PromptMessage")
+                            {
+                                return PromptReturnTypeKind::VecPromptMessage;
+                            }
+                        }
+                    }
+                }
+                "Result" | "McpResult" => {
+                    // Check the Ok type
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                            let inner_kind = analyze_prompt_type(inner_ty);
+                            return match inner_kind {
+                                PromptReturnTypeKind::VecPromptMessage => {
+                                    if type_name == "McpResult" {
+                                        PromptReturnTypeKind::McpResultVecPromptMessage
+                                    } else {
+                                        PromptReturnTypeKind::ResultVecPromptMessage
+                                    }
+                                }
+                                _ => PromptReturnTypeKind::Other,
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    PromptReturnTypeKind::Other
+}
+
+/// Generates code to convert a prompt function result to McpResult<Vec<PromptMessage>>.
+fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
+    let kind = analyze_prompt_return_type(output);
+
+    match kind {
+        PromptReturnTypeKind::VecPromptMessage => quote! {
+            Ok(result)
+        },
+        PromptReturnTypeKind::ResultVecPromptMessage
+        | PromptReturnTypeKind::McpResultVecPromptMessage => quote! {
+            result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
+        },
+        PromptReturnTypeKind::Other => quote! {
+            // Fallback: assume the result is Vec<PromptMessage>
+            Ok(result)
+        },
+    }
+}
+
+// ============================================================================
+// Resource Return Type Analysis
+// ============================================================================
+
+/// Represents return type strategies for resource handlers.
+enum ResourceReturnTypeKind {
+    /// Returns String directly
+    String,
+    /// Returns Result<String, E>
+    ResultString,
+    /// Returns McpResult<String>
+    McpResultString,
+    /// Unknown type - use ToString
+    Other,
+}
+
+/// Analyzes a resource function's return type.
+fn analyze_resource_return_type(output: &syn::ReturnType) -> ResourceReturnTypeKind {
+    match output {
+        syn::ReturnType::Default => ResourceReturnTypeKind::Other, // () not typical for resources
+        syn::ReturnType::Type(_, ty) => analyze_resource_type(ty),
+    }
+}
+
+/// Analyzes a type for resource return type classification.
+fn analyze_resource_type(ty: &Type) -> ResourceReturnTypeKind {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let type_name = segment.ident.to_string();
+
+            match type_name.as_str() {
+                "String" => return ResourceReturnTypeKind::String,
+                "Result" | "McpResult" => {
+                    // Check the Ok type
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                            let inner_kind = analyze_resource_type(inner_ty);
+                            return match inner_kind {
+                                ResourceReturnTypeKind::String => {
+                                    if type_name == "McpResult" {
+                                        ResourceReturnTypeKind::McpResultString
+                                    } else {
+                                        ResourceReturnTypeKind::ResultString
+                                    }
+                                }
+                                _ => ResourceReturnTypeKind::Other,
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ResourceReturnTypeKind::Other
+}
+
+/// Generates code to convert a resource function result to McpResult<Vec<ResourceContent>>.
+///
+/// The generated code handles:
+/// - `String` → wrap in ResourceContent
+/// - `Result<String, E>` → unwrap result, then wrap in ResourceContent
+/// - `McpResult<String>` → unwrap result, then wrap in ResourceContent
+/// - Other types → use ToString trait
+///
+/// The generated code uses `uri` and `mime_type` variables that must be in scope.
+fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str) -> TokenStream2 {
+    let kind = analyze_resource_return_type(output);
+
+    match kind {
+        ResourceReturnTypeKind::String => quote! {
+            let text = result;
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
+        },
+        ResourceReturnTypeKind::ResultString | ResourceReturnTypeKind::McpResultString => quote! {
+            let text = result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))?;
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
+        },
+        ResourceReturnTypeKind::Other => quote! {
+            // Fallback: use ToString trait
+            let text = result.to_string();
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
         },
     }
 }
@@ -664,6 +880,7 @@ impl Parse for ResourceAttrs {
 /// - `description` - Resource description (default: doc comment)
 /// - `mime_type` - MIME type (default: "text/plain")
 #[proc_macro_attribute]
+#[allow(clippy::too_many_lines)]
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = parse_macro_input!(attr as ResourceAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
@@ -693,40 +910,138 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         |desc| quote! { Some(#desc.to_string()) },
     );
 
-    // Check if the function expects a context argument
+    let template_params = extract_template_params(&uri);
+
+    // Parse parameters (skip first if it's &McpContext)
+    let mut params: Vec<(&Ident, &Type)> = Vec::new();
     let mut expects_context = false;
-    if let Some(FnArg::Typed(pat_type)) = input_fn.sig.inputs.first() {
-        if is_mcp_context_ref(pat_type.ty.as_ref()) {
-            expects_context = true;
+
+    for (i, arg) in input_fn.sig.inputs.iter().enumerate() {
+        if let FnArg::Typed(pat_type) = arg {
+            if i == 0 && is_mcp_context_ref(pat_type.ty.as_ref()) {
+                expects_context = true;
+                continue;
+            }
+
+            if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
+                let param_name = &pat_ident.ident;
+                let param_type = pat_type.ty.as_ref();
+                params.push((param_name, param_type));
+            }
         }
     }
 
+    if template_params.is_empty() && !params.is_empty() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            "resource parameters require a URI template with matching {params}",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let missing_params: Vec<String> = params
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !template_params.contains(name))
+        .collect();
+
+    if !missing_params.is_empty() {
+        return syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            format!(
+                "resource parameters missing from uri template: {}",
+                missing_params.join(", ")
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let is_template = !template_params.is_empty();
+
+    let param_extractions: Vec<TokenStream2> = params
+        .iter()
+        .map(|(name, ty)| {
+            let name_str = name.to_string();
+            if let Some(inner_ty) = option_inner_type(ty) {
+                if is_string_type(inner_ty) {
+                    quote! {
+                        let #name: #ty = uri_params.get(#name_str).cloned();
+                    }
+                } else {
+                    quote! {
+                        let #name: #ty = match uri_params.get(#name_str) {
+                            Some(value) => Some(value.parse().map_err(|_| {
+                                fastmcp_core::McpError::invalid_params(
+                                    format!("invalid uri parameter: {}", #name_str)
+                                )
+                            })?),
+                            None => None,
+                        };
+                    }
+                }
+            } else if is_string_type(ty) {
+                quote! {
+                    let #name: #ty = uri_params
+                        .get(#name_str)
+                        .ok_or_else(|| fastmcp_core::McpError::invalid_params(
+                            format!("missing uri parameter: {}", #name_str)
+                        ))?
+                        .clone();
+                }
+            } else {
+                quote! {
+                    let #name: #ty = uri_params
+                        .get(#name_str)
+                        .ok_or_else(|| fastmcp_core::McpError::invalid_params(
+                            format!("missing uri parameter: {}", #name_str)
+                        ))?
+                        .parse()
+                        .map_err(|_| fastmcp_core::McpError::invalid_params(
+                            format!("invalid uri parameter: {}", #name_str)
+                        ))?;
+                }
+            }
+        })
+        .collect();
+
+    let param_names: Vec<&Ident> = params.iter().map(|(name, _)| *name).collect();
+    let call_args = if expects_context {
+        quote! { ctx, #(#param_names),* }
+    } else {
+        quote! { #(#param_names),* }
+    };
+
     let is_async = input_fn.sig.asyncness.is_some();
     let call_expr = if is_async {
-        if expects_context {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name(ctx).await
-                })
-            }
-        } else {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name().await
-                })
-            }
+        quote! {
+            fastmcp_core::runtime::block_on(async move {
+                #fn_name(#call_args).await
+            })
         }
     } else {
-        if expects_context {
-            quote! {
-                #fn_name(ctx)
-            }
-        } else {
-            quote! {
-                #fn_name()
-            }
+        quote! {
+            #fn_name(#call_args)
         }
     };
+
+    let template_tokens = if is_template {
+        quote! {
+            Some(fastmcp_protocol::ResourceTemplate {
+                uri_template: #uri.to_string(),
+                name: #resource_name.to_string(),
+                description: #description_tokens,
+                mime_type: Some(#mime_type.to_string()),
+            })
+        }
+    } else {
+        quote! { None }
+    };
+
+    // Generate result conversion based on return type (supports Result<String, E>)
+    let return_type = &input_fn.sig.output;
+    let resource_result_conversion = generate_resource_result_conversion(return_type, &mime_type);
 
     let expanded = quote! {
         // Keep the original function
@@ -746,20 +1061,41 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
+            fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+                #template_tokens
+            }
+
             fn read(
                 &self,
                 ctx: &fastmcp_core::McpContext,
             ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                let uri_params = std::collections::HashMap::new();
+                self.read_with_uri(ctx, #uri, &uri_params)
+            }
+
+            fn read_with_uri(
+                &self,
+                ctx: &fastmcp_core::McpContext,
+                uri: &str,
+                uri_params: &std::collections::HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                #(#param_extractions)*
                 let result = #call_expr;
-                // Convert result to text content
-                // Supports: String, &str, types implementing ToString
-                let text = result.to_string();
-                Ok(vec![fastmcp_protocol::ResourceContent {
-                    uri: #uri.to_string(),
-                    mime_type: Some(#mime_type.to_string()),
-                    text: Some(text),
-                    blob: None,
-                }])
+                #resource_result_conversion
+            }
+
+            fn read_async_with_uri<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                uri: &'a str,
+                uri_params: &'a std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>> {
+                Box::pin(async move {
+                    match self.read_with_uri(ctx, uri, uri_params) {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
             }
         }
     };
@@ -885,13 +1221,25 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
                 let param_name = &pat_ident.ident;
                 let param_name_str = param_name.to_string();
+                let is_optional = is_option_type(pat_type.ty.as_ref());
 
                 param_names.push(param_name.clone());
-                param_extractions.push(quote! {
-                    let #param_name = arguments.get(#param_name_str)
-                        .cloned()
-                        .unwrap_or_default();
-                });
+
+                if is_optional {
+                    // Optional parameters: return None if not provided
+                    param_extractions.push(quote! {
+                        let #param_name = arguments.get(#param_name_str).cloned();
+                    });
+                } else {
+                    // Required parameters: return an error if missing
+                    param_extractions.push(quote! {
+                        let #param_name = arguments.get(#param_name_str)
+                            .cloned()
+                            .ok_or_else(|| fastmcp_core::McpError::invalid_params(
+                                format!("missing required argument: {}", #param_name_str)
+                            ))?;
+                    });
+                }
             }
         }
     }
@@ -923,6 +1271,10 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate result conversion based on return type (supports Result<Vec<PromptMessage>, E>)
+    let return_type = &input_fn.sig.output;
+    let prompt_result_conversion = generate_prompt_result_conversion(return_type);
+
     let expanded = quote! {
         // Keep the original function
         #input_fn
@@ -947,7 +1299,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
                 #(#param_extractions)*
                 let result = #call_expr;
-                Ok(result)
+                #prompt_result_conversion
             }
         }
     };

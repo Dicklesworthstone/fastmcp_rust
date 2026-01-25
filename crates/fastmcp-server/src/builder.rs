@@ -1,17 +1,20 @@
 //! Server builder for configuring MCP servers.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_protocol::{
-    PromptsCapability, ResourceTemplate, ResourcesCapability, ServerCapabilities, ServerInfo,
-    ToolsCapability,
+    LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
+    ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
-use crate::{LoggingConfig, PromptHandler, ResourceHandler, Router, Server, ToolHandler};
+use crate::{
+    AuthProvider, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
+    ToolHandler,
+};
 
 /// Default request timeout in seconds.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -30,6 +33,10 @@ pub struct ServerBuilder {
     logging: LoggingConfig,
     /// Console configuration for rich output.
     console_config: ConsoleConfig,
+    /// Lifecycle hooks for startup/shutdown.
+    lifespan: LifespanHooks,
+    /// Optional authentication provider.
+    auth_provider: Option<Arc<dyn AuthProvider>>,
 }
 
 impl ServerBuilder {
@@ -47,14 +54,26 @@ impl ServerBuilder {
                 name: name.into(),
                 version: version.into(),
             },
-            capabilities: ServerCapabilities::default(),
+            capabilities: ServerCapabilities {
+                logging: Some(LoggingCapability::default()),
+                ..ServerCapabilities::default()
+            },
             router: Router::new(),
             instructions: None,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             stats_enabled: true,
             logging: LoggingConfig::from_env(),
             console_config: ConsoleConfig::from_env(),
+            lifespan: LifespanHooks::default(),
+            auth_provider: None,
         }
+    }
+
+    /// Sets an authentication provider.
+    #[must_use]
+    pub fn auth_provider<P: AuthProvider + 'static>(mut self, provider: P) -> Self {
+        self.auth_provider = Some(Arc::new(provider));
+        self
     }
 
     /// Disables statistics collection.
@@ -251,6 +270,69 @@ impl ServerBuilder {
         &self.console_config
     }
 
+    // ─────────────────────────────────────────────────
+    // Lifecycle Hooks
+    // ─────────────────────────────────────────────────
+
+    /// Registers a startup hook that runs before the server starts accepting connections.
+    ///
+    /// The hook can perform initialization tasks like:
+    /// - Opening database connections
+    /// - Loading configuration files
+    /// - Initializing caches
+    ///
+    /// If the hook returns an error, the server will not start.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Server::new("demo", "1.0.0")
+    ///     .on_startup(|| {
+    ///         println!("Server starting up...");
+    ///         Ok(())
+    ///     })
+    ///     .run_stdio();
+    /// ```
+    #[must_use]
+    pub fn on_startup<F, E>(mut self, hook: F) -> Self
+    where
+        F: FnOnce() -> Result<(), E> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.lifespan.on_startup = Some(Box::new(move || {
+            hook().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }));
+        self
+    }
+
+    /// Registers a shutdown hook that runs when the server is shutting down.
+    ///
+    /// The hook can perform cleanup tasks like:
+    /// - Closing database connections
+    /// - Flushing caches
+    /// - Saving state
+    ///
+    /// Shutdown hooks are run on a best-effort basis. If the process is
+    /// forcefully terminated, hooks may not run.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Server::new("demo", "1.0.0")
+    ///     .on_shutdown(|| {
+    ///         println!("Server shutting down...");
+    ///     })
+    ///     .run_stdio();
+    /// ```
+    #[must_use]
+    pub fn on_shutdown<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.lifespan.on_shutdown = Some(Box::new(hook));
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -267,6 +349,8 @@ impl ServerBuilder {
             },
             logging: self.logging,
             console_config: self.console_config,
+            lifespan: Mutex::new(Some(self.lifespan)),
+            auth_provider: self.auth_provider,
             active_requests: Mutex::new(HashMap::new()),
         }
     }

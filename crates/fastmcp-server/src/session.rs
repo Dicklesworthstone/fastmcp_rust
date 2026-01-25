@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use fastmcp_core::SessionState;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
 
 /// An MCP session between client and server.
@@ -23,6 +24,8 @@ pub struct Session {
     protocol_version: Option<String>,
     /// Resource subscriptions for this session.
     resource_subscriptions: HashSet<String>,
+    /// Per-session state storage.
+    state: SessionState,
 }
 
 impl Session {
@@ -37,7 +40,17 @@ impl Session {
             server_capabilities,
             protocol_version: None,
             resource_subscriptions: HashSet::new(),
+            state: SessionState::new(),
         }
+    }
+
+    /// Returns a reference to the session state.
+    ///
+    /// Session state persists across requests within this session and can be
+    /// used to store handler-specific data.
+    #[must_use]
+    pub fn state(&self) -> &SessionState {
+        &self.state
     }
 
     /// Returns whether the session has been initialized.

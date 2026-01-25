@@ -22,6 +22,9 @@ pub struct ServerCapabilities {
     /// Logging capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Background tasks capability (Docket/SEP-1686).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<TasksCapability>,
 }
 
 /// Tool capabilities.
@@ -223,4 +226,153 @@ pub struct PromptMessage {
     pub role: Role,
     /// Message content.
     pub content: Content,
+}
+
+// ============================================================================
+// Background Tasks (Docket/SEP-1686)
+// ============================================================================
+
+/// Task identifier.
+///
+/// Unique identifier for background tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskId(pub String);
+
+impl TaskId {
+    /// Creates a new random task ID.
+    #[must_use]
+    pub fn new() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self(format!("task-{timestamp:x}"))
+    }
+
+    /// Creates a task ID from a string.
+    #[must_use]
+    pub fn from_string(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Returns the task ID as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for TaskId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for TaskId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+/// Status of a background task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// Task is queued but not yet started.
+    Pending,
+    /// Task is currently running.
+    Running,
+    /// Task completed successfully.
+    Completed,
+    /// Task failed with an error.
+    Failed,
+    /// Task was cancelled.
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// Returns true if the task is in a terminal state.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+
+    /// Returns true if the task is still active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        matches!(self, TaskStatus::Pending | TaskStatus::Running)
+    }
+}
+
+/// Information about a background task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    /// Unique task identifier.
+    pub id: TaskId,
+    /// Task type (identifies the kind of work).
+    #[serde(rename = "taskType")]
+    pub task_type: String,
+    /// Current status.
+    pub status: TaskStatus,
+    /// Progress (0.0 to 1.0, if known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
+    /// Progress message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Task creation timestamp (ISO 8601).
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    /// Task start timestamp (ISO 8601), if started.
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Task completion timestamp (ISO 8601), if completed.
+    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Error message if failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Task result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    /// Task identifier.
+    pub id: TaskId,
+    /// Whether the task succeeded.
+    pub success: bool,
+    /// Result data (if successful).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Error message (if failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Task capability for server capabilities.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TasksCapability {
+    /// Whether the server supports task list changes notifications.
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub list_changed: bool,
 }

@@ -213,13 +213,15 @@ impl ToolTableRenderer {
     }
 
     fn truncate_description(&self, desc: &str) -> String {
-        if desc.len() <= self.max_description_width {
+        let char_count = desc.chars().count();
+        if char_count <= self.max_description_width {
             desc.to_string()
         } else {
-            format!(
-                "{}...",
-                &desc[..self.max_description_width.saturating_sub(3)]
-            )
+            let truncated: String = desc
+                .chars()
+                .take(self.max_description_width.saturating_sub(3))
+                .collect();
+            format!("{truncated}...")
         }
     }
 
@@ -486,13 +488,11 @@ impl ResourceTableRenderer {
                     buffer.clear();
                     buffer.push('{');
                 }
+            } else if c == '{' {
+                in_template = true;
+                buffer.push(c);
             } else {
-                if c == '{' {
-                    in_template = true;
-                    buffer.push(c);
-                } else {
-                    result.push(c);
-                }
+                result.push(c);
             }
         }
 
@@ -531,13 +531,15 @@ impl ResourceTableRenderer {
     }
 
     fn truncate_description(&self, desc: &str) -> String {
-        if desc.len() <= self.max_description_width {
+        let char_count = desc.chars().count();
+        if char_count <= self.max_description_width {
             desc.to_string()
         } else {
-            format!(
-                "{}...",
-                &desc[..self.max_description_width.saturating_sub(3)]
-            )
+            let truncated: String = desc
+                .chars()
+                .take(self.max_description_width.saturating_sub(3))
+                .collect();
+            format!("{truncated}...")
         }
     }
 
@@ -714,13 +716,15 @@ impl PromptTableRenderer {
     }
 
     fn truncate_description(&self, desc: &str) -> String {
-        if desc.len() <= self.max_description_width {
+        let char_count = desc.chars().count();
+        if char_count <= self.max_description_width {
             desc.to_string()
         } else {
-            format!(
-                "{}...",
-                &desc[..self.max_description_width.saturating_sub(3)]
-            )
+            let truncated: String = desc
+                .chars()
+                .take(self.max_description_width.saturating_sub(3))
+                .collect();
+            format!("{truncated}...")
         }
     }
 

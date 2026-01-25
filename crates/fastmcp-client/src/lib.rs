@@ -39,9 +39,10 @@ use fastmcp_protocol::{
     GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
     JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
     ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, PROTOCOL_VERSION, ProgressParams, ProgressToken, Prompt, PromptMessage,
-    ReadResourceParams, ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent,
-    ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressParams, ProgressToken,
+    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta,
+    Resource, ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams,
+    Tool,
 };
 
 /// Callback for receiving progress notifications during tool execution.
@@ -280,9 +281,16 @@ impl Client {
 
             match message {
                 JsonRpcMessage::Response(response) => return Ok(response),
-                JsonRpcMessage::Request(_) => {
+                JsonRpcMessage::Request(request) => {
                     // Server sending a request to client (e.g., notification)
-                    // For now, ignore these - in a full implementation we'd handle them
+                    if request.method == "notifications/message" {
+                        if let Some(params) = request.params {
+                            if let Ok(message) = serde_json::from_value::<LogMessageParams>(params)
+                            {
+                                self.emit_log_message(message);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -467,11 +475,35 @@ impl Client {
                                 }
                             }
                         }
+                    } else if request.method == "notifications/message" {
+                        if let Some(params) = request.params {
+                            if let Ok(message) = serde_json::from_value::<LogMessageParams>(params)
+                            {
+                                self.emit_log_message(message);
+                            }
+                        }
                     }
                     // Continue waiting for actual response
                 }
             }
         }
+    }
+
+    fn emit_log_message(&self, message: LogMessageParams) {
+        let level = match message.level {
+            LogLevel::Debug => log::Level::Debug,
+            LogLevel::Info => log::Level::Info,
+            LogLevel::Warning => log::Level::Warn,
+            LogLevel::Error => log::Level::Error,
+        };
+
+        let target = message.logger.as_deref().unwrap_or("fastmcp::remote");
+        let text = match message.data {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        };
+
+        log::log!(target: target, level, "{text}");
     }
 
     /// Lists available resources.
@@ -495,6 +527,17 @@ impl Client {
         let result: ListResourceTemplatesResult =
             self.send_request("resources/templates/list", params)?;
         Ok(result.resource_templates)
+    }
+
+    /// Sets the server log level (if supported).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()> {
+        let params = SetLogLevelParams { level };
+        let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
+        Ok(())
     }
 
     /// Reads a resource by URI.

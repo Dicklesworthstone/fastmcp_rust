@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use asupersync::{Budget, Cx, Outcome};
 use fastmcp_core::logging::{debug, targets, trace};
-use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, block_on};
+use fastmcp_core::{
+    McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
+};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, Content, GetPromptParams, GetPromptResult, InitializeParams,
     InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
@@ -14,7 +16,7 @@ use fastmcp_protocol::{
     ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, Tool, validate,
 };
 
-use crate::handler::create_context_with_progress;
+use crate::handler::{UriParams, create_context_with_progress};
 
 use crate::Session;
 use crate::handler::{
@@ -33,7 +35,7 @@ pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
     resources: HashMap<String, BoxedResourceHandler>,
     prompts: HashMap<String, BoxedPromptHandler>,
-    resource_templates: HashMap<String, ResourceTemplate>,
+    resource_templates: HashMap<String, ResourceTemplateEntry>,
 }
 
 impl Router {
@@ -56,14 +58,41 @@ impl Router {
 
     /// Adds a resource handler.
     pub fn add_resource<H: ResourceHandler + 'static>(&mut self, handler: H) {
+        let template = handler.template();
         let def = handler.definition();
-        self.resources.insert(def.uri.clone(), Box::new(handler));
+        let boxed: BoxedResourceHandler = Box::new(handler);
+
+        if let Some(template) = template {
+            let entry = ResourceTemplateEntry {
+                matcher: UriTemplate::new(&template.uri_template),
+                template: template.clone(),
+                handler: Some(boxed),
+            };
+            self.resource_templates
+                .insert(template.uri_template.clone(), entry);
+        } else {
+            self.resources.insert(def.uri.clone(), boxed);
+        }
     }
 
     /// Adds a resource template definition.
     pub fn add_resource_template(&mut self, template: ResourceTemplate) {
-        self.resource_templates
-            .insert(template.uri_template.clone(), template);
+        let matcher = UriTemplate::new(&template.uri_template);
+        let entry = ResourceTemplateEntry {
+            matcher,
+            template: template.clone(),
+            handler: None,
+        };
+        match self.resource_templates.get_mut(&template.uri_template) {
+            Some(existing) => {
+                existing.template = template;
+                existing.matcher = entry.matcher;
+            }
+            None => {
+                self.resource_templates
+                    .insert(template.uri_template.clone(), entry);
+            }
+        }
     }
 
     /// Adds a prompt handler.
@@ -87,7 +116,10 @@ impl Router {
     /// Returns all resource templates.
     #[must_use]
     pub fn resource_templates(&self) -> Vec<ResourceTemplate> {
-        self.resource_templates.values().cloned().collect()
+        self.resource_templates
+            .values()
+            .map(|entry| entry.template.clone())
+            .collect()
     }
 
     /// Returns all prompt definitions.
@@ -135,7 +167,35 @@ impl Router {
     /// Gets a resource template by URI template.
     #[must_use]
     pub fn get_resource_template(&self, uri_template: &str) -> Option<&ResourceTemplate> {
-        self.resource_templates.get(uri_template)
+        self.resource_templates
+            .get(uri_template)
+            .map(|entry| &entry.template)
+    }
+
+    /// Returns true if a resource exists for the given URI (static or template match).
+    #[must_use]
+    pub fn resource_exists(&self, uri: &str) -> bool {
+        self.resolve_resource(uri).is_some()
+    }
+
+    fn resolve_resource(&self, uri: &str) -> Option<ResolvedResource<'_>> {
+        if let Some(handler) = self.resources.get(uri) {
+            return Some(ResolvedResource {
+                handler,
+                params: UriParams::new(),
+            });
+        }
+
+        for entry in self.resource_templates.values() {
+            let Some(handler) = entry.handler.as_ref() else {
+                continue;
+            };
+            if let Some(params) = entry.matcher.matches(uri) {
+                return Some(ResolvedResource { handler, params });
+            }
+        }
+
+        None
     }
 
     /// Gets a prompt handler by name.
@@ -197,6 +257,7 @@ impl Router {
     /// * `request_id` - Internal request ID for tracking
     /// * `params` - The tool call parameters including tool name and arguments
     /// * `budget` - Request budget for timeout enforcement
+    /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     pub fn handle_tools_call(
         &self,
@@ -204,6 +265,7 @@ impl Router {
         request_id: u64,
         params: CallToolParams,
         budget: &Budget,
+        session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
     ) -> McpResult<CallToolResult> {
         debug!(target: targets::HANDLER, "Calling tool: {}", params.name);
@@ -247,15 +309,21 @@ impl Router {
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting if token provided
+        // Create context for the handler with progress reporting and session state
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(cx.clone(), request_id, Some(token), move |req| {
-                    sender(req);
-                })
+                create_context_with_progress(
+                    cx.clone(),
+                    request_id,
+                    Some(token),
+                    Some(session_state),
+                    move |req| {
+                        sender(req);
+                    },
+                )
             }
-            _ => McpContext::new(cx.clone(), request_id),
+            _ => McpContext::with_state(cx.clone(), request_id, session_state),
         };
 
         // Call the handler asynchronously - returns McpOutcome (4-valued)
@@ -322,6 +390,7 @@ impl Router {
     /// * `request_id` - Internal request ID for tracking
     /// * `params` - The resource read parameters including URI
     /// * `budget` - Request budget for timeout enforcement
+    /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     pub fn handle_resources_read(
         &self,
@@ -329,6 +398,7 @@ impl Router {
         request_id: u64,
         params: &ReadResourceParams,
         budget: &Budget,
+        session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
     ) -> McpResult<ReadResourceResult> {
         debug!(target: targets::HANDLER, "Reading resource: {}", params.uri);
@@ -346,29 +416,37 @@ impl Router {
             ));
         }
 
-        // Find the resource handler
-        let handler = self
-            .resources
-            .get(&params.uri)
+        let resolved = self
+            .resolve_resource(&params.uri)
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
 
         // Extract progress token from request metadata
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting if token provided
+        // Create context for the handler with progress reporting and session state
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(cx.clone(), request_id, Some(token), move |req| {
-                    sender(req);
-                })
+                create_context_with_progress(
+                    cx.clone(),
+                    request_id,
+                    Some(token),
+                    Some(session_state),
+                    move |req| {
+                        sender(req);
+                    },
+                )
             }
-            _ => McpContext::new(cx.clone(), request_id),
+            _ => McpContext::with_state(cx.clone(), request_id, session_state),
         };
 
         // Read the resource asynchronously - returns McpOutcome (4-valued)
-        let outcome = block_on(handler.read_async(&ctx));
+        let outcome = block_on(resolved.handler.read_async_with_uri(
+            &ctx,
+            &params.uri,
+            &resolved.params,
+        ));
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
         let contents = outcome.into_mcp_result()?;
@@ -396,6 +474,7 @@ impl Router {
     /// * `request_id` - Internal request ID for tracking
     /// * `params` - The prompt get parameters including name and arguments
     /// * `budget` - Request budget for timeout enforcement
+    /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     pub fn handle_prompts_get(
         &self,
@@ -403,6 +482,7 @@ impl Router {
         request_id: u64,
         params: GetPromptParams,
         budget: &Budget,
+        session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
     ) -> McpResult<GetPromptResult> {
         debug!(target: targets::HANDLER, "Getting prompt: {}", params.name);
@@ -433,15 +513,21 @@ impl Router {
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting if token provided
+        // Create context for the handler with progress reporting and session state
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(cx.clone(), request_id, Some(token), move |req| {
-                    sender(req);
-                })
+                create_context_with_progress(
+                    cx.clone(),
+                    request_id,
+                    Some(token),
+                    Some(session_state),
+                    move |req| {
+                        sender(req);
+                    },
+                )
             }
-            _ => McpContext::new(cx.clone(), request_id),
+            _ => McpContext::with_state(cx.clone(), request_id, session_state),
         };
 
         // Get the prompt asynchronously - returns McpOutcome (4-valued)
@@ -461,5 +547,110 @@ impl Router {
 impl Default for Router {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct ResolvedResource<'a> {
+    handler: &'a BoxedResourceHandler,
+    params: UriParams,
+}
+
+struct ResourceTemplateEntry {
+    matcher: UriTemplate,
+    template: ResourceTemplate,
+    handler: Option<BoxedResourceHandler>,
+}
+
+#[derive(Debug, Clone)]
+struct UriTemplate {
+    pattern: String,
+    segments: Vec<UriSegment>,
+}
+
+#[derive(Debug, Clone)]
+enum UriSegment {
+    Literal(String),
+    Param(String),
+}
+
+impl UriTemplate {
+    fn new(pattern: &str) -> Self {
+        let mut segments = Vec::new();
+        let mut literal = String::new();
+        let mut chars = pattern.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '{' {
+                if !literal.is_empty() {
+                    segments.push(UriSegment::Literal(std::mem::take(&mut literal)));
+                }
+
+                let mut name = String::new();
+                for next in chars.by_ref() {
+                    if next == '}' {
+                        break;
+                    }
+                    name.push(next);
+                }
+
+                if name.is_empty() {
+                    literal.push('{');
+                    literal.push('}');
+                } else {
+                    segments.push(UriSegment::Param(name));
+                }
+            } else {
+                literal.push(ch);
+            }
+        }
+
+        if !literal.is_empty() {
+            segments.push(UriSegment::Literal(literal));
+        }
+
+        Self {
+            pattern: pattern.to_string(),
+            segments,
+        }
+    }
+
+    fn matches(&self, uri: &str) -> Option<UriParams> {
+        let mut params = UriParams::new();
+        let mut remainder = uri;
+        let mut iter = self.segments.iter().peekable();
+
+        while let Some(segment) = iter.next() {
+            match segment {
+                UriSegment::Literal(lit) => {
+                    remainder = remainder.strip_prefix(lit)?;
+                }
+                UriSegment::Param(name) => {
+                    let next_literal = iter.peek().and_then(|next| match next {
+                        UriSegment::Literal(lit) => Some(lit.as_str()),
+                        UriSegment::Param(_) => None,
+                    });
+
+                    if next_literal.is_none() && iter.peek().is_some() {
+                        return None;
+                    }
+
+                    if let Some(literal) = next_literal {
+                        let idx = remainder.find(literal)?;
+                        let value = &remainder[..idx];
+                        params.insert(name.clone(), value.to_string());
+                        remainder = &remainder[idx..];
+                    } else {
+                        params.insert(name.clone(), remainder.to_string());
+                        remainder = "";
+                    }
+                }
+            }
+        }
+
+        if remainder.is_empty() {
+            Some(params)
+        } else {
+            None
+        }
     }
 }

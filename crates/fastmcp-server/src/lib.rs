@@ -26,10 +26,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+mod auth;
 mod builder;
 mod handler;
 mod router;
 mod session;
+mod tasks;
 
 #[cfg(test)]
 mod tests;
@@ -37,12 +39,14 @@ mod tests;
 pub use builder::ServerBuilder;
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
+pub use auth::{AllowAllAuthProvider, AuthProvider, AuthRequest};
 pub use handler::{
     BoxFuture, ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
     create_context_with_progress,
 };
 pub use router::{NotificationSender, Router};
 pub use session::Session;
+pub use tasks::{SharedTaskManager, TaskManager};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -52,19 +56,67 @@ use std::time::Instant;
 use asupersync::{Budget, CancelKind, Cx};
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_console::{banner::StartupBanner, console};
-use fastmcp_core::logging::{error, info, targets};
-use fastmcp_core::{McpError, McpErrorCode};
+use fastmcp_core::logging::{debug, error, info, targets};
+use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode};
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, GetPromptParams, InitializeParams, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, Prompt, ReadResourceParams,
-    RequestId, Resource, ResourceTemplate, ServerCapabilities, ServerInfo, SubscribeResourceParams,
-    Tool, UnsubscribeResourceParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, Prompt,
+    ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
+    SetLogLevelParams, SubscribeResourceParams, Tool, UnsubscribeResourceParams,
 };
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
 use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
-use log::Level;
+use log::{Level, LevelFilter};
+
+/// Type alias for startup hook function.
+pub type StartupHook =
+    Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send>;
+
+/// Type alias for shutdown hook function.
+pub type ShutdownHook = Box<dyn FnOnce() + Send>;
+
+/// Lifecycle hooks for server startup and shutdown.
+///
+/// These hooks allow custom initialization and cleanup logic to run
+/// at well-defined points in the server lifecycle:
+///
+/// - `on_startup`: Called before the server starts accepting connections
+/// - `on_shutdown`: Called when the server is shutting down
+///
+/// # Example
+///
+/// ```ignore
+/// use fastmcp::prelude::*;
+///
+/// Server::new("demo", "1.0.0")
+///     .on_startup(|| {
+///         println!("Initializing...");
+///         // Initialize database, caches, etc.
+///         Ok(())
+///     })
+///     .on_shutdown(|| {
+///         println!("Cleaning up...");
+///         // Close connections, flush buffers, etc.
+///     })
+///     .run_stdio();
+/// ```
+#[derive(Default)]
+pub struct LifespanHooks {
+    /// Hook called before the server starts accepting connections.
+    pub on_startup: Option<StartupHook>,
+    /// Hook called when the server is shutting down.
+    pub on_shutdown: Option<ShutdownHook>,
+}
+
+impl LifespanHooks {
+    /// Creates empty lifecycle hooks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// Logging configuration for the server.
 #[derive(Debug, Clone)]
@@ -150,6 +202,10 @@ pub struct Server {
     logging: LoggingConfig,
     /// Console configuration for rich output.
     console_config: ConsoleConfig,
+    /// Lifecycle hooks (wrapped in Option so they can be taken once).
+    lifespan: Mutex<Option<LifespanHooks>>,
+    /// Optional authentication provider.
+    auth_provider: Option<Arc<dyn AuthProvider>>,
     /// Active requests by JSON-RPC request ID.
     active_requests: Mutex<HashMap<RequestId, Cx>>,
 }
@@ -395,6 +451,56 @@ impl Server {
         self.run_transport_with_cx(cx, transport)
     }
 
+    /// Runs the startup lifecycle hook, if configured.
+    ///
+    /// Returns `true` if startup succeeded (or no hook was configured),
+    /// `false` if the hook returned an error.
+    pub(crate) fn run_startup_hook(&self) -> bool {
+        let hook = {
+            let mut guard = self.lifespan.lock().expect("lifespan lock poisoned");
+            guard.as_mut().and_then(|h| h.on_startup.take())
+        };
+
+        if let Some(hook) = hook {
+            debug!(target: targets::SERVER, "Running startup hook");
+            match hook() {
+                Ok(()) => {
+                    debug!(target: targets::SERVER, "Startup hook completed successfully");
+                    true
+                }
+                Err(e) => {
+                    error!(target: targets::SERVER, "Startup hook failed: {}", e);
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Runs the shutdown lifecycle hook, if configured.
+    pub(crate) fn run_shutdown_hook(&self) {
+        let hook = {
+            let mut guard = self.lifespan.lock().expect("lifespan lock poisoned");
+            guard.as_mut().and_then(|h| h.on_shutdown.take())
+        };
+
+        if let Some(hook) = hook {
+            debug!(target: targets::SERVER, "Running shutdown hook");
+            hook();
+            debug!(target: targets::SERVER, "Shutdown hook completed");
+        }
+    }
+
+    /// Performs graceful shutdown: runs hook, closes stats, exits.
+    fn graceful_shutdown(&self, exit_code: i32) -> ! {
+        self.run_shutdown_hook();
+        if let Some(ref stats) = self.stats {
+            stats.connection_closed();
+        }
+        std::process::exit(exit_code)
+    }
+
     /// Shared server loop for any transport, using closure-based recv/send.
     fn run_loop<R, S>(
         self,
@@ -419,15 +525,18 @@ impl Server {
             self.render_startup_banner();
         }
 
+        // Run startup hook
+        if !self.run_startup_hook() {
+            error!(target: targets::SERVER, "Startup hook failed, exiting");
+            self.graceful_shutdown(1);
+        }
+
         // Main request loop
         loop {
             // Check for cancellation
             if cx.is_cancel_requested() {
                 info!(target: targets::SERVER, "Cancellation requested, shutting down");
-                if let Some(ref stats) = self.stats {
-                    stats.connection_closed();
-                }
-                std::process::exit(0);
+                self.graceful_shutdown(0);
             }
 
             // Receive next message
@@ -435,17 +544,11 @@ impl Server {
                 Ok(msg) => msg,
                 Err(TransportError::Closed) => {
                     // Clean shutdown - track connection close
-                    if let Some(ref stats) = self.stats {
-                        stats.connection_closed();
-                    }
-                    std::process::exit(0);
+                    self.graceful_shutdown(0);
                 }
                 Err(TransportError::Cancelled) => {
                     info!(target: targets::SERVER, "Transport cancelled");
-                    if let Some(ref stats) = self.stats {
-                        stats.connection_closed();
-                    }
-                    std::process::exit(0);
+                    self.graceful_shutdown(0);
                 }
                 Err(e) => {
                     error!(target: targets::TRANSPORT, "Transport error: {}", e);
@@ -635,6 +738,15 @@ impl Server {
             ));
         }
 
+        if self.should_authenticate(method) {
+            let auth_request = AuthRequest {
+                method,
+                params: params.as_ref(),
+                request_id,
+            };
+            self.authenticate_request(cx, request_id, session, auth_request)?;
+        }
+
         match method {
             "initialize" => {
                 let params: InitializeParams = parse_params(params)?;
@@ -655,6 +767,11 @@ impl Server {
                 self.handle_cancelled_notification(params);
                 Ok(serde_json::Value::Null)
             }
+            "logging/setLevel" => {
+                let params: SetLogLevelParams = parse_params(params)?;
+                self.handle_set_log_level(params);
+                Ok(serde_json::Value::Null)
+            }
             "tools/list" => {
                 let params: ListToolsParams = parse_params_or_default(params)?;
                 let result = self.router.handle_tools_list(cx, params)?;
@@ -667,6 +784,7 @@ impl Server {
                     request_id,
                     params,
                     budget,
+                    session.state().clone(),
                     Some(notification_sender),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
@@ -688,13 +806,14 @@ impl Server {
                     request_id,
                     &params,
                     budget,
+                    session.state().clone(),
                     Some(notification_sender),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
             "resources/subscribe" => {
                 let params: SubscribeResourceParams = parse_params(params)?;
-                if self.router.get_resource(&params.uri).is_none() {
+                if !self.router.resource_exists(&params.uri) {
                     return Err(McpError::resource_not_found(&params.uri));
                 }
                 session.subscribe_resource(params.uri);
@@ -717,6 +836,7 @@ impl Server {
                     request_id,
                     params,
                     budget,
+                    session.state().clone(),
                     Some(notification_sender),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
@@ -727,6 +847,35 @@ impl Server {
             }
             _ => Err(McpError::method_not_found(method)),
         }
+    }
+
+    fn should_authenticate(&self, method: &str) -> bool {
+        !matches!(
+            method,
+            "initialize" | "initialized" | "notifications/cancelled" | "ping"
+        )
+    }
+
+    fn authenticate_request(
+        &self,
+        cx: &Cx,
+        request_id: u64,
+        session: &Session,
+        request: AuthRequest<'_>,
+    ) -> Result<AuthContext, McpError> {
+        let Some(provider) = &self.auth_provider else {
+            return Ok(AuthContext::anonymous());
+        };
+
+        let ctx = McpContext::with_state(cx.clone(), request_id, session.state().clone());
+        let auth = provider.authenticate(&ctx, request)?;
+        if !ctx.set_auth(auth.clone()) {
+            debug!(
+                target: targets::SESSION,
+                "Auth context not stored (session state unavailable)"
+            );
+        }
+        Ok(auth)
     }
 
     fn handle_cancelled_notification(&self, params: CancelledParams) {
@@ -759,6 +908,39 @@ impl Server {
                 target: targets::SESSION,
                 "No active request found for cancellation requestId={}",
                 params.request_id
+            );
+        }
+    }
+
+    fn handle_set_log_level(&self, params: SetLogLevelParams) {
+        let requested = match params.level {
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Warning => LevelFilter::Warn,
+            LogLevel::Error => LevelFilter::Error,
+        };
+
+        let configured = self.logging.level.to_level_filter();
+        let effective = if requested > configured {
+            configured
+        } else {
+            requested
+        };
+
+        log::set_max_level(effective);
+
+        if effective != requested {
+            fastmcp_core::logging::warn!(
+                target: targets::SESSION,
+                "Client requested log level {:?}; clamped to server level {:?}",
+                params.level,
+                effective
+            );
+        } else {
+            info!(
+                target: targets::SESSION,
+                "Log level set to {:?}",
+                params.level
             );
         }
     }

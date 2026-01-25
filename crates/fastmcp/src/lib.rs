@@ -53,9 +53,9 @@
 
 // Re-export core types
 pub use fastmcp_core::{
-    Budget, CancelledError, Cx, IntoOutcome, LabConfig, LabRuntime, McpContext, McpError,
-    McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt, RegionId, ResultExt, Scope, TaskId,
-    cancelled, err, ok,
+    AUTH_STATE_KEY, AccessToken, AuthContext, Budget, CancelledError, Cx, IntoOutcome, LabConfig,
+    LabRuntime, McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt,
+    RegionId, ResultExt, Scope, TaskId, cancelled, err, ok,
 };
 
 // Re-export logging module
@@ -78,7 +78,8 @@ pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
 
 // Re-export server types
 pub use fastmcp_server::{
-    PromptHandler, ResourceHandler, Router, Server, ServerBuilder, Session, ToolHandler,
+    AllowAllAuthProvider, AuthProvider, AuthRequest, PromptHandler, ResourceHandler, Router,
+    Server, ServerBuilder, Session, ToolHandler,
 };
 
 // Re-export client types
@@ -94,12 +95,14 @@ pub use fastmcp_macros::{JsonSchema, prompt, resource, tool};
 /// ```
 pub mod prelude {
     pub use crate::{
+        // Context and errors
+        AccessToken,
+        AuthContext,
         // Client
         Client,
         // Protocol types
         Content,
         JsonSchema,
-        // Context and errors
         McpContext,
         McpError,
         McpOutcome,

@@ -190,7 +190,7 @@ impl RichErrorRenderer {
                 .as_ref()
                 .map(|c| c.triplet.unwrap_or_default().hex())
                 .unwrap_or_default();
-            console.print(&format!("\n[{}]Backtrace:[/] инструкция", label_color));
+            console.print(&format!("\n[{}]Backtrace:[/]", label_color));
 
             // Syntax-highlight the backtrace (if syntax feature enabled)
             #[cfg(feature = "syntax")]
@@ -206,7 +206,7 @@ impl RichErrorRenderer {
                 for line in bt.lines() {
                     // Fix hex call
                     let text_color = theme.text_dim.triplet.unwrap_or_default().hex();
-                    console.print(&format!("  [{}]{}[/] инструкция", text_color, line));
+                    console.print(&format!("  [{}]{}[/]", text_color, line));
                 }
             }
         }

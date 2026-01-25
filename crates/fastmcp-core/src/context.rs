@@ -8,6 +8,8 @@ use std::sync::Arc;
 use asupersync::types::CancelReason;
 use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 
+use crate::{AUTH_STATE_KEY, AuthContext, SessionState};
+
 // ============================================================================
 // Notification Sender
 // ============================================================================
@@ -110,6 +112,8 @@ pub struct McpContext {
     request_id: u64,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
+    /// Session state for per-session key-value storage.
+    state: Option<SessionState>,
 }
 
 impl McpContext {
@@ -123,6 +127,20 @@ impl McpContext {
             cx,
             request_id,
             progress_reporter: None,
+            state: None,
+        }
+    }
+
+    /// Creates a new MCP context with session state.
+    ///
+    /// Use this constructor when session state should be accessible to handlers.
+    #[must_use]
+    pub fn with_state(cx: Cx, request_id: u64, state: SessionState) -> Self {
+        Self {
+            cx,
+            request_id,
+            progress_reporter: None,
+            state: Some(state),
         }
     }
 
@@ -136,6 +154,23 @@ impl McpContext {
             cx,
             request_id,
             progress_reporter: Some(reporter),
+            state: None,
+        }
+    }
+
+    /// Creates a new MCP context with both state and progress reporting.
+    #[must_use]
+    pub fn with_state_and_progress(
+        cx: Cx,
+        request_id: u64,
+        state: SessionState,
+        reporter: ProgressReporter,
+    ) -> Self {
+        Self {
+            cx,
+            request_id,
+            progress_reporter: Some(reporter),
+            state: Some(state),
         }
     }
 
@@ -267,10 +302,11 @@ impl McpContext {
     /// }
     /// ```
     pub fn checkpoint(&self) -> Result<(), CancelledError> {
+        self.cx.checkpoint().map_err(|_| CancelledError)?;
         if self.cx.budget().is_exhausted() {
             return Err(CancelledError);
         }
-        self.cx.checkpoint().map_err(|_| CancelledError)
+        Ok(())
     }
 
     /// Executes a closure with cancellation masked.
@@ -310,6 +346,186 @@ impl McpContext {
     #[must_use]
     pub fn cx(&self) -> &Cx {
         &self.cx
+    }
+
+    // ========================================================================
+    // Session State Access
+    // ========================================================================
+
+    /// Gets a value from session state by key.
+    ///
+    /// Returns `None` if:
+    /// - Session state is not available (context created without state)
+    /// - The key doesn't exist
+    /// - Deserialization to type `T` fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn my_tool(ctx: &McpContext, args: MyArgs) -> McpResult<Value> {
+    ///     // Get a counter from session state
+    ///     let count: Option<i32> = ctx.get_state("counter");
+    ///     let count = count.unwrap_or(0);
+    ///     // ... use count ...
+    ///     Ok(json!({"count": count}))
+    /// }
+    /// ```
+    #[must_use]
+    pub fn get_state<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        self.state.as_ref()?.get(key)
+    }
+
+    /// Returns the authentication context for this request, if available.
+    #[must_use]
+    pub fn auth(&self) -> Option<AuthContext> {
+        self.state.as_ref()?.get(AUTH_STATE_KEY)
+    }
+
+    /// Stores authentication context into session state.
+    ///
+    /// Returns `false` if session state is unavailable or serialization fails.
+    pub fn set_auth(&self, auth: AuthContext) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
+        state.set(AUTH_STATE_KEY, auth)
+    }
+
+    /// Sets a value in session state.
+    ///
+    /// The value persists across requests within the same session.
+    /// Returns `true` if the value was successfully stored.
+    /// Returns `false` if session state is not available or serialization fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn my_tool(ctx: &McpContext, args: MyArgs) -> McpResult<Value> {
+    ///     // Increment a counter in session state
+    ///     let count: i32 = ctx.get_state("counter").unwrap_or(0);
+    ///     ctx.set_state("counter", count + 1);
+    ///     Ok(json!({"new_count": count + 1}))
+    /// }
+    /// ```
+    pub fn set_state<T: serde::Serialize>(&self, key: impl Into<String>, value: T) -> bool {
+        match &self.state {
+            Some(state) => state.set(key, value),
+            None => false,
+        }
+    }
+
+    /// Removes a value from session state.
+    ///
+    /// Returns the previous value if it existed, or `None` if:
+    /// - Session state is not available
+    /// - The key didn't exist
+    pub fn remove_state(&self, key: &str) -> Option<serde_json::Value> {
+        self.state.as_ref()?.remove(key)
+    }
+
+    /// Checks if a key exists in session state.
+    ///
+    /// Returns `false` if session state is not available.
+    #[must_use]
+    pub fn has_state(&self, key: &str) -> bool {
+        self.state.as_ref().is_some_and(|s| s.contains(key))
+    }
+
+    /// Returns whether session state is available in this context.
+    #[must_use]
+    pub fn has_session_state(&self) -> bool {
+        self.state.is_some()
+    }
+
+    // ========================================================================
+    // Parallel Combinators
+    // ========================================================================
+
+    /// Waits for all futures to complete and returns their results.
+    ///
+    /// This is the N-of-N combinator: all futures must complete before
+    /// returning. Results are returned in the same order as input futures.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let futures = vec![
+    ///     Box::pin(fetch_user(1)),
+    ///     Box::pin(fetch_user(2)),
+    ///     Box::pin(fetch_user(3)),
+    /// ];
+    /// let users = ctx.join_all(futures).await;
+    /// ```
+    pub async fn join_all<T: Send + 'static>(
+        &self,
+        futures: Vec<crate::combinator::BoxFuture<'_, T>>,
+    ) -> Vec<T> {
+        crate::combinator::join_all(&self.cx, futures).await
+    }
+
+    /// Races multiple futures, returning the first to complete.
+    ///
+    /// This is the 1-of-N combinator: the first future to complete wins,
+    /// and all others are cancelled and drained.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let futures = vec![
+    ///     Box::pin(fetch_from_primary()),
+    ///     Box::pin(fetch_from_replica()),
+    /// ];
+    /// let result = ctx.race(futures).await?;
+    /// ```
+    pub async fn race<T: Send + 'static>(
+        &self,
+        futures: Vec<crate::combinator::BoxFuture<'_, T>>,
+    ) -> crate::McpResult<T> {
+        crate::combinator::race(&self.cx, futures).await
+    }
+
+    /// Waits for M of N futures to complete successfully.
+    ///
+    /// Returns when `required` futures have completed successfully.
+    /// Remaining futures are cancelled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let futures = vec![
+    ///     Box::pin(write_to_replica(1)),
+    ///     Box::pin(write_to_replica(2)),
+    ///     Box::pin(write_to_replica(3)),
+    /// ];
+    /// let result = ctx.quorum(2, futures).await?;
+    /// ```
+    pub async fn quorum<T: Send + 'static>(
+        &self,
+        required: usize,
+        futures: Vec<crate::combinator::BoxFuture<'_, crate::McpResult<T>>>,
+    ) -> crate::McpResult<crate::combinator::QuorumResult<T>> {
+        crate::combinator::quorum(&self.cx, required, futures).await
+    }
+
+    /// Races futures and returns the first successful result.
+    ///
+    /// Unlike `race` which returns the first to complete (success or failure),
+    /// `first_ok` returns the first to complete successfully.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let futures = vec![
+    ///     Box::pin(try_primary()),
+    ///     Box::pin(try_fallback()),
+    /// ];
+    /// let result = ctx.first_ok(futures).await?;
+    /// ```
+    pub async fn first_ok<T: Send + 'static>(
+        &self,
+        futures: Vec<crate::combinator::BoxFuture<'_, crate::McpResult<T>>>,
+    ) -> crate::McpResult<T> {
+        crate::combinator::first_ok(&self.cx, futures).await
     }
 }
 
@@ -514,5 +730,87 @@ mod tests {
         let sender = NoOpNotificationSender;
         // Should not panic
         sender.send_progress(0.5, Some(1.0), Some("test"));
+    }
+
+    // Session state tests
+    #[test]
+    fn test_mcp_context_no_session_state_by_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert!(!ctx.has_session_state());
+    }
+
+    #[test]
+    fn test_mcp_context_with_session_state() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(cx, 1, state);
+        assert!(ctx.has_session_state());
+    }
+
+    #[test]
+    fn test_mcp_context_get_set_state() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(cx, 1, state);
+
+        // Set a value
+        assert!(ctx.set_state("counter", 42));
+
+        // Get the value back
+        let value: Option<i32> = ctx.get_state("counter");
+        assert_eq!(value, Some(42));
+    }
+
+    #[test]
+    fn test_mcp_context_state_not_available() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        // set_state returns false when state is not available
+        assert!(!ctx.set_state("key", "value"));
+
+        // get_state returns None when state is not available
+        let value: Option<String> = ctx.get_state("key");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_mcp_context_has_state() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(cx, 1, state);
+
+        assert!(!ctx.has_state("missing"));
+
+        ctx.set_state("present", true);
+        assert!(ctx.has_state("present"));
+    }
+
+    #[test]
+    fn test_mcp_context_remove_state() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(cx, 1, state);
+
+        ctx.set_state("key", "value");
+        assert!(ctx.has_state("key"));
+
+        let removed = ctx.remove_state("key");
+        assert!(removed.is_some());
+        assert!(!ctx.has_state("key"));
+    }
+
+    #[test]
+    fn test_mcp_context_with_state_and_progress() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let sender = Arc::new(NoOpNotificationSender);
+        let reporter = ProgressReporter::new(sender);
+
+        let ctx = McpContext::with_state_and_progress(cx, 1, state, reporter);
+
+        assert!(ctx.has_session_state());
+        assert!(ctx.has_progress_reporter());
     }
 }
