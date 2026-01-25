@@ -8,6 +8,7 @@ description = "MCP server implementation for FastMCP"
 
 [dependencies]
 fastmcp-core.workspace = true
+fastmcp-client.workspace = true
 fastmcp-console.workspace = true
 fastmcp-protocol.workspace = true
 fastmcp-transport.workspace = true

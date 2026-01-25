@@ -46,12 +46,7 @@ pub trait Middleware: Send + Sync {
     /// Invoked when a handler or middleware returns an error.
     ///
     /// Middleware may rewrite the error before it is sent to the client.
-    fn on_error(
-        &self,
-        _ctx: &McpContext,
-        _request: &JsonRpcRequest,
-        error: McpError,
-    ) -> McpError {
+    fn on_error(&self, _ctx: &McpContext, _request: &JsonRpcRequest, error: McpError) -> McpError {
         error
     }
 }

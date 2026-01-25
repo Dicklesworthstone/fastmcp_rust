@@ -7,13 +7,15 @@ use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
-    ServerCapabilities, ServerInfo, ToolsCapability,
+    ServerCapabilities, ServerInfo, TasksCapability, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
+use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
+use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
-    ToolHandler,
+    AuthProvider, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient,
+    ResourceHandler, Router, Server, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -37,6 +39,10 @@ pub struct ServerBuilder {
     lifespan: LifespanHooks,
     /// Optional authentication provider.
     auth_provider: Option<Arc<dyn AuthProvider>>,
+    /// Registered middleware.
+    middleware: Vec<Box<dyn crate::Middleware>>,
+    /// Optional task manager for background tasks (Docket/SEP-1686).
+    task_manager: Option<SharedTaskManager>,
 }
 
 impl ServerBuilder {
@@ -66,6 +72,8 @@ impl ServerBuilder {
             console_config: ConsoleConfig::from_env(),
             lifespan: LifespanHooks::default(),
             auth_provider: None,
+            middleware: Vec::new(),
+            task_manager: None,
         }
     }
 
@@ -98,6 +106,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers a middleware.
+    #[must_use]
+    pub fn middleware<M: crate::Middleware + 'static>(mut self, middleware: M) -> Self {
+        self.middleware.push(Box::new(middleware));
+        self
+    }
+
     /// Registers a tool handler.
     #[must_use]
     pub fn tool<H: ToolHandler + 'static>(mut self, handler: H) -> Self {
@@ -127,6 +142,52 @@ impl ServerBuilder {
     pub fn prompt<H: PromptHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_prompt(handler);
         self.capabilities.prompts = Some(PromptsCapability::default());
+        self
+    }
+
+    /// Registers proxy handlers for a remote MCP server.
+    ///
+    /// Use [`ProxyCatalog::from_client`] or [`ProxyClient::catalog`] to fetch
+    /// definitions before calling this method.
+    #[must_use]
+    pub fn proxy(mut self, client: ProxyClient, catalog: ProxyCatalog) -> Self {
+        let has_tools = !catalog.tools.is_empty();
+        let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
+        let has_prompts = !catalog.prompts.is_empty();
+
+        for tool in catalog.tools {
+            self.router
+                .add_tool(ProxyToolHandler::new(tool, client.clone()));
+        }
+
+        for resource in catalog.resources {
+            self.router
+                .add_resource(ProxyResourceHandler::new(resource, client.clone()));
+        }
+
+        for template in catalog.resource_templates {
+            self.router
+                .add_resource(ProxyResourceHandler::from_template(
+                    template,
+                    client.clone(),
+                ));
+        }
+
+        for prompt in catalog.prompts {
+            self.router
+                .add_prompt(ProxyPromptHandler::new(prompt, client.clone()));
+        }
+
+        if has_tools {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+        if has_resources {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        if has_prompts {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+
         self
     }
 
@@ -333,6 +394,28 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets a task manager for background tasks (Docket/SEP-1686).
+    ///
+    /// When a task manager is configured, the server will advertise
+    /// task capabilities and handle task-related methods.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastmcp_server::TaskManager;
+    ///
+    /// let task_manager = TaskManager::new();
+    /// Server::new("demo", "1.0.0")
+    ///     .with_task_manager(task_manager.into_shared())
+    ///     .run_stdio();
+    /// ```
+    #[must_use]
+    pub fn with_task_manager(mut self, task_manager: SharedTaskManager) -> Self {
+        self.task_manager = Some(task_manager);
+        self.capabilities.tasks = Some(TasksCapability::default());
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -351,7 +434,9 @@ impl ServerBuilder {
             console_config: self.console_config,
             lifespan: Mutex::new(Some(self.lifespan)),
             auth_provider: self.auth_provider,
+            middleware: Arc::new(self.middleware),
             active_requests: Mutex::new(HashMap::new()),
+            task_manager: self.task_manager,
         }
     }
 }

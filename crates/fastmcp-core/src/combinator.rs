@@ -140,12 +140,14 @@ pub async fn race<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -
 
     // Phase 0: Sequential execution - first future wins
     // Phase 1+: Will use proper concurrent polling with cancellation
-    for fut in futures {
-        return Ok(fut.await);
-    }
-
-    // Unreachable because we checked for empty above
-    unreachable!()
+    let mut iter = futures.into_iter();
+    let Some(fut) = iter.next() else {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "race requires at least one future",
+        ));
+    };
+    Ok(fut.await)
 }
 
 /// Races multiple futures with a timeout.

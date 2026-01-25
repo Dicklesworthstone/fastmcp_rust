@@ -9,14 +9,17 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
 };
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, Content, GetPromptParams, GetPromptResult, InitializeParams,
-    InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressToken, Prompt,
-    ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, Tool, validate,
+    CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, Content, GetPromptParams,
+    GetPromptResult, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
+    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListTasksParams,
+    ListTasksResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressToken, Prompt,
+    ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, SubmitTaskParams,
+    SubmitTaskResult, Tool, validate,
 };
 
 use crate::handler::{UriParams, create_context_with_progress};
+use crate::tasks::SharedTaskManager;
 
 use crate::Session;
 use crate::handler::{
@@ -116,10 +119,13 @@ impl Router {
     /// Returns all resource templates.
     #[must_use]
     pub fn resource_templates(&self) -> Vec<ResourceTemplate> {
-        self.resource_templates
+        let mut templates: Vec<ResourceTemplate> = self
+            .resource_templates
             .values()
             .map(|entry| entry.template.clone())
-            .collect()
+            .collect();
+        templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+        templates
     }
 
     /// Returns all prompt definitions.
@@ -186,7 +192,19 @@ impl Router {
             });
         }
 
-        for entry in self.resource_templates.values() {
+        let mut candidates: Vec<&ResourceTemplateEntry> =
+            self.resource_templates.values().collect();
+        candidates.sort_by(|a, b| {
+            let (a_literals, a_literal_segments, a_segments) = a.matcher.specificity();
+            let (b_literals, b_literal_segments, b_segments) = b.matcher.specificity();
+            b_literals
+                .cmp(&a_literals)
+                .then(b_literal_segments.cmp(&a_literal_segments))
+                .then(b_segments.cmp(&a_segments))
+                .then_with(|| a.template.uri_template.cmp(&b.template.uri_template))
+        });
+
+        for entry in candidates {
             let Some(handler) = entry.handler.as_ref() else {
                 continue;
             };
@@ -542,6 +560,114 @@ impl Router {
             messages,
         })
     }
+
+    // ========================================================================
+    // Task Dispatch Methods (Docket/SEP-1686)
+    // ========================================================================
+
+    /// Handles the tasks/list request.
+    ///
+    /// Lists all background tasks, optionally filtered by status.
+    pub fn handle_tasks_list(
+        &self,
+        _cx: &Cx,
+        params: ListTasksParams,
+        task_manager: Option<&SharedTaskManager>,
+    ) -> McpResult<ListTasksResult> {
+        let task_manager = task_manager.ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::MethodNotFound,
+                "Background tasks not enabled on this server",
+            )
+        })?;
+
+        debug!(target: targets::HANDLER, "Listing tasks (status filter: {:?})", params.status);
+
+        let tasks = task_manager.list_tasks(params.status);
+        Ok(ListTasksResult {
+            tasks,
+            next_cursor: None, // Pagination not yet implemented
+        })
+    }
+
+    /// Handles the tasks/get request.
+    ///
+    /// Gets information about a specific task, including its result if completed.
+    pub fn handle_tasks_get(
+        &self,
+        _cx: &Cx,
+        params: GetTaskParams,
+        task_manager: Option<&SharedTaskManager>,
+    ) -> McpResult<GetTaskResult> {
+        let task_manager = task_manager.ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::MethodNotFound,
+                "Background tasks not enabled on this server",
+            )
+        })?;
+
+        debug!(target: targets::HANDLER, "Getting task: {}", params.id);
+
+        let task = task_manager
+            .get_info(&params.id)
+            .ok_or_else(|| McpError::invalid_params(format!("Task not found: {}", params.id)))?;
+
+        let result = task_manager.get_result(&params.id);
+
+        Ok(GetTaskResult { task, result })
+    }
+
+    /// Handles the tasks/cancel request.
+    ///
+    /// Requests cancellation of a running or pending task.
+    pub fn handle_tasks_cancel(
+        &self,
+        _cx: &Cx,
+        params: CancelTaskParams,
+        task_manager: Option<&SharedTaskManager>,
+    ) -> McpResult<CancelTaskResult> {
+        let task_manager = task_manager.ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::MethodNotFound,
+                "Background tasks not enabled on this server",
+            )
+        })?;
+
+        debug!(target: targets::HANDLER, "Cancelling task: {}", params.id);
+
+        let task = task_manager.cancel(&params.id, params.reason)?;
+
+        Ok(CancelTaskResult {
+            cancelled: true,
+            task,
+        })
+    }
+
+    /// Handles the tasks/submit request.
+    ///
+    /// Submits a new background task for execution.
+    pub fn handle_tasks_submit(
+        &self,
+        cx: &Cx,
+        params: SubmitTaskParams,
+        task_manager: Option<&SharedTaskManager>,
+    ) -> McpResult<SubmitTaskResult> {
+        let task_manager = task_manager.ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::MethodNotFound,
+                "Background tasks not enabled on this server",
+            )
+        })?;
+
+        debug!(target: targets::HANDLER, "Submitting task: {}", params.task_type);
+
+        let task_id = task_manager.submit(cx, &params.task_type, params.params)?;
+        let task = task_manager
+            .get_info(&task_id)
+            .ok_or_else(|| McpError::internal_error("Task created but not found"))?;
+
+        Ok(SubmitTaskResult { task })
+    }
 }
 
 impl Default for Router {
@@ -612,6 +738,18 @@ impl UriTemplate {
             pattern: pattern.to_string(),
             segments,
         }
+    }
+
+    fn specificity(&self) -> (usize, usize, usize) {
+        let mut literal_len = 0usize;
+        let mut literal_segments = 0usize;
+        for segment in &self.segments {
+            if let UriSegment::Literal(lit) = segment {
+                literal_len += lit.len();
+                literal_segments += 1;
+            }
+        }
+        (literal_len, literal_segments, self.segments.len())
     }
 
     fn matches(&self, uri: &str) -> Option<UriParams> {

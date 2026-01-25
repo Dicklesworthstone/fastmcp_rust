@@ -29,6 +29,8 @@
 mod auth;
 mod builder;
 mod handler;
+mod middleware;
+mod proxy;
 mod router;
 mod session;
 mod tasks;
@@ -36,14 +38,16 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 
+pub use auth::{AllowAllAuthProvider, AuthProvider, AuthRequest};
 pub use builder::ServerBuilder;
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
-pub use auth::{AllowAllAuthProvider, AuthProvider, AuthRequest};
 pub use handler::{
     BoxFuture, ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
     create_context_with_progress,
 };
+pub use middleware::{Middleware, MiddlewareDecision};
+pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
 pub use router::{NotificationSender, Router};
 pub use session::Session;
 pub use tasks::{SharedTaskManager, TaskManager};
@@ -59,11 +63,12 @@ use fastmcp_console::{banner::StartupBanner, console};
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode};
 use fastmcp_protocol::{
-    CallToolParams, CancelledParams, GetPromptParams, InitializeParams, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, Prompt,
-    ReadResourceParams, RequestId, Resource, ResourceTemplate, ServerCapabilities, ServerInfo,
-    SetLogLevelParams, SubscribeResourceParams, Tool, UnsubscribeResourceParams,
+    CallToolParams, CancelTaskParams, CancelledParams, GetPromptParams, GetTaskParams,
+    InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListTasksParams,
+    ListToolsParams, LogLevel, Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate,
+    ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams, SubscribeResourceParams,
+    Tool, UnsubscribeResourceParams,
 };
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
@@ -206,8 +211,12 @@ pub struct Server {
     lifespan: Mutex<Option<LifespanHooks>>,
     /// Optional authentication provider.
     auth_provider: Option<Arc<dyn AuthProvider>>,
+    /// Registered middleware.
+    middleware: Arc<Vec<Box<dyn crate::Middleware>>>,
     /// Active requests by JSON-RPC request ID.
     active_requests: Mutex<HashMap<RequestId, Cx>>,
+    /// Optional task manager for background tasks (Docket/SEP-1686).
+    task_manager: Option<SharedTaskManager>,
 }
 
 impl Server {
@@ -252,6 +261,14 @@ impl Server {
     #[must_use]
     pub fn prompts(&self) -> Vec<Prompt> {
         self.router.prompts()
+    }
+
+    /// Returns the task manager, if configured.
+    ///
+    /// Returns `None` if background tasks are not enabled.
+    #[must_use]
+    pub fn task_manager(&self) -> Option<&SharedTaskManager> {
+        self.task_manager.as_ref()
     }
 
     /// Returns a point-in-time snapshot of server statistics.
@@ -644,8 +661,7 @@ impl Server {
         let result = self.dispatch_method(
             &request_cx,
             session,
-            &method,
-            request.params,
+            request,
             request_id,
             &budget,
             notification_sender,
@@ -710,8 +726,7 @@ impl Server {
         &self,
         cx: &Cx,
         session: &mut Session,
-        method: &str,
-        params: Option<serde_json::Value>,
+        request: JsonRpcRequest,
         request_id: u64,
         budget: &Budget,
         notification_sender: &NotificationSender,
@@ -730,24 +745,37 @@ impl Server {
         }
 
         // Check initialization state
-        // Per MCP spec, client must send initialize first.
-        // We allow "ping" for health checks even before initialization.
-        if !session.is_initialized() && method != "initialize" && method != "ping" {
+        if !session.is_initialized() && request.method != "initialize" && request.method != "ping" {
             return Err(McpError::invalid_request(
                 "Server not initialized. Client must send 'initialize' first.",
             ));
         }
 
-        if self.should_authenticate(method) {
+        // Middleware: on_request
+        // We use a temporary context derived from the request context for middleware
+        // so they can access session state but share the request's lifecycle.
+        let mw_ctx = McpContext::with_state(cx.clone(), request_id, session.state().clone());
+
+        for m in self.middleware.iter() {
+            match m.on_request(&mw_ctx, &request)? {
+                crate::MiddlewareDecision::Continue => {}
+                crate::MiddlewareDecision::Respond(v) => return Ok(v),
+            }
+        }
+
+        if self.should_authenticate(&request.method) {
             let auth_request = AuthRequest {
-                method,
-                params: params.as_ref(),
+                method: &request.method,
+                params: request.params.as_ref(),
                 request_id,
             };
             self.authenticate_request(cx, request_id, session, auth_request)?;
         }
 
-        match method {
+        let method = &request.method;
+        let params = request.params.clone();
+
+        let result = match method.as_str() {
             "initialize" => {
                 let params: InitializeParams = parse_params(params)?;
                 let result = self.router.handle_initialize(
@@ -845,7 +873,54 @@ impl Server {
                 // Simple ping-pong for health checks
                 Ok(serde_json::json!({}))
             }
+            // Task methods (Docket/SEP-1686)
+            "tasks/list" => {
+                let params: ListTasksParams = parse_params_or_default(params)?;
+                let result =
+                    self.router
+                        .handle_tasks_list(cx, params, self.task_manager.as_ref())?;
+                Ok(serde_json::to_value(result).map_err(McpError::from)?)
+            }
+            "tasks/get" => {
+                let params: GetTaskParams = parse_params(params)?;
+                let result =
+                    self.router
+                        .handle_tasks_get(cx, params, self.task_manager.as_ref())?;
+                Ok(serde_json::to_value(result).map_err(McpError::from)?)
+            }
+            "tasks/cancel" => {
+                let params: CancelTaskParams = parse_params(params)?;
+                let result =
+                    self.router
+                        .handle_tasks_cancel(cx, params, self.task_manager.as_ref())?;
+                Ok(serde_json::to_value(result).map_err(McpError::from)?)
+            }
+            "tasks/submit" => {
+                let params: SubmitTaskParams = parse_params(params)?;
+                let result =
+                    self.router
+                        .handle_tasks_submit(cx, params, self.task_manager.as_ref())?;
+                Ok(serde_json::to_value(result).map_err(McpError::from)?)
+            }
             _ => Err(McpError::method_not_found(method)),
+        };
+
+        // Middleware: on_response / on_error
+        match result {
+            Ok(v) => {
+                let mut resp = v;
+                for m in self.middleware.iter() {
+                    resp = m.on_response(&mw_ctx, &request, resp)?;
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                let mut err = e;
+                for m in self.middleware.iter() {
+                    err = m.on_error(&mw_ctx, &request, err);
+                }
+                Err(err)
+            }
         }
     }
 

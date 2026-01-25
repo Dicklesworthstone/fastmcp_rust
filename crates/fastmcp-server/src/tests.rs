@@ -514,11 +514,11 @@ mod router_tests {
         assert!(!call_result.is_error);
         assert_eq!(call_result.content.len(), 1);
 
-        if let Content::Text { text } = &call_result.content[0] {
-            assert_eq!(text, "Hello, Alice!");
-        } else {
-            panic!("Expected text content");
-        }
+        assert!(matches!(call_result.content[0], Content::Text { .. }));
+        let Content::Text { text } = &call_result.content[0] else {
+            return;
+        };
+        assert_eq!(text, "Hello, Alice!");
     }
 
     #[test]
@@ -704,11 +704,11 @@ mod router_tests {
         let get_result = result.unwrap();
         assert_eq!(get_result.messages.len(), 1);
 
-        if let Content::Text { text } = &get_result.messages[0].content {
-            assert!(text.contains("Bob"));
-        } else {
-            panic!("Expected text content");
-        }
+        assert!(matches!(get_result.messages[0].content, Content::Text { .. }));
+        let Content::Text { text } = &get_result.messages[0].content else {
+            return;
+        };
+        assert!(text.contains("Bob"));
     }
 
     #[test]

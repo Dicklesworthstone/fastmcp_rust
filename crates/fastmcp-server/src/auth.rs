@@ -25,11 +25,7 @@ pub trait AuthProvider: Send + Sync {
     /// Authenticate an incoming request.
     ///
     /// Return `Ok(AuthContext)` to allow, or an `Err(McpError)` to deny.
-    fn authenticate(
-        &self,
-        ctx: &McpContext,
-        request: AuthRequest<'_>,
-    ) -> McpResult<AuthContext>;
+    fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext>;
 }
 
 /// Default allow-all provider (returns anonymous auth context).
@@ -37,11 +33,7 @@ pub trait AuthProvider: Send + Sync {
 pub struct AllowAllAuthProvider;
 
 impl AuthProvider for AllowAllAuthProvider {
-    fn authenticate(
-        &self,
-        _ctx: &McpContext,
-        _request: AuthRequest<'_>,
-    ) -> McpResult<AuthContext> {
+    fn authenticate(&self, _ctx: &McpContext, _request: AuthRequest<'_>) -> McpResult<AuthContext> {
         Ok(AuthContext::anonymous())
     }
 }

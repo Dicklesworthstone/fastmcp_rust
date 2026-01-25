@@ -78,8 +78,8 @@ pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
 
 // Re-export server types
 pub use fastmcp_server::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, PromptHandler, ResourceHandler, Router,
-    Server, ServerBuilder, Session, ToolHandler,
+    AllowAllAuthProvider, AuthProvider, AuthRequest, PromptHandler, ProxyBackend, ProxyCatalog,
+    ProxyClient, ResourceHandler, Router, Server, ServerBuilder, Session, ToolHandler,
 };
 
 // Re-export client types
@@ -113,11 +113,14 @@ pub mod prelude {
         Prompt,
         PromptArgument,
         PromptMessage,
+        // Server
+        ProxyBackend,
+        ProxyCatalog,
+        ProxyClient,
         Resource,
         ResourceContent,
         ResultExt,
         Role,
-        // Server
         Server,
         Tool,
         cancelled,

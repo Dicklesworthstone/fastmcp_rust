@@ -22,29 +22,28 @@
 //! let task_manager = TaskManager::new();
 //!
 //! // Submit a background task
-//! let task_id = task_manager.submit(&cx, "long_analysis", json!({"data": ...})).await?;
+//! let task_id = task_manager.submit(&cx, "long_analysis", Some(json!({"data": ...})))?;
 //!
 //! // Check status
 //! let info = task_manager.get_info(&task_id);
 //!
 //! // Cancel if needed
-//! task_manager.cancel(&task_id, Some("User requested")).await?;
+//! task_manager.cancel(&task_id, Some("User requested"))?;
 //! ```
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use asupersync::Cx;
+use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+use asupersync::{Budget, CancelKind, Cx};
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{TaskId, TaskInfo, TaskResult, TaskStatus};
 
 /// Callback type for task execution.
 ///
 /// Task handlers receive the context and parameters, and return a result.
-pub type TaskHandler = Box<
-    dyn Fn(&Cx, serde_json::Value) -> TaskFuture + Send + Sync + 'static,
->;
+pub type TaskHandler = Box<dyn Fn(&Cx, serde_json::Value) -> TaskFuture + Send + Sync + 'static>;
 
 /// Future type for task execution.
 pub type TaskFuture = std::pin::Pin<
@@ -59,6 +58,8 @@ struct TaskState {
     cancel_requested: bool,
     /// Task result once completed.
     result: Option<TaskResult>,
+    /// Task-scoped cancellation context.
+    cx: Cx,
 }
 
 /// Background task manager.
@@ -67,24 +68,34 @@ struct TaskState {
 /// tracking, and cancellation.
 pub struct TaskManager {
     /// Active and completed tasks by ID.
-    tasks: RwLock<HashMap<TaskId, TaskState>>,
+    tasks: Arc<RwLock<HashMap<TaskId, TaskState>>>,
     /// Registered task handlers by type.
-    handlers: RwLock<HashMap<String, TaskHandler>>,
+    handlers: Arc<RwLock<HashMap<String, TaskHandler>>>,
     /// Counter for generating unique task IDs.
     task_counter: AtomicU64,
     /// Whether task list changes should trigger notifications.
     list_changed_notifications: bool,
+    /// Background runtime handle for executing tasks.
+    runtime: RuntimeHandle,
+    /// Whether submitted tasks should execute immediately.
+    auto_execute: bool,
 }
 
 impl TaskManager {
     /// Creates a new task manager.
     #[must_use]
     pub fn new() -> Self {
+        let runtime = RuntimeBuilder::multi_thread()
+            .build()
+            .expect("failed to build background task runtime")
+            .handle();
         Self {
-            tasks: RwLock::new(HashMap::new()),
-            handlers: RwLock::new(HashMap::new()),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            handlers: Arc::new(RwLock::new(HashMap::new())),
             task_counter: AtomicU64::new(0),
             list_changed_notifications: false,
+            runtime,
+            auto_execute: true,
         }
     }
 
@@ -95,6 +106,22 @@ impl TaskManager {
             list_changed_notifications: true,
             ..Self::new()
         }
+    }
+
+    /// Creates a task manager configured for deterministic tests.
+    ///
+    /// Tasks are not executed automatically; tests can drive state manually.
+    #[must_use]
+    pub fn new_for_testing() -> Self {
+        let mut manager = Self::new();
+        manager.auto_execute = false;
+        manager
+    }
+
+    /// Converts this manager into a shared handle.
+    #[must_use]
+    pub fn into_shared(self) -> SharedTaskManager {
+        Arc::new(self)
     }
 
     /// Returns whether list change notifications are enabled.
@@ -112,9 +139,7 @@ impl TaskManager {
         Fut: std::future::Future<Output = McpResult<serde_json::Value>> + Send + 'static,
     {
         let task_type = task_type.into();
-        let boxed_handler: TaskHandler = Box::new(move |cx, params| {
-            Box::pin(handler(cx, params))
-        });
+        let boxed_handler: TaskHandler = Box::new(move |cx, params| Box::pin(handler(cx, params)));
 
         let mut handlers = self.handlers.write().unwrap();
         handlers.insert(task_type, boxed_handler);
@@ -148,6 +173,7 @@ impl TaskManager {
 
         // Create task info
         let now = chrono::Utc::now().to_rfc3339();
+        let task_cx = Cx::for_testing_with_budget(Budget::INFINITE);
         let info = TaskInfo {
             id: task_id.clone(),
             task_type: task_type.clone(),
@@ -165,16 +191,104 @@ impl TaskManager {
             info,
             cancel_requested: false,
             result: None,
+            cx: task_cx.clone(),
         };
 
-        let mut tasks = self.tasks.write().unwrap();
-        tasks.insert(task_id.clone(), state);
+        {
+            let mut tasks = self.tasks.write().unwrap();
+            tasks.insert(task_id.clone(), state);
+        }
 
-        // Note: Actual task execution would be spawned in the background region.
-        // For now, we just track the task state. The execution integration
-        // will be added when we integrate with the Server's background region.
+        if self.auto_execute {
+            let params = params.unwrap_or_else(|| serde_json::json!({}));
+            self.spawn_task(task_id.clone(), task_type, task_cx, params);
+        }
 
         Ok(task_id)
+    }
+
+    fn spawn_task(
+        &self,
+        task_id: TaskId,
+        task_type: String,
+        task_cx: Cx,
+        params: serde_json::Value,
+    ) {
+        let tasks = Arc::clone(&self.tasks);
+        let handlers = Arc::clone(&self.handlers);
+
+        self.runtime.spawn(async move {
+            {
+                let mut tasks_guard = tasks.write().unwrap();
+                let Some(state) = tasks_guard.get_mut(&task_id) else {
+                    return;
+                };
+                if state.cancel_requested {
+                    return;
+                }
+                state.info.status = TaskStatus::Running;
+                state.info.started_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+
+            let task_future = {
+                let handlers_guard = handlers.read().unwrap();
+                let Some(handler) = handlers_guard.get(&task_type) else {
+                    let mut tasks_guard = tasks.write().unwrap();
+                    if let Some(state) = tasks_guard.get_mut(&task_id) {
+                        if !state.cancel_requested {
+                            let error_msg = format!("Unknown task type: {task_type}");
+                            state.info.status = TaskStatus::Failed;
+                            state.info.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            state.info.error = Some(error_msg.clone());
+                            state.result = Some(TaskResult {
+                                id: task_id.clone(),
+                                success: false,
+                                data: None,
+                                error: Some(error_msg),
+                            });
+                        }
+                    }
+                    return;
+                };
+                (handler)(&task_cx, params)
+            };
+
+            let result = task_future.await;
+
+            let mut tasks_guard = tasks.write().unwrap();
+            let Some(state) = tasks_guard.get_mut(&task_id) else {
+                return;
+            };
+            if state.cancel_requested {
+                return;
+            }
+
+            match result {
+                Ok(data) => {
+                    state.info.status = TaskStatus::Completed;
+                    state.info.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    state.info.progress = Some(1.0);
+                    state.result = Some(TaskResult {
+                        id: task_id.clone(),
+                        success: true,
+                        data: Some(data),
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    let error_msg = err.message;
+                    state.info.status = TaskStatus::Failed;
+                    state.info.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    state.info.error = Some(error_msg.clone());
+                    state.result = Some(TaskResult {
+                        id: task_id.clone(),
+                        success: false,
+                        data: None,
+                        error: Some(error_msg),
+                    });
+                }
+            }
+        });
     }
 
     /// Starts execution of a pending task.
@@ -291,6 +405,8 @@ impl TaskManager {
         state.info.status = TaskStatus::Cancelled;
         state.info.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
+        state.cx.cancel_with(CancelKind::User, None);
+
         let error_msg = reason.unwrap_or_else(|| "Cancelled by request".to_string());
         state.info.error = Some(error_msg.clone());
         state.result = Some(TaskResult {
@@ -307,9 +423,7 @@ impl TaskManager {
     #[must_use]
     pub fn is_cancel_requested(&self, task_id: &TaskId) -> bool {
         let tasks = self.tasks.read().unwrap();
-        tasks
-            .get(task_id)
-            .is_some_and(|s| s.cancel_requested)
+        tasks.get(task_id).is_some_and(|s| s.cancel_requested)
     }
 
     /// Returns the number of active (non-terminal) tasks.
@@ -331,7 +445,6 @@ impl TaskManager {
     /// This is useful for preventing unbounded memory growth from completed tasks.
     pub fn cleanup_completed(&self, max_age: std::time::Duration) {
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
-        let cutoff_str = cutoff.to_rfc3339();
 
         let mut tasks = self.tasks.write().unwrap();
         tasks.retain(|_, state| {
@@ -342,7 +455,10 @@ impl TaskManager {
 
             // Keep recent completed tasks
             if let Some(ref completed) = state.info.completed_at {
-                return completed > &cutoff_str;
+                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(completed) {
+                    return parsed.with_timezone(&chrono::Utc) > cutoff;
+                }
+                return true;
             }
 
             true
@@ -363,7 +479,10 @@ impl std::fmt::Debug for TaskManager {
         f.debug_struct("TaskManager")
             .field("task_count", &tasks.len())
             .field("handler_count", &handlers.len())
-            .field("list_changed_notifications", &self.list_changed_notifications)
+            .field(
+                "list_changed_notifications",
+                &self.list_changed_notifications,
+            )
             .finish()
     }
 }
@@ -393,7 +512,9 @@ mod tests {
     fn test_register_handler() {
         let manager = TaskManager::new();
 
-        manager.register_handler("test_task", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("test_task", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         // Submit should succeed now
         let cx = Cx::for_testing();
@@ -412,10 +533,12 @@ mod tests {
 
     #[test]
     fn test_task_lifecycle() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("test", |_cx, _params| async { Ok(serde_json::json!({"done": true})) });
+        manager.register_handler("test", |_cx, _params| async {
+            Ok(serde_json::json!({"done": true}))
+        });
 
         // Submit
         let task_id = manager.submit(&cx, "test", None).unwrap();
@@ -451,10 +574,12 @@ mod tests {
 
     #[test]
     fn test_task_failure() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("fail_test", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("fail_test", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         let task_id = manager.submit(&cx, "fail_test", None).unwrap();
         manager.start_task(&task_id).unwrap();
@@ -471,16 +596,20 @@ mod tests {
 
     #[test]
     fn test_task_cancellation() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("cancel_test", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("cancel_test", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         let task_id = manager.submit(&cx, "cancel_test", None).unwrap();
         manager.start_task(&task_id).unwrap();
 
         // Cancel
-        let info = manager.cancel(&task_id, Some("User cancelled".into())).unwrap();
+        let info = manager
+            .cancel(&task_id, Some("User cancelled".into()))
+            .unwrap();
         assert_eq!(info.status, TaskStatus::Cancelled);
 
         // Check cancel flag
@@ -493,14 +622,16 @@ mod tests {
 
     #[test]
     fn test_list_tasks() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("list_test", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("list_test", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         let task1 = manager.submit(&cx, "list_test", None).unwrap();
         let task2 = manager.submit(&cx, "list_test", None).unwrap();
-        let task3 = manager.submit(&cx, "list_test", None).unwrap();
+        let _task3 = manager.submit(&cx, "list_test", None).unwrap();
 
         // All pending initially
         assert_eq!(manager.list_tasks(Some(TaskStatus::Pending)).len(), 3);
@@ -522,10 +653,12 @@ mod tests {
 
     #[test]
     fn test_active_count() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("count_test", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("count_test", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         let task1 = manager.submit(&cx, "count_test", None).unwrap();
         let task2 = manager.submit(&cx, "count_test", None).unwrap();
@@ -546,10 +679,12 @@ mod tests {
 
     #[test]
     fn test_progress_clamping() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
 
-        manager.register_handler("clamp_test", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("clamp_test", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
 
         let task_id = manager.submit(&cx, "clamp_test", None).unwrap();
         manager.start_task(&task_id).unwrap();
