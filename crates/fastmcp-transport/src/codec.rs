@@ -29,6 +29,20 @@ impl Codec {
         }
     }
 
+    /// Returns the maximum allowed message size in bytes.
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
+    /// Sets the maximum allowed message size in bytes.
+    pub fn set_max_message_size(&mut self, size: usize) {
+        self.max_message_size = size;
+        if self.buffer.len() > size {
+            self.buffer.clear();
+        }
+    }
+
     /// Encodes a request to bytes.
     ///
     /// # Errors
@@ -59,10 +73,6 @@ impl Codec {
     ///
     /// Returns an error if a complete line fails to parse or if the buffer exceeds the limit.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<JsonRpcMessage>, CodecError> {
-        if self.buffer.len() + data.len() > self.max_message_size {
-            return Err(CodecError::MessageTooLarge(self.buffer.len() + data.len()));
-        }
-
         self.buffer.extend_from_slice(data);
 
         let mut messages = Vec::new();
@@ -70,6 +80,11 @@ impl Codec {
 
         for (i, &byte) in self.buffer.iter().enumerate() {
             if byte == b'\n' {
+                let line_len = i - start;
+                if line_len > self.max_message_size {
+                    self.buffer.clear();
+                    return Err(CodecError::MessageTooLarge(line_len));
+                }
                 let line = &self.buffer[start..i];
                 if !line.is_empty() {
                     let msg: JsonRpcMessage = serde_json::from_slice(line)?;
@@ -82,6 +97,12 @@ impl Codec {
         // Keep any incomplete data in buffer
         if start > 0 {
             self.buffer.drain(..start);
+        }
+
+        if self.buffer.len() > self.max_message_size {
+            let size = self.buffer.len();
+            self.buffer.clear();
+            return Err(CodecError::MessageTooLarge(size));
         }
 
         Ok(messages)
@@ -158,11 +179,12 @@ mod tests {
         let messages = codec2.decode(&encoded).unwrap();
         assert_eq!(messages.len(), 1);
 
-        match &messages[0] {
-            JsonRpcMessage::Response(resp) => {
-                assert_eq!(resp.id, Some(RequestId::Number(1)));
-            }
-            JsonRpcMessage::Request(_) => panic!("Expected response"),
+        assert!(
+            matches!(&messages[0], JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        if let JsonRpcMessage::Response(resp) = &messages[0] {
+            assert_eq!(resp.id, Some(RequestId::Number(1)));
         }
     }
 
@@ -175,15 +197,53 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
 
-        match &messages[0] {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test1"),
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(
+            matches!(&messages[0], JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "test1");
         }
 
-        match &messages[1] {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test2"),
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(
+            matches!(&messages[1], JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = &messages[1] {
+            assert_eq!(req.method, "test2");
         }
+    }
+
+    #[test]
+    fn test_decode_allows_multiple_messages_over_buffer_limit() {
+        let req1 = JsonRpcRequest::new("test1", None, 1i64);
+        let req2 = JsonRpcRequest::new("test2", None, 2i64);
+        let line1 = serde_json::to_vec(&req1).unwrap();
+        let line2 = serde_json::to_vec(&req2).unwrap();
+
+        let mut codec = Codec::new();
+        codec.max_message_size = line1.len();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&line1);
+        input.push(b'\n');
+        input.extend_from_slice(&line2);
+        input.push(b'\n');
+
+        let messages = codec.decode(&input).unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_incomplete_line() {
+        let req = JsonRpcRequest::new("oversized", None, 1i64);
+        let line = serde_json::to_vec(&req).unwrap();
+
+        let mut codec = Codec::new();
+        codec.max_message_size = line.len().saturating_sub(1);
+
+        let result = codec.decode(&line);
+        assert!(matches!(result, Err(CodecError::MessageTooLarge(_))));
     }
 
     #[test]
@@ -200,9 +260,12 @@ mod tests {
         let messages = codec.decode(rest).unwrap();
         assert_eq!(messages.len(), 1);
 
-        match &messages[0] {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test"),
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(
+            matches!(&messages[0], JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "test");
         }
     }
 
@@ -214,10 +277,8 @@ mod tests {
         let result = codec.decode(invalid);
         assert!(result.is_err());
 
-        match result.unwrap_err() {
-            CodecError::Json(_) => {} // Expected
-            CodecError::MessageTooLarge(_) => panic!("Expected JSON error"),
-        }
+        let err = result.unwrap_err();
+        assert!(matches!(err, CodecError::Json(_)));
     }
 
     #[test]
@@ -245,9 +306,12 @@ mod tests {
         let messages = codec.decode(complete).unwrap();
 
         assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "fresh"),
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(
+            matches!(&messages[0], JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "fresh");
         }
     }
 

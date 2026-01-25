@@ -78,7 +78,7 @@ use fastmcp_protocol::{
 };
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
-use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
+use fastmcp_transport::{AsyncStdout, Codec, StdioTransport, Transport, TransportError};
 use log::{Level, LevelFilter};
 
 /// Type alias for startup hook function.
@@ -1399,12 +1399,24 @@ fn parse_params_or_default<T: serde::de::DeserializeOwned + Default>(
 /// Converts a JSON-RPC RequestId to a u64 for internal tracking.
 ///
 /// If the ID is a number, uses that number. If it's a string or absent,
-/// uses 0 as a fallback.
+/// uses a stable hash (string) or 0 (absent) as a fallback.
 fn request_id_to_u64(id: Option<&RequestId>) -> u64 {
     match id {
-        Some(RequestId::Number(n)) => (*n).try_into().unwrap_or(0),
-        Some(RequestId::String(_)) | None => 0,
+        Some(RequestId::Number(n)) => *n as u64,
+        Some(RequestId::String(s)) => stable_hash_request_id(s),
+        None => 0,
     }
+}
+
+fn stable_hash_request_id(value: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    if hash == 0 { FNV_OFFSET } else { hash }
 }
 
 struct SharedTransport<T> {
@@ -1470,13 +1482,12 @@ where
 fn create_notification_sender() -> NotificationSender {
     use std::sync::Mutex;
 
-    // Create a Mutex-wrapped stdout handle for thread-safe writes.
-    // Each notification write is atomic at the stdout level.
-    let stdout = Mutex::new(std::io::stdout());
+    // Use AsyncStdout so notifications share the global stdout lock used by
+    // the transport writer, preventing interleaved NDJSON writes.
+    let stdout = Mutex::new(AsyncStdout::new());
     let codec = Codec::new();
 
     Arc::new(move |request: JsonRpcRequest| {
-        // Encode the notification to JSON
         let bytes = match codec.encode_request(&request) {
             Ok(b) => b,
             Err(e) => {
@@ -1485,12 +1496,11 @@ fn create_notification_sender() -> NotificationSender {
             }
         };
 
-        // Write to stdout atomically
         if let Ok(mut stdout) = stdout.lock() {
-            if let Err(e) = stdout.write_all(&bytes) {
+            if let Err(e) = stdout.write_all_unchecked(&bytes) {
                 log::error!(target: targets::TRANSPORT, "Failed to send notification: {}", e);
             }
-            if let Err(e) = stdout.flush() {
+            if let Err(e) = stdout.flush_unchecked() {
                 log::error!(target: targets::TRANSPORT, "Failed to flush notification: {}", e);
             }
         } else {

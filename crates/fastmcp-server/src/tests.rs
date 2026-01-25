@@ -281,6 +281,32 @@ impl Middleware for StepMiddleware {
     }
 }
 
+#[test]
+fn request_id_to_u64_number() {
+    let id = RequestId::Number(42);
+    assert_eq!(crate::request_id_to_u64(Some(&id)), 42);
+}
+
+#[test]
+fn request_id_to_u64_negative_number() {
+    let id = RequestId::Number(-1);
+    assert_eq!(crate::request_id_to_u64(Some(&id)), (-1i64) as u64);
+}
+
+#[test]
+fn request_id_to_u64_string_stable_nonzero() {
+    let id = RequestId::String("abc".to_string());
+    let first = crate::request_id_to_u64(Some(&id));
+    let second = crate::request_id_to_u64(Some(&id));
+    assert_eq!(first, second);
+    assert_ne!(first, 0);
+}
+
+#[test]
+fn request_id_to_u64_none_is_zero() {
+    assert_eq!(crate::request_id_to_u64(None), 0);
+}
+
 #[derive(Debug)]
 struct FailingRequestMiddleware {
     name: &'static str,

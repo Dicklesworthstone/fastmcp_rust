@@ -37,12 +37,12 @@ use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, ClientInfo, Content,
     GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage,
-    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
-    ListToolsResult, LogLevel, LogMessageParams, PROTOCOL_VERSION, ProgressParams, ProgressToken,
-    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, RequestMeta,
-    Resource, ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams,
-    Tool,
+    JsonRpcRequest, JsonRpcResponse, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
+    PROTOCOL_VERSION, ProgressToken as ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
+    ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate,
+    ServerCapabilities, ServerInfo, SetLogLevelParams, Tool,
 };
 
 /// Callback for receiving progress notifications during tool execution.
@@ -50,6 +50,22 @@ use fastmcp_protocol::{
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
+
+#[derive(Debug, serde::Deserialize)]
+struct ClientProgressParams {
+    #[serde(rename = "progressToken")]
+    marker: ProgressMarker,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+fn method_not_found_response(request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
+    let id = request.id.clone()?;
+    let error = McpError::method_not_found(&request.method);
+    let response = JsonRpcResponse::error(Some(id), error.into());
+    Some(JsonRpcMessage::Response(response))
+}
 
 /// An MCP client instance.
 ///
@@ -284,12 +300,19 @@ impl Client {
                 JsonRpcMessage::Request(request) => {
                     // Server sending a request to client (e.g., notification)
                     if request.method == "notifications/message" {
-                        if let Some(params) = request.params {
-                            if let Ok(message) = serde_json::from_value::<LogMessageParams>(params)
+                        if let Some(params) = request.params.as_ref() {
+                            if let Ok(message) =
+                                serde_json::from_value::<LogMessageParams>(params.clone())
                             {
                                 self.emit_log_message(message);
                             }
                         }
+                    }
+
+                    if let Some(response) = method_not_found_response(&request) {
+                        self.transport
+                            .send(&self.cx, &response)
+                            .map_err(transport_error_to_mcp)?;
                     }
                 }
             }
@@ -375,20 +398,26 @@ impl Client {
         arguments: serde_json::Value,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<Vec<Content>> {
-        // Generate a unique progress token based on request ID
+        // Generate a unique request ID and reuse it as the progress token.
+        let request_id = self.next_request_id();
         #[allow(clippy::cast_possible_wrap)]
-        let progress_token = ProgressToken::Number(self.next_request_id() as i64);
+        let progress_marker = ProgressMarker::Number(request_id as i64);
 
         let params = CallToolParams {
             name: name.to_string(),
             arguments: Some(arguments),
             meta: Some(RequestMeta {
-                progress_token: Some(progress_token.clone()),
+                progress_token: Some(progress_marker.clone()),
             }),
         };
 
-        let result: CallToolResult =
-            self.send_request_with_progress("tools/call", params, &progress_token, on_progress)?;
+        let result: CallToolResult = self.send_request_with_progress(
+            "tools/call",
+            params,
+            request_id,
+            &progress_marker,
+            on_progress,
+        )?;
 
         if result.is_error {
             // Extract error message from content if available
@@ -411,15 +440,15 @@ impl Client {
         &mut self,
         method: &str,
         params: P,
-        expected_token: &ProgressToken,
+        request_id: u64,
+        expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<R> {
-        let id = self.next_request_id();
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
         #[allow(clippy::cast_possible_wrap)]
-        let request = JsonRpcRequest::new(method, Some(params_value), id as i64);
+        let request = JsonRpcRequest::new(method, Some(params_value), request_id as i64);
 
         // Send request
         self.transport
@@ -427,7 +456,7 @@ impl Client {
             .map_err(transport_error_to_mcp)?;
 
         // Receive response, handling progress notifications
-        let response = self.recv_response_with_progress(expected_token, on_progress)?;
+        let response = self.recv_response_with_progress(expected_marker, on_progress)?;
 
         // Check for error response
         if let Some(error) = response.error {
@@ -449,7 +478,7 @@ impl Client {
     /// Receives a response from the transport, handling progress notifications.
     fn recv_response_with_progress(
         &mut self,
-        expected_token: &ProgressToken,
+        expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
         loop {
@@ -463,10 +492,12 @@ impl Client {
                 JsonRpcMessage::Request(request) => {
                     // Check if this is a progress notification
                     if request.method == "notifications/progress" {
-                        if let Some(params) = request.params {
-                            if let Ok(progress) = serde_json::from_value::<ProgressParams>(params) {
-                                // Only handle progress for our expected token
-                                if progress.progress_token == *expected_token {
+                        if let Some(params) = request.params.as_ref() {
+                            if let Ok(progress) =
+                                serde_json::from_value::<ClientProgressParams>(params.clone())
+                            {
+                                // Only handle progress for our expected marker
+                                if progress.marker == *expected_marker {
                                     on_progress(
                                         progress.progress,
                                         progress.total,
@@ -476,12 +507,19 @@ impl Client {
                             }
                         }
                     } else if request.method == "notifications/message" {
-                        if let Some(params) = request.params {
-                            if let Ok(message) = serde_json::from_value::<LogMessageParams>(params)
+                        if let Some(params) = request.params.as_ref() {
+                            if let Ok(message) =
+                                serde_json::from_value::<LogMessageParams>(params.clone())
                             {
                                 self.emit_log_message(message);
                             }
                         }
+                    }
+
+                    if let Some(response) = method_not_found_response(&request) {
+                        self.transport
+                            .send(&self.cx, &response)
+                            .map_err(transport_error_to_mcp)?;
                     }
                     // Continue waiting for actual response
                 }
@@ -609,5 +647,34 @@ fn transport_error_to_mcp(e: TransportError) -> McpError {
         TransportError::Codec(codec_err) => {
             McpError::internal_error(format!("Codec error: {codec_err}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_not_found_response_for_request() {
+        let request = JsonRpcRequest::new("sampling/createMessage", None, "req-1");
+        let response = method_not_found_response(&request);
+        assert!(response.is_some());
+        if let Some(JsonRpcMessage::Response(resp)) = response {
+            assert!(matches!(
+                resp.error.as_ref(),
+                Some(error)
+                    if error.code == i32::from(fastmcp_core::McpErrorCode::MethodNotFound)
+            ));
+            assert_eq!(resp.id, Some(RequestId::String("req-1".to_string())));
+        } else {
+            assert!(matches!(response, Some(JsonRpcMessage::Response(_))));
+        }
+    }
+
+    #[test]
+    fn method_not_found_response_for_notification() {
+        let request = JsonRpcRequest::notification("notifications/message", None);
+        let response = method_not_found_response(&request);
+        assert!(response.is_none());
     }
 }

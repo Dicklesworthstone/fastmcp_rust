@@ -706,8 +706,14 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             if is_optional {
                 quote! {
-                    let #name: #ty = arguments.get(#name_str)
-                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    let #name: #ty = match arguments.get(#name_str) {
+                        Some(value) => Some(
+                            serde_json::from_value(value.clone()).map_err(|e| {
+                                fastmcp_core::McpError::invalid_params(e.to_string())
+                            })?,
+                        ),
+                        None => None,
+                    };
                 }
             } else {
                 quote! {

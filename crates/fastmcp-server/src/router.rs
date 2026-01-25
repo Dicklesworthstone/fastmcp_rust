@@ -817,12 +817,33 @@ impl UriTemplate {
                         params.insert(name.clone(), value);
                         remainder = &remainder[idx..];
                     } else {
+                        // Last param: only allow "/" when this is the sole param.
+                        // Multi-param templates should not let the tail param
+                        // consume extra path segments.
                         if remainder.is_empty() {
                             return None;
                         }
-                        let value = percent_decode(remainder)?;
+
+                        let allow_slash_in_last_param = self
+                            .segments
+                            .iter()
+                            .filter(|seg| matches!(seg, UriSegment::Param(_)))
+                            .count()
+                            == 1;
+
+                        let end_idx = if allow_slash_in_last_param {
+                            remainder.len()
+                        } else {
+                            remainder.find('/').unwrap_or(remainder.len())
+                        };
+
+                        let value = &remainder[..end_idx];
+                        if value.is_empty() {
+                            return None;
+                        }
+                        let value = percent_decode(value)?;
                         params.insert(name.clone(), value);
-                        remainder = "";
+                        remainder = &remainder[end_idx..];
                     }
                 }
             }
@@ -903,6 +924,15 @@ mod uri_template_tests {
     fn uri_template_rejects_extra_segments() {
         let matcher = UriTemplate::new("db://{table}/{id}");
         assert!(matcher.matches("db://users/42/extra").is_none());
+    }
+
+    #[test]
+    fn uri_template_rejects_extra_segments_with_literal_path() {
+        let matcher = UriTemplate::new("db://{table}/items/{id}");
+        let params = matcher.matches("db://users/items/42").expect("match");
+        assert_eq!(params.get("table").map(String::as_str), Some("users"));
+        assert_eq!(params.get("id").map(String::as_str), Some("42"));
+        assert!(matcher.matches("db://users/items/42/extra").is_none());
     }
 
     #[test]

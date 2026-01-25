@@ -18,6 +18,7 @@ use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 /// Async wrapper for stdin.
@@ -107,6 +108,8 @@ pub struct AsyncStdout {
     inner: std::io::Stdout,
 }
 
+static STDOUT_LOCK: Mutex<()> = Mutex::new(());
+
 impl AsyncStdout {
     /// Creates a new `AsyncStdout` wrapping the standard output.
     #[must_use]
@@ -130,6 +133,9 @@ impl AsyncStdout {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
 
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.write_all(buf)
     }
 
@@ -144,6 +150,9 @@ impl AsyncStdout {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
 
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.flush()
     }
 
@@ -158,6 +167,9 @@ impl AsyncStdout {
     ///
     /// Returns an error only on I/O failure.
     pub fn write_all_unchecked(&mut self, buf: &[u8]) -> io::Result<()> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.write_all(buf)
     }
 
@@ -170,6 +182,9 @@ impl AsyncStdout {
     ///
     /// Returns an error only on I/O failure.
     pub fn flush_unchecked(&mut self) -> io::Result<()> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.flush()
     }
 }
@@ -181,14 +196,23 @@ impl AsyncStdout {
 /// during reservation.
 impl Write for AsyncStdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.flush()
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.write_all(buf)
     }
 }
@@ -206,11 +230,17 @@ impl AsyncWrite for AsyncStdout {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // Phase 0: Blocking write, immediate Poll::Ready
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         let n = self.inner.write(buf)?;
         Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let _guard = STDOUT_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.flush()?;
         Poll::Ready(Ok(()))
     }

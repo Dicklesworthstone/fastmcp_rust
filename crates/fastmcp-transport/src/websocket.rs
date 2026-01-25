@@ -153,6 +153,7 @@ impl WsFrame {
 /// Handles frame parsing according to RFC 6455.
 pub struct WsReader<R> {
     reader: BufReader<R>,
+    max_frame_size: usize,
 }
 
 impl<R: Read> WsReader<R> {
@@ -160,6 +161,7 @@ impl<R: Read> WsReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
+            max_frame_size: 10 * 1024 * 1024,
         }
     }
 
@@ -197,6 +199,20 @@ impl<R: Read> WsReader<R> {
         } else {
             None
         };
+
+        let max_frame_size = self.max_frame_size as u64;
+        if payload_len > max_frame_size {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WebSocket frame too large: {payload_len} bytes"),
+            )));
+        }
+        if payload_len > usize::MAX as u64 {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WebSocket frame length exceeds platform limits",
+            )));
+        }
 
         // Read payload
         let mut payload = vec![0u8; payload_len as usize];
@@ -293,6 +309,7 @@ pub struct WsTransport<R, W> {
     writer: WsWriter<W>,
     codec: Codec,
     fragment_buffer: Vec<u8>,
+    max_message_size: usize,
 }
 
 impl<R: Read, W: Write> WsTransport<R, W> {
@@ -303,6 +320,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
             writer: WsWriter::new(writer),
             codec: Codec::new(),
             fragment_buffer: Vec::new(),
+            max_message_size: 10 * 1024 * 1024,
         }
     }
 
@@ -380,6 +398,17 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                     }
 
                     // Start of fragmented message
+                    let next_len = self
+                        .fragment_buffer
+                        .len()
+                        .saturating_add(frame.payload.len());
+                    if next_len > self.max_message_size {
+                        self.fragment_buffer.clear();
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fragmented message exceeds size limit",
+                        )));
+                    }
                     self.fragment_buffer.extend(frame.payload);
                     continue;
                 }
@@ -391,6 +420,17 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                         )));
                     }
 
+                    let next_len = self
+                        .fragment_buffer
+                        .len()
+                        .saturating_add(frame.payload.len());
+                    if next_len > self.max_message_size {
+                        self.fragment_buffer.clear();
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fragmented message exceeds size limit",
+                        )));
+                    }
                     self.fragment_buffer.extend(frame.payload);
 
                     if frame.fin {
@@ -586,6 +626,7 @@ pub struct WsClientTransport<R, W> {
     writer: WsClientWriter<W>,
     codec: Codec,
     fragment_buffer: Vec<u8>,
+    max_message_size: usize,
 }
 
 impl<R: Read, W: Write> WsClientTransport<R, W> {
@@ -596,6 +637,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
             writer: WsClientWriter::new(writer),
             codec: Codec::new(),
             fragment_buffer: Vec::new(),
+            max_message_size: 10 * 1024 * 1024,
         }
     }
 
@@ -674,6 +716,17 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                     }
 
                     // Start of fragmented message
+                    let next_len = self
+                        .fragment_buffer
+                        .len()
+                        .saturating_add(frame.payload.len());
+                    if next_len > self.max_message_size {
+                        self.fragment_buffer.clear();
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fragmented message exceeds size limit",
+                        )));
+                    }
                     self.fragment_buffer.extend(frame.payload);
                     continue;
                 }
@@ -685,6 +738,17 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                         )));
                     }
 
+                    let next_len = self
+                        .fragment_buffer
+                        .len()
+                        .saturating_add(frame.payload.len());
+                    if next_len > self.max_message_size {
+                        self.fragment_buffer.clear();
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fragmented message exceeds size limit",
+                        )));
+                    }
                     self.fragment_buffer.extend(frame.payload);
 
                     if frame.fin {
@@ -906,6 +970,49 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_rejects_oversized_frame() {
+        let mut buffer = Vec::new();
+        buffer.push(0x81); // FIN + Text opcode
+        buffer.push(0x03); // 3-byte payload
+        buffer.extend_from_slice(b"hey");
+
+        let mut reader = WsReader::new(Cursor::new(buffer));
+        reader.max_frame_size = 2;
+
+        let err = reader.read_frame().unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn test_fragmented_message_size_limit() {
+        let mut buffer = Vec::new();
+
+        // Text frame start (FIN=0, opcode=Text)
+        buffer.push(0x01);
+        buffer.push(0x05);
+        buffer.extend_from_slice(b"hello");
+
+        // Continuation frame end (FIN=1, opcode=Continuation)
+        buffer.push(0x80);
+        buffer.push(0x05);
+        buffer.extend_from_slice(b"world");
+
+        let cx = Cx::for_testing();
+        let writer: Vec<u8> = Vec::new();
+        let mut transport = WsTransport::new(Cursor::new(buffer), writer);
+        transport.max_message_size = 8;
+
+        let err = transport.recv(&cx).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
     fn test_transport_roundtrip() {
         use fastmcp_protocol::RequestId;
 
@@ -935,12 +1042,13 @@ mod tests {
             let mut transport = WsTransport::new(Cursor::new(write_buf), writer);
 
             let msg = transport.recv(&cx).unwrap();
-            match msg {
-                JsonRpcMessage::Request(req) => {
-                    assert_eq!(req.method, "test");
-                    assert_eq!(req.id, Some(RequestId::Number(1)));
-                }
-                _ => panic!("Expected request"),
+            assert!(
+                matches!(msg, JsonRpcMessage::Request(_)),
+                "Expected request"
+            );
+            if let JsonRpcMessage::Request(req) = msg {
+                assert_eq!(req.method, "test");
+                assert_eq!(req.id, Some(RequestId::Number(1)));
             }
         }
     }
@@ -983,11 +1091,12 @@ mod tests {
 
         // Should skip ping (auto-pong) and return the text message
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-            }
-            _ => panic!("Expected request"),
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "test");
         }
 
         // Check that pong was written

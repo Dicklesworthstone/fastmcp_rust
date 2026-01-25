@@ -44,7 +44,7 @@ use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
 use crate::async_io::{AsyncLineReader, AsyncStdout};
-use crate::{Codec, SendPermit, Transport, TransportError, TwoPhaseTransport};
+use crate::{Codec, CodecError, SendPermit, Transport, TransportError, TwoPhaseTransport};
 
 /// Stdio transport implementation.
 ///
@@ -100,6 +100,17 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         }
 
         // Trim trailing newline
+        let line_len = {
+            let line = self
+                .line_buffer
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+            line.len()
+        };
+        if line_len > self.codec.max_message_size() {
+            self.line_buffer.clear();
+            return Err(TransportError::Codec(CodecError::MessageTooLarge(line_len)));
+        }
         let line = self
             .line_buffer
             .trim_end_matches('\n')
@@ -324,6 +335,12 @@ impl Transport for AsyncStdioTransport {
             })?
             .ok_or(TransportError::Closed)?;
 
+        if line.len() > self.codec.max_message_size() {
+            return Err(TransportError::Codec(CodecError::MessageTooLarge(
+                line.len(),
+            )));
+        }
+
         // Parse the JSON message
         let message: JsonRpcMessage = serde_json::from_str(&line)
             .map_err(|e| TransportError::Codec(crate::CodecError::Json(e)))?;
@@ -430,11 +447,9 @@ mod tests {
         // Use Cx::for_testing() for unit tests
         let cx = Cx::for_testing();
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-            }
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(matches!(&msg, JsonRpcMessage::Request(_)));
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "test");
         }
     }
 
@@ -474,12 +489,32 @@ mod tests {
 
         let cx = Cx::for_testing();
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-            }
-            JsonRpcMessage::Response(_) => panic!("Expected request"),
+        assert!(matches!(&msg, JsonRpcMessage::Request(_)));
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "test");
         }
+    }
+
+    #[test]
+    fn test_recv_rejects_oversized_line() {
+        let request = JsonRpcRequest::new("test/method", None, 1i64);
+        let line = serde_json::to_vec(&request).unwrap();
+        let mut input = line.clone();
+        input.push(b'\n');
+        let reader = Cursor::new(input);
+        let writer = Vec::new();
+
+        let mut transport = StdioTransport::new(reader, writer);
+        transport
+            .codec
+            .set_max_message_size(line.len().saturating_sub(1));
+
+        let cx = Cx::for_testing();
+        let result = transport.recv(&cx);
+        assert!(matches!(
+            result,
+            Err(TransportError::Codec(CodecError::MessageTooLarge(_)))
+        ));
     }
 
     #[test]

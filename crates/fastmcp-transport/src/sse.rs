@@ -390,6 +390,7 @@ impl<R: Read> SseReader<R> {
         }
 
         let mut event_type: Option<SseEventType> = None;
+        let mut unknown_event = false;
         let mut data_lines: Vec<String> = Vec::new();
         let mut event_id: Option<String> = None;
         let mut retry: Option<u64> = None;
@@ -414,6 +415,14 @@ impl<R: Read> SseReader<R> {
 
             // Empty line = end of event
             if line.is_empty() {
+                if unknown_event {
+                    event_type = None;
+                    data_lines.clear();
+                    event_id = None;
+                    retry = None;
+                    unknown_event = false;
+                    continue;
+                }
                 if event_type.is_some() || !data_lines.is_empty() {
                     // We have an event to return
                     let data = data_lines.join("\n");
@@ -440,7 +449,13 @@ impl<R: Read> SseReader<R> {
 
                 match field {
                     "event" => {
-                        event_type = SseEventType::from_str(value);
+                        if let Some(parsed) = SseEventType::from_str(value) {
+                            event_type = Some(parsed);
+                            unknown_event = false;
+                        } else {
+                            event_type = None;
+                            unknown_event = true;
+                        }
                     }
                     "data" => {
                         data_lines.push(value.to_string());
@@ -804,6 +819,25 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_reader_skips_unknown_events() {
+        let input = b"event: ping\ndata: keep-alive\n\n\
+event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n\n";
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+
+        let cx = Cx::for_testing();
+        let message = sse_reader.read_message(&cx).unwrap().unwrap();
+
+        assert!(
+            matches!(message, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        if let JsonRpcMessage::Request(req) = message {
+            assert_eq!(req.method, "ping");
+        }
+    }
+
+    #[test]
     fn test_sse_reader_eof() {
         let input = b"";
         let reader = Cursor::new(input.to_vec());
@@ -875,11 +909,12 @@ mod tests {
         let mut reader = SseReader::new(Cursor::new(written));
         let read_message = reader.read_message(&cx).unwrap().unwrap();
 
-        match read_message {
-            JsonRpcMessage::Response(resp) => {
-                assert_eq!(resp.result, Some(serde_json::json!({"status": "ok"})));
-            }
-            _ => panic!("Expected response"),
+        assert!(
+            matches!(read_message, JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        if let JsonRpcMessage::Response(resp) = read_message {
+            assert_eq!(resp.result, Some(serde_json::json!({"status": "ok"})));
         }
     }
 
