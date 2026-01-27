@@ -376,3 +376,98 @@ pub struct TasksCapability {
     )]
     pub list_changed: bool,
 }
+
+// ============================================================================
+// Sampling Protocol Types
+// ============================================================================
+
+/// Message content for sampling requests.
+///
+/// Can contain text, images, or tool-related content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SamplingContent {
+    /// Text content.
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// Image content.
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type (e.g., "image/png").
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+}
+
+/// A message in a sampling conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingMessage {
+    /// Message role (user or assistant).
+    pub role: Role,
+    /// Message content.
+    pub content: SamplingContent,
+}
+
+impl SamplingMessage {
+    /// Creates a new user message with text content.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: SamplingContent::Text { text: text.into() },
+        }
+    }
+
+    /// Creates a new assistant message with text content.
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: SamplingContent::Text { text: text.into() },
+        }
+    }
+}
+
+/// Model preferences for sampling requests.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelPreferences {
+    /// Hints for model selection (model names or patterns).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<ModelHint>,
+    /// Priority for cost (0.0 = lowest priority, 1.0 = highest).
+    #[serde(rename = "costPriority", skip_serializing_if = "Option::is_none")]
+    pub cost_priority: Option<f64>,
+    /// Priority for speed (0.0 = lowest priority, 1.0 = highest).
+    #[serde(rename = "speedPriority", skip_serializing_if = "Option::is_none")]
+    pub speed_priority: Option<f64>,
+    /// Priority for intelligence (0.0 = lowest priority, 1.0 = highest).
+    #[serde(
+        rename = "intelligencePriority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub intelligence_priority: Option<f64>,
+}
+
+/// A hint for model selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelHint {
+    /// Model name or pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Stop reason for sampling responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopReason {
+    /// End of natural turn.
+    #[default]
+    EndTurn,
+    /// Hit stop sequence.
+    StopSequence,
+    /// Hit max tokens limit.
+    MaxTokens,
+}

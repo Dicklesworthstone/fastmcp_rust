@@ -36,8 +36,9 @@ mod state;
 
 pub use auth::{AUTH_STATE_KEY, AccessToken, AuthContext};
 pub use context::{
-    CancelledError, IntoOutcome, McpContext, NoOpNotificationSender, NotificationSender,
-    ProgressReporter,
+    CancelledError, IntoOutcome, McpContext, NoOpNotificationSender, NoOpSamplingSender,
+    NotificationSender, ProgressReporter, SamplingRequest, SamplingRequestMessage,
+    SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
 };
 pub use error::{
     McpError, McpErrorCode, McpOutcome, McpResult, OutcomeExt, ResultExt, cancelled, err, ok,

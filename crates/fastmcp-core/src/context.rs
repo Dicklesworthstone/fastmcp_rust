@@ -29,6 +29,195 @@ pub trait NotificationSender: Send + Sync {
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>);
 }
 
+// ============================================================================
+// Sampling Sender
+// ============================================================================
+
+/// Trait for sending sampling requests to the client.
+///
+/// Sampling allows the server to request LLM completions from the client.
+/// This enables agentic workflows where tools can leverage the client's
+/// LLM capabilities.
+pub trait SamplingSender: Send + Sync {
+    /// Sends a sampling/createMessage request to the client.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The sampling request parameters
+    ///
+    /// # Returns
+    ///
+    /// The sampling response from the client, or an error if sampling failed
+    /// or the client doesn't support sampling.
+    fn create_message(
+        &self,
+        request: SamplingRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::McpResult<SamplingResponse>> + Send + '_>,
+    >;
+}
+
+/// Parameters for a sampling request.
+#[derive(Debug, Clone)]
+pub struct SamplingRequest {
+    /// Conversation messages.
+    pub messages: Vec<SamplingRequestMessage>,
+    /// Maximum tokens to generate.
+    pub max_tokens: u32,
+    /// Optional system prompt.
+    pub system_prompt: Option<String>,
+    /// Sampling temperature (0.0 to 2.0).
+    pub temperature: Option<f64>,
+    /// Stop sequences to end generation.
+    pub stop_sequences: Vec<String>,
+    /// Model hints for preference.
+    pub model_hints: Vec<String>,
+}
+
+impl SamplingRequest {
+    /// Creates a new sampling request with the given messages and max tokens.
+    #[must_use]
+    pub fn new(messages: Vec<SamplingRequestMessage>, max_tokens: u32) -> Self {
+        Self {
+            messages,
+            max_tokens,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: Vec::new(),
+            model_hints: Vec::new(),
+        }
+    }
+
+    /// Creates a simple user prompt request.
+    #[must_use]
+    pub fn prompt(text: impl Into<String>, max_tokens: u32) -> Self {
+        Self::new(vec![SamplingRequestMessage::user(text)], max_tokens)
+    }
+
+    /// Sets the system prompt.
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sets the temperature.
+    #[must_use]
+    pub fn with_temperature(mut self, temp: f64) -> Self {
+        self.temperature = Some(temp);
+        self
+    }
+
+    /// Adds stop sequences.
+    #[must_use]
+    pub fn with_stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.stop_sequences = sequences;
+        self
+    }
+
+    /// Adds model hints.
+    #[must_use]
+    pub fn with_model_hints(mut self, hints: Vec<String>) -> Self {
+        self.model_hints = hints;
+        self
+    }
+}
+
+/// A message in a sampling request.
+#[derive(Debug, Clone)]
+pub struct SamplingRequestMessage {
+    /// Message role.
+    pub role: SamplingRole,
+    /// Message text content.
+    pub text: String,
+}
+
+impl SamplingRequestMessage {
+    /// Creates a user message.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: SamplingRole::User,
+            text: text.into(),
+        }
+    }
+
+    /// Creates an assistant message.
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: SamplingRole::Assistant,
+            text: text.into(),
+        }
+    }
+}
+
+/// Role in a sampling message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingRole {
+    /// User message.
+    User,
+    /// Assistant message.
+    Assistant,
+}
+
+/// Response from a sampling request.
+#[derive(Debug, Clone)]
+pub struct SamplingResponse {
+    /// Generated text content.
+    pub text: String,
+    /// Model that was used.
+    pub model: String,
+    /// Reason generation stopped.
+    pub stop_reason: SamplingStopReason,
+}
+
+impl SamplingResponse {
+    /// Creates a new sampling response.
+    #[must_use]
+    pub fn new(text: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            model: model.into(),
+            stop_reason: SamplingStopReason::EndTurn,
+        }
+    }
+}
+
+/// Stop reason for sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SamplingStopReason {
+    /// End of natural turn.
+    #[default]
+    EndTurn,
+    /// Hit stop sequence.
+    StopSequence,
+    /// Hit max tokens limit.
+    MaxTokens,
+}
+
+/// A no-op sampling sender that always returns an error.
+///
+/// Used when the client doesn't support sampling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOpSamplingSender;
+
+impl SamplingSender for NoOpSamplingSender {
+    fn create_message(
+        &self,
+        _request: SamplingRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::McpResult<SamplingResponse>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Err(crate::McpError::new(
+                crate::McpErrorCode::InvalidRequest,
+                "Sampling not supported: client does not have sampling capability",
+            ))
+        })
+    }
+}
+
 /// A no-op notification sender used when progress reporting is disabled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpNotificationSender;
@@ -89,6 +278,7 @@ impl std::fmt::Debug for ProgressReporter {
 /// - Cancellation checkpoints for cancel-safe handlers
 /// - Budget/deadline awareness for timeout enforcement
 /// - Region-scoped spawning for background work
+/// - Sampling capability for LLM completions (if client supports it)
 ///
 /// # Example
 ///
@@ -100,11 +290,14 @@ impl std::fmt::Debug for ProgressReporter {
 ///     // Do work with budget awareness
 ///     let remaining = ctx.budget();
 ///
+///     // Request an LLM completion (if available)
+///     let response = ctx.sample("Write a haiku about Rust", 100).await?;
+///
 ///     // Return result
-///     Ok(json!({"result": "success"}))
+///     Ok(json!({"result": response.text}))
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpContext {
     /// The underlying capability context.
     cx: Cx,
@@ -114,6 +307,20 @@ pub struct McpContext {
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
     state: Option<SessionState>,
+    /// Optional sampling sender for LLM completions.
+    sampling_sender: Option<Arc<dyn SamplingSender>>,
+}
+
+impl std::fmt::Debug for McpContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpContext")
+            .field("cx", &self.cx)
+            .field("request_id", &self.request_id)
+            .field("progress_reporter", &self.progress_reporter)
+            .field("state", &self.state.is_some())
+            .field("sampling_sender", &self.sampling_sender.is_some())
+            .finish()
+    }
 }
 
 impl McpContext {
@@ -128,6 +335,7 @@ impl McpContext {
             request_id,
             progress_reporter: None,
             state: None,
+            sampling_sender: None,
         }
     }
 
@@ -141,6 +349,7 @@ impl McpContext {
             request_id,
             progress_reporter: None,
             state: Some(state),
+            sampling_sender: None,
         }
     }
 
@@ -155,6 +364,7 @@ impl McpContext {
             request_id,
             progress_reporter: Some(reporter),
             state: None,
+            sampling_sender: None,
         }
     }
 
@@ -171,7 +381,18 @@ impl McpContext {
             request_id,
             progress_reporter: Some(reporter),
             state: Some(state),
+            sampling_sender: None,
         }
+    }
+
+    /// Sets the sampling sender for this context.
+    ///
+    /// This enables the `sample()` method to request LLM completions from
+    /// the client.
+    #[must_use]
+    pub fn with_sampling(mut self, sender: Arc<dyn SamplingSender>) -> Self {
+        self.sampling_sender = Some(sender);
+        self
     }
 
     /// Returns whether progress reporting is enabled for this context.
@@ -435,6 +656,97 @@ impl McpContext {
     #[must_use]
     pub fn has_session_state(&self) -> bool {
         self.state.is_some()
+    }
+
+    // ========================================================================
+    // Sampling (LLM Completions)
+    // ========================================================================
+
+    /// Returns whether sampling is available in this context.
+    ///
+    /// Sampling is available when the client has advertised sampling
+    /// capability and a sampling sender has been configured.
+    #[must_use]
+    pub fn can_sample(&self) -> bool {
+        self.sampling_sender.is_some()
+    }
+
+    /// Requests an LLM completion from the client.
+    ///
+    /// This is a convenience method for simple text prompts. For more control
+    /// over the request, use [`sample_with_request`](Self::sample_with_request).
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The prompt text to send (as a user message)
+    /// * `max_tokens` - Maximum number of tokens to generate
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The client doesn't support sampling
+    /// - The sampling request fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn my_tool(ctx: &McpContext, topic: String) -> McpResult<String> {
+    ///     let response = ctx.sample(&format!("Write a haiku about {topic}"), 100).await?;
+    ///     Ok(response.text)
+    /// }
+    /// ```
+    pub async fn sample(
+        &self,
+        prompt: impl Into<String>,
+        max_tokens: u32,
+    ) -> crate::McpResult<SamplingResponse> {
+        let request = SamplingRequest::prompt(prompt, max_tokens);
+        self.sample_with_request(request).await
+    }
+
+    /// Requests an LLM completion with full control over the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The full sampling request parameters
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The client doesn't support sampling
+    /// - The sampling request fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn my_tool(ctx: &McpContext) -> McpResult<String> {
+    ///     let request = SamplingRequest::new(
+    ///         vec![
+    ///             SamplingRequestMessage::user("Hello!"),
+    ///             SamplingRequestMessage::assistant("Hi! How can I help?"),
+    ///             SamplingRequestMessage::user("Tell me a joke."),
+    ///         ],
+    ///         200,
+    ///     )
+    ///     .with_system_prompt("You are a helpful and funny assistant.")
+    ///     .with_temperature(0.8);
+    ///
+    ///     let response = ctx.sample_with_request(request).await?;
+    ///     Ok(response.text)
+    /// }
+    /// ```
+    pub async fn sample_with_request(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::McpResult<SamplingResponse> {
+        let sender = self.sampling_sender.as_ref().ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InvalidRequest,
+                "Sampling not available: client does not support sampling capability",
+            )
+        })?;
+
+        sender.create_message(request).await
     }
 
     // ========================================================================

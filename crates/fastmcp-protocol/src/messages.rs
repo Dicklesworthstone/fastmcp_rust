@@ -485,6 +485,141 @@ pub struct TaskStatusNotificationParams {
     pub result: Option<TaskResult>,
 }
 
+// ============================================================================
+// Sampling (Server-to-Client LLM requests)
+// ============================================================================
+
+use crate::types::{ModelPreferences, SamplingContent, SamplingMessage, StopReason};
+
+/// sampling/createMessage request params.
+///
+/// Sent from server to client to request an LLM completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMessageParams {
+    /// Conversation messages.
+    pub messages: Vec<SamplingMessage>,
+    /// Maximum tokens to generate.
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: u32,
+    /// Optional system prompt.
+    #[serde(rename = "systemPrompt", skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Sampling temperature (0.0 to 2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Stop sequences to end generation.
+    #[serde(
+        rename = "stopSequences",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub stop_sequences: Vec<String>,
+    /// Model preferences/hints.
+    #[serde(rename = "modelPreferences", skip_serializing_if = "Option::is_none")]
+    pub model_preferences: Option<ModelPreferences>,
+    /// Include context from MCP servers.
+    #[serde(rename = "includeContext", skip_serializing_if = "Option::is_none")]
+    pub include_context: Option<IncludeContext>,
+    /// Request metadata.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+impl CreateMessageParams {
+    /// Creates a new sampling request with default settings.
+    #[must_use]
+    pub fn new(messages: Vec<SamplingMessage>, max_tokens: u32) -> Self {
+        Self {
+            messages,
+            max_tokens,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: Vec::new(),
+            model_preferences: None,
+            include_context: None,
+            meta: None,
+        }
+    }
+
+    /// Sets the system prompt.
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sets the sampling temperature.
+    #[must_use]
+    pub fn with_temperature(mut self, temp: f64) -> Self {
+        self.temperature = Some(temp);
+        self
+    }
+
+    /// Adds stop sequences.
+    #[must_use]
+    pub fn with_stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.stop_sequences = sequences;
+        self
+    }
+}
+
+/// Context inclusion mode for sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IncludeContext {
+    /// Include no MCP context.
+    None,
+    /// Include context from the current server only.
+    ThisServer,
+    /// Include context from all connected MCP servers.
+    AllServers,
+}
+
+/// sampling/createMessage response result.
+///
+/// Returned by the client with the LLM completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMessageResult {
+    /// Generated content.
+    pub content: SamplingContent,
+    /// Role of the generated message (always "assistant").
+    pub role: crate::types::Role,
+    /// Model that was used.
+    pub model: String,
+    /// Reason generation stopped.
+    #[serde(rename = "stopReason")]
+    pub stop_reason: StopReason,
+}
+
+impl CreateMessageResult {
+    /// Creates a new text completion result.
+    #[must_use]
+    pub fn text(text: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            content: SamplingContent::Text { text: text.into() },
+            role: crate::types::Role::Assistant,
+            model: model.into(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    /// Sets the stop reason.
+    #[must_use]
+    pub fn with_stop_reason(mut self, reason: StopReason) -> Self {
+        self.stop_reason = reason;
+        self
+    }
+
+    /// Returns the text content if this is a text response.
+    #[must_use]
+    pub fn text_content(&self) -> Option<&str> {
+        match &self.content {
+            SamplingContent::Text { text } => Some(text),
+            SamplingContent::Image { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +763,119 @@ mod tests {
                 "message": "halfway"
             })
         );
+    }
+
+    // ========================================================================
+    // Sampling Tests
+    // ========================================================================
+
+    #[test]
+    fn create_message_params_minimal() {
+        let params = CreateMessageParams::new(vec![SamplingMessage::user("Hello")], 100);
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["maxTokens"], 100);
+        assert!(value["messages"].is_array());
+        assert!(value.get("systemPrompt").is_none());
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
+    fn create_message_params_full() {
+        let params = CreateMessageParams::new(
+            vec![
+                SamplingMessage::user("Hello"),
+                SamplingMessage::assistant("Hi there!"),
+            ],
+            500,
+        )
+        .with_system_prompt("You are helpful")
+        .with_temperature(0.7)
+        .with_stop_sequences(vec!["END".to_string()]);
+
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["maxTokens"], 500);
+        assert_eq!(value["systemPrompt"], "You are helpful");
+        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["stopSequences"][0], "END");
+        assert_eq!(value["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn create_message_result_text() {
+        let result = CreateMessageResult::text("Hello!", "claude-3");
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["content"]["type"], "text");
+        assert_eq!(value["content"]["text"], "Hello!");
+        assert_eq!(value["model"], "claude-3");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["stopReason"], "endTurn");
+    }
+
+    #[test]
+    fn create_message_result_max_tokens() {
+        use crate::types::StopReason;
+
+        let result =
+            CreateMessageResult::text("Truncated", "gpt-4").with_stop_reason(StopReason::MaxTokens);
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["stopReason"], "maxTokens");
+    }
+
+    #[test]
+    fn sampling_message_user() {
+        let msg = SamplingMessage::user("Test message");
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["role"], "user");
+        assert_eq!(value["content"]["type"], "text");
+        assert_eq!(value["content"]["text"], "Test message");
+    }
+
+    #[test]
+    fn sampling_message_assistant() {
+        let msg = SamplingMessage::assistant("Response");
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"]["type"], "text");
+        assert_eq!(value["content"]["text"], "Response");
+    }
+
+    #[test]
+    fn sampling_content_image() {
+        let content = SamplingContent::Image {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        let value = serde_json::to_value(&content).expect("serialize");
+        assert_eq!(value["type"], "image");
+        assert_eq!(value["data"], "base64data");
+        assert_eq!(value["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn include_context_serialization() {
+        let none = IncludeContext::None;
+        let this = IncludeContext::ThisServer;
+        let all = IncludeContext::AllServers;
+
+        assert_eq!(serde_json::to_value(none).unwrap(), "none");
+        assert_eq!(serde_json::to_value(this).unwrap(), "thisServer");
+        assert_eq!(serde_json::to_value(all).unwrap(), "allServers");
+    }
+
+    #[test]
+    fn create_message_result_text_content() {
+        let result = CreateMessageResult::text("Hello!", "model");
+        assert_eq!(result.text_content(), Some("Hello!"));
+
+        let result = CreateMessageResult {
+            content: SamplingContent::Image {
+                data: "data".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+            role: crate::types::Role::Assistant,
+            model: "model".to_string(),
+            stop_reason: StopReason::EndTurn,
+        };
+        assert_eq!(result.text_content(), None);
     }
 }

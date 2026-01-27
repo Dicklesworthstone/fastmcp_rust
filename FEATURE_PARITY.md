@@ -138,11 +138,16 @@ The FastMCP Rust port implements **significantly more** than previously assessed
 | `tasks/submit` | ✅ | ✅ | Background task submission |
 | `tasks/cancel` | ✅ | ✅ | With reason support |
 
+### Sampling Protocol
+
+| MCP Method | Python | Rust | Notes |
+|------------|--------|------|-------|
+| `sampling/createMessage` | ✅ | ✅ | Protocol types + McpContext::sample() |
+
 ### Missing Protocol Methods
 
 | MCP Method | Python | Rust | Priority | Notes |
 |------------|--------|------|----------|-------|
-| **`sampling/create`** | ✅ | ❌ | High | LLM sampling support |
 | **Elicitation** | ✅ | ❌ | Medium | User input requests |
 | **Roots** | ✅ | ❌ | Medium | Filesystem roots |
 
@@ -167,7 +172,7 @@ The FastMCP Rust port implements **significantly more** than previously assessed
 
 | Feature | Python | Rust | Priority | Notes |
 |---------|--------|------|----------|-------|
-| **SamplingHandler** | ✅ | ❌ | High | No sampling |
+| **SamplingHandler** | ✅ | 🟡 | Low | Types exist, needs wiring |
 | **ElicitationHandler** | ✅ | ❌ | Medium | No elicitation |
 | **RootsHandler** | ✅ | ❌ | Medium | No roots |
 | **SSE/WS client transports** | ✅ | 🟡 | Medium | Protocol exists, not wired |
@@ -199,6 +204,7 @@ The FastMCP Rust port implements **significantly more** than previously assessed
 | **Resource reading from handler** | ✅ | ❌ | Medium | Not in McpContext |
 | **Tool calling from handler** | ✅ | ❌ | Medium | Not in McpContext |
 | **MCP capabilities access** | ✅ | ❌ | Low | Not exposed |
+| **Sampling from handler** | ✅ | ✅ | N/A | `ctx.sample()` and `ctx.sample_with_request()` |
 
 ### Dependency Injection
 
@@ -302,7 +308,7 @@ The FastMCP Rust port implements **significantly more** than previously assessed
 
 ### High Priority (Needed for Feature Parity)
 
-1. **Sampling/Completions** - No `sampling/create` support for LLM integration
+1. ~~**Sampling/Completions**~~ - ✅ Implemented (`ctx.sample()` + protocol types)
 2. **Elicitation** - No user input request support
 3. **Roots** - No filesystem roots support
 
@@ -364,7 +370,7 @@ The port is suitable for:
 - Binary distribution scenarios
 
 The main gaps are:
-- Sampling/elicitation/roots protocol methods
+- Elicitation/roots protocol methods
 - Dynamic per-session visibility control
 - Per-handler configuration (timeout, auth)
 
