@@ -32,6 +32,9 @@ log = "0.4"
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
+# Cryptographic RNG (for WebSocket masking)
+getrandom = "0.3"
+
 # Internal crates
 fastmcp = { path = "crates/fastmcp" }
 fastmcp-core = { path = "crates/fastmcp-core" }
