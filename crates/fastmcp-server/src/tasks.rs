@@ -290,6 +290,7 @@ impl TaskManager {
         Ok(task_id)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_task(
         &self,
         task_id: TaskId,

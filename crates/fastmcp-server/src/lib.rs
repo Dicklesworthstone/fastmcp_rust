@@ -1262,7 +1262,10 @@ impl RequestCompletion {
     }
 
     fn mark_done(&self) {
-        let mut done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !*done {
             *done = true;
             self.cv.notify_all();
@@ -1270,7 +1273,10 @@ impl RequestCompletion {
     }
 
     fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *done {
             return true;
         }
@@ -1280,7 +1286,7 @@ impl RequestCompletion {
             let (guard, result) = self
                 .cv
                 .wait_timeout(done, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             done = guard;
             if *done {
                 return true;
@@ -1297,7 +1303,10 @@ impl RequestCompletion {
     }
 
     fn is_done(&self) -> bool {
-        let done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *done
     }
 }
@@ -1329,7 +1338,9 @@ impl<'a> ActiveRequestGuard<'a> {
     fn new(map: &'a Mutex<HashMap<RequestId, ActiveRequest>>, id: RequestId, cx: Cx) -> Self {
         let completion = Arc::new(RequestCompletion::new());
         let entry = ActiveRequest::new(cx, completion.clone());
-        let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.insert(id.clone(), entry).is_some() {
             fastmcp_core::logging::warn!(
                 target: targets::SESSION,
@@ -1348,7 +1359,10 @@ impl<'a> ActiveRequestGuard<'a> {
 impl Drop for ActiveRequestGuard<'_> {
     fn drop(&mut self) {
         {
-            let mut guard = self.map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match guard.get(&self.id) {
                 Some(entry) if Arc::ptr_eq(&entry.completion, &self.completion) => {
                     guard.remove(&self.id);
