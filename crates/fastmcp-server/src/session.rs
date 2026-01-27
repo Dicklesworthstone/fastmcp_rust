@@ -138,6 +138,30 @@ impl Session {
         self.log_level
     }
 
+    /// Returns whether the client supports sampling (LLM completions).
+    #[must_use]
+    pub fn supports_sampling(&self) -> bool {
+        self.client_capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.sampling.is_some())
+    }
+
+    /// Returns whether the client supports elicitation (user input requests).
+    #[must_use]
+    pub fn supports_elicitation(&self) -> bool {
+        self.client_capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.elicitation.is_some())
+    }
+
+    /// Returns whether the client supports roots listing.
+    #[must_use]
+    pub fn supports_roots(&self) -> bool {
+        self.client_capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.roots.is_some())
+    }
+
     /// Sends a resource updated notification if the session is subscribed.
     ///
     /// Returns true if a notification was sent.
@@ -172,5 +196,151 @@ impl Session {
             Some(payload),
         ));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_protocol::{ElicitationCapability, RootsCapability, SamplingCapability};
+
+    #[test]
+    fn test_session_supports_sampling() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        // Before initialization, no capabilities
+        assert!(!session.supports_sampling());
+
+        // Initialize with sampling capability
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+            ClientCapabilities {
+                sampling: Some(SamplingCapability {}),
+                elicitation: None,
+                roots: None,
+            },
+            "2024-11-05".to_string(),
+        );
+
+        assert!(session.supports_sampling());
+        assert!(!session.supports_elicitation());
+        assert!(!session.supports_roots());
+    }
+
+    #[test]
+    fn test_session_supports_elicitation() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+            ClientCapabilities {
+                sampling: None,
+                elicitation: Some(ElicitationCapability::form()),
+                roots: None,
+            },
+            "2024-11-05".to_string(),
+        );
+
+        assert!(!session.supports_sampling());
+        assert!(session.supports_elicitation());
+        assert!(!session.supports_roots());
+    }
+
+    #[test]
+    fn test_session_supports_roots() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+            ClientCapabilities {
+                sampling: None,
+                elicitation: None,
+                roots: Some(RootsCapability { list_changed: true }),
+            },
+            "2024-11-05".to_string(),
+        );
+
+        assert!(!session.supports_sampling());
+        assert!(!session.supports_elicitation());
+        assert!(session.supports_roots());
+    }
+
+    #[test]
+    fn test_session_supports_all_capabilities() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+            ClientCapabilities {
+                sampling: Some(SamplingCapability {}),
+                elicitation: Some(ElicitationCapability::both()),
+                roots: Some(RootsCapability { list_changed: false }),
+            },
+            "2024-11-05".to_string(),
+        );
+
+        assert!(session.supports_sampling());
+        assert!(session.supports_elicitation());
+        assert!(session.supports_roots());
+    }
+
+    #[test]
+    fn test_session_no_capabilities() {
+        let mut session = Session::new(
+            ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            ServerCapabilities::default(),
+        );
+
+        session.initialize(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        assert!(!session.supports_sampling());
+        assert!(!session.supports_elicitation());
+        assert!(!session.supports_roots());
     }
 }

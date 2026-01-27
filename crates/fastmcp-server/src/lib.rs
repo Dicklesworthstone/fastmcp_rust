@@ -38,6 +38,8 @@ mod router;
 mod session;
 mod tasks;
 pub mod transform;
+pub mod oauth;
+pub mod oidc;
 
 #[cfg(test)]
 mod tests;
@@ -52,8 +54,8 @@ pub use builder::ServerBuilder;
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
-    BoxFuture, ProgressNotificationSender, PromptHandler, ResourceHandler, ToolHandler,
-    create_context_with_progress,
+    BidirectionalSenders, BoxFuture, ProgressNotificationSender, PromptHandler, ResourceHandler,
+    ToolHandler, create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
@@ -396,10 +398,12 @@ impl Server {
         // while the main transport is blocked on recv().
         let notification_sender = create_notification_sender();
 
+        let shared_recv = shared.clone();
+        let shared_send = shared.clone();
         self.run_loop(
             cx,
-            |cx| shared.recv(cx),
-            |cx, message| shared.send(cx, message),
+            move |cx| shared_recv.recv(cx),
+            move |cx, message| shared_send.send(cx, message),
             notification_sender,
         )
     }
@@ -428,10 +432,12 @@ impl Server {
         let shared = SharedTransport::new(transport);
         let notification_sender = create_transport_notification_sender(shared.clone());
 
+        let shared_recv = shared.clone();
+        let shared_send = shared;
         self.run_loop(
             cx,
-            |cx| shared.recv(cx),
-            |cx, message| shared.send(cx, message),
+            move |cx| shared_recv.recv(cx),
+            move |cx, message| shared_send.send(cx, message),
             notification_sender,
         )
     }
@@ -548,14 +554,29 @@ impl Server {
         self,
         cx: &Cx,
         mut recv: R,
-        mut send: S,
+        send: S,
         notification_sender: NotificationSender,
     ) -> !
     where
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+
+        // Wrap send in Arc<Mutex> for shared access from bidirectional requests
+        let send = Arc::new(Mutex::new(send));
+
+        // Create a RequestSender for bidirectional communication
+        let request_sender = {
+            let send_clone = send.clone();
+            let send_fn: bidirectional::TransportSendFn = Arc::new(move |message| {
+                let mut guard = send_clone.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+                // We need a Cx for the send call, but we're sending async so use a basic one
+                let cx = Cx::for_testing();
+                guard(&cx, message).map_err(|e| format!("Send failed: {}", e))
+            });
+            bidirectional::RequestSender::new(self.pending_requests.clone(), send_fn)
+        };
 
         // Track connection opened
         if let Some(ref stats) = self.stats {
@@ -638,7 +659,13 @@ impl Server {
                             stats.add_bytes_received(json.len() as u64 + 1); // +1 for newline
                         }
                     }
-                    self.handle_request(cx, &mut session, request, &notification_sender)
+                    self.handle_request(
+                        cx,
+                        &mut session,
+                        request,
+                        &notification_sender,
+                        &request_sender,
+                    )
                 }
                 JsonRpcMessage::Response(response) => {
                     // Route response to pending server-initiated request (bidirectional)
@@ -667,7 +694,11 @@ impl Server {
                 }
 
                 // Send response
-                if let Err(e) = send(cx, &JsonRpcMessage::Response(response)) {
+                let send_result = {
+                    let mut guard = send.lock().unwrap();
+                    guard(cx, &JsonRpcMessage::Response(response))
+                };
+                if let Err(e) = send_result {
                     error!(target: targets::TRANSPORT, "Failed to send response: {}", e);
                 }
             }
@@ -681,6 +712,7 @@ impl Server {
         session: &mut Session,
         request: JsonRpcRequest,
         notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
     ) -> Option<JsonRpcResponse> {
         let id = request.id.clone();
         let method = request.method.clone();
@@ -723,7 +755,7 @@ impl Server {
             ActiveRequestGuard::new(&self.active_requests, request_id, request_cx.clone())
         });
 
-        // Dispatch based on method, passing the budget and notification sender
+        // Dispatch based on method, passing the budget, notification sender, and request sender
         let result = self.dispatch_method(
             &request_cx,
             session,
@@ -731,6 +763,7 @@ impl Server {
             request_id,
             &budget,
             notification_sender,
+            request_sender,
         );
 
         // Record statistics
@@ -796,6 +829,7 @@ impl Server {
         request_id: u64,
         budget: &Budget,
         notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
     ) -> Result<serde_json::Value, McpError> {
         // Check cancellation before dispatch
         if cx.is_cancel_requested() {
@@ -859,6 +893,9 @@ impl Server {
         let method = &request.method;
         let params = request.params.clone();
 
+        // Create bidirectional senders based on client capabilities
+        let bidirectional_senders = self.create_bidirectional_senders(session, request_sender);
+
         let result = match method.as_str() {
             "initialize" => {
                 let params: InitializeParams = parse_params(params)?;
@@ -898,6 +935,7 @@ impl Server {
                     budget,
                     session.state().clone(),
                     Some(notification_sender),
+                    bidirectional_senders.as_ref(),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
@@ -920,6 +958,7 @@ impl Server {
                     budget,
                     session.state().clone(),
                     Some(notification_sender),
+                    bidirectional_senders.as_ref(),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
@@ -950,6 +989,7 @@ impl Server {
                     budget,
                     session.state().clone(),
                     Some(notification_sender),
+                    bidirectional_senders.as_ref(),
                 )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
@@ -1031,6 +1071,39 @@ impl Server {
             err = m.on_error(ctx, request, err);
         }
         err
+    }
+
+    /// Creates bidirectional senders based on client capabilities.
+    ///
+    /// Returns `Some(BidirectionalSenders)` if the client supports any bidirectional
+    /// features (sampling, elicitation), or `None` if no features are supported.
+    fn create_bidirectional_senders(
+        &self,
+        session: &Session,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<handler::BidirectionalSenders> {
+        let supports_sampling = session.supports_sampling();
+        let supports_elicitation = session.supports_elicitation();
+
+        if !supports_sampling && !supports_elicitation {
+            return None;
+        }
+
+        let mut senders = handler::BidirectionalSenders::new();
+
+        if supports_sampling {
+            let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
+                Arc::new(bidirectional::TransportSamplingSender::new(request_sender.clone()));
+            senders = senders.with_sampling(sampling_sender);
+        }
+
+        if supports_elicitation {
+            let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
+                Arc::new(bidirectional::TransportElicitationSender::new(request_sender.clone()));
+            senders = senders.with_elicitation(elicitation_sender);
+        }
+
+        Some(senders)
     }
 
     fn should_authenticate(&self, method: &str) -> bool {

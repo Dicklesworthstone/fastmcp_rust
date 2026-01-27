@@ -89,7 +89,7 @@ pub use fastmcp_server::{
 };
 
 // Re-export server middleware modules
-pub use fastmcp_server::{caching, rate_limiting, transform};
+pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{Client, ClientBuilder, ClientSession};

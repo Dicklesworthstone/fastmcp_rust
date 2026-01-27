@@ -18,7 +18,7 @@ use fastmcp_protocol::{
     SubmitTaskResult, Tool, validate,
 };
 
-use crate::handler::{UriParams, create_context_with_progress};
+use crate::handler::{BidirectionalSenders, UriParams, create_context_with_progress_and_senders};
 use crate::tasks::SharedTaskManager;
 
 use crate::Session;
@@ -277,6 +277,7 @@ impl Router {
     /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
+    /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_tools_call(
         &self,
         cx: &Cx,
@@ -285,6 +286,7 @@ impl Router {
         budget: &Budget,
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
         debug!(target: targets::HANDLER, "Calling tool: {}", params.name);
         trace!(target: targets::HANDLER, "Tool arguments: {:?}", params.arguments);
@@ -327,11 +329,11 @@ impl Router {
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting and session state
+        // Create context for the handler with progress reporting, session state, and bidirectional senders
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(
+                create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
                     Some(token),
@@ -339,9 +341,22 @@ impl Router {
                     move |req| {
                         sender(req);
                     },
+                    bidirectional_senders,
                 )
             }
-            _ => McpContext::with_state(cx.clone(), request_id, session_state),
+            _ => {
+                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
+                // Attach bidirectional senders even without progress
+                if let Some(senders) = bidirectional_senders {
+                    if let Some(ref sampling) = senders.sampling {
+                        ctx = ctx.with_sampling(sampling.clone());
+                    }
+                    if let Some(ref elicitation) = senders.elicitation {
+                        ctx = ctx.with_elicitation(elicitation.clone());
+                    }
+                }
+                ctx
+            }
         };
 
         // Call the handler asynchronously - returns McpOutcome (4-valued)
@@ -410,6 +425,7 @@ impl Router {
     /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
+    /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_resources_read(
         &self,
         cx: &Cx,
@@ -418,6 +434,7 @@ impl Router {
         budget: &Budget,
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ReadResourceResult> {
         debug!(target: targets::HANDLER, "Reading resource: {}", params.uri);
 
@@ -442,11 +459,11 @@ impl Router {
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting and session state
+        // Create context for the handler with progress reporting, session state, and bidirectional senders
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(
+                create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
                     Some(token),
@@ -454,9 +471,22 @@ impl Router {
                     move |req| {
                         sender(req);
                     },
+                    bidirectional_senders,
                 )
             }
-            _ => McpContext::with_state(cx.clone(), request_id, session_state),
+            _ => {
+                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
+                // Attach bidirectional senders even without progress
+                if let Some(senders) = bidirectional_senders {
+                    if let Some(ref sampling) = senders.sampling {
+                        ctx = ctx.with_sampling(sampling.clone());
+                    }
+                    if let Some(ref elicitation) = senders.elicitation {
+                        ctx = ctx.with_elicitation(elicitation.clone());
+                    }
+                }
+                ctx
+            }
         };
 
         // Read the resource asynchronously - returns McpOutcome (4-valued)
@@ -494,6 +524,7 @@ impl Router {
     /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
+    /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_prompts_get(
         &self,
         cx: &Cx,
@@ -502,6 +533,7 @@ impl Router {
         budget: &Budget,
         session_state: SessionState,
         notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<GetPromptResult> {
         debug!(target: targets::HANDLER, "Getting prompt: {}", params.name);
         trace!(target: targets::HANDLER, "Prompt arguments: {:?}", params.arguments);
@@ -531,11 +563,11 @@ impl Router {
         let progress_token: Option<ProgressToken> =
             params.meta.as_ref().and_then(|m| m.progress_token.clone());
 
-        // Create context for the handler with progress reporting and session state
+        // Create context for the handler with progress reporting, session state, and bidirectional senders
         let ctx = match (progress_token, notification_sender) {
             (Some(token), Some(sender)) => {
                 let sender = sender.clone();
-                create_context_with_progress(
+                create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
                     Some(token),
@@ -543,9 +575,22 @@ impl Router {
                     move |req| {
                         sender(req);
                     },
+                    bidirectional_senders,
                 )
             }
-            _ => McpContext::with_state(cx.clone(), request_id, session_state),
+            _ => {
+                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
+                // Attach bidirectional senders even without progress
+                if let Some(senders) = bidirectional_senders {
+                    if let Some(ref sampling) = senders.sampling {
+                        ctx = ctx.with_sampling(sampling.clone());
+                    }
+                    if let Some(ref elicitation) = senders.elicitation {
+                        ctx = ctx.with_elicitation(elicitation.clone());
+                    }
+                }
+                ctx
+            }
         };
 
         // Get the prompt asynchronously - returns McpOutcome (4-valued)

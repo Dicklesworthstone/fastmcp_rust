@@ -183,10 +183,11 @@ The Rust port covers **core MCP protocol functionality well**, but lacks several
 6. ✅ Main loop routes responses to pending requests (no longer ignores them)
 7. ✅ `Server` struct has `pending_requests` field for tracking
 
-**Remaining Wiring (bd-21v, bd-10g, bd-j6n):**
-Pass `RequestSender` through handler execution path to attach senders to `McpContext`.
-
-**Unblocked Beads:** bd-21v (sampling wiring), bd-10g (roots wiring), bd-j6n (elicitation wiring)
+**Wiring Complete (bd-21v, bd-10g, bd-j6n):**
+✅ `RequestSender` passed through handler execution path
+✅ `BidirectionalSenders` created based on client capabilities
+✅ Sampling/elicitation senders attached to `McpContext` in tool/resource/prompt handlers
+✅ `ctx.sample()` and `ctx.elicit()` now work when client supports the capability
 
 ---
 
@@ -209,9 +210,9 @@ Pass `RequestSender` through handler execution path to attach senders to `McpCon
 
 | Feature | Python | Rust | Priority | Notes |
 |---------|--------|------|----------|-------|
-| **SamplingHandler** | ✅ | 🟡 | Medium | Types exist, needs full wiring |
-| **ElicitationHandler** | ✅ | ❌ | **High** | No elicitation callback |
-| **RootsHandler** | ✅ | ❌ | Medium | No roots callback |
+| **SamplingHandler** | ✅ | ✅ | Medium | Fully wired via `ctx.sample()` |
+| **ElicitationHandler** | ✅ | ✅ | **High** | Fully wired via `ctx.elicit()` |
+| **RootsHandler** | ✅ | 🟡 | Medium | `TransportRootsProvider` exists, needs context access |
 | **SSE client transport** | ✅ | 🟡 | Medium | Protocol exists, not wired |
 | **WebSocket client transport** | ✅ | 🟡 | Medium | Protocol exists, not wired |
 | **MCPConfig client creation** | ✅ | ❌ | Medium | Server registry from files |

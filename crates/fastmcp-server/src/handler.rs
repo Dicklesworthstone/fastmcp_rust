@@ -95,6 +95,46 @@ where
     }
 }
 
+/// Configuration for bidirectional senders to attach to context.
+#[derive(Clone, Default)]
+pub struct BidirectionalSenders {
+    /// Optional sampling sender for LLM completions.
+    pub sampling: Option<Arc<dyn fastmcp_core::SamplingSender>>,
+    /// Optional elicitation sender for user input requests.
+    pub elicitation: Option<Arc<dyn fastmcp_core::ElicitationSender>>,
+}
+
+impl BidirectionalSenders {
+    /// Creates empty senders (no bidirectional features).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the sampling sender.
+    #[must_use]
+    pub fn with_sampling(mut self, sender: Arc<dyn fastmcp_core::SamplingSender>) -> Self {
+        self.sampling = Some(sender);
+        self
+    }
+
+    /// Sets the elicitation sender.
+    #[must_use]
+    pub fn with_elicitation(mut self, sender: Arc<dyn fastmcp_core::ElicitationSender>) -> Self {
+        self.elicitation = Some(sender);
+        self
+    }
+}
+
+impl std::fmt::Debug for BidirectionalSenders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BidirectionalSenders")
+            .field("sampling", &self.sampling.is_some())
+            .field("elicitation", &self.elicitation.is_some())
+            .finish()
+    }
+}
+
 /// Helper to create an McpContext with optional progress reporting and session state.
 pub fn create_context_with_progress<F>(
     cx: asupersync::Cx,
@@ -106,7 +146,22 @@ pub fn create_context_with_progress<F>(
 where
     F: Fn(JsonRpcRequest) + Send + Sync + 'static,
 {
-    match (progress_token, state) {
+    create_context_with_progress_and_senders(cx, request_id, progress_token, state, send_fn, None)
+}
+
+/// Helper to create an McpContext with optional progress reporting, session state, and bidirectional senders.
+pub fn create_context_with_progress_and_senders<F>(
+    cx: asupersync::Cx,
+    request_id: u64,
+    progress_token: Option<ProgressToken>,
+    state: Option<SessionState>,
+    send_fn: F,
+    senders: Option<&BidirectionalSenders>,
+) -> McpContext
+where
+    F: Fn(JsonRpcRequest) + Send + Sync + 'static,
+{
+    let mut ctx = match (progress_token, state) {
         (Some(token), Some(state)) => {
             let sender = ProgressNotificationSender::new(token, send_fn);
             McpContext::with_state_and_progress(cx, request_id, state, sender.into_reporter())
@@ -117,7 +172,19 @@ where
         }
         (None, Some(state)) => McpContext::with_state(cx, request_id, state),
         (None, None) => McpContext::new(cx, request_id),
+    };
+
+    // Attach bidirectional senders if provided
+    if let Some(senders) = senders {
+        if let Some(ref sampling) = senders.sampling {
+            ctx = ctx.with_sampling(sampling.clone());
+        }
+        if let Some(ref elicitation) = senders.elicitation {
+            ctx = ctx.with_elicitation(elicitation.clone());
+        }
     }
+
+    ctx
 }
 
 /// A boxed future for async handler results.
