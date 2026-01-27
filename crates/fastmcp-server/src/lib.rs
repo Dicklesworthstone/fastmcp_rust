@@ -480,7 +480,10 @@ impl Server {
     /// `false` if the hook returned an error.
     pub(crate) fn run_startup_hook(&self) -> bool {
         let hook = {
-            let mut guard = self.lifespan.lock().expect("lifespan lock poisoned");
+            let mut guard = self.lifespan.lock().unwrap_or_else(|poisoned| {
+                error!(target: targets::SERVER, "lifespan lock poisoned in run_startup_hook, recovering");
+                poisoned.into_inner()
+            });
             guard.as_mut().and_then(|h| h.on_startup.take())
         };
 
@@ -504,7 +507,10 @@ impl Server {
     /// Runs the shutdown lifecycle hook, if configured.
     pub(crate) fn run_shutdown_hook(&self) {
         let hook = {
-            let mut guard = self.lifespan.lock().expect("lifespan lock poisoned");
+            let mut guard = self.lifespan.lock().unwrap_or_else(|poisoned| {
+                error!(target: targets::SERVER, "lifespan lock poisoned in run_shutdown_hook, recovering");
+                poisoned.into_inner()
+            });
             guard.as_mut().and_then(|h| h.on_shutdown.take())
         };
 
@@ -1050,10 +1056,10 @@ impl Server {
             await_cleanup
         );
         let active = {
-            let guard = self
-                .active_requests
-                .lock()
-                .expect("active_requests lock poisoned");
+            let guard = self.active_requests.lock().unwrap_or_else(|poisoned| {
+                error!(target: targets::SERVER, "active_requests lock poisoned, recovering");
+                poisoned.into_inner()
+            });
             guard
                 .get(&params.request_id)
                 .map(|entry| (entry.cx.clone(), entry.region_id, entry.completion.clone()))
@@ -1082,10 +1088,10 @@ impl Server {
 
     fn cancel_active_requests(&self, kind: CancelKind, await_cleanup: bool) {
         let active: Vec<(RequestId, RegionId, Cx, Arc<RequestCompletion>)> = {
-            let guard = self
-                .active_requests
-                .lock()
-                .expect("active_requests lock poisoned");
+            let guard = self.active_requests.lock().unwrap_or_else(|poisoned| {
+                error!(target: targets::SERVER, "active_requests lock poisoned in cancel_active_requests, recovering");
+                poisoned.into_inner()
+            });
             guard
                 .iter()
                 .map(|(request_id, entry)| {
@@ -1256,7 +1262,7 @@ impl RequestCompletion {
     }
 
     fn mark_done(&self) {
-        let mut done = self.done.lock().expect("completion lock poisoned");
+        let mut done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !*done {
             *done = true;
             self.cv.notify_all();
@@ -1264,7 +1270,7 @@ impl RequestCompletion {
     }
 
     fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut done = self.done.lock().expect("completion lock poisoned");
+        let mut done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if *done {
             return true;
         }
@@ -1274,7 +1280,7 @@ impl RequestCompletion {
             let (guard, result) = self
                 .cv
                 .wait_timeout(done, remaining)
-                .expect("completion lock poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             done = guard;
             if *done {
                 return true;
@@ -1291,7 +1297,7 @@ impl RequestCompletion {
     }
 
     fn is_done(&self) -> bool {
-        let done = self.done.lock().expect("completion lock poisoned");
+        let done = self.done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *done
     }
 }
@@ -1323,7 +1329,7 @@ impl<'a> ActiveRequestGuard<'a> {
     fn new(map: &'a Mutex<HashMap<RequestId, ActiveRequest>>, id: RequestId, cx: Cx) -> Self {
         let completion = Arc::new(RequestCompletion::new());
         let entry = ActiveRequest::new(cx, completion.clone());
-        let mut guard = map.lock().expect("active_requests lock poisoned");
+        let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.insert(id.clone(), entry).is_some() {
             fastmcp_core::logging::warn!(
                 target: targets::SESSION,
@@ -1342,7 +1348,7 @@ impl<'a> ActiveRequestGuard<'a> {
 impl Drop for ActiveRequestGuard<'_> {
     fn drop(&mut self) {
         {
-            let mut guard = self.map.lock().expect("active_requests lock poisoned");
+            let mut guard = self.map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.get(&self.id) {
                 Some(entry) if Arc::ptr_eq(&entry.completion, &self.completion) => {
                     guard.remove(&self.id);

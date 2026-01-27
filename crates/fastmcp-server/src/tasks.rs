@@ -193,10 +193,10 @@ impl TaskManager {
 
     /// Sets the notification sender for task status updates.
     pub fn set_notification_sender(&self, sender: TaskNotificationSender) {
-        let mut guard = self
-            .notification_sender
-            .write()
-            .expect("task notification sender lock poisoned");
+        let mut guard = self.notification_sender.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "notification sender lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         *guard = Some(sender);
     }
 
@@ -211,7 +211,10 @@ impl TaskManager {
         let task_type = task_type.into();
         let boxed_handler: TaskHandler = Box::new(move |cx, params| Box::pin(handler(cx, params)));
 
-        let mut handlers = self.handlers.write().unwrap();
+        let mut handlers = self.handlers.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "handlers lock poisoned, recovering");
+            poisoned.into_inner()
+        });
         handlers.insert(task_type, boxed_handler);
     }
 
@@ -229,7 +232,10 @@ impl TaskManager {
 
         // Check if handler exists
         {
-            let handlers = self.handlers.read().unwrap();
+            let handlers = self.handlers.read().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "handlers lock poisoned, recovering");
+                poisoned.into_inner()
+            });
             if !handlers.contains_key(&task_type) {
                 return Err(McpError::invalid_params(format!(
                     "Unknown task type: {task_type}"
@@ -267,7 +273,10 @@ impl TaskManager {
         };
 
         {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned, recovering");
+                poisoned.into_inner()
+            });
             tasks.insert(task_id.clone(), state);
         }
 
@@ -294,7 +303,10 @@ impl TaskManager {
 
         self.runtime.spawn(async move {
             let running_snapshot = {
-                let mut tasks_guard = tasks.write().unwrap();
+                let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
+                    warn!(target: targets::SERVER, "tasks lock poisoned in spawn_task, recovering");
+                    poisoned.into_inner()
+                });
                 match tasks_guard.get_mut(&task_id) {
                     Some(state) => {
                         if state.cancel_requested || !transition_state(state, TaskStatus::Running) {
@@ -310,10 +322,16 @@ impl TaskManager {
             notify_snapshot(&notification_sender, running_snapshot);
 
             let task_future = {
-                let handlers_guard = handlers.read().unwrap();
+                let handlers_guard = handlers.read().unwrap_or_else(|poisoned| {
+                    warn!(target: targets::SERVER, "handlers lock poisoned in spawn_task, recovering");
+                    poisoned.into_inner()
+                });
                 let Some(handler) = handlers_guard.get(&task_type) else {
                     let failure_snapshot = {
-                        let mut tasks_guard = tasks.write().unwrap();
+                        let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
+                            warn!(target: targets::SERVER, "tasks lock poisoned in spawn_task failure, recovering");
+                            poisoned.into_inner()
+                        });
                         match tasks_guard.get_mut(&task_id) {
                             Some(state) => {
                                 if !state.cancel_requested {
@@ -344,7 +362,10 @@ impl TaskManager {
             let result = task_future.await;
 
             let completion_snapshot = {
-                let mut tasks_guard = tasks.write().unwrap();
+                let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
+                    warn!(target: targets::SERVER, "tasks lock poisoned in spawn_task completion, recovering");
+                    poisoned.into_inner()
+                });
                 match tasks_guard.get_mut(&task_id) {
                     Some(state) => {
                         if state.cancel_requested {
@@ -394,7 +415,10 @@ impl TaskManager {
     /// This is called internally to transition a task from Pending to Running.
     pub fn start_task(&self, task_id: &TaskId) -> McpResult<()> {
         let snapshot = {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in start_task, recovering");
+                poisoned.into_inner()
+            });
             let state = tasks
                 .get_mut(task_id)
                 .ok_or_else(|| McpError::invalid_params(format!("Task not found: {task_id}")))?;
@@ -420,7 +444,10 @@ impl TaskManager {
     /// Updates progress for a running task.
     pub fn update_progress(&self, task_id: &TaskId, progress: f64, message: Option<String>) {
         let snapshot = {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in update_progress, recovering");
+                poisoned.into_inner()
+            });
             if let Some(state) = tasks.get_mut(task_id) {
                 if state.info.status != TaskStatus::Running {
                     debug!(
@@ -445,7 +472,10 @@ impl TaskManager {
     /// Completes a task with a successful result.
     pub fn complete_task(&self, task_id: &TaskId, data: serde_json::Value) {
         let snapshot = {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in complete_task, recovering");
+                poisoned.into_inner()
+            });
             if let Some(state) = tasks.get_mut(task_id) {
                 if !transition_state(state, TaskStatus::Completed) {
                     return;
@@ -470,7 +500,10 @@ impl TaskManager {
     pub fn fail_task(&self, task_id: &TaskId, error: impl Into<String>) {
         let error = error.into();
         let snapshot = {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in fail_task, recovering");
+                poisoned.into_inner()
+            });
             if let Some(state) = tasks.get_mut(task_id) {
                 if !transition_state(state, TaskStatus::Failed) {
                     return;
@@ -494,21 +527,30 @@ impl TaskManager {
     /// Gets information about a task.
     #[must_use]
     pub fn get_info(&self, task_id: &TaskId) -> Option<TaskInfo> {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in get_info, recovering");
+            poisoned.into_inner()
+        });
         tasks.get(task_id).map(|s| s.info.clone())
     }
 
     /// Gets the result of a completed task.
     #[must_use]
     pub fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in get_result, recovering");
+            poisoned.into_inner()
+        });
         tasks.get(task_id).and_then(|s| s.result.clone())
     }
 
     /// Lists all tasks, optionally filtered by status.
     #[must_use]
     pub fn list_tasks(&self, status_filter: Option<TaskStatus>) -> Vec<TaskInfo> {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in list_tasks, recovering");
+            poisoned.into_inner()
+        });
         tasks
             .values()
             .filter(|s| status_filter.is_none_or(|f| s.info.status == f))
@@ -522,7 +564,10 @@ impl TaskManager {
     /// The task may still be running until it checks for cancellation.
     pub fn cancel(&self, task_id: &TaskId, reason: Option<String>) -> McpResult<TaskInfo> {
         let snapshot = {
-            let mut tasks = self.tasks.write().unwrap();
+            let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in cancel, recovering");
+                poisoned.into_inner()
+            });
             let state = tasks
                 .get_mut(task_id)
                 .ok_or_else(|| McpError::invalid_params(format!("Task not found: {task_id}")))?;
@@ -574,21 +619,30 @@ impl TaskManager {
     /// Checks if cancellation has been requested for a task.
     #[must_use]
     pub fn is_cancel_requested(&self, task_id: &TaskId) -> bool {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in is_cancel_requested, recovering");
+            poisoned.into_inner()
+        });
         tasks.get(task_id).is_some_and(|s| s.cancel_requested)
     }
 
     /// Returns the number of active (non-terminal) tasks.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in active_count, recovering");
+            poisoned.into_inner()
+        });
         tasks.values().filter(|s| s.info.status.is_active()).count()
     }
 
     /// Returns the total number of tasks.
     #[must_use]
     pub fn total_count(&self) -> usize {
-        let tasks = self.tasks.read().unwrap();
+        let tasks = self.tasks.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in total_count, recovering");
+            poisoned.into_inner()
+        });
         tasks.len()
     }
 
@@ -598,7 +652,10 @@ impl TaskManager {
     pub fn cleanup_completed(&self, max_age: std::time::Duration) {
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();
 
-        let mut tasks = self.tasks.write().unwrap();
+        let mut tasks = self.tasks.write().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "tasks lock poisoned in cleanup_completed, recovering");
+            poisoned.into_inner()
+        });
         tasks.retain(|_, state| {
             // Keep active tasks
             if state.info.status.is_active() {
@@ -625,10 +682,10 @@ impl TaskManager {
 
     fn notify_status(&self, info: TaskInfo, result: Option<TaskResult>) {
         let sender = {
-            let guard = self
-                .notification_sender
-                .read()
-                .expect("task notification sender lock poisoned");
+            let guard = self.notification_sender.read().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "notification sender lock poisoned in notify_status, recovering");
+                poisoned.into_inner()
+            });
             guard.clone()
         };
         let Some(sender) = sender else {
@@ -684,9 +741,10 @@ fn notify_snapshot(
         return;
     };
     let sender = {
-        let guard = sender
-            .read()
-            .expect("task notification sender lock poisoned");
+        let guard = sender.read().unwrap_or_else(|poisoned| {
+            warn!(target: targets::SERVER, "notification sender lock poisoned in notify_snapshot, recovering");
+            poisoned.into_inner()
+        });
         guard.clone()
     };
     let Some(sender) = sender else {
@@ -725,11 +783,20 @@ impl Default for TaskManager {
 
 impl std::fmt::Debug for TaskManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tasks = self.tasks.read().unwrap();
-        let handlers = self.handlers.read().unwrap();
+        // Use poison recovery to avoid panic during Debug formatting
+        let task_count = self
+            .tasks
+            .read()
+            .map(|g| g.len())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().len());
+        let handler_count = self
+            .handlers
+            .read()
+            .map(|g| g.len())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().len());
         f.debug_struct("TaskManager")
-            .field("task_count", &tasks.len())
-            .field("handler_count", &handlers.len())
+            .field("task_count", &task_count)
+            .field("handler_count", &handler_count)
             .field("task_counter", &self.task_counter.load(Ordering::SeqCst))
             .field(
                 "list_changed_notifications",
