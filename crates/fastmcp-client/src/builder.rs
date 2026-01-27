@@ -22,6 +22,31 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+/// Guard that kills and waits for a child process when dropped.
+/// Call `disarm()` to prevent cleanup (e.g., when ownership transfers to Client).
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Takes ownership of the child, preventing cleanup on drop.
+    fn disarm(mut self) -> Child {
+        self.0.take().expect("ChildGuard already disarmed")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // Best effort cleanup - ignore errors
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
@@ -271,6 +296,10 @@ impl ClientBuilder {
         mut transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
     ) -> McpResult<Client> {
+        // Guard ensures child process is killed if initialization fails.
+        // Disarmed when client is successfully created.
+        let child_guard = ChildGuard::new(child);
+
         // Send initialize request
         let init_params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -342,8 +371,14 @@ impl ClientBuilder {
             init_result.protocol_version,
         );
 
-        // Create client
-        Ok(Client::from_parts(child, transport, cx.clone(), session))
+        // Create client - disarm guard since Client now owns the subprocess
+        Ok(Client::from_parts(
+            child_guard.disarm(),
+            transport,
+            cx.clone(),
+            session,
+            self.timeout_ms,
+        ))
     }
 }
 
