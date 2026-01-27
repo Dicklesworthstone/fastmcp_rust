@@ -224,8 +224,13 @@ impl Client {
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
         #[allow(clippy::cast_possible_wrap)]
-        let request_id = RequestId::Number(id as i64);
-        let request = JsonRpcRequest::new(method, Some(params_value), id as i64);
+        let (request_id, request) = {
+            let id_i64 = id as i64;
+            (
+                RequestId::Number(id_i64),
+                JsonRpcRequest::new(method, Some(params_value), id_i64),
+            )
+        };
 
         // Send request
         self.transport
