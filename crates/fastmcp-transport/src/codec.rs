@@ -9,6 +9,8 @@ use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 pub struct Codec {
     /// Buffer for incomplete messages.
     buffer: Vec<u8>,
+    /// Read position in buffer (data before this has been consumed).
+    read_pos: usize,
     /// Maximum allowed message size in bytes.
     max_message_size: usize,
 }
@@ -19,12 +21,16 @@ impl Default for Codec {
     }
 }
 
+/// Threshold for compacting buffer (when read_pos exceeds this fraction of capacity).
+const COMPACT_THRESHOLD: usize = 4096;
+
 impl Codec {
     /// Creates a new codec with default settings (10MB limit).
     #[must_use]
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
+            read_pos: 0,
             max_message_size: 10 * 1024 * 1024, // 10MB
         }
     }
@@ -38,8 +44,10 @@ impl Codec {
     /// Sets the maximum allowed message size in bytes.
     pub fn set_max_message_size(&mut self, size: usize) {
         self.max_message_size = size;
-        if self.buffer.len() > size {
+        let unread = self.buffer.len() - self.read_pos;
+        if unread > size {
             self.buffer.clear();
+            self.read_pos = 0;
         }
     }
 
@@ -73,23 +81,34 @@ impl Codec {
     ///
     /// Returns an error if a complete line fails to parse or if the buffer exceeds the limit.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<JsonRpcMessage>, CodecError> {
+        // Calculate unread data size
+        let unread_len = self.buffer.len() - self.read_pos;
+        let projected_size = unread_len.saturating_add(data.len());
+
         // Check projected size BEFORE extending to prevent temporary memory exhaustion
-        let projected_size = self.buffer.len().saturating_add(data.len());
         if projected_size > self.max_message_size {
             self.buffer.clear();
+            self.read_pos = 0;
             return Err(CodecError::MessageTooLarge(projected_size));
+        }
+
+        // Compact buffer if read_pos is large (to prevent unbounded growth)
+        if self.read_pos >= COMPACT_THRESHOLD {
+            self.buffer.drain(..self.read_pos);
+            self.read_pos = 0;
         }
 
         self.buffer.extend_from_slice(data);
 
         let mut messages = Vec::new();
-        let mut start = 0;
+        let mut start = self.read_pos;
 
-        for (i, &byte) in self.buffer.iter().enumerate() {
-            if byte == b'\n' {
+        for i in start..self.buffer.len() {
+            if self.buffer[i] == b'\n' {
                 let line_len = i - start;
                 if line_len > self.max_message_size {
                     self.buffer.clear();
+                    self.read_pos = 0;
                     return Err(CodecError::MessageTooLarge(line_len));
                 }
                 let line = &self.buffer[start..i];
@@ -101,15 +120,15 @@ impl Codec {
             }
         }
 
-        // Keep any incomplete data in buffer
-        if start > 0 {
-            self.buffer.drain(..start);
-        }
+        // Update read position instead of draining for each decode call
+        self.read_pos = start;
 
-        if self.buffer.len() > self.max_message_size {
-            let size = self.buffer.len();
+        // Check remaining unread data
+        let remaining = self.buffer.len() - self.read_pos;
+        if remaining > self.max_message_size {
             self.buffer.clear();
-            return Err(CodecError::MessageTooLarge(size));
+            self.read_pos = 0;
+            return Err(CodecError::MessageTooLarge(remaining));
         }
 
         Ok(messages)
@@ -118,6 +137,7 @@ impl Codec {
     /// Clears the internal buffer.
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.read_pos = 0;
     }
 }
 
