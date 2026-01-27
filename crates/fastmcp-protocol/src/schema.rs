@@ -229,14 +229,15 @@ fn validate_object(
 
     // Check additionalProperties constraint
     if let Some(additional) = schema.get("additionalProperties") {
+        // Get properties map directly - avoid collecting keys into Vec
         let properties = schema
             .get("properties")
-            .and_then(|v| v.as_object())
-            .map(|p| p.keys().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .and_then(|v| v.as_object());
 
         for (key, value) in obj {
-            if !properties.contains(&key) {
+            // Use contains_key directly on the Map (O(1) lookup) instead of Vec::contains (O(n))
+            let is_defined_property = properties.is_some_and(|p| p.contains_key(key));
+            if !is_defined_property {
                 match additional {
                     Value::Bool(false) => {
                         errors.push(ValidationError {
@@ -344,15 +345,19 @@ fn validate_array(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        let mut seen = Vec::with_capacity(arr.len());
+        // Use HashSet with serialized JSON strings for O(1) lookup instead of O(n) Vec::contains
+        // This makes the overall algorithm O(n) instead of O(n²)
+        let mut seen = std::collections::HashSet::with_capacity(arr.len());
         for (i, item) in arr.iter().enumerate() {
-            if seen.contains(&item) {
+            // Serialize to canonical JSON string for comparison
+            // serde_json produces consistent output for equal values
+            let key = serde_json::to_string(item).unwrap_or_default();
+            if !seen.insert(key) {
                 errors.push(ValidationError {
                     path: format!("{path}[{i}]"),
                     message: "duplicate item in array".to_string(),
                 });
             }
-            seen.push(item);
         }
     }
 }
