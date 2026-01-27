@@ -122,10 +122,11 @@ impl E2ETestConfig {
     /// Create config for NO_COLOR mode.
     #[must_use]
     pub fn no_color_mode() -> Self {
-        Self {
-            env_vars: vec![("NO_COLOR".into(), "1".into())],
-            ..Default::default()
-        }
+        let mut config = Self::default();
+        config.env_vars.push(("NO_COLOR".into(), "1".into()));
+        // Remove NO_COLOR from clear_env since we want to set it
+        config.clear_env.retain(|k| k != "NO_COLOR");
+        config
     }
 
     /// Add an environment variable.
@@ -306,14 +307,14 @@ impl TestServerRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set environment variables
-        for (key, value) in &self.config.env_vars {
-            cmd.env(key, value);
-        }
-
-        // Clear environment variables
+        // Clear environment variables first (clean slate)
         for key in &self.config.clear_env {
             cmd.env_remove(key);
+        }
+
+        // Then set environment variables (overrides take effect)
+        for (key, value) in &self.config.env_vars {
+            cmd.env(key, value);
         }
 
         eprintln!("[E2E] Starting server with {} messages", messages.len());
