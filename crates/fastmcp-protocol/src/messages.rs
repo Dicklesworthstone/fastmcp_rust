@@ -1314,7 +1314,10 @@ mod tests {
     #[test]
     fn elicit_result_accept_with_content() {
         let mut content = std::collections::HashMap::new();
-        content.insert("name".to_string(), ElicitContentValue::String("Alice".to_string()));
+        content.insert(
+            "name".to_string(),
+            ElicitContentValue::String("Alice".to_string()),
+        );
         content.insert("age".to_string(), ElicitContentValue::Int(30));
         content.insert("active".to_string(), ElicitContentValue::Bool(true));
 
@@ -1382,5 +1385,82 @@ mod tests {
         let both = ElicitationCapability::both();
         assert!(both.supports_form());
         assert!(both.supports_url());
+    }
+
+    // ========================================================================
+    // Roots tests
+    // ========================================================================
+
+    #[test]
+    fn root_new() {
+        use crate::types::Root;
+
+        let root = Root::new("file:///home/user/project");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert!(root.name.is_none());
+    }
+
+    #[test]
+    fn root_with_name() {
+        use crate::types::Root;
+
+        let root = Root::with_name("file:///home/user/project", "My Project");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert_eq!(root.name, Some("My Project".to_string()));
+    }
+
+    #[test]
+    fn root_serialization() {
+        use crate::types::Root;
+
+        let root = Root::with_name("file:///home/user/project", "My Project");
+        let json = serde_json::to_value(&root).expect("serialize");
+        assert_eq!(json["uri"], "file:///home/user/project");
+        assert_eq!(json["name"], "My Project");
+
+        // Without name
+        let root_no_name = Root::new("file:///tmp");
+        let json = serde_json::to_value(&root_no_name).expect("serialize");
+        assert_eq!(json["uri"], "file:///tmp");
+        assert!(json.get("name").is_none());
+    }
+
+    #[test]
+    fn list_roots_result_empty() {
+        let result = ListRootsResult::empty();
+        assert!(result.roots.is_empty());
+    }
+
+    #[test]
+    fn list_roots_result_serialization() {
+        use crate::types::Root;
+
+        let result = ListRootsResult::new(vec![
+            Root::with_name("file:///home/user/frontend", "Frontend"),
+            Root::with_name("file:///home/user/backend", "Backend"),
+        ]);
+
+        let json = serde_json::to_value(&result).expect("serialize");
+        let roots = json["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0]["uri"], "file:///home/user/frontend");
+        assert_eq!(roots[0]["name"], "Frontend");
+        assert_eq!(roots[1]["uri"], "file:///home/user/backend");
+        assert_eq!(roots[1]["name"], "Backend");
+    }
+
+    #[test]
+    fn roots_capability_serialization() {
+        use crate::types::RootsCapability;
+
+        // With listChanged = true
+        let cap = RootsCapability { list_changed: true };
+        let json = serde_json::to_value(&cap).expect("serialize");
+        assert_eq!(json["listChanged"], true);
+
+        // With listChanged = false (should be omitted)
+        let cap = RootsCapability::default();
+        let json = serde_json::to_value(&cap).expect("serialize");
+        assert!(json.get("listChanged").is_none());
     }
 }

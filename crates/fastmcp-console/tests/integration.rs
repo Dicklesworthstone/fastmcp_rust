@@ -395,6 +395,7 @@ fn test_client_info_with_capabilities() {
 
     let caps = ClientCapabilities {
         sampling: Some(fastmcp_protocol::SamplingCapability {}),
+        elicitation: None,
         roots: Some(RootsCapability { list_changed: true }),
     };
 

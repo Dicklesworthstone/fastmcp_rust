@@ -267,6 +267,7 @@ mod tests {
     fn sample_capabilities() -> ClientCapabilities {
         ClientCapabilities {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            elicitation: None,
             roots: Some(RootsCapability { list_changed: true }),
         }
     }
@@ -344,6 +345,7 @@ mod tests {
         let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
         let caps = ClientCapabilities {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            elicitation: None,
             roots: None,
         };
         assert_eq!(renderer.format_capabilities(&caps), "sampling");
@@ -354,6 +356,7 @@ mod tests {
         let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
         let caps = ClientCapabilities {
             sampling: None,
+            elicitation: None,
             roots: Some(RootsCapability {
                 list_changed: false,
             }),

@@ -142,7 +142,11 @@ impl ElicitationCapability {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RootsCapability {
     /// Whether the client supports list changes notifications.
-    #[serde(rename = "listChanged", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "listChanged",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub list_changed: bool,
 }
 
