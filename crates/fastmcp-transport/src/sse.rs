@@ -342,6 +342,9 @@ impl<W: Write> SseWriter<W> {
 // SSE Reader
 // =============================================================================
 
+/// Maximum line size for SSE events (64KB should be generous for JSON-RPC).
+const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
+
 /// Reader for SSE event streams.
 ///
 /// Parses SSE events from any `Read` implementation.
@@ -361,6 +364,8 @@ impl<W: Write> SseWriter<W> {
 pub struct SseReader<R> {
     reader: BufReader<R>,
     line_buffer: String,
+    /// Maximum line size to prevent memory exhaustion.
+    max_line_size: usize,
 }
 
 impl<R: Read> SseReader<R> {
@@ -370,6 +375,57 @@ impl<R: Read> SseReader<R> {
         Self {
             reader: BufReader::new(reader),
             line_buffer: String::with_capacity(4096),
+            max_line_size: MAX_SSE_LINE_SIZE,
+        }
+    }
+
+    /// Reads a line with size limit to prevent memory exhaustion.
+    ///
+    /// Returns the number of bytes read, or an error if the line exceeds
+    /// the maximum size.
+    fn read_line_bounded(&mut self) -> Result<usize, std::io::Error> {
+        use std::io::BufRead;
+
+        let mut total_read = 0;
+        loop {
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF
+                return Ok(total_read);
+            }
+
+            // Find newline in available buffer
+            let newline_pos = available.iter().position(|&b| b == b'\n');
+            let bytes_to_consume = match newline_pos {
+                Some(pos) => pos + 1, // Include the newline
+                None => available.len(),
+            };
+
+            // Check if this would exceed our limit
+            if self.line_buffer.len() + bytes_to_consume > self.max_line_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "SSE line exceeds maximum size of {} bytes",
+                        self.max_line_size
+                    ),
+                ));
+            }
+
+            // Convert bytes to string and append
+            let chunk = &available[..bytes_to_consume];
+            let chunk_str = std::str::from_utf8(chunk).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8: {e}"))
+            })?;
+            self.line_buffer.push_str(chunk_str);
+            total_read += bytes_to_consume;
+
+            self.reader.consume(bytes_to_consume);
+
+            if newline_pos.is_some() {
+                // Found newline, done with this line
+                return Ok(total_read);
+            }
         }
     }
 
@@ -392,12 +448,16 @@ impl<R: Read> SseReader<R> {
         let mut event_type: Option<SseEventType> = None;
         let mut unknown_event = false;
         let mut data_lines: Vec<String> = Vec::new();
+        let mut total_data_size: usize = 0;
         let mut event_id: Option<String> = None;
         let mut retry: Option<u64> = None;
 
+        // Maximum total event data size (1MB should be generous)
+        const MAX_EVENT_DATA_SIZE: usize = 1024 * 1024;
+
         loop {
             self.line_buffer.clear();
-            let bytes_read = self.reader.read_line(&mut self.line_buffer)?;
+            let bytes_read = self.read_line_bounded()?;
 
             if bytes_read == 0 {
                 // EOF
@@ -418,6 +478,7 @@ impl<R: Read> SseReader<R> {
                 if unknown_event {
                     event_type = None;
                     data_lines.clear();
+                    total_data_size = 0;
                     event_id = None;
                     retry = None;
                     unknown_event = false;
@@ -458,6 +519,17 @@ impl<R: Read> SseReader<R> {
                         }
                     }
                     "data" => {
+                        // Check accumulated data size to prevent memory exhaustion
+                        total_data_size = total_data_size.saturating_add(value.len() + 1); // +1 for newline
+                        if total_data_size > MAX_EVENT_DATA_SIZE {
+                            return Err(TransportError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "SSE event data exceeds maximum size of {} bytes",
+                                    MAX_EVENT_DATA_SIZE
+                                ),
+                            )));
+                        }
                         data_lines.push(value.to_string());
                     }
                     "id" => {
