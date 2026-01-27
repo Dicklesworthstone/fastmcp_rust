@@ -40,6 +40,7 @@ mod tasks;
 pub mod transform;
 pub mod oauth;
 pub mod oidc;
+pub mod docket;
 
 #[cfg(test)]
 mod tests;

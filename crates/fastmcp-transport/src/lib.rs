@@ -26,6 +26,7 @@
 mod async_io;
 mod codec;
 pub mod event_store;
+pub mod http;
 pub mod memory;
 pub mod sse;
 mod stdio;

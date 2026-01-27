@@ -77,7 +77,7 @@ pub use fastmcp_protocol::{
 pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
 
 // Re-export transport modules
-pub use fastmcp_transport::{event_store, memory};
+pub use fastmcp_transport::{event_store, http, memory};
 
 // Re-export server types
 #[cfg(feature = "jwt")]
@@ -89,10 +89,13 @@ pub use fastmcp_server::{
 };
 
 // Re-export server middleware modules
-pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
+pub use fastmcp_server::{caching, docket, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{Client, ClientBuilder, ClientSession};
+
+// Re-export client configuration module
+pub use fastmcp_client::mcp_config;
 
 // Re-export macros
 pub use fastmcp_macros::{JsonSchema, prompt, resource, tool};
