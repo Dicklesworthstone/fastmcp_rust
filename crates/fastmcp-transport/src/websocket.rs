@@ -1139,19 +1139,32 @@ mod tests {
         assert_eq!(frame.as_text().unwrap(), "hello");
     }
 
+    /// Helper to build a masked WebSocket frame for testing server-side code.
+    fn build_masked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let masked: Vec<u8> = payload
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i % 4])
+            .collect();
+
+        let mut frame = Vec::new();
+        let byte1 = if fin { 0x80 } else { 0x00 } | opcode;
+        frame.push(byte1);
+        frame.push(0x80 | payload.len() as u8); // Mask bit + length
+        frame.extend_from_slice(&mask);
+        frame.extend_from_slice(&masked);
+        frame
+    }
+
     #[test]
     fn test_fragmented_message_size_limit() {
+        // Build masked frames (client -> server)
         let mut buffer = Vec::new();
-
         // Text frame start (FIN=0, opcode=Text)
-        buffer.push(0x01);
-        buffer.push(0x05);
-        buffer.extend_from_slice(b"hello");
-
+        buffer.extend(build_masked_frame(0x01, false, b"hello"));
         // Continuation frame end (FIN=1, opcode=Continuation)
-        buffer.push(0x80);
-        buffer.push(0x05);
-        buffer.extend_from_slice(b"world");
+        buffer.extend(build_masked_frame(0x00, true, b"world"));
 
         let cx = Cx::for_testing();
         let writer: Vec<u8> = Vec::new();
@@ -1168,17 +1181,12 @@ mod tests {
     #[test]
     fn test_rejects_interleaved_binary_during_fragmentation() {
         // RFC 6455 Section 5.4: Data frames MUST NOT be interleaved
+        // Build masked frames (client -> server)
         let mut buffer = Vec::new();
-
         // Text frame start (FIN=0, opcode=Text)
-        buffer.push(0x01);
-        buffer.push(0x05);
-        buffer.extend_from_slice(b"hello");
-
+        buffer.extend(build_masked_frame(0x01, false, b"hello"));
         // Binary frame (interleaved - MUST be rejected)
-        buffer.push(0x82); // FIN + Binary opcode
-        buffer.push(0x03);
-        buffer.extend_from_slice(b"bad");
+        buffer.extend(build_masked_frame(0x02, true, b"bad"));
 
         let cx = Cx::for_testing();
         let writer: Vec<u8> = Vec::new();
@@ -1196,9 +1204,10 @@ mod tests {
         use fastmcp_protocol::RequestId;
 
         // Create a pipe using in-memory buffers
+        // Simulating server -> client: server writes unmasked, client reads unmasked
         let mut write_buf = Vec::new();
 
-        // Write a request
+        // Server writes a request (unmasked)
         {
             let cx = Cx::for_testing();
             let reader: &[u8] = &[];
@@ -1214,11 +1223,11 @@ mod tests {
             transport.send_request(&cx, &request).unwrap();
         }
 
-        // Read it back
+        // Client reads the request (accepts unmasked frames from server)
         {
             let cx = Cx::for_testing();
             let writer: Vec<u8> = Vec::new();
-            let mut transport = WsTransport::new(Cursor::new(write_buf), writer);
+            let mut transport = WsClientTransport::new(Cursor::new(write_buf), writer);
 
             let msg = transport.recv(&cx).unwrap();
             assert!(
@@ -1250,19 +1259,15 @@ mod tests {
 
     #[test]
     fn test_ping_auto_pong() {
-        // Build a ping frame followed by a text frame
+        // Build masked frames (simulating client -> server)
         let mut buffer = Vec::new();
 
-        // Ping frame
-        buffer.push(0x89); // FIN + Ping opcode
-        buffer.push(0x04); // 4-byte payload
-        buffer.extend_from_slice(b"ping");
+        // Ping frame (masked, opcode 0x09)
+        buffer.extend(build_masked_frame(0x09, true, b"ping"));
 
-        // Text frame with JSON-RPC
+        // Text frame with JSON-RPC (masked, opcode 0x01)
         let text = r#"{"jsonrpc":"2.0","id":1,"method":"test"}"#;
-        buffer.push(0x81); // FIN + Text opcode
-        buffer.push(text.len() as u8);
-        buffer.extend_from_slice(text.as_bytes());
+        buffer.extend(build_masked_frame(0x01, true, text.as_bytes()));
 
         let mut response_buf = Vec::new();
 

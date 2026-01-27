@@ -55,7 +55,7 @@
 //! You'll need to integrate with an HTTP server framework that works with
 //! asupersync (or use the provided adapters if available).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
@@ -415,7 +415,10 @@ impl<R: Read> SseReader<R> {
             // Convert bytes to string and append
             let chunk = &available[..bytes_to_consume];
             let chunk_str = std::str::from_utf8(chunk).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8: {e}"))
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid UTF-8: {e}"),
+                )
             })?;
             self.line_buffer.push_str(chunk_str);
             total_read += bytes_to_consume;
@@ -441,6 +444,9 @@ impl<R: Read> SseReader<R> {
     ///
     /// Checks for cancellation between reads.
     pub fn read_event(&mut self, cx: &Cx) -> Result<Option<SseEvent>, TransportError> {
+        // Maximum total event data size (1MB should be generous)
+        const MAX_EVENT_DATA_SIZE: usize = 1024 * 1024;
+
         if cx.is_cancel_requested() {
             return Err(TransportError::Cancelled);
         }
@@ -451,9 +457,6 @@ impl<R: Read> SseReader<R> {
         let mut total_data_size: usize = 0;
         let mut event_id: Option<String> = None;
         let mut retry: Option<u64> = None;
-
-        // Maximum total event data size (1MB should be generous)
-        const MAX_EVENT_DATA_SIZE: usize = 1024 * 1024;
 
         loop {
             self.line_buffer.clear();

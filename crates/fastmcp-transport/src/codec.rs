@@ -73,6 +73,13 @@ impl Codec {
     ///
     /// Returns an error if a complete line fails to parse or if the buffer exceeds the limit.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<JsonRpcMessage>, CodecError> {
+        // Check projected size BEFORE extending to prevent temporary memory exhaustion
+        let projected_size = self.buffer.len().saturating_add(data.len());
+        if projected_size > self.max_message_size {
+            self.buffer.clear();
+            return Err(CodecError::MessageTooLarge(projected_size));
+        }
+
         self.buffer.extend_from_slice(data);
 
         let mut messages = Vec::new();
@@ -215,23 +222,26 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_allows_multiple_messages_over_buffer_limit() {
+    fn test_decode_allows_multiple_messages_in_separate_chunks() {
+        // Since the codec now pre-checks chunk size, send messages in separate chunks
         let req1 = JsonRpcRequest::new("test1", None, 1i64);
         let req2 = JsonRpcRequest::new("test2", None, 2i64);
-        let line1 = serde_json::to_vec(&req1).unwrap();
-        let line2 = serde_json::to_vec(&req2).unwrap();
+        let mut line1 = serde_json::to_vec(&req1).unwrap();
+        let mut line2 = serde_json::to_vec(&req2).unwrap();
+        line1.push(b'\n');
+        line2.push(b'\n');
 
         let mut codec = Codec::new();
-        codec.max_message_size = line1.len();
+        // Set limit to accommodate one message at a time
+        codec.set_max_message_size(line1.len());
 
-        let mut input = Vec::new();
-        input.extend_from_slice(&line1);
-        input.push(b'\n');
-        input.extend_from_slice(&line2);
-        input.push(b'\n');
+        // Decode first message
+        let messages1 = codec.decode(&line1).unwrap();
+        assert_eq!(messages1.len(), 1);
 
-        let messages = codec.decode(&input).unwrap();
-        assert_eq!(messages.len(), 2);
+        // Decode second message
+        let messages2 = codec.decode(&line2).unwrap();
+        assert_eq!(messages2.len(), 1);
     }
 
     #[test]
