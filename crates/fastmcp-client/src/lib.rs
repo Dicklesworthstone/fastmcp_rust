@@ -265,7 +265,7 @@ impl Client {
 
         // Create a notification (request without id)
         let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
             method: method.to_string(),
             params: Some(params_value),
             id: None,

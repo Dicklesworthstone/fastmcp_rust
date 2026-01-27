@@ -1,7 +1,33 @@
 //! JSON-RPC 2.0 message types.
 
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+
+/// The JSON-RPC version string. Used as a static reference to avoid allocations.
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// Serializes the jsonrpc version field.
+fn serialize_jsonrpc_version<S>(value: &Cow<'static, str>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value)
+}
+
+/// Deserializes the jsonrpc version field, returning a borrowed reference for "2.0".
+fn deserialize_jsonrpc_version<'de, D>(deserializer: D) -> Result<Cow<'static, str>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s == JSONRPC_VERSION {
+        Ok(Cow::Borrowed(JSONRPC_VERSION))
+    } else {
+        Ok(Cow::Owned(s))
+    }
+}
 
 /// JSON-RPC request ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,7 +70,11 @@ impl std::fmt::Display for RequestId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     /// Protocol version (always "2.0").
-    pub jsonrpc: String,
+    #[serde(
+        serialize_with = "serialize_jsonrpc_version",
+        deserialize_with = "deserialize_jsonrpc_version"
+    )]
+    pub jsonrpc: Cow<'static, str>,
     /// Method name.
     pub method: String,
     /// Request parameters.
@@ -60,7 +90,7 @@ impl JsonRpcRequest {
     #[must_use]
     pub fn new(method: impl Into<String>, params: Option<Value>, id: impl Into<RequestId>) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             method: method.into(),
             params,
             id: Some(id.into()),
@@ -71,7 +101,7 @@ impl JsonRpcRequest {
     #[must_use]
     pub fn notification(method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             method: method.into(),
             params,
             id: None,
@@ -111,7 +141,11 @@ impl From<fastmcp_core::McpError> for JsonRpcError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     /// Protocol version (always "2.0").
-    pub jsonrpc: String,
+    #[serde(
+        serialize_with = "serialize_jsonrpc_version",
+        deserialize_with = "deserialize_jsonrpc_version"
+    )]
+    pub jsonrpc: Cow<'static, str>,
     /// Result (present on success).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -127,7 +161,7 @@ impl JsonRpcResponse {
     #[must_use]
     pub fn success(id: RequestId, result: Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             result: Some(result),
             error: None,
             id: Some(id),
@@ -138,7 +172,7 @@ impl JsonRpcResponse {
     #[must_use]
     pub fn error(id: Option<RequestId>, error: JsonRpcError) -> Self {
         Self {
-            jsonrpc: "2.0".to_owned(),
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             result: None,
             error: Some(error),
             id,

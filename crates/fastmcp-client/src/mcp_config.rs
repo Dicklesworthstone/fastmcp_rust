@@ -423,7 +423,7 @@ fn create_and_initialize_client(
 
     // Send initialized notification
     let notification = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
+        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
         method: "initialized".to_string(),
         params: Some(serde_json::json!({})),
         id: None,
