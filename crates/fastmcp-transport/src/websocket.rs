@@ -1140,7 +1140,17 @@ mod tests {
     }
 
     /// Helper to build a masked WebSocket frame for testing server-side code.
+    ///
+    /// # Panics
+    ///
+    /// Panics if payload length exceeds 125 bytes (extended length encoding not implemented).
     fn build_masked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        assert!(
+            payload.len() <= 125,
+            "build_masked_frame: payload too large ({} bytes), max 125",
+            payload.len()
+        );
+
         let mask = [0x12, 0x34, 0x56, 0x78];
         let masked: Vec<u8> = payload
             .iter()
@@ -1151,7 +1161,7 @@ mod tests {
         let mut frame = Vec::new();
         let byte1 = if fin { 0x80 } else { 0x00 } | opcode;
         frame.push(byte1);
-        frame.push(0x80 | payload.len() as u8); // Mask bit + length
+        frame.push(0x80 | payload.len() as u8); // Mask bit + length (7-bit, max 125)
         frame.extend_from_slice(&mask);
         frame.extend_from_slice(&masked);
         frame

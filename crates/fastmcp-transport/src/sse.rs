@@ -383,6 +383,11 @@ impl<R: Read> SseReader<R> {
     ///
     /// Returns the number of bytes read, or an error if the line exceeds
     /// the maximum size.
+    ///
+    /// # Note
+    ///
+    /// On error, the reader state may be inconsistent (partial data consumed).
+    /// Callers should treat errors as terminal and not attempt further reads.
     fn read_line_bounded(&mut self) -> Result<usize, std::io::Error> {
         use std::io::BufRead;
 
