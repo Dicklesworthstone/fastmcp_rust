@@ -31,6 +31,7 @@ pub use session::ClientSession;
 
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult};
@@ -82,6 +83,8 @@ pub struct Client {
     session: ClientSession,
     /// Request ID counter.
     next_id: AtomicU64,
+    /// Request timeout in milliseconds (0 = no timeout).
+    timeout_ms: u64,
 }
 
 impl Client {
@@ -146,6 +149,7 @@ impl Client {
                 String::new(),
             ),
             next_id: AtomicU64::new(1),
+            timeout_ms: 30_000, // Default 30 second timeout
         };
 
         // Perform initialization handshake
@@ -180,6 +184,7 @@ impl Client {
         transport: StdioTransport<ChildStdout, ChildStdin>,
         cx: Cx,
         session: ClientSession,
+        timeout_ms: u64,
     ) -> Self {
         Self {
             child,
@@ -187,6 +192,7 @@ impl Client {
             cx,
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
+            timeout_ms,
         }
     }
 
@@ -218,6 +224,7 @@ impl Client {
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
         #[allow(clippy::cast_possible_wrap)]
+        let request_id = RequestId::Number(id as i64);
         let request = JsonRpcRequest::new(method, Some(params_value), id as i64);
 
         // Send request
@@ -225,8 +232,8 @@ impl Client {
             .send(&self.cx, &JsonRpcMessage::Request(request))
             .map_err(transport_error_to_mcp)?;
 
-        // Receive response
-        let response = self.recv_response()?;
+        // Receive response with ID validation
+        let response = self.recv_response(&request_id)?;
 
         // Check for error response
         if let Some(error) = response.error {
@@ -287,16 +294,43 @@ impl Client {
         self.send_notification("notifications/cancelled", params)
     }
 
-    /// Receives a response from the transport.
-    fn recv_response(&mut self) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
+    /// Receives a response from the transport, validating the response ID.
+    fn recv_response(
+        &mut self,
+        expected_id: &RequestId,
+    ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
+        // Calculate deadline if timeout is configured
+        let deadline = if self.timeout_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(self.timeout_ms))
+        } else {
+            None
+        };
+
         loop {
+            // Check timeout before each recv attempt
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(McpError::internal_error("Request timed out"));
+                }
+            }
+
             let message = self
                 .transport
                 .recv(&self.cx)
                 .map_err(transport_error_to_mcp)?;
 
             match message {
-                JsonRpcMessage::Response(response) => return Ok(response),
+                JsonRpcMessage::Response(response) => {
+                    // Validate response ID matches the expected request ID
+                    if let Some(ref id) = response.id {
+                        if id != expected_id {
+                            // This response is for a different request; continue waiting.
+                            // (Could queue it for later, but for simplicity we discard.)
+                            continue;
+                        }
+                    }
+                    return Ok(response);
+                }
                 JsonRpcMessage::Request(request) => {
                     // Server sending a request to client (e.g., notification)
                     if request.method == "notifications/message" {
@@ -481,7 +515,21 @@ impl Client {
         expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
+        // Calculate deadline if timeout is configured
+        let deadline = if self.timeout_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(self.timeout_ms))
+        } else {
+            None
+        };
+
         loop {
+            // Check timeout before each recv attempt
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(McpError::internal_error("Request timed out"));
+                }
+            }
+
             let message = self
                 .transport
                 .recv(&self.cx)
@@ -632,6 +680,16 @@ impl Client {
         let _ = self.transport.close();
 
         // Kill the subprocess if still running
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Ensure subprocess is cleaned up even if close() wasn't called.
+        // Ignore errors since we're in drop - best effort cleanup.
+        let _ = self.transport.close();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
