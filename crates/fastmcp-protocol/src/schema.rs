@@ -78,6 +78,115 @@ pub fn validate(schema: &Value, value: &Value) -> ValidationResult {
     }
 }
 
+/// Validates a JSON value against a JSON Schema in strict mode.
+///
+/// Strict mode enforces `additionalProperties: false` on all object schemas,
+/// rejecting any properties not explicitly defined in the schema.
+///
+/// # Arguments
+///
+/// * `schema` - The JSON Schema to validate against
+/// * `value` - The value to validate
+///
+/// # Returns
+///
+/// `Ok(())` if the value is valid, or `Err(Vec<ValidationError>)` with all
+/// validation errors found.
+///
+/// # Example
+///
+/// ```
+/// use fastmcp_protocol::schema::validate_strict;
+/// use serde_json::json;
+///
+/// let schema = json!({
+///     "type": "object",
+///     "properties": {
+///         "name": { "type": "string" }
+///     }
+/// });
+///
+/// // Extra property "age" is rejected in strict mode
+/// let with_extra = json!({ "name": "Alice", "age": 30 });
+/// assert!(validate_strict(&schema, &with_extra).is_err());
+///
+/// // Only defined properties pass
+/// let valid = json!({ "name": "Alice" });
+/// assert!(validate_strict(&schema, &valid).is_ok());
+/// ```
+pub fn validate_strict(schema: &Value, value: &Value) -> ValidationResult {
+    // Clone and modify the schema to enforce additionalProperties: false
+    let strict_schema = make_strict_schema(schema);
+    validate(&strict_schema, value)
+}
+
+/// Recursively adds `additionalProperties: false` to all object schemas.
+fn make_strict_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(obj) => {
+            let mut new_obj = obj.clone();
+
+            // Add additionalProperties: false if this is an object type schema
+            // and doesn't already have additionalProperties defined
+            if let Some(type_val) = obj.get("type") {
+                let is_object_type = type_val == "object"
+                    || type_val
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().any(|t| t == "object"));
+
+                if is_object_type && !obj.contains_key("additionalProperties") {
+                    new_obj.insert(
+                        "additionalProperties".to_string(),
+                        Value::Bool(false),
+                    );
+                }
+            }
+
+            // Recursively process nested schemas
+            if let Some(properties) = obj.get("properties") {
+                if let Value::Object(props) = properties {
+                    let strict_props: serde_json::Map<String, Value> = props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), make_strict_schema(v)))
+                        .collect();
+                    new_obj.insert("properties".to_string(), Value::Object(strict_props));
+                }
+            }
+
+            // Handle additionalProperties if it's a schema object
+            if let Some(additional) = obj.get("additionalProperties") {
+                if additional.is_object() {
+                    new_obj.insert(
+                        "additionalProperties".to_string(),
+                        make_strict_schema(additional),
+                    );
+                }
+            }
+
+            // Handle items schema for arrays
+            if let Some(items) = obj.get("items") {
+                new_obj.insert("items".to_string(), make_strict_schema(items));
+            }
+
+            // Handle prefixItems for tuple validation
+            if let Some(prefix_items) = obj.get("prefixItems") {
+                if let Value::Array(arr) = prefix_items {
+                    let strict_items: Vec<Value> =
+                        arr.iter().map(make_strict_schema).collect();
+                    new_obj.insert("prefixItems".to_string(), Value::Array(strict_items));
+                }
+            }
+
+            Value::Object(new_obj)
+        }
+        Value::Array(arr) => {
+            // Handle array schemas (union types in older drafts)
+            Value::Array(arr.iter().map(make_strict_schema).collect())
+        }
+        _ => schema.clone(),
+    }
+}
+
 /// Internal recursive validation function.
 fn validate_internal(schema: &Value, value: &Value, path: &str, errors: &mut Vec<ValidationError>) {
     // Handle boolean schemas (true = accept all, false = reject all)
@@ -709,5 +818,132 @@ mod tests {
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "root.items[1]");
+    }
+
+    // ========================================================================
+    // Strict Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_validate_strict_rejects_extra_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+
+        // Regular validate allows extra properties
+        assert!(validate(&schema, &json!({"name": "Alice", "extra": 123})).is_ok());
+
+        // Strict validate rejects extra properties
+        assert!(validate_strict(&schema, &json!({"name": "Alice", "extra": 123})).is_err());
+
+        // Strict validate allows only defined properties
+        assert!(validate_strict(&schema, &json!({"name": "Alice"})).is_ok());
+    }
+
+    #[test]
+    fn test_validate_strict_nested_objects() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "person": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    }
+                }
+            }
+        });
+
+        // Regular validate allows extra properties at any level
+        assert!(validate(&schema, &json!({
+            "person": {"name": "Alice", "age": 30}
+        })).is_ok());
+
+        // Strict validate rejects extra properties at nested level
+        assert!(validate_strict(&schema, &json!({
+            "person": {"name": "Alice", "age": 30}
+        })).is_err());
+
+        // Strict validate passes with only defined properties
+        assert!(validate_strict(&schema, &json!({
+            "person": {"name": "Alice"}
+        })).is_ok());
+    }
+
+    #[test]
+    fn test_validate_strict_preserves_explicit_additional_properties() {
+        // Schema explicitly allows additional properties with a specific type
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "additionalProperties": {"type": "integer"}
+        });
+
+        // With explicit additionalProperties schema, strict mode should honor it
+        assert!(validate_strict(&schema, &json!({
+            "name": "Alice",
+            "count": 42
+        })).is_ok());
+
+        // But still validate the type of additional properties
+        assert!(validate_strict(&schema, &json!({
+            "name": "Alice",
+            "count": "not an integer"
+        })).is_err());
+    }
+
+    #[test]
+    fn test_validate_strict_array_items() {
+        let schema = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"}
+                }
+            }
+        });
+
+        // Regular validate allows extra properties in array items
+        assert!(validate(&schema, &json!([
+            {"id": 1, "extra": "value"}
+        ])).is_ok());
+
+        // Strict validate rejects extra properties in array items
+        assert!(validate_strict(&schema, &json!([
+            {"id": 1, "extra": "value"}
+        ])).is_err());
+
+        // Strict validate passes with only defined properties
+        assert!(validate_strict(&schema, &json!([
+            {"id": 1}
+        ])).is_ok());
+    }
+
+    #[test]
+    fn test_validate_strict_empty_schema() {
+        // Empty schema or true accepts everything
+        let schema = json!({});
+
+        // Empty schema doesn't have type: "object", so strict doesn't add additionalProperties
+        assert!(validate_strict(&schema, &json!({"anything": "goes"})).is_ok());
+    }
+
+    #[test]
+    fn test_validate_strict_non_object_types() {
+        // Strict mode shouldn't affect non-object types
+        let string_schema = json!({"type": "string"});
+        assert!(validate_strict(&string_schema, &json!("hello")).is_ok());
+
+        let number_schema = json!({"type": "number"});
+        assert!(validate_strict(&number_schema, &json!(42)).is_ok());
+
+        let array_schema = json!({"type": "array"});
+        assert!(validate_strict(&array_schema, &json!([1, 2, 3])).is_ok());
     }
 }

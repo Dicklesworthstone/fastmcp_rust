@@ -31,5 +31,5 @@ pub use jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
 pub use messages::*;
-pub use schema::{ValidationError, ValidationResult, validate};
+pub use schema::{ValidationError, ValidationResult, validate, validate_strict};
 pub use types::*;

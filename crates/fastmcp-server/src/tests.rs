@@ -2885,6 +2885,77 @@ mod router_tests {
         let call_result = result.unwrap();
         assert!(!call_result.is_error);
     }
+
+    #[test]
+    fn test_handle_tools_call_lenient_validation_allows_extra_properties() {
+        // Default (lenient) mode allows extra properties
+        let router = create_test_router();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Include an extra property not in the schema
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice", "extra": "ignored"})),
+            meta: None,
+        };
+
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+
+        // Should pass in lenient mode
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(!call_result.is_error);
+    }
+
+    #[test]
+    fn test_handle_tools_call_strict_validation_rejects_extra_properties() {
+        // Enable strict validation mode
+        let mut router = create_test_router();
+        router.set_strict_input_validation(true);
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Include an extra property not in the schema
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice", "extra": "should_fail"})),
+            meta: None,
+        };
+
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+
+        // Should fail in strict mode due to extra property
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("validation") || err.message.contains("additional"));
+    }
+
+    #[test]
+    fn test_handle_tools_call_strict_validation_passes_valid_input() {
+        // Enable strict validation mode
+        let mut router = create_test_router();
+        router.set_strict_input_validation(true);
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+
+        // Only include defined properties
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: Some(serde_json::json!({"name": "Alice"})),
+            meta: None,
+        };
+
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+
+        // Should pass in strict mode with valid input
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(!call_result.is_error);
+    }
 }
 
 // ============================================================================

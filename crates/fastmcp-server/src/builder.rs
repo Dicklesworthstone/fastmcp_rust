@@ -47,6 +47,8 @@ pub struct ServerBuilder {
     task_manager: Option<SharedTaskManager>,
     /// Behavior when registering duplicate component names.
     on_duplicate: DuplicateBehavior,
+    /// Whether to use strict input validation (reject extra properties).
+    strict_input_validation: bool,
 }
 
 impl ServerBuilder {
@@ -80,6 +82,7 @@ impl ServerBuilder {
             middleware: Vec::new(),
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
+            strict_input_validation: false,
         }
     }
 
@@ -214,6 +217,33 @@ impl ServerBuilder {
     #[must_use]
     pub fn is_error_masking_enabled(&self) -> bool {
         self.mask_error_details
+    }
+
+    /// Enables or disables strict input validation.
+    ///
+    /// When enabled, tool input validation will reject any properties not
+    /// explicitly defined in the tool's input schema (enforces `additionalProperties: false`).
+    ///
+    /// When disabled (default), extra properties are allowed unless the schema
+    /// explicitly sets `additionalProperties: false`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let server = Server::new("api", "1.0")
+    ///     .strict_input_validation(true)  // Reject unknown properties
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn strict_input_validation(mut self, enabled: bool) -> Self {
+        self.strict_input_validation = enabled;
+        self
+    }
+
+    /// Returns whether strict input validation is enabled.
+    #[must_use]
+    pub fn is_strict_input_validation_enabled(&self) -> bool {
+        self.strict_input_validation
     }
 
     /// Registers a middleware.
@@ -877,7 +907,10 @@ impl ServerBuilder {
 
     /// Builds the server.
     #[must_use]
-    pub fn build(self) -> Server {
+    pub fn build(mut self) -> Server {
+        // Configure router with strict input validation setting
+        self.router.set_strict_input_validation(self.strict_input_validation);
+
         Server {
             info: self.info,
             capabilities: self.capabilities,

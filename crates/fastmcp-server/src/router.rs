@@ -15,7 +15,7 @@ use fastmcp_protocol::{
     ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListTasksParams,
     ListTasksResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressToken, Prompt,
     ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, SubmitTaskParams,
-    SubmitTaskResult, Tool, validate,
+    SubmitTaskResult, Tool, validate, validate_strict,
 };
 
 use crate::handler::{BidirectionalSenders, UriParams, create_context_with_progress_and_senders};
@@ -42,6 +42,8 @@ pub struct Router {
     /// Pre-sorted template keys by specificity (most specific first).
     /// Updated whenever templates are added/modified.
     sorted_template_keys: Vec<String>,
+    /// Whether to enforce strict input validation (reject extra properties).
+    strict_input_validation: bool,
 }
 
 impl Router {
@@ -54,7 +56,25 @@ impl Router {
             prompts: HashMap::new(),
             resource_templates: HashMap::new(),
             sorted_template_keys: Vec::new(),
+            strict_input_validation: false,
         }
+    }
+
+    /// Sets whether to use strict input validation.
+    ///
+    /// When enabled, tool input validation will reject any properties not
+    /// explicitly defined in the tool's input schema (enforces `additionalProperties: false`).
+    ///
+    /// When disabled (default), extra properties are allowed unless the schema
+    /// explicitly sets `additionalProperties: false`.
+    pub fn set_strict_input_validation(&mut self, strict: bool) {
+        self.strict_input_validation = strict;
+    }
+
+    /// Returns whether strict input validation is enabled.
+    #[must_use]
+    pub fn strict_input_validation(&self) -> bool {
+        self.strict_input_validation
     }
 
     /// Rebuilds the sorted template keys vector.
@@ -570,7 +590,15 @@ impl Router {
         // Default to empty object since MCP tool arguments are always objects
         let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
         let tool_def = handler.definition();
-        if let Err(validation_errors) = validate(&tool_def.input_schema, &arguments) {
+
+        // Use strict or lenient validation based on configuration
+        let validation_result = if self.strict_input_validation {
+            validate_strict(&tool_def.input_schema, &arguments)
+        } else {
+            validate(&tool_def.input_schema, &arguments)
+        };
+
+        if let Err(validation_errors) = validation_result {
             let error_messages: Vec<String> = validation_errors
                 .iter()
                 .map(|e| format!("{}: {}", e.path, e.message))
@@ -1757,7 +1785,15 @@ impl ToolCaller for RouterToolCaller {
 
             // Validate arguments against the tool's input schema
             let tool_def = handler.definition();
-            if let Err(validation_errors) = validate(&tool_def.input_schema, &args) {
+
+            // Use strict or lenient validation based on router configuration
+            let validation_result = if router.strict_input_validation {
+                validate_strict(&tool_def.input_schema, &args)
+            } else {
+                validate(&tool_def.input_schema, &args)
+            };
+
+            if let Err(validation_errors) = validation_result {
                 let error_messages: Vec<String> = validation_errors
                     .iter()
                     .map(|e| format!("{}: {}", e.path, e.message))
