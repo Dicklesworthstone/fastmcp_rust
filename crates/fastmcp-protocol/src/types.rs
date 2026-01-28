@@ -295,6 +295,9 @@ pub struct Tool {
     /// Icon for visual representation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<Icon>,
+    /// Component version (semver-like string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Resource definition.
@@ -313,6 +316,9 @@ pub struct Resource {
     /// Icon for visual representation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<Icon>,
+    /// Component version (semver-like string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Resource template definition.
@@ -332,6 +338,9 @@ pub struct ResourceTemplate {
     /// Icon for visual representation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<Icon>,
+    /// Component version (semver-like string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Prompt definition.
@@ -348,6 +357,9 @@ pub struct Prompt {
     /// Icon for visual representation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<Icon>,
+    /// Component version (semver-like string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Prompt argument definition.

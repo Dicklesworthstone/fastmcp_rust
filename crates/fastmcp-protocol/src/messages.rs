@@ -1028,6 +1028,7 @@ mod tests {
                 description: Some("Template description".to_string()),
                 mime_type: Some("text/plain".to_string()),
                 icon: None,
+                version: None,
             }],
         };
 
@@ -1463,5 +1464,156 @@ mod tests {
         let cap = RootsCapability::default();
         let json = serde_json::to_value(&cap).expect("serialize");
         assert!(json.get("listChanged").is_none());
+    }
+
+    // ========================================================================
+    // Component Version Metadata Tests
+    // ========================================================================
+
+    #[test]
+    fn tool_version_serialization() {
+        use crate::types::Tool;
+
+        // Tool without version (should omit version field)
+        let tool = Tool {
+            name: "my_tool".to_string(),
+            description: Some("A test tool".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
+            version: None,
+        };
+        let json = serde_json::to_value(&tool).expect("serialize");
+        assert!(json.get("version").is_none());
+
+        // Tool with version
+        let tool = Tool {
+            name: "my_tool".to_string(),
+            description: Some("A test tool".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
+            version: Some("1.2.3".to_string()),
+        };
+        let json = serde_json::to_value(&tool).expect("serialize");
+        assert_eq!(json["version"], "1.2.3");
+    }
+
+    #[test]
+    fn resource_version_serialization() {
+        use crate::types::Resource;
+
+        // Resource without version
+        let resource = Resource {
+            uri: "file://test".to_string(),
+            name: "Test Resource".to_string(),
+            description: None,
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: None,
+        };
+        let json = serde_json::to_value(&resource).expect("serialize");
+        assert!(json.get("version").is_none());
+
+        // Resource with version
+        let resource = Resource {
+            uri: "file://test".to_string(),
+            name: "Test Resource".to_string(),
+            description: None,
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: Some("2.0.0".to_string()),
+        };
+        let json = serde_json::to_value(&resource).expect("serialize");
+        assert_eq!(json["version"], "2.0.0");
+    }
+
+    #[test]
+    fn prompt_version_serialization() {
+        use crate::types::Prompt;
+
+        // Prompt without version
+        let prompt = Prompt {
+            name: "greeting".to_string(),
+            description: Some("A greeting prompt".to_string()),
+            arguments: vec![],
+            icon: None,
+            version: None,
+        };
+        let json = serde_json::to_value(&prompt).expect("serialize");
+        assert!(json.get("version").is_none());
+
+        // Prompt with version
+        let prompt = Prompt {
+            name: "greeting".to_string(),
+            description: Some("A greeting prompt".to_string()),
+            arguments: vec![],
+            icon: None,
+            version: Some("0.1.0".to_string()),
+        };
+        let json = serde_json::to_value(&prompt).expect("serialize");
+        assert_eq!(json["version"], "0.1.0");
+    }
+
+    #[test]
+    fn resource_template_version_serialization() {
+        // ResourceTemplate without version
+        let template = ResourceTemplate {
+            uri_template: "file://{path}".to_string(),
+            name: "Files".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+        };
+        let json = serde_json::to_value(&template).expect("serialize");
+        assert!(json.get("version").is_none());
+
+        // ResourceTemplate with version
+        let template = ResourceTemplate {
+            uri_template: "file://{path}".to_string(),
+            name: "Files".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: Some("3.0.0".to_string()),
+        };
+        let json = serde_json::to_value(&template).expect("serialize");
+        assert_eq!(json["version"], "3.0.0");
+    }
+
+    #[test]
+    fn version_deserialization() {
+        use crate::types::{Prompt, Resource, Tool};
+
+        // Deserialize tool without version
+        let json = serde_json::json!({
+            "name": "tool",
+            "inputSchema": {"type": "object"}
+        });
+        let tool: Tool = serde_json::from_value(json).expect("deserialize");
+        assert!(tool.version.is_none());
+
+        // Deserialize tool with version
+        let json = serde_json::json!({
+            "name": "tool",
+            "inputSchema": {"type": "object"},
+            "version": "1.0.0"
+        });
+        let tool: Tool = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(tool.version, Some("1.0.0".to_string()));
+
+        // Deserialize resource without version
+        let json = serde_json::json!({
+            "uri": "file://test",
+            "name": "Test"
+        });
+        let resource: Resource = serde_json::from_value(json).expect("deserialize");
+        assert!(resource.version.is_none());
+
+        // Deserialize prompt without version
+        let json = serde_json::json!({
+            "name": "prompt"
+        });
+        let prompt: Prompt = serde_json::from_value(json).expect("deserialize");
+        assert!(prompt.version.is_none());
     }
 }

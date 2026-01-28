@@ -222,6 +222,14 @@ pub trait ToolHandler: Send + Sync {
         None
     }
 
+    /// Returns the tool's version, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide a version.
+    /// Note: Version can also be set directly in `definition()`.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
     /// Calls the tool synchronously with the given arguments.
     ///
     /// This is the default implementation point. Override this for simple
@@ -281,6 +289,14 @@ pub trait ResourceHandler: Send + Sync {
     /// Default implementation returns `None`. Override to provide an icon.
     /// Note: Icons can also be set directly in `definition()`.
     fn icon(&self) -> Option<&Icon> {
+        None
+    }
+
+    /// Returns the resource's version, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide a version.
+    /// Note: Version can also be set directly in `definition()`.
+    fn version(&self) -> Option<&str> {
         None
     }
 
@@ -367,6 +383,14 @@ pub trait PromptHandler: Send + Sync {
     /// Default implementation returns `None`. Override to provide an icon.
     /// Note: Icons can also be set directly in `definition()`.
     fn icon(&self) -> Option<&Icon> {
+        None
+    }
+
+    /// Returns the prompt's version, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide a version.
+    /// Note: Version can also be set directly in `definition()`.
+    fn version(&self) -> Option<&str> {
         None
     }
 

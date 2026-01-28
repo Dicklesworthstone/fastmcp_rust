@@ -593,6 +593,7 @@ impl FilesystemResourceHandler {
                     description: None,
                     mime_type: Some(entry.mime_type),
                     icon: None,
+                    version: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -618,6 +619,7 @@ impl ResourceHandler for FilesystemResourceHandler {
             description: self.provider.description.clone(),
             mime_type: None,
             icon: None,
+            version: None,
         }
     }
 
@@ -632,6 +634,7 @@ impl ResourceHandler for FilesystemResourceHandler {
             description: self.provider.description.clone(),
             mime_type: None,
             icon: None,
+            version: None,
         })
     }
 
