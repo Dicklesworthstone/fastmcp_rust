@@ -100,6 +100,9 @@ pub use fastmcp_client::mcp_config;
 // Re-export macros
 pub use fastmcp_macros::{JsonSchema, prompt, resource, tool};
 
+// Testing module
+pub mod testing;
+
 /// Prelude module for convenient imports.
 ///
 /// ```ignore
