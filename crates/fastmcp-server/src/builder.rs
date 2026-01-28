@@ -14,8 +14,8 @@ use log::{Level, LevelFilter};
 use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog, ProxyClient,
-    ResourceHandler, Router, Server, ToolHandler,
+    AuthProvider, DuplicateBehavior, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog,
+    ProxyClient, ResourceHandler, Router, Server, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -45,6 +45,8 @@ pub struct ServerBuilder {
     middleware: Vec<Box<dyn crate::Middleware>>,
     /// Optional task manager for background tasks (Docket/SEP-1686).
     task_manager: Option<SharedTaskManager>,
+    /// Behavior when registering duplicate component names.
+    on_duplicate: DuplicateBehavior,
 }
 
 impl ServerBuilder {
@@ -77,7 +79,33 @@ impl ServerBuilder {
             auth_provider: None,
             middleware: Vec::new(),
             task_manager: None,
+            on_duplicate: DuplicateBehavior::default(),
         }
+    }
+
+    /// Sets the behavior when registering duplicate component names.
+    ///
+    /// Controls what happens when a tool, resource, or prompt is registered
+    /// with a name that already exists:
+    ///
+    /// - [`DuplicateBehavior::Error`]: Fail with an error
+    /// - [`DuplicateBehavior::Warn`]: Log warning, keep original (default)
+    /// - [`DuplicateBehavior::Replace`]: Replace with new component
+    /// - [`DuplicateBehavior::Ignore`]: Silently keep original
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Server::new("demo", "1.0")
+    ///     .on_duplicate(DuplicateBehavior::Error)  // Strict mode
+    ///     .tool(handler1)
+    ///     .tool(handler2)  // Fails if name conflicts
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn on_duplicate(mut self, behavior: DuplicateBehavior) -> Self {
+        self.on_duplicate = behavior;
+        self
     }
 
     /// Sets an authentication provider.
@@ -196,18 +224,38 @@ impl ServerBuilder {
     }
 
     /// Registers a tool handler.
+    ///
+    /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
+    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
+    /// an error will be logged and the tool will not be registered.
     #[must_use]
     pub fn tool<H: ToolHandler + 'static>(mut self, handler: H) -> Self {
-        self.router.add_tool(handler);
-        self.capabilities.tools = Some(ToolsCapability::default());
+        if let Err(e) = self
+            .router
+            .add_tool_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(target: "fastmcp::builder", "Failed to register tool: {}", e);
+        } else {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
         self
     }
 
     /// Registers a resource handler.
+    ///
+    /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
+    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
+    /// an error will be logged and the resource will not be registered.
     #[must_use]
     pub fn resource<H: ResourceHandler + 'static>(mut self, handler: H) -> Self {
-        self.router.add_resource(handler);
-        self.capabilities.resources = Some(ResourcesCapability::default());
+        if let Err(e) = self
+            .router
+            .add_resource_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(target: "fastmcp::builder", "Failed to register resource: {}", e);
+        } else {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
         self
     }
 
@@ -220,10 +268,20 @@ impl ServerBuilder {
     }
 
     /// Registers a prompt handler.
+    ///
+    /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
+    /// If [`DuplicateBehavior::Error`] is set and a duplicate is found,
+    /// an error will be logged and the prompt will not be registered.
     #[must_use]
     pub fn prompt<H: PromptHandler + 'static>(mut self, handler: H) -> Self {
-        self.router.add_prompt(handler);
-        self.capabilities.prompts = Some(PromptsCapability::default());
+        if let Err(e) = self
+            .router
+            .add_prompt_with_behavior(handler, self.on_duplicate)
+        {
+            log::error!(target: "fastmcp::builder", "Failed to register prompt: {}", e);
+        } else {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
         self
     }
 
@@ -267,6 +325,321 @@ impl ServerBuilder {
             self.capabilities.resources = Some(ResourcesCapability::default());
         }
         if has_prompts {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+
+        self
+    }
+
+    /// Creates a proxy to an external MCP server with automatic discovery.
+    ///
+    /// This is a convenience method that combines connection, discovery, and
+    /// handler registration. The client should already be initialized (connected
+    /// to the server).
+    ///
+    /// All tools, resources, and prompts from the external server are registered
+    /// as proxy handlers with the specified prefix.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastmcp_client::Client;
+    ///
+    /// // Create and initialize client
+    /// let mut client = Client::new(transport)?;
+    /// client.initialize()?;
+    ///
+    /// // Create main server with proxy to external
+    /// let main = Server::new("main", "1.0")
+    ///     .tool(local_tool)
+    ///     .as_proxy("ext", client)?    // ext/external_tool, etc.
+    ///     .build();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog fetch fails.
+    pub fn as_proxy(
+        mut self,
+        prefix: &str,
+        client: fastmcp_client::Client,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        // Create proxy client and fetch catalog
+        let proxy_client = ProxyClient::from_client(client);
+        let catalog = proxy_client.catalog()?;
+
+        // Capture counts before consuming
+        let tool_count = catalog.tools.len();
+        let resource_count = catalog.resources.len();
+        let template_count = catalog.resource_templates.len();
+        let prompt_count = catalog.prompts.len();
+
+        let has_tools = tool_count > 0;
+        let has_resources = resource_count > 0 || template_count > 0;
+        let has_prompts = prompt_count > 0;
+
+        // Register tools with prefix
+        for tool in catalog.tools {
+            log::debug!(
+                target: "fastmcp::proxy",
+                "Registering proxied tool: {}/{}", prefix, tool.name
+            );
+            self.router.add_tool(ProxyToolHandler::with_prefix(
+                tool,
+                prefix,
+                proxy_client.clone(),
+            ));
+        }
+
+        // Register resources with prefix
+        for resource in catalog.resources {
+            log::debug!(
+                target: "fastmcp::proxy",
+                "Registering proxied resource: {}/{}", prefix, resource.uri
+            );
+            self.router.add_resource(ProxyResourceHandler::with_prefix(
+                resource,
+                prefix,
+                proxy_client.clone(),
+            ));
+        }
+
+        // Register resource templates with prefix
+        for template in catalog.resource_templates {
+            log::debug!(
+                target: "fastmcp::proxy",
+                "Registering proxied template: {}/{}", prefix, template.uri_template
+            );
+            self.router
+                .add_resource(ProxyResourceHandler::from_template_with_prefix(
+                    template,
+                    prefix,
+                    proxy_client.clone(),
+                ));
+        }
+
+        // Register prompts with prefix
+        for prompt in catalog.prompts {
+            log::debug!(
+                target: "fastmcp::proxy",
+                "Registering proxied prompt: {}/{}", prefix, prompt.name
+            );
+            self.router.add_prompt(ProxyPromptHandler::with_prefix(
+                prompt,
+                prefix,
+                proxy_client.clone(),
+            ));
+        }
+
+        // Update capabilities
+        if has_tools {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+        if has_resources {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        if has_prompts {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+
+        log::info!(
+            target: "fastmcp::proxy",
+            "Proxied {} tools, {} resources, {} templates, {} prompts with prefix '{}'",
+            tool_count,
+            resource_count,
+            template_count,
+            prompt_count,
+            prefix
+        );
+
+        Ok(self)
+    }
+
+    /// Creates a proxy to an external MCP server without a prefix.
+    ///
+    /// Similar to [`as_proxy`](Self::as_proxy), but tools/resources/prompts
+    /// keep their original names. Use this when proxying a single external
+    /// server or when you don't need namespace separation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let main = Server::new("main", "1.0")
+    ///     .as_proxy_raw(client)?  // External tools appear with original names
+    ///     .build();
+    /// ```
+    pub fn as_proxy_raw(
+        self,
+        client: fastmcp_client::Client,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        let proxy_client = ProxyClient::from_client(client);
+        let catalog = proxy_client.catalog()?;
+        Ok(self.proxy(proxy_client, catalog))
+    }
+
+    // ─────────────────────────────────────────────────
+    // Server Composition (Mount)
+    // ─────────────────────────────────────────────────
+
+    /// Mounts another server's components into this server with an optional prefix.
+    ///
+    /// This consumes the source server and moves all its tools, resources, and prompts
+    /// into this server. Names/URIs are prefixed with `prefix/` if a prefix is provided.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let db_server = Server::new("db", "1.0")
+    ///     .tool(query_tool)
+    ///     .tool(insert_tool)
+    ///     .build();
+    ///
+    /// let api_server = Server::new("api", "1.0")
+    ///     .tool(endpoint_tool)
+    ///     .build();
+    ///
+    /// let main = Server::new("main", "1.0")
+    ///     .mount(db_server, Some("db"))      // db/query, db/insert
+    ///     .mount(api_server, Some("api"))    // api/endpoint
+    ///     .build();
+    /// ```
+    ///
+    /// # Prefix Rules
+    ///
+    /// - Prefixes must be alphanumeric plus underscores and hyphens
+    /// - Prefixes cannot contain slashes
+    /// - With prefix `"db"`, tool `"query"` becomes `"db/query"`
+    /// - Without prefix, names are preserved (may cause conflicts)
+    #[must_use]
+    pub fn mount(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        let has_tools = server.has_tools();
+        let has_resources = server.has_resources();
+        let has_prompts = server.has_prompts();
+
+        let source_router = server.into_router();
+        let result = self.router.mount(source_router, prefix);
+
+        // Log warnings if any
+        for warning in &result.warnings {
+            log::warn!(target: "fastmcp::mount", "{}", warning);
+        }
+
+        // Update capabilities based on what was mounted
+        if has_tools && result.tools > 0 {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+        if has_resources && (result.resources > 0 || result.resource_templates > 0) {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        if has_prompts && result.prompts > 0 {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+
+        self
+    }
+
+    /// Mounts only tools from another server with an optional prefix.
+    ///
+    /// Similar to [`mount`](Self::mount), but only transfers tools, ignoring
+    /// resources and prompts.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let utils_server = Server::new("utils", "1.0")
+    ///     .tool(format_tool)
+    ///     .tool(parse_tool)
+    ///     .resource(config_resource)  // Will NOT be mounted
+    ///     .build();
+    ///
+    /// let main = Server::new("main", "1.0")
+    ///     .mount_tools(utils_server, Some("utils"))  // Only tools
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn mount_tools(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        let source_router = server.into_router();
+        let result = self.router.mount_tools(source_router, prefix);
+
+        // Log warnings if any
+        for warning in &result.warnings {
+            log::warn!(target: "fastmcp::mount", "{}", warning);
+        }
+
+        // Update capabilities if tools were mounted
+        if result.tools > 0 {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+
+        self
+    }
+
+    /// Mounts only resources from another server with an optional prefix.
+    ///
+    /// Similar to [`mount`](Self::mount), but only transfers resources,
+    /// ignoring tools and prompts.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let data_server = Server::new("data", "1.0")
+    ///     .resource(config_resource)
+    ///     .resource(schema_resource)
+    ///     .tool(query_tool)  // Will NOT be mounted
+    ///     .build();
+    ///
+    /// let main = Server::new("main", "1.0")
+    ///     .mount_resources(data_server, Some("data"))  // Only resources
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn mount_resources(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        let source_router = server.into_router();
+        let result = self.router.mount_resources(source_router, prefix);
+
+        // Log warnings if any
+        for warning in &result.warnings {
+            log::warn!(target: "fastmcp::mount", "{}", warning);
+        }
+
+        // Update capabilities if resources were mounted
+        if result.resources > 0 || result.resource_templates > 0 {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+
+        self
+    }
+
+    /// Mounts only prompts from another server with an optional prefix.
+    ///
+    /// Similar to [`mount`](Self::mount), but only transfers prompts,
+    /// ignoring tools and resources.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let templates_server = Server::new("templates", "1.0")
+    ///     .prompt(greeting_prompt)
+    ///     .prompt(error_prompt)
+    ///     .tool(format_tool)  // Will NOT be mounted
+    ///     .build();
+    ///
+    /// let main = Server::new("main", "1.0")
+    ///     .mount_prompts(templates_server, Some("tmpl"))  // Only prompts
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn mount_prompts(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        let source_router = server.into_router();
+        let result = self.router.mount_prompts(source_router, prefix);
+
+        // Log warnings if any
+        for warning in &result.warnings {
+            log::warn!(target: "fastmcp::mount", "{}", warning);
+        }
+
+        // Update capabilities if prompts were mounted
+        if result.prompts > 0 {
             self.capabilities.prompts = Some(PromptsCapability::default());
         }
 

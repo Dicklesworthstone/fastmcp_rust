@@ -75,12 +75,58 @@ impl Router {
     }
 
     /// Adds a tool handler.
+    ///
+    /// If a tool with the same name already exists, it will be replaced.
+    /// Use [`add_tool_with_behavior`](Self::add_tool_with_behavior) for
+    /// finer control over duplicate handling.
     pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
         self.tools.insert(def.name.clone(), Box::new(handler));
     }
 
+    /// Adds a tool handler with specified duplicate behavior.
+    ///
+    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// tool name already exists.
+    pub fn add_tool_with_behavior<H: ToolHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        let def = handler.definition();
+        let name = &def.name;
+
+        if self.tools.contains_key(name) {
+            match behavior {
+                crate::DuplicateBehavior::Error => {
+                    return Err(McpError::invalid_request(format!(
+                        "Tool '{}' already exists",
+                        name
+                    )));
+                }
+                crate::DuplicateBehavior::Warn => {
+                    log::warn!(target: "fastmcp::router", "Tool '{}' already exists, keeping original", name);
+                    return Ok(());
+                }
+                crate::DuplicateBehavior::Replace => {
+                    log::debug!(target: "fastmcp::router", "Replacing tool '{}'", name);
+                    // Fall through to insert
+                }
+                crate::DuplicateBehavior::Ignore => {
+                    return Ok(());
+                }
+            }
+        }
+
+        self.tools.insert(def.name.clone(), Box::new(handler));
+        Ok(())
+    }
+
     /// Adds a resource handler.
+    ///
+    /// If a resource with the same URI already exists, it will be replaced.
+    /// Use [`add_resource_with_behavior`](Self::add_resource_with_behavior) for
+    /// finer control over duplicate handling.
     pub fn add_resource<H: ResourceHandler + 'static>(&mut self, handler: H) {
         let template = handler.template();
         let def = handler.definition();
@@ -98,6 +144,72 @@ impl Router {
         } else {
             self.resources.insert(def.uri.clone(), boxed);
         }
+    }
+
+    /// Adds a resource handler with specified duplicate behavior.
+    ///
+    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// resource URI already exists.
+    pub fn add_resource_with_behavior<H: ResourceHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        let template = handler.template();
+        let def = handler.definition();
+
+        // Check for duplicates
+        let key = if template.is_some() {
+            template.as_ref().unwrap().uri_template.clone()
+        } else {
+            def.uri.clone()
+        };
+
+        let exists = if template.is_some() {
+            self.resource_templates.contains_key(&key)
+        } else {
+            self.resources.contains_key(&key)
+        };
+
+        if exists {
+            match behavior {
+                crate::DuplicateBehavior::Error => {
+                    return Err(McpError::invalid_request(format!(
+                        "Resource '{}' already exists",
+                        key
+                    )));
+                }
+                crate::DuplicateBehavior::Warn => {
+                    log::warn!(target: "fastmcp::router", "Resource '{}' already exists, keeping original", key);
+                    return Ok(());
+                }
+                crate::DuplicateBehavior::Replace => {
+                    log::debug!(target: "fastmcp::router", "Replacing resource '{}'", key);
+                    // Fall through to insert
+                }
+                crate::DuplicateBehavior::Ignore => {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Actually add the resource
+        let boxed: BoxedResourceHandler = Box::new(handler);
+
+        if let Some(template) = template {
+            let entry = ResourceTemplateEntry {
+                matcher: UriTemplate::new(&template.uri_template),
+                template: template.clone(),
+                handler: Some(boxed),
+            };
+            self.resource_templates
+                .insert(template.uri_template.clone(), entry);
+            self.rebuild_sorted_template_keys();
+        } else {
+            self.resources.insert(def.uri.clone(), boxed);
+        }
+
+        Ok(())
     }
 
     /// Adds a resource template definition.
@@ -126,9 +238,52 @@ impl Router {
     }
 
     /// Adds a prompt handler.
+    /// Adds a prompt handler.
+    ///
+    /// If a prompt with the same name already exists, it will be replaced.
+    /// Use [`add_prompt_with_behavior`](Self::add_prompt_with_behavior) for
+    /// finer control over duplicate handling.
     pub fn add_prompt<H: PromptHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
         self.prompts.insert(def.name.clone(), Box::new(handler));
+    }
+
+    /// Adds a prompt handler with specified duplicate behavior.
+    ///
+    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// prompt name already exists.
+    pub fn add_prompt_with_behavior<H: PromptHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        let def = handler.definition();
+        let name = &def.name;
+
+        if self.prompts.contains_key(name) {
+            match behavior {
+                crate::DuplicateBehavior::Error => {
+                    return Err(McpError::invalid_request(format!(
+                        "Prompt '{}' already exists",
+                        name
+                    )));
+                }
+                crate::DuplicateBehavior::Warn => {
+                    log::warn!(target: "fastmcp::router", "Prompt '{}' already exists, keeping original", name);
+                    return Ok(());
+                }
+                crate::DuplicateBehavior::Replace => {
+                    log::debug!(target: "fastmcp::router", "Replacing prompt '{}'", name);
+                    // Fall through to insert
+                }
+                crate::DuplicateBehavior::Ignore => {
+                    return Ok(());
+                }
+            }
+        }
+
+        self.prompts.insert(def.name.clone(), Box::new(handler));
+        Ok(())
     }
 
     /// Returns all tool definitions.
@@ -738,19 +893,359 @@ impl Default for Router {
     }
 }
 
+// ============================================================================
+// Mount/Composition Support
+// ============================================================================
+
+/// Result of a mount operation.
+#[derive(Debug, Default)]
+pub struct MountResult {
+    /// Number of tools mounted.
+    pub tools: usize,
+    /// Number of resources mounted.
+    pub resources: usize,
+    /// Number of resource templates mounted.
+    pub resource_templates: usize,
+    /// Number of prompts mounted.
+    pub prompts: usize,
+    /// Any warnings generated during mounting (e.g., name conflicts).
+    pub warnings: Vec<String>,
+}
+
+impl MountResult {
+    /// Returns true if any components were mounted.
+    #[must_use]
+    pub fn has_components(&self) -> bool {
+        self.tools > 0 || self.resources > 0 || self.resource_templates > 0 || self.prompts > 0
+    }
+
+    /// Returns true if mounting was successful (currently always true).
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        true
+    }
+}
+
+impl Router {
+    /// Applies a prefix to a name or URI.
+    fn apply_prefix(name: &str, prefix: Option<&str>) -> String {
+        match prefix {
+            Some(p) if !p.is_empty() => format!("{}/{}", p, name),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Validates a prefix string.
+    ///
+    /// Prefixes must be alphanumeric plus underscores and hyphens,
+    /// and cannot contain slashes.
+    fn validate_prefix(prefix: &str) -> Result<(), String> {
+        if prefix.is_empty() {
+            return Ok(());
+        }
+        if prefix.contains('/') {
+            return Err(format!("Prefix cannot contain slashes: '{}'", prefix));
+        }
+        // Allow alphanumeric, underscore, hyphen
+        for ch in prefix.chars() {
+            if !ch.is_alphanumeric() && ch != '_' && ch != '-' {
+                return Err(format!(
+                    "Prefix contains invalid character '{}': '{}'",
+                    ch, prefix
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Mounts all handlers from another router with an optional prefix.
+    ///
+    /// This consumes the source router and moves its handlers into this router.
+    /// Names/URIs are prefixed with `prefix/` if a prefix is provided.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut main_router = Router::new();
+    /// let db_router = Router::new();
+    /// // ... add handlers to db_router ...
+    ///
+    /// main_router.mount(db_router, Some("db"));
+    /// // Tool "query" becomes "db/query"
+    /// ```
+    pub fn mount(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
+        let mut result = MountResult::default();
+
+        // Validate prefix
+        if let Some(p) = prefix {
+            if let Err(e) = Self::validate_prefix(p) {
+                result.warnings.push(e);
+                // Continue anyway, but log the warning
+            }
+        }
+
+        // Mount tools
+        let tool_result = self.mount_tools_from(other.tools, prefix);
+        result.tools = tool_result.tools;
+        result.warnings.extend(tool_result.warnings);
+
+        // Mount resources
+        let resource_result = self.mount_resources_from(other.resources, prefix);
+        result.resources = resource_result.resources;
+        result.warnings.extend(resource_result.warnings);
+
+        // Mount resource templates
+        let template_result = self.mount_resource_templates_from(other.resource_templates, prefix);
+        result.resource_templates = template_result.resource_templates;
+        result.warnings.extend(template_result.warnings);
+
+        // Mount prompts
+        let prompt_result = self.mount_prompts_from(other.prompts, prefix);
+        result.prompts = prompt_result.prompts;
+        result.warnings.extend(prompt_result.warnings);
+
+        // Log mount result
+        if result.has_components() {
+            debug!(
+                target: targets::HANDLER,
+                "Mounted {} tools, {} resources, {} templates, {} prompts (prefix: {:?})",
+                result.tools,
+                result.resources,
+                result.resource_templates,
+                result.prompts,
+                prefix
+            );
+        }
+
+        result
+    }
+
+    /// Mounts only tools from a router.
+    pub fn mount_tools(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
+        self.mount_tools_from(other.tools, prefix)
+    }
+
+    /// Internal: mount tools from a HashMap.
+    fn mount_tools_from(
+        &mut self,
+        tools: HashMap<String, BoxedToolHandler>,
+        prefix: Option<&str>,
+    ) -> MountResult {
+        use crate::handler::MountedToolHandler;
+
+        let mut result = MountResult::default();
+
+        for (name, handler) in tools {
+            let mounted_name = Self::apply_prefix(&name, prefix);
+            trace!(
+                target: targets::HANDLER,
+                "Mounting tool '{}' as '{}'",
+                name,
+                mounted_name
+            );
+
+            // Check for conflicts
+            if self.tools.contains_key(&mounted_name) {
+                result.warnings.push(format!(
+                    "Tool '{}' already exists, will be overwritten",
+                    mounted_name
+                ));
+            }
+
+            // Wrap with mounted name and insert
+            let mounted = MountedToolHandler::new(handler, mounted_name.clone());
+            self.tools.insert(mounted_name, Box::new(mounted));
+            result.tools += 1;
+        }
+
+        result
+    }
+
+    /// Mounts only resources from a router.
+    pub fn mount_resources(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
+        let mut result = self.mount_resources_from(other.resources, prefix);
+        let template_result = self.mount_resource_templates_from(other.resource_templates, prefix);
+        result.resource_templates = template_result.resource_templates;
+        result.warnings.extend(template_result.warnings);
+        result
+    }
+
+    /// Internal: mount resources from a HashMap.
+    fn mount_resources_from(
+        &mut self,
+        resources: HashMap<String, BoxedResourceHandler>,
+        prefix: Option<&str>,
+    ) -> MountResult {
+        use crate::handler::MountedResourceHandler;
+
+        let mut result = MountResult::default();
+
+        for (uri, handler) in resources {
+            let mounted_uri = Self::apply_prefix(&uri, prefix);
+            trace!(
+                target: targets::HANDLER,
+                "Mounting resource '{}' as '{}'",
+                uri,
+                mounted_uri
+            );
+
+            // Check for conflicts
+            if self.resources.contains_key(&mounted_uri) {
+                result.warnings.push(format!(
+                    "Resource '{}' already exists, will be overwritten",
+                    mounted_uri
+                ));
+            }
+
+            // Wrap with mounted URI and insert
+            let mounted = MountedResourceHandler::new(handler, mounted_uri.clone());
+            self.resources.insert(mounted_uri, Box::new(mounted));
+            result.resources += 1;
+        }
+
+        result
+    }
+
+    /// Internal: mount resource templates from a HashMap.
+    fn mount_resource_templates_from(
+        &mut self,
+        templates: HashMap<String, ResourceTemplateEntry>,
+        prefix: Option<&str>,
+    ) -> MountResult {
+        use crate::handler::MountedResourceHandler;
+
+        let mut result = MountResult::default();
+
+        for (uri_template, entry) in templates {
+            let mounted_uri_template = Self::apply_prefix(&uri_template, prefix);
+            trace!(
+                target: targets::HANDLER,
+                "Mounting resource template '{}' as '{}'",
+                uri_template,
+                mounted_uri_template
+            );
+
+            // Check for conflicts
+            if self.resource_templates.contains_key(&mounted_uri_template) {
+                result.warnings.push(format!(
+                    "Resource template '{}' already exists, will be overwritten",
+                    mounted_uri_template
+                ));
+            }
+
+            // Create new template with mounted URI
+            let mut mounted_template = entry.template.clone();
+            mounted_template.uri_template = mounted_uri_template.clone();
+
+            // Wrap handler if present
+            let mounted_handler = entry.handler.map(|h| {
+                let wrapped: BoxedResourceHandler =
+                    Box::new(MountedResourceHandler::with_template(
+                        h,
+                        mounted_uri_template.clone(),
+                        mounted_template.clone(),
+                    ));
+                wrapped
+            });
+
+            // Create new entry with mounted template
+            let mounted_entry = ResourceTemplateEntry {
+                matcher: UriTemplate::new(&mounted_uri_template),
+                template: mounted_template,
+                handler: mounted_handler,
+            };
+
+            self.resource_templates
+                .insert(mounted_uri_template, mounted_entry);
+            result.resource_templates += 1;
+        }
+
+        // Rebuild sorted keys if we added templates
+        if result.resource_templates > 0 {
+            self.rebuild_sorted_template_keys();
+        }
+
+        result
+    }
+
+    /// Mounts only prompts from a router.
+    pub fn mount_prompts(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
+        self.mount_prompts_from(other.prompts, prefix)
+    }
+
+    /// Internal: mount prompts from a HashMap.
+    fn mount_prompts_from(
+        &mut self,
+        prompts: HashMap<String, BoxedPromptHandler>,
+        prefix: Option<&str>,
+    ) -> MountResult {
+        use crate::handler::MountedPromptHandler;
+
+        let mut result = MountResult::default();
+
+        for (name, handler) in prompts {
+            let mounted_name = Self::apply_prefix(&name, prefix);
+            trace!(
+                target: targets::HANDLER,
+                "Mounting prompt '{}' as '{}'",
+                name,
+                mounted_name
+            );
+
+            // Check for conflicts
+            if self.prompts.contains_key(&mounted_name) {
+                result.warnings.push(format!(
+                    "Prompt '{}' already exists, will be overwritten",
+                    mounted_name
+                ));
+            }
+
+            // Wrap with mounted name and insert
+            let mounted = MountedPromptHandler::new(handler, mounted_name.clone());
+            self.prompts.insert(mounted_name, Box::new(mounted));
+            result.prompts += 1;
+        }
+
+        result
+    }
+
+    /// Consumes the router and returns its internal handlers.
+    ///
+    /// This is used internally for mounting operations.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        HashMap<String, BoxedToolHandler>,
+        HashMap<String, BoxedResourceHandler>,
+        HashMap<String, ResourceTemplateEntry>,
+        HashMap<String, BoxedPromptHandler>,
+    ) {
+        (
+            self.tools,
+            self.resources,
+            self.resource_templates,
+            self.prompts,
+        )
+    }
+}
+
 struct ResolvedResource<'a> {
     handler: &'a BoxedResourceHandler,
     params: UriParams,
 }
 
-struct ResourceTemplateEntry {
-    matcher: UriTemplate,
-    template: ResourceTemplate,
-    handler: Option<BoxedResourceHandler>,
+/// Entry for a resource template with its matcher and optional handler.
+pub(crate) struct ResourceTemplateEntry {
+    pub(crate) matcher: UriTemplate,
+    pub(crate) template: ResourceTemplate,
+    pub(crate) handler: Option<BoxedResourceHandler>,
 }
 
+/// A parsed URI template for matching resource URIs.
 #[derive(Debug, Clone)]
-struct UriTemplate {
+pub(crate) struct UriTemplate {
     pattern: String,
     segments: Vec<UriSegment>,
 }
@@ -974,6 +1469,244 @@ fn from_hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+// ============================================================================
+// Resource Reader Implementation
+// ============================================================================
+
+use fastmcp_core::{
+    MAX_RESOURCE_READ_DEPTH, ResourceContentItem, ResourceReadResult, ResourceReader,
+};
+use std::pin::Pin;
+
+/// A wrapper that implements `ResourceReader` for a shared `Router`.
+///
+/// This allows handlers to read resources from within tool/resource/prompt
+/// handlers, enabling cross-component access.
+pub struct RouterResourceReader {
+    /// The shared router.
+    router: Arc<Router>,
+    /// Session state for handlers.
+    session_state: SessionState,
+}
+
+impl RouterResourceReader {
+    /// Creates a new resource reader with the given router and session state.
+    #[must_use]
+    pub fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+        Self {
+            router,
+            session_state,
+        }
+    }
+}
+
+impl ResourceReader for RouterResourceReader {
+    fn read_resource(
+        &self,
+        cx: &Cx,
+        uri: &str,
+        depth: u32,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = fastmcp_core::McpResult<ResourceReadResult>>
+                + Send
+                + '_,
+        >,
+    > {
+        // Check recursion depth
+        if depth > MAX_RESOURCE_READ_DEPTH {
+            return Box::pin(async move {
+                Err(McpError::new(
+                    McpErrorCode::InternalError,
+                    format!(
+                        "Maximum resource read depth ({}) exceeded",
+                        MAX_RESOURCE_READ_DEPTH
+                    ),
+                ))
+            });
+        }
+
+        // Clone what we need for the async block
+        let cx = cx.clone();
+        let uri = uri.to_string();
+        let router = self.router.clone();
+        let session_state = self.session_state.clone();
+
+        Box::pin(async move {
+            debug!(target: targets::HANDLER, "Cross-component resource read: {} (depth: {})", uri, depth);
+
+            // Resolve the resource
+            let resolved = router.resolve_resource(&uri).ok_or_else(|| {
+                McpError::new(
+                    McpErrorCode::ResourceNotFound,
+                    format!("Resource not found: {}", uri),
+                )
+            })?;
+
+            // Create a child context with incremented depth
+            // Clone router again for the nested reader (the original is borrowed by resolved)
+            let nested_router = router.clone();
+            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
+                .with_resource_read_depth(depth)
+                .with_resource_reader(Arc::new(RouterResourceReader::new(
+                    nested_router,
+                    SessionState::new(), // Use fresh state for nested reads
+                )));
+
+            // Read the resource
+            let outcome = block_on(resolved.handler.read_async_with_uri(
+                &child_ctx,
+                &uri,
+                &resolved.params,
+            ));
+
+            // Convert outcome to result
+            let contents = outcome.into_mcp_result()?;
+
+            // Convert protocol ResourceContent to core ResourceContentItem
+            let items: Vec<ResourceContentItem> = contents
+                .into_iter()
+                .map(|c| ResourceContentItem {
+                    uri: c.uri,
+                    mime_type: c.mime_type,
+                    text: c.text,
+                    blob: c.blob,
+                })
+                .collect();
+
+            Ok(ResourceReadResult::new(items))
+        })
+    }
+}
+
+// ============================================================================
+// Tool Caller Implementation
+// ============================================================================
+
+use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCallResult, ToolCaller, ToolContentItem};
+
+/// A wrapper that implements `ToolCaller` for a shared `Router`.
+///
+/// This allows handlers to call other tools from within tool/resource/prompt
+/// handlers, enabling cross-component access.
+pub struct RouterToolCaller {
+    /// The shared router.
+    router: Arc<Router>,
+    /// Session state for handlers.
+    session_state: SessionState,
+}
+
+impl RouterToolCaller {
+    /// Creates a new tool caller with the given router and session state.
+    #[must_use]
+    pub fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+        Self {
+            router,
+            session_state,
+        }
+    }
+}
+
+impl ToolCaller for RouterToolCaller {
+    fn call_tool(
+        &self,
+        cx: &Cx,
+        name: &str,
+        args: serde_json::Value,
+        depth: u32,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = fastmcp_core::McpResult<ToolCallResult>> + Send + '_>,
+    > {
+        // Check recursion depth
+        if depth > MAX_TOOL_CALL_DEPTH {
+            return Box::pin(async move {
+                Err(McpError::new(
+                    McpErrorCode::InternalError,
+                    format!("Maximum tool call depth ({}) exceeded", MAX_TOOL_CALL_DEPTH),
+                ))
+            });
+        }
+
+        // Clone what we need for the async block
+        let cx = cx.clone();
+        let name = name.to_string();
+        let router = self.router.clone();
+        let session_state = self.session_state.clone();
+
+        Box::pin(async move {
+            debug!(target: targets::HANDLER, "Cross-component tool call: {} (depth: {})", name, depth);
+
+            // Find the tool handler
+            let handler = router
+                .tools
+                .get(&name)
+                .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", name)))?;
+
+            // Validate arguments against the tool's input schema
+            let tool_def = handler.definition();
+            if let Err(validation_errors) = validate(&tool_def.input_schema, &args) {
+                let error_messages: Vec<String> = validation_errors
+                    .iter()
+                    .map(|e| format!("{}: {}", e.path, e.message))
+                    .collect();
+                return Err(McpError::invalid_params(format!(
+                    "Input validation failed: {}",
+                    error_messages.join("; ")
+                )));
+            }
+
+            // Create a child context with incremented depth
+            // Clone router again for nested calls
+            let nested_router = router.clone();
+            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state.clone())
+                .with_tool_call_depth(depth)
+                .with_tool_caller(Arc::new(RouterToolCaller::new(
+                    nested_router.clone(),
+                    SessionState::new(),
+                )))
+                .with_resource_reader(Arc::new(RouterResourceReader::new(
+                    nested_router,
+                    SessionState::new(),
+                )));
+
+            // Call the tool
+            let outcome = block_on(handler.call_async(&child_ctx, args));
+
+            // Convert outcome to result
+            match outcome {
+                Outcome::Ok(content) => {
+                    // Convert protocol Content to core ToolContentItem
+                    let items: Vec<ToolContentItem> = content
+                        .into_iter()
+                        .map(|c| match c {
+                            Content::Text { text } => ToolContentItem::Text { text },
+                            Content::Image { data, mime_type } => {
+                                ToolContentItem::Image { data, mime_type }
+                            }
+                            Content::Resource { resource } => ToolContentItem::Resource {
+                                uri: resource.uri,
+                                mime_type: resource.mime_type,
+                                text: resource.text,
+                            },
+                        })
+                        .collect();
+
+                    Ok(ToolCallResult::success(items))
+                }
+                Outcome::Err(e) => {
+                    // Tool errors become error results, not failures
+                    Ok(ToolCallResult::error(e.message))
+                }
+                Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+                Outcome::Panicked(payload) => Err(McpError::internal_error(format!(
+                    "Handler panic: {}",
+                    payload.message()
+                ))),
+            }
+        })
     }
 }
 

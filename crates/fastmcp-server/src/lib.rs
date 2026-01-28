@@ -61,7 +61,7 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
-pub use router::{NotificationSender, Router};
+pub use router::{MountResult, NotificationSender, Router, RouterResourceReader, RouterToolCaller};
 pub use session::Session;
 pub use tasks::{SharedTaskManager, TaskManager};
 
@@ -210,6 +210,35 @@ impl LoggingConfig {
     }
 }
 
+/// Behavior when registering a component with a name that already exists.
+///
+/// This setting controls how the server handles duplicate tool, resource,
+/// or prompt names during registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DuplicateBehavior {
+    /// Raise an error and fail registration.
+    ///
+    /// Use this for strict validation in production environments.
+    Error,
+
+    /// Log a warning and keep the original component.
+    ///
+    /// This is the default behavior, providing visibility into duplicates
+    /// while maintaining backwards compatibility.
+    #[default]
+    Warn,
+
+    /// Replace the original component with the new one.
+    ///
+    /// Use this when you want later registrations to override earlier ones.
+    Replace,
+
+    /// Silently keep the original component.
+    ///
+    /// Use this when duplicates are expected and should be ignored.
+    Ignore,
+}
+
 /// An MCP server instance.
 ///
 /// Servers are built using [`ServerBuilder`] and can run on various
@@ -293,6 +322,35 @@ impl Server {
     #[must_use]
     pub fn task_manager(&self) -> Option<&SharedTaskManager> {
         self.task_manager.as_ref()
+    }
+
+    /// Consumes the server and returns its router.
+    ///
+    /// This is used for mounting one server's components into another.
+    #[must_use]
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+
+    /// Returns the capabilities this server provides.
+    ///
+    /// This is useful when determining what components a server has
+    /// before mounting.
+    #[must_use]
+    pub fn has_tools(&self) -> bool {
+        self.capabilities.tools.is_some()
+    }
+
+    /// Returns whether this server has resources.
+    #[must_use]
+    pub fn has_resources(&self) -> bool {
+        self.capabilities.resources.is_some()
+    }
+
+    /// Returns whether this server has prompts.
+    #[must_use]
+    pub fn has_prompts(&self) -> bool {
+        self.capabilities.prompts.is_some()
     }
 
     /// Returns a point-in-time snapshot of server statistics.

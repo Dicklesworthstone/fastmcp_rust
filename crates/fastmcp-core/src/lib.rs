@@ -37,9 +37,11 @@ mod state;
 pub use auth::{AUTH_STATE_KEY, AccessToken, AuthContext};
 pub use context::{
     CancelledError, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    ElicitationSender, IntoOutcome, McpContext, NoOpElicitationSender, NoOpNotificationSender,
-    NoOpSamplingSender, NotificationSender, ProgressReporter, SamplingRequest,
+    ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext,
+    NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NotificationSender,
+    ProgressReporter, ResourceContentItem, ResourceReadResult, ResourceReader, SamplingRequest,
     SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+    ToolCallResult, ToolCaller, ToolContentItem,
 };
 pub use error::{
     McpError, McpErrorCode, McpOutcome, McpResult, OutcomeExt, ResultExt, cancelled, err, ok,

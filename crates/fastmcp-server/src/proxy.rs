@@ -211,13 +211,35 @@ impl ProxyClient {
 }
 
 pub(crate) struct ProxyToolHandler {
+    /// The tool definition as exposed to clients (may have prefixed name).
     tool: Tool,
+    /// The original tool name on the remote server (for forwarding).
+    external_name: String,
     client: ProxyClient,
 }
 
 impl ProxyToolHandler {
     pub(crate) fn new(tool: Tool, client: ProxyClient) -> Self {
-        Self { tool, client }
+        let external_name = tool.name.clone();
+        Self {
+            tool,
+            external_name,
+            client,
+        }
+    }
+
+    /// Creates a proxy handler with a prefixed name.
+    ///
+    /// The tool will be exposed with `prefix/original_name` but calls will be
+    /// forwarded using the original name.
+    pub(crate) fn with_prefix(mut tool: Tool, prefix: &str, client: ProxyClient) -> Self {
+        let external_name = tool.name.clone();
+        tool.name = format!("{}/{}", prefix, tool.name);
+        Self {
+            tool,
+            external_name,
+            client,
+        }
     }
 }
 
@@ -227,28 +249,64 @@ impl ToolHandler for ProxyToolHandler {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        self.client.call_tool(ctx, &self.tool.name, arguments)
+        // Forward using the original external name
+        self.client.call_tool(ctx, &self.external_name, arguments)
     }
 }
 
 pub(crate) struct ProxyResourceHandler {
+    /// The resource definition as exposed to clients (may have prefixed URI).
     resource: Resource,
+    /// The original URI on the remote server (for forwarding).
+    external_uri: String,
     template: Option<ResourceTemplate>,
     client: ProxyClient,
 }
 
 impl ProxyResourceHandler {
     pub(crate) fn new(resource: Resource, client: ProxyClient) -> Self {
+        let external_uri = resource.uri.clone();
         Self {
             resource,
+            external_uri,
+            template: None,
+            client,
+        }
+    }
+
+    /// Creates a proxy handler with a prefixed URI.
+    pub(crate) fn with_prefix(mut resource: Resource, prefix: &str, client: ProxyClient) -> Self {
+        let external_uri = resource.uri.clone();
+        resource.uri = format!("{}/{}", prefix, resource.uri);
+        Self {
+            resource,
+            external_uri,
             template: None,
             client,
         }
     }
 
     pub(crate) fn from_template(template: ResourceTemplate, client: ProxyClient) -> Self {
+        let external_uri = template.uri_template.clone();
         Self {
             resource: resource_from_template(&template),
+            external_uri,
+            template: Some(template),
+            client,
+        }
+    }
+
+    /// Creates a proxy handler from a template with a prefixed URI.
+    pub(crate) fn from_template_with_prefix(
+        mut template: ResourceTemplate,
+        prefix: &str,
+        client: ProxyClient,
+    ) -> Self {
+        let external_uri = template.uri_template.clone();
+        template.uri_template = format!("{}/{}", prefix, template.uri_template);
+        Self {
+            resource: resource_from_template(&template),
+            external_uri,
             template: Some(template),
             client,
         }
@@ -265,7 +323,8 @@ impl ResourceHandler for ProxyResourceHandler {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        self.client.read_resource(ctx, &self.resource.uri)
+        // Forward using the original external URI
+        self.client.read_resource(ctx, &self.external_uri)
     }
 
     fn read_with_uri(
@@ -274,18 +333,52 @@ impl ResourceHandler for ProxyResourceHandler {
         uri: &str,
         _params: &UriParams,
     ) -> McpResult<Vec<ResourceContent>> {
-        self.client.read_resource(ctx, uri)
+        // For templated resources with a prefix, we need to strip the prefix
+        // to forward the correct URI to the external server.
+        //
+        // If the incoming URI matches our prefixed pattern (e.g., "ext/file://..."),
+        // strip the prefix to get the original URI (e.g., "file://...").
+        let external_uri = if uri.starts_with(&format!(
+            "{}/",
+            self.resource.uri.split('/').next().unwrap_or("")
+        )) {
+            // Strip the prefix (everything before and including the first '/')
+            uri.splitn(2, '/').nth(1).unwrap_or(uri)
+        } else {
+            // No prefix match, use as-is
+            uri
+        };
+        self.client.read_resource(ctx, external_uri)
     }
 }
 
 pub(crate) struct ProxyPromptHandler {
+    /// The prompt definition as exposed to clients (may have prefixed name).
     prompt: Prompt,
+    /// The original prompt name on the remote server (for forwarding).
+    external_name: String,
     client: ProxyClient,
 }
 
 impl ProxyPromptHandler {
     pub(crate) fn new(prompt: Prompt, client: ProxyClient) -> Self {
-        Self { prompt, client }
+        let external_name = prompt.name.clone();
+        Self {
+            prompt,
+            external_name,
+            client,
+        }
+    }
+
+    /// Creates a proxy handler with a prefixed name.
+    pub(crate) fn with_prefix(mut prompt: Prompt, prefix: &str, client: ProxyClient) -> Self {
+        let external_name = prompt.name.clone();
+        prompt.name = format!("{}/{}", prefix, prompt.name);
+        Self {
+            prompt,
+            external_name,
+            client,
+        }
     }
 }
 
@@ -299,7 +392,8 @@ impl PromptHandler for ProxyPromptHandler {
         ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        self.client.get_prompt(ctx, &self.prompt.name, arguments)
+        // Forward using the original external name
+        self.client.get_prompt(ctx, &self.external_name, arguments)
     }
 }
 
@@ -505,5 +599,123 @@ mod tests {
             .clone();
         assert_eq!(name, "prompt");
         assert_eq!(recorded_args, args);
+    }
+
+    // =========================================================================
+    // Prefixed Proxy Handler Tests (for as_proxy)
+    // =========================================================================
+
+    #[test]
+    fn prefixed_tool_handler_uses_correct_names() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            tools: vec![Tool {
+                name: "query".to_string(),
+                description: Some("Execute a query".to_string()),
+                input_schema: serde_json::json!({}),
+            }],
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        // Create handler with prefix "db"
+        let handler = ProxyToolHandler::with_prefix(
+            Tool {
+                name: "query".to_string(),
+                description: Some("Execute a query".to_string()),
+                input_schema: serde_json::json!({}),
+            },
+            "db",
+            proxy,
+        );
+
+        // Definition should have prefixed name
+        let def = handler.definition();
+        assert_eq!(def.name, "db/query");
+        assert_eq!(def.description, Some("Execute a query".to_string()));
+
+        // Call should forward with original name
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let args = serde_json::json!({"sql": "SELECT 1"});
+        handler.call(&ctx, args.clone()).expect("call ok");
+
+        let guard = state.lock().expect("state lock poisoned");
+        let (forwarded_name, _) = guard.last_tool.as_ref().expect("tool called").clone();
+        assert_eq!(forwarded_name, "query"); // Original name, not prefixed
+    }
+
+    #[test]
+    fn prefixed_prompt_handler_uses_correct_names() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            prompts: vec![Prompt {
+                name: "greeting".to_string(),
+                description: Some("A greeting prompt".to_string()),
+                arguments: Vec::new(),
+            }],
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        // Create handler with prefix "templates"
+        let handler = ProxyPromptHandler::with_prefix(
+            Prompt {
+                name: "greeting".to_string(),
+                description: Some("A greeting prompt".to_string()),
+                arguments: Vec::new(),
+            },
+            "templates",
+            proxy,
+        );
+
+        // Definition should have prefixed name
+        let def = handler.definition();
+        assert_eq!(def.name, "templates/greeting");
+        assert_eq!(def.description, Some("A greeting prompt".to_string()));
+
+        // Call should forward with original name
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let args = HashMap::new();
+        handler.get(&ctx, args).expect("get ok");
+
+        let guard = state.lock().expect("state lock poisoned");
+        let (forwarded_name, _) = guard.last_prompt.as_ref().expect("prompt called").clone();
+        assert_eq!(forwarded_name, "greeting"); // Original name, not prefixed
+    }
+
+    #[test]
+    fn prefixed_resource_handler_uses_correct_uri() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend {
+            resources: vec![Resource {
+                uri: "file://data".to_string(),
+                name: "Data File".to_string(),
+                description: None,
+                mime_type: None,
+            }],
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        // Create handler with prefix "storage"
+        let handler = ProxyResourceHandler::with_prefix(
+            Resource {
+                uri: "file://data".to_string(),
+                name: "Data File".to_string(),
+                description: None,
+                mime_type: None,
+            },
+            "storage",
+            proxy,
+        );
+
+        // Definition should have prefixed URI
+        let def = handler.definition();
+        assert_eq!(def.uri, "storage/file://data");
+        assert_eq!(def.name, "Data File");
     }
 }

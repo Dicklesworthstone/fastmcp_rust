@@ -3,6 +3,8 @@
 //! [`McpContext`] wraps asupersync's [`Cx`] to provide request-scoped
 //! capabilities for MCP message handling (tools, resources, prompts).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use asupersync::types::CancelReason;
@@ -416,6 +418,290 @@ impl ElicitationSender for NoOpElicitationSender {
     }
 }
 
+// ============================================================================
+// Resource Reader (Cross-Component Access)
+// ============================================================================
+
+/// Maximum depth for nested resource reads to prevent infinite recursion.
+pub const MAX_RESOURCE_READ_DEPTH: u32 = 10;
+
+/// A single item of resource content.
+///
+/// Mirrors the protocol's ResourceContent but lives in core to avoid
+/// circular dependencies.
+#[derive(Debug, Clone)]
+pub struct ResourceContentItem {
+    /// Resource URI.
+    pub uri: String,
+    /// MIME type.
+    pub mime_type: Option<String>,
+    /// Text content (if text).
+    pub text: Option<String>,
+    /// Binary content (if blob, base64-encoded).
+    pub blob: Option<String>,
+}
+
+impl ResourceContentItem {
+    /// Creates a text resource content item.
+    #[must_use]
+    pub fn text(uri: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some(text.into()),
+            blob: None,
+        }
+    }
+
+    /// Creates a JSON resource content item.
+    #[must_use]
+    pub fn json(uri: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            mime_type: Some("application/json".to_string()),
+            text: Some(text.into()),
+            blob: None,
+        }
+    }
+
+    /// Creates a binary resource content item.
+    #[must_use]
+    pub fn blob(
+        uri: impl Into<String>,
+        mime_type: impl Into<String>,
+        blob: impl Into<String>,
+    ) -> Self {
+        Self {
+            uri: uri.into(),
+            mime_type: Some(mime_type.into()),
+            text: None,
+            blob: Some(blob.into()),
+        }
+    }
+
+    /// Returns the text content, if present.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    /// Returns the blob content, if present.
+    #[must_use]
+    pub fn as_blob(&self) -> Option<&str> {
+        self.blob.as_deref()
+    }
+
+    /// Returns true if this is a text resource.
+    #[must_use]
+    pub fn is_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// Returns true if this is a blob resource.
+    #[must_use]
+    pub fn is_blob(&self) -> bool {
+        self.blob.is_some()
+    }
+}
+
+/// Result of reading a resource.
+#[derive(Debug, Clone)]
+pub struct ResourceReadResult {
+    /// The content items.
+    pub contents: Vec<ResourceContentItem>,
+}
+
+impl ResourceReadResult {
+    /// Creates a new resource read result with the given contents.
+    #[must_use]
+    pub fn new(contents: Vec<ResourceContentItem>) -> Self {
+        Self { contents }
+    }
+
+    /// Creates a single-item text result.
+    #[must_use]
+    pub fn text(uri: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            contents: vec![ResourceContentItem::text(uri, text)],
+        }
+    }
+
+    /// Returns the first text content, if present.
+    #[must_use]
+    pub fn first_text(&self) -> Option<&str> {
+        self.contents.first().and_then(|c| c.as_text())
+    }
+
+    /// Returns the first blob content, if present.
+    #[must_use]
+    pub fn first_blob(&self) -> Option<&str> {
+        self.contents.first().and_then(|c| c.as_blob())
+    }
+}
+
+/// Trait for reading resources from within handlers.
+///
+/// This trait is implemented by the server's Router to allow tools,
+/// resources, and prompts to read other resources. It enables
+/// cross-component composition and code reuse.
+///
+/// The trait uses boxed futures to avoid complex lifetime issues
+/// with async traits.
+pub trait ResourceReader: Send + Sync {
+    /// Reads a resource by URI.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The asupersync context
+    /// * `uri` - The resource URI to read
+    /// * `depth` - Current recursion depth (to prevent infinite loops)
+    ///
+    /// # Returns
+    ///
+    /// The resource contents, or an error if the resource doesn't exist
+    /// or reading fails.
+    fn read_resource(
+        &self,
+        cx: &Cx,
+        uri: &str,
+        depth: u32,
+    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ResourceReadResult>> + Send + '_>>;
+}
+
+// ============================================================================
+// Tool Caller (Cross-Component Access)
+// ============================================================================
+
+/// Maximum depth for nested tool calls to prevent infinite recursion.
+pub const MAX_TOOL_CALL_DEPTH: u32 = 10;
+
+/// A single item of content returned from a tool call.
+///
+/// Mirrors the protocol's Content type but lives in core to avoid
+/// circular dependencies.
+#[derive(Debug, Clone)]
+pub enum ToolContentItem {
+    /// Text content.
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// Image content (base64-encoded).
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type of the image.
+        mime_type: String,
+    },
+    /// Embedded resource reference.
+    Resource {
+        /// Resource URI.
+        uri: String,
+        /// MIME type.
+        mime_type: Option<String>,
+        /// Text content.
+        text: Option<String>,
+    },
+}
+
+impl ToolContentItem {
+    /// Creates a text content item.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    /// Returns the text content, if this is a text item.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a text content item.
+    #[must_use]
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text { .. })
+    }
+}
+
+/// Result of calling a tool.
+#[derive(Debug, Clone)]
+pub struct ToolCallResult {
+    /// The content items returned by the tool.
+    pub content: Vec<ToolContentItem>,
+    /// Whether the tool returned an error.
+    pub is_error: bool,
+}
+
+impl ToolCallResult {
+    /// Creates a successful tool result with the given content.
+    #[must_use]
+    pub fn success(content: Vec<ToolContentItem>) -> Self {
+        Self {
+            content,
+            is_error: false,
+        }
+    }
+
+    /// Creates a successful tool result with a single text item.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ToolContentItem::text(text)],
+            is_error: false,
+        }
+    }
+
+    /// Creates an error tool result.
+    #[must_use]
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            content: vec![ToolContentItem::text(message)],
+            is_error: true,
+        }
+    }
+
+    /// Returns the first text content, if present.
+    #[must_use]
+    pub fn first_text(&self) -> Option<&str> {
+        self.content.first().and_then(|c| c.as_text())
+    }
+}
+
+/// Trait for calling tools from within handlers.
+///
+/// This trait is implemented by the server's Router to allow tools,
+/// resources, and prompts to call other tools. It enables
+/// cross-component composition and code reuse.
+///
+/// The trait uses boxed futures to avoid complex lifetime issues
+/// with async traits.
+pub trait ToolCaller: Send + Sync {
+    /// Calls a tool by name with the given arguments.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The asupersync context
+    /// * `name` - The tool name to call
+    /// * `args` - The arguments as a JSON value
+    /// * `depth` - Current recursion depth (to prevent infinite loops)
+    ///
+    /// # Returns
+    ///
+    /// The tool result, or an error if the tool doesn't exist
+    /// or execution fails.
+    fn call_tool(
+        &self,
+        cx: &Cx,
+        name: &str,
+        args: serde_json::Value,
+        depth: u32,
+    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ToolCallResult>> + Send + '_>>;
+}
+
 /// A no-op notification sender used when progress reporting is disabled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoOpNotificationSender;
@@ -478,6 +764,7 @@ impl std::fmt::Debug for ProgressReporter {
 /// - Region-scoped spawning for background work
 /// - Sampling capability for LLM completions (if client supports it)
 /// - Elicitation capability for user input requests (if client supports it)
+/// - Cross-component resource reading (if router is attached)
 ///
 /// # Example
 ///
@@ -494,6 +781,12 @@ impl std::fmt::Debug for ProgressReporter {
 ///
 ///     // Request user input (if available)
 ///     let input = ctx.elicit_form("Enter your name", schema).await?;
+///
+///     // Read a resource from within a tool
+///     let config = ctx.read_resource("config://app").await?;
+///
+///     // Call another tool from within a tool
+///     let result = ctx.call_tool("other_tool", json!({"arg": "value"})).await?;
 ///
 ///     // Return result
 ///     Ok(json!({"result": response.text}))
@@ -513,6 +806,14 @@ pub struct McpContext {
     sampling_sender: Option<Arc<dyn SamplingSender>>,
     /// Optional elicitation sender for user input requests.
     elicitation_sender: Option<Arc<dyn ElicitationSender>>,
+    /// Optional resource reader for cross-component access.
+    resource_reader: Option<Arc<dyn ResourceReader>>,
+    /// Current resource read depth (to prevent infinite recursion).
+    resource_read_depth: u32,
+    /// Optional tool caller for cross-component access.
+    tool_caller: Option<Arc<dyn ToolCaller>>,
+    /// Current tool call depth (to prevent infinite recursion).
+    tool_call_depth: u32,
 }
 
 impl std::fmt::Debug for McpContext {
@@ -524,6 +825,10 @@ impl std::fmt::Debug for McpContext {
             .field("state", &self.state.is_some())
             .field("sampling_sender", &self.sampling_sender.is_some())
             .field("elicitation_sender", &self.elicitation_sender.is_some())
+            .field("resource_reader", &self.resource_reader.is_some())
+            .field("resource_read_depth", &self.resource_read_depth)
+            .field("tool_caller", &self.tool_caller.is_some())
+            .field("tool_call_depth", &self.tool_call_depth)
             .finish()
     }
 }
@@ -542,6 +847,10 @@ impl McpContext {
             state: None,
             sampling_sender: None,
             elicitation_sender: None,
+            resource_reader: None,
+            resource_read_depth: 0,
+            tool_caller: None,
+            tool_call_depth: 0,
         }
     }
 
@@ -557,6 +866,10 @@ impl McpContext {
             state: Some(state),
             sampling_sender: None,
             elicitation_sender: None,
+            resource_reader: None,
+            resource_read_depth: 0,
+            tool_caller: None,
+            tool_call_depth: 0,
         }
     }
 
@@ -573,6 +886,10 @@ impl McpContext {
             state: None,
             sampling_sender: None,
             elicitation_sender: None,
+            resource_reader: None,
+            resource_read_depth: 0,
+            tool_caller: None,
+            tool_call_depth: 0,
         }
     }
 
@@ -591,6 +908,10 @@ impl McpContext {
             state: Some(state),
             sampling_sender: None,
             elicitation_sender: None,
+            resource_reader: None,
+            resource_read_depth: 0,
+            tool_caller: None,
+            tool_call_depth: 0,
         }
     }
 
@@ -611,6 +932,46 @@ impl McpContext {
     #[must_use]
     pub fn with_elicitation(mut self, sender: Arc<dyn ElicitationSender>) -> Self {
         self.elicitation_sender = Some(sender);
+        self
+    }
+
+    /// Sets the resource reader for this context.
+    ///
+    /// This enables the `read_resource()` methods to read resources from
+    /// within tool, resource, or prompt handlers.
+    #[must_use]
+    pub fn with_resource_reader(mut self, reader: Arc<dyn ResourceReader>) -> Self {
+        self.resource_reader = Some(reader);
+        self
+    }
+
+    /// Sets the resource read depth for this context.
+    ///
+    /// This is used internally to track recursion depth when reading
+    /// resources from within resource handlers.
+    #[must_use]
+    pub fn with_resource_read_depth(mut self, depth: u32) -> Self {
+        self.resource_read_depth = depth;
+        self
+    }
+
+    /// Sets the tool caller for this context.
+    ///
+    /// This enables the `call_tool()` methods to call other tools from
+    /// within tool, resource, or prompt handlers.
+    #[must_use]
+    pub fn with_tool_caller(mut self, caller: Arc<dyn ToolCaller>) -> Self {
+        self.tool_caller = Some(caller);
+        self
+    }
+
+    /// Sets the tool call depth for this context.
+    ///
+    /// This is used internally to track recursion depth when calling
+    /// tools from within tool handlers.
+    #[must_use]
+    pub fn with_tool_call_depth(mut self, depth: u32) -> Self {
+        self.tool_call_depth = depth;
         self
     }
 
@@ -1093,6 +1454,302 @@ impl McpContext {
         })?;
 
         sender.elicit(request).await
+    }
+
+    // ========================================================================
+    // Resource Reading (Cross-Component Access)
+    // ========================================================================
+
+    /// Returns whether resource reading is available in this context.
+    ///
+    /// Resource reading is available when a resource reader (Router) has
+    /// been attached to this context.
+    #[must_use]
+    pub fn can_read_resources(&self) -> bool {
+        self.resource_reader.is_some()
+    }
+
+    /// Returns the current resource read depth.
+    ///
+    /// This is used to track recursion when resources read other resources.
+    #[must_use]
+    pub fn resource_read_depth(&self) -> u32 {
+        self.resource_read_depth
+    }
+
+    /// Reads a resource by URI.
+    ///
+    /// This allows tools, resources, and prompts to read other resources
+    /// configured on the same server. This enables composition and code reuse.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The resource URI to read
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No resource reader is available (context not configured for resource access)
+    /// - The resource is not found
+    /// - Maximum recursion depth is exceeded
+    /// - The resource read fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[tool]
+    /// async fn process_config(ctx: &McpContext) -> Result<String, ToolError> {
+    ///     let config = ctx.read_resource("config://app").await?;
+    ///     let text = config.first_text()
+    ///         .ok_or(ToolError::InvalidConfig)?;
+    ///     Ok(format!("Config loaded: {}", text))
+    /// }
+    /// ```
+    pub async fn read_resource(&self, uri: &str) -> crate::McpResult<ResourceReadResult> {
+        // Check if we have a resource reader
+        let reader = self.resource_reader.as_ref().ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                "Resource reading not available: no router attached to context",
+            )
+        })?;
+
+        // Check recursion depth
+        if self.resource_read_depth >= MAX_RESOURCE_READ_DEPTH {
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!(
+                    "Maximum resource read depth ({}) exceeded; possible infinite recursion",
+                    MAX_RESOURCE_READ_DEPTH
+                ),
+            ));
+        }
+
+        // Read the resource with incremented depth
+        reader
+            .read_resource(&self.cx, uri, self.resource_read_depth + 1)
+            .await
+    }
+
+    /// Reads a resource and extracts the text content.
+    ///
+    /// This is a convenience method that reads a resource and returns
+    /// the first text content item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The resource read fails
+    /// - The resource has no text content
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let text = ctx.read_resource_text("file://readme.md").await?;
+    /// println!("Content: {}", text);
+    /// ```
+    pub async fn read_resource_text(&self, uri: &str) -> crate::McpResult<String> {
+        let result = self.read_resource(uri).await?;
+        result.first_text().map(String::from).ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Resource '{}' has no text content", uri),
+            )
+        })
+    }
+
+    /// Reads a resource and parses it as JSON.
+    ///
+    /// This is a convenience method that reads a resource and deserializes
+    /// the text content as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The resource read fails
+    /// - The resource has no text content
+    /// - JSON deserialization fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Deserialize)]
+    /// struct Config {
+    ///     database_url: String,
+    /// }
+    ///
+    /// let config: Config = ctx.read_resource_json("config://app").await?;
+    /// println!("Database: {}", config.database_url);
+    /// ```
+    pub async fn read_resource_json<T: serde::de::DeserializeOwned>(
+        &self,
+        uri: &str,
+    ) -> crate::McpResult<T> {
+        let text = self.read_resource_text(uri).await?;
+        serde_json::from_str(&text).map_err(|e| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Failed to parse resource '{}' as JSON: {}", uri, e),
+            )
+        })
+    }
+
+    // ========================================================================
+    // Tool Calling (Cross-Component Access)
+    // ========================================================================
+
+    /// Returns whether tool calling is available in this context.
+    ///
+    /// Tool calling is available when a tool caller (Router) has
+    /// been attached to this context.
+    #[must_use]
+    pub fn can_call_tools(&self) -> bool {
+        self.tool_caller.is_some()
+    }
+
+    /// Returns the current tool call depth.
+    ///
+    /// This is used to track recursion when tools call other tools.
+    #[must_use]
+    pub fn tool_call_depth(&self) -> u32 {
+        self.tool_call_depth
+    }
+
+    /// Calls a tool by name with the given arguments.
+    ///
+    /// This allows tools, resources, and prompts to call other tools
+    /// configured on the same server. This enables composition and code reuse.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The tool name to call
+    /// * `args` - The arguments as a JSON value
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No tool caller is available (context not configured for tool access)
+    /// - The tool is not found
+    /// - Maximum recursion depth is exceeded
+    /// - The tool execution fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[tool]
+    /// async fn double_add(ctx: &McpContext, a: i32, b: i32) -> Result<i32, ToolError> {
+    ///     let sum: i32 = ctx.call_tool_json("add", json!({"a": a, "b": b})).await?;
+    ///     Ok(sum * 2)
+    /// }
+    /// ```
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> crate::McpResult<ToolCallResult> {
+        // Check if we have a tool caller
+        let caller = self.tool_caller.as_ref().ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                "Tool calling not available: no router attached to context",
+            )
+        })?;
+
+        // Check recursion depth
+        if self.tool_call_depth >= MAX_TOOL_CALL_DEPTH {
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!(
+                    "Maximum tool call depth ({}) exceeded calling '{}'; possible infinite recursion",
+                    MAX_TOOL_CALL_DEPTH, name
+                ),
+            ));
+        }
+
+        // Call the tool with incremented depth
+        caller
+            .call_tool(&self.cx, name, args, self.tool_call_depth + 1)
+            .await
+    }
+
+    /// Calls a tool and extracts the text content.
+    ///
+    /// This is a convenience method that calls a tool and returns
+    /// the first text content item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The tool call fails
+    /// - The tool returns an error result
+    /// - The tool has no text content
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let greeting = ctx.call_tool_text("greet", json!({"name": "World"})).await?;
+    /// println!("Result: {}", greeting);
+    /// ```
+    pub async fn call_tool_text(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> crate::McpResult<String> {
+        let result = self.call_tool(name, args).await?;
+
+        // Check if tool returned an error
+        if result.is_error {
+            let error_msg = result.first_text().unwrap_or("Tool returned an error");
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Tool '{}' failed: {}", name, error_msg),
+            ));
+        }
+
+        result.first_text().map(String::from).ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Tool '{}' returned no text content", name),
+            )
+        })
+    }
+
+    /// Calls a tool and parses the result as JSON.
+    ///
+    /// This is a convenience method that calls a tool and deserializes
+    /// the text content as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The tool call fails
+    /// - The tool returns an error result
+    /// - The tool has no text content
+    /// - JSON deserialization fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Deserialize)]
+    /// struct ComputeResult {
+    ///     value: i64,
+    /// }
+    ///
+    /// let result: ComputeResult = ctx.call_tool_json("compute", json!({"x": 5})).await?;
+    /// println!("Result: {}", result.value);
+    /// ```
+    pub async fn call_tool_json<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> crate::McpResult<T> {
+        let text = self.call_tool_text(name, args).await?;
+        serde_json::from_str(&text).map_err(|e| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Failed to parse tool '{}' result as JSON: {}", name, e),
+            )
+        })
     }
 
     // ========================================================================

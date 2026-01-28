@@ -387,3 +387,161 @@ pub type BoxedResourceHandler = Box<dyn ResourceHandler>;
 
 /// A boxed prompt handler.
 pub type BoxedPromptHandler = Box<dyn PromptHandler>;
+
+// ============================================================================
+// Mounted Handler Wrappers
+// ============================================================================
+
+/// A wrapper for a tool handler that overrides its name.
+///
+/// Used by `mount()` to prefix tool names when mounting from another server.
+pub struct MountedToolHandler {
+    inner: BoxedToolHandler,
+    mounted_name: String,
+}
+
+impl MountedToolHandler {
+    /// Creates a new mounted tool handler with the given name.
+    pub fn new(inner: BoxedToolHandler, mounted_name: String) -> Self {
+        Self {
+            inner,
+            mounted_name,
+        }
+    }
+}
+
+impl ToolHandler for MountedToolHandler {
+    fn definition(&self) -> Tool {
+        let mut def = self.inner.definition();
+        def.name = self.mounted_name.clone();
+        def
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.inner.call(ctx, arguments)
+    }
+
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        self.inner.call_async(ctx, arguments)
+    }
+}
+
+/// A wrapper for a resource handler that overrides its URI.
+///
+/// Used by `mount()` to prefix resource URIs when mounting from another server.
+pub struct MountedResourceHandler {
+    inner: BoxedResourceHandler,
+    mounted_uri: String,
+    mounted_template: Option<ResourceTemplate>,
+}
+
+impl MountedResourceHandler {
+    /// Creates a new mounted resource handler with the given URI.
+    pub fn new(inner: BoxedResourceHandler, mounted_uri: String) -> Self {
+        Self {
+            inner,
+            mounted_uri,
+            mounted_template: None,
+        }
+    }
+
+    /// Creates a new mounted resource handler with a mounted template.
+    pub fn with_template(
+        inner: BoxedResourceHandler,
+        mounted_uri: String,
+        mounted_template: ResourceTemplate,
+    ) -> Self {
+        Self {
+            inner,
+            mounted_uri,
+            mounted_template: Some(mounted_template),
+        }
+    }
+}
+
+impl ResourceHandler for MountedResourceHandler {
+    fn definition(&self) -> Resource {
+        let mut def = self.inner.definition();
+        def.uri = self.mounted_uri.clone();
+        def
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        self.mounted_template.clone()
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.inner.read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<Vec<ResourceContent>> {
+        self.inner.read_with_uri(ctx, uri, params)
+    }
+
+    fn read_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        self.inner.read_async_with_uri(ctx, uri, params)
+    }
+
+    fn read_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        self.inner.read_async(ctx)
+    }
+}
+
+/// A wrapper for a prompt handler that overrides its name.
+///
+/// Used by `mount()` to prefix prompt names when mounting from another server.
+pub struct MountedPromptHandler {
+    inner: BoxedPromptHandler,
+    mounted_name: String,
+}
+
+impl MountedPromptHandler {
+    /// Creates a new mounted prompt handler with the given name.
+    pub fn new(inner: BoxedPromptHandler, mounted_name: String) -> Self {
+        Self {
+            inner,
+            mounted_name,
+        }
+    }
+}
+
+impl PromptHandler for MountedPromptHandler {
+    fn definition(&self) -> Prompt {
+        let mut def = self.inner.definition();
+        def.name = self.mounted_name.clone();
+        def
+    }
+
+    fn get(
+        &self,
+        ctx: &McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        self.inner.get(ctx, arguments)
+    }
+
+    fn get_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        self.inner.get_async(ctx, arguments)
+    }
+}

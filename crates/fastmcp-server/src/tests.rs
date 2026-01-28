@@ -3542,3 +3542,1105 @@ mod lab_runtime_tests {
         });
     }
 }
+
+// ============================================================================
+// Mount/Composition Tests
+// ============================================================================
+
+mod mount_tests {
+    use super::*;
+    use crate::Router;
+
+    /// A simple tool for mount tests.
+    struct QueryTool;
+
+    impl ToolHandler for QueryTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "query".to_string(),
+                description: Some("Executes a query".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sql": {"type": "string"}
+                    }
+                }),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let sql = arguments.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(vec![Content::Text {
+                text: format!("Query result: {sql}"),
+            }])
+        }
+    }
+
+    /// Another tool for mount tests.
+    struct InsertTool;
+
+    impl ToolHandler for InsertTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "insert".to_string(),
+                description: Some("Inserts data".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: "Inserted".to_string(),
+            }])
+        }
+    }
+
+    /// A resource for mount tests.
+    struct ConfigResource;
+
+    impl ResourceHandler for ConfigResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "config://app".to_string(),
+                name: "App Config".to_string(),
+                description: Some("Application configuration".to_string()),
+                mime_type: Some("application/json".to_string()),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "config://app".to_string(),
+                text: Some(r#"{"debug": true}"#.to_string()),
+                mime_type: Some("application/json".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    /// A prompt for mount tests.
+    struct GreetingPrompt;
+
+    impl PromptHandler for GreetingPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "greeting".to_string(),
+                description: Some("A greeting prompt".to_string()),
+                arguments: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _arguments: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![PromptMessage {
+                role: Role::User,
+                content: Content::Text {
+                    text: "Hello!".to_string(),
+                },
+            }])
+        }
+    }
+
+    #[test]
+    fn test_mount_with_prefix_renames_tools() {
+        let mut main_router = Router::new();
+        let mut db_router = Router::new();
+        db_router.add_tool(QueryTool);
+        db_router.add_tool(InsertTool);
+
+        let result = main_router.mount(db_router, Some("db"));
+
+        assert_eq!(result.tools, 2);
+        assert!(main_router.get_tool("db/query").is_some());
+        assert!(main_router.get_tool("db/insert").is_some());
+        assert!(main_router.get_tool("query").is_none());
+        assert!(main_router.get_tool("insert").is_none());
+    }
+
+    #[test]
+    fn test_mount_without_prefix_keeps_names() {
+        let mut main_router = Router::new();
+        let mut other_router = Router::new();
+        other_router.add_tool(QueryTool);
+
+        let result = main_router.mount(other_router, None);
+
+        assert_eq!(result.tools, 1);
+        assert!(main_router.get_tool("query").is_some());
+    }
+
+    #[test]
+    fn test_mount_resources_with_prefix() {
+        let mut main_router = Router::new();
+        let mut other_router = Router::new();
+        other_router.add_resource(ConfigResource);
+
+        let result = main_router.mount(other_router, Some("service"));
+
+        assert_eq!(result.resources, 1);
+        assert!(main_router.get_resource("service/config://app").is_some());
+        assert!(main_router.get_resource("config://app").is_none());
+    }
+
+    #[test]
+    fn test_mount_prompts_with_prefix() {
+        let mut main_router = Router::new();
+        let mut other_router = Router::new();
+        other_router.add_prompt(GreetingPrompt);
+
+        let result = main_router.mount(other_router, Some("templates"));
+
+        assert_eq!(result.prompts, 1);
+        assert!(main_router.get_prompt("templates/greeting").is_some());
+        assert!(main_router.get_prompt("greeting").is_none());
+    }
+
+    #[test]
+    fn test_mount_conflict_generates_warning() {
+        let mut main_router = Router::new();
+        main_router.add_tool(QueryTool);
+
+        let mut other_router = Router::new();
+        other_router.add_tool(QueryTool);
+
+        // Mount without prefix, causing a conflict
+        let result = main_router.mount(other_router, None);
+
+        assert_eq!(result.tools, 1);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("already exists"));
+    }
+
+    #[test]
+    fn test_mount_preserves_tool_definition() {
+        let mut main_router = Router::new();
+        let mut db_router = Router::new();
+        db_router.add_tool(QueryTool);
+
+        main_router.mount(db_router, Some("db"));
+
+        let tools = main_router.tools();
+        let tool = tools.iter().find(|t| t.name == "db/query").unwrap();
+        assert_eq!(tool.description, Some("Executes a query".to_string()));
+    }
+
+    #[test]
+    fn test_mount_all_components() {
+        let mut main_router = Router::new();
+        let mut other_router = Router::new();
+        other_router.add_tool(QueryTool);
+        other_router.add_resource(ConfigResource);
+        other_router.add_prompt(GreetingPrompt);
+
+        let result = main_router.mount(other_router, Some("sub"));
+
+        assert_eq!(result.tools, 1);
+        assert_eq!(result.resources, 1);
+        assert_eq!(result.prompts, 1);
+        assert!(result.has_components());
+    }
+
+    #[test]
+    fn test_selective_mount_tools_only() {
+        let db_server = Server::new("db", "1.0")
+            .tool(QueryTool)
+            .resource(ConfigResource)
+            .prompt(GreetingPrompt)
+            .build();
+
+        let main = Server::new("main", "1.0")
+            .mount_tools(db_server, Some("db"))
+            .build();
+
+        let tools = main.tools();
+        let resources = main.resources();
+        let prompts = main.prompts();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "db/query");
+        assert!(resources.is_empty());
+        assert!(prompts.is_empty());
+    }
+
+    #[test]
+    fn test_selective_mount_resources_only() {
+        let data_server = Server::new("data", "1.0")
+            .tool(QueryTool)
+            .resource(ConfigResource)
+            .build();
+
+        let main = Server::new("main", "1.0")
+            .mount_resources(data_server, Some("data"))
+            .build();
+
+        let tools = main.tools();
+        let resources = main.resources();
+
+        assert!(tools.is_empty());
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "data/config://app");
+    }
+
+    #[test]
+    fn test_selective_mount_prompts_only() {
+        let templates_server = Server::new("templates", "1.0")
+            .tool(QueryTool)
+            .prompt(GreetingPrompt)
+            .build();
+
+        let main = Server::new("main", "1.0")
+            .mount_prompts(templates_server, Some("tmpl"))
+            .build();
+
+        let tools = main.tools();
+        let prompts = main.prompts();
+
+        assert!(tools.is_empty());
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "tmpl/greeting");
+    }
+
+    #[test]
+    fn test_full_mount_via_server_builder() {
+        let db_server = Server::new("db", "1.0")
+            .tool(QueryTool)
+            .tool(InsertTool)
+            .build();
+
+        let api_server = Server::new("api", "1.0").prompt(GreetingPrompt).build();
+
+        let main = Server::new("main", "1.0")
+            .tool(GreetTool)
+            .mount(db_server, Some("db"))
+            .mount(api_server, Some("api"))
+            .build();
+
+        let tools = main.tools();
+        let prompts = main.prompts();
+
+        // Should have original greet + mounted db/query and db/insert
+        assert_eq!(tools.len(), 3);
+        let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(tool_names.contains(&"greet"));
+        assert!(tool_names.contains(&"db/query"));
+        assert!(tool_names.contains(&"db/insert"));
+
+        // Should have api/greeting
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "api/greeting");
+    }
+
+    #[test]
+    fn test_nested_mounting() {
+        // Create inner server
+        let inner = Server::new("inner", "1.0").tool(QueryTool).build();
+
+        // Mount inner into middle
+        let middle = Server::new("middle", "1.0")
+            .mount(inner, Some("inner"))
+            .build();
+
+        // Mount middle into outer
+        let outer = Server::new("outer", "1.0")
+            .mount(middle, Some("middle"))
+            .build();
+
+        let tools = outer.tools();
+        assert_eq!(tools.len(), 1);
+        // Tool should be at middle/inner/query
+        assert_eq!(tools[0].name, "middle/inner/query");
+    }
+
+    #[test]
+    fn test_prefix_validation_rejects_slashes() {
+        let mut router = Router::new();
+        let mut other = Router::new();
+        other.add_tool(QueryTool);
+
+        let result = router.mount(other, Some("bad/prefix"));
+
+        // Should still mount but generate a warning
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("slash"));
+    }
+
+    #[test]
+    fn test_mounted_tool_can_be_called() {
+        let db_server = Server::new("db", "1.0").tool(QueryTool).build();
+
+        let main = Server::new("main", "1.0")
+            .mount(db_server, Some("db"))
+            .build();
+
+        // Get the tool handler
+        let tools = main.tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "db/query");
+
+        // Verify the definition is correct
+        let tool = &tools[0];
+        assert_eq!(tool.description, Some("Executes a query".to_string()));
+    }
+
+    #[test]
+    fn test_mount_empty_router() {
+        let mut main_router = Router::new();
+        let empty_router = Router::new();
+
+        let result = main_router.mount(empty_router, Some("empty"));
+
+        assert_eq!(result.tools, 0);
+        assert_eq!(result.resources, 0);
+        assert_eq!(result.prompts, 0);
+        assert!(!result.has_components());
+    }
+}
+
+// ============================================================================
+// Duplicate Behavior Tests
+// ============================================================================
+
+mod duplicate_behavior_tests {
+    use super::*;
+    use crate::{DuplicateBehavior, Router};
+
+    /// A simple tool for duplicate tests.
+    struct DupTool {
+        id: u32,
+    }
+
+    impl DupTool {
+        fn new(id: u32) -> Self {
+            Self { id }
+        }
+    }
+
+    impl ToolHandler for DupTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "dup_tool".to_string(),
+                description: Some(format!("Tool #{}", self.id)),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: format!("Tool #{}", self.id),
+            }])
+        }
+    }
+
+    #[test]
+    fn test_duplicate_behavior_error_returns_error() {
+        let mut router = Router::new();
+        router.add_tool(DupTool::new(1));
+
+        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Error);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("already exists"));
+    }
+
+    #[test]
+    fn test_duplicate_behavior_warn_keeps_original() {
+        let mut router = Router::new();
+        router.add_tool(DupTool::new(1));
+
+        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Warn);
+        assert!(result.is_ok());
+
+        // Original should be kept
+        let tool = router.get_tool("dup_tool").unwrap();
+        assert_eq!(tool.definition().description, Some("Tool #1".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_behavior_replace_replaces() {
+        let mut router = Router::new();
+        router.add_tool(DupTool::new(1));
+
+        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Replace);
+        assert!(result.is_ok());
+
+        // New one should replace original
+        let tool = router.get_tool("dup_tool").unwrap();
+        assert_eq!(tool.definition().description, Some("Tool #2".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_behavior_ignore_keeps_original() {
+        let mut router = Router::new();
+        router.add_tool(DupTool::new(1));
+
+        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Ignore);
+        assert!(result.is_ok());
+
+        // Original should be kept
+        let tool = router.get_tool("dup_tool").unwrap();
+        assert_eq!(tool.definition().description, Some("Tool #1".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_behavior_default_is_warn() {
+        assert_eq!(DuplicateBehavior::default(), DuplicateBehavior::Warn);
+    }
+
+    #[test]
+    fn test_no_duplicate_succeeds_for_all_behaviors() {
+        for behavior in [
+            DuplicateBehavior::Error,
+            DuplicateBehavior::Warn,
+            DuplicateBehavior::Replace,
+            DuplicateBehavior::Ignore,
+        ] {
+            let mut router = Router::new();
+            let result = router.add_tool_with_behavior(DupTool::new(1), behavior);
+            assert!(result.is_ok(), "Failed for {:?}", behavior);
+        }
+    }
+
+    #[test]
+    fn test_server_builder_on_duplicate() {
+        // Create server with strict duplicate checking
+        let server = Server::new("test", "1.0")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .tool(DupTool::new(1))
+            .tool(DupTool::new(2)) // Should replace
+            .build();
+
+        let tools = server.tools();
+        assert_eq!(tools.len(), 1);
+        // The replaced tool should have id 2
+        assert_eq!(tools[0].description, Some("Tool #2".to_string()));
+    }
+
+    #[test]
+    fn test_server_builder_error_behavior_logs_but_continues() {
+        // Create server with error behavior
+        let server = Server::new("test", "1.0")
+            .on_duplicate(DuplicateBehavior::Error)
+            .tool(DupTool::new(1))
+            .tool(DupTool::new(2)) // Should fail silently in builder
+            .build();
+
+        let tools = server.tools();
+        // Only first tool should be registered
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].description, Some("Tool #1".to_string()));
+    }
+}
+
+// ============================================================================
+// Cross-Component Resource Reading Tests (ctx.read_resource)
+// ============================================================================
+
+mod ctx_read_resource_tests {
+    use super::*;
+    use crate::RouterResourceReader;
+    use fastmcp_core::{
+        MAX_RESOURCE_READ_DEPTH, ResourceContentItem, ResourceReadResult, ResourceReader,
+    };
+
+    /// A simple resource that returns static config data.
+    struct ConfigResource {
+        config_json: String,
+    }
+
+    impl ConfigResource {
+        fn new(json: &str) -> Self {
+            Self {
+                config_json: json.to_string(),
+            }
+        }
+    }
+
+    impl ResourceHandler for ConfigResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "config://app".to_string(),
+                name: "app_config".to_string(),
+                description: Some("Application configuration".to_string()),
+                mime_type: Some("application/json".to_string()),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "config://app".to_string(),
+                mime_type: Some("application/json".to_string()),
+                text: Some(self.config_json.clone()),
+                blob: None,
+            }])
+        }
+    }
+
+    /// A resource that reads another resource.
+    struct NestedResource {
+        inner_uri: String,
+    }
+
+    impl NestedResource {
+        fn new(inner_uri: &str) -> Self {
+            Self {
+                inner_uri: inner_uri.to_string(),
+            }
+        }
+    }
+
+    impl ResourceHandler for NestedResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "nested://wrapper".to_string(),
+                name: "nested_wrapper".to_string(),
+                description: Some("Wraps another resource".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // Read the inner resource using ctx
+            let inner_uri = self.inner_uri.clone();
+            let inner_result = fastmcp_core::block_on(ctx.read_resource(&inner_uri))?;
+
+            let text = inner_result.first_text().unwrap_or("(no content)");
+            Ok(vec![ResourceContent {
+                uri: "nested://wrapper".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(format!("Wrapped: {}", text)),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn test_resource_content_item_constructors() {
+        let text_item = ResourceContentItem::text("file://test", "hello world");
+        assert_eq!(text_item.uri, "file://test");
+        assert_eq!(text_item.as_text(), Some("hello world"));
+        assert!(text_item.is_text());
+        assert!(!text_item.is_blob());
+
+        let json_item = ResourceContentItem::json("config://app", r#"{"key": "value"}"#);
+        assert_eq!(json_item.mime_type, Some("application/json".to_string()));
+
+        let blob_item = ResourceContentItem::blob("image://test", "image/png", "base64data");
+        assert_eq!(blob_item.as_blob(), Some("base64data"));
+        assert!(blob_item.is_blob());
+        assert!(!blob_item.is_text());
+    }
+
+    #[test]
+    fn test_resource_read_result_constructors() {
+        let result = ResourceReadResult::text("file://test", "content");
+        assert_eq!(result.first_text(), Some("content"));
+        assert_eq!(result.contents.len(), 1);
+
+        let multi = ResourceReadResult::new(vec![
+            ResourceContentItem::text("file://a", "A"),
+            ResourceContentItem::text("file://b", "B"),
+        ]);
+        assert_eq!(multi.contents.len(), 2);
+        assert_eq!(multi.first_text(), Some("A"));
+    }
+
+    #[test]
+    fn test_ctx_read_resource_without_reader_fails() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        // Without a resource reader, should fail
+        assert!(!ctx.can_read_resources());
+
+        let result = fastmcp_core::block_on(ctx.read_resource("config://app"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("no router"));
+    }
+
+    #[test]
+    fn test_router_resource_reader_reads_resource() {
+        let mut router = Router::new();
+        router.add_resource(ConfigResource::new(r#"{"db": "postgres"}"#));
+
+        let router_arc = Arc::new(router);
+        let reader = RouterResourceReader::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://app", 0));
+
+        assert!(result.is_ok());
+        let read_result = result.unwrap();
+        assert_eq!(read_result.first_text(), Some(r#"{"db": "postgres"}"#));
+    }
+
+    #[test]
+    fn test_router_resource_reader_not_found() {
+        let router = Router::new(); // No resources
+        let router_arc = Arc::new(router);
+        let reader = RouterResourceReader::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://missing", 0));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn test_router_resource_reader_depth_limit() {
+        let router = Router::new();
+        let router_arc = Arc::new(router);
+        let reader = RouterResourceReader::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        // Call with depth at limit
+        let result = fastmcp_core::block_on(reader.read_resource(
+            &cx,
+            "any://uri",
+            MAX_RESOURCE_READ_DEPTH + 1,
+        ));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("depth"));
+    }
+
+    #[test]
+    fn test_ctx_with_resource_reader() {
+        let mut router = Router::new();
+        router.add_resource(ConfigResource::new(r#"{"name": "test"}"#));
+
+        let router_arc = Arc::new(router);
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
+
+        assert!(ctx.can_read_resources());
+        assert_eq!(ctx.resource_read_depth(), 0);
+
+        // Read the resource
+        let result = fastmcp_core::block_on(ctx.read_resource("config://app"));
+        assert!(result.is_ok());
+        let read_result = result.unwrap();
+        assert!(read_result.first_text().unwrap().contains("test"));
+    }
+
+    #[test]
+    fn test_ctx_read_resource_text() {
+        let mut router = Router::new();
+        router.add_resource(ConfigResource::new(r#"{"value": 42}"#));
+
+        let router_arc = Arc::new(router);
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
+
+        let result = fastmcp_core::block_on(ctx.read_resource_text("config://app"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), r#"{"value": 42}"#);
+    }
+
+    #[test]
+    fn test_ctx_read_resource_json() {
+        let mut router = Router::new();
+        router.add_resource(ConfigResource::new(
+            r#"{"database": "postgres", "port": 5432}"#,
+        ));
+
+        let router_arc = Arc::new(router);
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
+
+        #[derive(Debug, serde::Deserialize)]
+        struct DbConfig {
+            database: String,
+            port: u16,
+        }
+
+        let result: McpResult<DbConfig> =
+            fastmcp_core::block_on(ctx.read_resource_json("config://app"));
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.database, "postgres");
+        assert_eq!(config.port, 5432);
+    }
+
+    #[test]
+    fn test_ctx_read_resource_json_parse_error() {
+        let mut router = Router::new();
+        router.add_resource(ConfigResource::new("not valid json"));
+
+        let router_arc = Arc::new(router);
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Config {
+            value: i32,
+        }
+
+        let result: McpResult<Config> =
+            fastmcp_core::block_on(ctx.read_resource_json("config://app"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("JSON"));
+    }
+
+    #[test]
+    fn test_resource_read_depth_increments() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_resource_read_depth(5);
+
+        assert_eq!(ctx.resource_read_depth(), 5);
+    }
+
+    #[test]
+    fn test_max_resource_read_depth_constant() {
+        // Verify the constant is reasonable
+        assert_eq!(MAX_RESOURCE_READ_DEPTH, 10);
+    }
+}
+
+// ============================================================================
+// Cross-Component Tool Calling Tests (ctx.call_tool)
+// ============================================================================
+
+mod ctx_call_tool_tests {
+    use super::*;
+    use crate::RouterToolCaller;
+    use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCallResult, ToolCaller, ToolContentItem};
+
+    /// A simple tool that adds two numbers.
+    struct AddTool;
+
+    impl ToolHandler for AddTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "add".to_string(),
+                description: Some("Adds two numbers".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "b": {"type": "integer"}
+                    },
+                    "required": ["a", "b"]
+                }),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+            let a = args["a"].as_i64().unwrap_or(0);
+            let b = args["b"].as_i64().unwrap_or(0);
+            let sum = a + b;
+            Ok(vec![Content::Text {
+                text: sum.to_string(),
+            }])
+        }
+    }
+
+    /// A tool that returns JSON.
+    struct JsonTool;
+
+    impl ToolHandler for JsonTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "compute".to_string(),
+                description: Some("Returns a JSON result".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: r#"{"value": 42}"#.to_string(),
+            }])
+        }
+    }
+
+    /// A tool that always fails.
+    struct FailingTool;
+
+    impl ToolHandler for FailingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "failing".to_string(),
+                description: Some("Always fails".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::new(
+                McpErrorCode::InternalError,
+                "Something went wrong",
+            ))
+        }
+    }
+
+    #[test]
+    fn test_tool_content_item_constructors() {
+        let text_item = ToolContentItem::text("hello world");
+        assert_eq!(text_item.as_text(), Some("hello world"));
+        assert!(text_item.is_text());
+    }
+
+    #[test]
+    fn test_tool_call_result_constructors() {
+        let success = ToolCallResult::text("result");
+        assert!(!success.is_error);
+        assert_eq!(success.first_text(), Some("result"));
+
+        let error = ToolCallResult::error("failed");
+        assert!(error.is_error);
+        assert_eq!(error.first_text(), Some("failed"));
+
+        let multi =
+            ToolCallResult::success(vec![ToolContentItem::text("a"), ToolContentItem::text("b")]);
+        assert_eq!(multi.content.len(), 2);
+        assert_eq!(multi.first_text(), Some("a"));
+    }
+
+    #[test]
+    fn test_ctx_call_tool_without_caller_fails() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+
+        // Without a tool caller, should fail
+        assert!(!ctx.can_call_tools());
+
+        let result =
+            fastmcp_core::block_on(ctx.call_tool("add", serde_json::json!({"a": 1, "b": 2})));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("no router"));
+    }
+
+    #[test]
+    fn test_router_tool_caller_calls_tool() {
+        let mut router = Router::new();
+        router.add_tool(AddTool);
+
+        let router_arc = Arc::new(router);
+        let caller = RouterToolCaller::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(caller.call_tool(
+            &cx,
+            "add",
+            serde_json::json!({"a": 5, "b": 3}),
+            0,
+        ));
+
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(!call_result.is_error);
+        assert_eq!(call_result.first_text(), Some("8"));
+    }
+
+    #[test]
+    fn test_router_tool_caller_not_found() {
+        let router = Router::new(); // No tools
+        let router_arc = Arc::new(router);
+        let caller = RouterToolCaller::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        let result =
+            fastmcp_core::block_on(caller.call_tool(&cx, "nonexistent", serde_json::json!({}), 0));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn test_router_tool_caller_depth_limit() {
+        let router = Router::new();
+        let router_arc = Arc::new(router);
+        let caller = RouterToolCaller::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        // Call with depth at limit
+        let result = fastmcp_core::block_on(caller.call_tool(
+            &cx,
+            "any_tool",
+            serde_json::json!({}),
+            MAX_TOOL_CALL_DEPTH + 1,
+        ));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("depth"));
+    }
+
+    #[test]
+    fn test_ctx_with_tool_caller() {
+        let mut router = Router::new();
+        router.add_tool(AddTool);
+
+        let router_arc = Arc::new(router);
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_caller(caller);
+
+        assert!(ctx.can_call_tools());
+        assert_eq!(ctx.tool_call_depth(), 0);
+
+        // Call the tool
+        let result =
+            fastmcp_core::block_on(ctx.call_tool("add", serde_json::json!({"a": 10, "b": 5})));
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert_eq!(call_result.first_text(), Some("15"));
+    }
+
+    #[test]
+    fn test_ctx_call_tool_text() {
+        let mut router = Router::new();
+        router.add_tool(AddTool);
+
+        let router_arc = Arc::new(router);
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_caller(caller);
+
+        let result =
+            fastmcp_core::block_on(ctx.call_tool_text("add", serde_json::json!({"a": 7, "b": 3})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "10");
+    }
+
+    #[test]
+    fn test_ctx_call_tool_json() {
+        let mut router = Router::new();
+        router.add_tool(JsonTool);
+
+        let router_arc = Arc::new(router);
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_caller(caller);
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Result {
+            value: i32,
+        }
+
+        let result: McpResult<Result> =
+            fastmcp_core::block_on(ctx.call_tool_json("compute", serde_json::json!({})));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().value, 42);
+    }
+
+    #[test]
+    fn test_ctx_call_tool_returns_error_result() {
+        let mut router = Router::new();
+        router.add_tool(FailingTool);
+
+        let router_arc = Arc::new(router);
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_caller(caller);
+
+        // call_tool returns the error as is_error=true
+        let result = fastmcp_core::block_on(ctx.call_tool("failing", serde_json::json!({})));
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+        assert!(call_result.is_error);
+    }
+
+    #[test]
+    fn test_ctx_call_tool_text_propagates_error() {
+        let mut router = Router::new();
+        router.add_tool(FailingTool);
+
+        let router_arc = Arc::new(router);
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, SessionState::new()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_caller(caller);
+
+        // call_tool_text converts is_error=true to Err
+        let result = fastmcp_core::block_on(ctx.call_tool_text("failing", serde_json::json!({})));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("failed"));
+    }
+
+    #[test]
+    fn test_tool_call_depth_increments() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1).with_tool_call_depth(5);
+
+        assert_eq!(ctx.tool_call_depth(), 5);
+    }
+
+    #[test]
+    fn test_max_tool_call_depth_constant() {
+        // Verify the constant is reasonable
+        assert_eq!(MAX_TOOL_CALL_DEPTH, 10);
+    }
+
+    #[test]
+    fn test_tool_validation_error() {
+        let mut router = Router::new();
+        router.add_tool(AddTool);
+
+        let router_arc = Arc::new(router);
+        let caller = RouterToolCaller::new(router_arc, SessionState::new());
+
+        let cx = Cx::for_testing();
+        // Missing required parameters
+        let result = fastmcp_core::block_on(caller.call_tool(
+            &cx,
+            "add",
+            serde_json::json!({}), // Missing a and b
+            0,
+        ));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("validation"));
+    }
+}
