@@ -18,7 +18,7 @@ use fastmcp_core::{
     McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter, SessionState,
 };
 use fastmcp_protocol::{
-    Content, JsonRpcRequest, ProgressParams, ProgressToken, Prompt, PromptMessage, Resource,
+    Content, Icon, JsonRpcRequest, ProgressParams, ProgressToken, Prompt, PromptMessage, Resource,
     ResourceContent, ResourceTemplate, Tool,
 };
 
@@ -214,6 +214,14 @@ pub trait ToolHandler: Send + Sync {
     /// Returns the tool definition.
     fn definition(&self) -> Tool;
 
+    /// Returns the tool's icon, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide an icon.
+    /// Note: Icons can also be set directly in `definition()`.
+    fn icon(&self) -> Option<&Icon> {
+        None
+    }
+
     /// Calls the tool synchronously with the given arguments.
     ///
     /// This is the default implementation point. Override this for simple
@@ -265,6 +273,14 @@ pub trait ResourceHandler: Send + Sync {
 
     /// Returns the resource template definition, if this resource uses a URI template.
     fn template(&self) -> Option<ResourceTemplate> {
+        None
+    }
+
+    /// Returns the resource's icon, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide an icon.
+    /// Note: Icons can also be set directly in `definition()`.
+    fn icon(&self) -> Option<&Icon> {
         None
     }
 
@@ -346,6 +362,14 @@ pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
 
+    /// Returns the prompt's icon, if any.
+    ///
+    /// Default implementation returns `None`. Override to provide an icon.
+    /// Note: Icons can also be set directly in `definition()`.
+    fn icon(&self) -> Option<&Icon> {
+        None
+    }
+
     /// Gets the prompt messages synchronously with the given arguments.
     ///
     /// This is the default implementation point. Override this for simple
@@ -413,7 +437,7 @@ impl MountedToolHandler {
 impl ToolHandler for MountedToolHandler {
     fn definition(&self) -> Tool {
         let mut def = self.inner.definition();
-        def.name = self.mounted_name.clone();
+        def.name.clone_from(&self.mounted_name);
         def
     }
 
@@ -466,7 +490,7 @@ impl MountedResourceHandler {
 impl ResourceHandler for MountedResourceHandler {
     fn definition(&self) -> Resource {
         let mut def = self.inner.definition();
-        def.uri = self.mounted_uri.clone();
+        def.uri.clone_from(&self.mounted_uri);
         def
     }
 
@@ -525,7 +549,7 @@ impl MountedPromptHandler {
 impl PromptHandler for MountedPromptHandler {
     fn definition(&self) -> Prompt {
         let mut def = self.inner.definition();
-        def.name = self.mounted_name.clone();
+        def.name.clone_from(&self.mounted_name);
         def
     }
 

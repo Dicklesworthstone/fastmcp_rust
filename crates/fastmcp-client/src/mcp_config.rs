@@ -253,7 +253,7 @@ impl McpConfig {
     /// Serializes configuration to TOML.
     #[must_use]
     pub fn to_toml(&self) -> String {
-        toml::to_string_pretty(self).unwrap_or_else(|_| "".to_string())
+        toml::to_string_pretty(self).unwrap_or_else(|_| String::new())
     }
 
     /// Adds a server configuration.

@@ -344,11 +344,13 @@ mod tests {
                 name: "calculate".to_string(),
                 description: Some("Perform calculations".to_string()),
                 input_schema: json!({"type": "object", "properties": {}}),
+                icon: None,
             },
             Tool {
                 name: "search".to_string(),
                 description: Some("Search for items".to_string()),
                 input_schema: json!({"type": "object", "properties": {}}),
+                icon: None,
             },
         ]
     }
@@ -359,6 +361,7 @@ mod tests {
             name: "example.txt".to_string(),
             description: Some("Example file".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }]
     }
 
@@ -367,6 +370,7 @@ mod tests {
             name: "code_review".to_string(),
             description: Some("Review code changes".to_string()),
             arguments: vec![],
+            icon: None,
         }]
     }
 

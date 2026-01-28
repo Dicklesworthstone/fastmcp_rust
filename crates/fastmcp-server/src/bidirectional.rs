@@ -77,6 +77,7 @@ impl PendingRequests {
     }
 
     /// Generates a new unique request ID.
+    #[allow(clippy::cast_possible_wrap)]
     pub fn next_request_id(&self) -> RequestId {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         RequestId::Number(id as i64)

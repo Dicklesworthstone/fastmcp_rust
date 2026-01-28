@@ -293,7 +293,10 @@ impl EventStore {
         let event_id = self.generate_event_id();
         let entry = EventEntry::new(event_id.clone(), stream_id.to_string(), data);
 
-        let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        let mut streams = self
+            .streams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let stream = streams
             .entry(stream_id.to_string())
@@ -328,7 +331,10 @@ impl EventStore {
     /// Vector of events in chronological order.
     #[must_use]
     pub fn get_events_after(&self, stream_id: &str, after_id: Option<&str>) -> Vec<EventEntry> {
-        let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        let mut streams = self
+            .streams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(stream) = streams.get_mut(stream_id) {
             // Clean up expired events first
@@ -356,7 +362,10 @@ impl EventStore {
     where
         F: FnMut(&EventEntry),
     {
-        let streams = self.streams.read().unwrap_or_else(|e| e.into_inner());
+        let streams = self
+            .streams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Find which stream contains this event
         for (stream_id, stream) in streams.iter() {
@@ -379,7 +388,10 @@ impl EventStore {
     /// The stream ID if the event exists, `None` otherwise.
     #[must_use]
     pub fn find_stream_for_event(&self, event_id: &str) -> Option<StreamId> {
-        let streams = self.streams.read().unwrap_or_else(|e| e.into_inner());
+        let streams = self
+            .streams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for (stream_id, stream) in streams.iter() {
             if stream.contains(event_id) {
@@ -394,7 +406,10 @@ impl EventStore {
     ///
     /// Call this when a session ends to free memory.
     pub fn clear_stream(&self, stream_id: &str) {
-        let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        let mut streams = self
+            .streams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         streams.remove(stream_id);
     }
 
@@ -407,7 +422,10 @@ impl EventStore {
             return;
         }
 
-        let mut streams = self.streams.write().unwrap_or_else(|e| e.into_inner());
+        let mut streams = self
+            .streams
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Remove expired events from each stream
         for stream in streams.values_mut() {
@@ -421,21 +439,30 @@ impl EventStore {
     /// Returns the number of streams currently stored.
     #[must_use]
     pub fn stream_count(&self) -> usize {
-        let streams = self.streams.read().unwrap_or_else(|e| e.into_inner());
+        let streams = self
+            .streams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         streams.len()
     }
 
     /// Returns the total number of events across all streams.
     #[must_use]
     pub fn event_count(&self) -> usize {
-        let streams = self.streams.read().unwrap_or_else(|e| e.into_inner());
+        let streams = self
+            .streams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         streams.values().map(|s| s.events.len()).sum()
     }
 
     /// Returns statistics about the event store.
     #[must_use]
     pub fn stats(&self) -> EventStoreStats {
-        let streams = self.streams.read().unwrap_or_else(|e| e.into_inner());
+        let streams = self
+            .streams
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let total_events: usize = streams.values().map(|s| s.events.len()).sum();
 
         EventStoreStats {
@@ -604,8 +631,14 @@ mod tests {
         let id1 = store.store_event("stream1", Some(serde_json::json!({})));
         let id2 = store.store_event("stream2", Some(serde_json::json!({})));
 
-        assert_eq!(store.find_stream_for_event(&id1), Some("stream1".to_string()));
-        assert_eq!(store.find_stream_for_event(&id2), Some("stream2".to_string()));
+        assert_eq!(
+            store.find_stream_for_event(&id1),
+            Some("stream1".to_string())
+        );
+        assert_eq!(
+            store.find_stream_for_event(&id2),
+            Some("stream2".to_string())
+        );
         assert_eq!(store.find_stream_for_event("nonexistent"), None);
     }
 

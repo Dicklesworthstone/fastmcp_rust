@@ -337,7 +337,7 @@ impl std::fmt::Debug for ResponseCachingMiddleware {
         f.debug_struct("ResponseCachingMiddleware")
             .field("list_ttl", &self.list_ttl)
             .field("call_ttl", &self.call_ttl)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -395,11 +395,17 @@ impl ResponseCachingMiddleware {
     #[must_use]
     pub fn max_entries(self, max: usize) -> Self {
         let max_size = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_size_bytes
         };
         let max_item_size = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_item_size
         };
         Self {
@@ -412,11 +418,17 @@ impl ResponseCachingMiddleware {
     #[must_use]
     pub fn max_size_bytes(self, max: usize) -> Self {
         let max_entries = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_entries
         };
         let max_item_size = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_item_size
         };
         Self {
@@ -429,11 +441,17 @@ impl ResponseCachingMiddleware {
     #[must_use]
     pub fn max_item_size(self, max: usize) -> Self {
         let max_entries = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_entries
         };
         let max_size = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.max_size_bytes
         };
         Self {
@@ -521,8 +539,15 @@ impl ResponseCachingMiddleware {
     /// Returns current cache statistics.
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         stats.entries = cache.len();
         stats.size_bytes = cache.current_size_bytes;
         stats
@@ -530,14 +555,20 @@ impl ResponseCachingMiddleware {
 
     /// Clears the entire cache.
     pub fn clear(&self) {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.clear();
     }
 
     /// Invalidates a specific cache entry by method and params.
     pub fn invalidate(&self, method: &str, params: Option<&serde_json::Value>) {
         let key = CacheKey::new(method, params);
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.remove(&key);
     }
 
@@ -579,12 +610,18 @@ impl ResponseCachingMiddleware {
     }
 
     fn record_hit(&self) {
-        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.hits += 1;
     }
 
     fn record_miss(&self) {
-        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.misses += 1;
     }
 }

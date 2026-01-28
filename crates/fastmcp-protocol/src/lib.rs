@@ -28,7 +28,7 @@ pub mod schema;
 mod types;
 
 pub use jsonrpc::{
-    JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, JSONRPC_VERSION,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
 pub use messages::*;
 pub use schema::{ValidationError, ValidationResult, validate};

@@ -826,6 +826,7 @@ mod tests {
                     },
                     "required": ["expression"]
                 }),
+                icon: None,
             },
             Tool {
                 name: "search".to_string(),
@@ -840,6 +841,7 @@ mod tests {
                     },
                     "required": ["pattern"]
                 }),
+                icon: None,
             },
         ]
     }
@@ -851,12 +853,14 @@ mod tests {
                 name: "config".to_string(),
                 description: Some("Application configuration".to_string()),
                 mime_type: Some("application/json".to_string()),
+                icon: None,
             },
             Resource {
                 uri: "file://data.csv".to_string(),
                 name: "data".to_string(),
                 description: Some("Data file".to_string()),
                 mime_type: Some("text/csv".to_string()),
+                icon: None,
             },
         ]
     }
@@ -871,6 +875,7 @@ mod tests {
                     description: Some("Person's name".to_string()),
                     required: true,
                 }],
+                icon: None,
             },
             Prompt {
                 name: "summarize".to_string(),
@@ -887,6 +892,7 @@ mod tests {
                         required: false,
                     },
                 ],
+                icon: None,
             },
         ]
     }
@@ -1066,24 +1072,28 @@ mod tests {
                 name: "file".to_string(),
                 description: Some("Read file contents".to_string()),
                 mime_type: None,
+                icon: None,
             },
             Resource {
                 uri: "file://config.json".to_string(),
                 name: "config".to_string(),
                 description: Some("Application config".to_string()),
                 mime_type: Some("application/json".to_string()),
+                icon: None,
             },
             Resource {
                 uri: "db://users/{id}".to_string(),
                 name: "user".to_string(),
                 description: Some("User record by ID".to_string()),
                 mime_type: None,
+                icon: None,
             },
             Resource {
                 uri: "cache://stats".to_string(),
                 name: "stats".to_string(),
                 description: Some("Cached statistics".to_string()),
                 mime_type: None,
+                icon: None,
             },
         ]
     }

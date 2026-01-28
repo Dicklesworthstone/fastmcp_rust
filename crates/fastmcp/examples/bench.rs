@@ -243,6 +243,7 @@ fn bench_protocol_types() {
             name: "my_tool".to_string(),
             description: Some("A test tool".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
         };
     });
 

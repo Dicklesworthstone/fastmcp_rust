@@ -359,6 +359,7 @@ impl TransformedToolBuilder {
             name,
             description,
             input_schema,
+            icon: parent.icon.clone(),
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
                 name: self.name.clone(),
                 description: self.description.clone(),
                 input_schema: self.schema.clone(),
+                icon: None,
             }
         }
 

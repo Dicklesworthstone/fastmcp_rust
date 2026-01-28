@@ -60,6 +60,7 @@ impl ToolHandler for GreetTool {
                 },
                 "required": ["name"]
             }),
+            icon: None,
         }
     }
 
@@ -83,6 +84,7 @@ impl ToolHandler for CancellationCheckTool {
             name: "cancellation_check".to_string(),
             description: Some("Tool that checks cancellation status".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
         }
     }
 
@@ -106,6 +108,7 @@ impl ToolHandler for SlowTool {
             name: "slow_tool".to_string(),
             description: Some("Simulates a slow operation".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
         }
     }
 
@@ -135,6 +138,7 @@ impl ToolHandler for BlockingTool {
             name: "block_until_cancelled".to_string(),
             description: Some("Blocks until cancellation is observed".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
         }
     }
 
@@ -400,6 +404,7 @@ impl ToolHandler for LoggingBlockingTool {
                 "type": "object",
                 "properties": { "request_id": { "type": "integer" } }
             }),
+            icon: None,
         }
     }
 
@@ -434,6 +439,7 @@ impl ToolHandler for ErrorTool {
             name: "error_tool".to_string(),
             description: Some("Always returns an error".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
         }
     }
 
@@ -459,6 +465,7 @@ impl ResourceHandler for StaticResource {
             name: "Static Resource".to_string(),
             description: Some("A static test resource".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }
     }
 
@@ -482,6 +489,7 @@ impl ResourceHandler for CancellableResource {
             name: "Cancellable Resource".to_string(),
             description: Some("A resource that checks cancellation".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }
     }
 
@@ -508,6 +516,7 @@ impl ResourceHandler for TemplateResource {
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }
     }
 
@@ -517,6 +526,7 @@ impl ResourceHandler for TemplateResource {
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         })
     }
 
@@ -554,6 +564,7 @@ impl ResourceHandler for SpecificTemplateResource {
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }
     }
 
@@ -563,6 +574,7 @@ impl ResourceHandler for SpecificTemplateResource {
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         })
     }
 
@@ -611,6 +623,7 @@ impl ResourceHandler for LoggingTemplateResource {
             name: "Logging Template Resource".to_string(),
             description: Some("Template resource that logs matches".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         }
     }
 
@@ -620,6 +633,7 @@ impl ResourceHandler for LoggingTemplateResource {
             name: "Logging Template Resource".to_string(),
             description: Some("Template resource that logs matches".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         })
     }
 
@@ -683,6 +697,7 @@ impl PromptHandler for GreetingPrompt {
                 description: Some("Name to greet".to_string()),
                 required: true,
             }],
+            icon: None,
         }
     }
 
@@ -734,6 +749,7 @@ mod router_tests {
             name: "Manual Template".to_string(),
             description: Some("Resource template for manual listing".to_string()),
             mime_type: Some("text/plain".to_string()),
+            icon: None,
         });
 
         // Register prompts
@@ -2976,6 +2992,7 @@ mod multi_handler_tests {
                         "name": {"type": "string"}
                     }
                 }),
+                icon: None,
             }
         }
 
@@ -3112,6 +3129,7 @@ mod session_state_tests {
                 name: "increment".to_string(),
                 description: Some("Increments a counter in session state".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 
@@ -3565,6 +3583,7 @@ mod mount_tests {
                         "sql": {"type": "string"}
                     }
                 }),
+                icon: None,
             }
         }
 
@@ -3585,6 +3604,7 @@ mod mount_tests {
                 name: "insert".to_string(),
                 description: Some("Inserts data".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 
@@ -3609,6 +3629,7 @@ mod mount_tests {
                 name: "App Config".to_string(),
                 description: Some("Application configuration".to_string()),
                 mime_type: Some("application/json".to_string()),
+                icon: None,
             }
         }
 
@@ -3631,6 +3652,7 @@ mod mount_tests {
                 name: "greeting".to_string(),
                 description: Some("A greeting prompt".to_string()),
                 arguments: Vec::new(),
+                icon: None,
             }
         }
 
@@ -3928,6 +3950,7 @@ mod duplicate_behavior_tests {
                 name: "dup_tool".to_string(),
                 description: Some(format!("Tool #{}", self.id)),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 
@@ -4072,6 +4095,7 @@ mod ctx_read_resource_tests {
                 name: "app_config".to_string(),
                 description: Some("Application configuration".to_string()),
                 mime_type: Some("application/json".to_string()),
+                icon: None,
             }
         }
 
@@ -4109,6 +4133,7 @@ mod ctx_read_resource_tests {
                 name: "nested_wrapper".to_string(),
                 description: Some("Wraps another resource".to_string()),
                 mime_type: Some("text/plain".to_string()),
+                icon: None,
             }
         }
 
@@ -4340,6 +4365,7 @@ mod ctx_read_resource_tests {
                 name: "session_state".to_string(),
                 description: Some("Returns session state value".to_string()),
                 mime_type: Some("text/plain".to_string()),
+                icon: None,
             }
         }
 
@@ -4368,6 +4394,7 @@ mod ctx_read_resource_tests {
                 name: "nested_session".to_string(),
                 description: Some("Sets state then reads another resource".to_string()),
                 mime_type: Some("text/plain".to_string()),
+                icon: None,
             }
         }
 
@@ -4446,6 +4473,7 @@ mod ctx_call_tool_tests {
                     },
                     "required": ["a", "b"]
                 }),
+                icon: None,
             }
         }
 
@@ -4471,6 +4499,7 @@ mod ctx_call_tool_tests {
                     "type": "object",
                     "properties": {}
                 }),
+                icon: None,
             }
         }
 
@@ -4490,6 +4519,7 @@ mod ctx_call_tool_tests {
                 name: "failing".to_string(),
                 description: Some("Always fails".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 
@@ -4743,6 +4773,7 @@ mod ctx_call_tool_tests {
                 name: "get_state".to_string(),
                 description: Some("Returns session state value".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 
@@ -4763,6 +4794,7 @@ mod ctx_call_tool_tests {
                 name: "nested_state".to_string(),
                 description: Some("Sets state then calls another tool".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
             }
         }
 

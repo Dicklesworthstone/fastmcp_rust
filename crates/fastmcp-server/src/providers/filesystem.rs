@@ -592,6 +592,7 @@ impl FilesystemResourceHandler {
                     name: entry.relative_path.clone(),
                     description: None,
                     mime_type: Some(entry.mime_type),
+                    icon: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -616,6 +617,7 @@ impl ResourceHandler for FilesystemResourceHandler {
                 .unwrap_or_else(|| "files".to_string()),
             description: self.provider.description.clone(),
             mime_type: None,
+            icon: None,
         }
     }
 
@@ -629,6 +631,7 @@ impl ResourceHandler for FilesystemResourceHandler {
                 .unwrap_or_else(|| "files".to_string()),
             description: self.provider.description.clone(),
             mime_type: None,
+            icon: None,
         })
     }
 
@@ -866,23 +869,23 @@ fn glob_match_recursive(pattern: &str, path: &str) -> bool {
                         }
                     }
                     return false;
-                } else {
-                    // Single * - match anything except /
-                    let remaining_pattern: String = pattern_chars.collect();
-                    let remaining_path: String = path_chars.collect();
-
-                    // Try matching with * consuming 0, 1, 2, ... characters (but not /)
-                    for i in 0..=remaining_path.len() {
-                        // Check if the portion we're consuming contains /
-                        if remaining_path[..i].contains('/') {
-                            break;
-                        }
-                        if glob_match_recursive(&remaining_pattern, &remaining_path[i..]) {
-                            return true;
-                        }
-                    }
-                    return false;
                 }
+
+                // Single * - match anything except /
+                let remaining_pattern: String = pattern_chars.collect();
+                let remaining_path: String = path_chars.collect();
+
+                // Try matching with * consuming 0, 1, 2, ... characters (but not /)
+                for i in 0..=remaining_path.len() {
+                    // Check if the portion we're consuming contains /
+                    if remaining_path[..i].contains('/') {
+                        break;
+                    }
+                    if glob_match_recursive(&remaining_pattern, &remaining_path[i..]) {
+                        return true;
+                    }
+                }
+                return false;
             }
             '?' => {
                 // Match any single character

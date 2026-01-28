@@ -790,6 +790,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                         "properties": properties,
                         "required": required,
                     }),
+                    icon: None,
                 }
             }
 
@@ -1039,6 +1040,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #resource_name.to_string(),
                 description: #description_tokens,
                 mime_type: Some(#mime_type.to_string()),
+                icon: None,
             })
         }
     } else {
@@ -1064,6 +1066,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: #resource_name.to_string(),
                     description: #description_tokens,
                     mime_type: Some(#mime_type.to_string()),
+                    icon: None,
                 }
             }
 
@@ -1295,6 +1298,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: #prompt_name.to_string(),
                     description: #description_tokens,
                     arguments: vec![#(#prompt_args),*],
+                    icon: None,
                 }
             }
 

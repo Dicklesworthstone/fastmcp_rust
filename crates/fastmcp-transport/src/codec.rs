@@ -103,6 +103,7 @@ impl Codec {
         let mut messages = Vec::new();
         let mut start = self.read_pos;
 
+        #[allow(clippy::mut_range_bound)]
         for i in start..self.buffer.len() {
             if self.buffer[i] == b'\n' {
                 let line_len = i - start;

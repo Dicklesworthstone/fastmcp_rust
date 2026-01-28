@@ -21,6 +21,7 @@ fn main() {
             },
             "required": ["a", "b"]
         }),
+        icon: None,
     }];
 
     let resources = vec![Resource {
@@ -28,6 +29,7 @@ fn main() {
         name: "config".to_string(),
         description: Some("Application configuration".to_string()),
         mime_type: Some("application/json".to_string()),
+        icon: None,
     }];
 
     let prompts = vec![Prompt {
@@ -38,6 +40,7 @@ fn main() {
             description: Some("Name to greet".to_string()),
             required: true,
         }],
+        icon: None,
     }];
 
     ToolTableRenderer::detect().render(&tools, &console);

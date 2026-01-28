@@ -201,6 +201,86 @@ pub struct ClientInfo {
     pub version: String,
 }
 
+// ============================================================================
+// Icon Metadata
+// ============================================================================
+
+/// Icon metadata for visual representation of components.
+///
+/// Icons provide visual representation for tools, resources, and prompts
+/// in client UIs. All fields are optional to support various use cases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Icon {
+    /// URL or data URI for the icon.
+    ///
+    /// Can be:
+    /// - HTTP/HTTPS URL: `https://example.com/icon.png`
+    /// - Data URI: `data:image/png;base64,iVBORw0KGgo...`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
+
+    /// MIME type of the icon (e.g., "image/png", "image/svg+xml").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+
+    /// Size hints for the icon (e.g., "32x32", "16x16 32x32 64x64").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<String>,
+}
+
+impl Icon {
+    /// Creates a new icon with just a source URL.
+    #[must_use]
+    pub fn new(src: impl Into<String>) -> Self {
+        Self {
+            src: Some(src.into()),
+            mime_type: None,
+            sizes: None,
+        }
+    }
+
+    /// Creates a new icon with source and MIME type.
+    #[must_use]
+    pub fn with_mime_type(src: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            src: Some(src.into()),
+            mime_type: Some(mime_type.into()),
+            sizes: None,
+        }
+    }
+
+    /// Creates a new icon with all fields.
+    #[must_use]
+    pub fn full(
+        src: impl Into<String>,
+        mime_type: impl Into<String>,
+        sizes: impl Into<String>,
+    ) -> Self {
+        Self {
+            src: Some(src.into()),
+            mime_type: Some(mime_type.into()),
+            sizes: Some(sizes.into()),
+        }
+    }
+
+    /// Returns true if this icon has a source.
+    #[must_use]
+    pub fn has_src(&self) -> bool {
+        self.src.is_some()
+    }
+
+    /// Returns true if the source is a data URI.
+    #[must_use]
+    pub fn is_data_uri(&self) -> bool {
+        self.src.as_ref().is_some_and(|s| s.starts_with("data:"))
+    }
+}
+
+// ============================================================================
+// Component Definitions
+// ============================================================================
+
 /// Tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
@@ -212,6 +292,9 @@ pub struct Tool {
     /// Input schema (JSON Schema).
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Icon for visual representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<Icon>,
 }
 
 /// Resource definition.
@@ -227,6 +310,9 @@ pub struct Resource {
     /// MIME type.
     #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Icon for visual representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<Icon>,
 }
 
 /// Resource template definition.
@@ -243,6 +329,9 @@ pub struct ResourceTemplate {
     /// MIME type.
     #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Icon for visual representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<Icon>,
 }
 
 /// Prompt definition.
@@ -256,6 +345,9 @@ pub struct Prompt {
     /// Prompt arguments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<PromptArgument>,
+    /// Icon for visual representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<Icon>,
 }
 
 /// Prompt argument definition.

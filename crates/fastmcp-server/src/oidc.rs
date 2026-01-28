@@ -275,6 +275,7 @@ impl UserClaims {
     ///
     /// Only returns claims that are allowed by the given scopes.
     #[must_use]
+    #[allow(clippy::assigning_clones)]
     pub fn filter_by_scopes(&self, scopes: &[String]) -> UserClaims {
         let mut filtered = UserClaims::new(&self.sub);
 
@@ -634,18 +635,13 @@ pub struct OidcProvider {
 }
 
 /// Signing key for ID tokens.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 enum SigningKey {
     /// HMAC-SHA256 secret.
     Hmac(Vec<u8>),
     /// No key configured (will generate on first use).
+    #[default]
     None,
-}
-
-impl Default for SigningKey {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl OidcProvider {

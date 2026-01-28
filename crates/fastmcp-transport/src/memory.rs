@@ -100,7 +100,7 @@ impl std::fmt::Debug for MemoryTransport {
         f.debug_struct("MemoryTransport")
             .field("closed", &self.closed)
             .field("poll_interval", &self.poll_interval)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -344,7 +344,8 @@ mod tests {
 
         // Server receives and responds
         let _msg = server.recv(&cx).unwrap();
-        let response = JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"pong": true}));
+        let response =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"pong": true}));
         server.send_response(&cx, &response).unwrap();
 
         // Client receives response
@@ -364,7 +365,7 @@ mod tests {
 
         // Send multiple messages
         for i in 1..=5 {
-            let request = JsonRpcRequest::new(&format!("method_{i}"), None, i as i64);
+            let request = JsonRpcRequest::new(format!("method_{i}"), None, i as i64);
             client.send_request(&cx, &request).unwrap();
         }
 

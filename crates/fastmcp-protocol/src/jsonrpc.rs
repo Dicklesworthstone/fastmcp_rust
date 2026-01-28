@@ -9,7 +9,7 @@ use serde_json::Value;
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// Serializes the jsonrpc version field.
-fn serialize_jsonrpc_version<S>(value: &Cow<'static, str>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_jsonrpc_version<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

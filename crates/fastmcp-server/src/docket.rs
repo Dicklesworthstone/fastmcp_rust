@@ -981,9 +981,8 @@ impl Worker {
         }
 
         // Try to dequeue a task
-        let task = match self.backend.dequeue(&task_types)? {
-            Some(task) => task,
-            None => return Ok(false),
+        let Some(task) = self.backend.dequeue(&task_types)? else {
+            return Ok(false);
         };
 
         let task_id = task.id.clone();
@@ -997,13 +996,10 @@ impl Worker {
         );
 
         // Get handler
-        let handler = match self.handlers.get(&task_type) {
-            Some(h) => h,
-            None => {
-                // This shouldn't happen since we only dequeue subscribed types
-                self.backend.nack(&task_id, "No handler for task type")?;
-                return Ok(true);
-            }
+        let Some(handler) = self.handlers.get(&task_type) else {
+            // This shouldn't happen since we only dequeue subscribed types
+            self.backend.nack(&task_id, "No handler for task type")?;
+            return Ok(true);
         };
 
         // Execute handler

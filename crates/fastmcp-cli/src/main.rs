@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use fastmcp_client::Client;
+use fastmcp_console::rich_rust::prelude::*;
 use fastmcp_core::McpResult;
 
 /// FastMCP CLI - Run, inspect, and install MCP servers.
@@ -94,6 +95,17 @@ enum Commands {
         /// Just print the config, don't modify any files.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// List configured MCP servers.
+    ///
+    /// Scans configuration files for known MCP clients (Claude Desktop, Cursor, Cline)
+    /// and lists all registered servers.
+    List {
+        /// Target client to list servers from (claude, cursor, cline).
+        /// If not specified, lists from all detected clients.
+        #[arg(long, short = 't')]
+        target: Option<InstallTarget>,
     },
 }
 

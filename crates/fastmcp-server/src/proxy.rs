@@ -403,6 +403,7 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
         name: template.name.clone(),
         description: template.description.clone(),
         mime_type: template.mime_type.clone(),
+        icon: template.icon.clone(),
     }
 }
 
@@ -505,17 +506,20 @@ mod tests {
                 name: "tool".to_string(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                icon: None,
             }],
             resources: vec![Resource {
                 uri: "test://resource".to_string(),
                 name: "resource".to_string(),
                 description: None,
                 mime_type: None,
+                icon: None,
             }],
             prompts: vec![Prompt {
                 name: "prompt".to_string(),
                 description: None,
                 arguments: Vec::new(),
+                icon: None,
             }],
             ..TestBackend::default()
         };
@@ -534,6 +538,7 @@ mod tests {
                 name: "tool".to_string(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                icon: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -544,6 +549,7 @@ mod tests {
                 name: "tool".to_string(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                icon: None,
             },
             proxy,
         );
@@ -571,6 +577,7 @@ mod tests {
                 name: "prompt".to_string(),
                 description: None,
                 arguments: Vec::new(),
+                icon: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -581,6 +588,7 @@ mod tests {
                 name: "prompt".to_string(),
                 description: None,
                 arguments: Vec::new(),
+                icon: None,
             },
             proxy,
         );
@@ -613,6 +621,7 @@ mod tests {
                 name: "query".to_string(),
                 description: Some("Execute a query".to_string()),
                 input_schema: serde_json::json!({}),
+                icon: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -625,6 +634,7 @@ mod tests {
                 name: "query".to_string(),
                 description: Some("Execute a query".to_string()),
                 input_schema: serde_json::json!({}),
+                icon: None,
             },
             "db",
             proxy,
@@ -653,6 +663,7 @@ mod tests {
                 name: "greeting".to_string(),
                 description: Some("A greeting prompt".to_string()),
                 arguments: Vec::new(),
+                icon: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -665,6 +676,7 @@ mod tests {
                 name: "greeting".to_string(),
                 description: Some("A greeting prompt".to_string()),
                 arguments: Vec::new(),
+                icon: None,
             },
             "templates",
             proxy,
@@ -696,6 +708,7 @@ mod tests {
                 name: "Data File".to_string(),
                 description: None,
                 mime_type: None,
+                icon: None,
             }],
             ..TestBackend::default()
         };
@@ -708,6 +721,7 @@ mod tests {
                 name: "Data File".to_string(),
                 description: None,
                 mime_type: None,
+                icon: None,
             },
             "storage",
             proxy,

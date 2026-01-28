@@ -1027,6 +1027,7 @@ mod tests {
                 name: "Resource Template".to_string(),
                 description: Some("Template description".to_string()),
                 mime_type: Some("text/plain".to_string()),
+                icon: None,
             }],
         };
 
@@ -1353,7 +1354,7 @@ mod tests {
         let b: ElicitContentValue = true.into();
         assert!(matches!(b, ElicitContentValue::Bool(true)));
 
-        let f: ElicitContentValue = 3.14.into();
+        let f: ElicitContentValue = 1.23.into();
         assert!(matches!(f, ElicitContentValue::Float(_)));
 
         let arr: ElicitContentValue = vec!["a".to_string(), "b".to_string()].into();

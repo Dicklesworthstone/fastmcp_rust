@@ -170,7 +170,8 @@ impl HttpRequest {
     /// Adds a header.
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(name.into().to_lowercase(), value.into());
+        self.headers
+            .insert(name.into().to_lowercase(), value.into());
         self
     }
 
@@ -257,7 +258,8 @@ impl HttpResponse {
     /// Adds a header.
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(name.into().to_lowercase(), value.into());
+        self.headers
+            .insert(name.into().to_lowercase(), value.into());
         self
     }
 
@@ -272,16 +274,26 @@ impl HttpResponse {
     #[must_use]
     pub fn with_json<T: serde::Serialize>(mut self, value: &T) -> Self {
         self.body = serde_json::to_vec(value).unwrap_or_default();
-        self.headers.insert("content-type".to_string(), "application/json".to_string());
+        self.headers
+            .insert("content-type".to_string(), "application/json".to_string());
         self
     }
 
     /// Sets CORS headers for cross-origin requests.
     #[must_use]
     pub fn with_cors(mut self, origin: &str) -> Self {
-        self.headers.insert("access-control-allow-origin".to_string(), origin.to_string());
-        self.headers.insert("access-control-allow-methods".to_string(), "GET, POST, OPTIONS".to_string());
-        self.headers.insert("access-control-allow-headers".to_string(), "Content-Type, Authorization".to_string());
+        self.headers.insert(
+            "access-control-allow-origin".to_string(),
+            origin.to_string(),
+        );
+        self.headers.insert(
+            "access-control-allow-methods".to_string(),
+            "GET, POST, OPTIONS".to_string(),
+        );
+        self.headers.insert(
+            "access-control-allow-headers".to_string(),
+            "Content-Type, Authorization".to_string(),
+        );
         self
     }
 }
@@ -428,14 +440,19 @@ impl HttpRequestHandler {
     /// Checks if the origin is allowed for CORS.
     #[must_use]
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
-        self.config.cors_origins.iter().any(|o| o == "*" || o == origin)
+        self.config
+            .cors_origins
+            .iter()
+            .any(|o| o == "*" || o == origin)
     }
 
     /// Parses a JSON-RPC request from an HTTP request.
     pub fn parse_request(&self, request: &HttpRequest) -> Result<JsonRpcRequest, HttpError> {
         // Validate method
         if request.method != HttpMethod::Post {
-            return Err(HttpError::InvalidMethod(request.method.as_str().to_string()));
+            return Err(HttpError::InvalidMethod(
+                request.method.as_str().to_string(),
+            ));
         }
 
         // Validate content type
@@ -460,7 +477,11 @@ impl HttpRequestHandler {
 
     /// Creates an HTTP response from a JSON-RPC response.
     #[must_use]
-    pub fn create_response(&self, response: &JsonRpcResponse, origin: Option<&str>) -> HttpResponse {
+    pub fn create_response(
+        &self,
+        response: &JsonRpcResponse,
+        origin: Option<&str>,
+    ) -> HttpResponse {
         let body = self.codec.encode_response(response).unwrap_or_default();
 
         let mut http_response = HttpResponse::ok()
@@ -538,7 +559,12 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
         // Read headers until \r\n\r\n
         loop {
-            if self.reader.read(&mut byte).map_err(|e| HttpError::Transport(e.into()))? == 0 {
+            if self
+                .reader
+                .read(&mut byte)
+                .map_err(|e| HttpError::Transport(e.into()))?
+                == 0
+            {
                 return Err(HttpError::Closed);
             }
             buffer.push(byte[0]);
@@ -549,7 +575,9 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
             // Prevent infinite loops
             if buffer.len() > 64 * 1024 {
-                return Err(HttpError::InvalidContentType("headers too large".to_string()));
+                return Err(HttpError::InvalidContentType(
+                    "headers too large".to_string(),
+                ));
             }
         }
 
@@ -557,18 +585,17 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         let mut lines = header_str.lines();
 
         // Parse request line
-        let request_line = lines.next().ok_or_else(|| {
-            HttpError::InvalidMethod("missing request line".to_string())
-        })?;
+        let request_line = lines
+            .next()
+            .ok_or_else(|| HttpError::InvalidMethod("missing request line".to_string()))?;
 
         let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return Err(HttpError::InvalidMethod("invalid request line".to_string()));
         }
 
-        let method = HttpMethod::parse(parts[0]).ok_or_else(|| {
-            HttpError::InvalidMethod(parts[0].to_string())
-        })?;
+        let method = HttpMethod::parse(parts[0])
+            .ok_or_else(|| HttpError::InvalidMethod(parts[0].to_string()))?;
 
         let path = parts[1].to_string();
 
@@ -591,7 +618,9 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
         let mut body = vec![0u8; content_length];
         if content_length > 0 {
-            self.reader.read_exact(&mut body).map_err(|e| HttpError::Transport(e.into()))?;
+            self.reader
+                .read_exact(&mut body)
+                .map_err(|e| HttpError::Transport(e.into()))?;
         }
 
         Ok(HttpRequest {
@@ -616,8 +645,12 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         };
 
         // Write status line
-        write!(self.writer, "HTTP/1.1 {} {}\r\n", response.status.0, status_text)
-            .map_err(|e| HttpError::Transport(e.into()))?;
+        write!(
+            self.writer,
+            "HTTP/1.1 {} {}\r\n",
+            response.status.0, status_text
+        )
+        .map_err(|e| HttpError::Transport(e.into()))?;
 
         // Write headers
         for (name, value) in &response.headers {
@@ -635,8 +668,12 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         write!(self.writer, "\r\n").map_err(|e| HttpError::Transport(e.into()))?;
 
         // Write body
-        self.writer.write_all(&response.body).map_err(|e| HttpError::Transport(e.into()))?;
-        self.writer.flush().map_err(|e| HttpError::Transport(e.into()))?;
+        self.writer
+            .write_all(&response.body)
+            .map_err(|e| HttpError::Transport(e.into()))?;
+        self.writer
+            .flush()
+            .map_err(|e| HttpError::Transport(e.into()))?;
 
         Ok(())
     }
@@ -668,12 +705,10 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
             }
         };
 
-        let http_response = HttpResponse::ok()
-            .with_json(&response);
+        let http_response = HttpResponse::ok().with_json(&response);
 
-        self.write_response(&http_response).map_err(|_| TransportError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, "write error")
-        ))?;
+        self.write_response(&http_response)
+            .map_err(|_| TransportError::Io(std::io::Error::other("write error")))?;
 
         Ok(())
     }
@@ -690,7 +725,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         let http_request = self.read_request().map_err(|e| match e {
             HttpError::Closed => TransportError::Closed,
             HttpError::Timeout => TransportError::Timeout,
-            _ => TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+            _ => TransportError::Io(std::io::Error::other(e.to_string())),
         })?;
 
         // Parse JSON-RPC from body
@@ -1042,8 +1077,11 @@ mod tests {
         let data = serde_json::json!({"result": "ok"});
         let response = HttpResponse::ok().with_json(&data);
 
-        assert!(response.body.len() > 0);
-        assert_eq!(response.headers.get("content-type"), Some(&"application/json".to_string()));
+        assert!(!response.body.is_empty());
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some(&"application/json".to_string())
+        );
     }
 
     #[test]
@@ -1088,8 +1126,8 @@ mod tests {
         assert!(handler.parse_request(&request).is_err());
 
         // Invalid content type
-        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
-            .with_header("Content-Type", "text/plain");
+        let request =
+            HttpRequest::new(HttpMethod::Post, "/mcp/v1").with_header("Content-Type", "text/plain");
         assert!(handler.parse_request(&request).is_err());
     }
 

@@ -230,9 +230,7 @@ fn validate_object(
     // Check additionalProperties constraint
     if let Some(additional) = schema.get("additionalProperties") {
         // Get properties map directly - avoid collecting keys into Vec
-        let properties = schema
-            .get("properties")
-            .and_then(|v| v.as_object());
+        let properties = schema.get("properties").and_then(|v| v.as_object());
 
         for (key, value) in obj {
             // Use contains_key directly on the Map (O(1) lookup) instead of Vec::contains (O(n))
