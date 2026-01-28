@@ -596,4 +596,312 @@ mod tests {
         let message = JsonRpcMessage::Request(request);
         permit.send(&message).unwrap();
     }
+
+    // =========================================================================
+    // E2E Stdio NDJSON Tests (bd-2kv / bd-swyn)
+    // =========================================================================
+
+    #[test]
+    fn e2e_ndjson_multiple_messages_in_sequence() {
+        // Simulate multiple JSON-RPC messages in NDJSON format
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"init\",\"id\":1}\n\
+                      {\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":2}\n\
+                      {\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"test\"},\"id\":3}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        // Receive first message
+        let msg1 = transport.recv(&cx).unwrap();
+        match msg1 {
+            JsonRpcMessage::Request(req) => assert_eq!(req.method, "init"),
+            _ => panic!("Expected request"),
+        }
+
+        // Receive second message
+        let msg2 = transport.recv(&cx).unwrap();
+        match msg2 {
+            JsonRpcMessage::Request(req) => assert_eq!(req.method, "tools/list"),
+            _ => panic!("Expected request"),
+        }
+
+        // Receive third message
+        let msg3 = transport.recv(&cx).unwrap();
+        match msg3 {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "tools/call");
+                assert!(req.params.is_some());
+            }
+            _ => panic!("Expected request"),
+        }
+
+        // Fourth recv should return EOF (Closed)
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn e2e_ndjson_request_response_flow() {
+        // Test a typical request/response flow
+        let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"success\":true},\"id\":1}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let mut output = Vec::new();
+        let mut transport = StdioTransport::new(reader, Cursor::new(&mut output));
+        let cx = Cx::for_testing();
+
+        // Send a request
+        let request = JsonRpcRequest::new(
+            "test/method",
+            Some(serde_json::json!({"key": "value"})),
+            1i64,
+        );
+        transport.send_request_direct(&cx, &request).unwrap();
+
+        // Receive response
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Response(resp) => {
+                assert!(resp.result.is_some());
+                assert!(resp.error.is_none());
+            }
+            _ => panic!("Expected response"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_handles_mixed_empty_lines() {
+        // NDJSON should skip empty lines
+        let input = b"\n\n{\"jsonrpc\":\"2.0\",\"method\":\"test1\",\"id\":1}\n\n\n{\"jsonrpc\":\"2.0\",\"method\":\"test2\",\"id\":2}\n\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        // Should receive both messages despite empty lines
+        let msg1 = transport.recv(&cx).unwrap();
+        match msg1 {
+            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test1"),
+            _ => panic!("Expected request"),
+        }
+
+        let msg2 = transport.recv(&cx).unwrap();
+        match msg2 {
+            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test2"),
+            _ => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_handles_unicode_content() {
+        // Test UTF-8 handling in NDJSON
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"params\":{\"message\":\"\xC3\xA9\xC3\xA8\xC3\xAA\xE4\xB8\xAD\xE6\x96\x87\xF0\x9F\x91\x8B\"},\"id\":1}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "test");
+                let params = req.params.as_ref().unwrap();
+                let message = params.get("message").unwrap().as_str().unwrap();
+                // Contains: éèê中文👋
+                assert!(message.contains("é"));
+                assert!(message.contains("中"));
+                assert!(message.contains("👋"));
+            }
+            _ => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_large_message() {
+        // Test handling of larger messages
+        let large_data = "x".repeat(100_000);
+        let message = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"params\":{{\"data\":\"{}\"}},\"id\":1}}\n",
+            large_data
+        );
+
+        let reader = Cursor::new(message.into_bytes());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "test");
+                let params = req.params.as_ref().unwrap();
+                let data = params.get("data").unwrap().as_str().unwrap();
+                assert_eq!(data.len(), 100_000);
+            }
+            _ => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_notification() {
+        // Test JSON-RPC notifications (requests without id)
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "notifications/initialized");
+                assert!(req.id.is_none());
+            }
+            _ => panic!("Expected request/notification"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_error_response() {
+        // Test JSON-RPC error response parsing
+        let input = b"{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Response(resp) => {
+                assert!(resp.result.is_none());
+                assert!(resp.error.is_some());
+                let error = resp.error.unwrap();
+                assert_eq!(error.code, -32601);
+                assert_eq!(error.message, "Method not found");
+            }
+            _ => panic!("Expected response"),
+        }
+    }
+
+    #[test]
+    fn e2e_ndjson_malformed_json_error() {
+        // Test handling of malformed JSON
+        let input = b"{invalid json\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Codec(_))));
+    }
+
+    #[test]
+    fn e2e_ndjson_bidirectional_flow() {
+        // Test bidirectional communication (simulated)
+        let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\n";
+        let reader = Cursor::new(input.to_vec());
+        let mut output = Vec::new();
+
+        // Create transport with a writeable output buffer
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            // Send a request
+            let request = JsonRpcRequest::new("tools/list", None, 1i64);
+            transport.send_request_direct(&cx, &request).unwrap();
+
+            // Receive response
+            let msg = transport.recv(&cx).unwrap();
+            assert!(matches!(msg, JsonRpcMessage::Response(_)));
+        }
+
+        // Verify the sent message is valid NDJSON
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.ends_with('\n'));
+        assert!(sent.contains("\"method\":\"tools/list\""));
+        assert!(sent.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn e2e_ndjson_response_with_complex_result() {
+        // Test response with complex nested result
+        let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[{\"name\":\"tool1\",\"description\":\"A test tool\",\"inputSchema\":{\"type\":\"object\"}}]},\"id\":1}\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        match msg {
+            JsonRpcMessage::Response(resp) => {
+                let result = resp.result.unwrap();
+                let tools = result.get("tools").unwrap().as_array().unwrap();
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].get("name").unwrap(), "tool1");
+            }
+            _ => panic!("Expected response"),
+        }
+    }
+
+    #[test]
+    fn e2e_two_phase_send_multiple_messages() {
+        // Test multiple two-phase sends in sequence
+        let reader = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            // Send multiple messages using two-phase pattern
+            for i in 1..=5 {
+                let permit = transport.reserve_send(&cx).unwrap();
+                let request = JsonRpcRequest::new(format!("method_{i}"), None, i as i64);
+                permit.send_request(&request).unwrap();
+            }
+        }
+
+        // Verify all messages were sent as valid NDJSON
+        let sent = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = sent.lines().collect();
+        assert_eq!(lines.len(), 5);
+
+        for (i, line) in lines.iter().enumerate() {
+            let expected_method = format!("method_{}", i + 1);
+            assert!(line.contains(&expected_method));
+        }
+    }
+
+    #[test]
+    fn e2e_transport_close_flushes() {
+        let reader = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            // Send a message
+            let request = JsonRpcRequest::new("test", None, 1i64);
+            transport.send_request_direct(&cx, &request).unwrap();
+
+            // Close should flush
+            transport.close().unwrap();
+        }
+
+        // Verify data was flushed
+        let sent = String::from_utf8(output).unwrap();
+        assert!(!sent.is_empty());
+        assert!(sent.contains("\"method\":\"test\""));
+    }
 }

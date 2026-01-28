@@ -1022,4 +1022,260 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n\n";
         let result = writer.write_endpoint(&cx, "http://test");
         assert!(matches!(result, Err(TransportError::Cancelled)));
     }
+
+    // =========================================================================
+    // E2E SSE Streaming Tests (bd-2kv / bd-1pua)
+    // =========================================================================
+
+    #[test]
+    fn e2e_sse_connection_establishment() {
+        // Test the full connection establishment flow
+        let buffer = Vec::new();
+        let mut writer = SseWriter::new(buffer);
+        let cx = Cx::for_testing();
+
+        // Server sends endpoint event first
+        writer
+            .write_endpoint(&cx, "http://localhost:8080/mcp/messages")
+            .unwrap();
+
+        let output = String::from_utf8(writer.into_inner()).unwrap();
+
+        // Verify proper SSE format
+        assert!(output.starts_with("event: endpoint\n"));
+        assert!(output.contains("data: http://localhost:8080/mcp/messages\n"));
+        assert!(output.contains("\n\n")); // Event terminator
+    }
+
+    #[test]
+    fn e2e_sse_event_stream_sequence() {
+        // Test multiple events in sequence (simulating a session)
+        let buffer = Vec::new();
+        let mut writer = SseWriter::new(buffer);
+        let cx = Cx::for_testing();
+
+        // 1. Send endpoint
+        writer.write_endpoint(&cx, "http://localhost/post").unwrap();
+
+        // 2. Send a few responses
+        for i in 1..=3 {
+            let response = JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"count": i})),
+                error: None,
+                id: Some(fastmcp_protocol::RequestId::Number(i)),
+            };
+            writer.write_response(&cx, &response).unwrap();
+        }
+
+        // 3. Send keep-alive
+        writer.keep_alive(&cx).unwrap();
+
+        let output = String::from_utf8(writer.into_inner()).unwrap();
+
+        // Verify all events are present
+        assert!(output.contains("event: endpoint\n"));
+        assert!(output.contains("event: message\n"));
+        assert!(output.contains("id: 1\n")); // First message has id 1
+        assert!(output.contains("id: 2\n"));
+        assert!(output.contains("id: 3\n"));
+        assert!(output.contains(": keep-alive\n"));
+    }
+
+    #[test]
+    fn e2e_sse_resumability_with_last_event_id() {
+        // Test reading events and tracking Last-Event-ID for resumption
+        let input = b"\
+event: message\n\
+id: 100\n\
+data: {\"jsonrpc\":\"2.0\",\"result\":{\"n\":1},\"id\":1}\n\
+\n\
+event: message\n\
+id: 101\n\
+data: {\"jsonrpc\":\"2.0\",\"result\":{\"n\":2},\"id\":2}\n\
+\n\
+event: message\n\
+id: 102\n\
+data: {\"jsonrpc\":\"2.0\",\"result\":{\"n\":3},\"id\":3}\n\
+\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        // Read all events and track IDs
+        let mut event_ids = Vec::new();
+        while let Some(event) = sse_reader.read_event(&cx).unwrap() {
+            if let Some(id) = event.id {
+                event_ids.push(id);
+            }
+        }
+
+        assert_eq!(event_ids, vec!["100", "101", "102"]);
+
+        // Last event ID for resumption would be "102"
+        let last_event_id = event_ids.last().unwrap();
+        assert_eq!(last_event_id, "102");
+    }
+
+    #[test]
+    fn e2e_sse_graceful_disconnect_on_eof() {
+        // Test that EOF is handled gracefully
+        let input = b"\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"test\"}\n\
+\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        // First read should succeed
+        let event = sse_reader.read_event(&cx).unwrap();
+        assert!(event.is_some());
+
+        // Second read should return None (EOF), not error
+        let event = sse_reader.read_event(&cx).unwrap();
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn e2e_sse_server_transport_flow() {
+        // Test the server-side transport with injected requests
+        let requests = vec![
+            JsonRpcRequest::new("initialize", None, 1i64),
+            JsonRpcRequest::new("tools/list", None, 2i64),
+        ];
+
+        let buffer = Vec::new();
+        let mut transport =
+            SseServerTransport::new(buffer, requests.into_iter(), "http://localhost/post");
+        let cx = Cx::for_testing();
+
+        // Receive requests from POST handler
+        let msg1 = transport.recv(&cx).unwrap();
+        assert!(matches!(msg1, JsonRpcMessage::Request(_)));
+        if let JsonRpcMessage::Request(req) = msg1 {
+            assert_eq!(req.method, "initialize");
+        }
+
+        // Send a response (triggers endpoint event first)
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({"capabilities": {}})),
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        };
+        transport
+            .send(&cx, &JsonRpcMessage::Response(response))
+            .unwrap();
+
+        // Receive second request
+        let msg2 = transport.recv(&cx).unwrap();
+        if let JsonRpcMessage::Request(req) = msg2 {
+            assert_eq!(req.method, "tools/list");
+        }
+
+        // EOF after requests are exhausted
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn e2e_sse_client_transport_flow() {
+        // Test the client-side transport
+        let sse_input = b"\
+event: endpoint\n\
+data: http://localhost/post\n\
+\n\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\n\
+\n";
+
+        let reader = Cursor::new(sse_input.to_vec());
+        let mut request_buffer = Vec::new();
+
+        {
+            let mut transport = SseClientTransport::new(reader, &mut request_buffer);
+            let cx = Cx::for_testing();
+
+            // Read endpoint URL
+            let endpoint = transport.read_endpoint(&cx).unwrap().unwrap();
+            assert_eq!(endpoint, "http://localhost/post");
+
+            // Send a request (goes to request_buffer)
+            let request = JsonRpcRequest::new("tools/list", None, 1i64);
+            transport
+                .send(&cx, &JsonRpcMessage::Request(request))
+                .unwrap();
+
+            // Receive response from SSE stream
+            let msg = transport.recv(&cx).unwrap();
+            assert!(matches!(msg, JsonRpcMessage::Response(_)));
+        }
+
+        // Verify request was sent correctly (NDJSON format)
+        let sent = String::from_utf8(request_buffer).unwrap();
+        assert!(sent.contains("\"method\":\"tools/list\""));
+    }
+
+    #[test]
+    fn e2e_sse_event_with_retry() {
+        // Test retry field for reconnection hints
+        let input = b"\
+event: message\n\
+id: 1\n\
+retry: 5000\n\
+data: test\n\
+\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        let event = sse_reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(event.retry, Some(5000));
+    }
+
+    #[test]
+    fn e2e_sse_multiple_data_lines() {
+        // Test handling of multi-line JSON (split across data lines)
+        // This can happen with pretty-printed JSON
+        let input = b"\
+event: message\n\
+data: {\n\
+data:   \"jsonrpc\": \"2.0\",\n\
+data:   \"result\": {\"key\": \"value\"},\n\
+data:   \"id\": 1\n\
+data: }\n\
+\n";
+
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        let event = sse_reader.read_event(&cx).unwrap().unwrap();
+
+        // Data lines are joined with newlines
+        assert!(event.data.contains("\"jsonrpc\""));
+        assert!(event.data.contains("\"result\""));
+
+        // Parse the JSON (should work when lines are joined)
+        let parsed: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(parsed.get("id"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn e2e_sse_unicode_in_events() {
+        // Test Unicode handling in SSE events
+        let input = "event: message\ndata: {\"text\":\"Hello 世界 👋\"}\n\n";
+
+        let reader = Cursor::new(input.as_bytes().to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        let event = sse_reader.read_event(&cx).unwrap().unwrap();
+        assert!(event.data.contains("世界"));
+        assert!(event.data.contains("👋"));
+    }
 }
