@@ -753,8 +753,7 @@ impl PromptHandler for GreetingPrompt {
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    use crate::router::TagFilters;
-    use fastmcp_protocol::{ListResourceTemplatesParams, ListToolsParams};
+    use fastmcp_protocol::ListResourceTemplatesParams;
 
     /// Creates a test router with all handlers registered.
     fn create_test_router() -> Router {
@@ -3130,6 +3129,8 @@ mod budget_tests {
 #[cfg(test)]
 mod handler_definition_tests {
     use super::*;
+    use crate::router::TagFilters;
+    use fastmcp_protocol::ListToolsParams;
 
     #[test]
     fn test_tool_definition() {
@@ -3217,10 +3218,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_include_single_tag() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec!["api".to_string()]),
-            None,
-        );
+        let include = vec!["api".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 3, "Expected search, create, admin");
         assert!(tools.iter().any(|t| t.name == "search"));
@@ -3231,10 +3230,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_include_multiple_tags_and_logic() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec!["api".to_string(), "public".to_string()]),
-            None,
-        );
+        let include = vec!["api".to_string(), "public".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 2, "Expected search, create (both have api AND public)");
         assert!(tools.iter().any(|t| t.name == "search"));
@@ -3244,10 +3241,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_exclude_single_tag() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            None,
-            Some(&vec!["private".to_string()]),
-        );
+        let exclude = vec!["private".to_string()];
+        let filters = TagFilters::new(None, Some(&exclude));
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 4, "Expected all except admin");
         assert!(!tools.iter().any(|t| t.name == "admin"));
@@ -3256,10 +3251,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_exclude_multiple_tags_or_logic() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            None,
-            Some(&vec!["private".to_string(), "internal".to_string()]),
-        );
+        let exclude = vec!["private".to_string(), "internal".to_string()];
+        let filters = TagFilters::new(None, Some(&exclude));
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 3, "Expected search, create, untagged");
         assert!(tools.iter().any(|t| t.name == "search"));
@@ -3270,10 +3263,9 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_include_and_exclude_combined() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec!["api".to_string()]),
-            Some(&vec!["private".to_string()]),
-        );
+        let include = vec!["api".to_string()];
+        let exclude = vec!["private".to_string()];
+        let filters = TagFilters::new(Some(&include), Some(&exclude));
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 2, "Expected search, create (api but not private)");
         assert!(tools.iter().any(|t| t.name == "search"));
@@ -3283,10 +3275,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_case_insensitive() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec!["API".to_string()]),
-            None,
-        );
+        let include = vec!["API".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 3, "Should match 'api' tags case-insensitively");
     }
@@ -3294,10 +3284,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_empty_include_no_filter() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec![]),
-            None,
-        );
+        let include: Vec<String> = vec![];
+        let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
         assert_eq!(tools.len(), 5, "Empty include should not filter");
     }
@@ -3305,10 +3293,8 @@ mod handler_definition_tests {
     #[test]
     fn test_tag_filters_no_matches() {
         let router = create_tagged_tools_router();
-        let filters = TagFilters::new(
-            Some(&vec!["nonexistent".to_string()]),
-            None,
-        );
+        let include = vec!["nonexistent".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
         assert!(tools.is_empty(), "No tools should match nonexistent tag");
     }
