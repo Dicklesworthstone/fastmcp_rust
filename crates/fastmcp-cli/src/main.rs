@@ -174,6 +174,7 @@ fn main() -> ExitCode {
             target,
             dry_run,
         } => cmd_install(&name, &server, &args, target, dry_run),
+        Commands::List { target } => cmd_list(target),
     };
 
     match result {
@@ -228,6 +229,100 @@ fn cmd_run(
         return Err(fastmcp_core::McpError::internal_error(
             "Server terminated by signal",
         ));
+    }
+
+    Ok(())
+}
+
+/// List command: List configured MCP servers.
+fn cmd_list(target: Option<InstallTarget>) -> McpResult<()> {
+    use rich_rust::r#box::ROUNDED;
+
+    let targets = if let Some(t) = target {
+        vec![t]
+    } else {
+        vec![InstallTarget::Claude, InstallTarget::Cursor, InstallTarget::Cline]
+    };
+
+    let mut table = Table::new()
+        .title("Configured MCP Servers")
+        .box_style(&ROUNDED)
+        .show_header(true);
+
+    table.add_column(Column::new("Client").style("bold cyan"));
+    table.add_column(Column::new("Server Name").style("bold yellow"));
+    table.add_column(Column::new("Command"));
+    table.add_column(Column::new("Arguments"));
+    table.add_column(Column::new("Environment"));
+
+    let mut found_any = false;
+
+    for t in targets {
+        let (name, config_path) = match t {
+            InstallTarget::Claude => ("Claude", get_claude_desktop_config_path()),
+            InstallTarget::Cursor => ("Cursor", get_cursor_config_path()),
+            InstallTarget::Cline => ("Cline", get_cline_config_path()),
+        };
+
+        if let Ok(path) = config_path {
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    // Extract servers based on client type
+                    let servers_map = match t {
+                        InstallTarget::Claude | InstallTarget::Cursor => {
+                            json.get("mcpServers").and_then(|v| v.as_object())
+                        }
+                        InstallTarget::Cline => {
+                            json.get("cline.mcpServers").and_then(|v| v.as_object())
+                        }
+                    };
+
+                    if let Some(servers) = servers_map {
+                        for (server_name, config) in servers {
+                            if let Ok(mcp_config) = serde_json::from_value::<McpServerConfig>(config.clone()) {
+                                found_any = true;
+                                let args = if mcp_config.args.is_empty() {
+                                    "-".to_string()
+                                } else {
+                                    mcp_config.args.join(" ")
+                                };
+
+                                let env = if let Some(e) = &mcp_config.env {
+                                    if e.is_empty() {
+                                        "-".to_string()
+                                    } else {
+                                        e.iter()
+                                            .map(|(k, v)| format!("{k}={v}"))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    }
+                                } else {
+                                    "-".to_string()
+                                };
+
+                                table.add_row_cells([
+                                    name,
+                                    server_name,
+                                    &mcp_config.command,
+                                    &args,
+                                    &env,
+                                ]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if found_any {
+        fastmcp_console::console().render(&table);
+    } else {
+        println!("No configured servers found.");
     }
 
     Ok(())

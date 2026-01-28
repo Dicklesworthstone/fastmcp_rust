@@ -331,7 +331,7 @@ The Rust port now covers **nearly all Python FastMCP functionality** with severa
 | **`fastmcp inspect`** | ✅ | ✅ | JSON/text/mcp output formats |
 | **`fastmcp install`** | ✅ | ✅ | Claude Desktop, Cursor, Cline targets |
 | **`fastmcp dev`** | ✅ | ❌ | Development mode |
-| **`fastmcp list`** | ✅ | ❌ | List available servers |
+| **`fastmcp list`** | ✅ | ✅ | List available servers |
 | **`fastmcp test`** | ✅ | ❌ | Test server connectivity |
 | **`fastmcp tasks`** | ✅ | ❌ | Task queue management |
 
@@ -356,7 +356,7 @@ The Rust port now covers **nearly all Python FastMCP functionality** with severa
 3. **Error masking** - `mask_error_details` setting
 4. **Full RFC 6570** - Query parameters, wildcards
 5. **Server composition** - mount(), as_proxy()
-6. **CLI commands** - dev, list, test, tasks
+6. **CLI commands** - dev, test, tasks
 7. **FilesystemProvider** - Built-in filesystem resource provider
 8. **Auto-initialize** - Client auto-initialization
 9. **Resource/Tool calling from handler** - Cross-component access in handlers
