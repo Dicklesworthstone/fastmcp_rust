@@ -61,7 +61,7 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
-pub use router::{MountResult, NotificationSender, Router, RouterResourceReader, RouterToolCaller};
+pub use router::{MountResult, NotificationSender, Router, RouterResourceReader, RouterToolCaller, TagFilters};
 pub use session::Session;
 pub use tasks::{SharedTaskManager, TaskManager};
 

@@ -33,6 +33,61 @@ use crate::handler::{
 /// during request handling. The callback receives a JSON-RPC request (notification format).
 pub type NotificationSender = Arc<dyn Fn(JsonRpcRequest) + Send + Sync>;
 
+/// Tag filtering parameters for list operations.
+#[derive(Debug, Clone, Default)]
+pub struct TagFilters<'a> {
+    /// Only include components with ALL of these tags (AND logic).
+    pub include: Option<&'a [String]>,
+    /// Exclude components with ANY of these tags (OR logic).
+    pub exclude: Option<&'a [String]>,
+}
+
+impl<'a> TagFilters<'a> {
+    /// Creates tag filters from include and exclude vectors.
+    pub fn new(include: Option<&'a Vec<String>>, exclude: Option<&'a Vec<String>>) -> Self {
+        Self {
+            include: include.map(|v| v.as_slice()),
+            exclude: exclude.map(|v| v.as_slice()),
+        }
+    }
+
+    /// Returns true if the given component tags pass the filter.
+    ///
+    /// - Include filter: component must have ALL include tags (AND logic)
+    /// - Exclude filter: component is rejected if it has ANY exclude tag (OR logic)
+    /// - Tag matching is case-insensitive
+    pub fn matches(&self, component_tags: &[String]) -> bool {
+        // Normalize component tags to lowercase for comparison
+        let component_tags_lower: Vec<String> =
+            component_tags.iter().map(|t| t.to_lowercase()).collect();
+
+        // Include filter: must have ALL specified tags
+        if let Some(include) = self.include {
+            // Empty include array means no filter (all pass)
+            if !include.is_empty() {
+                for tag in include {
+                    let tag_lower = tag.to_lowercase();
+                    if !component_tags_lower.contains(&tag_lower) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Exclude filter: rejected if has ANY specified tag
+        if let Some(exclude) = self.exclude {
+            for tag in exclude {
+                let tag_lower = tag.to_lowercase();
+                if component_tags_lower.contains(&tag_lower) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+}
+
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
@@ -312,20 +367,36 @@ impl Router {
         self.tools.values().map(|h| h.definition()).collect()
     }
 
-    /// Returns tool definitions filtered by session state.
+    /// Returns tool definitions filtered by session state and tags.
     ///
     /// Tools that have been disabled in the session state will not be included.
+    /// If tag filters are provided, tools must match the include/exclude criteria.
     #[must_use]
-    pub fn tools_filtered(&self, session_state: Option<&SessionState>) -> Vec<Tool> {
-        match session_state {
-            Some(state) => self
-                .tools
-                .values()
-                .filter(|h| state.is_tool_enabled(&h.definition().name))
-                .map(|h| h.definition())
-                .collect(),
-            None => self.tools(),
-        }
+    pub fn tools_filtered(
+        &self,
+        session_state: Option<&SessionState>,
+        tag_filters: Option<&TagFilters<'_>>,
+    ) -> Vec<Tool> {
+        self.tools
+            .values()
+            .filter(|h| {
+                let def = h.definition();
+                // Check session state filter
+                if let Some(state) = session_state {
+                    if !state.is_tool_enabled(&def.name) {
+                        return false;
+                    }
+                }
+                // Check tag filters
+                if let Some(filters) = tag_filters {
+                    if !filters.matches(&def.tags) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns all resource definitions.
@@ -334,20 +405,36 @@ impl Router {
         self.resources.values().map(|h| h.definition()).collect()
     }
 
-    /// Returns resource definitions filtered by session state.
+    /// Returns resource definitions filtered by session state and tags.
     ///
     /// Resources that have been disabled in the session state will not be included.
+    /// If tag filters are provided, resources must match the include/exclude criteria.
     #[must_use]
-    pub fn resources_filtered(&self, session_state: Option<&SessionState>) -> Vec<Resource> {
-        match session_state {
-            Some(state) => self
-                .resources
-                .values()
-                .filter(|h| state.is_resource_enabled(&h.definition().uri))
-                .map(|h| h.definition())
-                .collect(),
-            None => self.resources(),
-        }
+    pub fn resources_filtered(
+        &self,
+        session_state: Option<&SessionState>,
+        tag_filters: Option<&TagFilters<'_>>,
+    ) -> Vec<Resource> {
+        self.resources
+            .values()
+            .filter(|h| {
+                let def = h.definition();
+                // Check session state filter
+                if let Some(state) = session_state {
+                    if !state.is_resource_enabled(&def.uri) {
+                        return false;
+                    }
+                }
+                // Check tag filters
+                if let Some(filters) = tag_filters {
+                    if !filters.matches(&def.tags) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns all resource templates.
@@ -362,27 +449,36 @@ impl Router {
         templates
     }
 
-    /// Returns resource templates filtered by session state.
+    /// Returns resource templates filtered by session state and tags.
     ///
     /// Templates that have been disabled in the session state will not be included.
+    /// If tag filters are provided, templates must match the include/exclude criteria.
     #[must_use]
     pub fn resource_templates_filtered(
         &self,
         session_state: Option<&SessionState>,
+        tag_filters: Option<&TagFilters<'_>>,
     ) -> Vec<ResourceTemplate> {
-        let mut templates: Vec<ResourceTemplate> = match session_state {
-            Some(state) => self
-                .resource_templates
-                .values()
-                .filter(|entry| state.is_resource_enabled(&entry.template.uri_template))
-                .map(|entry| entry.template.clone())
-                .collect(),
-            None => self
-                .resource_templates
-                .values()
-                .map(|entry| entry.template.clone())
-                .collect(),
-        };
+        let mut templates: Vec<ResourceTemplate> = self
+            .resource_templates
+            .values()
+            .filter(|entry| {
+                // Check session state filter
+                if let Some(state) = session_state {
+                    if !state.is_resource_enabled(&entry.template.uri_template) {
+                        return false;
+                    }
+                }
+                // Check tag filters
+                if let Some(filters) = tag_filters {
+                    if !filters.matches(&entry.template.tags) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|entry| entry.template.clone())
+            .collect();
         templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
         templates
     }
@@ -393,20 +489,36 @@ impl Router {
         self.prompts.values().map(|h| h.definition()).collect()
     }
 
-    /// Returns prompt definitions filtered by session state.
+    /// Returns prompt definitions filtered by session state and tags.
     ///
     /// Prompts that have been disabled in the session state will not be included.
+    /// If tag filters are provided, prompts must match the include/exclude criteria.
     #[must_use]
-    pub fn prompts_filtered(&self, session_state: Option<&SessionState>) -> Vec<Prompt> {
-        match session_state {
-            Some(state) => self
-                .prompts
-                .values()
-                .filter(|h| state.is_prompt_enabled(&h.definition().name))
-                .map(|h| h.definition())
-                .collect(),
-            None => self.prompts(),
-        }
+    pub fn prompts_filtered(
+        &self,
+        session_state: Option<&SessionState>,
+        tag_filters: Option<&TagFilters<'_>>,
+    ) -> Vec<Prompt> {
+        self.prompts
+            .values()
+            .filter(|h| {
+                let def = h.definition();
+                // Check session state filter
+                if let Some(state) = session_state {
+                    if !state.is_prompt_enabled(&def.name) {
+                        return false;
+                    }
+                }
+                // Check tag filters
+                if let Some(filters) = tag_filters {
+                    if !filters.matches(&def.tags) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns the number of registered tools.
@@ -523,14 +635,21 @@ impl Router {
     /// Handles the tools/list request.
     ///
     /// If session_state is provided, disabled tools will be filtered out.
+    /// If include_tags/exclude_tags are provided, tools are filtered by tags.
     pub fn handle_tools_list(
         &self,
         _cx: &Cx,
-        _params: ListToolsParams,
+        params: ListToolsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListToolsResult> {
+        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
+            Some(&tag_filters)
+        } else {
+            None
+        };
         Ok(ListToolsResult {
-            tools: self.tools_filtered(session_state),
+            tools: self.tools_filtered(session_state, tag_filters),
             next_cursor: None,
         })
     }
@@ -679,14 +798,21 @@ impl Router {
     /// Handles the resources/list request.
     ///
     /// If session_state is provided, disabled resources will be filtered out.
+    /// If include_tags/exclude_tags are provided, resources are filtered by tags.
     pub fn handle_resources_list(
         &self,
         _cx: &Cx,
-        _params: ListResourcesParams,
+        params: ListResourcesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourcesResult> {
+        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
+            Some(&tag_filters)
+        } else {
+            None
+        };
         Ok(ListResourcesResult {
-            resources: self.resources_filtered(session_state),
+            resources: self.resources_filtered(session_state, tag_filters),
             next_cursor: None,
         })
     }
@@ -694,14 +820,21 @@ impl Router {
     /// Handles the resources/templates/list request.
     ///
     /// If session_state is provided, disabled resource templates will be filtered out.
+    /// If include_tags/exclude_tags are provided, templates are filtered by tags.
     pub fn handle_resource_templates_list(
         &self,
         _cx: &Cx,
-        _params: ListResourceTemplatesParams,
+        params: ListResourceTemplatesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourceTemplatesResult> {
+        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
+            Some(&tag_filters)
+        } else {
+            None
+        };
         Ok(ListResourceTemplatesResult {
-            resource_templates: self.resource_templates_filtered(session_state),
+            resource_templates: self.resource_templates_filtered(session_state, tag_filters),
         })
     }
 
@@ -803,14 +936,21 @@ impl Router {
     /// Handles the prompts/list request.
     ///
     /// If session_state is provided, disabled prompts will be filtered out.
+    /// If include_tags/exclude_tags are provided, prompts are filtered by tags.
     pub fn handle_prompts_list(
         &self,
         _cx: &Cx,
-        _params: ListPromptsParams,
+        params: ListPromptsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListPromptsResult> {
+        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
+            Some(&tag_filters)
+        } else {
+            None
+        };
         Ok(ListPromptsResult {
-            prompts: self.prompts_filtered(session_state),
+            prompts: self.prompts_filtered(session_state, tag_filters),
             next_cursor: None,
         })
     }

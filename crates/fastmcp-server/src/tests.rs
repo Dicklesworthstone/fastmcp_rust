@@ -753,7 +753,8 @@ impl PromptHandler for GreetingPrompt {
 #[cfg(test)]
 mod router_tests {
     use super::*;
-    use fastmcp_protocol::ListResourceTemplatesParams;
+    use crate::router::TagFilters;
+    use fastmcp_protocol::{ListResourceTemplatesParams, ListToolsParams};
 
     /// Creates a test router with all handlers registered.
     fn create_test_router() -> Router {
@@ -1342,7 +1343,7 @@ mod router_tests {
         let state = SessionState::new();
 
         // All tools visible without filtering
-        let all_tools = router.tools_filtered(None);
+        let all_tools = router.tools_filtered(None, None);
         assert_eq!(all_tools.len(), 4);
 
         // Disable a tool
@@ -1351,7 +1352,7 @@ mod router_tests {
         state.set("fastmcp.disabled_tools", disabled);
 
         // Now filtered list should have one less tool
-        let filtered_tools = router.tools_filtered(Some(&state));
+        let filtered_tools = router.tools_filtered(Some(&state), None);
         assert_eq!(filtered_tools.len(), 3);
         assert!(!filtered_tools.iter().any(|t| t.name == "greet"));
         assert!(filtered_tools.iter().any(|t| t.name == "slow_tool"));
@@ -1363,7 +1364,7 @@ mod router_tests {
         let state = SessionState::new();
 
         // All resources visible without filtering
-        let all_resources = router.resources_filtered(None);
+        let all_resources = router.resources_filtered(None, None);
         assert_eq!(all_resources.len(), 2);
 
         // Disable a resource
@@ -1372,7 +1373,7 @@ mod router_tests {
         state.set("fastmcp.disabled_resources", disabled);
 
         // Now filtered list should have one less resource
-        let filtered_resources = router.resources_filtered(Some(&state));
+        let filtered_resources = router.resources_filtered(Some(&state), None);
         assert_eq!(filtered_resources.len(), 1);
         assert!(!filtered_resources.iter().any(|r| r.uri == "resource://test"));
         assert!(filtered_resources.iter().any(|r| r.uri == "resource://cancellable"));
@@ -1384,7 +1385,7 @@ mod router_tests {
         let state = SessionState::new();
 
         // All prompts visible without filtering
-        let all_prompts = router.prompts_filtered(None);
+        let all_prompts = router.prompts_filtered(None, None);
         assert_eq!(all_prompts.len(), 1);
 
         // Disable the "greeting" prompt (that's its actual name)
@@ -1393,7 +1394,7 @@ mod router_tests {
         state.set("fastmcp.disabled_prompts", disabled);
 
         // Now filtered list should be empty
-        let filtered_prompts = router.prompts_filtered(Some(&state));
+        let filtered_prompts = router.prompts_filtered(Some(&state), None);
         assert_eq!(filtered_prompts.len(), 0);
     }
 
@@ -1403,7 +1404,7 @@ mod router_tests {
         let state = SessionState::new();
 
         // All templates visible without filtering
-        let all_templates = router.resource_templates_filtered(None);
+        let all_templates = router.resource_templates_filtered(None, None);
         assert_eq!(all_templates.len(), 2);
 
         // Disable a template by its URI template
@@ -1412,7 +1413,7 @@ mod router_tests {
         state.set("fastmcp.disabled_resources", disabled);
 
         // Now filtered list should have one less template
-        let filtered_templates = router.resource_templates_filtered(Some(&state));
+        let filtered_templates = router.resource_templates_filtered(Some(&state), None);
         assert_eq!(filtered_templates.len(), 1);
         assert!(!filtered_templates
             .iter()
@@ -1426,7 +1427,7 @@ mod router_tests {
     fn test_handle_resource_templates_list_sorted() {
         let router = create_test_router();
         let cx = Cx::for_testing();
-        let params = ListResourceTemplatesParams { cursor: None };
+        let params = ListResourceTemplatesParams::default();
 
         let result = router.handle_resource_templates_list(&cx, params, None);
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
@@ -1453,7 +1454,7 @@ mod router_tests {
     fn test_e2e_resource_templates_list_logs_response() {
         let router = create_test_router();
         let cx = Cx::for_testing();
-        let params = ListResourceTemplatesParams { cursor: None };
+        let params = ListResourceTemplatesParams::default();
 
         let result = router
             .handle_resource_templates_list(&cx, params, None)
@@ -3160,6 +3161,184 @@ mod handler_definition_tests {
         assert_eq!(def.name, "greeting");
         assert!(!def.arguments.is_empty());
         assert_eq!(def.arguments.len(), 1);
+    }
+
+    // ========================================================================
+    // Tag Filtering Tests
+    // ========================================================================
+
+    /// A tool with tags for testing tag filtering.
+    struct TaggedTool {
+        name: String,
+        tags: Vec<String>,
+    }
+
+    impl TaggedTool {
+        fn new(name: &str, tags: &[&str]) -> Self {
+            Self {
+                name: name.to_string(),
+                tags: tags.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+    }
+
+    impl ToolHandler for TaggedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.clone(),
+                description: Some(format!("Tool with tags: {:?}", self.tags)),
+                input_schema: serde_json::json!({"type": "object"}),
+                icon: None,
+                version: None,
+                tags: self.tags.clone(),
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text { text: "ok".to_string() }])
+        }
+    }
+
+    fn create_tagged_tools_router() -> Router {
+        let mut router = Router::new();
+        // Tools with various tag combinations
+        router.add_tool(TaggedTool::new("search", &["api", "public", "read"]));
+        router.add_tool(TaggedTool::new("create", &["api", "public", "write"]));
+        router.add_tool(TaggedTool::new("admin", &["api", "private", "admin"]));
+        router.add_tool(TaggedTool::new("debug", &["internal", "debug"]));
+        router.add_tool(TaggedTool::new("untagged", &[]));
+        router
+    }
+
+    #[test]
+    fn test_tag_filters_include_single_tag() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec!["api".to_string()]),
+            None,
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 3, "Expected search, create, admin");
+        assert!(tools.iter().any(|t| t.name == "search"));
+        assert!(tools.iter().any(|t| t.name == "create"));
+        assert!(tools.iter().any(|t| t.name == "admin"));
+    }
+
+    #[test]
+    fn test_tag_filters_include_multiple_tags_and_logic() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec!["api".to_string(), "public".to_string()]),
+            None,
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 2, "Expected search, create (both have api AND public)");
+        assert!(tools.iter().any(|t| t.name == "search"));
+        assert!(tools.iter().any(|t| t.name == "create"));
+    }
+
+    #[test]
+    fn test_tag_filters_exclude_single_tag() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            None,
+            Some(&vec!["private".to_string()]),
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 4, "Expected all except admin");
+        assert!(!tools.iter().any(|t| t.name == "admin"));
+    }
+
+    #[test]
+    fn test_tag_filters_exclude_multiple_tags_or_logic() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            None,
+            Some(&vec!["private".to_string(), "internal".to_string()]),
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 3, "Expected search, create, untagged");
+        assert!(tools.iter().any(|t| t.name == "search"));
+        assert!(tools.iter().any(|t| t.name == "create"));
+        assert!(tools.iter().any(|t| t.name == "untagged"));
+    }
+
+    #[test]
+    fn test_tag_filters_include_and_exclude_combined() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec!["api".to_string()]),
+            Some(&vec!["private".to_string()]),
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 2, "Expected search, create (api but not private)");
+        assert!(tools.iter().any(|t| t.name == "search"));
+        assert!(tools.iter().any(|t| t.name == "create"));
+    }
+
+    #[test]
+    fn test_tag_filters_case_insensitive() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec!["API".to_string()]),
+            None,
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 3, "Should match 'api' tags case-insensitively");
+    }
+
+    #[test]
+    fn test_tag_filters_empty_include_no_filter() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec![]),
+            None,
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 5, "Empty include should not filter");
+    }
+
+    #[test]
+    fn test_tag_filters_no_matches() {
+        let router = create_tagged_tools_router();
+        let filters = TagFilters::new(
+            Some(&vec!["nonexistent".to_string()]),
+            None,
+        );
+        let tools = router.tools_filtered(None, Some(&filters));
+        assert!(tools.is_empty(), "No tools should match nonexistent tag");
+    }
+
+    #[test]
+    fn test_handle_tools_list_with_include_tags() {
+        let router = create_tagged_tools_router();
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["public".to_string()]),
+            exclude_tags: None,
+        };
+        let result = router.handle_tools_list(&cx, params, None);
+        let tools = result.unwrap().tools;
+        assert_eq!(tools.len(), 2, "Expected search, create");
+    }
+
+    #[test]
+    fn test_handle_tools_list_with_exclude_tags() {
+        let router = create_tagged_tools_router();
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: Some(vec!["private".to_string(), "internal".to_string()]),
+        };
+        let result = router.handle_tools_list(&cx, params, None);
+        let tools = result.unwrap().tools;
+        assert_eq!(tools.len(), 3, "Expected search, create, untagged");
     }
 }
 

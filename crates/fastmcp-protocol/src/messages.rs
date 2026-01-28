@@ -104,6 +104,12 @@ pub struct ListToolsParams {
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Only include tools with ALL of these tags (AND logic).
+    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    pub include_tags: Option<Vec<String>>,
+    /// Exclude tools with ANY of these tags (OR logic).
+    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tags: Option<Vec<String>>,
 }
 
 /// tools/list response result.
@@ -153,6 +159,12 @@ pub struct ListResourcesParams {
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Only include resources with ALL of these tags (AND logic).
+    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    pub include_tags: Option<Vec<String>>,
+    /// Exclude resources with ANY of these tags (OR logic).
+    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tags: Option<Vec<String>>,
 }
 
 /// resources/list response result.
@@ -171,6 +183,12 @@ pub struct ListResourceTemplatesParams {
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Only include templates with ALL of these tags (AND logic).
+    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    pub include_tags: Option<Vec<String>>,
+    /// Exclude templates with ANY of these tags (OR logic).
+    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tags: Option<Vec<String>>,
 }
 
 /// resources/templates/list response result.
@@ -222,6 +240,12 @@ pub struct ListPromptsParams {
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Only include prompts with ALL of these tags (AND logic).
+    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    pub include_tags: Option<Vec<String>>,
+    /// Exclude prompts with ANY of these tags (OR logic).
+    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tags: Option<Vec<String>>,
 }
 
 /// prompts/list response result.
@@ -1008,12 +1032,13 @@ mod tests {
 
     #[test]
     fn list_resource_templates_params_serialization() {
-        let params = ListResourceTemplatesParams { cursor: None };
+        let params = ListResourceTemplatesParams::default();
         let value = serde_json::to_value(&params).expect("serialize params");
         assert_eq!(value, serde_json::json!({}));
 
         let params = ListResourceTemplatesParams {
             cursor: Some("next".to_string()),
+            ..Default::default()
         };
         let value = serde_json::to_value(&params).expect("serialize params with cursor");
         assert_eq!(value, serde_json::json!({ "cursor": "next" }));

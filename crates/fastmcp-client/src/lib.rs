@@ -382,7 +382,7 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
-        let params = ListToolsParams { cursor: None };
+        let params = ListToolsParams::default();
         let result: ListToolsResult = self.send_request("tools/list", params)?;
         Ok(result.tools)
     }
@@ -606,7 +606,7 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
-        let params = ListResourcesParams { cursor: None };
+        let params = ListResourcesParams::default();
         let result: ListResourcesResult = self.send_request("resources/list", params)?;
         Ok(result.resources)
     }
@@ -617,7 +617,7 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
-        let params = ListResourceTemplatesParams { cursor: None };
+        let params = ListResourceTemplatesParams::default();
         let result: ListResourceTemplatesResult =
             self.send_request("resources/templates/list", params)?;
         Ok(result.resource_templates)
@@ -654,7 +654,7 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
-        let params = ListPromptsParams { cursor: None };
+        let params = ListPromptsParams::default();
         let result: ListPromptsResult = self.send_request("prompts/list", params)?;
         Ok(result.prompts)
     }
