@@ -212,7 +212,8 @@ impl SlidingWindowRateLimiter {
 }
 
 /// Function type for extracting client ID from request context.
-pub type ClientIdExtractor = Box<dyn Fn(&McpContext, &JsonRpcRequest) -> Option<String> + Send + Sync>;
+pub type ClientIdExtractor =
+    Box<dyn Fn(&McpContext, &JsonRpcRequest) -> Option<String> + Send + Sync>;
 
 /// Rate limiting middleware using token bucket algorithm.
 ///
@@ -280,8 +281,10 @@ impl RateLimitingMiddleware {
         self.burst_capacity = capacity;
         // Re-create global limiter if it exists
         if self.global_limit {
-            self.global_limiter =
-                Some(TokenBucketRateLimiter::new(capacity, self.max_requests_per_second));
+            self.global_limiter = Some(TokenBucketRateLimiter::new(
+                capacity,
+                self.max_requests_per_second,
+            ));
         }
         self
     }
@@ -312,11 +315,7 @@ impl RateLimitingMiddleware {
         self
     }
 
-    fn get_client_identifier(
-        &self,
-        ctx: &McpContext,
-        request: &JsonRpcRequest,
-    ) -> String {
+    fn get_client_identifier(&self, ctx: &McpContext, request: &JsonRpcRequest) -> String {
         if let Some(ref extractor) = self.get_client_id {
             if let Some(id) = extractor(ctx, request) {
                 return id;
@@ -446,11 +445,7 @@ impl SlidingWindowRateLimitingMiddleware {
         self
     }
 
-    fn get_client_identifier(
-        &self,
-        ctx: &McpContext,
-        request: &JsonRpcRequest,
-    ) -> String {
+    fn get_client_identifier(&self, ctx: &McpContext, request: &JsonRpcRequest) -> String {
         if let Some(ref extractor) = self.get_client_id {
             if let Some(id) = extractor(ctx, request) {
                 return id;
@@ -605,9 +600,7 @@ mod tests {
 
     #[test]
     fn test_rate_limiting_middleware_denies_after_burst() {
-        let middleware = RateLimitingMiddleware::new(10.0)
-            .burst_capacity(2)
-            .global();
+        let middleware = RateLimitingMiddleware::new(10.0).burst_capacity(2).global();
         let ctx = test_context();
         let request = test_request("tools/call");
 

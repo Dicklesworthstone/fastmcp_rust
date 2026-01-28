@@ -30,17 +30,18 @@ mod auth;
 pub mod bidirectional;
 mod builder;
 pub mod caching;
+pub mod docket;
 mod handler;
 mod middleware;
+pub mod oauth;
+pub mod oidc;
+pub mod providers;
 mod proxy;
 pub mod rate_limiting;
 mod router;
 mod session;
 mod tasks;
 pub mod transform;
-pub mod oauth;
-pub mod oidc;
-pub mod docket;
 
 #[cfg(test)]
 mod tests;
@@ -571,7 +572,9 @@ impl Server {
         let request_sender = {
             let send_clone = send.clone();
             let send_fn: bidirectional::TransportSendFn = Arc::new(move |message| {
-                let mut guard = send_clone.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+                let mut guard = send_clone
+                    .lock()
+                    .map_err(|e| format!("Lock poisoned: {}", e))?;
                 // We need a Cx for the send call, but we're sending async so use a basic one
                 let cx = Cx::for_testing();
                 guard(&cx, message).map_err(|e| format!("Send failed: {}", e))
@@ -1093,14 +1096,16 @@ impl Server {
         let mut senders = handler::BidirectionalSenders::new();
 
         if supports_sampling {
-            let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
-                Arc::new(bidirectional::TransportSamplingSender::new(request_sender.clone()));
+            let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> = Arc::new(
+                bidirectional::TransportSamplingSender::new(request_sender.clone()),
+            );
             senders = senders.with_sampling(sampling_sender);
         }
 
         if supports_elicitation {
-            let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
-                Arc::new(bidirectional::TransportElicitationSender::new(request_sender.clone()));
+            let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> = Arc::new(
+                bidirectional::TransportElicitationSender::new(request_sender.clone()),
+            );
             senders = senders.with_elicitation(elicitation_sender);
         }
 

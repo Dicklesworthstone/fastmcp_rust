@@ -352,7 +352,11 @@ impl ResponseCachingMiddleware {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(LruCache::new(1000, 100 * 1024 * 1024, DEFAULT_MAX_ITEM_SIZE)),
+            cache: Mutex::new(LruCache::new(
+                1000,
+                100 * 1024 * 1024,
+                DEFAULT_MAX_ITEM_SIZE,
+            )),
             list_ttl: Duration::from_secs(DEFAULT_LIST_TTL_SECS),
             call_ttl: Duration::from_secs(DEFAULT_CALL_TTL_SECS),
             tools_list_config: MethodCacheConfig {
@@ -518,11 +522,7 @@ impl ResponseCachingMiddleware {
     #[must_use]
     pub fn stats(&self) -> CacheStats {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stats = self
-            .stats
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
         stats.entries = cache.len();
         stats.size_bytes = cache.current_size_bytes;
         stats
@@ -641,12 +641,7 @@ impl Middleware for ResponseCachingMiddleware {
         Ok(response)
     }
 
-    fn on_error(
-        &self,
-        _ctx: &McpContext,
-        _request: &JsonRpcRequest,
-        error: McpError,
-    ) -> McpError {
+    fn on_error(&self, _ctx: &McpContext, _request: &JsonRpcRequest, error: McpError) -> McpError {
         // Don't cache errors, just pass them through
         error
     }
@@ -713,11 +708,23 @@ mod tests {
         let key2 = CacheKey::new("test2", None);
         let key3 = CacheKey::new("test3", None);
 
-        cache.insert(key1.clone(), serde_json::json!("v1"), Duration::from_secs(60));
-        cache.insert(key2.clone(), serde_json::json!("v2"), Duration::from_secs(60));
+        cache.insert(
+            key1.clone(),
+            serde_json::json!("v1"),
+            Duration::from_secs(60),
+        );
+        cache.insert(
+            key2.clone(),
+            serde_json::json!("v2"),
+            Duration::from_secs(60),
+        );
 
         // Should evict key1 (LRU)
-        cache.insert(key3.clone(), serde_json::json!("v3"), Duration::from_secs(60));
+        cache.insert(
+            key3.clone(),
+            serde_json::json!("v3"),
+            Duration::from_secs(60),
+        );
 
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_some());
@@ -850,7 +857,8 @@ mod tests {
 
     #[test]
     fn test_caching_middleware_tool_exclusion() {
-        let middleware = ResponseCachingMiddleware::new().exclude_tools(vec!["excluded_tool".to_string()]);
+        let middleware =
+            ResponseCachingMiddleware::new().exclude_tools(vec!["excluded_tool".to_string()]);
         let ctx = test_context();
 
         let excluded_request = test_request(

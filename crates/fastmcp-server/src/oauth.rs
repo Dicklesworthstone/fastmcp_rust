@@ -87,9 +87,9 @@ impl Default for OAuthServerConfig {
     fn default() -> Self {
         Self {
             issuer: "fastmcp".to_string(),
-            access_token_lifetime: Duration::from_secs(3600),         // 1 hour
-            refresh_token_lifetime: Duration::from_secs(86400 * 30),  // 30 days
-            authorization_code_lifetime: Duration::from_secs(600),    // 10 minutes
+            access_token_lifetime: Duration::from_secs(3600), // 1 hour
+            refresh_token_lifetime: Duration::from_secs(86400 * 30), // 30 days
+            authorization_code_lifetime: Duration::from_secs(600), // 10 minutes
             allow_public_clients: true,
             min_code_verifier_length: 43,
             max_code_verifier_length: 128,
@@ -240,7 +240,8 @@ impl OAuthClientBuilder {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.allowed_scopes.extend(scopes.into_iter().map(Into::into));
+        self.allowed_scopes
+            .extend(scopes.into_iter().map(Into::into));
         self
     }
 
@@ -267,11 +268,15 @@ impl OAuthClientBuilder {
     /// - Client ID is empty
     pub fn build(self) -> Result<OAuthClient, OAuthError> {
         if self.client_id.is_empty() {
-            return Err(OAuthError::InvalidRequest("client_id cannot be empty".to_string()));
+            return Err(OAuthError::InvalidRequest(
+                "client_id cannot be empty".to_string(),
+            ));
         }
 
         if self.redirect_uris.is_empty() {
-            return Err(OAuthError::InvalidRequest("at least one redirect_uri is required".to_string()));
+            return Err(OAuthError::InvalidRequest(
+                "at least one redirect_uri is required".to_string(),
+            ));
         }
 
         let client_type = if self.client_secret.is_some() {
@@ -657,9 +662,10 @@ impl OAuthServer {
             ));
         }
 
-        let mut state = self.state.write().map_err(|_| {
-            OAuthError::ServerError("failed to acquire write lock".to_string())
-        })?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
 
         if state.clients.contains_key(&client.client_id) {
             return Err(OAuthError::InvalidClient(format!(
@@ -676,9 +682,10 @@ impl OAuthServer {
     ///
     /// This also revokes all tokens issued to the client.
     pub fn unregister_client(&self, client_id: &str) -> Result<(), OAuthError> {
-        let mut state = self.state.write().map_err(|_| {
-            OAuthError::ServerError("failed to acquire write lock".to_string())
-        })?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
 
         if state.clients.remove(client_id).is_none() {
             return Err(OAuthError::InvalidClient(format!(
@@ -785,7 +792,9 @@ impl OAuthServer {
 
         // Validate scopes
         if !client.validate_scopes(&request.scopes) {
-            return Err(OAuthError::InvalidScope("requested scope not allowed".to_string()));
+            return Err(OAuthError::InvalidScope(
+                "requested scope not allowed".to_string(),
+            ));
         }
 
         // Validate PKCE (required for OAuth 2.1)
@@ -813,9 +822,10 @@ impl OAuthServer {
 
         // Store the code
         {
-            let mut state = self.state.write().map_err(|_| {
-                OAuthError::ServerError("failed to acquire write lock".to_string())
-            })?;
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
             state.authorization_codes.insert(code_value.clone(), code);
         }
 
@@ -849,14 +859,19 @@ impl OAuthServer {
         }
     }
 
-    fn token_authorization_code(&self, request: &TokenRequest) -> Result<TokenResponse, OAuthError> {
+    fn token_authorization_code(
+        &self,
+        request: &TokenRequest,
+    ) -> Result<TokenResponse, OAuthError> {
         // Validate required parameters
-        let code_value = request.code.as_ref().ok_or_else(|| {
-            OAuthError::InvalidRequest("code is required".to_string())
-        })?;
-        let redirect_uri = request.redirect_uri.as_ref().ok_or_else(|| {
-            OAuthError::InvalidRequest("redirect_uri is required".to_string())
-        })?;
+        let code_value = request
+            .code
+            .as_ref()
+            .ok_or_else(|| OAuthError::InvalidRequest("code is required".to_string()))?;
+        let redirect_uri = request
+            .redirect_uri
+            .as_ref()
+            .ok_or_else(|| OAuthError::InvalidRequest("redirect_uri is required".to_string()))?;
         let code_verifier = request.code_verifier.as_ref().ok_or_else(|| {
             OAuthError::InvalidRequest("code_verifier is required (PKCE)".to_string())
         })?;
@@ -873,30 +888,42 @@ impl OAuthServer {
 
         // Get and validate authorization code
         let auth_code = {
-            let mut state = self.state.write().map_err(|_| {
-                OAuthError::ServerError("failed to acquire write lock".to_string())
-            })?;
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
 
             // Remove the code (single-use)
-            state.authorization_codes.remove(code_value).ok_or_else(|| {
-                OAuthError::InvalidGrant("authorization code not found or already used".to_string())
-            })?
+            state
+                .authorization_codes
+                .remove(code_value)
+                .ok_or_else(|| {
+                    OAuthError::InvalidGrant(
+                        "authorization code not found or already used".to_string(),
+                    )
+                })?
         };
 
         // Validate the code
         if auth_code.is_expired() {
-            return Err(OAuthError::InvalidGrant("authorization code has expired".to_string()));
+            return Err(OAuthError::InvalidGrant(
+                "authorization code has expired".to_string(),
+            ));
         }
         if auth_code.client_id != request.client_id {
             return Err(OAuthError::InvalidGrant("client_id mismatch".to_string()));
         }
         if auth_code.redirect_uri != *redirect_uri {
-            return Err(OAuthError::InvalidGrant("redirect_uri mismatch".to_string()));
+            return Err(OAuthError::InvalidGrant(
+                "redirect_uri mismatch".to_string(),
+            ));
         }
 
         // Validate PKCE
         if !auth_code.validate_code_verifier(code_verifier) {
-            return Err(OAuthError::InvalidGrant("code_verifier validation failed".to_string()));
+            return Err(OAuthError::InvalidGrant(
+                "code_verifier validation failed".to_string(),
+            ));
         }
 
         // Authenticate client (if confidential)
@@ -906,28 +933,38 @@ impl OAuthServer {
 
         if client.client_type == ClientType::Confidential {
             if !client.authenticate(request.client_secret.as_deref()) {
-                return Err(OAuthError::InvalidClient("client authentication failed".to_string()));
+                return Err(OAuthError::InvalidClient(
+                    "client authentication failed".to_string(),
+                ));
             }
         }
 
         // Issue tokens
-        self.issue_tokens(&auth_code.client_id, &auth_code.scopes, auth_code.subject.as_deref())
+        self.issue_tokens(
+            &auth_code.client_id,
+            &auth_code.scopes,
+            auth_code.subject.as_deref(),
+        )
     }
 
     fn token_refresh_token(&self, request: &TokenRequest) -> Result<TokenResponse, OAuthError> {
-        let refresh_token_value = request.refresh_token.as_ref().ok_or_else(|| {
-            OAuthError::InvalidRequest("refresh_token is required".to_string())
-        })?;
+        let refresh_token_value = request
+            .refresh_token
+            .as_ref()
+            .ok_or_else(|| OAuthError::InvalidRequest("refresh_token is required".to_string()))?;
 
         // Get and validate refresh token
         let refresh_token = {
-            let state = self.state.read().map_err(|_| {
-                OAuthError::ServerError("failed to acquire read lock".to_string())
-            })?;
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
 
             // Check if revoked
             if state.revoked_tokens.contains(refresh_token_value) {
-                return Err(OAuthError::InvalidGrant("refresh token has been revoked".to_string()));
+                return Err(OAuthError::InvalidGrant(
+                    "refresh token has been revoked".to_string(),
+                ));
             }
 
             state
@@ -938,7 +975,9 @@ impl OAuthServer {
         };
 
         if refresh_token.is_expired() {
-            return Err(OAuthError::InvalidGrant("refresh token has expired".to_string()));
+            return Err(OAuthError::InvalidGrant(
+                "refresh token has expired".to_string(),
+            ));
         }
         if refresh_token.client_id != request.client_id {
             return Err(OAuthError::InvalidGrant("client_id mismatch".to_string()));
@@ -951,7 +990,9 @@ impl OAuthServer {
 
         if client.client_type == ClientType::Confidential {
             if !client.authenticate(request.client_secret.as_deref()) {
-                return Err(OAuthError::InvalidClient("client authentication failed".to_string()));
+                return Err(OAuthError::InvalidClient(
+                    "client authentication failed".to_string(),
+                ));
             }
         }
 
@@ -987,10 +1028,13 @@ impl OAuthServer {
 
         // Store new access token
         {
-            let mut state = self.state.write().map_err(|_| {
-                OAuthError::ServerError("failed to acquire write lock".to_string())
-            })?;
-            state.access_tokens.insert(access_token_value.clone(), access_token.clone());
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+            state
+                .access_tokens
+                .insert(access_token_value.clone(), access_token.clone());
         }
 
         Ok(TokenResponse {
@@ -1042,11 +1086,16 @@ impl OAuthServer {
 
         // Store tokens
         {
-            let mut state = self.state.write().map_err(|_| {
-                OAuthError::ServerError("failed to acquire write lock".to_string())
-            })?;
-            state.access_tokens.insert(access_token_value.clone(), access_token.clone());
-            state.refresh_tokens.insert(refresh_token_value.clone(), refresh_token);
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+            state
+                .access_tokens
+                .insert(access_token_value.clone(), access_token.clone());
+            state
+                .refresh_tokens
+                .insert(refresh_token_value.clone(), refresh_token);
         }
 
         Ok(TokenResponse {
@@ -1069,7 +1118,12 @@ impl OAuthServer {
     /// Revokes a token (access or refresh).
     ///
     /// Per RFC 7009, this always returns success even if the token was not found.
-    pub fn revoke(&self, token: &str, client_id: &str, client_secret: Option<&str>) -> Result<(), OAuthError> {
+    pub fn revoke(
+        &self,
+        token: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+    ) -> Result<(), OAuthError> {
         // Authenticate client
         let client = self.get_client(client_id).ok_or_else(|| {
             OAuthError::InvalidClient(format!("client '{}' not found", client_id))
@@ -1077,13 +1131,16 @@ impl OAuthServer {
 
         if client.client_type == ClientType::Confidential {
             if !client.authenticate(client_secret) {
-                return Err(OAuthError::InvalidClient("client authentication failed".to_string()));
+                return Err(OAuthError::InvalidClient(
+                    "client authentication failed".to_string(),
+                ));
             }
         }
 
-        let mut state = self.state.write().map_err(|_| {
-            OAuthError::ServerError("failed to acquire write lock".to_string())
-        })?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
 
         // Try to find and remove the token
         let found_access = state.access_tokens.remove(token);
@@ -1225,9 +1282,12 @@ impl TokenVerifier for OAuthTokenVerifier {
         }
 
         // Validate the token
-        let token_info = self.server.validate_access_token(&token.token).ok_or_else(|| {
-            McpError::new(McpErrorCode::ResourceForbidden, "invalid or expired token")
-        })?;
+        let token_info = self
+            .server
+            .validate_access_token(&token.token)
+            .ok_or_else(|| {
+                McpError::new(McpErrorCode::ResourceForbidden, "invalid or expired token")
+            })?;
 
         Ok(AuthContext {
             subject: token_info.subject,
@@ -1519,7 +1579,9 @@ mod tests {
             code_challenge_method: CodeChallengeMethod::S256,
         };
 
-        let (code, redirect) = server.authorize(&request, Some("user123".to_string())).unwrap();
+        let (code, redirect) = server
+            .authorize(&request, Some("user123".to_string()))
+            .unwrap();
 
         assert!(!code.is_empty());
         assert!(redirect.contains("code="));
@@ -1559,7 +1621,11 @@ mod tests {
         // Tokens should be unique
         assert_ne!(token1, token2);
         // Tokens should be URL-safe
-        assert!(token1.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(
+            token1
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
     }
 
     #[test]
@@ -1624,8 +1690,14 @@ mod tests {
 
     #[test]
     fn test_code_challenge_method_parse() {
-        assert_eq!(CodeChallengeMethod::parse("plain"), Some(CodeChallengeMethod::Plain));
-        assert_eq!(CodeChallengeMethod::parse("S256"), Some(CodeChallengeMethod::S256));
+        assert_eq!(
+            CodeChallengeMethod::parse("plain"),
+            Some(CodeChallengeMethod::Plain)
+        );
+        assert_eq!(
+            CodeChallengeMethod::parse("S256"),
+            Some(CodeChallengeMethod::S256)
+        );
         assert_eq!(CodeChallengeMethod::parse("unknown"), None);
     }
 
@@ -1663,7 +1735,9 @@ mod tests {
                 subject: Some("user123".to_string()),
                 is_refresh_token: false,
             };
-            state.access_tokens.insert("test-access-token".to_string(), token);
+            state
+                .access_tokens
+                .insert("test-access-token".to_string(), token);
             TokenResponse {
                 access_token: "test-access-token".to_string(),
                 token_type: "bearer".to_string(),
@@ -1674,13 +1748,23 @@ mod tests {
         };
 
         // Token should be valid
-        assert!(server.validate_access_token(&token_response.access_token).is_some());
+        assert!(
+            server
+                .validate_access_token(&token_response.access_token)
+                .is_some()
+        );
 
         // Revoke the token
-        server.revoke(&token_response.access_token, "test-client", None).unwrap();
+        server
+            .revoke(&token_response.access_token, "test-client", None)
+            .unwrap();
 
         // Token should no longer be valid
-        assert!(server.validate_access_token(&token_response.access_token).is_none());
+        assert!(
+            server
+                .validate_access_token(&token_response.access_token)
+                .is_none()
+        );
     }
 
     #[test]

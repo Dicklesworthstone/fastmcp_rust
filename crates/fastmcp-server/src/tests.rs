@@ -784,7 +784,13 @@ mod router_tests {
             1,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
 
         assert!(response.error.is_none(), "expected successful response");
@@ -823,7 +829,13 @@ mod router_tests {
             2,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
 
         let result = response.result.expect("short-circuit result");
@@ -883,7 +895,13 @@ mod router_tests {
             3,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
 
         assert!(response.is_error(), "expected error response");
@@ -922,7 +940,13 @@ mod router_tests {
             4,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
 
         let result = response.result.expect("result");
@@ -968,7 +992,13 @@ mod router_tests {
             5,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
 
         let ts = chrono::Utc::now().to_rfc3339();
@@ -1049,7 +1079,13 @@ mod router_tests {
             6,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
 
@@ -1063,7 +1099,13 @@ mod router_tests {
             7,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.is_error(), "expected auth error");
         let error = response.error.expect("error payload");
@@ -1103,7 +1145,13 @@ mod router_tests {
             8,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.is_error(), "expected auth error");
 
@@ -1116,7 +1164,13 @@ mod router_tests {
             9,
         );
         let response = server
-            .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
     }
@@ -1150,7 +1204,13 @@ mod router_tests {
             12,
         );
         let unauthorized_response = server
-            .handle_request(&cx, &mut session, unauthorized, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                unauthorized,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         info!(
             target: targets::SESSION,
@@ -1166,7 +1226,13 @@ mod router_tests {
             13,
         );
         let authorized_response = server
-            .handle_request(&cx, &mut session, authorized, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                authorized,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         info!(
             target: targets::SESSION,
@@ -1532,7 +1598,13 @@ mod router_tests {
             20,
         );
         let response = server
-            .handle_request(&cx, &mut session, submit, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                submit,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("submit response");
         let task_id = response
             .result
@@ -1609,7 +1681,13 @@ mod router_tests {
             Some(serde_json::to_value(params).unwrap()),
         );
 
-        let response = server.handle_request(&cx, &mut session, request, &sender, &create_test_request_sender());
+        let response = server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        );
         assert!(response.is_none());
     }
 
@@ -1847,7 +1925,13 @@ mod router_tests {
                     i64::try_from(i + 1).expect("request id fits in i64"),
                 );
                 let response = server
-                    .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+                    .handle_request(
+                        &cx,
+                        &mut session,
+                        request,
+                        &sender,
+                        &create_test_request_sender(),
+                    )
                     .expect("response");
                 tx.send(response).expect("response send failed");
             });
@@ -1932,7 +2016,13 @@ mod router_tests {
                     request_id,
                 );
                 let response = server
-                    .handle_request(&cx, &mut session, request, &sender, &create_test_request_sender())
+                    .handle_request(
+                        &cx,
+                        &mut session,
+                        request,
+                        &sender,
+                        &create_test_request_sender(),
+                    )
                     .expect("response");
                 tx.send(response).expect("response send failed");
             });
@@ -2029,7 +2119,13 @@ mod router_tests {
             1i64,
         );
         let response = server
-            .handle_request(&cx, &mut session, subscribe, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                subscribe,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.error.is_none());
         assert!(session.is_resource_subscribed("resource://test"));
@@ -2061,7 +2157,13 @@ mod router_tests {
             2i64,
         );
         let response = server
-            .handle_request(&cx, &mut session, unsubscribe, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                unsubscribe,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("response");
         assert!(response.error.is_none());
         assert!(!session.is_resource_subscribed("resource://test"));
@@ -2111,7 +2213,13 @@ mod router_tests {
             1i64,
         );
         let _ = server
-            .handle_request(&cx, &mut session, set_level, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                set_level,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
@@ -2127,7 +2235,13 @@ mod router_tests {
             2i64,
         );
         let _ = server
-            .handle_request(&cx, &mut session, call, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                call,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
@@ -2187,7 +2301,13 @@ mod router_tests {
             1i64,
         );
         let _ = server
-            .handle_request(&cx, &mut session, set_level, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                set_level,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
@@ -2203,7 +2323,13 @@ mod router_tests {
             2i64,
         );
         let _ = server
-            .handle_request(&cx, &mut session, call, &sender, &create_test_request_sender())
+            .handle_request(
+                &cx,
+                &mut session,
+                call,
+                &sender,
+                &create_test_request_sender(),
+            )
             .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
@@ -2253,7 +2379,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2279,7 +2406,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2298,7 +2426,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -2320,7 +2449,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -2338,7 +2468,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         // Request should fail due to exhausted budget
         assert!(result.is_err());
@@ -2551,7 +2682,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -2579,7 +2711,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_err());
     }
@@ -2597,7 +2730,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2617,7 +2751,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2637,7 +2772,8 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result =
+            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();

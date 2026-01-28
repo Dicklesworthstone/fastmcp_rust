@@ -486,10 +486,7 @@ impl DiscoveryDocument {
                 "preferred_username".to_string(),
                 "picture".to_string(),
             ]),
-            code_challenge_methods_supported: Some(vec![
-                "plain".to_string(),
-                "S256".to_string(),
-            ]),
+            code_challenge_methods_supported: Some(vec!["plain".to_string(), "S256".to_string()]),
         }
     }
 }
@@ -710,7 +707,8 @@ impl OidcProvider {
         let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url);
         doc.scopes_supported = self.config.supported_scopes.clone();
         doc.claims_supported = Some(self.config.supported_claims.clone());
-        doc.id_token_signing_alg_values_supported = vec![self.config.signing_algorithm.as_str().to_string()];
+        doc.id_token_signing_alg_values_supported =
+            vec![self.config.signing_algorithm.as_str().to_string()];
         doc
     }
 
@@ -732,9 +730,10 @@ impl OidcProvider {
             return Err(OidcError::MissingOpenIdScope);
         }
 
-        let subject = access_token.subject.as_ref().ok_or_else(|| {
-            OidcError::ClaimsNotFound("no subject in access token".to_string())
-        })?;
+        let subject = access_token
+            .subject
+            .as_ref()
+            .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
 
         // Get user claims
         let user_claims = self.get_user_claims(subject, &access_token.scopes)?;
@@ -764,10 +763,7 @@ impl OidcProvider {
         // Sign the token
         let raw = self.sign_id_token(&claims)?;
 
-        let id_token = IdToken {
-            raw,
-            claims,
-        };
+        let id_token = IdToken { raw, claims };
 
         // Cache the ID token
         if let Ok(mut guard) = self.id_tokens.write() {
@@ -795,18 +791,24 @@ impl OidcProvider {
     /// Returns the user's claims filtered by the access token's scopes.
     pub fn userinfo(&self, access_token: &str) -> Result<UserClaims, OidcError> {
         // Validate access token
-        let token = self.oauth.validate_access_token(access_token).ok_or_else(|| {
-            OidcError::OAuth(OAuthError::InvalidGrant("invalid or expired access token".to_string()))
-        })?;
+        let token = self
+            .oauth
+            .validate_access_token(access_token)
+            .ok_or_else(|| {
+                OidcError::OAuth(OAuthError::InvalidGrant(
+                    "invalid or expired access token".to_string(),
+                ))
+            })?;
 
         // Verify openid scope
         if !token.scopes.iter().any(|s| s == "openid") {
             return Err(OidcError::MissingOpenIdScope);
         }
 
-        let subject = token.subject.as_ref().ok_or_else(|| {
-            OidcError::ClaimsNotFound("no subject in access token".to_string())
-        })?;
+        let subject = token
+            .subject
+            .as_ref()
+            .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
 
         self.get_user_claims(subject, &token.scopes)
     }
@@ -816,15 +818,16 @@ impl OidcProvider {
     // -------------------------------------------------------------------------
 
     fn get_user_claims(&self, subject: &str, scopes: &[String]) -> Result<UserClaims, OidcError> {
-        let provider = self.claims_provider
+        let provider = self
+            .claims_provider
             .read()
             .ok()
             .and_then(|guard| guard.clone());
 
         let claims = match provider {
-            Some(p) => p.get_claims(subject).ok_or_else(|| {
-                OidcError::ClaimsNotFound(subject.to_string())
-            })?,
+            Some(p) => p
+                .get_claims(subject)
+                .ok_or_else(|| OidcError::ClaimsNotFound(subject.to_string()))?,
             None => {
                 // Default: just return subject
                 UserClaims::new(subject)
@@ -844,20 +847,24 @@ impl OidcProvider {
             "kid": self.config.key_id.as_deref().unwrap_or("default"),
         });
 
-        let header_b64 = base64url_encode(&serde_json::to_vec(&header).map_err(|e| {
-            OidcError::SigningError(format!("failed to serialize header: {}", e))
-        })?);
+        let header_b64 =
+            base64url_encode(&serde_json::to_vec(&header).map_err(|e| {
+                OidcError::SigningError(format!("failed to serialize header: {}", e))
+            })?);
 
-        let claims_b64 = base64url_encode(&serde_json::to_vec(claims).map_err(|e| {
-            OidcError::SigningError(format!("failed to serialize claims: {}", e))
-        })?);
+        let claims_b64 =
+            base64url_encode(&serde_json::to_vec(claims).map_err(|e| {
+                OidcError::SigningError(format!("failed to serialize claims: {}", e))
+            })?);
 
         let signing_input = format!("{}.{}", header_b64, claims_b64);
 
         let signature = match &key {
             SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret),
             SigningKey::None => {
-                return Err(OidcError::SigningError("no signing key configured".to_string()));
+                return Err(OidcError::SigningError(
+                    "no signing key configured".to_string(),
+                ));
             }
         };
 
@@ -867,9 +874,10 @@ impl OidcProvider {
     }
 
     fn get_or_generate_signing_key(&self) -> Result<SigningKey, OidcError> {
-        let guard = self.signing_key.read().map_err(|_| {
-            OidcError::SigningError("failed to acquire read lock".to_string())
-        })?;
+        let guard = self
+            .signing_key
+            .read()
+            .map_err(|_| OidcError::SigningError("failed to acquire read lock".to_string()))?;
 
         match &*guard {
             SigningKey::None => {
@@ -1004,7 +1012,7 @@ fn generate_random_bytes(len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::{OAuthServerConfig, OAuthClient};
+    use crate::oauth::{OAuthClient, OAuthServerConfig};
     use std::time::Instant;
 
     fn create_test_provider() -> OidcProvider {
@@ -1143,7 +1151,7 @@ mod tests {
         claims_provider.set_claims(
             UserClaims::new("user123")
                 .with_name("John Doe")
-                .with_email("john@example.com")
+                .with_email("john@example.com"),
         );
         provider.set_claims_provider(claims_provider);
 
@@ -1156,7 +1164,11 @@ mod tests {
             token: "test-access-token".to_string(),
             token_type: crate::oauth::TokenType::Bearer,
             client_id: "test-client".to_string(),
-            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            scopes: vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+            ],
             issued_at: now,
             expires_at: now + Duration::from_secs(3600),
             subject: Some("user123".to_string()),
@@ -1172,7 +1184,10 @@ mod tests {
         assert_eq!(id_token.claims.sub, "user123");
         assert_eq!(id_token.claims.aud, "test-client");
         assert_eq!(id_token.claims.nonce, Some("nonce123".to_string()));
-        assert_eq!(id_token.claims.user_claims.name, Some("John Doe".to_string()));
+        assert_eq!(
+            id_token.claims.user_claims.name,
+            Some("John Doe".to_string())
+        );
     }
 
     #[test]
@@ -1229,10 +1244,7 @@ mod tests {
 
         // Set up claims
         let claims_store = InMemoryClaimsProvider::new();
-        claims_store.set_claims(
-            UserClaims::new("user123")
-                .with_name("John Doe")
-        );
+        claims_store.set_claims(UserClaims::new("user123").with_name("John Doe"));
         provider.set_claims_provider(claims_store);
 
         let result = provider.userinfo("test-token");
@@ -1265,7 +1277,13 @@ mod tests {
             .with_custom("custom_field", serde_json::json!("custom_value"))
             .with_custom("roles", serde_json::json!(["admin", "user"]));
 
-        assert_eq!(claims.custom.get("custom_field"), Some(&serde_json::json!("custom_value")));
-        assert_eq!(claims.custom.get("roles"), Some(&serde_json::json!(["admin", "user"])));
+        assert_eq!(
+            claims.custom.get("custom_field"),
+            Some(&serde_json::json!("custom_value"))
+        );
+        assert_eq!(
+            claims.custom.get("roles"),
+            Some(&serde_json::json!(["admin", "user"]))
+        );
     }
 }

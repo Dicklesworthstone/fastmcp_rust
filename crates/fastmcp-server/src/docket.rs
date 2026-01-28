@@ -64,8 +64,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asupersync::Cx;
-use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::McpError;
+use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_protocol::{TaskId, TaskInfo, TaskResult, TaskStatus};
 use serde::{Deserialize, Serialize};
 
@@ -375,7 +375,8 @@ pub trait DocketBackend: Send + Sync {
     fn get_task(&self, task_id: &TaskId) -> DocketResult<Option<DocketTask>>;
 
     /// Lists tasks, optionally filtered by status.
-    fn list_tasks(&self, status: Option<TaskStatus>, limit: usize) -> DocketResult<Vec<DocketTask>>;
+    fn list_tasks(&self, status: Option<TaskStatus>, limit: usize)
+    -> DocketResult<Vec<DocketTask>>;
 
     /// Cancels a task.
     fn cancel(&self, task_id: &TaskId, reason: Option<&str>) -> DocketResult<()>;
@@ -437,29 +438,28 @@ impl DocketBackend for MemoryDocketBackend {
         let priority = task.priority;
 
         {
-            let mut tasks = self.tasks.write().map_err(|e| {
-                DocketError::Backend(format!("Lock poisoned: {e}"))
-            })?;
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
             tasks.insert(task_id.clone(), task);
         }
 
         {
-            let mut pending = self.pending.write().map_err(|e| {
-                DocketError::Backend(format!("Lock poisoned: {e}"))
-            })?;
+            let mut pending = self
+                .pending
+                .write()
+                .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
             // Insert maintaining priority order (higher priority first)
-            let tasks = self.tasks.read().map_err(|e| {
-                DocketError::Backend(format!("Lock poisoned: {e}"))
-            })?;
+            let tasks = self
+                .tasks
+                .read()
+                .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
             let pos = pending
                 .iter()
-                .position(|id| {
-                    tasks
-                        .get(id)
-                        .is_none_or(|t| t.priority < priority)
-                })
+                .position(|id| tasks.get(id).is_none_or(|t| t.priority < priority))
                 .unwrap_or(pending.len());
 
             pending.insert(pos, task_id);
@@ -469,18 +469,20 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn dequeue(&self, task_types: &[String]) -> DocketResult<Option<DocketTask>> {
-        let mut pending = self.pending.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
-        let mut tasks = self.tasks.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         // Find first pending task matching subscribed types
         let pos = pending.iter().position(|id| {
-            tasks
-                .get(id)
-                .is_some_and(|t| t.status == TaskStatus::Pending && task_types.contains(&t.task_type))
+            tasks.get(id).is_some_and(|t| {
+                t.status == TaskStatus::Pending && task_types.contains(&t.task_type)
+            })
         });
 
         if let Some(pos) = pos {
@@ -496,9 +498,10 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn ack(&self, task_id: &TaskId, result: serde_json::Value) -> DocketResult<()> {
-        let mut tasks = self.tasks.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         let task = tasks
             .get_mut(task_id)
@@ -511,12 +514,14 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn nack(&self, task_id: &TaskId, error: &str) -> DocketResult<()> {
-        let mut tasks = self.tasks.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
-        let mut pending = self.pending.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         let task = tasks
             .get_mut(task_id)
@@ -539,29 +544,39 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn get_task(&self, task_id: &TaskId) -> DocketResult<Option<DocketTask>> {
-        let tasks = self.tasks.read().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let tasks = self
+            .tasks
+            .read()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
         Ok(tasks.get(task_id).cloned())
     }
 
-    fn list_tasks(&self, status: Option<TaskStatus>, limit: usize) -> DocketResult<Vec<DocketTask>> {
-        let tasks = self.tasks.read().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+    fn list_tasks(
+        &self,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> DocketResult<Vec<DocketTask>> {
+        let tasks = self
+            .tasks
+            .read()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
-        let iter = tasks.values().filter(|t| status.is_none_or(|s| t.status == s));
+        let iter = tasks
+            .values()
+            .filter(|t| status.is_none_or(|s| t.status == s));
 
         Ok(iter.take(limit).cloned().collect())
     }
 
     fn cancel(&self, task_id: &TaskId, reason: Option<&str>) -> DocketResult<()> {
-        let mut tasks = self.tasks.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
-        let mut pending = self.pending.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         let task = tasks
             .get_mut(task_id)
@@ -584,9 +599,10 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn stats(&self) -> DocketResult<QueueStats> {
-        let tasks = self.tasks.read().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let tasks = self
+            .tasks
+            .read()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         let mut stats = QueueStats::default();
         for task in tasks.values() {
@@ -603,12 +619,14 @@ impl DocketBackend for MemoryDocketBackend {
     }
 
     fn requeue_stale(&self) -> DocketResult<usize> {
-        let mut tasks = self.tasks.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
-        let mut pending = self.pending.write().map_err(|e| {
-            DocketError::Backend(format!("Lock poisoned: {e}"))
-        })?;
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|e| DocketError::Backend(format!("Lock poisoned: {e}")))?;
 
         let now = chrono::Utc::now();
         let timeout = chrono::Duration::from_std(self.settings.visibility_timeout)
@@ -663,48 +681,75 @@ pub struct RedisDocketBackend {
 #[cfg(feature = "redis")]
 impl RedisDocketBackend {
     /// Creates a new Redis backend.
-    pub fn new(_redis_settings: RedisSettings, _docket_settings: DocketSettings) -> DocketResult<Self> {
+    pub fn new(
+        _redis_settings: RedisSettings,
+        _docket_settings: DocketSettings,
+    ) -> DocketResult<Self> {
         // TODO: Initialize Redis connection pool
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 }
 
 #[cfg(feature = "redis")]
 impl DocketBackend for RedisDocketBackend {
     fn enqueue(&self, _task: DocketTask) -> DocketResult<()> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn dequeue(&self, _task_types: &[String]) -> DocketResult<Option<DocketTask>> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn ack(&self, _task_id: &TaskId, _result: serde_json::Value) -> DocketResult<()> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn nack(&self, _task_id: &TaskId, _error: &str) -> DocketResult<()> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn get_task(&self, _task_id: &TaskId) -> DocketResult<Option<DocketTask>> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
-    fn list_tasks(&self, _status: Option<TaskStatus>, _limit: usize) -> DocketResult<Vec<DocketTask>> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+    fn list_tasks(
+        &self,
+        _status: Option<TaskStatus>,
+        _limit: usize,
+    ) -> DocketResult<Vec<DocketTask>> {
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn cancel(&self, _task_id: &TaskId, _reason: Option<&str>) -> DocketResult<()> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn stats(&self) -> DocketResult<QueueStats> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 
     fn requeue_stale(&self) -> DocketResult<usize> {
-        Err(DocketError::Backend("Redis backend not yet implemented".to_string()))
+        Err(DocketError::Backend(
+            "Redis backend not yet implemented".to_string(),
+        ))
     }
 }
 
@@ -727,9 +772,10 @@ impl Docket {
         let backend: Arc<dyn DocketBackend> = match &settings.backend {
             DocketBackendType::Memory => Arc::new(MemoryDocketBackend::new(settings.clone())),
             #[cfg(feature = "redis")]
-            DocketBackendType::Redis(redis_settings) => {
-                Arc::new(RedisDocketBackend::new(redis_settings.clone(), settings.clone())?)
-            }
+            DocketBackendType::Redis(redis_settings) => Arc::new(RedisDocketBackend::new(
+                redis_settings.clone(),
+                settings.clone(),
+            )?),
             #[cfg(not(feature = "redis"))]
             DocketBackendType::Redis(_) => {
                 return Err(DocketError::Backend(
@@ -771,7 +817,13 @@ impl Docket {
         let task_id = TaskId::from_string(format!("docket-{counter:08x}"));
 
         let max_retries = options.max_retries.unwrap_or(self.settings.max_retries);
-        let task = DocketTask::new(task_id.clone(), task_type.into(), params, options.priority, max_retries);
+        let task = DocketTask::new(
+            task_id.clone(),
+            task_type.into(),
+            params,
+            options.priority,
+            max_retries,
+        );
 
         self.backend.enqueue(task)?;
 
@@ -791,7 +843,11 @@ impl Docket {
     }
 
     /// Lists tasks with optional status filter.
-    pub fn list_tasks(&self, status: Option<TaskStatus>, limit: usize) -> DocketResult<Vec<DocketTask>> {
+    pub fn list_tasks(
+        &self,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> DocketResult<Vec<DocketTask>> {
         self.backend.list_tasks(status, limit)
     }
 
@@ -1113,9 +1169,10 @@ mod tests {
             .unwrap();
 
         // High priority should be dequeued first
-        let worker = docket.worker().subscribe("task", |t| async move {
-            Ok(t.params)
-        }).build();
+        let worker = docket
+            .worker()
+            .subscribe("task", |t| async move { Ok(t.params) })
+            .build();
 
         let types = worker.subscribed_types();
         let dequeued = docket.backend.dequeue(&types).unwrap().unwrap();
@@ -1209,11 +1266,17 @@ mod tests {
         backend.enqueue(task).unwrap();
 
         // Dequeue and nack (first failure)
-        let task = backend.dequeue(&["retry_test".to_string()]).unwrap().unwrap();
+        let task = backend
+            .dequeue(&["retry_test".to_string()])
+            .unwrap()
+            .unwrap();
         backend.nack(&task.id, "error 1").unwrap();
 
         // Should be requeued
-        let task = backend.dequeue(&["retry_test".to_string()]).unwrap().unwrap();
+        let task = backend
+            .dequeue(&["retry_test".to_string()])
+            .unwrap()
+            .unwrap();
         assert_eq!(task.retry_count, 1);
         backend.nack(&task.id, "error 2").unwrap();
 
@@ -1222,7 +1285,10 @@ mod tests {
         assert!(task.is_none());
 
         // Verify it's marked as failed
-        let task = backend.get_task(&TaskId::from_string("test-1")).unwrap().unwrap();
+        let task = backend
+            .get_task(&TaskId::from_string("test-1"))
+            .unwrap()
+            .unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
     }
 
@@ -1250,7 +1316,9 @@ mod tests {
         let docket = Docket::memory();
 
         // Submit a task
-        let task_id = docket.submit("process_test", serde_json::json!({"x": 1})).unwrap();
+        let task_id = docket
+            .submit("process_test", serde_json::json!({"x": 1}))
+            .unwrap();
 
         // Create worker
         let worker = docket
@@ -1303,8 +1371,14 @@ mod tests {
     #[test]
     fn test_docket_error_display() {
         let errors = vec![
-            (DocketError::NotFound("task-1".into()), "Task not found: task-1"),
-            (DocketError::Connection("refused".into()), "Connection error: refused"),
+            (
+                DocketError::NotFound("task-1".into()),
+                "Task not found: task-1",
+            ),
+            (
+                DocketError::Connection("refused".into()),
+                "Connection error: refused",
+            ),
             (DocketError::Handler("panic".into()), "Handler error: panic"),
             (DocketError::Cancelled, "Operation cancelled"),
         ];

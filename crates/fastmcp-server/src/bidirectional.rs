@@ -200,15 +200,9 @@ impl RequestSender {
         // Wait for response
         // TODO: Add timeout based on budget
         match receiver.recv() {
-            Ok(Ok(value)) => {
-                serde_json::from_value(value).map_err(|e| {
-                    McpError::internal_error(format!("Failed to parse response: {}", e))
-                })
-            }
-            Ok(Err(error)) => Err(McpError::new(
-                McpErrorCode::from(error.code),
-                error.message,
-            )),
+            Ok(Ok(value)) => serde_json::from_value(value)
+                .map_err(|e| McpError::internal_error(format!("Failed to parse response: {}", e))),
+            Ok(Err(error)) => Err(McpError::new(McpErrorCode::from(error.code), error.message)),
             Err(_) => Err(McpError::internal_error(
                 "Response channel closed unexpectedly",
             )),
@@ -245,9 +239,8 @@ impl SamplingSender for TransportSamplingSender {
     fn create_message(
         &self,
         request: SamplingRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = McpResult<SamplingResponse>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<SamplingResponse>> + Send + '_>>
+    {
         Box::pin(async move {
             // Convert to protocol types
             let params = fastmcp_protocol::CreateMessageParams {
@@ -289,7 +282,8 @@ impl SamplingSender for TransportSamplingSender {
             let cx = Cx::for_testing();
 
             let result: fastmcp_protocol::CreateMessageResult =
-                self.sender.send_request(&cx, "sampling/createMessage", params_value)?;
+                self.sender
+                    .send_request(&cx, "sampling/createMessage", params_value)?;
 
             Ok(SamplingResponse {
                 text: match result.content {
@@ -341,8 +335,9 @@ impl ElicitationSender for TransportElicitationSender {
                         message: request.message.clone(),
                         requested_schema: request.schema.unwrap_or(serde_json::json!({})),
                     };
-                    serde_json::to_value(&params)
-                        .map_err(|e| McpError::internal_error(format!("Failed to serialize: {}", e)))?
+                    serde_json::to_value(&params).map_err(|e| {
+                        McpError::internal_error(format!("Failed to serialize: {}", e))
+                    })?
                 }
                 ElicitationMode::Url => {
                     let params = fastmcp_protocol::ElicitRequestUrlParams {
@@ -351,8 +346,9 @@ impl ElicitationSender for TransportElicitationSender {
                         url: request.url.unwrap_or_default(),
                         elicitation_id: request.elicitation_id.unwrap_or_default(),
                     };
-                    serde_json::to_value(&params)
-                        .map_err(|e| McpError::internal_error(format!("Failed to serialize: {}", e)))?
+                    serde_json::to_value(&params).map_err(|e| {
+                        McpError::internal_error(format!("Failed to serialize: {}", e))
+                    })?
                 }
             };
 
@@ -360,7 +356,8 @@ impl ElicitationSender for TransportElicitationSender {
             let cx = Cx::for_testing();
 
             let result: fastmcp_protocol::ElicitResult =
-                self.sender.send_request(&cx, "elicitation/elicit", params_value)?;
+                self.sender
+                    .send_request(&cx, "elicitation/elicit", params_value)?;
 
             // Convert HashMap<String, ElicitContentValue> to HashMap<String, serde_json::Value>
             let content = result.content.map(|content_map| {
@@ -423,7 +420,8 @@ impl TransportRootsProvider {
     pub fn list_roots(&self) -> McpResult<Vec<fastmcp_protocol::Root>> {
         let cx = Cx::for_testing();
         let result: fastmcp_protocol::ListRootsResult =
-            self.sender.send_request(&cx, "roots/list", serde_json::json!({}))?;
+            self.sender
+                .send_request(&cx, "roots/list", serde_json::json!({}))?;
         Ok(result.roots)
     }
 }
@@ -451,10 +449,7 @@ mod tests {
         // Receive the response
         let result = receiver.recv().unwrap();
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            serde_json::json!({"result": "ok"})
-        );
+        assert_eq!(result.unwrap(), serde_json::json!({"result": "ok"}));
     }
 
     #[test]

@@ -310,7 +310,9 @@ mod tests {
             ClientCapabilities {
                 sampling: Some(SamplingCapability {}),
                 elicitation: Some(ElicitationCapability::both()),
-                roots: Some(RootsCapability { list_changed: false }),
+                roots: Some(RootsCapability {
+                    list_changed: false,
+                }),
             },
             "2024-11-05".to_string(),
         );
