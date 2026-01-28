@@ -146,6 +146,54 @@ enum Commands {
         json: bool,
     },
 
+    /// Run server in development mode with hot reloading.
+    ///
+    /// Watches source files and automatically rebuilds and restarts the server on changes.
+    Dev {
+        /// Path to server module, binary, or Cargo target.
+        target: String,
+
+        /// Host to bind (for SSE/HTTP transport).
+        #[arg(long, default_value = "localhost")]
+        host: String,
+
+        /// Port to bind (for SSE/HTTP transport).
+        #[arg(long, default_value = "8000")]
+        port: u16,
+
+        /// Directory to watch for changes (can specify multiple).
+        #[arg(long = "reload-dir", default_value = "src")]
+        reload_dirs: Vec<PathBuf>,
+
+        /// File patterns to watch (glob syntax).
+        #[arg(long = "reload-pattern", default_value = "**/*.rs")]
+        reload_patterns: Vec<String>,
+
+        /// Disable auto-reload (just run the server).
+        #[arg(long)]
+        no_reload: bool,
+
+        /// Transport type: stdio, sse, http.
+        #[arg(long, default_value = "stdio")]
+        transport: DevTransport,
+
+        /// Debounce time in milliseconds.
+        #[arg(long, default_value = "100")]
+        debounce: u64,
+
+        /// Clear terminal on restart.
+        #[arg(long)]
+        clear: bool,
+
+        /// Environment variables (KEY=VALUE format).
+        #[arg(long, short = 'e')]
+        env: Vec<String>,
+
+        /// Show detailed output.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
     /// Manage background tasks on an MCP server.
     ///
     /// Query task status, retry failed tasks, cancel pending tasks, and view queue statistics.
@@ -321,6 +369,28 @@ impl std::str::FromStr for ListFormat {
     }
 }
 
+/// Transport type for dev mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum DevTransport {
+    #[default]
+    Stdio,
+    Sse,
+    Http,
+}
+
+impl std::str::FromStr for DevTransport {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "stdio" => Ok(Self::Stdio),
+            "sse" => Ok(Self::Sse),
+            "http" => Ok(Self::Http),
+            _ => Err(format!("Unknown transport: {s}. Expected: stdio, sse, http")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallTarget {
     Claude,
@@ -379,6 +449,31 @@ fn main() -> ExitCode {
             verbose,
             json,
         } => cmd_test(&server, &args, timeout, verbose, json),
+        Commands::Dev {
+            target,
+            host,
+            port,
+            reload_dirs,
+            reload_patterns,
+            no_reload,
+            transport,
+            debounce,
+            clear,
+            env,
+            verbose,
+        } => cmd_dev(DevConfig {
+            target,
+            host,
+            port,
+            reload_dirs,
+            reload_patterns,
+            no_reload,
+            transport,
+            debounce_ms: debounce,
+            clear,
+            env,
+            verbose,
+        }),
         Commands::Tasks { action } => cmd_tasks(action),
     };
 
@@ -923,6 +1018,319 @@ fn print_test_result(result: &TestResult, verbose: bool) {
             }
         }
     }
+}
+
+// ============================================================================
+// Dev Command
+// ============================================================================
+
+/// Configuration for dev mode.
+#[allow(dead_code)] // Fields will be used as more transport options are implemented
+struct DevConfig {
+    target: String,
+    host: String,
+    port: u16,
+    reload_dirs: Vec<PathBuf>,
+    reload_patterns: Vec<String>,
+    no_reload: bool,
+    transport: DevTransport,
+    debounce_ms: u64,
+    clear: bool,
+    env: Vec<String>,
+    verbose: bool,
+}
+
+/// Dev command: Run server in development mode with hot reloading.
+fn cmd_dev(config: DevConfig) -> McpResult<()> {
+    use console::{style, Term};
+    use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let term = Term::stdout();
+
+    // Parse environment variables
+    let env_vars: HashMap<String, String> = config
+        .env
+        .iter()
+        .filter_map(|s| {
+            let mut parts = s.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .collect();
+
+    // Determine if this is a Cargo project
+    let target_path = PathBuf::from(&config.target);
+    let is_cargo_project = target_path.join("Cargo.toml").exists()
+        || config.target == "."
+        || config.target.starts_with("./");
+
+    // Print startup message
+    println!(
+        "{} {} Development mode",
+        style("▶").green().bold(),
+        style("fastmcp").cyan().bold()
+    );
+    println!(
+        "  Target: {}",
+        style(target_path.display()).yellow()
+    );
+    if !config.no_reload {
+        println!(
+            "  Watching: {}",
+            style(config.reload_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")).dim()
+        );
+    }
+    println!();
+
+    // Build and start the server
+    let rebuild_needed = std::sync::Arc::new(AtomicBool::new(false));
+    let mut child: Option<std::process::Child> = None;
+
+    // Function to build the project
+    let build_project = |verbose: bool| -> bool {
+        if is_cargo_project {
+            println!(
+                "{} Building...",
+                style("🔨").bold()
+            );
+            let output = Command::new("cargo")
+                .arg("build")
+                .current_dir(&target_path)
+                .envs(&env_vars)
+                .output();
+
+            match output {
+                Ok(output) => {
+                    if output.status.success() {
+                        println!(
+                            "{} Build successful",
+                            style("✓").green().bold()
+                        );
+                        true
+                    } else {
+                        println!(
+                            "{} Build failed",
+                            style("✗").red().bold()
+                        );
+                        if verbose {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            for line in stderr.lines().take(20) {
+                                println!("  {}", style(line).red());
+                            }
+                        }
+                        false
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "{} Build error: {}",
+                        style("✗").red().bold(),
+                        e
+                    );
+                    false
+                }
+            }
+        } else {
+            // Binary, no build needed
+            true
+        }
+    };
+
+    // Function to start the server
+    let start_server = |env_vars: &HashMap<String, String>| -> Option<std::process::Child> {
+        let (cmd, args) = if is_cargo_project {
+            ("cargo".to_string(), vec!["run".to_string()])
+        } else {
+            (config.target.clone(), vec![])
+        };
+
+        println!(
+            "{} Starting server...",
+            style("🚀").bold()
+        );
+
+        let mut command = Command::new(&cmd);
+        command
+            .args(&args)
+            .current_dir(&target_path)
+            .envs(env_vars)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        match command.spawn() {
+            Ok(child) => {
+                println!(
+                    "{} Server running (PID: {})",
+                    style("✓").green().bold(),
+                    child.id()
+                );
+                Some(child)
+            }
+            Err(e) => {
+                println!(
+                    "{} Failed to start server: {}",
+                    style("✗").red().bold(),
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    // Initial build and start
+    if build_project(config.verbose) {
+        child = start_server(&env_vars);
+    }
+
+    // If no reload, just wait for the process
+    if config.no_reload {
+        if let Some(mut c) = child {
+            let _ = c.wait();
+        }
+        return Ok(());
+    }
+
+    // Set up file watcher
+    let (tx, rx) = mpsc::channel();
+    let rebuild_flag = rebuild_needed.clone();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                // Check if any path matches our patterns
+                let should_rebuild = event.paths.iter().any(|path| {
+                    let path_str = path.to_string_lossy();
+                    // Skip target directory
+                    if path_str.contains("/target/") || path_str.contains("\\target\\") {
+                        return false;
+                    }
+                    // Check if it's a Rust file
+                    path_str.ends_with(".rs") || path_str.ends_with(".toml")
+                });
+
+                if should_rebuild {
+                    rebuild_flag.store(true, Ordering::SeqCst);
+                    let _ = tx.send(());
+                }
+            }
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_millis(100)),
+    )
+    .map_err(|e| fastmcp_core::McpError::internal_error(format!("Failed to create watcher: {e}")))?;
+
+    // Watch directories
+    for dir in &config.reload_dirs {
+        let watch_path = target_path.join(dir);
+        if watch_path.exists() {
+            watcher
+                .watch(&watch_path, RecursiveMode::Recursive)
+                .map_err(|e| {
+                    fastmcp_core::McpError::internal_error(format!(
+                        "Failed to watch {}: {e}",
+                        watch_path.display()
+                    ))
+                })?;
+        }
+    }
+
+    println!(
+        "\n{} Watching for changes... (Ctrl+C to stop)\n",
+        style("👀").bold()
+    );
+
+    // Main loop
+    let mut last_rebuild = Instant::now();
+    let debounce_duration = Duration::from_millis(config.debounce_ms);
+
+    loop {
+        // Check for file changes with timeout
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => {
+                // Debounce
+                if last_rebuild.elapsed() < debounce_duration {
+                    continue;
+                }
+
+                if rebuild_needed.swap(false, Ordering::SeqCst) {
+                    if config.clear {
+                        let _ = term.clear_screen();
+                    }
+
+                    println!(
+                        "\n{} Change detected, rebuilding...",
+                        style("🔄").bold()
+                    );
+
+                    // Kill existing process
+                    if let Some(mut c) = child.take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+
+                    // Rebuild and restart
+                    if build_project(config.verbose) {
+                        child = start_server(&env_vars);
+                    }
+
+                    last_rebuild = Instant::now();
+                    println!(
+                        "\n{} Watching for changes...\n",
+                        style("👀").bold()
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Check if child has exited
+                if let Some(ref mut c) = child {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            if status.success() {
+                                println!(
+                                    "\n{} Server exited normally",
+                                    style("ℹ").blue().bold()
+                                );
+                            } else {
+                                println!(
+                                    "\n{} Server exited with error ({})",
+                                    style("⚠").yellow().bold(),
+                                    status
+                                );
+                            }
+                            println!(
+                                "{} Waiting for changes...\n",
+                                style("👀").bold()
+                            );
+                            child = None;
+                        }
+                        Ok(None) => {
+                            // Still running
+                        }
+                        Err(e) => {
+                            println!(
+                                "\n{} Error checking process: {}",
+                                style("✗").red().bold(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    Ok(())
 }
 
 /// Tasks command: Manage background tasks on an MCP server.

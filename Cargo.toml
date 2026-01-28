@@ -34,6 +34,13 @@ log = "0.4"
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
+# File watching
+notify = "8"
+glob = "0.3"
+
+# Console output
+console = "0.15"
+
 # Configuration file parsing
 toml = "0.8"
 dirs = "6"

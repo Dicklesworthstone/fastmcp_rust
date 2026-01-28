@@ -38,5 +38,12 @@ log = { workspace = true }
 # Time/date handling
 chrono = { workspace = true }
 
+# File watching (for dev command)
+notify = { workspace = true }
+glob = { workspace = true }
+
+# Console output
+console = { workspace = true }
+
 [lints]
 workspace = true
