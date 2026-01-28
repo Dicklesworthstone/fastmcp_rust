@@ -799,10 +799,10 @@ mod tests {
             tasks: Some(TasksCapability { list_changed: true }),
         };
         let value = serde_json::to_value(&caps).expect("serialize");
-        assert_eq!(value["tools"]["listChanged"], true);
+        assert_eq!(value["tools"]["list_changed"], true);
         assert_eq!(value["resources"]["subscribe"], true);
-        assert_eq!(value["resources"]["listChanged"], true);
-        assert_eq!(value["prompts"]["listChanged"], true);
+        assert_eq!(value["resources"]["list_changed"], true);
+        assert_eq!(value["prompts"]["list_changed"], true);
         assert!(value.get("logging").is_some());
         assert_eq!(value["tasks"]["listChanged"], true);
     }
@@ -854,14 +854,14 @@ mod tests {
         let cap = ToolsCapability::default();
         let value = serde_json::to_value(&cap).expect("serialize");
         // list_changed defaults to false and should be omitted
-        assert!(value.get("listChanged").is_none());
+        assert!(value.get("list_changed").is_none());
     }
 
     #[test]
     fn tools_capability_list_changed() {
         let cap = ToolsCapability { list_changed: true };
         let value = serde_json::to_value(&cap).expect("serialize");
-        assert_eq!(value["listChanged"], true);
+        assert_eq!(value["list_changed"], true);
     }
 
     // ========================================================================
@@ -873,7 +873,7 @@ mod tests {
         let cap = ResourcesCapability::default();
         let value = serde_json::to_value(&cap).expect("serialize");
         assert!(value.get("subscribe").is_none());
-        assert!(value.get("listChanged").is_none());
+        assert!(value.get("list_changed").is_none());
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
         };
         let value = serde_json::to_value(&cap).expect("serialize");
         assert_eq!(value["subscribe"], true);
-        assert_eq!(value["listChanged"], true);
+        assert_eq!(value["list_changed"], true);
     }
 
     // ========================================================================
@@ -1323,7 +1323,7 @@ mod tests {
         assert_eq!(tool.name, "greet");
         assert_eq!(tool.version, Some("1.0.0".to_string()));
         assert_eq!(tool.tags, vec!["greeting"]);
-        assert!(tool.annotations.unwrap().read_only.unwrap());
+        assert!(tool.annotations.as_ref().unwrap().read_only.unwrap());
         let re_serialized = serde_json::to_value(&tool).expect("re-serialize");
         assert_eq!(re_serialized["name"], json["name"]);
     }
