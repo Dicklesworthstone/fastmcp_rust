@@ -909,7 +909,8 @@ impl ServerBuilder {
     #[must_use]
     pub fn build(mut self) -> Server {
         // Configure router with strict input validation setting
-        self.router.set_strict_input_validation(self.strict_input_validation);
+        self.router
+            .set_strict_input_validation(self.strict_input_validation);
 
         Server {
             info: self.info,

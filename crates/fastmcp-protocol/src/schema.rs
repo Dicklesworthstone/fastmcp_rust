@@ -135,10 +135,7 @@ fn make_strict_schema(schema: &Value) -> Value {
                         .is_some_and(|arr| arr.iter().any(|t| t == "object"));
 
                 if is_object_type && !obj.contains_key("additionalProperties") {
-                    new_obj.insert(
-                        "additionalProperties".to_string(),
-                        Value::Bool(false),
-                    );
+                    new_obj.insert("additionalProperties".to_string(), Value::Bool(false));
                 }
             }
 
@@ -171,8 +168,7 @@ fn make_strict_schema(schema: &Value) -> Value {
             // Handle prefixItems for tuple validation
             if let Some(prefix_items) = obj.get("prefixItems") {
                 if let Value::Array(arr) = prefix_items {
-                    let strict_items: Vec<Value> =
-                        arr.iter().map(make_strict_schema).collect();
+                    let strict_items: Vec<Value> = arr.iter().map(make_strict_schema).collect();
                     new_obj.insert("prefixItems".to_string(), Value::Array(strict_items));
                 }
             }
@@ -858,19 +854,37 @@ mod tests {
         });
 
         // Regular validate allows extra properties at any level
-        assert!(validate(&schema, &json!({
-            "person": {"name": "Alice", "age": 30}
-        })).is_ok());
+        assert!(
+            validate(
+                &schema,
+                &json!({
+                    "person": {"name": "Alice", "age": 30}
+                })
+            )
+            .is_ok()
+        );
 
         // Strict validate rejects extra properties at nested level
-        assert!(validate_strict(&schema, &json!({
-            "person": {"name": "Alice", "age": 30}
-        })).is_err());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!({
+                    "person": {"name": "Alice", "age": 30}
+                })
+            )
+            .is_err()
+        );
 
         // Strict validate passes with only defined properties
-        assert!(validate_strict(&schema, &json!({
-            "person": {"name": "Alice"}
-        })).is_ok());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!({
+                    "person": {"name": "Alice"}
+                })
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -885,16 +899,28 @@ mod tests {
         });
 
         // With explicit additionalProperties schema, strict mode should honor it
-        assert!(validate_strict(&schema, &json!({
-            "name": "Alice",
-            "count": 42
-        })).is_ok());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!({
+                    "name": "Alice",
+                    "count": 42
+                })
+            )
+            .is_ok()
+        );
 
         // But still validate the type of additional properties
-        assert!(validate_strict(&schema, &json!({
-            "name": "Alice",
-            "count": "not an integer"
-        })).is_err());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!({
+                    "name": "Alice",
+                    "count": "not an integer"
+                })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -910,19 +936,37 @@ mod tests {
         });
 
         // Regular validate allows extra properties in array items
-        assert!(validate(&schema, &json!([
-            {"id": 1, "extra": "value"}
-        ])).is_ok());
+        assert!(
+            validate(
+                &schema,
+                &json!([
+                    {"id": 1, "extra": "value"}
+                ])
+            )
+            .is_ok()
+        );
 
         // Strict validate rejects extra properties in array items
-        assert!(validate_strict(&schema, &json!([
-            {"id": 1, "extra": "value"}
-        ])).is_err());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!([
+                    {"id": 1, "extra": "value"}
+                ])
+            )
+            .is_err()
+        );
 
         // Strict validate passes with only defined properties
-        assert!(validate_strict(&schema, &json!([
-            {"id": 1}
-        ])).is_ok());
+        assert!(
+            validate_strict(
+                &schema,
+                &json!([
+                    {"id": 1}
+                ])
+            )
+            .is_ok()
+        );
     }
 
     #[test]

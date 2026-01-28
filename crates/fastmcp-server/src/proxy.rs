@@ -511,6 +511,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }],
             resources: vec![Resource {
                 uri: "test://resource".to_string(),
@@ -549,6 +550,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -562,6 +564,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             },
             proxy,
         );
@@ -640,6 +643,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }],
             state: Arc::clone(&state),
             ..TestBackend::default()
@@ -655,6 +659,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             },
             "db",
             proxy,

@@ -61,7 +61,9 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{ProxyBackend, ProxyCatalog, ProxyClient};
-pub use router::{MountResult, NotificationSender, Router, RouterResourceReader, RouterToolCaller, TagFilters};
+pub use router::{
+    MountResult, NotificationSender, Router, RouterResourceReader, RouterToolCaller, TagFilters,
+};
 pub use session::Session;
 pub use tasks::{SharedTaskManager, TaskManager};
 
@@ -1001,7 +1003,9 @@ impl Server {
             }
             "tools/list" => {
                 let params: ListToolsParams = parse_params_or_default(params)?;
-                let result = self.router.handle_tools_list(cx, params, Some(session.state()))?;
+                let result = self
+                    .router
+                    .handle_tools_list(cx, params, Some(session.state()))?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
             "tools/call" => {
@@ -1019,12 +1023,18 @@ impl Server {
             }
             "resources/list" => {
                 let params: ListResourcesParams = parse_params_or_default(params)?;
-                let result = self.router.handle_resources_list(cx, params, Some(session.state()))?;
+                let result =
+                    self.router
+                        .handle_resources_list(cx, params, Some(session.state()))?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
             "resources/templates/list" => {
                 let params: ListResourceTemplatesParams = parse_params_or_default(params)?;
-                let result = self.router.handle_resource_templates_list(cx, params, Some(session.state()))?;
+                let result = self.router.handle_resource_templates_list(
+                    cx,
+                    params,
+                    Some(session.state()),
+                )?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
             "resources/read" => {
@@ -1055,7 +1065,9 @@ impl Server {
             }
             "prompts/list" => {
                 let params: ListPromptsParams = parse_params_or_default(params)?;
-                let result = self.router.handle_prompts_list(cx, params, Some(session.state()))?;
+                let result = self
+                    .router
+                    .handle_prompts_list(cx, params, Some(session.state()))?;
                 Ok(serde_json::to_value(result).map_err(McpError::from)?)
             }
             "prompts/get" => {

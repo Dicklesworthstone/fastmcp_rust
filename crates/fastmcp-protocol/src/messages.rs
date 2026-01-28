@@ -105,10 +105,18 @@ pub struct ListToolsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Only include tools with ALL of these tags (AND logic).
-    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "includeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_tags: Option<Vec<String>>,
     /// Exclude tools with ANY of these tags (OR logic).
-    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exclude_tags: Option<Vec<String>>,
 }
 
@@ -160,10 +168,18 @@ pub struct ListResourcesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Only include resources with ALL of these tags (AND logic).
-    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "includeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_tags: Option<Vec<String>>,
     /// Exclude resources with ANY of these tags (OR logic).
-    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exclude_tags: Option<Vec<String>>,
 }
 
@@ -184,10 +200,18 @@ pub struct ListResourceTemplatesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Only include templates with ALL of these tags (AND logic).
-    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "includeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_tags: Option<Vec<String>>,
     /// Exclude templates with ANY of these tags (OR logic).
-    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exclude_tags: Option<Vec<String>>,
 }
 
@@ -241,10 +265,18 @@ pub struct ListPromptsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Only include prompts with ALL of these tags (AND logic).
-    #[serde(rename = "includeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "includeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_tags: Option<Vec<String>>,
     /// Exclude prompts with ANY of these tags (OR logic).
-    #[serde(rename = "excludeTags", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludeTags",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub exclude_tags: Option<Vec<String>>,
 }
 
@@ -1054,7 +1086,7 @@ mod tests {
                 mime_type: Some("text/plain".to_string()),
                 icon: None,
                 version: None,
-            tags: vec![],
+                tags: vec![],
             }],
         };
 
@@ -1672,7 +1704,10 @@ mod tests {
             annotations: None,
         };
         let json = serde_json::to_value(&tool).expect("serialize");
-        assert!(json.get("tags").is_none(), "Empty tags should not appear in JSON");
+        assert!(
+            json.get("tags").is_none(),
+            "Empty tags should not appear in JSON"
+        );
 
         // Tool with tags
         let tool = Tool {
@@ -1703,7 +1738,10 @@ mod tests {
             tags: vec![],
         };
         let json = serde_json::to_value(&resource).expect("serialize");
-        assert!(json.get("tags").is_none(), "Empty tags should not appear in JSON");
+        assert!(
+            json.get("tags").is_none(),
+            "Empty tags should not appear in JSON"
+        );
 
         // Resource with tags
         let resource = Resource {
@@ -1733,7 +1771,10 @@ mod tests {
             tags: vec![],
         };
         let json = serde_json::to_value(&prompt).expect("serialize");
-        assert!(json.get("tags").is_none(), "Empty tags should not appear in JSON");
+        assert!(
+            json.get("tags").is_none(),
+            "Empty tags should not appear in JSON"
+        );
 
         // Prompt with tags
         let prompt = Prompt {
@@ -1761,7 +1802,10 @@ mod tests {
             tags: vec![],
         };
         let json = serde_json::to_value(&template).expect("serialize");
-        assert!(json.get("tags").is_none(), "Empty tags should not appear in JSON");
+        assert!(
+            json.get("tags").is_none(),
+            "Empty tags should not appear in JSON"
+        );
 
         // ResourceTemplate with tags
         let template = ResourceTemplate {
@@ -1829,5 +1873,125 @@ mod tests {
         });
         let prompt: Prompt = serde_json::from_value(json).expect("deserialize");
         assert_eq!(prompt.tags, vec!["greeting", "onboarding"]);
+    }
+
+    // ========================================================================
+    // Tool Annotations Serialization Tests
+    // ========================================================================
+
+    #[test]
+    fn tool_annotations_serialization() {
+        use crate::types::{Tool, ToolAnnotations};
+
+        // Tool without annotations (None should not appear in JSON)
+        let tool = Tool {
+            name: "my_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let json = serde_json::to_value(&tool).expect("serialize");
+        assert!(
+            json.get("annotations").is_none(),
+            "None annotations should not appear in JSON"
+        );
+
+        // Tool with annotations
+        let tool = Tool {
+            name: "delete_file".to_string(),
+            description: Some("Deletes a file".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(
+                ToolAnnotations::new()
+                    .destructive(true)
+                    .idempotent(false)
+                    .read_only(false),
+            ),
+        };
+        let json = serde_json::to_value(&tool).expect("serialize");
+        let annotations = json.get("annotations").expect("annotations field");
+        assert_eq!(annotations["destructive"], true);
+        assert_eq!(annotations["idempotent"], false);
+        assert_eq!(annotations["readOnly"], false);
+        assert!(annotations.get("openWorldHint").is_none());
+
+        // Tool with read_only annotation
+        let tool = Tool {
+            name: "get_status".to_string(),
+            description: Some("Gets status".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(ToolAnnotations::new().read_only(true)),
+        };
+        let json = serde_json::to_value(&tool).expect("serialize");
+        let annotations = json.get("annotations").expect("annotations field");
+        assert_eq!(annotations["readOnly"], true);
+        assert!(annotations.get("destructive").is_none());
+    }
+
+    #[test]
+    fn tool_annotations_deserialization() {
+        use crate::types::Tool;
+
+        // Deserialize tool without annotations
+        let json = serde_json::json!({
+            "name": "tool",
+            "inputSchema": {"type": "object"}
+        });
+        let tool: Tool = serde_json::from_value(json).expect("deserialize");
+        assert!(tool.annotations.is_none());
+
+        // Deserialize tool with annotations
+        let json = serde_json::json!({
+            "name": "delete_tool",
+            "inputSchema": {"type": "object"},
+            "annotations": {
+                "destructive": true,
+                "idempotent": false,
+                "readOnly": false,
+                "openWorldHint": "May delete any file"
+            }
+        });
+        let tool: Tool = serde_json::from_value(json).expect("deserialize");
+        let annotations = tool.annotations.expect("annotations present");
+        assert_eq!(annotations.destructive, Some(true));
+        assert_eq!(annotations.idempotent, Some(false));
+        assert_eq!(annotations.read_only, Some(false));
+        assert_eq!(
+            annotations.open_world_hint,
+            Some("May delete any file".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_annotations_builder() {
+        use crate::types::ToolAnnotations;
+
+        let annotations = ToolAnnotations::new()
+            .destructive(true)
+            .idempotent(true)
+            .read_only(false)
+            .open_world_hint("Handles unknown inputs gracefully");
+
+        assert_eq!(annotations.destructive, Some(true));
+        assert_eq!(annotations.idempotent, Some(true));
+        assert_eq!(annotations.read_only, Some(false));
+        assert_eq!(
+            annotations.open_world_hint,
+            Some("Handles unknown inputs gracefully".to_string())
+        );
+        assert!(!annotations.is_empty());
+
+        // Empty annotations
+        let empty = ToolAnnotations::new();
+        assert!(empty.is_empty());
     }
 }

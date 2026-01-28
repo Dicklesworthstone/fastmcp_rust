@@ -642,7 +642,8 @@ impl Router {
         params: ListToolsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListToolsResult> {
-        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters =
+            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
             Some(&tag_filters)
         } else {
@@ -805,7 +806,8 @@ impl Router {
         params: ListResourcesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourcesResult> {
-        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters =
+            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
             Some(&tag_filters)
         } else {
@@ -827,7 +829,8 @@ impl Router {
         params: ListResourceTemplatesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourceTemplatesResult> {
-        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters =
+            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
             Some(&tag_filters)
         } else {
@@ -943,7 +946,8 @@ impl Router {
         params: ListPromptsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListPromptsResult> {
-        let tag_filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
+        let tag_filters =
+            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
             Some(&tag_filters)
         } else {

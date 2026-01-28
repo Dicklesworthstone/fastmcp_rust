@@ -61,8 +61,9 @@ impl ToolHandler for GreetTool {
                 "required": ["name"]
             }),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -87,8 +88,9 @@ impl ToolHandler for CancellationCheckTool {
             description: Some("Tool that checks cancellation status".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -113,8 +115,9 @@ impl ToolHandler for SlowTool {
             description: Some("Simulates a slow operation".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -145,8 +148,9 @@ impl ToolHandler for BlockingTool {
             description: Some("Blocks until cancellation is observed".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -413,8 +417,9 @@ impl ToolHandler for LoggingBlockingTool {
                 "properties": { "request_id": { "type": "integer" } }
             }),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -450,8 +455,9 @@ impl ToolHandler for ErrorTool {
             description: Some("Always returns an error".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
+            annotations: None,
         }
     }
 
@@ -478,8 +484,8 @@ impl ResourceHandler for StaticResource {
             description: Some("A static test resource".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -504,8 +510,8 @@ impl ResourceHandler for CancellableResource {
             description: Some("A resource that checks cancellation".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -533,8 +539,8 @@ impl ResourceHandler for TemplateResource {
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -545,8 +551,8 @@ impl ResourceHandler for TemplateResource {
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         })
     }
 
@@ -585,8 +591,8 @@ impl ResourceHandler for SpecificTemplateResource {
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -597,8 +603,8 @@ impl ResourceHandler for SpecificTemplateResource {
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         })
     }
 
@@ -648,8 +654,8 @@ impl ResourceHandler for LoggingTemplateResource {
             description: Some("Template resource that logs matches".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -660,8 +666,8 @@ impl ResourceHandler for LoggingTemplateResource {
             description: Some("Template resource that logs matches".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         })
     }
 
@@ -726,8 +732,8 @@ impl PromptHandler for GreetingPrompt {
                 required: true,
             }],
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         }
     }
 
@@ -780,8 +786,8 @@ mod router_tests {
             description: Some("Resource template for manual listing".to_string()),
             mime_type: Some("text/plain".to_string()),
             icon: None,
-                version: None,
-                tags: vec![],
+            version: None,
+            tags: vec![],
         });
 
         // Register prompts
@@ -1374,8 +1380,16 @@ mod router_tests {
         // Now filtered list should have one less resource
         let filtered_resources = router.resources_filtered(Some(&state), None);
         assert_eq!(filtered_resources.len(), 1);
-        assert!(!filtered_resources.iter().any(|r| r.uri == "resource://test"));
-        assert!(filtered_resources.iter().any(|r| r.uri == "resource://cancellable"));
+        assert!(
+            !filtered_resources
+                .iter()
+                .any(|r| r.uri == "resource://test")
+        );
+        assert!(
+            filtered_resources
+                .iter()
+                .any(|r| r.uri == "resource://cancellable")
+        );
     }
 
     #[test]
@@ -1414,12 +1428,16 @@ mod router_tests {
         // Now filtered list should have one less template
         let filtered_templates = router.resource_templates_filtered(Some(&state), None);
         assert_eq!(filtered_templates.len(), 1);
-        assert!(!filtered_templates
-            .iter()
-            .any(|t| t.uri_template == "resource://{id}"));
-        assert!(filtered_templates
-            .iter()
-            .any(|t| t.uri_template == "resource://{name}"));
+        assert!(
+            !filtered_templates
+                .iter()
+                .any(|t| t.uri_template == "resource://{id}")
+        );
+        assert!(
+            filtered_templates
+                .iter()
+                .any(|t| t.uri_template == "resource://{name}")
+        );
     }
 
     #[test]
@@ -3192,15 +3210,14 @@ mod handler_definition_tests {
                 icon: None,
                 version: None,
                 tags: self.tags.clone(),
+                annotations: None,
             }
         }
 
-        fn call(
-            &self,
-            _ctx: &McpContext,
-            _args: serde_json::Value,
-        ) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text { text: "ok".to_string() }])
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: "ok".to_string(),
+            }])
         }
     }
 
@@ -3233,7 +3250,11 @@ mod handler_definition_tests {
         let include = vec!["api".to_string(), "public".to_string()];
         let filters = TagFilters::new(Some(&include), None);
         let tools = router.tools_filtered(None, Some(&filters));
-        assert_eq!(tools.len(), 2, "Expected search, create (both have api AND public)");
+        assert_eq!(
+            tools.len(),
+            2,
+            "Expected search, create (both have api AND public)"
+        );
         assert!(tools.iter().any(|t| t.name == "search"));
         assert!(tools.iter().any(|t| t.name == "create"));
     }
@@ -3267,7 +3288,11 @@ mod handler_definition_tests {
         let exclude = vec!["private".to_string()];
         let filters = TagFilters::new(Some(&include), Some(&exclude));
         let tools = router.tools_filtered(None, Some(&filters));
-        assert_eq!(tools.len(), 2, "Expected search, create (api but not private)");
+        assert_eq!(
+            tools.len(),
+            2,
+            "Expected search, create (api but not private)"
+        );
         assert!(tools.iter().any(|t| t.name == "search"));
         assert!(tools.iter().any(|t| t.name == "create"));
     }
@@ -3353,6 +3378,7 @@ mod multi_handler_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -3492,6 +3518,7 @@ mod session_state_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -3948,6 +3975,7 @@ mod mount_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -3971,6 +3999,7 @@ mod mount_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -4323,6 +4352,7 @@ mod duplicate_behavior_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -4856,6 +4886,7 @@ mod ctx_call_tool_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -4884,6 +4915,7 @@ mod ctx_call_tool_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -4906,6 +4938,7 @@ mod ctx_call_tool_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -5162,6 +5195,7 @@ mod ctx_call_tool_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 
@@ -5185,6 +5219,7 @@ mod ctx_call_tool_tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 

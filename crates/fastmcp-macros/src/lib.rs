@@ -793,6 +793,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                     icon: None,
                     version: None,
                     tags: vec![],
+                    annotations: None,
                 }
             }
 

@@ -362,6 +362,7 @@ impl TransformedToolBuilder {
             icon: parent.icon.clone(),
             version: parent.version.clone(),
             tags: parent.tags.clone(),
+            annotations: parent.annotations.clone(),
         }
     }
 
@@ -505,6 +506,7 @@ mod tests {
                 icon: None,
                 version: None,
                 tags: vec![],
+                annotations: None,
             }
         }
 

@@ -377,7 +377,11 @@ fn cmd_list(target: Option<InstallTarget>) -> McpResult<()> {
     let targets = if let Some(t) = target {
         vec![t]
     } else {
-        vec![InstallTarget::Claude, InstallTarget::Cursor, InstallTarget::Cline]
+        vec![
+            InstallTarget::Claude,
+            InstallTarget::Cursor,
+            InstallTarget::Cline,
+        ]
     };
 
     let mut table = Table::new()
@@ -386,7 +390,9 @@ fn cmd_list(target: Option<InstallTarget>) -> McpResult<()> {
         .show_header(true);
 
     table.add_column(Column::new("Client").style(Style::parse("bold cyan").unwrap_or_default()));
-    table.add_column(Column::new("Server Name").style(Style::parse("bold yellow").unwrap_or_default()));
+    table.add_column(
+        Column::new("Server Name").style(Style::parse("bold yellow").unwrap_or_default()),
+    );
     table.add_column(Column::new("Command"));
     table.add_column(Column::new("Arguments"));
     table.add_column(Column::new("Environment"));
@@ -419,7 +425,9 @@ fn cmd_list(target: Option<InstallTarget>) -> McpResult<()> {
 
                     if let Some(servers) = servers_map {
                         for (server_name, config) in servers {
-                            if let Ok(mcp_config) = serde_json::from_value::<McpServerConfig>(config.clone()) {
+                            if let Ok(mcp_config) =
+                                serde_json::from_value::<McpServerConfig>(config.clone())
+                            {
                                 found_any = true;
                                 let args = if mcp_config.args.is_empty() {
                                     "-".to_string()

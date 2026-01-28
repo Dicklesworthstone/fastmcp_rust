@@ -244,6 +244,9 @@ fn bench_protocol_types() {
             description: Some("A test tool".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
             icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
         };
     });
 
