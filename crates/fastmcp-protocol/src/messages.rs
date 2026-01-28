@@ -1061,6 +1061,588 @@ pub struct ElicitationRequiredErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PROTOCOL_VERSION;
+
+    // ========================================================================
+    // ProgressToken Tests
+    // ========================================================================
+
+    #[test]
+    fn progress_token_string_serialization() {
+        let token = ProgressToken::String("tok-1".to_string());
+        let value = serde_json::to_value(&token).expect("serialize");
+        assert_eq!(value, "tok-1");
+    }
+
+    #[test]
+    fn progress_token_number_serialization() {
+        let token = ProgressToken::Number(42);
+        let value = serde_json::to_value(&token).expect("serialize");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn progress_token_from_impls() {
+        let from_str: ProgressToken = "token".into();
+        assert!(matches!(from_str, ProgressToken::String(_)));
+
+        let from_string: ProgressToken = "token".to_string().into();
+        assert!(matches!(from_string, ProgressToken::String(_)));
+
+        let from_i64: ProgressToken = 99i64.into();
+        assert!(matches!(from_i64, ProgressToken::Number(99)));
+    }
+
+    #[test]
+    fn progress_token_display() {
+        assert_eq!(format!("{}", ProgressToken::String("tok-1".to_string())), "tok-1");
+        assert_eq!(format!("{}", ProgressToken::Number(42)), "42");
+    }
+
+    #[test]
+    fn progress_token_equality() {
+        assert_eq!(ProgressToken::Number(1), ProgressToken::Number(1));
+        assert_ne!(ProgressToken::Number(1), ProgressToken::Number(2));
+        assert_eq!(
+            ProgressToken::String("a".to_string()),
+            ProgressToken::String("a".to_string())
+        );
+    }
+
+    // ========================================================================
+    // RequestMeta Tests
+    // ========================================================================
+
+    #[test]
+    fn request_meta_default_empty() {
+        let meta = RequestMeta::default();
+        let value = serde_json::to_value(&meta).expect("serialize");
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn request_meta_with_token() {
+        let meta = RequestMeta {
+            progress_token: Some(ProgressToken::String("pt-1".to_string())),
+        };
+        let value = serde_json::to_value(&meta).expect("serialize");
+        assert_eq!(value["progressToken"], "pt-1");
+    }
+
+    // ========================================================================
+    // Initialize Tests
+    // ========================================================================
+
+    #[test]
+    fn initialize_params_serialization() {
+        let params = InitializeParams {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(value["clientInfo"]["name"], "test-client");
+        assert_eq!(value["clientInfo"]["version"], "1.0.0");
+    }
+
+    #[test]
+    fn initialize_params_round_trip() {
+        let json = serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "my-client", "version": "0.1.0"}
+        });
+        let params: InitializeParams = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(params.protocol_version, "2024-11-05");
+        assert_eq!(params.client_info.name, "my-client");
+    }
+
+    #[test]
+    fn initialize_result_serialization() {
+        let result = InitializeResult {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: ServerCapabilities::default(),
+            server_info: ServerInfo {
+                name: "test-server".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            instructions: Some("Welcome!".to_string()),
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(value["serverInfo"]["name"], "test-server");
+        assert_eq!(value["instructions"], "Welcome!");
+    }
+
+    #[test]
+    fn initialize_result_without_instructions() {
+        let result = InitializeResult {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: ServerCapabilities::default(),
+            server_info: ServerInfo {
+                name: "srv".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            instructions: None,
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert!(value.get("instructions").is_none());
+    }
+
+    // ========================================================================
+    // ListToolsParams Tests (with tags)
+    // ========================================================================
+
+    #[test]
+    fn list_tools_params_default() {
+        let params = ListToolsParams::default();
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn list_tools_params_with_cursor() {
+        let params = ListToolsParams {
+            cursor: Some("next-page".to_string()),
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["cursor"], "next-page");
+    }
+
+    #[test]
+    fn list_tools_params_with_tags() {
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["api".to_string(), "v2".to_string()]),
+            exclude_tags: Some(vec!["deprecated".to_string()]),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["includeTags"], serde_json::json!(["api", "v2"]));
+        assert_eq!(value["excludeTags"], serde_json::json!(["deprecated"]));
+    }
+
+    // ========================================================================
+    // CallToolParams Tests
+    // ========================================================================
+
+    #[test]
+    fn call_tool_params_minimal() {
+        let params = CallToolParams {
+            name: "greet".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["name"], "greet");
+        assert!(value.get("arguments").is_none());
+        assert!(value.get("_meta").is_none());
+    }
+
+    #[test]
+    fn call_tool_params_full() {
+        let params = CallToolParams {
+            name: "add".to_string(),
+            arguments: Some(serde_json::json!({"a": 1, "b": 2})),
+            meta: Some(RequestMeta {
+                progress_token: Some(ProgressToken::Number(100)),
+            }),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["name"], "add");
+        assert_eq!(value["arguments"]["a"], 1);
+        assert_eq!(value["_meta"]["progressToken"], 100);
+    }
+
+    // ========================================================================
+    // CallToolResult Tests
+    // ========================================================================
+
+    #[test]
+    fn call_tool_result_success() {
+        let result = CallToolResult {
+            content: vec![Content::Text {
+                text: "42".to_string(),
+            }],
+            is_error: false,
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "42");
+        // is_error=false should be omitted
+        assert!(value.get("isError").is_none());
+    }
+
+    #[test]
+    fn call_tool_result_error() {
+        let result = CallToolResult {
+            content: vec![Content::Text {
+                text: "Something went wrong".to_string(),
+            }],
+            is_error: true,
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["isError"], true);
+    }
+
+    // ========================================================================
+    // ListResourcesParams Tests
+    // ========================================================================
+
+    #[test]
+    fn list_resources_params_default() {
+        let params = ListResourcesParams::default();
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn list_resources_params_with_tags() {
+        let params = ListResourcesParams {
+            cursor: None,
+            include_tags: Some(vec!["config".to_string()]),
+            exclude_tags: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["includeTags"], serde_json::json!(["config"]));
+    }
+
+    // ========================================================================
+    // ReadResourceParams Tests
+    // ========================================================================
+
+    #[test]
+    fn read_resource_params_serialization() {
+        let params = ReadResourceParams {
+            uri: "file://config.json".to_string(),
+            meta: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["uri"], "file://config.json");
+        assert!(value.get("_meta").is_none());
+    }
+
+    #[test]
+    fn read_resource_params_with_meta() {
+        let params = ReadResourceParams {
+            uri: "file://data.csv".to_string(),
+            meta: Some(RequestMeta {
+                progress_token: Some(ProgressToken::String("pt-read".to_string())),
+            }),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["uri"], "file://data.csv");
+        assert_eq!(value["_meta"]["progressToken"], "pt-read");
+    }
+
+    // ========================================================================
+    // ReadResourceResult Tests
+    // ========================================================================
+
+    #[test]
+    fn read_resource_result_serialization() {
+        let result = ReadResourceResult {
+            contents: vec![ResourceContent {
+                uri: "file://test.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("Hello!".to_string()),
+                blob: None,
+            }],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["contents"][0]["uri"], "file://test.txt");
+        assert_eq!(value["contents"][0]["text"], "Hello!");
+    }
+
+    // ========================================================================
+    // ListPromptsParams Tests
+    // ========================================================================
+
+    #[test]
+    fn list_prompts_params_default() {
+        let params = ListPromptsParams::default();
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn list_prompts_params_with_tags() {
+        let params = ListPromptsParams {
+            cursor: Some("c1".to_string()),
+            include_tags: Some(vec!["onboarding".to_string()]),
+            exclude_tags: Some(vec!["deprecated".to_string()]),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["cursor"], "c1");
+        assert_eq!(value["includeTags"], serde_json::json!(["onboarding"]));
+        assert_eq!(value["excludeTags"], serde_json::json!(["deprecated"]));
+    }
+
+    // ========================================================================
+    // GetPromptParams Tests
+    // ========================================================================
+
+    #[test]
+    fn get_prompt_params_minimal() {
+        let params = GetPromptParams {
+            name: "greeting".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["name"], "greeting");
+        assert!(value.get("arguments").is_none());
+    }
+
+    #[test]
+    fn get_prompt_params_with_arguments() {
+        let mut args = std::collections::HashMap::new();
+        args.insert("name".to_string(), "Alice".to_string());
+        args.insert("language".to_string(), "French".to_string());
+
+        let params = GetPromptParams {
+            name: "translate".to_string(),
+            arguments: Some(args),
+            meta: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["name"], "translate");
+        assert_eq!(value["arguments"]["name"], "Alice");
+        assert_eq!(value["arguments"]["language"], "French");
+    }
+
+    // ========================================================================
+    // GetPromptResult Tests
+    // ========================================================================
+
+    #[test]
+    fn get_prompt_result_serialization() {
+        let result = GetPromptResult {
+            description: Some("A greeting prompt".to_string()),
+            messages: vec![PromptMessage {
+                role: crate::types::Role::User,
+                content: Content::Text {
+                    text: "Say hello".to_string(),
+                },
+            }],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["description"], "A greeting prompt");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"]["text"], "Say hello");
+    }
+
+    #[test]
+    fn get_prompt_result_without_description() {
+        let result = GetPromptResult {
+            description: None,
+            messages: vec![],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert!(value.get("description").is_none());
+    }
+
+    // ========================================================================
+    // CancelledParams Tests
+    // ========================================================================
+
+    #[test]
+    fn cancelled_params_minimal() {
+        let params = CancelledParams {
+            request_id: RequestId::Number(5),
+            reason: None,
+            await_cleanup: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["requestId"], 5);
+        assert!(value.get("reason").is_none());
+        assert!(value.get("awaitCleanup").is_none());
+    }
+
+    #[test]
+    fn cancelled_params_full() {
+        let params = CancelledParams {
+            request_id: RequestId::String("req-7".to_string()),
+            reason: Some("User cancelled".to_string()),
+            await_cleanup: Some(true),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["requestId"], "req-7");
+        assert_eq!(value["reason"], "User cancelled");
+        assert_eq!(value["awaitCleanup"], true);
+    }
+
+    // ========================================================================
+    // ProgressParams Tests
+    // ========================================================================
+
+    #[test]
+    fn progress_params_new() {
+        let params = ProgressParams::new("token-1", 0.5);
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["progressToken"], "token-1");
+        assert_eq!(value["progress"], 0.5);
+        assert!(value.get("total").is_none());
+        assert!(value.get("message").is_none());
+    }
+
+    #[test]
+    fn progress_params_with_total() {
+        let params = ProgressParams::with_total(42i64, 50.0, 100.0);
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["progressToken"], 42);
+        assert_eq!(value["progress"], 50.0);
+        assert_eq!(value["total"], 100.0);
+    }
+
+    #[test]
+    fn progress_params_with_message() {
+        let params = ProgressParams::new("tok", 0.75).with_message("Almost done");
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["message"], "Almost done");
+    }
+
+    #[test]
+    fn progress_params_fraction() {
+        let params = ProgressParams::with_total("t", 25.0, 100.0);
+        assert_eq!(params.fraction(), Some(0.25));
+
+        // Zero total
+        let params = ProgressParams::with_total("t", 10.0, 0.0);
+        assert_eq!(params.fraction(), Some(0.0));
+
+        // No total
+        let params = ProgressParams::new("t", 0.5);
+        assert_eq!(params.fraction(), None);
+    }
+
+    // ========================================================================
+    // GetTaskParams Tests
+    // ========================================================================
+
+    #[test]
+    fn get_task_params_serialization() {
+        let params = GetTaskParams {
+            id: TaskId::from_string("task-abc"),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["id"], "task-abc");
+    }
+
+    // ========================================================================
+    // GetTaskResult Tests
+    // ========================================================================
+
+    #[test]
+    fn get_task_result_serialization() {
+        let result = GetTaskResult {
+            task: crate::types::TaskInfo {
+                id: TaskId::from_string("task-1"),
+                task_type: "compute".to_string(),
+                status: TaskStatus::Completed,
+                progress: Some(1.0),
+                message: Some("Done".to_string()),
+                created_at: "2026-01-28T00:00:00Z".to_string(),
+                started_at: Some("2026-01-28T00:01:00Z".to_string()),
+                completed_at: Some("2026-01-28T00:02:00Z".to_string()),
+                error: None,
+            },
+            result: Some(crate::types::TaskResult {
+                id: TaskId::from_string("task-1"),
+                success: true,
+                data: Some(serde_json::json!({"value": 42})),
+                error: None,
+            }),
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["task"]["status"], "completed");
+        assert_eq!(value["result"]["success"], true);
+        assert_eq!(value["result"]["data"]["value"], 42);
+    }
+
+    // ========================================================================
+    // CancelTaskParams Tests
+    // ========================================================================
+
+    #[test]
+    fn cancel_task_params_serialization() {
+        let params = CancelTaskParams {
+            id: TaskId::from_string("task-1"),
+            reason: Some("No longer needed".to_string()),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["id"], "task-1");
+        assert_eq!(value["reason"], "No longer needed");
+    }
+
+    #[test]
+    fn cancel_task_params_without_reason() {
+        let params = CancelTaskParams {
+            id: TaskId::from_string("task-2"),
+            reason: None,
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(value["id"], "task-2");
+        assert!(value.get("reason").is_none());
+    }
+
+    // ========================================================================
+    // CancelTaskResult Tests
+    // ========================================================================
+
+    #[test]
+    fn cancel_task_result_serialization() {
+        let result = CancelTaskResult {
+            cancelled: true,
+            task: crate::types::TaskInfo {
+                id: TaskId::from_string("task-1"),
+                task_type: "compute".to_string(),
+                status: TaskStatus::Cancelled,
+                progress: None,
+                message: None,
+                created_at: "2026-01-28T00:00:00Z".to_string(),
+                started_at: None,
+                completed_at: None,
+                error: None,
+            },
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["cancelled"], true);
+        assert_eq!(value["task"]["status"], "cancelled");
+    }
+
+    // ========================================================================
+    // LogLevel Tests
+    // ========================================================================
+
+    #[test]
+    fn log_level_serialization() {
+        assert_eq!(serde_json::to_value(LogLevel::Debug).unwrap(), "debug");
+        assert_eq!(serde_json::to_value(LogLevel::Info).unwrap(), "info");
+        assert_eq!(serde_json::to_value(LogLevel::Warning).unwrap(), "warning");
+        assert_eq!(serde_json::to_value(LogLevel::Error).unwrap(), "error");
+    }
+
+    #[test]
+    fn log_level_deserialization() {
+        assert_eq!(
+            serde_json::from_value::<LogLevel>(serde_json::json!("debug")).unwrap(),
+            LogLevel::Debug
+        );
+        assert_eq!(
+            serde_json::from_value::<LogLevel>(serde_json::json!("warning")).unwrap(),
+            LogLevel::Warning
+        );
+    }
+
+    // ========================================================================
+    // Existing Tests (preserved below)
+    // ========================================================================
 
     #[test]
     fn list_resource_templates_params_serialization() {

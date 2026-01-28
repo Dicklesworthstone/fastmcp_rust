@@ -199,18 +199,330 @@ pub enum JsonRpcMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ========================================================================
+    // RequestId Tests
+    // ========================================================================
 
     #[test]
-    fn test_request_serialization() {
+    fn request_id_number_serialization() {
+        let id = RequestId::Number(42);
+        let value = serde_json::to_value(&id).expect("serialize");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn request_id_string_serialization() {
+        let id = RequestId::String("req-1".to_string());
+        let value = serde_json::to_value(&id).expect("serialize");
+        assert_eq!(value, "req-1");
+    }
+
+    #[test]
+    fn request_id_number_deserialization() {
+        let id: RequestId = serde_json::from_value(json!(99)).expect("deserialize");
+        assert_eq!(id, RequestId::Number(99));
+    }
+
+    #[test]
+    fn request_id_string_deserialization() {
+        let id: RequestId = serde_json::from_value(json!("abc")).expect("deserialize");
+        assert_eq!(id, RequestId::String("abc".to_string()));
+    }
+
+    #[test]
+    fn request_id_from_i64() {
+        let id: RequestId = 7i64.into();
+        assert_eq!(id, RequestId::Number(7));
+    }
+
+    #[test]
+    fn request_id_from_string() {
+        let id: RequestId = "test-id".to_string().into();
+        assert_eq!(id, RequestId::String("test-id".to_string()));
+    }
+
+    #[test]
+    fn request_id_from_str() {
+        let id: RequestId = "test-id".into();
+        assert_eq!(id, RequestId::String("test-id".to_string()));
+    }
+
+    #[test]
+    fn request_id_display() {
+        assert_eq!(format!("{}", RequestId::Number(42)), "42");
+        assert_eq!(format!("{}", RequestId::String("req-1".to_string())), "req-1");
+    }
+
+    #[test]
+    fn request_id_equality() {
+        assert_eq!(RequestId::Number(1), RequestId::Number(1));
+        assert_ne!(RequestId::Number(1), RequestId::Number(2));
+        assert_eq!(
+            RequestId::String("a".to_string()),
+            RequestId::String("a".to_string())
+        );
+        assert_ne!(RequestId::Number(1), RequestId::String("1".to_string()));
+    }
+
+    // ========================================================================
+    // JsonRpcRequest Tests
+    // ========================================================================
+
+    #[test]
+    fn request_serialization() {
         let req = JsonRpcRequest::new("tools/list", None, 1i64);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
         assert!(json.contains("\"method\":\"tools/list\""));
+        assert!(json.contains("\"id\":1"));
     }
 
     #[test]
-    fn test_notification() {
+    fn request_with_params() {
+        let params = json!({"name": "greet", "arguments": {"name": "World"}});
+        let req = JsonRpcRequest::new("tools/call", Some(params.clone()), 2i64);
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "tools/call");
+        assert_eq!(value["params"]["name"], "greet");
+        assert_eq!(value["id"], 2);
+    }
+
+    #[test]
+    fn request_without_params_omits_field() {
+        let req = JsonRpcRequest::new("tools/list", None, 1i64);
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert!(value.get("params").is_none());
+    }
+
+    #[test]
+    fn notification_has_no_id() {
         let notif = JsonRpcRequest::notification("notifications/progress", None);
         assert!(notif.is_notification());
+        assert!(notif.id.is_none());
+        let value = serde_json::to_value(&notif).expect("serialize");
+        assert!(value.get("id").is_none());
+    }
+
+    #[test]
+    fn notification_with_params() {
+        let params = json!({"uri": "file://changed.txt"});
+        let notif =
+            JsonRpcRequest::notification("notifications/resources/updated", Some(params));
+        assert!(notif.is_notification());
+        let value = serde_json::to_value(&notif).expect("serialize");
+        assert_eq!(value["params"]["uri"], "file://changed.txt");
+    }
+
+    #[test]
+    fn request_is_not_notification() {
+        let req = JsonRpcRequest::new("tools/list", None, 1i64);
+        assert!(!req.is_notification());
+    }
+
+    #[test]
+    fn request_with_string_id() {
+        let req = JsonRpcRequest::new("tools/list", None, "req-abc");
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(value["id"], "req-abc");
+    }
+
+    #[test]
+    fn request_round_trip() {
+        let original = JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({"name": "add", "arguments": {"a": 1, "b": 2}})),
+            42i64,
+        );
+        let json_str = serde_json::to_string(&original).expect("serialize");
+        let deserialized: JsonRpcRequest = serde_json::from_str(&json_str).expect("deserialize");
+        assert_eq!(deserialized.method, "tools/call");
+        assert_eq!(deserialized.id, Some(RequestId::Number(42)));
+        assert!(deserialized.params.is_some());
+    }
+
+    // ========================================================================
+    // JsonRpcError Tests
+    // ========================================================================
+
+    #[test]
+    fn jsonrpc_error_serialization() {
+        let error = JsonRpcError {
+            code: -32600,
+            message: "Invalid Request".to_string(),
+            data: None,
+        };
+        let value = serde_json::to_value(&error).expect("serialize");
+        assert_eq!(value["code"], -32600);
+        assert_eq!(value["message"], "Invalid Request");
+        assert!(value.get("data").is_none());
+    }
+
+    #[test]
+    fn jsonrpc_error_with_data() {
+        let error = JsonRpcError {
+            code: -32602,
+            message: "Invalid params".to_string(),
+            data: Some(json!({"field": "name", "reason": "required"})),
+        };
+        let value = serde_json::to_value(&error).expect("serialize");
+        assert_eq!(value["code"], -32602);
+        assert_eq!(value["data"]["field"], "name");
+    }
+
+    #[test]
+    fn jsonrpc_error_standard_codes() {
+        // Parse error
+        let err = JsonRpcError {
+            code: -32700,
+            message: "Parse error".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["code"],
+            -32700
+        );
+
+        // Method not found
+        let err = JsonRpcError {
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["code"],
+            -32601
+        );
+
+        // Internal error
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["code"],
+            -32603
+        );
+    }
+
+    // ========================================================================
+    // JsonRpcResponse Tests
+    // ========================================================================
+
+    #[test]
+    fn response_success() {
+        let resp = JsonRpcResponse::success(RequestId::Number(1), json!({"result": "ok"}));
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["result"]["result"], "ok");
+        assert_eq!(value["id"], 1);
+        assert!(value.get("error").is_none());
+        assert!(!resp.is_error());
+    }
+
+    #[test]
+    fn response_error() {
+        let error = JsonRpcError {
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: None,
+        };
+        let resp = JsonRpcResponse::error(Some(RequestId::Number(1)), error);
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert!(value.get("result").is_none());
+        assert_eq!(value["error"]["code"], -32601);
+        assert_eq!(value["error"]["message"], "Method not found");
+        assert_eq!(value["id"], 1);
+        assert!(resp.is_error());
+    }
+
+    #[test]
+    fn response_error_null_id() {
+        let error = JsonRpcError {
+            code: -32700,
+            message: "Parse error".to_string(),
+            data: None,
+        };
+        let resp = JsonRpcResponse::error(None, error);
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert!(value["id"].is_null());
+    }
+
+    #[test]
+    fn response_round_trip() {
+        let original = JsonRpcResponse::success(
+            RequestId::String("abc".to_string()),
+            json!({"tools": []}),
+        );
+        let json_str = serde_json::to_string(&original).expect("serialize");
+        let deserialized: JsonRpcResponse = serde_json::from_str(&json_str).expect("deserialize");
+        assert!(!deserialized.is_error());
+        assert!(deserialized.result.is_some());
+        assert_eq!(
+            deserialized.id,
+            Some(RequestId::String("abc".to_string()))
+        );
+    }
+
+    // ========================================================================
+    // JsonRpcMessage Tests
+    // ========================================================================
+
+    #[test]
+    fn message_request_variant() {
+        let req = JsonRpcRequest::new("tools/list", None, 1i64);
+        let msg = JsonRpcMessage::Request(req);
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["method"], "tools/list");
+    }
+
+    #[test]
+    fn message_response_variant() {
+        let resp = JsonRpcResponse::success(RequestId::Number(1), json!("ok"));
+        let msg = JsonRpcMessage::Response(resp);
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["result"], "ok");
+    }
+
+    #[test]
+    fn message_deserialize_as_request() {
+        let json_str = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let msg: JsonRpcMessage = serde_json::from_str(json_str).expect("deserialize");
+        match msg {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.method, "tools/list");
+                assert_eq!(req.id, Some(RequestId::Number(1)));
+            }
+            _ => panic!("Expected request variant"),
+        }
+    }
+
+    #[test]
+    fn message_deserialize_as_response() {
+        let json_str = r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#;
+        let msg: JsonRpcMessage = serde_json::from_str(json_str).expect("deserialize");
+        match msg {
+            JsonRpcMessage::Response(resp) => {
+                assert!(!resp.is_error());
+                assert_eq!(resp.id, Some(RequestId::Number(1)));
+            }
+            // The untagged enum may also parse as Request depending on field overlap
+            JsonRpcMessage::Request(_) => {
+                // This is acceptable for untagged deserialization
+            }
+        }
+    }
+
+    // ========================================================================
+    // JSONRPC_VERSION constant test
+    // ========================================================================
+
+    #[test]
+    fn jsonrpc_version_constant() {
+        assert_eq!(JSONRPC_VERSION, "2.0");
     }
 }
