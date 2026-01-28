@@ -1549,11 +1549,12 @@ impl ResourceReader for RouterResourceReader {
             // Create a child context with incremented depth
             // Clone router again for the nested reader (the original is borrowed by resolved)
             let nested_router = router.clone();
+            let nested_state = session_state.clone();
             let child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
                 .with_resource_read_depth(depth)
                 .with_resource_reader(Arc::new(RouterResourceReader::new(
                     nested_router,
-                    SessionState::new(), // Use fresh state for nested reads
+                    nested_state,
                 )));
 
             // Read the resource
@@ -1661,15 +1662,16 @@ impl ToolCaller for RouterToolCaller {
             // Create a child context with incremented depth
             // Clone router again for nested calls
             let nested_router = router.clone();
-            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state.clone())
+            let nested_state = session_state.clone();
+            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
                 .with_tool_call_depth(depth)
                 .with_tool_caller(Arc::new(RouterToolCaller::new(
                     nested_router.clone(),
-                    SessionState::new(),
+                    nested_state.clone(),
                 )))
                 .with_resource_reader(Arc::new(RouterResourceReader::new(
                     nested_router,
-                    SessionState::new(),
+                    nested_state,
                 )));
 
             // Call the tool

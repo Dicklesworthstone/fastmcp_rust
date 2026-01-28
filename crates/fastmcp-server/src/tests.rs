@@ -4329,6 +4329,96 @@ mod ctx_read_resource_tests {
         // Verify the constant is reasonable
         assert_eq!(MAX_RESOURCE_READ_DEPTH, 10);
     }
+
+    /// A resource that reads session state and then reads another resource.
+    struct SessionStateResource;
+
+    impl ResourceHandler for SessionStateResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "session://state".to_string(),
+                name: "session_state".to_string(),
+                description: Some("Returns session state value".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            let value: Option<String> = ctx.get_state("test_key");
+            Ok(vec![ResourceContent {
+                uri: "session://state".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(value.unwrap_or_else(|| "no_value".to_string())),
+                blob: None,
+            }])
+        }
+    }
+
+    /// A resource that sets session state and reads another resource to verify propagation.
+    struct NestedSessionResource;
+
+    impl ResourceHandler for NestedSessionResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "nested://session".to_string(),
+                name: "nested_session".to_string(),
+                description: Some("Sets state then reads another resource".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // Set a value in session state
+            ctx.set_state("test_key", "propagated_value");
+
+            // Read another resource - it should see our session state
+            let inner_result = fastmcp_core::block_on(ctx.read_resource("session://state"))?;
+            let text = inner_result.first_text().unwrap_or("(no content)");
+
+            Ok(vec![ResourceContent {
+                uri: "nested://session".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(format!("Inner saw: {}", text)),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn test_session_state_propagates_through_nested_reads() {
+        let mut router = Router::new();
+        router.add_resource(SessionStateResource);
+        router.add_resource(NestedSessionResource);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state).with_resource_reader(reader);
+
+        // Read the nested resource - it sets state then reads another resource
+        let result = fastmcp_core::block_on(ctx.read_resource("nested://session"));
+        assert!(result.is_ok());
+        let read_result = result.unwrap();
+
+        // The inner resource should have seen the propagated value
+        let text = read_result.first_text().unwrap();
+        assert!(
+            text.contains("propagated_value"),
+            "Expected session state to propagate, got: {}",
+            text
+        );
+    }
 }
 
 // ============================================================================
@@ -4642,5 +4732,88 @@ mod ctx_call_tool_tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("validation"));
+    }
+
+    /// A tool that reads session state.
+    struct GetStateTool;
+
+    impl ToolHandler for GetStateTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "get_state".to_string(),
+                description: Some("Returns session state value".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            let value: Option<String> = ctx.get_state("tool_test_key");
+            Ok(vec![Content::Text {
+                text: value.unwrap_or_else(|| "no_value".to_string()),
+            }])
+        }
+    }
+
+    /// A tool that sets session state and calls another tool to verify propagation.
+    struct NestedStateTool;
+
+    impl ToolHandler for NestedStateTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested_state".to_string(),
+                description: Some("Sets state then calls another tool".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            // Set a value in session state
+            ctx.set_state("tool_test_key", "tool_propagated_value");
+
+            // Call another tool - it should see our session state
+            let inner_result =
+                fastmcp_core::block_on(ctx.call_tool("get_state", serde_json::json!({})))?;
+            let text = inner_result.first_text().unwrap_or("(no content)");
+
+            Ok(vec![Content::Text {
+                text: format!("Inner tool saw: {}", text),
+            }])
+        }
+    }
+
+    #[test]
+    fn test_session_state_propagates_through_nested_tool_calls() {
+        use crate::RouterResourceReader;
+
+        let mut router = Router::new();
+        router.add_tool(GetStateTool);
+        router.add_tool(NestedStateTool);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let caller: Arc<dyn ToolCaller> = Arc::new(RouterToolCaller::new(
+            router_arc.clone(),
+            session_state.clone(),
+        ));
+        let reader: Arc<dyn fastmcp_core::ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state)
+            .with_tool_caller(caller)
+            .with_resource_reader(reader);
+
+        // Call the nested tool - it sets state then calls another tool
+        let result = fastmcp_core::block_on(ctx.call_tool("nested_state", serde_json::json!({})));
+        assert!(result.is_ok());
+        let call_result = result.unwrap();
+
+        // The inner tool should have seen the propagated value
+        let text = call_result.first_text().unwrap();
+        assert!(
+            text.contains("tool_propagated_value"),
+            "Expected session state to propagate through tool calls, got: {}",
+            text
+        );
     }
 }
