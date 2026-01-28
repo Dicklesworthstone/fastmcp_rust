@@ -1189,4 +1189,283 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(id1.len(), 16);
     }
+
+    // =========================================================================
+    // E2E HTTP Transport Tests (bd-2kv / bd-3fq1)
+    // =========================================================================
+
+    #[test]
+    fn e2e_http_request_response_flow() {
+        use fastmcp_protocol::RequestId;
+        use std::io::Cursor;
+
+        // Build an HTTP request with JSON-RPC body
+        let json_rpc_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": 1
+        });
+        let body = serde_json::to_vec(&json_rpc_request).unwrap();
+
+        let http_request = format!(
+            "POST /mcp/v1 HTTP/1.1\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            body.len()
+        );
+
+        let mut input = http_request.into_bytes();
+        input.extend(body);
+
+        let reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let cx = Cx::for_testing();
+
+        {
+            let mut transport = HttpTransport::new(reader, &mut output);
+
+            // Receive the request
+            let msg = transport.recv(&cx).unwrap();
+            match msg {
+                JsonRpcMessage::Request(req) => {
+                    assert_eq!(req.method, "tools/list");
+                    assert_eq!(req.id, Some(RequestId::Number(1)));
+
+                    // Send response
+                    let response = JsonRpcResponse {
+                        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                        result: Some(serde_json::json!({"tools": []})),
+                        error: None,
+                        id: Some(RequestId::Number(1)),
+                    };
+                    transport
+                        .send(&cx, &JsonRpcMessage::Response(response))
+                        .unwrap();
+                }
+                _ => panic!("Expected request"),
+            }
+        }
+
+        // Verify HTTP response
+        let response_str = String::from_utf8(output).unwrap();
+        assert!(response_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response_str.contains("content-type: application/json"));
+        assert!(response_str.contains("\"tools\":[]"));
+    }
+
+    #[test]
+    fn e2e_http_error_status_codes() {
+        let handler = HttpRequestHandler::new();
+
+        // Invalid method should return error
+        let request = HttpRequest::new(HttpMethod::Get, "/mcp/v1")
+            .with_header("Content-Type", "application/json");
+        let result = handler.parse_request(&request);
+        assert!(matches!(result, Err(HttpError::InvalidMethod(_))));
+
+        // Invalid content type
+        let request =
+            HttpRequest::new(HttpMethod::Post, "/mcp/v1").with_header("Content-Type", "text/xml");
+        let result = handler.parse_request(&request);
+        assert!(matches!(result, Err(HttpError::InvalidContentType(_))));
+
+        // Create error response
+        let response = handler.error_response(HttpStatus::BAD_REQUEST, "Invalid request format");
+        assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+        let body_str = String::from_utf8(response.body).unwrap();
+        assert!(body_str.contains("\"error\""));
+    }
+
+    #[test]
+    fn e2e_http_content_type_handling() {
+        let handler = HttpRequestHandler::new();
+
+        // Standard JSON content type
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#);
+        assert!(handler.parse_request(&request).is_ok());
+
+        // JSON with charset
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json; charset=utf-8")
+            .with_body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#);
+        assert!(handler.parse_request(&request).is_ok());
+
+        // Response content type is always application/json
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({})),
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        };
+        let http_response = handler.create_response(&response, None);
+        assert_eq!(
+            http_response.headers.get("content-type"),
+            Some(&"application/json".to_string())
+        );
+    }
+
+    #[test]
+    fn e2e_http_cors_handling() {
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://allowed.com".to_string()],
+            ..Default::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+
+        // Allowed origin
+        assert!(handler.is_origin_allowed("https://allowed.com"));
+
+        // Disallowed origin
+        assert!(!handler.is_origin_allowed("https://evil.com"));
+
+        // OPTIONS request from allowed origin
+        let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://allowed.com");
+        let response = handler.handle_options(&request);
+        assert_eq!(response.status, HttpStatus::OK);
+        assert_eq!(
+            response.headers.get("access-control-allow-origin"),
+            Some(&"https://allowed.com".to_string())
+        );
+
+        // OPTIONS request from disallowed origin
+        let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://evil.com");
+        let response = handler.handle_options(&request);
+        assert_eq!(response.status, HttpStatus::FORBIDDEN);
+    }
+
+    #[test]
+    fn e2e_http_streaming_transport() {
+        use fastmcp_protocol::RequestId;
+
+        let mut transport = StreamableHttpTransport::new();
+        let cx = Cx::for_testing();
+
+        // Simulate multiple requests being pushed (from HTTP handlers)
+        let req1 = JsonRpcRequest::new("method1", None, 1i64);
+        let req2 = JsonRpcRequest::new("method2", None, 2i64);
+        transport.push_request(req1);
+        transport.push_request(req2);
+
+        // Transport should receive requests in LIFO order (pop from vec)
+        let msg = transport.recv(&cx).unwrap();
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "method2"); // Last pushed, first popped
+        }
+
+        // Send a response
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({})),
+            error: None,
+            id: Some(RequestId::Number(2)),
+        };
+        transport
+            .send(&cx, &JsonRpcMessage::Response(response))
+            .unwrap();
+
+        // Response should be available for streaming
+        assert!(transport.has_responses());
+        let resp = transport.pop_response().unwrap();
+        assert_eq!(resp.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn e2e_http_session_lifecycle() {
+        let store = SessionStore::new(Duration::from_millis(100));
+
+        // Create session
+        let id = store.create();
+        assert_eq!(store.count(), 1);
+
+        // Get and modify session
+        let mut session = store.get(&id).unwrap();
+        session.set("user_id", serde_json::json!(42));
+        store.update(session);
+
+        // Retrieve and verify
+        let session = store.get(&id).unwrap();
+        assert_eq!(session.get("user_id"), Some(&serde_json::json!(42)));
+
+        // Wait for expiration
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Session should be expired
+        assert!(store.get(&id).is_none());
+    }
+
+    #[test]
+    fn e2e_http_transport_cancellation() {
+        use std::io::Cursor;
+
+        let reader = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let mut transport = HttpTransport::new(reader, &mut output);
+
+        // Send should respect cancellation
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: None,
+        };
+        let result = transport.send(&cx, &JsonRpcMessage::Response(response));
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+
+        // Nothing should be written
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn e2e_http_transport_close() {
+        use std::io::Cursor;
+
+        let reader = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let cx = Cx::for_testing();
+        let mut transport = HttpTransport::new(reader, &mut output);
+
+        // Close transport
+        transport.close().unwrap();
+
+        // Operations should fail after close
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: None,
+        };
+        let result = transport.send(&cx, &JsonRpcMessage::Response(response));
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn e2e_http_body_size_limit() {
+        let config = HttpHandlerConfig {
+            max_body_size: 100,
+            ..Default::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+
+        // Body exceeding limit
+        let large_body = vec![b'x'; 200];
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_body(large_body);
+
+        let result = handler.parse_request(&request);
+        // The error message contains "body size"
+        assert!(matches!(result, Err(HttpError::InvalidContentType(_))));
+    }
 }
