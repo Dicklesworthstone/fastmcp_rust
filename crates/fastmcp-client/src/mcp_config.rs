@@ -204,14 +204,13 @@ impl McpConfig {
     /// Returns an error if the file cannot be read or parsed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let content =
-            std::fs::read_to_string(path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ConfigError::NotFound(path.display().to_string())
-                } else {
-                    ConfigError::ReadError(e)
-                }
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::NotFound(path.display().to_string())
+            } else {
+                ConfigError::ReadError(e)
+            }
+        })?;
 
         Self::from_json(&content)
     }
@@ -320,7 +319,11 @@ impl McpConfig {
 }
 
 /// Spawns a client from a server configuration.
-fn spawn_client_from_config(name: &str, config: &ServerConfig, cx: Cx) -> Result<Client, ConfigError> {
+fn spawn_client_from_config(
+    name: &str,
+    config: &ServerConfig,
+    cx: Cx,
+) -> Result<Client, ConfigError> {
     // Build the command
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args);
@@ -709,10 +712,7 @@ mod tests {
     fn test_config_add_and_get_server() {
         let mut config = McpConfig::new();
 
-        config.add_server(
-            "test",
-            ServerConfig::new("echo").with_args(["hello"]),
-        );
+        config.add_server("test", ServerConfig::new("echo").with_args(["hello"]));
 
         assert_eq!(config.server_names().len(), 1);
         assert!(config.get_server("test").is_some());
@@ -763,7 +763,14 @@ mod tests {
             .with_priority_path("/priority/config.json");
 
         let paths = loader.search_paths();
-        assert!(paths.first().unwrap().to_str().unwrap().contains("priority"));
+        assert!(
+            paths
+                .first()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("priority")
+        );
         assert!(paths.last().unwrap().to_str().unwrap().contains("custom"));
     }
 
@@ -793,7 +800,10 @@ mod tests {
     fn test_config_error_display() {
         let errors = vec![
             (ConfigError::NotFound("path".into()), "not found"),
-            (ConfigError::ServerNotFound("name".into()), "server not found"),
+            (
+                ConfigError::ServerNotFound("name".into()),
+                "server not found",
+            ),
             (ConfigError::ServerDisabled("name".into()), "disabled"),
             (ConfigError::ParseError("msg".into()), "parse"),
         ];
