@@ -51,6 +51,9 @@ getrandom = "0.3"
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 
+# Testing
+trybuild = { version = "1", default-features = false }
+
 # Internal crates
 fastmcp = { path = "crates/fastmcp" }
 fastmcp-core = { path = "crates/fastmcp-core" }
