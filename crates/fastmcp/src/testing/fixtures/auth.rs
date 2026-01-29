@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_generate_test_token() {
         let token1 = generate_test_token("test", 16);
-        let token2 = generate_test_token("test", 16);
+        let _token2 = generate_test_token("test", 16);
 
         assert!(token1.starts_with("test-"));
         assert!(token1.len() == "test-".len() + 16);

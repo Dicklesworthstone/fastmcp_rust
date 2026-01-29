@@ -376,18 +376,22 @@ impl TransformedToolBuilder {
         };
 
         // Ensure properties and required exist
+        // Note: Using String::from() with static str is optimized by the compiler
+        // but explicit owned strings are required for serde_json::Map keys
         if !obj.contains_key("properties") {
-            obj.insert("properties".to_string(), serde_json::json!({}));
+            obj.insert(String::from("properties"), serde_json::json!({}));
         }
         if !obj.contains_key("required") {
-            obj.insert("required".to_string(), serde_json::json!([]));
+            obj.insert(String::from("required"), serde_json::json!([]));
         }
 
         // Track changes to apply
-        let mut props_to_remove: Vec<String> = Vec::new();
-        let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::new();
-        let mut required_renames: Vec<(String, String)> = Vec::new();
-        let mut required_removes: Vec<String> = Vec::new();
+        // Pre-allocate based on transform count to avoid reallocations
+        let capacity = self.arg_transforms.len();
+        let mut props_to_remove: Vec<String> = Vec::with_capacity(capacity);
+        let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::with_capacity(capacity);
+        let mut required_renames: Vec<(String, String)> = Vec::with_capacity(capacity);
+        let mut required_removes: Vec<String> = Vec::with_capacity(capacity);
 
         // First pass: collect property transformations
         {
@@ -408,7 +412,7 @@ impl TransformedToolBuilder {
                     if let (Some(desc), Some(schema_obj)) =
                         (&transform.description, new_schema.as_object_mut())
                     {
-                        schema_obj.insert("description".to_string(), serde_json::json!(desc));
+                        schema_obj.insert(String::from("description"), serde_json::json!(desc));
                     }
 
                     // Apply type override
@@ -420,7 +424,7 @@ impl TransformedToolBuilder {
                     if let (Some(default), Some(schema_obj)) =
                         (&transform.default, new_schema.as_object_mut())
                     {
-                        schema_obj.insert("default".to_string(), default.clone());
+                        schema_obj.insert(String::from("default"), default.clone());
                     }
 
                     if new_name != original_name {
@@ -453,10 +457,10 @@ impl TransformedToolBuilder {
                     required[idx] = serde_json::json!(new_name);
                 }
             }
-            // Handle removes
+            // Handle removes - compare &str directly to avoid allocation
             required.retain(|v| {
                 v.as_str()
-                    .is_none_or(|s| !required_removes.contains(&s.to_string()))
+                    .is_none_or(|s| !required_removes.iter().any(|r| r == s))
             });
         }
 

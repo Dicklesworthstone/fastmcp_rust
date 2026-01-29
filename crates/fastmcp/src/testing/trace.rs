@@ -47,6 +47,109 @@ pub fn is_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns the trace output directory from `FASTMCP_TEST_TRACE_DIR` or defaults to "test_traces".
+pub fn get_trace_dir() -> std::path::PathBuf {
+    std::env::var("FASTMCP_TEST_TRACE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("test_traces"))
+}
+
+/// Configuration for trace file cleanup.
+#[derive(Debug, Clone)]
+pub struct TraceRetentionConfig {
+    /// Maximum number of trace files to keep.
+    pub max_files: Option<usize>,
+    /// Maximum age of trace files in seconds.
+    pub max_age_secs: Option<u64>,
+}
+
+impl Default for TraceRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_files: Some(100),
+            max_age_secs: Some(7 * 24 * 60 * 60), // 7 days
+        }
+    }
+}
+
+/// Cleans up old trace files based on retention configuration.
+///
+/// Removes trace files that exceed either the max file count or max age.
+/// Files are sorted by modification time (oldest first) when enforcing max_files.
+///
+/// # Arguments
+///
+/// * `dir` - The directory containing trace files
+/// * `config` - Retention configuration
+///
+/// # Returns
+///
+/// The number of files removed.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be read.
+pub fn cleanup_old_traces(
+    dir: impl AsRef<Path>,
+    config: &TraceRetentionConfig,
+) -> std::io::Result<usize> {
+    let dir = dir.as_ref();
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            let modified = metadata.modified().ok()?;
+            Some((e.path(), modified))
+        })
+        .collect();
+
+    // Sort by modification time (oldest first)
+    entries.sort_by_key(|(_, time)| *time);
+
+    let mut removed = 0;
+    let now = SystemTime::now();
+
+    // Remove files older than max_age_secs
+    if let Some(max_age) = config.max_age_secs {
+        let max_age_duration = std::time::Duration::from_secs(max_age);
+        entries.retain(|(path, modified)| {
+            if let Ok(age) = now.duration_since(*modified) {
+                if age > max_age_duration {
+                    if fs::remove_file(path).is_ok() {
+                        removed += 1;
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    // Remove excess files (oldest first)
+    if let Some(max_files) = config.max_files {
+        while entries.len() > max_files {
+            if let Some((path, _)) = entries.first() {
+                if fs::remove_file(path).is_ok() {
+                    removed += 1;
+                }
+            }
+            entries.remove(0);
+        }
+    }
+
+    Ok(removed)
+}
+
 /// Global correlation ID counter.
 static CORRELATION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -716,6 +819,90 @@ impl TestTrace {
         Ok(())
     }
 
+    /// Saves the trace with automatic file naming to the trace directory.
+    ///
+    /// The file is saved to `FASTMCP_TEST_TRACE_DIR/{name}_{timestamp}.json`.
+    /// Creates the directory if it doesn't exist.
+    ///
+    /// Optionally runs cleanup to remove old trace files.
+    ///
+    /// # Arguments
+    ///
+    /// * `cleanup` - If Some, runs cleanup with the given retention config
+    ///
+    /// # Returns
+    ///
+    /// The path to the saved file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let trace = TestTrace::new("my-test");
+    /// // ... record trace entries ...
+    ///
+    /// // Save with default cleanup
+    /// let path = trace.auto_save(Some(&TraceRetentionConfig::default()))?;
+    /// println!("Trace saved to: {}", path.display());
+    ///
+    /// // Save without cleanup
+    /// let path = trace.auto_save(None)?;
+    /// ```
+    pub fn auto_save(
+        &self,
+        cleanup: Option<&TraceRetentionConfig>,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let dir = get_trace_dir();
+
+        // Ensure directory exists
+        fs::create_dir_all(&dir)?;
+
+        // Run cleanup if configured
+        if let Some(config) = cleanup {
+            let _ = cleanup_old_traces(&dir, config);
+        }
+
+        // Generate filename: {name}_{timestamp}.json
+        let timestamp = self.generate_file_timestamp();
+        let safe_name = self.sanitize_filename(&self.name);
+        let filename = format!("{safe_name}_{timestamp}.json");
+        let path = dir.join(filename);
+
+        // Save the trace
+        self.save(&path)?;
+
+        Ok(path)
+    }
+
+    /// Generates a timestamp suitable for filenames (no colons).
+    fn generate_file_timestamp(&self) -> String {
+        // Use the trace's start timestamp but make it filename-safe
+        // Format: YYYYMMDD_HHMMSS_mmm
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+
+        let secs = now.as_secs();
+        let millis = now.subsec_millis();
+        let (year, month, day, hour, min, sec) = epoch_to_datetime(secs);
+
+        format!("{year:04}{month:02}{day:02}_{hour:02}{min:02}{sec:02}_{millis:03}")
+    }
+
+    /// Sanitizes a string for use in filenames.
+    fn sanitize_filename(&self, name: &str) -> String {
+        name.chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                ' ' | '/' | '\\' | ':' => '_',
+                _ => '_',
+            })
+            .collect()
+    }
+
     /// Returns the trace as a JSON string.
     ///
     /// # Errors
@@ -971,8 +1158,8 @@ mod tests {
     fn test_timestamp_format() {
         let ts = current_timestamp();
         // Should match ISO 8601 format: YYYY-MM-DDTHH:MM:SS.mmmZ
-        assert!(ts.contains("T"));
-        assert!(ts.ends_with("Z"));
+        assert!(ts.contains('T'));
+        assert!(ts.ends_with('Z'));
         assert_eq!(ts.len(), 24);
     }
 
@@ -986,5 +1173,121 @@ mod tests {
         assert_eq!(hour, 0);
         assert_eq!(min, 0);
         assert_eq!(sec, 0);
+    }
+
+    #[test]
+    fn test_get_trace_dir_returns_path() {
+        // Just verify get_trace_dir returns a PathBuf (default or from env)
+        let dir = get_trace_dir();
+        // Should return some valid path
+        assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_trace_retention_config_default() {
+        let config = TraceRetentionConfig::default();
+        assert_eq!(config.max_files, Some(100));
+        assert_eq!(config.max_age_secs, Some(7 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_sanitize_filename() {
+        let trace = TestTrace::builder("test/with:special\\chars")
+            .with_console_output(false)
+            .build();
+        let sanitized = trace.sanitize_filename(&trace.name);
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains(':'));
+        assert!(!sanitized.contains('\\'));
+        assert!(sanitized.contains('_'));
+    }
+
+    #[test]
+    fn test_generate_file_timestamp() {
+        let trace = TestTrace::builder("timestamp-test")
+            .with_console_output(false)
+            .build();
+        let ts = trace.generate_file_timestamp();
+        // Should be format: YYYYMMDD_HHMMSS_mmm (e.g., 20260129_013800_123)
+        // Length is 19: 8 + 1 + 6 + 1 + 3 = 19
+        assert_eq!(ts.len(), 19);
+        assert!(ts.contains('_'));
+        // Should not contain colons or dashes
+        assert!(!ts.contains(':'));
+        assert!(!ts.contains('-'));
+    }
+
+    #[test]
+    fn test_save_to_explicit_path() {
+        use std::path::PathBuf;
+
+        // Use explicit path instead of auto_save to avoid env var issues
+        let test_dir = PathBuf::from("target/test_traces_explicit");
+        let _ = fs::remove_dir_all(&test_dir);
+
+        let mut trace = TestTrace::builder("explicit-save-test")
+            .with_console_output(false)
+            .build();
+
+        trace.info("test message");
+
+        let path = test_dir.join("test_trace.json");
+        trace.save(&path).unwrap();
+
+        // Verify file was created
+        assert!(path.exists());
+
+        // Verify content is valid JSON
+        let content = fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["name"], "explicit-save-test");
+        assert!(json["entries"].is_array());
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cleanup_old_traces() {
+        use std::path::PathBuf;
+
+        let test_dir = PathBuf::from("target/test_traces_cleanup");
+
+        // Clean up and create directory
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        // Create some test files
+        for i in 0..5 {
+            let path = test_dir.join(format!("trace_{i}.json"));
+            fs::write(&path, "{}").unwrap();
+        }
+
+        // Verify files exist
+        let count_before: usize = fs::read_dir(&test_dir).unwrap().count();
+        assert_eq!(count_before, 5);
+
+        // Run cleanup with max_files=3
+        let config = TraceRetentionConfig {
+            max_files: Some(3),
+            max_age_secs: None,
+        };
+        let removed = cleanup_old_traces(&test_dir, &config).unwrap();
+
+        // Verify cleanup worked
+        assert_eq!(removed, 2);
+        let count_after: usize = fs::read_dir(&test_dir).unwrap().count();
+        assert_eq!(count_after, 3);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cleanup_nonexistent_dir() {
+        let config = TraceRetentionConfig::default();
+        let result = cleanup_old_traces("/nonexistent/path/123456", &config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 }

@@ -672,8 +672,12 @@ fn tool_nested_vec_param_call() {
 #[tool]
 fn all_optional_tool(a: Option<String>, b: Option<i32>, c: Option<bool>) -> String {
     let a_str = a.unwrap_or_else(|| "none".to_string());
-    let b_str = b.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
-    let c_str = c.map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+    let b_str = b
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let c_str = c
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "none".to_string());
     format!("a={a_str}, b={b_str}, c={c_str}")
 }
 
@@ -989,6 +993,183 @@ fn resource_default_timeout_is_none() {
     assert!(handler.timeout().is_none());
 }
 
+// --- Resource with multiple URI template parameters ---
+
+/// A resource with multiple path segments.
+#[resource(uri = "files://{directory}/{filename}")]
+fn multi_param_resource(directory: String, filename: String) -> String {
+    format!("{directory}/{filename}")
+}
+
+#[test]
+fn resource_multi_param_template() {
+    let handler = MultiParamResourceResource;
+    let template = handler.template().expect("should have template");
+    assert_eq!(template.uri_template, "files://{directory}/{filename}");
+}
+
+#[test]
+fn resource_multi_param_read_with_uri() {
+    let handler = MultiParamResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("directory".to_string(), "docs".to_string());
+    params.insert("filename".to_string(), "readme.txt".to_string());
+    let result = handler
+        .read_with_uri(&ctx, "files://docs/readme.txt", &params)
+        .unwrap();
+    assert_eq!(result[0].text, Some("docs/readme.txt".to_string()));
+}
+
+// --- Resource with optional URI template parameter ---
+
+/// Resource with optional path parameter.
+#[resource(uri = "search://{query}")]
+fn optional_param_resource(query: Option<String>) -> String {
+    match query {
+        Some(q) => format!("results for: {q}"),
+        None => "no query".to_string(),
+    }
+}
+
+#[test]
+fn resource_optional_param_with_value() {
+    let handler = OptionalParamResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("query".to_string(), "rust".to_string());
+    let result = handler
+        .read_with_uri(&ctx, "search://rust", &params)
+        .unwrap();
+    assert_eq!(result[0].text, Some("results for: rust".to_string()));
+}
+
+#[test]
+fn resource_optional_param_without_value() {
+    let handler = OptionalParamResourceResource;
+    let ctx = test_ctx();
+    let params = HashMap::new();
+    let result = handler.read_with_uri(&ctx, "search://", &params).unwrap();
+    assert_eq!(result[0].text, Some("no query".to_string()));
+}
+
+// --- Resource returning McpResult with error case ---
+
+/// Resource that can fail.
+#[resource(uri = "fallible://checked")]
+fn fallible_error_resource() -> McpResult<String> {
+    Err(fastmcp::McpError::internal_error("resource failed"))
+}
+
+#[test]
+fn resource_result_err() {
+    let handler = FallibleErrorResourceResource;
+    let ctx = test_ctx();
+    let result = handler.read(&ctx);
+    assert!(result.is_err());
+}
+
+// --- Async resource with context ---
+
+/// Async resource using context.
+#[resource(uri = "async-ctx://info")]
+async fn async_ctx_resource(ctx: &McpContext) -> String {
+    format!("async_request_id={}", ctx.request_id())
+}
+
+#[test]
+fn async_resource_with_context_definition() {
+    let handler = AsyncCtxResourceResource;
+    let def = handler.definition();
+    assert_eq!(def.uri, "async-ctx://info");
+}
+
+#[test]
+fn async_resource_with_context_read() {
+    let handler = AsyncCtxResourceResource;
+    let ctx = test_ctx();
+    let result = handler.read(&ctx).unwrap();
+    assert_eq!(result[0].text, Some("async_request_id=1".to_string()));
+}
+
+// --- Resource with context AND URI template ---
+
+/// Resource with both context and template params.
+#[resource(uri = "ctx-template://{id}")]
+fn ctx_template_resource(ctx: &McpContext, id: String) -> String {
+    format!("request={}, id={}", ctx.request_id(), id)
+}
+
+#[test]
+fn resource_ctx_and_template_read() {
+    let handler = CtxTemplateResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("id".to_string(), "abc123".to_string());
+    let result = handler
+        .read_with_uri(&ctx, "ctx-template://abc123", &params)
+        .unwrap();
+    assert_eq!(result[0].text, Some("request=1, id=abc123".to_string()));
+}
+
+// --- Async resource with URI template ---
+
+/// Async templated resource.
+#[resource(uri = "async-file://{path}")]
+async fn async_template_resource(path: String) -> String {
+    format!("async contents of {path}")
+}
+
+#[test]
+fn async_template_resource_definition() {
+    let handler = AsyncTemplateResourceResource;
+    let template = handler.template().expect("should have template");
+    assert_eq!(template.uri_template, "async-file://{path}");
+}
+
+#[test]
+fn async_template_resource_read() {
+    let handler = AsyncTemplateResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("path".to_string(), "data.json".to_string());
+    let result = handler
+        .read_with_uri(&ctx, "async-file://data.json", &params)
+        .unwrap();
+    assert_eq!(
+        result[0].text,
+        Some("async contents of data.json".to_string())
+    );
+}
+
+// --- Resource with no description ---
+
+#[resource(uri = "no-desc://data")]
+fn no_desc_resource() -> String {
+    "data".to_string()
+}
+
+#[test]
+fn resource_no_description_is_none() {
+    let handler = NoDescResourceResource;
+    let def = handler.definition();
+    assert!(def.description.is_none());
+}
+
+// --- Resource with compound timeout ---
+
+/// Resource with compound timeout.
+#[resource(uri = "long-timed://data", timeout = "2m30s")]
+fn long_timed_resource() -> String {
+    "long timed".to_string()
+}
+
+#[test]
+fn resource_timeout_compound() {
+    let handler = LongTimedResourceResource;
+    assert_eq!(handler.timeout(), Some(std::time::Duration::from_secs(150)));
+}
+
 // ============================================================================
 // #[prompt] expansion tests
 // ============================================================================
@@ -1249,6 +1430,218 @@ fn prompt_default_tags_are_empty() {
 fn prompt_default_timeout_is_none() {
     let handler = GreetingPromptPrompt;
     assert!(handler.timeout().is_none());
+}
+
+// --- Prompt with no arguments ---
+
+/// A prompt with no arguments.
+#[prompt]
+fn no_args_prompt() -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: "Hello!".to_string(),
+        },
+    }]
+}
+
+#[test]
+fn prompt_no_args_definition() {
+    let handler = NoArgsPromptPrompt;
+    let def = handler.definition();
+    assert!(def.arguments.is_empty());
+}
+
+#[test]
+fn prompt_no_args_call() {
+    let handler = NoArgsPromptPrompt;
+    let ctx = test_ctx();
+    let args = HashMap::new();
+    let result = handler.get(&ctx, args).unwrap();
+    assert_eq!(result.len(), 1);
+    match &result[0].content {
+        Content::Text { text } => assert_eq!(text, "Hello!"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Prompt returning McpResult ---
+
+/// A fallible prompt.
+#[prompt]
+fn fallible_prompt(fail: Option<String>) -> McpResult<Vec<PromptMessage>> {
+    if fail.is_some() {
+        Err(fastmcp::McpError::internal_error("prompt failed"))
+    } else {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: "success".to_string(),
+            },
+        }])
+    }
+}
+
+#[test]
+fn prompt_result_ok() {
+    let handler = FalliblePromptPrompt;
+    let ctx = test_ctx();
+    let args = HashMap::new();
+    let result = handler.get(&ctx, args).unwrap();
+    match &result[0].content {
+        Content::Text { text } => assert_eq!(text, "success"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+#[test]
+fn prompt_result_err() {
+    let handler = FalliblePromptPrompt;
+    let ctx = test_ctx();
+    let mut args = HashMap::new();
+    args.insert("fail".to_string(), "true".to_string());
+    let result = handler.get(&ctx, args);
+    assert!(result.is_err());
+}
+
+// --- Async prompt with context ---
+
+/// Async prompt using context.
+#[prompt]
+async fn async_ctx_prompt(ctx: &McpContext, msg: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("async_req:{} msg:{msg}", ctx.request_id()),
+        },
+    }]
+}
+
+#[test]
+fn async_prompt_with_context_definition() {
+    let handler = AsyncCtxPromptPrompt;
+    let def = handler.definition();
+    // Only msg should be an argument, not ctx
+    assert_eq!(def.arguments.len(), 1);
+    assert_eq!(def.arguments[0].name, "msg");
+}
+
+#[test]
+fn async_prompt_with_context_get() {
+    let handler = AsyncCtxPromptPrompt;
+    let ctx = test_ctx();
+    let mut args = HashMap::new();
+    args.insert("msg".to_string(), "hello".to_string());
+    let result = handler.get(&ctx, args).unwrap();
+    match &result[0].content {
+        Content::Text { text } => assert_eq!(text, "async_req:1 msg:hello"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Prompt returning multiple messages ---
+
+/// A conversation prompt.
+#[prompt]
+fn conversation_prompt(topic: String) -> Vec<PromptMessage> {
+    vec![
+        PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: format!("Let's discuss {topic}"),
+            },
+        },
+        PromptMessage {
+            role: Role::Assistant,
+            content: Content::Text {
+                text: format!("I'd be happy to discuss {topic}"),
+            },
+        },
+        PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: "What are the key points?".to_string(),
+            },
+        },
+    ]
+}
+
+#[test]
+fn prompt_multiple_messages() {
+    let handler = ConversationPromptPrompt;
+    let ctx = test_ctx();
+    let mut args = HashMap::new();
+    args.insert("topic".to_string(), "Rust".to_string());
+    let result = handler.get(&ctx, args).unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].role, Role::User);
+    assert_eq!(result[1].role, Role::Assistant);
+    assert_eq!(result[2].role, Role::User);
+}
+
+// --- Prompt with no description ---
+
+#[prompt]
+fn no_desc_prompt(text: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text { text },
+    }]
+}
+
+#[test]
+fn prompt_no_description_is_none() {
+    let handler = NoDescPromptPrompt;
+    let def = handler.definition();
+    assert!(def.description.is_none());
+}
+
+// --- Prompt with compound timeout ---
+
+/// Prompt with compound timeout.
+#[prompt(timeout = "1m30s")]
+fn compound_timeout_prompt() -> Vec<PromptMessage> {
+    vec![]
+}
+
+#[test]
+fn prompt_timeout_compound() {
+    let handler = CompoundTimeoutPromptPrompt;
+    assert_eq!(handler.timeout(), Some(std::time::Duration::from_secs(90)));
+}
+
+// --- Prompt with all optional arguments ---
+
+/// Prompt with all optional args.
+#[prompt]
+fn all_optional_prompt(a: Option<String>, b: Option<String>) -> Vec<PromptMessage> {
+    let a_str = a.unwrap_or_else(|| "none".to_string());
+    let b_str = b.unwrap_or_else(|| "none".to_string());
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("a={a_str}, b={b_str}"),
+        },
+    }]
+}
+
+#[test]
+fn prompt_all_optional_none_required() {
+    let handler = AllOptionalPromptPrompt;
+    let def = handler.definition();
+    assert!(def.arguments.iter().all(|arg| !arg.required));
+}
+
+#[test]
+fn prompt_all_optional_call_empty() {
+    let handler = AllOptionalPromptPrompt;
+    let ctx = test_ctx();
+    let args = HashMap::new();
+    let result = handler.get(&ctx, args).unwrap();
+    match &result[0].content {
+        Content::Text { text } => assert_eq!(text, "a=none, b=none"),
+        _ => panic!("Expected Text content"),
+    }
 }
 
 // ============================================================================
@@ -1515,4 +1908,252 @@ fn json_schema_tagged_enum_uses_one_of() {
     let schema = Shape::json_schema();
     let one_of = schema["oneOf"].as_array().unwrap();
     assert_eq!(one_of.len(), 3);
+}
+
+// --- Additional primitive types ---
+
+#[derive(JsonSchema)]
+struct AllPrimitives {
+    i8_val: i8,
+    i16_val: i16,
+    i32_val: i32,
+    u8_val: u8,
+    u16_val: u16,
+    usize_val: usize,
+    isize_val: isize,
+}
+
+#[test]
+fn json_schema_all_integer_types() {
+    let schema = AllPrimitives::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // All integer types should map to "integer"
+    for key in [
+        "i8_val",
+        "i16_val",
+        "i32_val",
+        "u8_val",
+        "u16_val",
+        "usize_val",
+        "isize_val",
+    ] {
+        assert_eq!(props[key]["type"], "integer", "Failed for {key}");
+    }
+}
+
+// --- Tuple struct with multiple fields ---
+
+#[derive(JsonSchema)]
+struct Point3D(f64, f64, f64);
+
+#[test]
+fn json_schema_tuple_struct_multiple_fields() {
+    let schema = Point3D::json_schema();
+    assert_eq!(schema["type"], "array");
+    let prefix_items = schema["prefixItems"].as_array().unwrap();
+    assert_eq!(prefix_items.len(), 3);
+    for item in prefix_items {
+        assert_eq!(item["type"], "number");
+    }
+    assert_eq!(schema["minItems"], 3);
+    assert_eq!(schema["maxItems"], 3);
+}
+
+// --- BTreeMap schema ---
+
+#[derive(JsonSchema)]
+struct BTreeMapStruct {
+    sorted_map: std::collections::BTreeMap<String, i32>,
+}
+
+#[test]
+fn json_schema_btreemap_field() {
+    let schema = BTreeMapStruct::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    assert_eq!(props["sorted_map"]["type"], "object");
+    assert_eq!(
+        props["sorted_map"]["additionalProperties"]["type"],
+        "integer"
+    );
+}
+
+// --- HashSet/BTreeSet schema ---
+
+#[derive(JsonSchema)]
+struct SetStruct {
+    hash_set: std::collections::HashSet<String>,
+    btree_set: std::collections::BTreeSet<i32>,
+}
+
+#[test]
+fn json_schema_set_fields() {
+    let schema = SetStruct::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // Sets should be arrays with uniqueItems
+    assert_eq!(props["hash_set"]["type"], "array");
+    assert_eq!(props["hash_set"]["items"]["type"], "string");
+    assert_eq!(props["hash_set"]["uniqueItems"], true);
+
+    assert_eq!(props["btree_set"]["type"], "array");
+    assert_eq!(props["btree_set"]["items"]["type"], "integer");
+    assert_eq!(props["btree_set"]["uniqueItems"], true);
+}
+
+// --- Deeply nested types ---
+
+#[derive(JsonSchema)]
+struct DeeplyNested {
+    matrix: Vec<Vec<i32>>,
+    map_of_lists: std::collections::HashMap<String, Vec<String>>,
+    optional_map: Option<std::collections::HashMap<String, i32>>,
+}
+
+#[test]
+fn json_schema_matrix_field() {
+    let schema = DeeplyNested::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // Vec<Vec<i32>>
+    assert_eq!(props["matrix"]["type"], "array");
+    assert_eq!(props["matrix"]["items"]["type"], "array");
+    assert_eq!(props["matrix"]["items"]["items"]["type"], "integer");
+}
+
+#[test]
+fn json_schema_map_of_lists_field() {
+    let schema = DeeplyNested::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // HashMap<String, Vec<String>>
+    assert_eq!(props["map_of_lists"]["type"], "object");
+    assert_eq!(
+        props["map_of_lists"]["additionalProperties"]["type"],
+        "array"
+    );
+    assert_eq!(
+        props["map_of_lists"]["additionalProperties"]["items"]["type"],
+        "string"
+    );
+}
+
+#[test]
+fn json_schema_optional_map_field() {
+    let schema = DeeplyNested::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // Option<HashMap<String, i32>> - should be object, not required
+    assert_eq!(props["optional_map"]["type"], "object");
+    assert_eq!(
+        props["optional_map"]["additionalProperties"]["type"],
+        "integer"
+    );
+    // Verify it's not required
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(!required.contains(&"optional_map"));
+}
+
+// --- Multiple optional fields ---
+
+#[derive(JsonSchema)]
+struct ManyOptionals {
+    required_field: String,
+    opt1: Option<String>,
+    opt2: Option<i32>,
+    opt3: Option<bool>,
+    opt4: Option<Vec<String>>,
+}
+
+#[test]
+fn json_schema_many_optionals_required() {
+    let schema = ManyOptionals::json_schema();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // Only required_field should be required
+    assert_eq!(required.len(), 1);
+    assert!(required.contains(&"required_field"));
+}
+
+#[test]
+fn json_schema_many_optionals_properties() {
+    let schema = ManyOptionals::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // All 5 fields should be present
+    assert_eq!(props.len(), 5);
+    assert_eq!(props["opt1"]["type"], "string");
+    assert_eq!(props["opt2"]["type"], "integer");
+    assert_eq!(props["opt3"]["type"], "boolean");
+    assert_eq!(props["opt4"]["type"], "array");
+}
+
+// --- Enum with multiple variant types ---
+
+/// Status with mixed variants.
+#[derive(JsonSchema)]
+enum StatusVariants {
+    /// Pending state.
+    Pending,
+    /// Running with progress.
+    Running(f64),
+    /// Complete with result.
+    Complete(String),
+}
+
+#[test]
+fn json_schema_mixed_enum_variants() {
+    let schema = StatusVariants::json_schema();
+    let one_of = schema["oneOf"].as_array().unwrap();
+    assert_eq!(one_of.len(), 3);
+}
+
+#[test]
+fn json_schema_enum_description() {
+    let schema = StatusVariants::json_schema();
+    assert_eq!(schema["description"], "Status with mixed variants.");
+}
+
+// --- Struct with only description, no fields ---
+
+/// A marker struct.
+#[derive(JsonSchema)]
+struct EmptyMarker;
+
+#[test]
+fn json_schema_empty_marker_is_null() {
+    let schema = EmptyMarker::json_schema();
+    assert_eq!(schema["type"], "null");
+}
+
+// --- Struct with renamed and skipped fields mixed ---
+
+#[derive(JsonSchema)]
+struct MixedAttributes {
+    normal: String,
+    #[json_schema(rename = "renamedField")]
+    to_rename: i32,
+    #[json_schema(skip)]
+    to_skip: bool,
+    #[json_schema(rename = "anotherName")]
+    also_renamed: String,
+}
+
+#[test]
+fn json_schema_mixed_attributes() {
+    let schema = MixedAttributes::json_schema();
+    let props = schema["properties"].as_object().unwrap();
+    // Should have 3 fields (normal, renamedField, anotherName)
+    assert_eq!(props.len(), 3);
+    assert!(props.contains_key("normal"));
+    assert!(props.contains_key("renamedField"));
+    assert!(props.contains_key("anotherName"));
+    // Skipped field should not be present
+    assert!(!props.contains_key("to_skip"));
+    // Original names should not be present
+    assert!(!props.contains_key("to_rename"));
+    assert!(!props.contains_key("also_renamed"));
 }

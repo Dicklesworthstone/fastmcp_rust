@@ -1314,10 +1314,7 @@ fn workflow_task_cancel_pending() {
         .send_raw_request("tasks/get", json!({"id": task_id}))
         .unwrap();
 
-    assert_eq!(
-        get_result["task"]["status"].as_str().unwrap(),
-        "cancelled"
-    );
+    assert_eq!(get_result["task"]["status"].as_str().unwrap(), "cancelled");
 }
 
 #[test]
@@ -1377,10 +1374,7 @@ fn workflow_task_error_message_preserved() {
     // If failed, verify error is preserved
     if get_result["task"]["status"].as_str().unwrap() == "failed" {
         let error = get_result["task"]["error"].as_str();
-        assert!(
-            error.is_some(),
-            "Failed task should have error message"
-        );
+        assert!(error.is_some(), "Failed task should have error message");
         assert!(
             error.unwrap().contains("intentionally") || error.unwrap().contains("failed"),
             "Error message should describe failure"
@@ -1413,10 +1407,7 @@ fn workflow_task_type_preserved() {
             .send_raw_request("tasks/get", json!({"id": task_id}))
             .unwrap();
 
-        assert_eq!(
-            get_result["task"]["taskType"].as_str().unwrap(),
-            task_type
-        );
+        assert_eq!(get_result["task"]["taskType"].as_str().unwrap(), task_type);
     }
 }
 
@@ -1951,7 +1942,11 @@ fn session_operations_fail_before_init() {
     assert!(client.list_tools().is_err());
     assert!(client.list_resources().is_err());
     assert!(client.list_prompts().is_err());
-    assert!(client.call_tool("echo", json!({"message": "test"})).is_err());
+    assert!(
+        client
+            .call_tool("echo", json!({"message": "test"}))
+            .is_err()
+    );
     assert!(client.read_resource("app://test").is_err());
 }
 
@@ -2076,8 +2071,8 @@ fn session_tracks_client_info() {
         .build();
     thread::spawn(move || server.run_transport(server_transport));
 
-    let mut client = TestClient::new(client_transport)
-        .with_client_info("custom-client-name", "2.5.0");
+    let mut client =
+        TestClient::new(client_transport).with_client_info("custom-client-name", "2.5.0");
 
     // Verify client info is set before initialization
     let init = client.initialize().unwrap();
@@ -2115,10 +2110,7 @@ fn session_multiple_clients_independent_lifecycle() {
     // Initialize clients in order
     for (i, client) in &mut clients {
         let init = client.initialize().unwrap();
-        assert_eq!(
-            init.server_info.name,
-            format!("lifecycle-server-{}", i)
-        );
+        assert_eq!(init.server_info.name, format!("lifecycle-server-{}", i));
     }
 
     // All clients should work independently
@@ -2166,7 +2158,9 @@ fn session_state_persists_across_operations() {
 
     // Perform unrelated operations
     client.list_tools().unwrap();
-    client.call_tool("echo", json!({"message": "interleaved"})).unwrap();
+    client
+        .call_tool("echo", json!({"message": "interleaved"}))
+        .unwrap();
     client.list_tools().unwrap();
 
     // Value should still be there
@@ -2240,16 +2234,34 @@ impl ToolHandler for TypesToolHandler {
         let mut result = Vec::new();
 
         if let Some(v) = arguments.get("string_val") {
-            result.push(format!("string_val: {}", v.as_str().unwrap_or("(not string)")));
+            result.push(format!(
+                "string_val: {}",
+                v.as_str().unwrap_or("(not string)")
+            ));
         }
         if let Some(v) = arguments.get("int_val") {
-            result.push(format!("int_val: {}", v.as_i64().map(|n| n.to_string()).unwrap_or("(not int)".to_string())));
+            result.push(format!(
+                "int_val: {}",
+                v.as_i64()
+                    .map(|n| n.to_string())
+                    .unwrap_or("(not int)".to_string())
+            ));
         }
         if let Some(v) = arguments.get("float_val") {
-            result.push(format!("float_val: {}", v.as_f64().map(|n| n.to_string()).unwrap_or("(not float)".to_string())));
+            result.push(format!(
+                "float_val: {}",
+                v.as_f64()
+                    .map(|n| n.to_string())
+                    .unwrap_or("(not float)".to_string())
+            ));
         }
         if let Some(v) = arguments.get("bool_val") {
-            result.push(format!("bool_val: {}", v.as_bool().map(|b| b.to_string()).unwrap_or("(not bool)".to_string())));
+            result.push(format!(
+                "bool_val: {}",
+                v.as_bool()
+                    .map(|b| b.to_string())
+                    .unwrap_or("(not bool)".to_string())
+            ));
         }
         if let Some(v) = arguments.get("array_val") {
             let arr_len = v.as_array().map(|a| a.len()).unwrap_or(0);
@@ -2259,7 +2271,11 @@ impl ToolHandler for TypesToolHandler {
             let obj_keys = v.as_object().map(|o| o.len()).unwrap_or(0);
             result.push(format!("object_val: {{keys={}}}", obj_keys));
         }
-        if arguments.get("null_val").map(|v| v.is_null()).unwrap_or(false) {
+        if arguments
+            .get("null_val")
+            .map(|v| v.is_null())
+            .unwrap_or(false)
+        {
             result.push("null_val: null".to_string());
         }
 
@@ -2302,7 +2318,9 @@ impl ToolHandler for RequiredArgsToolHandler {
             .as_str()
             .ok_or_else(|| McpError::invalid_params("required_field is required"))?;
 
-        let optional = arguments["optional_field"].as_str().unwrap_or("(not provided)");
+        let optional = arguments["optional_field"]
+            .as_str()
+            .unwrap_or("(not provided)");
 
         Ok(vec![Content::Text {
             text: format!("required: {}, optional: {}", required, optional),
@@ -2475,7 +2493,10 @@ fn tool_call_object_argument() {
     client.initialize().unwrap();
 
     let result = client
-        .call_tool("types_test", json!({"object_val": {"key1": "val1", "key2": "val2"}}))
+        .call_tool(
+            "types_test",
+            json!({"object_val": {"key1": "val1", "key2": "val2"}}),
+        )
         .unwrap();
 
     match &result[0] {
@@ -2509,12 +2530,15 @@ fn tool_call_multiple_argument_types() {
     client.initialize().unwrap();
 
     let result = client
-        .call_tool("types_test", json!({
-            "string_val": "test",
-            "int_val": 100,
-            "bool_val": true,
-            "array_val": [1, 2, 3]
-        }))
+        .call_tool(
+            "types_test",
+            json!({
+                "string_val": "test",
+                "int_val": 100,
+                "bool_val": true,
+                "array_val": [1, 2, 3]
+            }),
+        )
         .unwrap();
 
     match &result[0] {
@@ -2567,10 +2591,13 @@ fn tool_call_required_and_optional_arguments() {
     client.initialize().unwrap();
 
     let result = client
-        .call_tool("required_args", json!({
-            "required_field": "required_value",
-            "optional_field": "optional_value"
-        }))
+        .call_tool(
+            "required_args",
+            json!({
+                "required_field": "required_value",
+                "optional_field": "optional_value"
+            }),
+        )
         .unwrap();
 
     match &result[0] {
@@ -2589,7 +2616,10 @@ fn tool_call_missing_required_argument() {
 
     let result = client.call_tool("required_args", json!({"optional_field": "only optional"}));
 
-    assert!(result.is_err(), "Should fail when required argument is missing");
+    assert!(
+        result.is_err(),
+        "Should fail when required argument is missing"
+    );
 }
 
 #[test]
@@ -2618,7 +2648,10 @@ fn tool_call_error_returns_mcp_error() {
     let mut client = setup_tool_test_server();
     client.initialize().unwrap();
 
-    let result = client.call_tool("fail_on_demand", json!({"fail": true, "message": "test error"}));
+    let result = client.call_tool(
+        "fail_on_demand",
+        json!({"fail": true, "message": "test error"}),
+    );
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -2658,7 +2691,10 @@ fn tool_call_special_characters() {
     client.initialize().unwrap();
 
     let result = client
-        .call_tool("echo", json!({"message": "Line 1\nLine 2\tTabbed \"quoted\" 'single'"}))
+        .call_tool(
+            "echo",
+            json!({"message": "Line 1\nLine 2\tTabbed \"quoted\" 'single'"}),
+        )
         .unwrap();
 
     match &result[0] {
@@ -2695,15 +2731,18 @@ fn tool_call_nested_object_argument() {
     client.initialize().unwrap();
 
     let result = client
-        .call_tool("types_test", json!({
-            "object_val": {
-                "level1": {
-                    "level2": {
-                        "level3": "deep value"
+        .call_tool(
+            "types_test",
+            json!({
+                "object_val": {
+                    "level1": {
+                        "level2": {
+                            "level3": "deep value"
+                        }
                     }
                 }
-            }
-        }))
+            }),
+        )
         .unwrap();
 
     match &result[0] {
@@ -3010,7 +3049,9 @@ impl ResourceHandler for FailingResourceHandler {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Err(McpError::resource_not_found("Resource read failed intentionally"))
+        Err(McpError::resource_not_found(
+            "Resource read failed intentionally",
+        ))
     }
 }
 
@@ -3076,7 +3117,10 @@ fn resource_read_binary() {
     let content = client.read_resource("binary://data.bin").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].mime_type.as_deref(), Some("application/octet-stream"));
+    assert_eq!(
+        content[0].mime_type.as_deref(),
+        Some("application/octet-stream")
+    );
     assert!(content[0].text.is_none());
     assert!(content[0].blob.is_some());
 
@@ -3084,7 +3128,10 @@ fn resource_read_binary() {
     let blob = content[0].blob.as_ref().unwrap();
     assert!(!blob.is_empty());
     // Base64 uses only alphanumeric chars and +/=
-    assert!(blob.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    assert!(
+        blob.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    );
 }
 
 #[test]
@@ -3147,7 +3194,10 @@ fn resource_read_failing() {
 
     let result = client.read_resource("error://fail");
 
-    assert!(result.is_err(), "Reading failing resource should return error");
+    assert!(
+        result.is_err(),
+        "Reading failing resource should return error"
+    );
 }
 
 #[test]
@@ -3211,10 +3261,16 @@ fn resource_metadata_preserved() {
 
     let plain_text = resources.iter().find(|r| r.uri == "text://plain").unwrap();
     assert_eq!(plain_text.name, "Plain Text");
-    assert_eq!(plain_text.description.as_deref(), Some("Returns plain text content"));
+    assert_eq!(
+        plain_text.description.as_deref(),
+        Some("Returns plain text content")
+    );
     assert_eq!(plain_text.mime_type.as_deref(), Some("text/plain"));
 
-    let json_resource = resources.iter().find(|r| r.uri == "data://config.json").unwrap();
+    let json_resource = resources
+        .iter()
+        .find(|r| r.uri == "data://config.json")
+        .unwrap();
     assert_eq!(json_resource.name, "JSON Config");
     assert_eq!(json_resource.mime_type.as_deref(), Some("application/json"));
 }

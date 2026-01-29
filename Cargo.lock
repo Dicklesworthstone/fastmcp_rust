@@ -1585,6 +1585,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "serde_json",
+ "smallvec",
  "syntect",
  "time",
  "unicode-width",
