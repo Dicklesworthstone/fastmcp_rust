@@ -1192,11 +1192,7 @@ impl ToolHandler for SessionStoreHandler {
         }
     }
 
-    fn call(
-        &self,
-        ctx: &McpContext,
-        arguments: serde_json::Value,
-    ) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let key = arguments["key"].as_str().unwrap_or("default").to_string();
         let value = arguments["value"].as_str().unwrap_or("").to_string();
 
@@ -1232,11 +1228,7 @@ impl ToolHandler for SessionGetHandler {
         }
     }
 
-    fn call(
-        &self,
-        ctx: &McpContext,
-        arguments: serde_json::Value,
-    ) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let key = arguments["key"].as_str().unwrap_or("default");
 
         let value: Option<String> = ctx.get_state(key);
@@ -1246,14 +1238,12 @@ impl ToolHandler for SessionGetHandler {
     }
 }
 
-
 use std::sync::Arc;
-use fastmcp_transport::memory::MemoryTransport;
 
 #[test]
 fn workflow_concurrent_clients_isolation() {
-    use std::thread;
     use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::thread;
 
     // Create multiple client-server transport pairs
     let mut clients_and_servers = Vec::new();
@@ -1272,7 +1262,7 @@ fn workflow_concurrent_clients_isolation() {
             server.run_transport(server_transport);
         });
 
-        let mut client = TestClient::new(client_transport)
+        let client = TestClient::new(client_transport)
             .with_client_info(format!("client-{}", client_num), "1.0.0");
 
         clients_and_servers.push((client_num, client));
@@ -1289,7 +1279,7 @@ fn workflow_concurrent_clients_isolation() {
         let result = client
             .call_tool(
                 "session_store",
-                json!({"key": "client_value", "value": format!("value_from_client_{}", num)})
+                json!({"key": "client_value", "value": format!("value_from_client_{}", num)}),
             )
             .unwrap();
 
@@ -1310,8 +1300,12 @@ fn workflow_concurrent_clients_isolation() {
         match &result[0] {
             Content::Text { text } => {
                 // Each client should see only its own value
-                assert_eq!(text, &format!("value_from_client_{}", num),
-                    "Client {} should see its own value, not another client's", num);
+                assert_eq!(
+                    text,
+                    &format!("value_from_client_{}", num),
+                    "Client {} should see its own value, not another client's",
+                    num
+                );
             }
             other => panic!("Expected text, got: {other:?}"),
         }
@@ -1320,9 +1314,9 @@ fn workflow_concurrent_clients_isolation() {
 
 #[test]
 fn workflow_concurrent_interleaved_operations() {
-    use std::thread;
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     let operation_counter = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
@@ -1350,13 +1344,19 @@ fn workflow_concurrent_interleaved_operations() {
             for op in 0..5 {
                 let op_num = counter.fetch_add(1, Ordering::SeqCst);
                 let result = client
-                    .call_tool("echo", json!({"message": format!("client_{}_op_{}", client_num, op)}))
+                    .call_tool(
+                        "echo",
+                        json!({"message": format!("client_{}_op_{}", client_num, op)}),
+                    )
                     .unwrap();
 
                 match &result[0] {
                     Content::Text { text } => {
-                        assert!(text.contains(&format!("client_{}_op_{}", client_num, op)),
-                            "Operation {} result mismatch", op_num);
+                        assert!(
+                            text.contains(&format!("client_{}_op_{}", client_num, op)),
+                            "Operation {} result mismatch",
+                            op_num
+                        );
                     }
                     other => panic!("Expected text, got: {other:?}"),
                 }
@@ -1384,9 +1384,9 @@ fn workflow_concurrent_interleaved_operations() {
 
 #[test]
 fn workflow_concurrent_no_crosstalk() {
-    use std::thread;
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::Mutex;
+    use std::thread;
 
     let results = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -1428,7 +1428,10 @@ fn workflow_concurrent_no_crosstalk() {
                 other => panic!("Expected text, got: {other:?}"),
             };
 
-            results.lock().unwrap().push((client_num, secret.clone(), retrieved));
+            results
+                .lock()
+                .unwrap()
+                .push((client_num, secret.clone(), retrieved));
         });
 
         handles.push(handle);
@@ -1444,16 +1447,18 @@ fn workflow_concurrent_no_crosstalk() {
     assert_eq!(results.len(), 3);
 
     for (client_num, expected, actual) in results.iter() {
-        assert_eq!(expected, actual,
+        assert_eq!(
+            expected, actual,
             "Client {} got wrong secret: expected '{}', got '{}'",
-            client_num, expected, actual);
+            client_num, expected, actual
+        );
     }
 }
 
 #[test]
 fn workflow_concurrent_session_state_persistence() {
-    use std::thread;
     use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::thread;
 
     // Test that session state persists across multiple calls within the same session
     let (client_transport, server_transport) = create_memory_transport_pair();
@@ -1473,7 +1478,10 @@ fn workflow_concurrent_session_state_persistence() {
     // Store multiple values
     for i in 0..5 {
         client
-            .call_tool("session_store", json!({"key": format!("key_{}", i), "value": format!("value_{}", i)}))
+            .call_tool(
+                "session_store",
+                json!({"key": format!("key_{}", i), "value": format!("value_{}", i)}),
+            )
             .unwrap();
     }
 
@@ -1506,9 +1514,9 @@ fn workflow_concurrent_session_state_persistence() {
 
 #[test]
 fn workflow_concurrent_stress_test() {
-    use std::thread;
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     const NUM_CLIENTS: usize = 5;
     const OPS_PER_CLIENT: usize = 10;
@@ -1540,8 +1548,14 @@ fn workflow_concurrent_stress_test() {
             for op in 0..OPS_PER_CLIENT {
                 // Alternate between different operations
                 let result = match op % 3 {
-                    0 => client.call_tool("echo", json!({"message": format!("c{}op{}", client_num, op)})),
-                    1 => client.call_tool("session_store", json!({"key": "k", "value": format!("v{}", op)})),
+                    0 => client.call_tool(
+                        "echo",
+                        json!({"message": format!("c{}op{}", client_num, op)}),
+                    ),
+                    1 => client.call_tool(
+                        "session_store",
+                        json!({"key": "k", "value": format!("v{}", op)}),
+                    ),
                     _ => client.call_tool("session_get", json!({"key": "k"})),
                 };
 
@@ -1566,6 +1580,7 @@ fn workflow_concurrent_stress_test() {
     assert!(
         total_success >= expected_total * 90 / 100,
         "Expected at least 90% success rate, got {}/{}",
-        total_success, expected_total
+        total_success,
+        expected_total
     );
 }
