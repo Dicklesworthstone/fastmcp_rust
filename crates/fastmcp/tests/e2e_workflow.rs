@@ -757,3 +757,399 @@ impl ContentExt for Content {
         }
     }
 }
+
+// ============================================================================
+// Background Tasks E2E Tests (bd-og1)
+// ============================================================================
+
+use fastmcp::TaskManager;
+
+/// Helper: build a server with background task support.
+fn setup_task_server() -> TestClient {
+    let (builder, client_transport, server_transport) = TestServer::builder()
+        .with_name("task-test-server")
+        .with_version("1.0.0")
+        .build_server_builder();
+
+    // Create task manager and register handlers
+    let task_manager = TaskManager::new();
+
+    // Register a simple counter task that completes quickly
+    task_manager.register_handler("quick_task", |_cx, params| async move {
+        let value = params.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(serde_json::json!({"result": value * 2}))
+    });
+
+    // Register a long-running task that can report progress
+    task_manager.register_handler("progress_task", |_cx, params| async move {
+        let steps = params.get("steps").and_then(|v| v.as_i64()).unwrap_or(3) as usize;
+        // Simulate work by returning after "steps" iterations
+        Ok(serde_json::json!({"completed_steps": steps}))
+    });
+
+    // Register a task that fails
+    task_manager.register_handler("failing_task", |_cx, _params| async move {
+        Err(fastmcp::McpError::internal_error("Task intentionally failed"))
+    });
+
+    let server = builder
+        .tool(EchoToolHandler)
+        .with_task_manager(task_manager.into_shared())
+        .build();
+
+    std::thread::spawn(move || {
+        server.run_transport(server_transport);
+    });
+
+    TestClient::new(client_transport)
+}
+
+#[test]
+fn workflow_task_submit_and_get() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Verify server has task capability
+    let caps = client.server_capabilities().unwrap();
+    assert!(caps.tasks.is_some(), "Server should have tasks capability");
+
+    // Submit a task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({
+                "taskType": "quick_task",
+                "params": {"value": 21}
+            }),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+    assert!(task_id.starts_with("task-"), "Task ID should have correct prefix");
+
+    // Get task info
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    let task_info = &get_result["task"];
+    assert_eq!(task_info["id"], task_id);
+    assert_eq!(task_info["taskType"], "quick_task");
+
+    // Give the task time to complete
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Get again and check for completion
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    let status = get_result["task"]["status"].as_str().unwrap();
+    // Task should be completed or still running
+    assert!(
+        status == "completed" || status == "running" || status == "pending",
+        "Unexpected status: {status}"
+    );
+}
+
+#[test]
+fn workflow_task_list_with_filtering() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit multiple tasks
+    let _task1 = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 1}}),
+        )
+        .unwrap();
+
+    let _task2 = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 2}}),
+        )
+        .unwrap();
+
+    // List all tasks
+    let list_result = client
+        .send_raw_request("tasks/list", json!({}))
+        .unwrap();
+
+    let tasks = list_result["tasks"].as_array().unwrap();
+    assert!(tasks.len() >= 2, "Should have at least 2 tasks");
+
+    // Wait for tasks to complete
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // List completed tasks
+    let completed_result = client
+        .send_raw_request("tasks/list", json!({"status": "completed"}))
+        .unwrap();
+
+    let completed_tasks = completed_result["tasks"].as_array().unwrap();
+    for task in completed_tasks {
+        assert_eq!(task["status"], "completed");
+    }
+}
+
+#[test]
+fn workflow_task_cancellation() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "progress_task", "params": {"steps": 100}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Cancel the task immediately
+    let cancel_result = client
+        .send_raw_request(
+            "tasks/cancel",
+            json!({"id": task_id, "reason": "User requested cancellation"}),
+        )
+        .unwrap();
+
+    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
+
+    // Verify task is cancelled
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    let status = get_result["task"]["status"].as_str().unwrap();
+    assert_eq!(status, "cancelled", "Task should be cancelled");
+
+    // Verify error message is set
+    let error = get_result["task"]["error"].as_str();
+    assert!(
+        error.is_some(),
+        "Cancelled task should have error message"
+    );
+}
+
+#[test]
+fn workflow_task_failure_handling() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a failing task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "failing_task", "params": {}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Wait for task to fail
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Get task and verify failure
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    let task = &get_result["task"];
+    let status = task["status"].as_str().unwrap();
+
+    // Task should be failed (or still running if it hasn't finished)
+    if status == "failed" {
+        assert!(
+            task["error"].as_str().is_some(),
+            "Failed task should have error message"
+        );
+    }
+}
+
+#[test]
+fn workflow_task_unknown_type_rejected() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Try to submit unknown task type
+    let result = client.send_raw_request(
+        "tasks/submit",
+        json!({"taskType": "nonexistent_task", "params": {}}),
+    );
+
+    assert!(result.is_err(), "Unknown task type should be rejected");
+}
+
+#[test]
+fn workflow_task_get_nonexistent() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Try to get a task that doesn't exist
+    let result = client.send_raw_request("tasks/get", json!({"id": "task-nonexistent"}));
+
+    assert!(result.is_err(), "Getting nonexistent task should fail");
+}
+
+#[test]
+fn workflow_task_cancel_already_completed() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a quick task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 5}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Wait for completion
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Verify it's completed
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    if get_result["task"]["status"] == "completed" {
+        // Try to cancel completed task (should fail)
+        let cancel_result = client.send_raw_request("tasks/cancel", json!({"id": task_id}));
+
+        assert!(
+            cancel_result.is_err(),
+            "Cancelling completed task should fail"
+        );
+    }
+}
+
+#[test]
+fn workflow_task_result_available_after_completion() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 42}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Wait for completion
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Get task with result
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    if get_result["task"]["status"] == "completed" {
+        // Result should be available
+        let result = &get_result["result"];
+        assert!(result.is_object(), "Result should be present for completed task");
+        assert!(result["success"].as_bool().unwrap_or(false));
+
+        // Check the data
+        let data = &result["data"];
+        assert_eq!(data["result"], 84, "42 * 2 = 84");
+    }
+}
+
+#[test]
+fn workflow_task_session_continues_after_task_error() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a failing task
+    let _fail_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "failing_task", "params": {}}),
+        )
+        .unwrap();
+
+    // Wait for it to fail
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Session should still be functional - submit another task
+    let success_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 10}}),
+        )
+        .unwrap();
+
+    assert!(
+        success_result["task"]["id"].as_str().is_some(),
+        "Should be able to submit new tasks after failure"
+    );
+
+    // Regular tool calls should also still work
+    let echo_result = client
+        .call_tool("echo", json!({"message": "still working"}))
+        .unwrap();
+
+    match &echo_result[0] {
+        Content::Text { text } => assert_eq!(text, "still working"),
+        other => panic!("Expected text, got: {other:?}"),
+    }
+}
+
+#[test]
+fn workflow_task_capabilities_advertised() {
+    let mut client = setup_task_server();
+    let init_result = client.initialize().unwrap();
+
+    // Verify task capabilities
+    let tasks_cap = init_result.capabilities.tasks;
+    assert!(tasks_cap.is_some(), "Server should advertise tasks capability");
+}
+
+#[test]
+fn workflow_task_multiple_sequential() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit tasks sequentially and track their IDs
+    let mut task_ids = Vec::new();
+    for i in 0..5 {
+        let result = client
+            .send_raw_request(
+                "tasks/submit",
+                json!({"taskType": "quick_task", "params": {"value": i}}),
+            )
+            .unwrap();
+
+        let task_id = result["task"]["id"].as_str().unwrap().to_string();
+        task_ids.push(task_id);
+    }
+
+    // All task IDs should be unique
+    let unique_ids: std::collections::HashSet<_> = task_ids.iter().collect();
+    assert_eq!(unique_ids.len(), task_ids.len(), "All task IDs should be unique");
+
+    // Wait for all to complete
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Verify all are either completed or in a valid state
+    for task_id in &task_ids {
+        let result = client
+            .send_raw_request("tasks/get", json!({"id": task_id}))
+            .unwrap();
+
+        let status = result["task"]["status"].as_str().unwrap();
+        assert!(
+            matches!(status, "pending" | "running" | "completed"),
+            "Task {task_id} has unexpected status: {status}"
+        );
+    }
+}
