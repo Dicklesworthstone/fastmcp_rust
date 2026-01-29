@@ -15,7 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Simple hex encoding for testing (avoids base64 dependency).
 fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    data.iter()
+        .fold(String::with_capacity(data.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
 /// Simple hex decoding for testing.

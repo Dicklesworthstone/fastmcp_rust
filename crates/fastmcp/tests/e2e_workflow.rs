@@ -332,7 +332,7 @@ fn workflow_complete_lifecycle() {
         help[0]
             .content
             .as_text()
-            .map_or(false, |t| t.contains("MCP protocol"))
+            .is_some_and(|t| t.contains("MCP protocol"))
     );
 
     // Phase 4: Close
@@ -789,7 +789,9 @@ fn setup_task_server() -> TestClient {
 
     // Register a task that fails
     task_manager.register_handler("failing_task", |_cx, _params| async move {
-        Err(fastmcp::McpError::internal_error("Task intentionally failed"))
+        Err(fastmcp::McpError::internal_error(
+            "Task intentionally failed",
+        ))
     });
 
     let server = builder
@@ -825,7 +827,10 @@ fn workflow_task_submit_and_get() {
         .unwrap();
 
     let task_id = submit_result["task"]["id"].as_str().unwrap();
-    assert!(task_id.starts_with("task-"), "Task ID should have correct prefix");
+    assert!(
+        task_id.starts_with("task-"),
+        "Task ID should have correct prefix"
+    );
 
     // Get task info
     let get_result = client
@@ -873,9 +878,7 @@ fn workflow_task_list_with_filtering() {
         .unwrap();
 
     // List all tasks
-    let list_result = client
-        .send_raw_request("tasks/list", json!({}))
-        .unwrap();
+    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
 
     let tasks = list_result["tasks"].as_array().unwrap();
     assert!(tasks.len() >= 2, "Should have at least 2 tasks");
@@ -929,10 +932,7 @@ fn workflow_task_cancellation() {
 
     // Verify error message is set
     let error = get_result["task"]["error"].as_str();
-    assert!(
-        error.is_some(),
-        "Cancelled task should have error message"
-    );
+    assert!(error.is_some(), "Cancelled task should have error message");
 }
 
 #[test]
@@ -1055,7 +1055,10 @@ fn workflow_task_result_available_after_completion() {
     if get_result["task"]["status"] == "completed" {
         // Result should be available
         let result = &get_result["result"];
-        assert!(result.is_object(), "Result should be present for completed task");
+        assert!(
+            result.is_object(),
+            "Result should be present for completed task"
+        );
         assert!(result["success"].as_bool().unwrap_or(false));
 
         // Check the data
@@ -1111,7 +1114,10 @@ fn workflow_task_capabilities_advertised() {
 
     // Verify task capabilities
     let tasks_cap = init_result.capabilities.tasks;
-    assert!(tasks_cap.is_some(), "Server should advertise tasks capability");
+    assert!(
+        tasks_cap.is_some(),
+        "Server should advertise tasks capability"
+    );
 }
 
 #[test]
@@ -1135,7 +1141,11 @@ fn workflow_task_multiple_sequential() {
 
     // All task IDs should be unique
     let unique_ids: std::collections::HashSet<_> = task_ids.iter().collect();
-    assert_eq!(unique_ids.len(), task_ids.len(), "All task IDs should be unique");
+    assert_eq!(
+        unique_ids.len(),
+        task_ids.len(),
+        "All task IDs should be unique"
+    );
 
     // Wait for all to complete
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1152,4 +1162,466 @@ fn workflow_task_multiple_sequential() {
             "Task {task_id} has unexpected status: {status}"
         );
     }
+}
+
+// ============================================================================
+// Multiple Concurrent Clients E2E Tests (bd-1s1)
+// ============================================================================
+
+/// Tool that stores a value in session state and returns it.
+struct SessionStoreHandler;
+
+impl ToolHandler for SessionStoreHandler {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "session_store".to_string(),
+            description: Some("Store and retrieve a value in session state".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["key", "value"]
+            }),
+            annotations: None,
+        }
+    }
+
+    fn call(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        let key = arguments["key"].as_str().unwrap_or("default").to_string();
+        let value = arguments["value"].as_str().unwrap_or("").to_string();
+
+        // Store value in session state
+        ctx.set_state(&key, value.clone());
+
+        Ok(vec![Content::text(format!("Stored: {key}={value}"))])
+    }
+}
+
+/// Tool that retrieves a value from session state.
+struct SessionGetHandler;
+
+impl ToolHandler for SessionGetHandler {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "session_get".to_string(),
+            description: Some("Get a value from session state".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" }
+                },
+                "required": ["key"]
+            }),
+            annotations: None,
+        }
+    }
+
+    fn call(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        let key = arguments["key"].as_str().unwrap_or("default");
+
+        let value: Option<String> = ctx.get_state(key);
+        let result = value.unwrap_or_else(|| "NOT_FOUND".to_string());
+
+        Ok(vec![Content::text(result)])
+    }
+}
+
+/// Tool that returns a unique client identifier based on the request.
+struct ClientIdHandler {
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl ClientIdHandler {
+    fn new() -> Self {
+        Self {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl ToolHandler for ClientIdHandler {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "get_client_id".to_string(),
+            description: Some("Get a unique identifier for this client session".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            annotations: None,
+        }
+    }
+
+    fn call(
+        &self,
+        ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        // Check if we already have a client ID in session state
+        let client_id: Option<u64> = ctx.get_state("_client_id");
+        let id = match client_id {
+            Some(id) => id,
+            None => {
+                let id = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ctx.set_state("_client_id", id);
+                id
+            }
+        };
+
+        Ok(vec![Content::text(id.to_string())])
+    }
+}
+
+/// Helper to create multiple client-server pairs sharing a common server.
+fn setup_concurrent_server() -> (Arc<fastmcp_server::Server>, Vec<(MemoryTransport, MemoryTransport)>) {
+    use fastmcp_transport::memory::create_memory_transport_pair;
+
+    let server = Server::new("concurrent-test-server", "1.0.0")
+        .tool(EchoToolHandler)
+        .tool(SessionStoreHandler)
+        .tool(SessionGetHandler)
+        .tool(ClientIdHandler::new())
+        .build();
+
+    let server = Arc::new(server);
+
+    // Create 5 transport pairs
+    let transports: Vec<_> = (0..5)
+        .map(|_| create_memory_transport_pair())
+        .collect();
+
+    (server, transports)
+}
+
+use std::sync::Arc;
+use fastmcp_transport::memory::MemoryTransport;
+
+#[test]
+fn workflow_concurrent_clients_isolation() {
+    use std::thread;
+    use fastmcp_transport::memory::create_memory_transport_pair;
+
+    // Create multiple client-server transport pairs
+    let mut clients_and_servers = Vec::new();
+
+    for client_num in 0..3 {
+        let (client_transport, server_transport) = create_memory_transport_pair();
+
+        let server = Server::new("concurrent-server", "1.0.0")
+            .tool(EchoToolHandler)
+            .tool(SessionStoreHandler)
+            .tool(SessionGetHandler)
+            .build();
+
+        // Spawn server thread
+        thread::spawn(move || {
+            server.run_transport(server_transport);
+        });
+
+        let mut client = TestClient::new(client_transport)
+            .with_client_info(format!("client-{}", client_num), "1.0.0");
+
+        clients_and_servers.push((client_num, client));
+    }
+
+    // Initialize all clients
+    for (num, client) in &mut clients_and_servers {
+        client.initialize().unwrap();
+        eprintln!("Client {} initialized", num);
+    }
+
+    // Each client stores a unique value
+    for (num, client) in &mut clients_and_servers {
+        let result = client
+            .call_tool(
+                "session_store",
+                json!({"key": "client_value", "value": format!("value_from_client_{}", num)})
+            )
+            .unwrap();
+
+        match &result[0] {
+            Content::Text { text } => {
+                assert!(text.contains(&format!("value_from_client_{}", num)));
+            }
+            other => panic!("Expected text, got: {other:?}"),
+        }
+    }
+
+    // Each client retrieves its own stored value (should not see other clients' values)
+    for (num, client) in &mut clients_and_servers {
+        let result = client
+            .call_tool("session_get", json!({"key": "client_value"}))
+            .unwrap();
+
+        match &result[0] {
+            Content::Text { text } => {
+                // Each client should see only its own value
+                assert_eq!(text, &format!("value_from_client_{}", num),
+                    "Client {} should see its own value, not another client's", num);
+            }
+            other => panic!("Expected text, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn workflow_concurrent_interleaved_operations() {
+    use std::thread;
+    use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let operation_counter = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+
+    for client_num in 0..4 {
+        let counter = Arc::clone(&operation_counter);
+
+        let handle = thread::spawn(move || {
+            let (client_transport, server_transport) = create_memory_transport_pair();
+
+            let server = Server::new("interleaved-server", "1.0.0")
+                .tool(EchoToolHandler)
+                .build();
+
+            thread::spawn(move || {
+                server.run_transport(server_transport);
+            });
+
+            let mut client = TestClient::new(client_transport)
+                .with_client_info(format!("client-{}", client_num), "1.0.0");
+
+            client.initialize().unwrap();
+
+            // Perform multiple operations
+            for op in 0..5 {
+                let op_num = counter.fetch_add(1, Ordering::SeqCst);
+                let result = client
+                    .call_tool("echo", json!({"message": format!("client_{}_op_{}", client_num, op)}))
+                    .unwrap();
+
+                match &result[0] {
+                    Content::Text { text } => {
+                        assert!(text.contains(&format!("client_{}_op_{}", client_num, op)),
+                            "Operation {} result mismatch", op_num);
+                    }
+                    other => panic!("Expected text, got: {other:?}"),
+                }
+            }
+
+            client_num
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads to complete
+    let mut completed_clients = Vec::new();
+    for handle in handles {
+        let client_num = handle.join().expect("Thread panicked");
+        completed_clients.push(client_num);
+    }
+
+    // Verify all clients completed
+    assert_eq!(completed_clients.len(), 4);
+
+    // Verify total operations (4 clients * 5 ops = 20)
+    assert_eq!(operation_counter.load(Ordering::SeqCst), 20);
+}
+
+#[test]
+fn workflow_concurrent_no_crosstalk() {
+    use std::thread;
+    use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::sync::Mutex;
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+
+    for client_num in 0..3 {
+        let results = Arc::clone(&results);
+
+        let handle = thread::spawn(move || {
+            let (client_transport, server_transport) = create_memory_transport_pair();
+
+            let server = Server::new("crosstalk-server", "1.0.0")
+                .tool(SessionStoreHandler)
+                .tool(SessionGetHandler)
+                .build();
+
+            thread::spawn(move || {
+                server.run_transport(server_transport);
+            });
+
+            let mut client = TestClient::new(client_transport);
+            client.initialize().unwrap();
+
+            // Store a secret value
+            let secret = format!("secret_{}", client_num);
+            client
+                .call_tool("session_store", json!({"key": "secret", "value": &secret}))
+                .unwrap();
+
+            // Sleep briefly to allow interleaving
+            thread::sleep(std::time::Duration::from_millis(10));
+
+            // Retrieve and verify our secret
+            let result = client
+                .call_tool("session_get", json!({"key": "secret"}))
+                .unwrap();
+
+            let retrieved = match &result[0] {
+                Content::Text { text } => text.clone(),
+                other => panic!("Expected text, got: {other:?}"),
+            };
+
+            results.lock().unwrap().push((client_num, secret.clone(), retrieved));
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads
+    for handle in handles {
+        handle.join().expect("Thread panicked");
+    }
+
+    // Verify each client got its own secret back
+    let results = results.lock().unwrap();
+    assert_eq!(results.len(), 3);
+
+    for (client_num, expected, actual) in results.iter() {
+        assert_eq!(expected, actual,
+            "Client {} got wrong secret: expected '{}', got '{}'",
+            client_num, expected, actual);
+    }
+}
+
+#[test]
+fn workflow_concurrent_session_state_persistence() {
+    use std::thread;
+    use fastmcp_transport::memory::create_memory_transport_pair;
+
+    // Test that session state persists across multiple calls within the same session
+    let (client_transport, server_transport) = create_memory_transport_pair();
+
+    let server = Server::new("persistence-server", "1.0.0")
+        .tool(SessionStoreHandler)
+        .tool(SessionGetHandler)
+        .build();
+
+    thread::spawn(move || {
+        server.run_transport(server_transport);
+    });
+
+    let mut client = TestClient::new(client_transport);
+    client.initialize().unwrap();
+
+    // Store multiple values
+    for i in 0..5 {
+        client
+            .call_tool("session_store", json!({"key": format!("key_{}", i), "value": format!("value_{}", i)}))
+            .unwrap();
+    }
+
+    // Retrieve all values
+    for i in 0..5 {
+        let result = client
+            .call_tool("session_get", json!({"key": format!("key_{}", i)}))
+            .unwrap();
+
+        match &result[0] {
+            Content::Text { text } => {
+                assert_eq!(text, &format!("value_{}", i), "Key {} has wrong value", i);
+            }
+            other => panic!("Expected text, got: {other:?}"),
+        }
+    }
+
+    // Verify non-existent key returns NOT_FOUND
+    let result = client
+        .call_tool("session_get", json!({"key": "nonexistent"}))
+        .unwrap();
+
+    match &result[0] {
+        Content::Text { text } => {
+            assert_eq!(text, "NOT_FOUND");
+        }
+        other => panic!("Expected text, got: {other:?}"),
+    }
+}
+
+#[test]
+fn workflow_concurrent_stress_test() {
+    use std::thread;
+    use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const NUM_CLIENTS: usize = 5;
+    const OPS_PER_CLIENT: usize = 10;
+
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+
+    for client_num in 0..NUM_CLIENTS {
+        let success = Arc::clone(&success_count);
+
+        let handle = thread::spawn(move || {
+            let (client_transport, server_transport) = create_memory_transport_pair();
+
+            let server = Server::new("stress-server", "1.0.0")
+                .tool(EchoToolHandler)
+                .tool(SessionStoreHandler)
+                .tool(SessionGetHandler)
+                .build();
+
+            thread::spawn(move || {
+                server.run_transport(server_transport);
+            });
+
+            let mut client = TestClient::new(client_transport);
+            if client.initialize().is_err() {
+                return;
+            }
+
+            for op in 0..OPS_PER_CLIENT {
+                // Alternate between different operations
+                let result = match op % 3 {
+                    0 => client.call_tool("echo", json!({"message": format!("c{}op{}", client_num, op)})),
+                    1 => client.call_tool("session_store", json!({"key": "k", "value": format!("v{}", op)})),
+                    _ => client.call_tool("session_get", json!({"key": "k"})),
+                };
+
+                if result.is_ok() {
+                    success.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Verify most operations succeeded
+    let total_success = success_count.load(Ordering::SeqCst);
+    let expected_total = NUM_CLIENTS * OPS_PER_CLIENT;
+
+    assert!(
+        total_success >= expected_total * 90 / 100,
+        "Expected at least 90% success rate, got {}/{}",
+        total_success, expected_total
+    );
 }
