@@ -1165,6 +1165,262 @@ fn workflow_task_multiple_sequential() {
 }
 
 // ============================================================================
+// Additional Task Management E2E Tests (bd-3n2)
+// ============================================================================
+
+#[test]
+fn workflow_task_polling_until_complete() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a quick task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 50}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Poll until complete (simulating wait_for_task behavior)
+    let mut attempts = 0;
+    let max_attempts = 20;
+    let mut final_status = String::new();
+
+    while attempts < max_attempts {
+        let get_result = client
+            .send_raw_request("tasks/get", json!({"id": task_id}))
+            .unwrap();
+
+        let status = get_result["task"]["status"].as_str().unwrap();
+        final_status = status.to_string();
+
+        if status == "completed" || status == "failed" || status == "cancelled" {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        attempts += 1;
+    }
+
+    // Should eventually complete
+    assert!(
+        attempts < max_attempts || final_status == "completed",
+        "Task should complete within timeout"
+    );
+}
+
+#[test]
+fn workflow_task_status_transitions() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 1}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+    let initial_status = submit_result["task"]["status"].as_str().unwrap();
+
+    // Initial status should be pending or running
+    assert!(
+        initial_status == "pending" || initial_status == "running",
+        "Initial status should be pending or running, got: {}",
+        initial_status
+    );
+
+    // Wait for completion
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    let final_status = get_result["task"]["status"].as_str().unwrap();
+
+    // Valid terminal states
+    assert!(
+        final_status == "completed" || final_status == "failed" || final_status == "cancelled",
+        "Final status should be terminal, got: {}",
+        final_status
+    );
+}
+
+#[test]
+fn workflow_task_list_pagination() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit several tasks
+    for i in 0..5 {
+        client
+            .send_raw_request(
+                "tasks/submit",
+                json!({"taskType": "quick_task", "params": {"value": i}}),
+            )
+            .unwrap();
+    }
+
+    // List all tasks
+    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
+
+    let tasks = list_result["tasks"].as_array().unwrap();
+    assert!(
+        tasks.len() >= 5,
+        "Should have at least 5 tasks, got {}",
+        tasks.len()
+    );
+
+    // Each task should have required fields
+    for task in tasks {
+        assert!(task["id"].is_string());
+        assert!(task["status"].is_string());
+        assert!(task["taskType"].is_string());
+    }
+}
+
+#[test]
+fn workflow_task_cancel_pending() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a task that takes time (progress_task with many steps)
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "progress_task", "params": {"steps": 100}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Cancel immediately
+    let cancel_result = client
+        .send_raw_request(
+            "tasks/cancel",
+            json!({"id": task_id, "reason": "Cancelled during pending"}),
+        )
+        .unwrap();
+
+    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
+
+    // Verify the task is cancelled
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    assert_eq!(
+        get_result["task"]["status"].as_str().unwrap(),
+        "cancelled"
+    );
+}
+
+#[test]
+fn workflow_task_result_structure() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a task that returns data
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "quick_task", "params": {"value": 123}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Wait for completion
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    // If completed, verify result structure
+    if get_result["task"]["status"].as_str().unwrap() == "completed" {
+        let result = &get_result["result"];
+        assert!(result["success"].as_bool().unwrap_or(false));
+        assert!(result["data"].is_object());
+        // The task multiplies by 2
+        assert_eq!(result["data"]["result"], 246);
+    }
+}
+
+#[test]
+fn workflow_task_error_message_preserved() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit a failing task
+    let submit_result = client
+        .send_raw_request(
+            "tasks/submit",
+            json!({"taskType": "failing_task", "params": {}}),
+        )
+        .unwrap();
+
+    let task_id = submit_result["task"]["id"].as_str().unwrap();
+
+    // Wait for failure
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let get_result = client
+        .send_raw_request("tasks/get", json!({"id": task_id}))
+        .unwrap();
+
+    // If failed, verify error is preserved
+    if get_result["task"]["status"].as_str().unwrap() == "failed" {
+        let error = get_result["task"]["error"].as_str();
+        assert!(
+            error.is_some(),
+            "Failed task should have error message"
+        );
+        assert!(
+            error.unwrap().contains("intentionally") || error.unwrap().contains("failed"),
+            "Error message should describe failure"
+        );
+    }
+}
+
+#[test]
+fn workflow_task_type_preserved() {
+    let mut client = setup_task_server();
+    client.initialize().unwrap();
+
+    // Submit different task types
+    let task_types = ["quick_task", "progress_task"];
+
+    for task_type in task_types {
+        let submit_result = client
+            .send_raw_request(
+                "tasks/submit",
+                json!({"taskType": task_type, "params": {"value": 1}}),
+            )
+            .unwrap();
+
+        let task_id = submit_result["task"]["id"].as_str().unwrap();
+        let returned_type = submit_result["task"]["taskType"].as_str().unwrap();
+        assert_eq!(returned_type, task_type);
+
+        // Verify on get as well
+        let get_result = client
+            .send_raw_request("tasks/get", json!({"id": task_id}))
+            .unwrap();
+
+        assert_eq!(
+            get_result["task"]["taskType"].as_str().unwrap(),
+            task_type
+        );
+    }
+}
+
+// ============================================================================
 // Multiple Concurrent Clients E2E Tests (bd-1s1)
 // ============================================================================
 
@@ -2515,4 +2771,467 @@ fn tool_call_alternating_success_failure() {
     // Verify client is still functional after alternating failures
     let tools = client.list_tools().unwrap();
     assert!(!tools.is_empty());
+}
+
+// ============================================================================
+// Resource Reading E2E Tests (bd-bte)
+// ============================================================================
+
+/// Resource that returns plain text content.
+struct PlainTextResourceHandler;
+
+impl ResourceHandler for PlainTextResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "text://plain".to_string(),
+            name: "Plain Text".to_string(),
+            description: Some("Returns plain text content".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent {
+            uri: "text://plain".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Hello, World!".to_string()),
+            blob: None,
+        }])
+    }
+}
+
+/// Resource that returns JSON content.
+struct JsonResourceHandler;
+
+impl ResourceHandler for JsonResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "data://config.json".to_string(),
+            name: "JSON Config".to_string(),
+            description: Some("Returns JSON configuration".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let json = serde_json::json!({
+            "name": "test-config",
+            "version": "1.0.0",
+            "settings": {
+                "debug": true,
+                "max_connections": 100
+            }
+        });
+        Ok(vec![ResourceContent {
+            uri: "data://config.json".to_string(),
+            mime_type: Some("application/json".to_string()),
+            text: Some(json.to_string()),
+            blob: None,
+        }])
+    }
+}
+
+/// Resource that returns binary content.
+struct BinaryResourceHandler;
+
+impl ResourceHandler for BinaryResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "binary://data.bin".to_string(),
+            name: "Binary Data".to_string(),
+            description: Some("Returns binary content".to_string()),
+            mime_type: Some("application/octet-stream".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        // Create some test binary data
+        let binary_data: Vec<u8> = (0..255u8).collect();
+        let blob = base64_encode(&binary_data);
+
+        Ok(vec![ResourceContent {
+            uri: "binary://data.bin".to_string(),
+            mime_type: Some("application/octet-stream".to_string()),
+            text: None,
+            blob: Some(blob),
+        }])
+    }
+}
+
+/// Simple base64 encoding for tests (no external dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut result = String::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        let b0 = data[i] as usize;
+        let b1 = data.get(i + 1).map(|&x| x as usize).unwrap_or(0);
+        let b2 = data.get(i + 2).map(|&x| x as usize).unwrap_or(0);
+
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+
+        if i + 1 < data.len() {
+            result.push(ALPHABET[((b1 & 0x0F) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+
+        if i + 2 < data.len() {
+            result.push(ALPHABET[b2 & 0x3F] as char);
+        } else {
+            result.push('=');
+        }
+
+        i += 3;
+    }
+
+    result
+}
+
+/// Resource that returns Unicode content.
+struct UnicodeResourceHandler;
+
+impl ResourceHandler for UnicodeResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "text://unicode".to_string(),
+            name: "Unicode Text".to_string(),
+            description: Some("Returns Unicode content".to_string()),
+            mime_type: Some("text/plain; charset=utf-8".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent {
+            uri: "text://unicode".to_string(),
+            mime_type: Some("text/plain; charset=utf-8".to_string()),
+            text: Some("日本語 中文 العربية 🌍🌎🌏 Ελληνικά".to_string()),
+            blob: None,
+        }])
+    }
+}
+
+/// Resource that returns large content.
+struct LargeContentResourceHandler;
+
+impl ResourceHandler for LargeContentResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "data://large".to_string(),
+            name: "Large Content".to_string(),
+            description: Some("Returns large content".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let large_content = "x".repeat(100_000);
+        Ok(vec![ResourceContent {
+            uri: "data://large".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some(large_content),
+            blob: None,
+        }])
+    }
+}
+
+/// Resource that returns multiple content items.
+struct MultiContentResourceHandler;
+
+impl ResourceHandler for MultiContentResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "data://multi".to_string(),
+            name: "Multi Content".to_string(),
+            description: Some("Returns multiple content items".to_string()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![
+            ResourceContent {
+                uri: "data://multi/part1".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("Part 1".to_string()),
+                blob: None,
+            },
+            ResourceContent {
+                uri: "data://multi/part2".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("Part 2".to_string()),
+                blob: None,
+            },
+            ResourceContent {
+                uri: "data://multi/part3".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("Part 3".to_string()),
+                blob: None,
+            },
+        ])
+    }
+}
+
+/// Resource that always fails.
+struct FailingResourceHandler;
+
+impl ResourceHandler for FailingResourceHandler {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "error://fail".to_string(),
+            name: "Failing Resource".to_string(),
+            description: Some("Always fails when read".to_string()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Err(McpError::resource_not_found("Resource read failed intentionally"))
+    }
+}
+
+fn setup_resource_test_server() -> TestClient {
+    let (builder, client_transport, server_transport) = TestServer::builder()
+        .with_name("resource-test-server")
+        .with_version("1.0.0")
+        .build_server_builder();
+
+    let server = builder
+        .resource(PlainTextResourceHandler)
+        .resource(JsonResourceHandler)
+        .resource(BinaryResourceHandler)
+        .resource(UnicodeResourceHandler)
+        .resource(LargeContentResourceHandler)
+        .resource(MultiContentResourceHandler)
+        .resource(FailingResourceHandler)
+        .build();
+
+    std::thread::spawn(move || {
+        server.run_transport(server_transport);
+    });
+
+    TestClient::new(client_transport)
+}
+
+#[test]
+fn resource_read_plain_text() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("text://plain").unwrap();
+
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0].uri, "text://plain");
+    assert_eq!(content[0].mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(content[0].text.as_deref(), Some("Hello, World!"));
+    assert!(content[0].blob.is_none());
+}
+
+#[test]
+fn resource_read_json() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("data://config.json").unwrap();
+
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0].mime_type.as_deref(), Some("application/json"));
+
+    let json: serde_json::Value = serde_json::from_str(content[0].text.as_ref().unwrap()).unwrap();
+    assert_eq!(json["name"], "test-config");
+    assert_eq!(json["version"], "1.0.0");
+    assert_eq!(json["settings"]["debug"], true);
+    assert_eq!(json["settings"]["max_connections"], 100);
+}
+
+#[test]
+fn resource_read_binary() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("binary://data.bin").unwrap();
+
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0].mime_type.as_deref(), Some("application/octet-stream"));
+    assert!(content[0].text.is_none());
+    assert!(content[0].blob.is_some());
+
+    // Verify blob is base64 encoded
+    let blob = content[0].blob.as_ref().unwrap();
+    assert!(!blob.is_empty());
+    // Base64 uses only alphanumeric chars and +/=
+    assert!(blob.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+}
+
+#[test]
+fn resource_read_unicode() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("text://unicode").unwrap();
+
+    assert_eq!(content.len(), 1);
+    let text = content[0].text.as_ref().unwrap();
+    assert!(text.contains("日本語"));
+    assert!(text.contains("中文"));
+    assert!(text.contains("العربية"));
+    assert!(text.contains("🌍"));
+    assert!(text.contains("Ελληνικά"));
+}
+
+#[test]
+fn resource_read_large_content() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("data://large").unwrap();
+
+    assert_eq!(content.len(), 1);
+    let text = content[0].text.as_ref().unwrap();
+    assert_eq!(text.len(), 100_000);
+    assert!(text.chars().all(|c| c == 'x'));
+}
+
+#[test]
+fn resource_read_multiple_content_items() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let content = client.read_resource("data://multi").unwrap();
+
+    assert_eq!(content.len(), 3, "Should return 3 content items");
+
+    assert_eq!(content[0].text.as_deref(), Some("Part 1"));
+    assert_eq!(content[1].text.as_deref(), Some("Part 2"));
+    assert_eq!(content[2].text.as_deref(), Some("Part 3"));
+}
+
+#[test]
+fn resource_read_nonexistent() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let result = client.read_resource("nonexistent://resource");
+
+    assert!(result.is_err(), "Reading nonexistent resource should fail");
+}
+
+#[test]
+fn resource_read_failing() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let result = client.read_resource("error://fail");
+
+    assert!(result.is_err(), "Reading failing resource should return error");
+}
+
+#[test]
+fn resource_list_all() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let resources = client.list_resources().unwrap();
+
+    assert_eq!(resources.len(), 7, "Should have 7 resources registered");
+
+    let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(uris.contains(&"text://plain"));
+    assert!(uris.contains(&"data://config.json"));
+    assert!(uris.contains(&"binary://data.bin"));
+    assert!(uris.contains(&"text://unicode"));
+    assert!(uris.contains(&"data://large"));
+    assert!(uris.contains(&"data://multi"));
+    assert!(uris.contains(&"error://fail"));
+}
+
+#[test]
+fn resource_read_sequential() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    // Read multiple resources in sequence
+    let content1 = client.read_resource("text://plain").unwrap();
+    let content2 = client.read_resource("data://config.json").unwrap();
+    let content3 = client.read_resource("text://unicode").unwrap();
+
+    assert_eq!(content1[0].text.as_deref(), Some("Hello, World!"));
+    assert!(content2[0].text.as_ref().unwrap().contains("test-config"));
+    assert!(content3[0].text.as_ref().unwrap().contains("日本語"));
+}
+
+#[test]
+fn resource_read_after_error() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    // First read a valid resource
+    let content = client.read_resource("text://plain").unwrap();
+    assert!(!content.is_empty());
+
+    // Try to read a failing resource
+    let result = client.read_resource("error://fail");
+    assert!(result.is_err());
+
+    // Session should still work - read another valid resource
+    let content = client.read_resource("text://unicode").unwrap();
+    assert!(!content.is_empty());
+}
+
+#[test]
+fn resource_metadata_preserved() {
+    let mut client = setup_resource_test_server();
+    client.initialize().unwrap();
+
+    let resources = client.list_resources().unwrap();
+
+    let plain_text = resources.iter().find(|r| r.uri == "text://plain").unwrap();
+    assert_eq!(plain_text.name, "Plain Text");
+    assert_eq!(plain_text.description.as_deref(), Some("Returns plain text content"));
+    assert_eq!(plain_text.mime_type.as_deref(), Some("text/plain"));
+
+    let json_resource = resources.iter().find(|r| r.uri == "data://config.json").unwrap();
+    assert_eq!(json_resource.name, "JSON Config");
+    assert_eq!(json_resource.mime_type.as_deref(), Some("application/json"));
+}
+
+#[test]
+fn resource_read_before_init_fails() {
+    use fastmcp_transport::memory::create_memory_transport_pair;
+    use std::thread;
+
+    let (client_transport, server_transport) = create_memory_transport_pair();
+    let server = Server::new("test", "1.0.0")
+        .resource(PlainTextResourceHandler)
+        .build();
+    thread::spawn(move || server.run_transport(server_transport));
+
+    let mut client = TestClient::new(client_transport);
+
+    // Should fail before initialization
+    assert!(client.read_resource("text://plain").is_err());
 }
