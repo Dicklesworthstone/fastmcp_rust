@@ -161,6 +161,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::duration_suboptimal_units)]
     fn test_parse_milliseconds() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(

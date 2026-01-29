@@ -486,7 +486,7 @@ mod tests {
 
         let mut stdout = AsyncStdout::new();
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
 
         let result = Pin::new(&mut stdout).poll_write(&mut cx, b"");
         assert!(matches!(result, Poll::Ready(Ok(0))));
