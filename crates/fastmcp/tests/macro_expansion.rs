@@ -5,6 +5,22 @@
 //! with proper trait impls, parameter extraction, schema generation,
 //! doc comments, async handling, and return type conversion.
 
+// Test-specific clippy allowances:
+// - unused_async: async functions are intentionally async to test macro handling
+// - struct_field_names: test structs use explicit naming for clarity
+// - similar_names: test functions have intentionally similar names
+// - too_many_lines: test file needs comprehensive coverage
+// - unnecessary_wraps: testing Result return type handling
+// - enum_variant_names: test enums for schema testing
+// - dead_code: test structs/enums exist only for schema generation testing
+#![allow(clippy::unused_async)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::enum_variant_names)]
+#![allow(dead_code)]
+
 use fastmcp::{
     Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceHandler,
     Role, ToolHandler, prompt, resource, tool,
@@ -473,6 +489,280 @@ fn tool_default_output_schema_is_none() {
 fn tool_default_timeout_is_none() {
     let handler = GreetSimple;
     assert!(handler.timeout().is_none());
+}
+
+// --- Tool with output_schema ---
+
+/// Tool with explicit output schema.
+#[tool(output_schema = serde_json::json!({
+    "type": "object",
+    "properties": {
+        "result": { "type": "string" },
+        "count": { "type": "integer" }
+    },
+    "required": ["result"]
+}))]
+fn tool_with_output_schema(input: String) -> String {
+    format!("processed: {input}")
+}
+
+#[test]
+fn tool_output_schema_is_set() {
+    let handler = ToolWithOutputSchema;
+    let schema = handler.output_schema();
+    assert!(schema.is_some());
+    let schema = schema.unwrap();
+    assert_eq!(schema["type"], "object");
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("result"));
+    assert!(props.contains_key("count"));
+}
+
+#[test]
+fn tool_output_schema_in_definition() {
+    let handler = ToolWithOutputSchema;
+    let def = handler.definition();
+    assert!(def.output_schema.is_some());
+    let schema = def.output_schema.unwrap();
+    assert_eq!(schema["type"], "object");
+}
+
+// --- Tool with HashMap parameter ---
+
+/// Tool with HashMap parameter.
+#[tool]
+fn map_tool(metadata: std::collections::HashMap<String, String>) -> String {
+    metadata
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[test]
+fn tool_hashmap_param_schema() {
+    let handler = MapTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["metadata"]["type"], "object");
+    assert_eq!(props["metadata"]["additionalProperties"]["type"], "string");
+}
+
+#[test]
+fn tool_hashmap_param_call() {
+    let handler = MapTool;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"metadata": {"key1": "val1", "key2": "val2"}}))
+        .unwrap();
+    match &result[0] {
+        Content::Text { text } => {
+            assert!(text.contains("key1=val1") || text.contains("key2=val2"));
+        }
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Tool with u32/i32 parameters ---
+
+/// Tool with unsigned integer parameter.
+#[tool]
+fn uint_tool(count: u32) -> String {
+    format!("count: {count}")
+}
+
+#[test]
+fn tool_u32_param_schema() {
+    let handler = UintTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["count"]["type"], "integer");
+}
+
+#[test]
+fn tool_u32_param_call() {
+    let handler = UintTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"count": 42})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "count: 42"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+/// Tool with signed integer parameter.
+#[tool]
+fn int_tool(value: i32) -> String {
+    format!("value: {value}")
+}
+
+#[test]
+fn tool_i32_param_schema() {
+    let handler = IntTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["value"]["type"], "integer");
+}
+
+#[test]
+fn tool_i32_param_call_positive() {
+    let handler = IntTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"value": 100})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "value: 100"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+#[test]
+fn tool_i32_param_call_negative() {
+    let handler = IntTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"value": -50})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "value: -50"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Tool with nested Vec ---
+
+/// Tool with nested Vec parameter.
+#[tool]
+fn nested_vec_tool(matrix: Vec<Vec<i32>>) -> String {
+    let rows: Vec<String> = matrix
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    rows.join("; ")
+}
+
+#[test]
+fn tool_nested_vec_param_schema() {
+    let handler = NestedVecTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["matrix"]["type"], "array");
+    assert_eq!(props["matrix"]["items"]["type"], "array");
+    assert_eq!(props["matrix"]["items"]["items"]["type"], "integer");
+}
+
+#[test]
+fn tool_nested_vec_param_call() {
+    let handler = NestedVecTool;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"matrix": [[1, 2], [3, 4]]}))
+        .unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "1,2; 3,4"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Tool with multiple optional parameters ---
+
+/// Tool with all optional parameters.
+#[tool]
+fn all_optional_tool(a: Option<String>, b: Option<i32>, c: Option<bool>) -> String {
+    let a_str = a.unwrap_or_else(|| "none".to_string());
+    let b_str = b.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
+    let c_str = c.map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+    format!("a={a_str}, b={b_str}, c={c_str}")
+}
+
+#[test]
+fn tool_all_optional_none_required() {
+    let handler = AllOptionalTool;
+    let def = handler.definition();
+    let required = def.input_schema["required"].as_array().unwrap();
+    assert!(required.is_empty());
+}
+
+#[test]
+fn tool_all_optional_call_empty() {
+    let handler = AllOptionalTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "a=none, b=none, c=none"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+#[test]
+fn tool_all_optional_call_partial() {
+    let handler = AllOptionalTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"b": 42})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "a=none, b=42, c=none"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+#[test]
+fn tool_all_optional_call_full() {
+    let handler = AllOptionalTool;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"a": "hello", "b": 42, "c": true}))
+        .unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "a=hello, b=42, c=true"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+// --- Tool returning unit ---
+
+/// Tool that returns nothing.
+#[tool]
+fn unit_tool() {}
+
+#[test]
+fn tool_unit_return_empty_content() {
+    let handler = UnitTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({})).unwrap();
+    assert!(result.is_empty());
+}
+
+// --- Async tool with Result return ---
+
+/// Async tool returning Result.
+#[tool]
+async fn async_fallible_tool(succeed: bool) -> McpResult<String> {
+    if succeed {
+        Ok("async success".to_string())
+    } else {
+        Err(fastmcp::McpError::internal_error("async failed"))
+    }
+}
+
+#[test]
+fn async_fallible_tool_ok() {
+    let handler = AsyncFallibleTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"succeed": true})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "async success"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
+#[test]
+fn async_fallible_tool_err() {
+    let handler = AsyncFallibleTool;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"succeed": false}));
+    assert!(result.is_err());
 }
 
 // ============================================================================
