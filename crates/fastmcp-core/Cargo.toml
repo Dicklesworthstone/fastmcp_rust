@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Core types and context for FastMCP"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/fastmcp-core"
+keywords = ["mcp", "context", "cancellation", "budget", "asupersync"]
+categories = ["development-tools", "network-programming"]
 
 [dependencies]
 asupersync.workspace = true

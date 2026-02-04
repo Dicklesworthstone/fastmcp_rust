@@ -95,9 +95,10 @@ dependencies = [
 name = "asupersync"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bincode",
  "crossbeam-queue",
- "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "libc",
  "nix",
  "parking_lot",
@@ -106,9 +107,14 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha1",
  "slab",
  "socket2",
+ "tempfile",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
 ]
 
 [[package]]
@@ -1780,6 +1786,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2248,6 +2265,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "visibility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "vte"

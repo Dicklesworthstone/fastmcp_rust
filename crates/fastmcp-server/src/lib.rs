@@ -22,6 +22,18 @@
 //!         .run_stdio();
 //! }
 //! ```
+//!
+//! # Role in the System
+//!
+//! `fastmcp-server` is the **execution engine** for MCP servers. It ties
+//! together:
+//! - Protocol types (`fastmcp-protocol`) for requests and responses
+//! - Transports (`fastmcp-transport`) for stdio/SSE/WebSocket I/O
+//! - Core context + cancellation (`fastmcp-core`) for budgets and checkpoints
+//! - Console output (`fastmcp-console`) for human-friendly stderr rendering
+//!
+//! The façade crate `fastmcp` re-exports this API, so most users interact with
+//! `Server` via `fastmcp::prelude::*`.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]

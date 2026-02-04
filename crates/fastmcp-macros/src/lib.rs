@@ -39,6 +39,18 @@
 //!     }]
 //! }
 //! ```
+//!
+//! # Role in the System
+//!
+//! `fastmcp-macros` is the **ergonomics layer** of FastMCP. The attribute
+//! macros expand handler functions into the trait implementations used by
+//! `fastmcp-server`, and they also generate JSON Schema metadata consumed by
+//! `fastmcp-protocol` during tool registration.
+//!
+//! Most users never need to depend on this crate directly; it is re-exported
+//! by the `fastmcp` façade for `use fastmcp::prelude::*`.
+
+#![forbid(unsafe_code)]
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

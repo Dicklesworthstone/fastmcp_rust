@@ -22,7 +22,10 @@
 ---
 
 ```bash
-# Add to your project
+# Add to your project (crates.io)
+cargo add fastmcp
+
+# Or use the git dependency for bleeding-edge changes
 cargo add fastmcp --git https://github.com/Dicklesworthstone/fastmcp_rust
 ```
 
@@ -231,6 +234,13 @@ async fn parallel_fetch(ctx: &McpContext, urls: Vec<String>) -> Vec<String> {
 
 ## Installation
 
+### From crates.io
+
+```toml
+[dependencies]
+fastmcp = "0.1"
+```
+
 ### As a Git Dependency
 
 ```toml
@@ -244,6 +254,12 @@ fastmcp = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 git clone https://github.com/Dicklesworthstone/fastmcp_rust.git
 cd fastmcp_rust
 cargo build --release
+```
+
+### CLI (optional)
+
+```bash
+cargo install fastmcp-cli
 ```
 
 **Requirements:**

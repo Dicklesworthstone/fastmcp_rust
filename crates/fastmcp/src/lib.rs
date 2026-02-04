@@ -39,6 +39,30 @@
 //! - `fastmcp-client`: Client implementation
 //! - `fastmcp-macros`: Procedural macros (#[tool], #[resource], #[prompt])
 //!
+//! # Role in the System
+//!
+//! This crate is the **public façade** of the workspace. It re-exports the
+//! pieces you need for day-to-day server and client development so that most
+//! applications can depend on a single crate and write `use fastmcp::prelude::*;`.
+//!
+//! Concretely, `fastmcp` glues together:
+//! - **Core runtime + context** from `fastmcp-core`
+//! - **Protocol models** from `fastmcp-protocol`
+//! - **Transports** from `fastmcp-transport`
+//! - **Server/client** APIs from `fastmcp-server` and `fastmcp-client`
+//! - **Macros** from `fastmcp-macros`
+//!
+//! # When to Use `fastmcp`
+//!
+//! - **You are building an MCP server or client** and want the canonical,
+//!   batteries-included API surface.
+//! - **You want a single dependency** rather than wiring the sub-crates
+//!   yourself.
+//!
+//! Use the sub-crates directly only when you need a narrower dependency surface
+//! (for example, a custom transport that depends on `fastmcp-transport` but not
+//! the full server stack).
+//!
 //! # Asupersync Integration
 //!
 //! FastMCP uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for:

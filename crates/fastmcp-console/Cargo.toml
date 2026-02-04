@@ -1,10 +1,16 @@
 [package]
 name = "fastmcp-console"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Rich console output for FastMCP servers"
-license = "MIT"
-repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/fastmcp-console"
+keywords = ["mcp", "console", "logging", "stderr", "rich"]
+categories = ["command-line-interface", "development-tools"]
 
 [dependencies]
 rich_rust = { workspace = true }

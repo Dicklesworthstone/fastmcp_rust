@@ -6,6 +6,13 @@ fastmcp-console renders human-friendly output to stderr and keeps stdout
 reserved for JSON-RPC (NDJSON). This preserves protocol correctness for agents
 while giving humans polished output.
 
+## Role in FastMCP
+
+fastmcp-console is the **human-facing output layer** of FastMCP. The server
+and CLI use it to render banners, tables, and logs to stderr while keeping
+stdout strictly reserved for JSON-RPC. This separation is critical for MCP
+clients and agents that parse stdout as a protocol stream.
+
 ## Quick Start
 
 ```rust

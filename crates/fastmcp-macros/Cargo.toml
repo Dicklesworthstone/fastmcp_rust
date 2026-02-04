@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Procedural macros for FastMCP (#[tool], #[resource], #[prompt])"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/fastmcp-macros"
+keywords = ["mcp", "proc-macro", "macros", "json-schema", "handlers"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

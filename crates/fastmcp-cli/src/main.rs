@@ -5,6 +5,15 @@
 //! - `inspect` - Inspect a server's capabilities
 //! - `install` - Install server config for Claude Desktop etc.
 //! - `tasks` - Manage background tasks on MCP servers
+//!
+//! # Role in the System
+//!
+//! `fastmcp-cli` is the **operator tooling layer** for FastMCP. It wraps the
+//! client and transport crates to provide day-to-day workflows:
+//! - Running local servers with stdio transport
+//! - Inspecting tools/resources/prompts for debugging
+//! - Installing client configs for Claude Desktop, Cursor, and Cline
+//! - Managing background tasks exposed by MCP servers
 
 #![forbid(unsafe_code)]
 

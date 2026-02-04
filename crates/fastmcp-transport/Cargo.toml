@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Transport layer (stdio, SSE, WebSocket) for FastMCP"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/fastmcp-transport"
+keywords = ["mcp", "transport", "stdio", "sse", "websocket"]
+categories = ["network-programming"]
 
 [dependencies]
 fastmcp-core.workspace = true

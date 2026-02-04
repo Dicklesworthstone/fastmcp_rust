@@ -19,6 +19,18 @@
 //! // Call a tool
 //! let result = client.call_tool("greet", json!({"name": "World"})).await?;
 //! ```
+//!
+//! # Role in the System
+//!
+//! `fastmcp-client` is the **companion client** to `fastmcp-server`. It uses
+//! the same protocol models and transport layer to:
+//! - Spawn MCP servers as subprocesses (stdio)
+//! - Initialize sessions and negotiate capabilities
+//! - Call tools, read resources, and fetch prompts
+//!
+//! If you are embedding FastMCP into a larger application (e.g. testing,
+//! orchestration, or local agent tooling), this is the crate that drives the
+//! client side of the protocol.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]

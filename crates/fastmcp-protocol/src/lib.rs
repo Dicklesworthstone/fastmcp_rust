@@ -18,6 +18,17 @@
 //! # Wire Format
 //!
 //! All messages are newline-delimited JSON (NDJSON).
+//!
+//! # Role in the System
+//!
+//! `fastmcp-protocol` is the **shared vocabulary** for FastMCP:
+//! - The server uses these types to validate and serialize responses.
+//! - The client uses the same types to construct requests and parse replies.
+//! - Transports carry these messages without needing to know business logic.
+//!
+//! If you are integrating FastMCP with a custom runtime or embedding it into
+//! another system, depend on this crate to get the canonical JSON-RPC and MCP
+//! data models.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]

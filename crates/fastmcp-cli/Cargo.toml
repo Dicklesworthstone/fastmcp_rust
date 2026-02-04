@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "CLI tooling for FastMCP - run, inspect, and install MCP servers"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/fastmcp-cli"
+keywords = ["mcp", "cli", "server", "tools", "json-rpc"]
+categories = ["command-line-interface", "development-tools"]
 
 [[bin]]
 name = "fastmcp"

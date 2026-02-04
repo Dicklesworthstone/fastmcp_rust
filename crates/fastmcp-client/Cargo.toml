@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "MCP client implementation for FastMCP"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/fastmcp-client"
+keywords = ["mcp", "client", "json-rpc", "async", "protocol"]
+categories = ["network-programming"]
 
 [dependencies]
 fastmcp-core.workspace = true

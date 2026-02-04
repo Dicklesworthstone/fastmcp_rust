@@ -12,6 +12,18 @@
 //! - All types support `Send + Sync`
 //! - Cancel-correct via asupersync integration
 //!
+//! # Role in the System
+//!
+//! `fastmcp-core` is the **foundation layer** shared by every other crate.
+//! It defines:
+//! - `McpContext`, the capability-carrying handle that wraps asupersync's `Cx`
+//! - The FastMCP error model (`McpError`, `McpErrorCode`, `McpResult`)
+//! - Budget/cancellation semantics that handlers and transports must obey
+//! - Outcome bridging utilities so server/client code can stay 4-valued
+//!
+//! If you are implementing a new transport, handler, or runtime adapter, this
+//! is the crate that gives you the shared primitives used everywhere else.
+//!
 //! # Asupersync Integration
 //!
 //! This crate uses [asupersync](https://github.com/Dicklesworthstone/asupersync) as its async

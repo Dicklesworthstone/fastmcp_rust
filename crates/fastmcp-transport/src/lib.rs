@@ -19,6 +19,16 @@
 //! - Each message is a single line of JSON
 //! - Messages are separated by `\n`
 //! - UTF-8 encoding is required
+//!
+//! # Role in the System
+//!
+//! `fastmcp-transport` is the **I/O boundary** for FastMCP. It is deliberately
+//! protocol-agnostic: transports move `JsonRpcMessage` values in and out while
+//! the server/client layers handle semantics. This keeps transport
+//! implementations small, testable, and reusable.
+//!
+//! If you need to add a new transport (for example, QUIC or a custom IPC),
+//! this is the crate to extend.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]

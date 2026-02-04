@@ -17,11 +17,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
+repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
+homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
+readme = "README.md"
 
 [workspace.dependencies]
 # Runtime (our own)
-asupersync = { path = "../asupersync" }
-rich_rust = { path = "../rich_rust" }
+asupersync = { version = "0.1.0", path = "../asupersync" }
+rich_rust = { version = "0.1.1", path = "../rich_rust" }
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }
@@ -55,15 +58,15 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 trybuild = { version = "1", default-features = false }
 
 # Internal crates
-fastmcp = { path = "crates/fastmcp" }
-fastmcp-core = { path = "crates/fastmcp-core" }
-fastmcp-transport = { path = "crates/fastmcp-transport" }
-fastmcp-protocol = { path = "crates/fastmcp-protocol" }
-fastmcp-server = { path = "crates/fastmcp-server" }
-fastmcp-client = { path = "crates/fastmcp-client" }
-fastmcp-macros = { path = "crates/fastmcp-macros" }
-fastmcp-console = { path = "crates/fastmcp-console" }
-fastmcp-cli = { path = "crates/fastmcp-cli" }
+fastmcp = { version = "0.1.0", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.1.0", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.1.0", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.1.0", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.1.0", path = "crates/fastmcp-server" }
+fastmcp-client = { version = "0.1.0", path = "crates/fastmcp-client" }
+fastmcp-macros = { version = "0.1.0", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.1.0", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.1.0", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
