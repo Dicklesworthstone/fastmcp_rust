@@ -180,11 +180,11 @@ impl Router {
                     )));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp::router", "Tool '{}' already exists, keeping original", name);
+                    log::warn!(target: "fastmcp_rust::router", "Tool '{}' already exists, keeping original", name);
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp::router", "Replacing tool '{}'", name);
+                    log::debug!(target: "fastmcp_rust::router", "Replacing tool '{}'", name);
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {
@@ -255,11 +255,11 @@ impl Router {
                     )));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp::router", "Resource '{}' already exists, keeping original", key);
+                    log::warn!(target: "fastmcp_rust::router", "Resource '{}' already exists, keeping original", key);
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp::router", "Replacing resource '{}'", key);
+                    log::debug!(target: "fastmcp_rust::router", "Replacing resource '{}'", key);
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {
@@ -344,11 +344,11 @@ impl Router {
                     )));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp::router", "Prompt '{}' already exists, keeping original", name);
+                    log::warn!(target: "fastmcp_rust::router", "Prompt '{}' already exists, keeping original", name);
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp::router", "Replacing prompt '{}'", name);
+                    log::debug!(target: "fastmcp_rust::router", "Replacing prompt '{}'", name);
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {

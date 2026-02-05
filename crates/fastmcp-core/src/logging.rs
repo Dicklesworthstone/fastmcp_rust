@@ -40,13 +40,13 @@
 //!
 //! FastMCP uses hierarchical log targets for filtering:
 //!
-//! - `fastmcp`: Root target for all FastMCP logs
-//! - `fastmcp::server`: Server lifecycle and request handling
-//! - `fastmcp::transport`: Transport layer messages
-//! - `fastmcp::router`: Request routing and dispatch
-//! - `fastmcp::handler`: Tool/resource/prompt handler execution
+//! - `fastmcp_rust`: Root target for all FastMCP logs
+//! - `fastmcp_rust::server`: Server lifecycle and request handling
+//! - `fastmcp_rust::transport`: Transport layer messages
+//! - `fastmcp_rust::router`: Request routing and dispatch
+//! - `fastmcp_rust::handler`: Tool/resource/prompt handler execution
 //!
-//! Example filter: `RUST_LOG=fastmcp::server=debug,fastmcp::transport=trace`
+//! Example filter: `RUST_LOG=fastmcp_rust::server=debug,fastmcp_rust::transport=trace`
 
 // Re-export log macros for ergonomic use
 pub use log::{debug, error, info, trace, warn};
@@ -60,25 +60,25 @@ pub use log::{Level, LevelFilter};
 /// for consistent filtering.
 pub mod targets {
     /// Root target for all FastMCP logs.
-    pub const FASTMCP: &str = "fastmcp";
+    pub const FASTMCP: &str = "fastmcp_rust";
 
     /// Server lifecycle and request handling.
-    pub const SERVER: &str = "fastmcp::server";
+    pub const SERVER: &str = "fastmcp_rust::server";
 
     /// Transport layer (stdio, SSE, WebSocket).
-    pub const TRANSPORT: &str = "fastmcp::transport";
+    pub const TRANSPORT: &str = "fastmcp_rust::transport";
 
     /// Request routing and method dispatch.
-    pub const ROUTER: &str = "fastmcp::router";
+    pub const ROUTER: &str = "fastmcp_rust::router";
 
     /// Tool, resource, and prompt handler execution.
-    pub const HANDLER: &str = "fastmcp::handler";
+    pub const HANDLER: &str = "fastmcp_rust::handler";
 
     /// Client connections and sessions.
-    pub const SESSION: &str = "fastmcp::session";
+    pub const SESSION: &str = "fastmcp_rust::session";
 
     /// Codec operations (JSON encoding/decoding).
-    pub const CODEC: &str = "fastmcp::codec";
+    pub const CODEC: &str = "fastmcp_rust::codec";
 }
 
 /// Returns whether logging is enabled at the given level for the given target.
@@ -105,7 +105,7 @@ pub fn is_enabled(level: Level, target: &str) -> bool {
 #[macro_export]
 macro_rules! log_server {
     ($($arg:tt)*) => {
-        log::info!(target: "fastmcp::server", $($arg)*)
+        log::info!(target: "fastmcp_rust::server", $($arg)*)
     };
 }
 
@@ -113,7 +113,7 @@ macro_rules! log_server {
 #[macro_export]
 macro_rules! log_transport {
     ($($arg:tt)*) => {
-        log::debug!(target: "fastmcp::transport", $($arg)*)
+        log::debug!(target: "fastmcp_rust::transport", $($arg)*)
     };
 }
 
@@ -121,7 +121,7 @@ macro_rules! log_transport {
 #[macro_export]
 macro_rules! log_router {
     ($($arg:tt)*) => {
-        log::debug!(target: "fastmcp::router", $($arg)*)
+        log::debug!(target: "fastmcp_rust::router", $($arg)*)
     };
 }
 
@@ -129,7 +129,7 @@ macro_rules! log_router {
 #[macro_export]
 macro_rules! log_handler {
     ($($arg:tt)*) => {
-        log::debug!(target: "fastmcp::handler", $($arg)*)
+        log::debug!(target: "fastmcp_rust::handler", $($arg)*)
     };
 }
 
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn log_targets_are_hierarchical() {
-        // Verify targets follow the fastmcp:: prefix pattern
+        // Verify targets follow the fastmcp_rust:: prefix pattern
         assert!(targets::SERVER.starts_with(targets::FASTMCP));
         assert!(targets::TRANSPORT.starts_with(targets::FASTMCP));
         assert!(targets::ROUTER.starts_with(targets::FASTMCP));

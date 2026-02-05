@@ -1396,7 +1396,7 @@ impl Server {
         let text = format!("{ts} {}", message.into());
         let params = LogMessageParams {
             level,
-            logger: Some("fastmcp::server".to_string()),
+            logger: Some("fastmcp_rust::server".to_string()),
             data: serde_json::Value::String(text),
         };
         let payload = match serde_json::to_value(params) {

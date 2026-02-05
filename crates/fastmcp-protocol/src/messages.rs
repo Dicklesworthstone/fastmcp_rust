@@ -1721,12 +1721,12 @@ mod tests {
 
         let log_message = LogMessageParams {
             level: LogLevel::Info,
-            logger: Some("fastmcp::server".to_string()),
+            logger: Some("fastmcp_rust::server".to_string()),
             data: serde_json::Value::String("hello".to_string()),
         };
         let value = serde_json::to_value(&log_message).expect("serialize log message");
         assert_eq!(value["level"], "info");
-        assert_eq!(value["logger"], "fastmcp::server");
+        assert_eq!(value["logger"], "fastmcp_rust::server");
         assert_eq!(value["data"], "hello");
     }
 

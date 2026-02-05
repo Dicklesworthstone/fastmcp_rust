@@ -984,7 +984,7 @@ impl Log for RichLogger {
             };
 
             let target = if record.target().starts_with("fastmcp") {
-                record.target().strip_prefix("fastmcp::").unwrap_or(record.target())
+                record.target().strip_prefix("fastmcp_rust::").unwrap_or(record.target())
             } else {
                 record.target()
             };

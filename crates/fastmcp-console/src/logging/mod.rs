@@ -18,7 +18,7 @@
 //!
 //! let formatter = RichLogFormatter::detect();
 //! let event = LogEvent::new(LogLevel::Info, "Server started")
-//!     .with_target("fastmcp::server");
+//!     .with_target("fastmcp_rust::server");
 //!
 //! let line = formatter.format_line(&event);
 //! eprintln!("{}", line);

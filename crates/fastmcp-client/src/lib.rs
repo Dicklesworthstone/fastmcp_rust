@@ -692,7 +692,7 @@ impl Client {
             LogLevel::Error => log::Level::Error,
         };
 
-        let target = message.logger.as_deref().unwrap_or("fastmcp::remote");
+        let target = message.logger.as_deref().unwrap_or("fastmcp_rust::remote");
         let text = match message.data {
             serde_json::Value::String(s) => s,
             other => other.to_string(),

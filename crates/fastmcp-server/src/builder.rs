@@ -264,7 +264,7 @@ impl ServerBuilder {
             .router
             .add_tool_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp::builder", "Failed to register tool: {}", e);
+            log::error!(target: "fastmcp_rust::builder", "Failed to register tool: {}", e);
         } else {
             self.capabilities.tools = Some(ToolsCapability::default());
         }
@@ -282,7 +282,7 @@ impl ServerBuilder {
             .router
             .add_resource_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp::builder", "Failed to register resource: {}", e);
+            log::error!(target: "fastmcp_rust::builder", "Failed to register resource: {}", e);
         } else {
             self.capabilities.resources = Some(ResourcesCapability::default());
         }
@@ -308,7 +308,7 @@ impl ServerBuilder {
             .router
             .add_prompt_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp::builder", "Failed to register prompt: {}", e);
+            log::error!(target: "fastmcp_rust::builder", "Failed to register prompt: {}", e);
         } else {
             self.capabilities.prompts = Some(PromptsCapability::default());
         }
@@ -411,7 +411,7 @@ impl ServerBuilder {
         // Register tools with prefix
         for tool in catalog.tools {
             log::debug!(
-                target: "fastmcp::proxy",
+                target: "fastmcp_rust::proxy",
                 "Registering proxied tool: {}/{}", prefix, tool.name
             );
             self.router.add_tool(ProxyToolHandler::with_prefix(
@@ -424,7 +424,7 @@ impl ServerBuilder {
         // Register resources with prefix
         for resource in catalog.resources {
             log::debug!(
-                target: "fastmcp::proxy",
+                target: "fastmcp_rust::proxy",
                 "Registering proxied resource: {}/{}", prefix, resource.uri
             );
             self.router.add_resource(ProxyResourceHandler::with_prefix(
@@ -437,7 +437,7 @@ impl ServerBuilder {
         // Register resource templates with prefix
         for template in catalog.resource_templates {
             log::debug!(
-                target: "fastmcp::proxy",
+                target: "fastmcp_rust::proxy",
                 "Registering proxied template: {}/{}", prefix, template.uri_template
             );
             self.router
@@ -451,7 +451,7 @@ impl ServerBuilder {
         // Register prompts with prefix
         for prompt in catalog.prompts {
             log::debug!(
-                target: "fastmcp::proxy",
+                target: "fastmcp_rust::proxy",
                 "Registering proxied prompt: {}/{}", prefix, prompt.name
             );
             self.router.add_prompt(ProxyPromptHandler::with_prefix(
@@ -473,7 +473,7 @@ impl ServerBuilder {
         }
 
         log::info!(
-            target: "fastmcp::proxy",
+            target: "fastmcp_rust::proxy",
             "Proxied {} tools, {} resources, {} templates, {} prompts with prefix '{}'",
             tool_count,
             resource_count,
@@ -551,7 +551,7 @@ impl ServerBuilder {
 
         // Log warnings if any
         for warning in &result.warnings {
-            log::warn!(target: "fastmcp::mount", "{}", warning);
+            log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
 
         // Update capabilities based on what was mounted
@@ -593,7 +593,7 @@ impl ServerBuilder {
 
         // Log warnings if any
         for warning in &result.warnings {
-            log::warn!(target: "fastmcp::mount", "{}", warning);
+            log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
 
         // Update capabilities if tools were mounted
@@ -629,7 +629,7 @@ impl ServerBuilder {
 
         // Log warnings if any
         for warning in &result.warnings {
-            log::warn!(target: "fastmcp::mount", "{}", warning);
+            log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
 
         // Update capabilities if resources were mounted
@@ -665,7 +665,7 @@ impl ServerBuilder {
 
         // Log warnings if any
         for warning in &result.warnings {
-            log::warn!(target: "fastmcp::mount", "{}", warning);
+            log::warn!(target: "fastmcp_rust::mount", "{}", warning);
         }
 
         // Update capabilities if prompts were mounted

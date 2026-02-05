@@ -134,8 +134,8 @@ impl RichLogFormatter {
             return None;
         }
 
-        // Strip "fastmcp::" prefix for cleaner output
-        let target = target.strip_prefix("fastmcp::").unwrap_or(target);
+        // Strip "fastmcp_rust::" prefix for cleaner output
+        let target = target.strip_prefix("fastmcp_rust::").unwrap_or(target);
         let target = self.truncate_text(target);
 
         if self.should_use_rich() {
@@ -441,8 +441,8 @@ mod tests {
     fn test_target_formatting() {
         let formatter = test_formatter_agent();
 
-        // Should strip fastmcp:: prefix
-        let target = formatter.format_target("fastmcp::server::router");
+        // Should strip fastmcp_rust:: prefix
+        let target = formatter.format_target("fastmcp_rust::server::router");
         assert_eq!(target, Some("server::router".to_string()));
 
         // Non-fastmcp targets remain unchanged
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_target_truncation() {
         let formatter = test_formatter_agent().with_max_width(Some(8));
-        let target = formatter.format_target("fastmcp::server::router");
+        let target = formatter.format_target("fastmcp_rust::server::router");
         assert_eq!(target, Some("serve...".to_string()));
     }
 
@@ -486,7 +486,7 @@ mod tests {
     fn test_format_event_plain() {
         let formatter = test_formatter_agent();
         let event = LogEvent::new(LogLevel::Info, "Server started")
-            .with_target("fastmcp::server")
+            .with_target("fastmcp_rust::server")
             .with_timestamp("12:00:00");
 
         let formatted = formatter.format_event(&event);
@@ -518,7 +518,7 @@ mod tests {
     fn test_format_line() {
         let formatter = test_formatter_agent();
         let event = LogEvent::new(LogLevel::Error, "Connection failed")
-            .with_target("fastmcp::transport")
+            .with_target("fastmcp_rust::transport")
             .with_timestamp("12:00:00")
             .with_field("error", "timeout");
 

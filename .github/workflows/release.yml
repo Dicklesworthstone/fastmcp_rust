@@ -149,6 +149,11 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     if: "!contains(needs.release.outputs.version, '-')"  # Skip prereleases
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -160,11 +165,59 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-${{ runner.os }}
+          workspaces: |
+            . -> target
+            ../asupersync -> ../asupersync/target
+
+      - name: Ensure crates.io token
+        if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
+        run: |
+          echo "CARGO_REGISTRY_TOKEN is not set. Configure it in repo secrets."
+          exit 1
+
       - name: Publish crates
         run: |
-          echo "Crates would be published here"
-          echo "Add: cargo publish --package fastmcp-core"
-          echo "Add: cargo publish --package fastmcp-protocol"
-          echo "etc."
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          set -euo pipefail
+
+          publish_crate() {
+            local crate="$1"
+            local attempt=1
+            local max_attempts=12
+            local wait_seconds=600
+
+            while true; do
+              echo "Publishing ${crate} (attempt ${attempt}/${max_attempts})..."
+              if output=$(cargo publish -p "${crate}" --locked 2>&1); then
+                echo "${output}"
+                return 0
+              fi
+
+              echo "${output}"
+              if echo "${output}" | grep -qi "already uploaded"; then
+                echo "Crate ${crate} already published. Skipping."
+                return 0
+              fi
+
+              if [ "${attempt}" -ge "${max_attempts}" ]; then
+                echo "Publishing ${crate} failed after ${max_attempts} attempts."
+                return 1
+              fi
+
+              echo "Waiting ${wait_seconds}s before retrying ${crate}..."
+              sleep "${wait_seconds}"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          publish_crate fastmcp-derive
+          publish_crate fastmcp-core
+          publish_crate fastmcp-protocol
+          publish_crate fastmcp-transport
+          publish_crate fastmcp-console
+          publish_crate fastmcp-client
+          publish_crate fastmcp-server
+          publish_crate fastmcp-cli
+          publish_crate fastmcp-rust
