@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //!
 //! /// Greets a user by name.
 //! #[tool]
@@ -48,7 +48,7 @@
 //! `fastmcp-protocol` during tool registration.
 //!
 //! Most users never need to depend on this crate directly; it is re-exported
-//! by the `fastmcp` façade for `use fastmcp::prelude::*`.
+//! by the `fastmcp-rust` façade for `use fastmcp_rust::prelude::*`.
 
 #![forbid(unsafe_code)]
 
@@ -1546,7 +1546,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::JsonSchema;
+/// use fastmcp_rust::JsonSchema;
 ///
 /// #[derive(JsonSchema)]
 /// struct MyToolInput {

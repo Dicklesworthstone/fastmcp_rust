@@ -1,6 +1,6 @@
 // Tests that #[tool] with zero-duration timeout produces a compile error.
 
-use fastmcp::tool;
+use fastmcp_rust::tool;
 
 #[tool(timeout = "0s")]
 fn my_tool() -> String {

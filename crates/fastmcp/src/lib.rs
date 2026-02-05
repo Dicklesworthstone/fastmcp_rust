@@ -14,7 +14,7 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //!
 //! #[tool]
 //! async fn greet(ctx: &McpContext, name: String) -> String {
@@ -41,18 +41,19 @@
 //!
 //! # Role in the System
 //!
-//! This crate is the **public façade** of the workspace. It re-exports the
+//! This crate is the **public façade** of the workspace. It is published as
+//! `fastmcp-rust` on crates.io and imported as `fastmcp_rust`. It re-exports the
 //! pieces you need for day-to-day server and client development so that most
-//! applications can depend on a single crate and write `use fastmcp::prelude::*;`.
+//! applications can depend on a single crate and write `use fastmcp_rust::prelude::*;`.
 //!
-//! Concretely, `fastmcp` glues together:
+//! Concretely, `fastmcp_rust` glues together:
 //! - **Core runtime + context** from `fastmcp-core`
 //! - **Protocol models** from `fastmcp-protocol`
 //! - **Transports** from `fastmcp-transport`
 //! - **Server/client** APIs from `fastmcp-server` and `fastmcp-client`
 //! - **Macros** from `fastmcp-derive`
 //!
-//! # When to Use `fastmcp`
+//! # When to Use `fastmcp_rust`
 //!
 //! - **You are building an MCP server or client** and want the canonical,
 //!   batteries-included API surface.
@@ -130,7 +131,7 @@ pub mod testing;
 /// Prelude module for convenient imports.
 ///
 /// ```ignore
-/// use fastmcp::prelude::*;
+/// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
     pub use crate::{

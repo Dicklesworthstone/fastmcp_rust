@@ -14,7 +14,7 @@ use serde_json::json;
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::text_file_resource;
+/// use fastmcp_rust::testing::fixtures::resources::text_file_resource;
 ///
 /// let resource = text_file_resource();
 /// assert!(resource.uri.starts_with("file://"));
@@ -37,7 +37,7 @@ pub fn text_file_resource() -> Resource {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::config_json_resource;
+/// use fastmcp_rust::testing::fixtures::resources::config_json_resource;
 ///
 /// let resource = config_json_resource();
 /// assert_eq!(resource.mime_type, Some("application/json".to_string()));
@@ -60,7 +60,7 @@ pub fn config_json_resource() -> Resource {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::log_file_resource;
+/// use fastmcp_rust::testing::fixtures::resources::log_file_resource;
 ///
 /// let resource = log_file_resource();
 /// assert!(resource.name.contains("log"));
@@ -83,7 +83,7 @@ pub fn log_file_resource() -> Resource {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::database_resource;
+/// use fastmcp_rust::testing::fixtures::resources::database_resource;
 ///
 /// let resource = database_resource();
 /// assert!(resource.uri.starts_with("db://"));
@@ -106,7 +106,7 @@ pub fn database_resource() -> Resource {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::api_resource;
+/// use fastmcp_rust::testing::fixtures::resources::api_resource;
 ///
 /// let resource = api_resource();
 /// assert!(resource.uri.starts_with("https://"));
@@ -175,7 +175,7 @@ pub fn all_sample_resources() -> Vec<Resource> {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::resources::file_path_template;
+/// use fastmcp_rust::testing::fixtures::resources::file_path_template;
 ///
 /// let template = file_path_template();
 /// assert!(template.uri_template.contains("{path}"));

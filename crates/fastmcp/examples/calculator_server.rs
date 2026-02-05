@@ -23,7 +23,7 @@
     clippy::cast_possible_truncation
 )]
 
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Basic Arithmetic Tools

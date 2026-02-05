@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Mock Data

@@ -1,7 +1,7 @@
 // Tests that #[prompt] with invalid timeout produces a compile error.
 
-use fastmcp::prompt;
-use fastmcp::{PromptMessage};
+use fastmcp_rust::prompt;
+use fastmcp_rust::{PromptMessage};
 
 #[prompt(timeout = "abc")]
 fn my_prompt() -> Vec<PromptMessage> {

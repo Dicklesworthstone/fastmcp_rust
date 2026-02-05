@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //! use fastmcp_server::caching::ResponseCachingMiddleware;
 //!
 //! let caching = ResponseCachingMiddleware::new()

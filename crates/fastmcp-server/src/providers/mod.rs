@@ -10,7 +10,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //! use fastmcp_server::providers::FilesystemProvider;
 //!
 //! let provider = FilesystemProvider::new("/data/docs")

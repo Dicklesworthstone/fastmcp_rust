@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //! use fastmcp_server::rate_limiting::RateLimitingMiddleware;
 //!
 //! // Allow 10 requests per second with bursts up to 20

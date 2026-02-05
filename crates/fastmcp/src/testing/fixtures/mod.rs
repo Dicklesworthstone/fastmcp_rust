@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::testing::fixtures::prelude::*;
+//! use fastmcp_rust::testing::fixtures::prelude::*;
 //!
 //! // Create sample tools
 //! let tool = greeting_tool();
@@ -49,7 +49,7 @@ pub mod tools;
 /// Prelude for convenient fixture imports.
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::prelude::*;
+/// use fastmcp_rust::testing::fixtures::prelude::*;
 /// ```
 pub mod prelude {
     // Tools

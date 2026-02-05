@@ -58,7 +58,7 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 trybuild = { version = "1", default-features = false }
 
 # Internal crates
-fastmcp = { version = "0.1.0", path = "crates/fastmcp" }
+fastmcp-rust = { version = "0.1.0", path = "crates/fastmcp" }
 fastmcp-core = { version = "0.1.0", path = "crates/fastmcp-core" }
 fastmcp-transport = { version = "0.1.0", path = "crates/fastmcp-transport" }
 fastmcp-protocol = { version = "0.1.0", path = "crates/fastmcp-protocol" }

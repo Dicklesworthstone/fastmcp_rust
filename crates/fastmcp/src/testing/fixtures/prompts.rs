@@ -14,7 +14,7 @@ use fastmcp_protocol::{Prompt, PromptArgument};
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::prompts::greeting_prompt;
+/// use fastmcp_rust::testing::fixtures::prompts::greeting_prompt;
 ///
 /// let prompt = greeting_prompt();
 /// assert_eq!(prompt.name, "greeting");

@@ -75,7 +75,7 @@ fastmcp_rust/
 ├── Cargo.toml                         # Workspace config
 ├── rust-toolchain.toml                # Nightly
 └── crates/
-    ├── fastmcp/                       # Facade crate (re-exports)
+    ├── fastmcp/                       # Facade crate (published as fastmcp-rust)
     ├── fastmcp-core/                  # Core types, McpContext, errors
     ├── fastmcp-protocol/              # MCP types, JSON-RPC
     ├── fastmcp-transport/             # Stdio, SSE transports

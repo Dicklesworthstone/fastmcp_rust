@@ -590,22 +590,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastmcp"
-version = "0.1.0"
-dependencies = [
- "asupersync",
- "fastmcp-client",
- "fastmcp-core",
- "fastmcp-derive",
- "fastmcp-protocol",
- "fastmcp-server",
- "fastmcp-transport",
- "serde",
- "serde_json",
- "trybuild",
-]
-
-[[package]]
 name = "fastmcp-cli"
 version = "0.1.0"
 dependencies = [
@@ -686,6 +670,22 @@ dependencies = [
  "fastmcp-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "fastmcp-rust"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "fastmcp-client",
+ "fastmcp-core",
+ "fastmcp-derive",
+ "fastmcp-protocol",
+ "fastmcp-server",
+ "fastmcp-transport",
+ "serde",
+ "serde_json",
+ "trybuild",
 ]
 
 [[package]]

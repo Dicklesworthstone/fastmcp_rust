@@ -19,8 +19,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::oidc::{OidcProvider, OidcProviderConfig, UserClaims};
-//! use fastmcp::oauth::{OAuthServer, OAuthServerConfig};
+//! use fastmcp_rust::oidc::{OidcProvider, OidcProviderConfig, UserClaims};
+//! use fastmcp_rust::oauth::{OAuthServer, OAuthServerConfig};
 //!
 //! // Create OAuth server first
 //! let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));

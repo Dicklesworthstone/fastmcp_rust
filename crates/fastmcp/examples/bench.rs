@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Benchmark Utilities

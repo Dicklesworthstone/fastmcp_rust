@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::prelude::*;
+//! use fastmcp_rust::prelude::*;
 //!
 //! #[tool]
 //! async fn greet(ctx: &McpContext, name: String) -> String {
@@ -33,7 +33,7 @@
 //! - Console output (`fastmcp-console`) for human-friendly stderr rendering
 //!
 //! The façade crate `fastmcp` re-exports this API, so most users interact with
-//! `Server` via `fastmcp::prelude::*`.
+//! `Server` via `fastmcp_rust::prelude::*`.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -127,7 +127,7 @@ pub type ShutdownHook = Box<dyn FnOnce() + Send>;
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::prelude::*;
+/// use fastmcp_rust::prelude::*;
 ///
 /// Server::new("demo", "1.0.0")
 ///     .on_startup(|| {

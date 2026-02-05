@@ -1,6 +1,6 @@
 // Tests that #[resource] without uri attribute produces a compile error.
 
-use fastmcp::resource;
+use fastmcp_rust::resource;
 
 #[resource]
 fn my_resource() -> String {

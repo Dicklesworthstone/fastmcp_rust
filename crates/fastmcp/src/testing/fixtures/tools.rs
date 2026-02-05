@@ -16,7 +16,7 @@ use serde_json::json;
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::greeting_tool;
+/// use fastmcp_rust::testing::fixtures::tools::greeting_tool;
 ///
 /// let tool = greeting_tool();
 /// assert_eq!(tool.name, "greeting");
@@ -56,7 +56,7 @@ pub fn greeting_tool() -> Tool {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::calculator_tool;
+/// use fastmcp_rust::testing::fixtures::tools::calculator_tool;
 ///
 /// let tool = calculator_tool();
 /// assert_eq!(tool.name, "calculator");
@@ -105,7 +105,7 @@ pub fn calculator_tool() -> Tool {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::slow_tool;
+/// use fastmcp_rust::testing::fixtures::tools::slow_tool;
 ///
 /// let tool = slow_tool();
 /// // Use in timeout tests
@@ -145,7 +145,7 @@ pub fn slow_tool() -> Tool {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::file_write_tool;
+/// use fastmcp_rust::testing::fixtures::tools::file_write_tool;
 ///
 /// let tool = file_write_tool();
 /// assert!(tool.annotations.as_ref().unwrap().destructive.unwrap());
@@ -298,7 +298,7 @@ pub fn error_tool() -> Tool {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::all_sample_tools;
+/// use fastmcp_rust::testing::fixtures::tools::all_sample_tools;
 ///
 /// let tools = all_sample_tools();
 /// assert!(tools.len() >= 5);
@@ -321,7 +321,7 @@ pub fn all_sample_tools() -> Vec<Tool> {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::fixtures::tools::ToolBuilder;
+/// use fastmcp_rust::testing::fixtures::tools::ToolBuilder;
 ///
 /// let tool = ToolBuilder::new("custom_tool")
 ///     .description("A custom tool for testing")

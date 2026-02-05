@@ -30,7 +30,7 @@ fastmcp (facade)
 
 ### `fastmcp` (facade)
 - Re-exports public types, macros, and prelude for ergonomic use.
-- Provides the unified API surface (`use fastmcp::prelude::*`).
+- Provides the unified API surface (`use fastmcp_rust::prelude::*`).
 
 ### `fastmcp-core`
 - `McpContext` wraps `asupersync::Cx` and exposes:

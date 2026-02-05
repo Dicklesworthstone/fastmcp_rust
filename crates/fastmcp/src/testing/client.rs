@@ -27,7 +27,7 @@ use fastmcp_transport::memory::MemoryTransport;
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::prelude::*;
+/// use fastmcp_rust::testing::prelude::*;
 ///
 /// let (router, client_transport, server_transport) = TestServer::builder()
 ///     .with_tool(my_tool)

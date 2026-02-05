@@ -23,10 +23,10 @@
 
 ```bash
 # Add to your project (crates.io)
-cargo add fastmcp
+cargo add fastmcp-rust
 
 # Or use the git dependency for bleeding-edge changes
-cargo add fastmcp --git https://github.com/Dicklesworthstone/fastmcp_rust
+cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
 ```
 
 ---
@@ -46,7 +46,7 @@ Building MCP servers in Rust is painful:
 **FastMCP Rust** is a batteries-included MCP framework with cancel-correct async, attribute macros, and structured concurrency baked in:
 
 ```rust
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 #[tool]
 async fn greet(ctx: &McpContext, name: String) -> String {
@@ -88,7 +88,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 ## Quick Example
 
 ```rust
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
@@ -238,14 +238,14 @@ async fn parallel_fetch(ctx: &McpContext, urls: Vec<String>) -> Vec<String> {
 
 ```toml
 [dependencies]
-fastmcp = "0.1"
+fastmcp-rust = "0.1"
 ```
 
 ### As a Git Dependency
 
 ```toml
 [dependencies]
-fastmcp = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 ```
 
 ### From Source
@@ -282,14 +282,14 @@ cd my-mcp-server
 ```toml
 # Cargo.toml
 [dependencies]
-fastmcp = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 ```
 
 ### 3. Write Your Server
 
 ```rust
 // src/main.rs
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 #[tool(description = "Echo the input message")]
 async fn echo(ctx: &McpContext, message: String) -> String {
@@ -377,7 +377,7 @@ FastMCP is organized as a workspace with focused crates:
 ```
 fastmcp_rust/
 ├── crates/
-│   ├── fastmcp/           # Facade crate (re-exports everything)
+│   ├── fastmcp/           # Facade crate (published as fastmcp-rust)
 │   ├── fastmcp-core/      # McpContext, errors, runtime helpers
 │   ├── fastmcp-protocol/  # MCP types, JSON-RPC messages
 │   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket)
@@ -388,7 +388,7 @@ fastmcp_rust/
 
 | Crate | Purpose |
 |-------|---------|
-| `fastmcp` | Convenience re-exports for simple `use fastmcp::prelude::*` |
+| `fastmcp-rust` | Convenience re-exports for simple `use fastmcp_rust::prelude::*` |
 | `fastmcp-core` | `McpContext` wrapper, error types, `block_on` helper |
 | `fastmcp-protocol` | MCP message types, capabilities, JSON-RPC framing |
 | `fastmcp-transport` | Transport trait, stdio/SSE/WebSocket implementations |

@@ -1,6 +1,6 @@
 // Tests that #[tool] with invalid timeout produces a compile error.
 
-use fastmcp::tool;
+use fastmcp_rust::tool;
 
 #[tool(timeout = "invalid")]
 fn my_tool() -> String {

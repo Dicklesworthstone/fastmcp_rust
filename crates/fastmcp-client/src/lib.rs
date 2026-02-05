@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::Client;
+//! use fastmcp_rust::Client;
 //!
 //! let client = Client::stdio("uvx", &["my-mcp-server"]).await?;
 //!

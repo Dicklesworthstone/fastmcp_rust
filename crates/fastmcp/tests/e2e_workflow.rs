@@ -12,12 +12,12 @@
 
 use std::collections::HashMap;
 
-use fastmcp::testing::prelude::*;
-use fastmcp::{
+use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
+use fastmcp_rust::testing::prelude::*;
+use fastmcp_rust::{
     McpContext, McpResult, PromptHandler, PromptMessage, Resource, ResourceContent,
     ResourceHandler, ResourceTemplate, Role, Server, ToolHandler,
 };
-use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use serde_json::json;
 
 // ============================================================================
@@ -762,7 +762,7 @@ impl ContentExt for Content {
 // Background Tasks E2E Tests (bd-og1)
 // ============================================================================
 
-use fastmcp::TaskManager;
+use fastmcp_rust::TaskManager;
 
 /// Helper: build a server with background task support.
 fn setup_task_server() -> TestClient {
@@ -789,7 +789,7 @@ fn setup_task_server() -> TestClient {
 
     // Register a task that fails
     task_manager.register_handler("failing_task", |_cx, _params| async move {
-        Err(fastmcp::McpError::internal_error(
+        Err(fastmcp_rust::McpError::internal_error(
             "Task intentionally failed",
         ))
     });

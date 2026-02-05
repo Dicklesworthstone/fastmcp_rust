@@ -1,7 +1,7 @@
 // Tests that #[prompt] with unknown attribute produces a compile error.
 
-use fastmcp::prompt;
-use fastmcp::{Content, PromptMessage, Role};
+use fastmcp_rust::prompt;
+use fastmcp_rust::{Content, PromptMessage, Role};
 
 #[prompt(unknown = "value")]
 fn my_prompt() -> Vec<PromptMessage> {

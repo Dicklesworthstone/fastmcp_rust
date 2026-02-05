@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::testing::prelude::*;
+//! use fastmcp_rust::testing::prelude::*;
 //!
 //! let mut trace = TestTrace::new("client-server-flow");
 //!

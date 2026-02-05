@@ -15,7 +15,7 @@
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use fastmcp::prelude::*;
+use fastmcp_rust::prelude::*;
 
 // ============================================================================
 // Tools

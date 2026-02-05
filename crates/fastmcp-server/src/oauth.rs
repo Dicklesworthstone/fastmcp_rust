@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::oauth::{OAuthServer, OAuthServerConfig, OAuthClient};
+//! use fastmcp_rust::oauth::{OAuthServer, OAuthServerConfig, OAuthClient};
 //!
 //! let oauth = OAuthServer::new(OAuthServerConfig::default());
 //!

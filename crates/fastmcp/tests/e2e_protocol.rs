@@ -13,12 +13,12 @@
 
 use std::collections::HashMap;
 
-use fastmcp::testing::prelude::*;
-use fastmcp::{
+use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
+use fastmcp_rust::testing::prelude::*;
+use fastmcp_rust::{
     McpContext, McpResult, PromptHandler, PromptMessage, Resource, ResourceContent,
     ResourceHandler, Role, ToolHandler,
 };
-use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use serde_json::json;
 
 // ============================================================================
@@ -322,7 +322,7 @@ fn e2e_initialize_handshake() {
     let init_result = result.unwrap();
     assert_eq!(init_result.server_info.name, "e2e-test-server");
     assert_eq!(init_result.server_info.version, "1.0.0");
-    assert_eq!(init_result.protocol_version, fastmcp::PROTOCOL_VERSION);
+    assert_eq!(init_result.protocol_version, fastmcp_rust::PROTOCOL_VERSION);
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn e2e_initialize_stores_server_info() {
     assert!(client.server_capabilities().is_some());
     assert_eq!(
         client.protocol_version().unwrap(),
-        fastmcp::PROTOCOL_VERSION
+        fastmcp_rust::PROTOCOL_VERSION
     );
 }
 

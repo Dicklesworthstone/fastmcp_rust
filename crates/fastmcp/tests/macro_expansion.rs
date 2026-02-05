@@ -21,7 +21,7 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(dead_code)]
 
-use fastmcp::{
+use fastmcp_rust::{
     Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceHandler,
     Role, ToolHandler, prompt, resource, tool,
 };
@@ -262,7 +262,7 @@ fn fallible_tool(succeed: bool) -> McpResult<String> {
     if succeed {
         Ok("success".to_string())
     } else {
-        Err(fastmcp::McpError::internal_error("failed"))
+        Err(fastmcp_rust::McpError::internal_error("failed"))
     }
 }
 
@@ -746,7 +746,7 @@ async fn async_fallible_tool(succeed: bool) -> McpResult<String> {
     if succeed {
         Ok("async success".to_string())
     } else {
-        Err(fastmcp::McpError::internal_error("async failed"))
+        Err(fastmcp_rust::McpError::internal_error("async failed"))
     }
 }
 
@@ -1058,7 +1058,7 @@ fn resource_optional_param_without_value() {
 /// Resource that can fail.
 #[resource(uri = "fallible://checked")]
 fn fallible_error_resource() -> McpResult<String> {
-    Err(fastmcp::McpError::internal_error("resource failed"))
+    Err(fastmcp_rust::McpError::internal_error("resource failed"))
 }
 
 #[test]
@@ -1471,7 +1471,7 @@ fn prompt_no_args_call() {
 #[prompt]
 fn fallible_prompt(fail: Option<String>) -> McpResult<Vec<PromptMessage>> {
     if fail.is_some() {
-        Err(fastmcp::McpError::internal_error("prompt failed"))
+        Err(fastmcp_rust::McpError::internal_error("prompt failed"))
     } else {
         Ok(vec![PromptMessage {
             role: Role::User,

@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::ClientBuilder;
+//! use fastmcp_rust::ClientBuilder;
 //!
 //! let client = ClientBuilder::new()
 //!     .client_info("my-client", "1.0.0")

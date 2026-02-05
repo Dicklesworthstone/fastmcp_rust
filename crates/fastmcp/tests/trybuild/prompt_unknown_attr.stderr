@@ -7,7 +7,7 @@ error: unknown attribute
 warning: unused imports: `Content`, `PromptMessage`, and `Role`
  --> tests/trybuild/prompt_unknown_attr.rs:4:15
   |
-4 | use fastmcp::{Content, PromptMessage, Role};
+4 | use fastmcp_rust::{Content, PromptMessage, Role};
   |               ^^^^^^^  ^^^^^^^^^^^^^  ^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

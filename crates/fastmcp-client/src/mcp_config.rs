@@ -24,7 +24,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use fastmcp::mcp_config::{McpConfig, ConfigLoader};
+//! use fastmcp_rust::mcp_config::{McpConfig, ConfigLoader};
 //!
 //! // Load from default location
 //! let config = ConfigLoader::default()?.load()?;

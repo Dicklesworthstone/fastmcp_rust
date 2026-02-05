@@ -7,7 +7,7 @@ error: resource parameters require a URI template with matching {params}
 warning: unused import: `McpContext`
  --> tests/trybuild/resource_params_without_template.rs:3:15
   |
-3 | use fastmcp::{McpContext, resource};
+3 | use fastmcp_rust::{McpContext, resource};
   |               ^^^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

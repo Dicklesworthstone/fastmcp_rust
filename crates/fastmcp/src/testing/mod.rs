@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp::testing::prelude::*;
+//! use fastmcp_rust::testing::prelude::*;
 //!
 //! #[test]
 //! fn test_tool_call() {
@@ -57,7 +57,7 @@ pub use trace::*;
 /// Prelude for convenient imports in tests.
 ///
 /// ```ignore
-/// use fastmcp::testing::prelude::*;
+/// use fastmcp_rust::testing::prelude::*;
 /// ```
 pub mod prelude {
     pub use super::{

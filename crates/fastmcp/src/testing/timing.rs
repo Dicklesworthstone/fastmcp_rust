@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::prelude::*;
+/// use fastmcp_rust::testing::prelude::*;
 ///
 /// let (result, duration) = measure_duration(|| {
 ///     // Some operation
@@ -32,7 +32,7 @@ pub fn measure_duration<T, F: FnOnce() -> T>(f: F) -> (T, Duration) {
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp::testing::prelude::*;
+/// use fastmcp_rust::testing::prelude::*;
 ///
 /// let mut stopwatch = Stopwatch::new();
 ///
