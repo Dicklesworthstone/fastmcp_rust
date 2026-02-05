@@ -773,7 +773,16 @@ impl Server {
 
                 // Send response
                 let send_result = {
-                    let mut guard = send.lock().unwrap();
+                    let mut guard = match send.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            error!(
+                                target: targets::TRANSPORT,
+                                "Send channel lock poisoned; continuing with inner guard"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
                     guard(cx, &JsonRpcMessage::Response(response))
                 };
                 if let Err(e) = send_result {

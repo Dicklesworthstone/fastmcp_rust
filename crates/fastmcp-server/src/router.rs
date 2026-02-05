@@ -234,10 +234,9 @@ impl Router {
         let def = handler.definition();
 
         // Check for duplicates
-        let key = if template.is_some() {
-            template.as_ref().unwrap().uri_template.clone()
-        } else {
-            def.uri.clone()
+        let key = match template.as_ref() {
+            Some(template) => template.uri_template.clone(),
+            None => def.uri.clone(),
         };
 
         let exists = if template.is_some() {
