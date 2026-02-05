@@ -64,7 +64,7 @@ fastmcp-transport = { version = "0.1.0", path = "crates/fastmcp-transport" }
 fastmcp-protocol = { version = "0.1.0", path = "crates/fastmcp-protocol" }
 fastmcp-server = { version = "0.1.0", path = "crates/fastmcp-server" }
 fastmcp-client = { version = "0.1.0", path = "crates/fastmcp-client" }
-fastmcp-macros = { version = "0.1.0", path = "crates/fastmcp-macros" }
+fastmcp-derive = { version = "0.1.0", path = "crates/fastmcp-macros" }
 fastmcp-console = { version = "0.1.0", path = "crates/fastmcp-console" }
 fastmcp-cli = { version = "0.1.0", path = "crates/fastmcp-cli" }
 

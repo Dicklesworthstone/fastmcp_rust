@@ -596,7 +596,7 @@ dependencies = [
  "asupersync",
  "fastmcp-client",
  "fastmcp-core",
- "fastmcp-macros",
+ "fastmcp-derive",
  "fastmcp-protocol",
  "fastmcp-server",
  "fastmcp-transport",
@@ -671,7 +671,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastmcp-macros"
+name = "fastmcp-derive"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",

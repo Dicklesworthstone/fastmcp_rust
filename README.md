@@ -383,7 +383,7 @@ fastmcp_rust/
 │   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket)
 │   ├── fastmcp-server/    # Server builder, router, handlers
 │   ├── fastmcp-client/    # Client implementation
-│   └── fastmcp-macros/    # #[tool], #[resource], #[prompt] macros
+│   └── fastmcp-derive/    # #[tool], #[resource], #[prompt] macros
 ```
 
 | Crate | Purpose |
@@ -394,7 +394,7 @@ fastmcp_rust/
 | `fastmcp-transport` | Transport trait, stdio/SSE/WebSocket implementations |
 | `fastmcp-server` | `Server`, `ServerBuilder`, routing, handler traits |
 | `fastmcp-client` | `Client` for calling MCP servers |
-| `fastmcp-macros` | Procedural macros for handler generation |
+| `fastmcp-derive` | Procedural macros for handler generation |
 
 ---
 

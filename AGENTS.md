@@ -81,7 +81,7 @@ fastmcp_rust/
     ├── fastmcp-transport/             # Stdio, SSE transports
     ├── fastmcp-server/                # Server implementation
     ├── fastmcp-client/                # Client implementation
-    └── fastmcp-macros/                # #[tool], #[resource], #[prompt]
+    └── fastmcp-derive/                # #[tool], #[resource], #[prompt]
 ```
 
 ---

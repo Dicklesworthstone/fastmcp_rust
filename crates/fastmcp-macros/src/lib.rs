@@ -42,7 +42,7 @@
 //!
 //! # Role in the System
 //!
-//! `fastmcp-macros` is the **ergonomics layer** of FastMCP. The attribute
+//! `fastmcp-derive` is the **ergonomics layer** of FastMCP. The attribute
 //! macros expand handler functions into the trait implementations used by
 //! `fastmcp-server`, and they also generate JSON Schema metadata consumed by
 //! `fastmcp-protocol` during tool registration.

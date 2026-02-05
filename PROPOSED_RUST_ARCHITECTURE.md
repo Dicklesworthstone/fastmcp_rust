@@ -22,7 +22,7 @@ fastmcp (facade)
   ├── fastmcp-transport (NDJSON + stdio transport)
   ├── fastmcp-server (builder, router, handlers, session)
   ├── fastmcp-client (stdio client + handshake)
-  ├── fastmcp-macros (#[tool], #[resource], #[prompt], JsonSchema)
+  ├── fastmcp-derive (#[tool], #[resource], #[prompt], JsonSchema)
   └── fastmcp-console (rich stderr output, stats, banner)
 ```
 
@@ -65,7 +65,7 @@ fastmcp (facade)
 - Call APIs for tools/resources/prompts
 - Progress notification handling for tool calls
 
-### `fastmcp-macros`
+### `fastmcp-derive`
 - `#[tool]`: converts a function into a `ToolHandler` impl
 - `#[resource]`: converts a function into a `ResourceHandler` impl
 - `#[prompt]`: converts a function into a `PromptHandler` impl

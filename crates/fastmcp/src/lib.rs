@@ -37,7 +37,7 @@
 //! - `fastmcp-transport`: Transport implementations (stdio, SSE)
 //! - `fastmcp-server`: Server implementation
 //! - `fastmcp-client`: Client implementation
-//! - `fastmcp-macros`: Procedural macros (#[tool], #[resource], #[prompt])
+//! - `fastmcp-derive`: Procedural macros (#[tool], #[resource], #[prompt])
 //!
 //! # Role in the System
 //!
@@ -50,7 +50,7 @@
 //! - **Protocol models** from `fastmcp-protocol`
 //! - **Transports** from `fastmcp-transport`
 //! - **Server/client** APIs from `fastmcp-server` and `fastmcp-client`
-//! - **Macros** from `fastmcp-macros`
+//! - **Macros** from `fastmcp-derive`
 //!
 //! # When to Use `fastmcp`
 //!
@@ -122,7 +122,7 @@ pub use fastmcp_client::{Client, ClientBuilder, ClientSession};
 pub use fastmcp_client::mcp_config;
 
 // Re-export macros
-pub use fastmcp_macros::{JsonSchema, prompt, resource, tool};
+pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 
 // Testing module
 pub mod testing;
