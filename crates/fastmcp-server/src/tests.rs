@@ -5637,23 +5637,23 @@ mod builder_tests {
     use fastmcp_protocol::ResourceTemplate;
     use log::Level;
 
-    // ── Minimal handler stubs ────────────────────────────────────────
+    // ── Minimal concrete handlers for builder coverage ─────────────────
 
-    struct StubTool {
+    struct NamedTool {
         name: &'static str,
     }
 
-    impl StubTool {
+    impl NamedTool {
         fn named(name: &'static str) -> Self {
             Self { name }
         }
     }
 
-    impl ToolHandler for StubTool {
+    impl ToolHandler for NamedTool {
         fn definition(&self) -> Tool {
             Tool {
                 name: self.name.to_string(),
-                description: Some(format!("Stub tool {}", self.name)),
+                description: Some(format!("Test tool {}", self.name)),
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: None,
                 icon: None,
@@ -5669,17 +5669,17 @@ mod builder_tests {
             _arguments: serde_json::Value,
         ) -> McpResult<Vec<Content>> {
             Ok(vec![Content::Text {
-                text: format!("stub:{}", self.name),
+                text: format!("test:{}", self.name),
             }])
         }
     }
 
-    struct StubResource {
+    struct NamedResource {
         name: &'static str,
         uri: String,
     }
 
-    impl StubResource {
+    impl NamedResource {
         fn named(name: &'static str) -> Self {
             Self {
                 name,
@@ -5688,12 +5688,12 @@ mod builder_tests {
         }
     }
 
-    impl ResourceHandler for StubResource {
+    impl ResourceHandler for NamedResource {
         fn definition(&self) -> Resource {
             Resource {
                 uri: self.uri.clone(),
                 name: self.name.to_string(),
-                description: Some(format!("Stub resource {}", self.name)),
+                description: Some(format!("Test resource {}", self.name)),
                 mime_type: Some("text/plain".to_string()),
                 icon: None,
                 version: None,
@@ -5711,21 +5711,21 @@ mod builder_tests {
         }
     }
 
-    struct StubPrompt {
+    struct NamedPrompt {
         name: &'static str,
     }
 
-    impl StubPrompt {
+    impl NamedPrompt {
         fn named(name: &'static str) -> Self {
             Self { name }
         }
     }
 
-    impl PromptHandler for StubPrompt {
+    impl PromptHandler for NamedPrompt {
         fn definition(&self) -> Prompt {
             Prompt {
                 name: self.name.to_string(),
-                description: Some(format!("Stub prompt {}", self.name)),
+                description: Some(format!("Test prompt {}", self.name)),
                 arguments: vec![],
                 icon: None,
                 version: None,
@@ -5778,7 +5778,7 @@ mod builder_tests {
     #[test]
     fn builder_tool_enables_tools_capability() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(StubTool::named("alpha"))
+            .tool(NamedTool::named("alpha"))
             .build();
         assert!(server.capabilities().tools.is_some());
         assert!(server.has_tools());
@@ -5787,9 +5787,9 @@ mod builder_tests {
     #[test]
     fn builder_registers_multiple_tools() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(StubTool::named("a"))
-            .tool(StubTool::named("b"))
-            .tool(StubTool::named("c"))
+            .tool(NamedTool::named("a"))
+            .tool(NamedTool::named("b"))
+            .tool(NamedTool::named("c"))
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 3);
@@ -5804,7 +5804,7 @@ mod builder_tests {
     #[test]
     fn builder_resource_enables_resources_capability() {
         let server = ServerBuilder::new("s", "0.1")
-            .resource(StubResource::named("data"))
+            .resource(NamedResource::named("data"))
             .build();
         assert!(server.capabilities().resources.is_some());
         assert!(server.has_resources());
@@ -5813,8 +5813,8 @@ mod builder_tests {
     #[test]
     fn builder_registers_multiple_resources() {
         let server = ServerBuilder::new("s", "0.1")
-            .resource(StubResource::named("r1"))
-            .resource(StubResource::named("r2"))
+            .resource(NamedResource::named("r1"))
+            .resource(NamedResource::named("r2"))
             .build();
         let resources = server.resources();
         assert_eq!(resources.len(), 2);
@@ -5846,7 +5846,7 @@ mod builder_tests {
     #[test]
     fn builder_prompt_enables_prompts_capability() {
         let server = ServerBuilder::new("s", "0.1")
-            .prompt(StubPrompt::named("hello"))
+            .prompt(NamedPrompt::named("hello"))
             .build();
         assert!(server.capabilities().prompts.is_some());
         assert!(server.has_prompts());
@@ -5855,9 +5855,9 @@ mod builder_tests {
     #[test]
     fn builder_registers_multiple_prompts() {
         let server = ServerBuilder::new("s", "0.1")
-            .prompt(StubPrompt::named("p1"))
-            .prompt(StubPrompt::named("p2"))
-            .prompt(StubPrompt::named("p3"))
+            .prompt(NamedPrompt::named("p1"))
+            .prompt(NamedPrompt::named("p2"))
+            .prompt(NamedPrompt::named("p3"))
             .build();
         let prompts = server.prompts();
         assert_eq!(prompts.len(), 3);
@@ -5868,9 +5868,9 @@ mod builder_tests {
     #[test]
     fn builder_mixed_handlers_enable_all_capabilities() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(StubTool::named("t"))
-            .resource(StubResource::named("r"))
-            .prompt(StubPrompt::named("p"))
+            .tool(NamedTool::named("t"))
+            .resource(NamedResource::named("r"))
+            .prompt(NamedPrompt::named("p"))
             .build();
         assert!(server.has_tools());
         assert!(server.has_resources());
@@ -6083,8 +6083,8 @@ mod builder_tests {
     fn builder_on_duplicate_default_is_warn() {
         // Default behavior is Warn (keeps original, logs warning)
         let server = ServerBuilder::new("s", "0.1")
-            .tool(StubTool::named("dup"))
-            .tool(StubTool::named("dup"))
+            .tool(NamedTool::named("dup"))
+            .tool(NamedTool::named("dup"))
             .build();
         // With Warn default, the second registration keeps original
         let tools = server.tools();
@@ -6096,8 +6096,8 @@ mod builder_tests {
     fn builder_on_duplicate_ignore_keeps_original() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Ignore)
-            .tool(StubTool::named("dup"))
-            .tool(StubTool::named("dup"))
+            .tool(NamedTool::named("dup"))
+            .tool(NamedTool::named("dup"))
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 1);
@@ -6107,8 +6107,8 @@ mod builder_tests {
     fn builder_on_duplicate_replace() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Replace)
-            .tool(StubTool::named("dup"))
-            .tool(StubTool::named("dup"))
+            .tool(NamedTool::named("dup"))
+            .tool(NamedTool::named("dup"))
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 1);
@@ -6120,8 +6120,8 @@ mod builder_tests {
         // With Error behavior, duplicate registration fails but builder doesn't panic
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Error)
-            .tool(StubTool::named("dup"))
-            .tool(StubTool::named("dup"))
+            .tool(NamedTool::named("dup"))
+            .tool(NamedTool::named("dup"))
             .build();
         // Only the first registration succeeds
         let tools = server.tools();
@@ -6132,8 +6132,8 @@ mod builder_tests {
     fn builder_on_duplicate_applies_to_resources() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Ignore)
-            .resource(StubResource::named("r"))
-            .resource(StubResource::named("r"))
+            .resource(NamedResource::named("r"))
+            .resource(NamedResource::named("r"))
             .build();
         let resources = server.resources();
         assert_eq!(resources.len(), 1);
@@ -6143,8 +6143,8 @@ mod builder_tests {
     fn builder_on_duplicate_applies_to_prompts() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Ignore)
-            .prompt(StubPrompt::named("p"))
-            .prompt(StubPrompt::named("p"))
+            .prompt(NamedPrompt::named("p"))
+            .prompt(NamedPrompt::named("p"))
             .build();
         let prompts = server.prompts();
         assert_eq!(prompts.len(), 1);
@@ -6218,9 +6218,9 @@ mod builder_tests {
     #[test]
     fn builder_mount_server_with_prefix() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(StubTool::named("do_thing"))
-            .resource(StubResource::named("data"))
-            .prompt(StubPrompt::named("ask"))
+            .tool(NamedTool::named("do_thing"))
+            .resource(NamedResource::named("data"))
+            .prompt(NamedPrompt::named("ask"))
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6239,7 +6239,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_server_without_prefix() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(StubTool::named("alpha"))
+            .tool(NamedTool::named("alpha"))
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6254,9 +6254,9 @@ mod builder_tests {
     #[test]
     fn builder_mount_tools_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(StubTool::named("t"))
-            .resource(StubResource::named("r"))
-            .prompt(StubPrompt::named("p"))
+            .tool(NamedTool::named("t"))
+            .resource(NamedResource::named("r"))
+            .prompt(NamedPrompt::named("p"))
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6271,8 +6271,8 @@ mod builder_tests {
     #[test]
     fn builder_mount_resources_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(StubTool::named("t"))
-            .resource(StubResource::named("r"))
+            .tool(NamedTool::named("t"))
+            .resource(NamedResource::named("r"))
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6286,8 +6286,8 @@ mod builder_tests {
     #[test]
     fn builder_mount_prompts_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(StubTool::named("t"))
-            .prompt(StubPrompt::named("p"))
+            .tool(NamedTool::named("t"))
+            .prompt(NamedPrompt::named("p"))
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6301,10 +6301,10 @@ mod builder_tests {
     #[test]
     fn builder_mount_multiple_servers() {
         let db = ServerBuilder::new("db", "0.1")
-            .tool(StubTool::named("query"))
+            .tool(NamedTool::named("query"))
             .build();
         let api = ServerBuilder::new("api", "0.1")
-            .tool(StubTool::named("fetch"))
+            .tool(NamedTool::named("fetch"))
             .build();
 
         let main = ServerBuilder::new("main", "0.1")
@@ -6333,9 +6333,9 @@ mod builder_tests {
             .log_timestamps(false)
             .without_banner()
             .plain_mode()
-            .tool(StubTool::named("tool_a"))
-            .resource(StubResource::named("res_a"))
-            .prompt(StubPrompt::named("prompt_a"))
+            .tool(NamedTool::named("tool_a"))
+            .resource(NamedResource::named("res_a"))
+            .prompt(NamedPrompt::named("prompt_a"))
             .middleware(ResponseCachingMiddleware::new())
             .auth_provider(crate::AllowAllAuthProvider)
             .on_startup(|| -> Result<(), std::io::Error> { Ok(()) })
@@ -6357,10 +6357,10 @@ mod builder_tests {
     #[test]
     fn builder_into_router_preserves_components() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(StubTool::named("t1"))
-            .tool(StubTool::named("t2"))
-            .resource(StubResource::named("r1"))
-            .prompt(StubPrompt::named("p1"))
+            .tool(NamedTool::named("t1"))
+            .tool(NamedTool::named("t2"))
+            .resource(NamedResource::named("r1"))
+            .prompt(NamedPrompt::named("p1"))
             .build();
 
         let router = server.into_router();
@@ -6394,9 +6394,9 @@ mod builder_tests {
     fn builder_list_page_size_enables_tools_pagination() {
         let router = ServerBuilder::new("s", "0.1")
             .list_page_size(2)
-            .tool(StubTool::named("t1"))
-            .tool(StubTool::named("t2"))
-            .tool(StubTool::named("t3"))
+            .tool(NamedTool::named("t1"))
+            .tool(NamedTool::named("t2"))
+            .tool(NamedTool::named("t3"))
             .build()
             .into_router();
 
@@ -6425,7 +6425,7 @@ mod builder_tests {
     fn tools_list_rejects_invalid_cursor() {
         let router = ServerBuilder::new("s", "0.1")
             .list_page_size(2)
-            .tool(StubTool::named("t1"))
+            .tool(NamedTool::named("t1"))
             .build()
             .into_router();
 
