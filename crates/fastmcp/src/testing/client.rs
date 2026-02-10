@@ -33,11 +33,8 @@ use fastmcp_transport::memory::MemoryTransport;
 /// let (router, client_transport, server_transport) = TestServer::builder()
 ///     .with_tool(my_tool)
 ///     .build();
-///
-/// // Run server in background thread
-/// std::thread::spawn(move || {
-///     // server loop with server_transport
-/// });
+/// // Run server in a background thread (omitted here). Prefer using the
+/// // higher-level E2E harness helpers in this crate which join threads on drop.
 ///
 /// // Create test client
 /// let mut client = TestClient::new(client_transport);
@@ -340,7 +337,7 @@ impl TestClient {
     }
 
     /// Closes the client connection.
-    pub fn close(mut self) {
+    pub fn close(&mut self) {
         let _ = self.transport.close();
     }
 

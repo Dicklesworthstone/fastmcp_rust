@@ -12,7 +12,9 @@
 //! - JSON-RPC 2.0 compliance
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use fastmcp_rust::testing::prelude::*;
@@ -156,13 +158,13 @@ impl ToolHandler for AuthInfoToolHandler {
 
     fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
-        let token = auth.token.as_ref();
+        let access = auth.token.as_ref();
 
         let payload = json!({
             "subject": auth.subject,
             "scopes": auth.scopes,
-            "scheme": token.map(|t| t.scheme.clone()),
-            "token": token.map(|t| t.token.clone()),
+            "scheme": access.map(|t| t.scheme.clone()),
+            "token": access.map(|t| t.token.clone()),
         });
 
         Ok(vec![Content::Text {
@@ -316,11 +318,55 @@ impl PromptHandler for CodeReviewPromptHandler {
 // Helper: build server + client pair
 // ============================================================================
 
+struct TestHarness {
+    client: Option<TestClient>,
+    server_thread: Option<JoinHandle<()>>,
+}
+
+impl TestHarness {
+    fn new(client: TestClient, server_thread: JoinHandle<()>) -> Self {
+        Self {
+            client: Some(client),
+            server_thread: Some(server_thread),
+        }
+    }
+}
+
+impl Deref for TestHarness {
+    type Target = TestClient;
+
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("client missing")
+    }
+}
+
+impl DerefMut for TestHarness {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("client missing")
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // Drop the client first so the transport closes and the server thread can exit.
+        self.client.take();
+
+        if let Some(handle) = self.server_thread.take() {
+            // If the server thread panicked, fail the test (assert! is acceptable in test-only Drop).
+            assert!(handle.join().is_ok(), "server thread panicked");
+        }
+    }
+}
+
+fn spawn_thread(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+    std::thread::spawn(f)
+}
+
 /// Spawns a server with all test handlers and returns a connected TestClient.
 ///
 /// The server runs in a background thread and is cleaned up when the
 /// transport is closed.
-fn setup_test_server_and_client() -> TestClient {
+fn setup_test_server_and_client() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("e2e-test-server")
         .with_version("1.0.0")
@@ -337,17 +383,17 @@ fn setup_test_server_and_client() -> TestClient {
         .build();
 
     // Run server in background thread
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
     provider: P,
     server_name: &str,
-) -> TestClient {
+) -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name(server_name)
         .with_version("1.0.0")
@@ -359,9 +405,9 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
         .auth_provider(provider)
         .build();
 
-    std::thread::spawn(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || server.run_transport(server_transport));
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 // ============================================================================
@@ -478,10 +524,14 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
 
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
     assert!(!call.is_error);
-    match call.content.first() {
-        Some(Content::Text { text }) => assert_eq!(text, "Hello, Ada!"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(call.content.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = call.content.first() else {
+        return;
+    };
+    assert_eq!(text, "Hello, Ada!");
 
     // Verify the server stored auth context into McpContext (subject + token).
     let params = json!({
@@ -494,9 +544,12 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
 
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
-    let text = match call.content.first() {
-        Some(Content::Text { text }) => text,
-        other => panic!("Expected text content, got: {other:?}"),
+    assert!(
+        matches!(call.content.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = call.content.first() else {
+        return;
     };
     let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(
@@ -515,8 +568,8 @@ fn e2e_auth_jwt_flow_allows_and_denies() {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let secret = b"e2e-jwt-secret";
-    let verifier = fastmcp_rust::JwtTokenVerifier::hs256(secret);
+    let signing_bytes = b"e2e-jwt-bytes";
+    let verifier = fastmcp_rust::JwtTokenVerifier::hs256(signing_bytes);
     let provider = TokenAuthProvider::new(verifier);
 
     let mut client = setup_auth_server_and_client(provider, "e2e-auth-jwt");
@@ -536,7 +589,7 @@ fn e2e_auth_jwt_flow_allows_and_denies() {
             "scope": "read write",
             "exp": exp_ok,
         }),
-        &EncodingKey::from_secret(secret),
+        &EncodingKey::from_secret(signing_bytes),
     )
     .unwrap();
 
@@ -606,10 +659,14 @@ fn e2e_auth_jwt_flow_allows_and_denies() {
 
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
     assert!(!call.is_error);
-    match call.content.first() {
-        Some(Content::Text { text }) => assert_eq!(text, "Hello, Linus!"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(call.content.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = call.content.first() else {
+        return;
+    };
+    assert_eq!(text, "Hello, Linus!");
 
     // Verify claims extracted to auth context.
     let params = json!({
@@ -622,9 +679,12 @@ fn e2e_auth_jwt_flow_allows_and_denies() {
     trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
 
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
-    let text = match call.content.first() {
-        Some(Content::Text { text }) => text,
-        other => panic!("Expected text content, got: {other:?}"),
+    assert!(
+        matches!(call.content.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = call.content.first() else {
+        return;
     };
     let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(
@@ -714,9 +774,12 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     let value = mcp_client.send_request_json("tools/call", params).unwrap();
     trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
     let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
-    let text = match call.content.first() {
-        Some(Content::Text { text }) => text,
-        other => panic!("Expected text content, got: {other:?}"),
+    assert!(
+        matches!(call.content.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = call.content.first() else {
+        return;
     };
     let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(
@@ -813,10 +876,14 @@ fn e2e_call_tool_greeting() {
         .unwrap();
     assert_eq!(result.len(), 1);
 
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Hello, Alice!"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "Hello, Alice!");
 }
 
 #[test]
@@ -829,10 +896,14 @@ fn e2e_call_tool_calculator_add() {
         .unwrap();
     assert_eq!(result.len(), 1);
 
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "30"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "30");
 }
 
 #[test]
@@ -847,10 +918,14 @@ fn e2e_call_tool_calculator_multiply() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "42"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "42");
 }
 
 #[test]
@@ -865,10 +940,14 @@ fn e2e_call_tool_calculator_divide() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "25"),
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "25");
 }
 
 #[test]
@@ -1032,15 +1111,20 @@ fn e2e_get_prompt_greeting() {
     let messages = client.get_prompt("greeting", args).unwrap();
     assert_eq!(messages.len(), 1);
 
-    match &messages[0].content {
-        Content::Text { text } => {
-            assert!(
-                text.contains("Bob"),
-                "Greeting should contain the name, got: {text}"
-            );
-        }
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    let Some(first) = messages.first() else {
+        return;
+    };
+    assert!(
+        matches!(&first.content, Content::Text { .. }),
+        "expected text content"
+    );
+    let Content::Text { text } = &first.content else {
+        return;
+    };
+    assert!(
+        text.contains("Bob"),
+        "Greeting should contain the name, got: {text}"
+    );
 }
 
 #[test]
@@ -1057,13 +1141,18 @@ fn e2e_get_prompt_code_review() {
 
     // First message should be user with the code
     assert!(matches!(messages[0].role, Role::User));
-    match &messages[0].content {
-        Content::Text { text } => {
-            assert!(text.contains("rust"), "Should mention language");
-            assert!(text.contains("fn main()"), "Should contain the code");
-        }
-        other => panic!("Expected text content, got: {other:?}"),
-    }
+    let Some(first) = messages.first() else {
+        return;
+    };
+    assert!(
+        matches!(&first.content, Content::Text { .. }),
+        "expected text content"
+    );
+    let Content::Text { text } = &first.content else {
+        return;
+    };
+    assert!(text.contains("rust"), "Should mention language");
+    assert!(text.contains("fn main()"), "Should contain the code");
 
     // Second message should be assistant
     assert!(matches!(messages[1].role, Role::Assistant));
@@ -1130,10 +1219,14 @@ fn e2e_full_workflow() {
     let greeting = client
         .call_tool("greeting", json!({"name": "E2E"}))
         .unwrap();
-    match &greeting[0] {
-        Content::Text { text } => assert_eq!(text, "Hello, E2E!"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(greeting.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = greeting.first() else {
+        return;
+    };
+    assert_eq!(text, "Hello, E2E!");
 
     // Step 4: List resources
     let resources = client.list_resources().unwrap();
@@ -1163,12 +1256,14 @@ fn e2e_multiple_tool_calls() {
     for i in 0..5 {
         let name = format!("User{i}");
         let result = client.call_tool("greeting", json!({"name": name})).unwrap();
-        match &result[0] {
-            Content::Text { text } => {
-                assert_eq!(text, &format!("Hello, {name}!"));
-            }
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, &format!("Hello, {name}!"));
     }
 }
 
@@ -1184,10 +1279,14 @@ fn e2e_mixed_operations() {
     let result = client
         .call_tool("calculator", json!({"a": 2, "b": 3, "operation": "add"}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "5"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "5");
 
     let resources = client.list_resources().unwrap();
     assert!(!resources.is_empty());
@@ -1212,10 +1311,14 @@ fn e2e_mixed_operations() {
             json!({"a": 10, "b": 5, "operation": "subtract"}),
         )
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "5"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "5");
 }
 
 // ============================================================================
@@ -1230,11 +1333,11 @@ fn e2e_server_with_tools_only() {
 
     let server = builder.tool(GreetingToolHandler).build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
 
     // Should have tools but not resources or prompts
@@ -1255,11 +1358,11 @@ fn e2e_server_with_resources_only() {
 
     let server = builder.resource(TextFileResourceHandler).build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
 
     assert!(init.capabilities.tools.is_none());
@@ -1278,11 +1381,11 @@ fn e2e_server_with_prompts_only() {
 
     let server = builder.prompt(GreetingPromptHandler).build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
 
     assert!(init.capabilities.tools.is_none());
@@ -1301,11 +1404,11 @@ fn e2e_empty_server() {
 
     let server = builder.build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
 
     // Empty server should not advertise any capabilities
@@ -1325,11 +1428,12 @@ fn e2e_custom_client_info() {
 
     let server = builder.tool(GreetingToolHandler).build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");
+    let client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");
+    let mut client = TestHarness::new(client, handle);
 
     let init = client.initialize().unwrap();
     // Initialization should succeed with custom client info

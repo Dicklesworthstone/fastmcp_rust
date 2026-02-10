@@ -6,7 +6,7 @@
 //! - [`resources`]: Sample resource definitions and content generators
 //! - [`prompts`]: Sample prompt definitions with various argument patterns
 //! - [`messages`]: JSON-RPC message templates (valid, invalid, large)
-//! - [`auth`]: Authentication token generators (bearer, JWT, API keys)
+//! - [`auth`]: Authentication credential generators (bearer, JWT-like, API values)
 //!
 //! # Example
 //!
@@ -28,9 +28,9 @@
 //! let request = valid_tools_call_request(1, "greeting", json!({"name": "World"}));
 //! let error = method_not_found_error_response(1, "unknown");
 //!
-//! // Create auth tokens
-//! let jwt = valid_jwt().encode();
-//! let api_key = generate_api_key();
+//! // Create auth credentials
+//! let jwt_like = valid_jwt().encode();
+//! let api_value = generate_api_value();
 //! ```
 //!
 //! # Design Philosophy
@@ -92,10 +92,10 @@ pub mod prelude {
 
     // Auth
     pub use super::auth::{
-        INVALID_API_KEY, INVALID_BEARER_TOKEN, MockJwt, TestCredentials, VALID_API_KEY,
-        VALID_BEARER_TOKEN, VALID_SESSION_TOKEN, admin_jwt, api_key_header, basic_auth_header,
-        bearer_auth_header, expired_jwt, generate_api_key, generate_bearer_token,
-        generate_session_token, generate_test_token, jwt_with_roles, readonly_jwt, valid_jwt,
+        INVALID_API_VALUE, INVALID_BEARER_VALUE, MockJwt, TestCredentials, VALID_API_VALUE,
+        VALID_BEARER_VALUE, VALID_SESSION_VALUE, admin_jwt, api_value_header, basic_auth_header,
+        bearer_auth_header, expired_jwt, generate_api_value, generate_bearer_value,
+        generate_session_value, generate_test_value, jwt_with_roles, readonly_jwt, valid_jwt,
     };
 
     pub use serde_json::json;
@@ -143,8 +143,8 @@ mod tests {
 
     #[test]
     fn test_prelude_auth() {
-        let token = generate_bearer_token();
-        assert!(token.starts_with("bearer-"));
+        let bearer = generate_bearer_value();
+        assert!(bearer.starts_with("bear-"));
 
         let jwt = valid_jwt();
         assert!(!jwt.is_expired());

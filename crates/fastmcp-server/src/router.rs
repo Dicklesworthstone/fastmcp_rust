@@ -16,7 +16,7 @@ use fastmcp_protocol::{
     GetPromptResult, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
     JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
     ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListTasksParams,
-    ListTasksResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressToken, Prompt,
+    ListTasksResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt,
     ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, SubmitTaskParams,
     SubmitTaskResult, Tool, validate, validate_strict,
 };
@@ -839,18 +839,18 @@ impl Router {
             )));
         }
 
-        // Extract progress token from request metadata
-        let progress_token: Option<ProgressToken> =
-            params.meta.as_ref().and_then(|m| m.progress_token.clone());
+        // Extract progress marker from request metadata
+        let progress_marker: Option<ProgressMarker> =
+            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_token, notification_sender) {
-            (Some(token), Some(sender)) => {
+        let ctx = match (progress_marker, notification_sender) {
+            (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
-                    Some(token),
+                    Some(marker),
                     Some(session_state),
                     move |req| {
                         sender(req);
@@ -1036,18 +1036,18 @@ impl Router {
             .resolve_resource(&params.uri)
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
 
-        // Extract progress token from request metadata
-        let progress_token: Option<ProgressToken> =
-            params.meta.as_ref().and_then(|m| m.progress_token.clone());
+        // Extract progress marker from request metadata
+        let progress_marker: Option<ProgressMarker> =
+            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_token, notification_sender) {
-            (Some(token), Some(sender)) => {
+        let ctx = match (progress_marker, notification_sender) {
+            (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
-                    Some(token),
+                    Some(marker),
                     Some(session_state),
                     move |req| {
                         sender(req);
@@ -1180,18 +1180,18 @@ impl Router {
             )
         })?;
 
-        // Extract progress token from request metadata
-        let progress_token: Option<ProgressToken> =
-            params.meta.as_ref().and_then(|m| m.progress_token.clone());
+        // Extract progress marker from request metadata
+        let progress_marker: Option<ProgressMarker> =
+            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_token, notification_sender) {
-            (Some(token), Some(sender)) => {
+        let ctx = match (progress_marker, notification_sender) {
+            (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
                     cx.clone(),
                     request_id,
-                    Some(token),
+                    Some(marker),
                     Some(session_state),
                     move |req| {
                         sender(req);

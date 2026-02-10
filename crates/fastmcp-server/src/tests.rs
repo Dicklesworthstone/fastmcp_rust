@@ -5686,7 +5686,7 @@ mod handler_direct_tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sent_clone = sent.clone();
         let sender = ProgressNotificationSender::new(
-            fastmcp_protocol::ProgressToken::String("tok".to_string()),
+            fastmcp_protocol::ProgressMarker::String("tok".to_string()),
             move |req: fastmcp_protocol::JsonRpcRequest| {
                 sent_clone.lock().unwrap().push(req);
             },
@@ -5705,7 +5705,7 @@ mod handler_direct_tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sent_clone = sent.clone();
         let sender = ProgressNotificationSender::new(
-            fastmcp_protocol::ProgressToken::Number(99),
+            fastmcp_protocol::ProgressMarker::Number(99),
             move |req: fastmcp_protocol::JsonRpcRequest| {
                 sent_clone.lock().unwrap().push(req);
             },
@@ -5721,7 +5721,7 @@ mod handler_direct_tests {
     #[test]
     fn progress_notification_sender_debug_format() {
         let sender = ProgressNotificationSender::new(
-            fastmcp_protocol::ProgressToken::String("debug-test".to_string()),
+            fastmcp_protocol::ProgressMarker::String("debug-test".to_string()),
             |_: fastmcp_protocol::JsonRpcRequest| {},
         );
         let debug = format!("{sender:?}");

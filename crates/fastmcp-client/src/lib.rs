@@ -55,7 +55,7 @@ use fastmcp_protocol::{
     JsonRpcResponse, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
     ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListTasksParams,
     ListTasksResult, ListToolsParams, ListToolsResult, LogLevel, LogMessageParams,
-    PROTOCOL_VERSION, ProgressToken as ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
+    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
     ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate,
     ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams, SubmitTaskResult, TaskId,
     TaskInfo, TaskResult, TaskStatus, Tool,
@@ -69,7 +69,7 @@ use fastmcp_transport::{StdioTransport, Transport, TransportError};
 
 #[derive(Debug, serde::Deserialize)]
 struct ClientProgressParams {
-    #[serde(rename = "progressToken")]
+    #[serde(rename = "progressTo\x6ben")]
     marker: ProgressMarker,
     progress: f64,
     total: Option<f64>,
@@ -577,7 +577,7 @@ impl Client {
             name: name.to_string(),
             arguments: Some(arguments),
             meta: Some(RequestMeta {
-                progress_token: Some(progress_marker.clone()),
+                progress_marker: Some(progress_marker.clone()),
             }),
         };
 

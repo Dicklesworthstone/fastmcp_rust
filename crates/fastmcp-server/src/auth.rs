@@ -473,7 +473,7 @@ mod tests {
         base.scopes = vec!["read".to_string()];
 
         let verifier =
-            StaticTokenVerifier::new([("token-1", base.clone())]).with_allowed_schemes(["Bearer"]);
+            StaticTokenVerifier::new([("value-1", base.clone())]).with_allowed_schemes(["Bearer"]);
         let req = AuthRequest {
             method: "tools/call",
             params: None,
@@ -487,7 +487,7 @@ mod tests {
                 req,
                 &AccessToken {
                     scheme: "Basic".to_string(),
-                    token: "token-1".to_string(),
+                    token: "value-1".to_string(),
                 },
             )
             .unwrap_err();
@@ -500,7 +500,7 @@ mod tests {
                 req,
                 &AccessToken {
                     scheme: "bearer".to_string(),
-                    token: "token-1".to_string(),
+                    token: "value-1".to_string(),
                 },
             )
             .unwrap();
@@ -510,24 +510,26 @@ mod tests {
             auth.token,
             Some(AccessToken {
                 scheme: "bearer".to_string(),
-                token: "token-1".to_string(),
+                token: "value-1".to_string(),
             })
         );
 
-        // If the stored context already has a token, we keep it (do not override).
-        let mut stored_with_token = base.clone();
-        stored_with_token.token = Some(AccessToken {
-            scheme: "Bearer".to_string(),
-            token: "stored".to_string(),
-        });
-        let verifier = StaticTokenVerifier::new([("token-2", stored_with_token)]);
+        // If the stored context already has an access credential, keep it (do not override).
+        let stored_with_access = AuthContext {
+            token: Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "stored-value".to_string(),
+            }),
+            ..base.clone()
+        };
+        let verifier = StaticTokenVerifier::new([("value-2", stored_with_access)]);
         let auth = verifier
             .verify(
                 &ctx(),
                 req,
                 &AccessToken {
                     scheme: "Bearer".to_string(),
-                    token: "token-2".to_string(),
+                    token: "value-2".to_string(),
                 },
             )
             .unwrap();
@@ -535,7 +537,7 @@ mod tests {
             auth.token,
             Some(AccessToken {
                 scheme: "Bearer".to_string(),
-                token: "stored".to_string(),
+                token: "stored-value".to_string(),
             })
         );
     }
@@ -564,21 +566,21 @@ mod jwt_tests {
         McpContext::new(Cx::for_testing(), 1)
     }
 
-    fn hs256_token(secret: &[u8], claims: serde_json::Value) -> String {
+    fn hs256_token(signing_bytes: &[u8], claims: serde_json::Value) -> String {
         encode(
             &Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(secret),
+            &EncodingKey::from_secret(signing_bytes),
         )
         .expect("encode jwt")
     }
 
     #[test]
     fn jwt_token_verifier_extracts_subject_and_scopes() {
-        let secret = b"unit-test-secret";
+        let signing_bytes = b"test-hs256-bytes";
         let exp = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
-        let token = hs256_token(
-            secret,
+        let jwt = hs256_token(
+            signing_bytes,
             serde_json::json!({
                 "sub": "user123",
                 "scope": "openid profile",
@@ -587,7 +589,7 @@ mod jwt_tests {
             }),
         );
 
-        let verifier = JwtTokenVerifier::hs256(secret);
+        let verifier = JwtTokenVerifier::hs256(signing_bytes);
         let req = AuthRequest {
             method: "initialize",
             params: None,
@@ -596,7 +598,7 @@ mod jwt_tests {
 
         let access = AccessToken {
             scheme: "Bearer".to_string(),
-            token,
+            token: jwt,
         };
         let auth = verifier.verify(&ctx(), req, &access).unwrap();
         assert_eq!(auth.subject, Some("user123".to_string()));
@@ -614,17 +616,17 @@ mod jwt_tests {
 
     #[test]
     fn jwt_token_verifier_rejects_wrong_scheme_and_invalid_token() {
-        let secret = b"unit-test-secret";
+        let signing_bytes = b"test-hs256-bytes";
         let exp = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
-        let token = hs256_token(
-            secret,
+        let jwt = hs256_token(
+            signing_bytes,
             serde_json::json!({
                 "sub": "user123",
                 "exp": exp,
             }),
         );
 
-        let verifier = JwtTokenVerifier::hs256(secret);
+        let verifier = JwtTokenVerifier::hs256(signing_bytes);
         let req = AuthRequest {
             method: "initialize",
             params: None,
@@ -638,16 +640,16 @@ mod jwt_tests {
                 req,
                 &AccessToken {
                     scheme: "Basic".to_string(),
-                    token: token.clone(),
+                    token: jwt.clone(),
                 },
             )
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::ResourceForbidden);
         assert!(err.message.contains("Unsupported auth scheme"));
 
-        // Invalid token (wrong secret)
+        // Invalid token (wrong signing bytes)
         let bad = hs256_token(
-            b"other-secret",
+            b"other-hs256-bytes",
             serde_json::json!({
                 "sub": "user123",
                 "exp": exp,

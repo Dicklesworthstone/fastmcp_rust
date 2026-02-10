@@ -83,10 +83,8 @@ impl TestServerBuilder {
     /// let (router, client_transport, server_transport) = TestServer::builder()
     ///     .build();
     ///
-    /// // Run server in a thread
-    /// std::thread::spawn(move || {
-    ///     // Use router and server_transport
-    /// });
+    /// // Run server in a background thread (omitted here). Prefer using the
+    /// // higher-level E2E harness helpers in this crate which join threads on drop.
     ///
     /// // Use client_transport for testing
     /// ```

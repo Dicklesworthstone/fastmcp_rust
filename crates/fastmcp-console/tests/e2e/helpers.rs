@@ -30,12 +30,11 @@ fn get_test_server_binary() -> PathBuf {
                 .output()
                 .expect("Failed to build test_server");
 
-            if !output.status.success() {
-                panic!(
-                    "Failed to build test_server: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            assert!(
+                output.status.success(),
+                "Failed to build test_server: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
 
             // Find the binary in target directory
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -44,9 +43,11 @@ fn get_test_server_binary() -> PathBuf {
                 .unwrap_or_else(|_| manifest_dir.join("../../target"));
             let binary_path = target_dir.join("debug/examples/test_server");
 
-            if !binary_path.exists() {
-                panic!("test_server binary not found at {}", binary_path.display());
-            }
+            assert!(
+                binary_path.exists(),
+                "test_server binary not found at {}",
+                binary_path.display()
+            );
 
             eprintln!("[E2E] Built test_server at {}", binary_path.display());
             binary_path

@@ -140,7 +140,7 @@ impl SnapshotTest {
         }
 
         if !snapshot_path.exists() {
-            panic!(
+            std::panic::panic_any(format!(
                 "Snapshot '{}' does not exist at {}.\n\
                  Run with UPDATE_SNAPSHOTS=1 to create it.\n\
                  Actual output ({} bytes):\n{}\n",
@@ -148,25 +148,28 @@ impl SnapshotTest {
                 snapshot_path.display(),
                 actual.len(),
                 truncate_for_display(actual, 1000)
-            );
+            ));
         }
 
-        let expected = fs::read_to_string(&snapshot_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to read snapshot file '{}': {}",
-                snapshot_path.display(),
-                e
-            )
-        });
+        let expected = match fs::read_to_string(&snapshot_path) {
+            Ok(expected) => expected,
+            Err(e) => {
+                std::panic::panic_any(format!(
+                    "Failed to read snapshot file '{}': {}",
+                    snapshot_path.display(),
+                    e
+                ));
+            }
+        };
 
         if actual != expected {
             let diff = self.generate_diff(&expected, actual);
-            panic!(
+            std::panic::panic_any(format!(
                 "Snapshot '{}' does not match.\n\
                  Run with UPDATE_SNAPSHOTS=1 to update.\n\
                  Diff (expected vs actual):\n{}\n",
                 self.name, diff
-            );
+            ));
         }
     }
 
@@ -184,13 +187,13 @@ impl SnapshotTest {
 
         if self.update_snapshots {
             fs::create_dir_all(&self.snapshot_dir).ok();
-            fs::write(&snapshot_path, &actual).unwrap_or_else(|e| {
-                panic!(
+            if let Err(e) = fs::write(&snapshot_path, &actual) {
+                std::panic::panic_any(format!(
                     "Failed to write raw snapshot '{}': {}",
                     snapshot_path.display(),
                     e
-                )
-            });
+                ));
+            }
             eprintln!(
                 "Updated raw snapshot: {} -> {}",
                 self.name,
@@ -200,24 +203,24 @@ impl SnapshotTest {
         }
 
         if !snapshot_path.exists() {
-            panic!(
+            std::panic::panic_any(format!(
                 "Raw snapshot '{}' does not exist at {}.\n\
                  Run with UPDATE_SNAPSHOTS=1 to create.",
                 self.name,
                 snapshot_path.display()
-            );
+            ));
         }
 
         let expected = fs::read_to_string(&snapshot_path).expect("Failed to read raw snapshot");
 
         if actual != expected {
             let diff = self.generate_diff(&expected, &actual);
-            panic!(
+            std::panic::panic_any(format!(
                 "Raw snapshot '{}' does not match.\n\
                  Run with UPDATE_SNAPSHOTS=1 to update.\n\
                  Diff:\n{}",
                 self.name, diff
-            );
+            ));
         }
     }
 
@@ -247,17 +250,22 @@ impl SnapshotTest {
 
     /// Saves a snapshot to disk.
     fn save_snapshot(&self, content: &str) {
-        fs::create_dir_all(&self.snapshot_dir).unwrap_or_else(|e| {
-            panic!(
+        if let Err(e) = fs::create_dir_all(&self.snapshot_dir) {
+            std::panic::panic_any(format!(
                 "Failed to create snapshot directory '{}': {}",
                 self.snapshot_dir.display(),
                 e
-            )
-        });
+            ));
+        }
 
         let path = self.snapshot_path();
-        fs::write(&path, content)
-            .unwrap_or_else(|e| panic!("Failed to write snapshot '{}': {}", path.display(), e));
+        if let Err(e) = fs::write(&path, content) {
+            std::panic::panic_any(format!(
+                "Failed to write snapshot '{}': {}",
+                path.display(),
+                e
+            ));
+        }
 
         eprintln!("Updated snapshot: {} -> {}", self.name, path.display());
     }

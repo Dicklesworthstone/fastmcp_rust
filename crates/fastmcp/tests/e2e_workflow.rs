@@ -11,6 +11,8 @@
 //! - Client info propagation
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::thread::JoinHandle;
 
 use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use fastmcp_rust::testing::prelude::*;
@@ -249,7 +251,65 @@ impl PromptHandler for NoArgsPromptHandler {
 // Helper: build full workflow server
 // ============================================================================
 
-fn setup_workflow_server() -> TestClient {
+struct ThreadJoins(Vec<JoinHandle<()>>);
+
+impl ThreadJoins {
+    fn new(handles: Vec<JoinHandle<()>>) -> Self {
+        Self(handles)
+    }
+}
+
+impl Drop for ThreadJoins {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..) {
+            assert!(handle.join().is_ok(), "server thread panicked");
+        }
+    }
+}
+
+fn spawn_thread<T>(f: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T>
+where
+    T: Send + 'static,
+{
+    std::thread::spawn(f)
+}
+
+struct TestHarness {
+    client: Option<TestClient>,
+    _joins: ThreadJoins,
+}
+
+impl TestHarness {
+    fn new(client: TestClient, server_thread: JoinHandle<()>) -> Self {
+        Self {
+            client: Some(client),
+            _joins: ThreadJoins::new(vec![server_thread]),
+        }
+    }
+}
+
+impl Deref for TestHarness {
+    type Target = TestClient;
+
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("client missing")
+    }
+}
+
+impl DerefMut for TestHarness {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("client missing")
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // Drop client first so transports close before joining threads.
+        self.client.take();
+    }
+}
+
+fn setup_workflow_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("workflow-test-server")
         .with_version("2.0.0")
@@ -274,11 +334,11 @@ fn setup_workflow_server() -> TestClient {
         .prompt(NoArgsPromptHandler)
         .build();
 
-    std::thread::spawn(move || {
-        server.run_transport(server_transport);
+    let handle = spawn_thread(move || {
+        server.run_transport_returning(server_transport);
     });
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 // ============================================================================
@@ -315,10 +375,14 @@ fn workflow_complete_lifecycle() {
     let echo_result = client
         .call_tool("echo", json!({"message": "workflow test"}))
         .unwrap();
-    match &echo_result[0] {
-        Content::Text { text } => assert_eq!(text, "workflow test"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(echo_result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = echo_result.first() else {
+        return;
+    };
+    assert_eq!(text, "workflow test");
 
     let status = client.read_resource("app://status").unwrap();
     let status_json: serde_json::Value =
@@ -384,10 +448,14 @@ fn workflow_error_recovery_continues_after_tool_error() {
     let result = client
         .call_tool("fail_on_demand", json!({"fail": false}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Success"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "Success");
 
     // Failed call
     let err = client
@@ -399,10 +467,14 @@ fn workflow_error_recovery_continues_after_tool_error() {
     let result = client
         .call_tool("echo", json!({"message": "still alive"}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "still alive"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "still alive");
 }
 
 #[test]
@@ -448,10 +520,14 @@ fn workflow_unknown_tool_doesnt_break_session() {
     let result = client
         .call_tool("echo", json!({"message": "after"}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "after"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "after");
 }
 
 #[test]
@@ -487,10 +563,14 @@ fn workflow_sequential_clients_same_server() {
         let result = client
             .call_tool("echo", json!({"message": format!("client-{i}")}))
             .unwrap();
-        match &result[0] {
-            Content::Text { text } => assert_eq!(text, &format!("client-{i}")),
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, &format!("client-{i}"));
 
         client.close();
     }
@@ -503,14 +583,20 @@ fn workflow_two_independent_servers() {
         .with_name("server-a")
         .build_server_builder();
     let server_a = builder_a.tool(EchoToolHandler).build();
-    std::thread::spawn(move || server_a.run_transport(server_a_transport));
+    let handle_a = spawn_thread(move || {
+        server_a.run_transport_returning(server_a_transport);
+    });
 
     // Server B: resources only
     let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
         .with_name("server-b")
         .build_server_builder();
     let server_b = builder_b.resource(StatusResourceHandler).build();
-    std::thread::spawn(move || server_b.run_transport(server_b_transport));
+    let handle_b = spawn_thread(move || {
+        server_b.run_transport_returning(server_b_transport);
+    });
+
+    let _joins = ThreadJoins::new(vec![handle_a, handle_b]);
 
     // Client A
     let mut client_a = TestClient::new(client_a_transport);
@@ -530,10 +616,14 @@ fn workflow_two_independent_servers() {
     let echo = client_a
         .call_tool("echo", json!({"message": "from A"}))
         .unwrap();
-    match &echo[0] {
-        Content::Text { text } => assert_eq!(text, "from A"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(echo.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = echo.first() else {
+        return;
+    };
+    assert_eq!(text, "from A");
 
     let status = client_b.read_resource("app://status").unwrap();
     assert!(!status.is_empty());
@@ -566,12 +656,17 @@ fn workflow_get_prompt_without_arguments() {
     let messages = client.get_prompt("system_prompt", HashMap::new()).unwrap();
     assert_eq!(messages.len(), 1);
     assert!(matches!(messages[0].role, Role::Assistant));
-    match &messages[0].content {
-        Content::Text { text } => {
-            assert!(text.contains("helpful assistant"));
-        }
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    let Some(first) = messages.first() else {
+        return;
+    };
+    assert!(
+        matches!(&first.content, Content::Text { .. }),
+        "expected text content"
+    );
+    let Content::Text { text } = &first.content else {
+        return;
+    };
+    assert!(text.contains("helpful assistant"));
 }
 
 // ============================================================================
@@ -587,10 +682,14 @@ fn workflow_many_sequential_tool_calls() {
     for i in 0..20 {
         let msg = format!("message-{i}");
         let result = client.call_tool("echo", json!({"message": msg})).unwrap();
-        match &result[0] {
-            Content::Text { text } => assert_eq!(text, &msg),
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, &msg);
     }
 }
 
@@ -605,10 +704,14 @@ fn workflow_interleaved_list_and_call() {
         assert_eq!(tools.len(), 3);
 
         let result = client.call_tool("counter", json!({"value": 42})).unwrap();
-        match &result[0] {
-            Content::Text { text } => assert_eq!(text, "42"),
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, "42");
 
         let resources = client.list_resources().unwrap();
         assert_eq!(resources.len(), 2);
@@ -630,7 +733,10 @@ fn workflow_server_name_and_version() {
         .build_server_builder();
 
     let server = builder.tool(EchoToolHandler).build();
-    std::thread::spawn(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || {
+        server.run_transport_returning(server_transport);
+    });
+    let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
     let init = client.initialize().unwrap();
@@ -648,7 +754,10 @@ fn workflow_capabilities_match_handlers() {
         .tool(EchoToolHandler)
         .resource(StatusResourceHandler)
         .build();
-    std::thread::spawn(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || {
+        server.run_transport_returning(server_transport);
+    });
+    let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
     let init = client.initialize().unwrap();
@@ -669,7 +778,10 @@ fn workflow_custom_client_info_accepted() {
         TestServer::builder().build_server_builder();
 
     let server = builder.tool(EchoToolHandler).build();
-    std::thread::spawn(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || {
+        server.run_transport_returning(server_transport);
+    });
+    let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client =
         TestClient::new(client_transport).with_client_info("my-custom-client", "5.0.0");
@@ -765,7 +877,7 @@ impl ContentExt for Content {
 use fastmcp_rust::TaskManager;
 
 /// Helper: build a server with background task support.
-fn setup_task_server() -> TestClient {
+fn setup_task_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("task-test-server")
         .with_version("1.0.0")
@@ -799,11 +911,11 @@ fn setup_task_server() -> TestClient {
         .with_task_manager(task_manager.into_shared())
         .build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 #[test]
@@ -1101,10 +1213,14 @@ fn workflow_task_session_continues_after_task_error() {
         .call_tool("echo", json!({"message": "still working"}))
         .unwrap();
 
-    match &echo_result[0] {
-        Content::Text { text } => assert_eq!(text, "still working"),
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(echo_result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = echo_result.first() else {
+        return;
+    };
+    assert_eq!(text, "still working");
 }
 
 #[test]
@@ -1490,9 +1606,9 @@ use std::sync::Arc;
 #[test]
 fn workflow_concurrent_clients_isolation() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     // Create multiple client-server transport pairs
+    let mut server_handles = Vec::new();
     let mut clients_and_servers = Vec::new();
 
     for client_num in 0..3 {
@@ -1505,9 +1621,10 @@ fn workflow_concurrent_clients_isolation() {
             .build();
 
         // Spawn server thread
-        thread::spawn(move || {
+        let handle = spawn_thread(move || {
             server.run_transport(server_transport);
         });
+        server_handles.push(handle);
 
         let client = TestClient::new(client_transport)
             .with_client_info(format!("client-{}", client_num), "1.0.0");
@@ -1516,9 +1633,8 @@ fn workflow_concurrent_clients_isolation() {
     }
 
     // Initialize all clients
-    for (num, client) in &mut clients_and_servers {
+    for (_num, client) in &mut clients_and_servers {
         client.initialize().unwrap();
-        eprintln!("Client {} initialized", num);
     }
 
     // Each client stores a unique value
@@ -1530,12 +1646,14 @@ fn workflow_concurrent_clients_isolation() {
             )
             .unwrap();
 
-        match &result[0] {
-            Content::Text { text } => {
-                assert!(text.contains(&format!("value_from_client_{}", num)));
-            }
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert!(text.contains(&format!("value_from_client_{}", num)));
     }
 
     // Each client retrieves its own stored value (should not see other clients' values)
@@ -1544,26 +1662,30 @@ fn workflow_concurrent_clients_isolation() {
             .call_tool("session_get", json!({"key": "client_value"}))
             .unwrap();
 
-        match &result[0] {
-            Content::Text { text } => {
-                // Each client should see only its own value
-                assert_eq!(
-                    text,
-                    &format!("value_from_client_{}", num),
-                    "Client {} should see its own value, not another client's",
-                    num
-                );
-            }
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        // Each client should see only its own value
+        assert_eq!(
+            text,
+            &format!("value_from_client_{}", num),
+            "Client {} should see its own value, not another client's",
+            num
+        );
     }
+
+    let _joins = ThreadJoins::new(server_handles);
+    drop(clients_and_servers);
 }
 
 #[test]
 fn workflow_concurrent_interleaved_operations() {
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
 
     let operation_counter = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
@@ -1571,16 +1693,17 @@ fn workflow_concurrent_interleaved_operations() {
     for client_num in 0..4 {
         let counter = Arc::clone(&operation_counter);
 
-        let handle = thread::spawn(move || {
+        let handle = spawn_thread(move || {
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("interleaved-server", "1.0.0")
                 .tool(EchoToolHandler)
                 .build();
 
-            thread::spawn(move || {
+            let server_handle = spawn_thread(move || {
                 server.run_transport(server_transport);
             });
+            let _server_join = ThreadJoins::new(vec![server_handle]);
 
             let mut client = TestClient::new(client_transport)
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
@@ -1597,16 +1720,18 @@ fn workflow_concurrent_interleaved_operations() {
                     )
                     .unwrap();
 
-                match &result[0] {
-                    Content::Text { text } => {
-                        assert!(
-                            text.contains(&format!("client_{}_op_{}", client_num, op)),
-                            "Operation {} result mismatch",
-                            op_num
-                        );
-                    }
-                    other => panic!("Expected text, got: {other:?}"),
-                }
+                assert!(
+                    matches!(result.first(), Some(Content::Text { .. })),
+                    "expected text content"
+                );
+                let Some(Content::Text { text }) = result.first() else {
+                    std::panic::panic_any("expected text content".to_string());
+                };
+                assert!(
+                    text.contains(&format!("client_{}_op_{}", client_num, op)),
+                    "Operation {} result mismatch",
+                    op_num
+                );
             }
 
             client_num
@@ -1618,7 +1743,9 @@ fn workflow_concurrent_interleaved_operations() {
     // Wait for all threads to complete
     let mut completed_clients = Vec::new();
     for handle in handles {
-        let client_num = handle.join().expect("Thread panicked");
+        let Ok(client_num) = handle.join() else {
+            return;
+        };
         completed_clients.push(client_num);
     }
 
@@ -1641,7 +1768,7 @@ fn workflow_concurrent_no_crosstalk() {
     for client_num in 0..3 {
         let results = Arc::clone(&results);
 
-        let handle = thread::spawn(move || {
+        let handle = spawn_thread(move || {
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("crosstalk-server", "1.0.0")
@@ -1649,36 +1776,41 @@ fn workflow_concurrent_no_crosstalk() {
                 .tool(SessionGetHandler)
                 .build();
 
-            thread::spawn(move || {
+            let server_handle = spawn_thread(move || {
                 server.run_transport(server_transport);
             });
+            let _server_join = ThreadJoins::new(vec![server_handle]);
 
             let mut client = TestClient::new(client_transport);
             client.initialize().unwrap();
 
-            // Store a secret value
-            let secret = format!("secret_{}", client_num);
+            // Store a per-client value (ensure no cross-talk).
+            let value = format!("value_{}", client_num);
             client
-                .call_tool("session_store", json!({"key": "secret", "value": &secret}))
+                .call_tool("session_store", json!({"key": "value", "value": &value}))
                 .unwrap();
 
             // Sleep briefly to allow interleaving
             thread::sleep(std::time::Duration::from_millis(10));
 
-            // Retrieve and verify our secret
+            // Retrieve and verify our value
             let result = client
-                .call_tool("session_get", json!({"key": "secret"}))
+                .call_tool("session_get", json!({"key": "value"}))
                 .unwrap();
 
-            let retrieved = match &result[0] {
-                Content::Text { text } => text.clone(),
-                other => panic!("Expected text, got: {other:?}"),
+            assert!(
+                matches!(result.first(), Some(Content::Text { .. })),
+                "expected text content"
+            );
+            let Some(Content::Text { text }) = result.first() else {
+                return;
             };
+            let retrieved = text.clone();
 
             results
                 .lock()
                 .unwrap()
-                .push((client_num, secret.clone(), retrieved));
+                .push((client_num, value.clone(), retrieved));
         });
 
         handles.push(handle);
@@ -1686,17 +1818,17 @@ fn workflow_concurrent_no_crosstalk() {
 
     // Wait for all threads
     for handle in handles {
-        handle.join().expect("Thread panicked");
+        assert!(handle.join().is_ok(), "thread panicked");
     }
 
-    // Verify each client got its own secret back
+    // Verify each client got its own value back
     let results = results.lock().unwrap();
     assert_eq!(results.len(), 3);
 
     for (client_num, expected, actual) in results.iter() {
         assert_eq!(
             expected, actual,
-            "Client {} got wrong secret: expected '{}', got '{}'",
+            "Client {} got wrong value: expected '{}', got '{}'",
             client_num, expected, actual
         );
     }
@@ -1705,7 +1837,6 @@ fn workflow_concurrent_no_crosstalk() {
 #[test]
 fn workflow_concurrent_session_state_persistence() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     // Test that session state persists across multiple calls within the same session
     let (client_transport, server_transport) = create_memory_transport_pair();
@@ -1715,9 +1846,10 @@ fn workflow_concurrent_session_state_persistence() {
         .tool(SessionGetHandler)
         .build();
 
-    thread::spawn(move || {
+    let server_handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
     client.initialize().unwrap();
@@ -1738,12 +1870,14 @@ fn workflow_concurrent_session_state_persistence() {
             .call_tool("session_get", json!({"key": format!("key_{}", i)}))
             .unwrap();
 
-        match &result[0] {
-            Content::Text { text } => {
-                assert_eq!(text, &format!("value_{}", i), "Key {} has wrong value", i);
-            }
-            other => panic!("Expected text, got: {other:?}"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, &format!("value_{}", i), "Key {} has wrong value", i);
     }
 
     // Verify non-existent key returns NOT_FOUND
@@ -1751,12 +1885,14 @@ fn workflow_concurrent_session_state_persistence() {
         .call_tool("session_get", json!({"key": "nonexistent"}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert_eq!(text, "NOT_FOUND");
-        }
-        other => panic!("Expected text, got: {other:?}"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "NOT_FOUND");
 }
 
 #[test]
@@ -2029,13 +2165,20 @@ fn session_state_isolated_per_client() {
         .call_tool("session_get", json!({"key": "shared_key"}))
         .unwrap();
 
-    match (&result_a[0], &result_b[0]) {
-        (Content::Text { text: text_a }, Content::Text { text: text_b }) => {
-            assert_eq!(text_a, "value_a", "Client A should see its own value");
-            assert_eq!(text_b, "value_b", "Client B should see its own value");
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(
+            (&result_a[0], &result_b[0]),
+            (Content::Text { .. }, Content::Text { .. })
+        ),
+        "expected text content"
+    );
+    let (Content::Text { text: text_a }, Content::Text { text: text_b }) =
+        (&result_a[0], &result_b[0])
+    else {
+        return;
+    };
+    assert_eq!(text_a, "value_a", "Client A should see its own value");
+    assert_eq!(text_b, "value_b", "Client B should see its own value");
 }
 
 #[test]
@@ -2090,22 +2233,27 @@ fn session_tracks_client_info() {
 #[test]
 fn session_multiple_clients_independent_lifecycle() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     // Create multiple independent client-server pairs
     let mut clients = Vec::new();
+    let mut server_handles = Vec::new();
 
     for i in 0..3 {
         let (client_transport, server_transport) = create_memory_transport_pair();
         let server = Server::new(&format!("lifecycle-server-{}", i), "1.0.0")
             .tool(EchoToolHandler)
             .build();
-        thread::spawn(move || server.run_transport(server_transport));
+        let handle = spawn_thread(move || {
+            server.run_transport_returning(server_transport);
+        });
+        server_handles.push(handle);
 
         let client = TestClient::new(client_transport)
             .with_client_info(format!("lifecycle-client-{}", i), "1.0.0");
         clients.push((i, client));
     }
+
+    let _joins = ThreadJoins::new(server_handles);
 
     // Initialize clients in order
     for (i, client) in &mut clients {
@@ -2118,16 +2266,18 @@ fn session_multiple_clients_independent_lifecycle() {
         let result = client
             .call_tool("echo", json!({"message": format!("from-client-{}", i)}))
             .unwrap();
-        match &result[0] {
-            Content::Text { text } => {
-                assert!(text.contains(&format!("from-client-{}", i)));
-            }
-            _ => panic!("Expected text"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert!(text.contains(&format!("from-client-{}", i)));
     }
 
     // Close clients in reverse order (shouldn't affect others)
-    while let Some((_, client)) = clients.pop() {
+    while let Some((_, mut client)) = clients.pop() {
         client.close();
     }
 }
@@ -2135,7 +2285,6 @@ fn session_multiple_clients_independent_lifecycle() {
 #[test]
 fn session_state_persists_across_operations() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("persistence-test", "1.0.0")
@@ -2143,7 +2292,10 @@ fn session_state_persists_across_operations() {
         .tool(SessionGetHandler)
         .tool(EchoToolHandler)
         .build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || {
+        server.run_transport_returning(server_transport);
+    });
+    let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
     client.initialize().unwrap();
@@ -2168,12 +2320,14 @@ fn session_state_persists_across_operations() {
         .call_tool("session_get", json!({"key": "persistent"}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert_eq!(text, "stored_value", "Session state should persist");
-        }
-        _ => panic!("Expected text"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "stored_value", "Session state should persist");
 }
 
 #[test]
@@ -2370,7 +2524,7 @@ trait Pipe: Sized {
 
 impl<T> Pipe for T {}
 
-fn setup_tool_test_server() -> TestClient {
+fn setup_tool_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("tool-test-server")
         .with_version("1.0.0")
@@ -2384,11 +2538,11 @@ fn setup_tool_test_server() -> TestClient {
         .tool(FailOnDemandToolHandler)
         .build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 #[test]
@@ -2400,12 +2554,14 @@ fn tool_call_string_argument() {
         .call_tool("types_test", json!({"string_val": "hello world"}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("string_val: hello world"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("string_val: hello world"));
 }
 
 #[test]
@@ -2417,12 +2573,14 @@ fn tool_call_integer_argument() {
         .call_tool("types_test", json!({"int_val": 42}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("int_val: 42"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("int_val: 42"));
 }
 
 #[test]
@@ -2434,12 +2592,14 @@ fn tool_call_float_argument() {
         .call_tool("types_test", json!({"float_val": 3.14159}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("float_val: 3.14159"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("float_val: 3.14159"));
 }
 
 #[test]
@@ -2451,23 +2611,27 @@ fn tool_call_boolean_argument() {
         .call_tool("types_test", json!({"bool_val": true}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("bool_val: true"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("bool_val: true"));
 
     let result = client
         .call_tool("types_test", json!({"bool_val": false}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("bool_val: false"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("bool_val: false"));
 }
 
 #[test]
@@ -2479,12 +2643,14 @@ fn tool_call_array_argument() {
         .call_tool("types_test", json!({"array_val": ["a", "b", "c"]}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("array_val: [len=3]"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("array_val: [len=3]"));
 }
 
 #[test]
@@ -2499,12 +2665,14 @@ fn tool_call_object_argument() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("object_val: {keys=2}"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("object_val: {keys=2}"));
 }
 
 #[test]
@@ -2516,12 +2684,14 @@ fn tool_call_null_argument() {
         .call_tool("types_test", json!({"null_val": null}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("null_val: null"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("null_val: null"));
 }
 
 #[test]
@@ -2541,15 +2711,17 @@ fn tool_call_multiple_argument_types() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("string_val: test"));
-            assert!(text.contains("int_val: 100"));
-            assert!(text.contains("bool_val: true"));
-            assert!(text.contains("array_val: [len=3]"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("string_val: test"));
+    assert!(text.contains("int_val: 100"));
+    assert!(text.contains("bool_val: true"));
+    assert!(text.contains("array_val: [len=3]"));
 }
 
 #[test]
@@ -2559,12 +2731,14 @@ fn tool_call_empty_arguments() {
 
     let result = client.call_tool("types_test", json!({})).unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("(no arguments provided)"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("(no arguments provided)"));
 }
 
 #[test]
@@ -2576,13 +2750,15 @@ fn tool_call_required_argument_provided() {
         .call_tool("required_args", json!({"required_field": "value123"}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("required: value123"));
-            assert!(text.contains("optional: (not provided)"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("required: value123"));
+    assert!(text.contains("optional: (not provided)"));
 }
 
 #[test]
@@ -2600,13 +2776,15 @@ fn tool_call_required_and_optional_arguments() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("required: required_value"));
-            assert!(text.contains("optional: optional_value"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("required: required_value"));
+    assert!(text.contains("optional: optional_value"));
 }
 
 #[test]
@@ -2634,12 +2812,14 @@ fn tool_call_returns_multiple_content() {
     assert_eq!(result.len(), 3, "Should return 3 content items");
 
     for (i, content) in result.iter().enumerate() {
-        match content {
-            Content::Text { text } => {
-                assert_eq!(text, &format!("Item {}", i + 1));
-            }
-            _ => panic!("Expected text content"),
-        }
+        assert!(
+            matches!(content, Content::Text { .. }),
+            "expected text content"
+        );
+        let Content::Text { text } = content else {
+            return;
+        };
+        assert_eq!(text, &format!("Item {}", i + 1));
     }
 }
 
@@ -2677,12 +2857,14 @@ fn tool_call_unicode_arguments() {
         .call_tool("echo", json!({"message": "こんにちは世界 🌍 مرحبا"}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert_eq!(text, "こんにちは世界 🌍 مرحبا");
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text, "こんにちは世界 🌍 مرحبا");
 }
 
 #[test]
@@ -2697,14 +2879,16 @@ fn tool_call_special_characters() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("Line 1"));
-            assert!(text.contains("Line 2"));
-            assert!(text.contains("quoted"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("Line 1"));
+    assert!(text.contains("Line 2"));
+    assert!(text.contains("quoted"));
 }
 
 #[test]
@@ -2717,12 +2901,14 @@ fn tool_call_large_string_argument() {
         .call_tool("echo", json!({"message": &large_string}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert_eq!(text.len(), 10_000);
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert_eq!(text.len(), 10_000);
 }
 
 #[test]
@@ -2745,12 +2931,14 @@ fn tool_call_nested_object_argument() {
         )
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("object_val: {keys=1}"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("object_val: {keys=1}"));
 }
 
 #[test]
@@ -2762,13 +2950,15 @@ fn tool_call_negative_numbers() {
         .call_tool("types_test", json!({"int_val": -42, "float_val": -3.14}))
         .unwrap();
 
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("int_val: -42"));
-            assert!(text.contains("float_val: -3.14"));
-        }
-        _ => panic!("Expected text content"),
-    }
+    assert!(
+        matches!(result.first(), Some(Content::Text { .. })),
+        "expected text content"
+    );
+    let Some(Content::Text { text }) = result.first() else {
+        return;
+    };
+    assert!(text.contains("int_val: -42"));
+    assert!(text.contains("float_val: -3.14"));
 }
 
 #[test]
@@ -2782,12 +2972,14 @@ fn tool_call_sequential_success() {
             .call_tool("echo", json!({"message": format!("call_{}", i)}))
             .unwrap();
 
-        match &result[0] {
-            Content::Text { text } => {
-                assert_eq!(text, &format!("call_{}", i));
-            }
-            _ => panic!("Expected text content"),
-        }
+        assert!(
+            matches!(result.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = result.first() else {
+            return;
+        };
+        assert_eq!(text, &format!("call_{}", i));
     }
 }
 
@@ -3055,7 +3247,7 @@ impl ResourceHandler for FailingResourceHandler {
     }
 }
 
-fn setup_resource_test_server() -> TestClient {
+fn setup_resource_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("resource-test-server")
         .with_version("1.0.0")
@@ -3071,11 +3263,11 @@ fn setup_resource_test_server() -> TestClient {
         .resource(FailingResourceHandler)
         .build();
 
-    std::thread::spawn(move || {
+    let handle = spawn_thread(move || {
         server.run_transport(server_transport);
     });
 
-    TestClient::new(client_transport)
+    TestHarness::new(TestClient::new(client_transport), handle)
 }
 
 #[test]

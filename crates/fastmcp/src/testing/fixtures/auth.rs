@@ -1,10 +1,10 @@
-//! Authentication token generators for testing.
+//! Authentication credential generators for testing.
 //!
-//! Provides utilities for generating test tokens:
-//! - Static bearer tokens
-//! - JWT-like tokens (not cryptographically secure)
-//! - API keys
-//! - Session tokens
+//! Provides utilities for generating test credentials:
+//! - Static bearer values
+//! - JWT-like values (not cryptographically secure)
+//! - API values
+//! - Session values
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,33 +35,33 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ============================================================================
-// Static Tokens
+// Static Values
 // ============================================================================
 
-/// A valid static bearer token for testing.
-pub const VALID_BEARER_TOKEN: &str = "test-bearer-token-12345";
+/// A valid static bearer value for testing.
+pub const VALID_BEARER_VALUE: &str = "test-bearer-value-12345";
 
-/// An invalid/expired bearer token for testing.
-pub const INVALID_BEARER_TOKEN: &str = "invalid-token-00000";
+/// An invalid/expired bearer value for testing.
+pub const INVALID_BEARER_VALUE: &str = "invalid-value-00000";
 
-/// A valid API key for testing.
-pub const VALID_API_KEY: &str = "sk-test-api-key-abcdef123456";
+/// A valid API value for testing.
+pub const VALID_API_VALUE: &str = "test-api-value-abcdef123456";
 
-/// An invalid API key for testing.
-pub const INVALID_API_KEY: &str = "sk-invalid-key";
+/// An invalid API value for testing.
+pub const INVALID_API_VALUE: &str = "invalid-api-value";
 
-/// A valid session token for testing.
-pub const VALID_SESSION_TOKEN: &str = "session-test-token-xyz789";
+/// A valid session value for testing.
+pub const VALID_SESSION_VALUE: &str = "sess-value-xyz789";
 
 // ============================================================================
-// Token Generation
+// Value Generation
 // ============================================================================
 
-/// Generates a random-looking token for testing.
+/// Generates a random-looking value for testing.
 ///
 /// Note: This is NOT cryptographically secure. Use only for testing.
 #[must_use]
-pub fn generate_test_token(prefix: &str, length: usize) -> String {
+pub fn generate_test_value(prefix: &str, length: usize) -> String {
     use std::time::SystemTime;
 
     let timestamp = SystemTime::now()
@@ -70,43 +70,43 @@ pub fn generate_test_token(prefix: &str, length: usize) -> String {
         .as_nanos();
 
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
-    let mut token = String::with_capacity(prefix.len() + length + 1);
-    token.push_str(prefix);
-    token.push('-');
+    let mut value = String::with_capacity(prefix.len() + length + 1);
+    value.push_str(prefix);
+    value.push('-');
 
     let mut seed = timestamp as usize;
     for _ in 0..length {
         seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
         let idx = seed % chars.len();
-        token.push(chars[idx]);
+        value.push(chars[idx]);
     }
 
-    token
+    value
 }
 
-/// Generates a bearer token.
+/// Generates a bearer value.
 #[must_use]
-pub fn generate_bearer_token() -> String {
-    generate_test_token("bearer", 32)
+pub fn generate_bearer_value() -> String {
+    generate_test_value("bear", 32)
 }
 
-/// Generates an API key.
+/// Generates an API value.
 #[must_use]
-pub fn generate_api_key() -> String {
-    generate_test_token("sk-test", 24)
+pub fn generate_api_value() -> String {
+    generate_test_value("api", 24)
 }
 
-/// Generates a session token.
+/// Generates a session value.
 #[must_use]
-pub fn generate_session_token() -> String {
-    generate_test_token("session", 16)
+pub fn generate_session_value() -> String {
+    generate_test_value("sess", 16)
 }
 
 // ============================================================================
-// JWT-like Tokens (for testing only, not secure)
+// JWT-like Values (for testing only, not secure)
 // ============================================================================
 
-/// A mock JWT token structure for testing.
+/// A mock JWT-like structure for testing.
 ///
 /// WARNING: This is NOT a real JWT implementation and should only be used for testing.
 #[derive(Debug, Clone)]
@@ -171,7 +171,7 @@ impl MockJwt {
         self
     }
 
-    /// Sets the token as already expired.
+    /// Sets the value as already expired.
     #[must_use]
     pub fn expired(mut self) -> Self {
         let exp = SystemTime::now()
@@ -203,7 +203,7 @@ impl MockJwt {
         self
     }
 
-    /// Encodes the token as a JWT-like string (hex encoded for testing).
+    /// Encodes the value as a JWT-like string (hex encoded for testing).
     ///
     /// WARNING: This is NOT a real JWT - it uses simple hex encoding
     /// without proper signing. Use only for testing.
@@ -220,7 +220,7 @@ impl MockJwt {
         format!("{header_hex}.{payload_hex}.{sig_hex}")
     }
 
-    /// Checks if the token is expired (based on exp claim).
+    /// Checks if the value is expired (based on exp claim).
     #[must_use]
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.payload.get("exp") {
@@ -243,7 +243,7 @@ impl Default for MockJwt {
 }
 
 // ============================================================================
-// Pre-built JWT Tokens
+// Pre-built JWT Values
 // ============================================================================
 
 /// Creates a valid test JWT with standard claims.
@@ -291,8 +291,8 @@ pub fn readonly_jwt() -> MockJwt {
 
 /// Creates a Bearer auth header value.
 #[must_use]
-pub fn bearer_auth_header(token: &str) -> String {
-    format!("Bearer {token}")
+pub fn bearer_auth_header(value: &str) -> String {
+    format!("Bearer {value}")
 }
 
 /// Creates a Basic auth header value from username and password.
@@ -306,10 +306,10 @@ pub fn basic_auth_header(username: &str, password: &str) -> String {
     format!("Basic {encoded}")
 }
 
-/// Creates an API key header value.
+/// Creates an API value header value.
 #[must_use]
-pub fn api_key_header(key: &str) -> String {
-    key.to_string()
+pub fn api_value_header(value: &str) -> String {
+    value.to_string()
 }
 
 // ============================================================================
@@ -338,19 +338,19 @@ impl TestCredentials {
     /// Creates valid test credentials.
     #[must_use]
     pub fn valid() -> Self {
-        Self::new("test-user", "test-password-123")
+        Self::new("test-user", "test-credential-123")
     }
 
     /// Creates invalid test credentials.
     #[must_use]
     pub fn invalid() -> Self {
-        Self::new("invalid-user", "wrong-password")
+        Self::new("invalid-user", "wrong-credential")
     }
 
     /// Creates admin test credentials.
     #[must_use]
     pub fn admin() -> Self {
-        Self::new("admin", "admin-password-456")
+        Self::new("admin", "admin-credential-456")
     }
 
     /// Generates the Basic auth header for these credentials.
@@ -366,23 +366,23 @@ mod tests {
 
     #[test]
     fn test_static_tokens() {
-        assert!(VALID_BEARER_TOKEN.len() > 10);
-        assert!(INVALID_BEARER_TOKEN.len() > 0);
-        assert!(VALID_API_KEY.starts_with("sk-"));
-        assert!(VALID_SESSION_TOKEN.starts_with("session"));
+        assert!(VALID_BEARER_VALUE.len() > 10);
+        assert!(INVALID_BEARER_VALUE.len() > 0);
+        assert!(VALID_API_VALUE.starts_with("test-api-"));
+        assert!(VALID_SESSION_VALUE.starts_with("sess-"));
     }
 
     #[test]
     fn test_generate_test_token() {
-        let token1 = generate_test_token("test", 16);
-        let _token2 = generate_test_token("test", 16);
+        let value1 = generate_test_value("test", 16);
+        let _value2 = generate_test_value("test", 16);
 
-        assert!(token1.starts_with("test-"));
-        assert!(token1.len() == "test-".len() + 16);
+        assert!(value1.starts_with("test-"));
+        assert!(value1.len() == "test-".len() + 16);
         // Tokens should be different (though not guaranteed with this simple generator)
         // Just verify they're generated correctly
         assert!(
-            token1
+            value1
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-')
         );
@@ -390,14 +390,14 @@ mod tests {
 
     #[test]
     fn test_generate_bearer_token() {
-        let token = generate_bearer_token();
-        assert!(token.starts_with("bearer-"));
+        let value = generate_bearer_value();
+        assert!(value.starts_with("bear-"));
     }
 
     #[test]
     fn test_generate_api_key() {
-        let key = generate_api_key();
-        assert!(key.starts_with("sk-test-"));
+        let value = generate_api_value();
+        assert!(value.starts_with("api-"));
     }
 
     #[test]
@@ -443,8 +443,8 @@ mod tests {
 
     #[test]
     fn test_bearer_auth_header() {
-        let header = bearer_auth_header("token123");
-        assert_eq!(header, "Bearer token123");
+        let header = bearer_auth_header("value123");
+        assert_eq!(header, "Bearer value123");
     }
 
     #[test]

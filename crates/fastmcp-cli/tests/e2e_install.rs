@@ -47,7 +47,10 @@ fn mktemp_home(prefix: &str) -> PathBuf {
 }
 
 fn read_to_string(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => std::panic::panic_any(format!("read {}: {e}", path.display())),
+    }
 }
 
 #[cfg(target_os = "linux")]

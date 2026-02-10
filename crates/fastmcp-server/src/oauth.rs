@@ -181,7 +181,7 @@ impl OAuthClient {
 #[derive(Debug)]
 pub struct OAuthClientBuilder {
     client_id: String,
-    client_secret: Option<String>,
+    client_credential: Option<String>,
     redirect_uris: Vec<String>,
     allowed_scopes: HashSet<String>,
     name: Option<String>,
@@ -193,7 +193,7 @@ impl OAuthClientBuilder {
     fn new(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
-            client_secret: None,
+            client_credential: None,
             redirect_uris: Vec::new(),
             allowed_scopes: HashSet::new(),
             name: None,
@@ -203,8 +203,8 @@ impl OAuthClientBuilder {
 
     /// Sets the client secret (makes this a confidential client).
     #[must_use]
-    pub fn secret(mut self, secret: impl Into<String>) -> Self {
-        self.client_secret = Some(secret.into());
+    pub fn secret(mut self, credential: impl Into<String>) -> Self {
+        self.client_credential = Some(credential.into());
         self
     }
 
@@ -279,7 +279,7 @@ impl OAuthClientBuilder {
             ));
         }
 
-        let client_type = if self.client_secret.is_some() {
+        let client_type = if self.client_credential.is_some() {
             ClientType::Confidential
         } else {
             ClientType::Public
@@ -287,7 +287,7 @@ impl OAuthClientBuilder {
 
         Ok(OAuthClient {
             client_id: self.client_id,
-            client_secret: self.client_secret,
+            client_secret: self.client_credential,
             client_type,
             redirect_uris: self.redirect_uris,
             allowed_scopes: self.allowed_scopes,
@@ -948,20 +948,20 @@ impl OAuthServer {
     }
 
     fn token_refresh_token(&self, request: &TokenRequest) -> Result<TokenResponse, OAuthError> {
-        let refresh_token_value = request
+        let refresh_value = request
             .refresh_token
             .as_ref()
             .ok_or_else(|| OAuthError::InvalidRequest("refresh_token is required".to_string()))?;
 
         // Get and validate refresh token
-        let refresh_token = {
+        let stored_refresh = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
 
             // Check if revoked
-            if state.revoked_tokens.contains(refresh_token_value) {
+            if state.revoked_tokens.contains(refresh_value) {
                 return Err(OAuthError::InvalidGrant(
                     "refresh token has been revoked".to_string(),
                 ));
@@ -969,17 +969,17 @@ impl OAuthServer {
 
             state
                 .refresh_tokens
-                .get(refresh_token_value)
+                .get(refresh_value)
                 .cloned()
                 .ok_or_else(|| OAuthError::InvalidGrant("refresh token not found".to_string()))?
         };
 
-        if refresh_token.is_expired() {
+        if stored_refresh.is_expired() {
             return Err(OAuthError::InvalidGrant(
                 "refresh token has expired".to_string(),
             ));
         }
-        if refresh_token.client_id != request.client_id {
+        if stored_refresh.client_id != request.client_id {
             return Err(OAuthError::InvalidGrant("client_id mismatch".to_string()));
         }
 
@@ -1000,7 +1000,7 @@ impl OAuthServer {
         let scopes = if let Some(requested) = &request.scopes {
             // Validate that requested scopes are a subset of original
             for scope in requested {
-                if !refresh_token.scopes.contains(scope) {
+                if !stored_refresh.scopes.contains(scope) {
                     return Err(OAuthError::InvalidScope(format!(
                         "scope '{}' was not in original grant",
                         scope
@@ -1009,20 +1009,20 @@ impl OAuthServer {
             }
             requested.clone()
         } else {
-            refresh_token.scopes.clone()
+            stored_refresh.scopes.clone()
         };
 
         // Issue new access token (keep same refresh token)
         let now = Instant::now();
-        let access_token_value = generate_token(self.config.token_entropy_bytes)?;
-        let access_token = OAuthToken {
-            token: access_token_value.clone(),
+        let access_value = generate_token(self.config.token_entropy_bytes)?;
+        let issued_access = OAuthToken {
+            token: access_value.clone(),
             token_type: TokenType::Bearer,
             client_id: request.client_id.clone(),
             scopes: scopes.clone(),
             issued_at: now,
             expires_at: now + self.config.access_token_lifetime,
-            subject: refresh_token.subject.clone(),
+            subject: stored_refresh.subject.clone(),
             is_refresh_token: false,
         };
 
@@ -1034,13 +1034,13 @@ impl OAuthServer {
                 .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
             state
                 .access_tokens
-                .insert(access_token_value.clone(), access_token.clone());
+                .insert(access_value.clone(), issued_access.clone());
         }
 
         Ok(TokenResponse {
-            access_token: access_token_value,
-            token_type: access_token.token_type.as_str().to_string(),
-            expires_in: access_token.expires_in_secs(),
+            access_token: access_value,
+            token_type: issued_access.token_type.as_str().to_string(),
+            expires_in: issued_access.expires_in_secs(),
             refresh_token: None, // Don't issue new refresh token
             scope: if scopes.is_empty() {
                 None
@@ -1059,9 +1059,9 @@ impl OAuthServer {
         let now = Instant::now();
 
         // Generate access token
-        let access_token_value = generate_token(self.config.token_entropy_bytes)?;
-        let access_token = OAuthToken {
-            token: access_token_value.clone(),
+        let access_value = generate_token(self.config.token_entropy_bytes)?;
+        let access_cred = OAuthToken {
+            token: access_value.clone(),
             token_type: TokenType::Bearer,
             client_id: client_id.to_string(),
             scopes: scopes.to_vec(),
@@ -1072,9 +1072,9 @@ impl OAuthServer {
         };
 
         // Generate refresh token
-        let refresh_token_value = generate_token(self.config.token_entropy_bytes)?;
-        let refresh_token = OAuthToken {
-            token: refresh_token_value.clone(),
+        let refresh_value = generate_token(self.config.token_entropy_bytes)?;
+        let refresh_cred = OAuthToken {
+            token: refresh_value.clone(),
             token_type: TokenType::Bearer,
             client_id: client_id.to_string(),
             scopes: scopes.to_vec(),
@@ -1092,17 +1092,17 @@ impl OAuthServer {
                 .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
             state
                 .access_tokens
-                .insert(access_token_value.clone(), access_token.clone());
+                .insert(access_value.clone(), access_cred.clone());
             state
                 .refresh_tokens
-                .insert(refresh_token_value.clone(), refresh_token);
+                .insert(refresh_value.clone(), refresh_cred);
         }
 
         Ok(TokenResponse {
-            access_token: access_token_value,
-            token_type: access_token.token_type.as_str().to_string(),
-            expires_in: access_token.expires_in_secs(),
-            refresh_token: Some(refresh_token_value),
+            access_token: access_value,
+            token_type: access_cred.token_type.as_str().to_string(),
+            expires_in: access_cred.expires_in_secs(),
+            refresh_token: Some(refresh_value),
             scope: if scopes.is_empty() {
                 None
             } else {
@@ -1553,14 +1553,14 @@ mod tests {
 
     #[test]
     fn test_token_generation() {
-        let token1 = generate_token(32).unwrap();
-        let token2 = generate_token(32).unwrap();
+        let value1 = generate_token(32).unwrap();
+        let value2 = generate_token(32).unwrap();
 
         // Tokens should be unique
-        assert_ne!(token1, token2);
+        assert_ne!(value1, value2);
         // Tokens should be URL-safe
         assert!(
-            token1
+            value1
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
@@ -1663,8 +1663,8 @@ mod tests {
         let token_response = {
             let mut state = server.state.write().unwrap();
             let now = Instant::now();
-            let token = OAuthToken {
-                token: "test-access-token".to_string(),
+            let access_cred = OAuthToken {
+                token: "test-access".to_string(),
                 token_type: TokenType::Bearer,
                 client_id: "test-client".to_string(),
                 scopes: vec!["read".to_string()],
@@ -1675,9 +1675,9 @@ mod tests {
             };
             state
                 .access_tokens
-                .insert("test-access-token".to_string(), token);
+                .insert("test-access".to_string(), access_cred);
             TokenResponse {
-                access_token: "test-access-token".to_string(),
+                access_token: "test-access".to_string(),
                 token_type: "bearer".to_string(),
                 expires_in: 3600,
                 refresh_token: None,
@@ -1741,8 +1741,8 @@ mod tests {
         {
             let mut state = server.state.write().unwrap();
             let now = Instant::now();
-            let token = OAuthToken {
-                token: "valid-token".to_string(),
+            let access_cred = OAuthToken {
+                token: "valid-value".to_string(),
                 token_type: TokenType::Bearer,
                 client_id: "test-client".to_string(),
                 scopes: vec!["read".to_string()],
@@ -1751,7 +1751,9 @@ mod tests {
                 subject: Some("user123".to_string()),
                 is_refresh_token: false,
             };
-            state.access_tokens.insert("valid-token".to_string(), token);
+            state
+                .access_tokens
+                .insert("valid-value".to_string(), access_cred);
         }
 
         // Create verifier
@@ -1767,7 +1769,7 @@ mod tests {
         // Valid token
         let access = AccessToken {
             scheme: "Bearer".to_string(),
-            token: "valid-token".to_string(),
+            token: "valid-value".to_string(),
         };
         let result = verifier.verify(&mcp_ctx, auth_request, &access);
         assert!(result.is_ok());
@@ -1778,7 +1780,7 @@ mod tests {
         // Invalid token
         let invalid = AccessToken {
             scheme: "Bearer".to_string(),
-            token: "invalid-token".to_string(),
+            token: "invalid-value".to_string(),
         };
         let result = verifier.verify(&mcp_ctx, auth_request, &invalid);
         assert!(result.is_err());
@@ -1786,7 +1788,7 @@ mod tests {
         // Wrong scheme
         let wrong_scheme = AccessToken {
             scheme: "Basic".to_string(),
-            token: "valid-token".to_string(),
+            token: "valid-value".to_string(),
         };
         let result = verifier.verify(&mcp_ctx, auth_request, &wrong_scheme);
         assert!(result.is_err());

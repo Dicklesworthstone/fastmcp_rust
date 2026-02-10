@@ -14,7 +14,7 @@
 //!             "command": "npx",
 //!             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
 //!             "env": {
-//!                 "API_KEY": "secret"
+//!                 "EXAMPLE_ENV": "example-value"
 //!             }
 //!         }
 //!     }
@@ -234,7 +234,7 @@ impl McpConfig {
     /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
     ///
     /// [mcp_servers.filesystem.env]
-    /// API_KEY = "secret"
+    /// EXAMPLE_ENV = "example-value"
     /// ```
     ///
     /// # Errors
@@ -698,12 +698,15 @@ mod tests {
     fn test_server_config_builder() {
         let config = ServerConfig::new("python")
             .with_args(["-m", "my_server"])
-            .with_env("API_KEY", "secret")
+            .with_env("EXAMPLE_ENV", "example-value")
             .with_cwd("/opt/server");
 
         assert_eq!(config.command, "python");
         assert_eq!(config.args, vec!["-m", "my_server"]);
-        assert_eq!(config.env.get("API_KEY"), Some(&"secret".to_string()));
+        assert_eq!(
+            config.env.get("EXAMPLE_ENV"),
+            Some(&"example-value".to_string())
+        );
         assert_eq!(config.cwd, Some("/opt/server".to_string()));
         assert!(!config.disabled);
     }

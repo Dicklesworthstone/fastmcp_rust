@@ -19,7 +19,7 @@ use fastmcp_core::{
     McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter, SessionState,
 };
 use fastmcp_protocol::{
-    Content, Icon, JsonRpcRequest, ProgressParams, ProgressToken, Prompt, PromptMessage, Resource,
+    Content, Icon, JsonRpcRequest, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
     ResourceContent, ResourceTemplate, Tool, ToolAnnotations,
 };
 
@@ -35,8 +35,8 @@ pub struct ProgressNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
-    /// The progress token from the original request.
-    token: ProgressToken,
+    /// The progress marker from the original request.
+    marker: ProgressMarker,
     /// Callback to send notifications.
     send_fn: F,
 }
@@ -46,8 +46,8 @@ where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
     /// Creates a new progress notification sender.
-    pub fn new(token: ProgressToken, send_fn: F) -> Self {
-        Self { token, send_fn }
+    pub fn new(marker: ProgressMarker, send_fn: F) -> Self {
+        Self { marker, send_fn }
     }
 
     /// Creates a progress reporter from this sender.
@@ -65,8 +65,8 @@ where
 {
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
         let params = match total {
-            Some(t) => ProgressParams::with_total(self.token.clone(), progress, t),
-            None => ProgressParams::new(self.token.clone(), progress),
+            Some(t) => ProgressParams::with_total(self.marker.clone(), progress, t),
+            None => ProgressParams::new(self.marker.clone(), progress),
         };
 
         let params = if let Some(msg) = message {
@@ -91,7 +91,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressNotificationSender")
-            .field("token", &self.token)
+            .field("marker", &self.marker)
             .finish_non_exhaustive()
     }
 }
@@ -140,21 +140,21 @@ impl std::fmt::Debug for BidirectionalSenders {
 pub fn create_context_with_progress<F>(
     cx: asupersync::Cx,
     request_id: u64,
-    progress_token: Option<ProgressToken>,
+    progress_marker: Option<ProgressMarker>,
     state: Option<SessionState>,
     send_fn: F,
 ) -> McpContext
 where
     F: Fn(JsonRpcRequest) + Send + Sync + 'static,
 {
-    create_context_with_progress_and_senders(cx, request_id, progress_token, state, send_fn, None)
+    create_context_with_progress_and_senders(cx, request_id, progress_marker, state, send_fn, None)
 }
 
 /// Helper to create an McpContext with optional progress reporting, session state, and bidirectional senders.
 pub fn create_context_with_progress_and_senders<F>(
     cx: asupersync::Cx,
     request_id: u64,
-    progress_token: Option<ProgressToken>,
+    progress_marker: Option<ProgressMarker>,
     state: Option<SessionState>,
     send_fn: F,
     senders: Option<&BidirectionalSenders>,
@@ -162,13 +162,13 @@ pub fn create_context_with_progress_and_senders<F>(
 where
     F: Fn(JsonRpcRequest) + Send + Sync + 'static,
 {
-    let mut ctx = match (progress_token, state) {
-        (Some(token), Some(state)) => {
-            let sender = ProgressNotificationSender::new(token, send_fn);
+    let mut ctx = match (progress_marker, state) {
+        (Some(marker), Some(state)) => {
+            let sender = ProgressNotificationSender::new(marker, send_fn);
             McpContext::with_state_and_progress(cx, request_id, state, sender.into_reporter())
         }
-        (Some(token), None) => {
-            let sender = ProgressNotificationSender::new(token, send_fn);
+        (Some(marker), None) => {
+            let sender = ProgressNotificationSender::new(marker, send_fn);
             McpContext::with_progress(cx, request_id, sender.into_reporter())
         }
         (None, Some(state)) => McpContext::with_state(cx, request_id, state),

@@ -32,6 +32,18 @@ fn test_ctx() -> McpContext {
     McpContext::new(Cx::for_testing(), 1)
 }
 
+fn expect_text(content: &Content) -> &str {
+    if let Content::Text { text } = content {
+        text
+    } else {
+        assert!(
+            matches!(content, Content::Text { .. }),
+            "Expected Text content"
+        );
+        ""
+    }
+}
+
 // ============================================================================
 // #[tool] expansion tests
 // ============================================================================
@@ -79,10 +91,8 @@ fn tool_call_returns_text_content() {
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"name": "World"})).unwrap();
     assert_eq!(result.len(), 1);
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Hello, World!"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "Hello, World!");
 }
 
 // --- Tool with name override ---
@@ -173,10 +183,8 @@ fn tool_call_with_required_params() {
     let handler = AddNumbers;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"a": 3, "b": 4})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "7"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "7");
 }
 
 #[test]
@@ -186,10 +194,8 @@ fn tool_call_with_optional_param() {
     let result = handler
         .call(&ctx, json!({"a": 3, "b": 4, "label": "Sum"}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Sum: 7"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "Sum: 7");
 }
 
 #[test]
@@ -224,10 +230,8 @@ fn tool_call_uses_default_param_when_missing() {
     let handler = GreetWithDefault;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"name": "World"})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Hello, World!"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "Hello, World!");
 }
 
 // --- Tool with context parameter ---
@@ -245,10 +249,8 @@ fn tool_with_context_call() {
     let handler = ToolWithContext;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"msg": "hello"})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "ctx:hello"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "ctx:hello");
 }
 
 #[test]
@@ -301,10 +303,8 @@ fn tool_result_ok() {
     let handler = FallibleTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"succeed": true})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "success"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "success");
 }
 
 #[test]
@@ -338,10 +338,8 @@ fn tool_no_params_call() {
     let handler = NoParamsTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "fixed"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "fixed");
 }
 
 // --- Tool with timeout ---
@@ -414,10 +412,8 @@ fn tool_vec_param_call() {
     let result = handler
         .call(&ctx, json!({"items": ["a", "b", "c"]}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "a, b, c"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a, b, c");
 }
 
 // --- Tool with f64 parameter ---
@@ -457,10 +453,8 @@ fn async_tool_call() {
     let handler = AsyncGreet;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"name": "Rust"})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "Hello async, Rust!"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "Hello async, Rust!");
 }
 
 // --- Async tool with context ---
@@ -477,10 +471,8 @@ fn async_tool_with_context_call() {
     let handler = AsyncCtxTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"val": "test"})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "async:test"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "async:test");
 }
 
 // --- Tool default trait methods ---
@@ -585,12 +577,8 @@ fn tool_hashmap_param_call() {
     let result = handler
         .call(&ctx, json!({"metadata": {"key1": "val1", "key2": "val2"}}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => {
-            assert!(text.contains("key1=val1") || text.contains("key2=val2"));
-        }
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert!(text.contains("key1=val1") || text.contains("key2=val2"));
 }
 
 // --- Tool with u32/i32 parameters ---
@@ -614,10 +602,8 @@ fn tool_u32_param_call() {
     let handler = UintTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"count": 42})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "count: 42"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "count: 42");
 }
 
 /// Tool with signed integer parameter.
@@ -639,10 +625,8 @@ fn tool_i32_param_call_positive() {
     let handler = IntTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"value": 100})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "value: 100"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "value: 100");
 }
 
 #[test]
@@ -650,10 +634,8 @@ fn tool_i32_param_call_negative() {
     let handler = IntTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"value": -50})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "value: -50"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "value: -50");
 }
 
 // --- Tool with nested Vec ---
@@ -690,10 +672,8 @@ fn tool_nested_vec_param_call() {
     let result = handler
         .call(&ctx, json!({"matrix": [[1, 2], [3, 4]]}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "1,2; 3,4"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "1,2; 3,4");
 }
 
 // --- Tool with multiple optional parameters ---
@@ -724,10 +704,8 @@ fn tool_all_optional_call_empty() {
     let handler = AllOptionalTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "a=none, b=none, c=none"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a=none, b=none, c=none");
 }
 
 #[test]
@@ -735,10 +713,8 @@ fn tool_all_optional_call_partial() {
     let handler = AllOptionalTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"b": 42})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "a=none, b=42, c=none"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a=none, b=42, c=none");
 }
 
 #[test]
@@ -748,10 +724,8 @@ fn tool_all_optional_call_full() {
     let result = handler
         .call(&ctx, json!({"a": "hello", "b": 42, "c": true}))
         .unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "a=hello, b=42, c=true"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a=hello, b=42, c=true");
 }
 
 // --- Tool returning unit ---
@@ -785,10 +759,8 @@ fn async_fallible_tool_ok() {
     let handler = AsyncFallibleTool;
     let ctx = test_ctx();
     let result = handler.call(&ctx, json!({"succeed": true})).unwrap();
-    match &result[0] {
-        Content::Text { text } => assert_eq!(text, "async success"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "async success");
 }
 
 #[test]
@@ -1269,10 +1241,8 @@ fn prompt_get_uses_default_argument_when_missing() {
     let mut args = HashMap::new();
     args.insert("name".to_string(), "Alice".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "Hi Alice"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "Hi Alice");
 }
 
 #[test]
@@ -1284,10 +1254,8 @@ fn prompt_get_returns_messages() {
     let result = handler.get(&ctx, args).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].role, Role::User);
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "Greet Alice"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "Greet Alice");
 }
 
 // --- Prompt with optional arguments ---
@@ -1327,10 +1295,8 @@ fn prompt_get_without_optional() {
     let mut args = HashMap::new();
     args.insert("code".to_string(), "fn main() {}".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert!(text.starts_with("Review:\n")),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert!(text.starts_with("Review:\n"));
 }
 
 #[test]
@@ -1341,10 +1307,8 @@ fn prompt_get_with_optional() {
     args.insert("code".to_string(), "fn main() {}".to_string());
     args.insert("focus".to_string(), "security".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert!(text.starts_with("Review (focus: security)")),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert!(text.starts_with("Review (focus: security)"));
 }
 
 #[test]
@@ -1425,10 +1389,8 @@ fn prompt_with_context_call() {
     let mut args = HashMap::new();
     args.insert("msg".to_string(), "hello".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "req:1 msg:hello"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "req:1 msg:hello");
 }
 
 #[test]
@@ -1465,10 +1427,8 @@ fn async_prompt_get() {
     let mut args = HashMap::new();
     args.insert("text".to_string(), "async hello".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "async hello"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "async hello");
 }
 
 // --- Prompt default trait methods ---
@@ -1524,10 +1484,8 @@ fn prompt_no_args_call() {
     let args = HashMap::new();
     let result = handler.get(&ctx, args).unwrap();
     assert_eq!(result.len(), 1);
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "Hello!"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "Hello!");
 }
 
 // --- Prompt returning McpResult ---
@@ -1553,10 +1511,8 @@ fn prompt_result_ok() {
     let ctx = test_ctx();
     let args = HashMap::new();
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "success"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "success");
 }
 
 #[test]
@@ -1598,10 +1554,8 @@ fn async_prompt_with_context_get() {
     let mut args = HashMap::new();
     args.insert("msg".to_string(), "hello".to_string());
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "async_req:1 msg:hello"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "async_req:1 msg:hello");
 }
 
 // --- Prompt returning multiple messages ---
@@ -1703,10 +1657,8 @@ fn prompt_all_optional_call_empty() {
     let ctx = test_ctx();
     let args = HashMap::new();
     let result = handler.get(&ctx, args).unwrap();
-    match &result[0].content {
-        Content::Text { text } => assert_eq!(text, "a=none, b=none"),
-        _ => panic!("Expected Text content"),
-    }
+    let text = expect_text(&result[0].content);
+    assert_eq!(text, "a=none, b=none");
 }
 
 // ============================================================================
