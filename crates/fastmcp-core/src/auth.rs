@@ -50,15 +50,17 @@ impl AccessToken {
             }
         }
 
-        if let Some((scheme, token)) = trimmed.split_once(' ') {
-            let scheme = scheme.trim();
-            let token = token.trim();
-            if scheme.is_empty() || token.is_empty() {
+        // Authorization headers use whitespace as the delimiter between scheme and token.
+        // Treat any multi-part value as invalid (tokens must not contain whitespace).
+        let mut parts = trimmed.split_whitespace();
+        let first = parts.next().unwrap_or_default();
+        if let Some(second) = parts.next() {
+            if parts.next().is_some() {
                 return None;
             }
             return Some(Self {
-                scheme: scheme.to_string(),
-                token: token.to_string(),
+                scheme: first.to_string(),
+                token: second.to_string(),
             });
         }
 
@@ -71,7 +73,7 @@ impl AccessToken {
 
 #[cfg(test)]
 mod tests {
-    use super::AccessToken;
+    use super::{AccessToken, AuthContext};
 
     #[test]
     fn parse_rejects_empty_and_scheme_without_token() {
@@ -91,6 +93,13 @@ mod tests {
             })
         );
         assert_eq!(
+            AccessToken::parse("bearer\tabc"),
+            Some(AccessToken {
+                scheme: "bearer".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+        assert_eq!(
             AccessToken::parse("abc"),
             Some(AccessToken {
                 scheme: "Bearer".to_string(),
@@ -105,6 +114,45 @@ mod tests {
                 token: "Bearer".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parse_rejects_values_with_multiple_whitespace_separated_parts() {
+        assert_eq!(AccessToken::parse("Bearer a b"), None);
+        assert_eq!(AccessToken::parse("Token a b c"), None);
+    }
+
+    #[test]
+    fn parse_accepts_non_bearer_schemes() {
+        assert_eq!(
+            AccessToken::parse("Token abc"),
+            Some(AccessToken {
+                scheme: "Token".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn auth_context_constructors() {
+        let anon = AuthContext::anonymous();
+        assert!(anon.subject.is_none());
+        assert!(anon.scopes.is_empty());
+        assert!(anon.token.is_none());
+        assert!(anon.claims.is_none());
+
+        let user = AuthContext::with_subject("user123");
+        assert_eq!(user.subject.as_deref(), Some("user123"));
+        assert!(user.scopes.is_empty());
+        assert!(user.token.is_none());
+        assert!(user.claims.is_none());
+    }
+
+    #[test]
+    fn auth_context_serialization_skips_empty_fields() {
+        let anon = AuthContext::anonymous();
+        let value = serde_json::to_value(&anon).expect("serialize");
+        assert_eq!(value, serde_json::json!({}));
     }
 }
 

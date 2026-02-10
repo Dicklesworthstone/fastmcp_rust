@@ -22,3 +22,22 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
     runtime.block_on(future)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::block_on;
+
+    #[test]
+    fn block_on_runs_async_blocks() {
+        let out = block_on(async { 1 + 1 });
+        assert_eq!(out, 2);
+    }
+
+    #[test]
+    fn block_on_can_be_called_multiple_times() {
+        let a = block_on(async { "a" });
+        let b = block_on(async { "b" });
+        assert_eq!(a, "a");
+        assert_eq!(b, "b");
+    }
+}
