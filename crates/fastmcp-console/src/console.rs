@@ -296,7 +296,7 @@ pub fn init_console(enabled: bool) -> Result<(), &'static str> {
 
 /// Strip markup tags from text (for plain output).
 ///
-/// Handles escaped brackets (`[[` -> `[`) and strips valid tags (`[...]`).
+/// Handles escaped brackets (`[[` -> `[`, `\\[` -> `[`, `\\]` -> `]`) and strips valid tags (`[...]`).
 #[must_use]
 pub fn strip_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -304,6 +304,19 @@ pub fn strip_markup(text: &str) -> String {
 
     while let Some(ch) = chars.next() {
         match ch {
+            '\\' => {
+                // Rich uses backslash escaping for literal brackets. Preserve those for plain output.
+                if let Some(next) = chars.peek().copied() {
+                    if next == '[' || next == ']' || next == '\\' {
+                        out.push(next);
+                        chars.next();
+                    } else {
+                        out.push('\\');
+                    }
+                } else {
+                    out.push('\\');
+                }
+            }
             '[' => {
                 // Check for escaped bracket [[
                 if let Some('[') = chars.peek() {
@@ -367,6 +380,16 @@ mod tests {
     #[test]
     fn test_strip_markup_preserves_unicode() {
         assert_eq!(strip_markup("[info]⚡ Fast[/]"), "⚡ Fast");
+    }
+
+    #[test]
+    fn test_strip_markup_preserves_backslash_escaped_brackets() {
+        assert_eq!(
+            strip_markup(r"tools/list \[OK\] 12ms"),
+            "tools/list [OK] 12ms"
+        );
+        assert_eq!(strip_markup(r"\[x\]"), "[x]");
+        assert_eq!(strip_markup(r"\\[bold]x[/]"), r"\x");
     }
 
     #[test]
