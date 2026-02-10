@@ -483,8 +483,23 @@ impl Client {
         self.ensure_initialized()?;
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: usize = 0;
 
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(McpError::internal_error(
+                    "Pagination exceeded 10,000 pages (tools/list)".to_string(),
+                ));
+            }
+            if let Some(cur) = cursor.as_ref() {
+                if !seen.insert(cur.clone()) {
+                    return Err(McpError::internal_error(format!(
+                        "Pagination cursor repeated (tools/list): {cur}"
+                    )));
+                }
+            }
             let mut params = ListToolsParams::default();
             params.cursor = cursor.clone();
             let result: ListToolsResult = self.send_request("tools/list", params)?;
@@ -722,8 +737,23 @@ impl Client {
         self.ensure_initialized()?;
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: usize = 0;
 
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(McpError::internal_error(
+                    "Pagination exceeded 10,000 pages (resources/list)".to_string(),
+                ));
+            }
+            if let Some(cur) = cursor.as_ref() {
+                if !seen.insert(cur.clone()) {
+                    return Err(McpError::internal_error(format!(
+                        "Pagination cursor repeated (resources/list): {cur}"
+                    )));
+                }
+            }
             let mut params = ListResourcesParams::default();
             params.cursor = cursor.clone();
             let result: ListResourcesResult = self.send_request("resources/list", params)?;
@@ -746,8 +776,23 @@ impl Client {
         self.ensure_initialized()?;
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: usize = 0;
 
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(McpError::internal_error(
+                    "Pagination exceeded 10,000 pages (resources/templates/list)".to_string(),
+                ));
+            }
+            if let Some(cur) = cursor.as_ref() {
+                if !seen.insert(cur.clone()) {
+                    return Err(McpError::internal_error(format!(
+                        "Pagination cursor repeated (resources/templates/list): {cur}"
+                    )));
+                }
+            }
             let mut params = ListResourceTemplatesParams::default();
             params.cursor = cursor.clone();
             let result: ListResourceTemplatesResult =
@@ -798,8 +843,23 @@ impl Client {
         self.ensure_initialized()?;
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: usize = 0;
 
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(McpError::internal_error(
+                    "Pagination exceeded 10,000 pages (prompts/list)".to_string(),
+                ));
+            }
+            if let Some(cur) = cursor.as_ref() {
+                if !seen.insert(cur.clone()) {
+                    return Err(McpError::internal_error(format!(
+                        "Pagination cursor repeated (prompts/list): {cur}"
+                    )));
+                }
+            }
             let mut params = ListPromptsParams::default();
             params.cursor = cursor.clone();
             let result: ListPromptsResult = self.send_request("prompts/list", params)?;
@@ -899,8 +959,23 @@ impl Client {
         self.ensure_initialized()?;
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: usize = 0;
 
         loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(McpError::internal_error(
+                    "Pagination exceeded 10,000 pages (tasks/list)".to_string(),
+                ));
+            }
+            if let Some(cur) = cursor.as_ref() {
+                if !seen.insert(cur.clone()) {
+                    return Err(McpError::internal_error(format!(
+                        "Pagination cursor repeated (tasks/list): {cur}"
+                    )));
+                }
+            }
             let result = self.list_tasks(status, cursor.as_deref(), Some(200))?;
             all.extend(result.tasks);
             cursor = result.next_cursor;

@@ -781,7 +781,7 @@ impl Parse for ToolAttrs {
 /// }
 /// ```
 ///
-/// If the argument is omitted in the JSON-RPC call, the default expression is used.
+/// If the argument is omitted in the JSON-RPC call, the default value is used.
 #[proc_macro_attribute]
 #[allow(clippy::too_many_lines)]
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
