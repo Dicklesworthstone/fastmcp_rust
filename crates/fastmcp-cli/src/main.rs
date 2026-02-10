@@ -1150,6 +1150,9 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
     use std::time::{Duration, Instant};
 
     let term = Term::stdout();
+    let flush_stdout = || {
+        let _ = io::stdout().flush();
+    };
 
     // Parse environment variables
     let env_vars: HashMap<String, String> = config
@@ -1160,6 +1163,16 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
             Some((parts.next()?.to_string(), parts.next()?.to_string()))
         })
         .collect();
+
+    let patterns: Vec<glob::Pattern> = config
+        .reload_patterns
+        .iter()
+        .map(|p| {
+            glob::Pattern::new(p).map_err(|e| {
+                fastmcp_core::McpError::internal_error(format!("Invalid reload pattern {p}: {e}"))
+            })
+        })
+        .collect::<McpResult<Vec<_>>>()?;
 
     // Determine if this is a Cargo project
     let target_path = PathBuf::from(&config.target);
@@ -1189,6 +1202,7 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
         );
     }
     println!();
+    flush_stdout();
 
     // Build and start the server
     let rebuild_needed = std::sync::Arc::new(AtomicBool::new(false));
@@ -1198,6 +1212,7 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
     let build_project = |verbose: bool| -> bool {
         if is_cargo_project {
             println!("{} Building...", style("🔨").bold());
+            flush_stdout();
             let output = Command::new("cargo")
                 .arg("build")
                 .current_dir(&target_path)
@@ -1208,6 +1223,7 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
                 Ok(output) => {
                     if output.status.success() {
                         println!("{} Build successful", style("✓").green().bold());
+                        flush_stdout();
                         true
                     } else {
                         println!("{} Build failed", style("✗").red().bold());
@@ -1217,11 +1233,13 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
                                 println!("  {}", style(line).red());
                             }
                         }
+                        flush_stdout();
                         false
                     }
                 }
                 Err(e) => {
                     println!("{} Build error: {}", style("✗").red().bold(), e);
+                    flush_stdout();
                     false
                 }
             }
@@ -1240,6 +1258,7 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
         };
 
         println!("{} Starting server...", style("🚀").bold());
+        flush_stdout();
 
         let mut command = Command::new(&cmd);
         command
@@ -1257,10 +1276,12 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
                     style("✓").green().bold(),
                     child.id()
                 );
+                flush_stdout();
                 Some(child)
             }
             Err(e) => {
                 println!("{} Failed to start server: {}", style("✗").red().bold(), e);
+                flush_stdout();
                 None
             }
         }
@@ -1282,19 +1303,33 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
     let rebuild_flag = rebuild_needed.clone();
+    let target_root = target_path.clone();
+    let patterns_for_cb = patterns.clone();
 
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 // Check if any path matches our patterns
                 let should_rebuild = event.paths.iter().any(|path| {
-                    let path_str = path.to_string_lossy();
-                    // Skip target directory
-                    if path_str.contains("/target/") || path_str.contains("\\target\\") {
+                    // Skip target directory (cargo build output).
+                    if path.components().any(|c| c.as_os_str() == "target") {
                         return false;
                     }
-                    // Check if it's a Rust file
-                    path_str.ends_with(".rs") || path_str.ends_with(".toml")
+
+                    // Match against user-specified reload patterns (relative to the target root).
+                    // Normalize to forward slashes to match common glob patterns.
+                    let rel = path.strip_prefix(&target_root).unwrap_or(path);
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+                    if patterns_for_cb.is_empty() {
+                        rel.extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| {
+                                ext.eq_ignore_ascii_case("rs") || ext.eq_ignore_ascii_case("toml")
+                            })
+                    } else {
+                        patterns_for_cb.iter().any(|p| p.matches(&rel_str))
+                    }
                 });
 
                 if should_rebuild {
@@ -1328,74 +1363,83 @@ fn cmd_dev(config: DevConfig) -> McpResult<()> {
         "\n{} Watching for changes... (Ctrl+C to stop)\n",
         style("👀").bold()
     );
+    flush_stdout();
 
     // Main loop
-    let mut last_rebuild = Instant::now();
+    let mut last_change = Option::<Instant>::None;
     let debounce_duration = Duration::from_millis(config.debounce_ms);
 
     loop {
         // Check for file changes with timeout
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(()) => {
-                // Debounce
-                if last_rebuild.elapsed() < debounce_duration {
-                    continue;
-                }
-
-                if rebuild_needed.swap(false, Ordering::SeqCst) {
-                    if config.clear {
-                        let _ = term.clear_screen();
-                    }
-
-                    println!("\n{} Change detected, rebuilding...", style("🔄").bold());
-
-                    // Kill existing process
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-
-                    // Rebuild and restart
-                    if build_project(config.verbose) {
-                        child = start_server(&env_vars);
-                    }
-
-                    last_rebuild = Instant::now();
-                    println!("\n{} Watching for changes...\n", style("👀").bold());
-                }
+                // Proper debounce: rebuild after the stream of changes has been quiet for
+                // `debounce_duration`. Without this, a single burst of edits can be missed.
+                last_change = Some(Instant::now());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Check if child has exited
-                if let Some(ref mut c) = child {
-                    match c.try_wait() {
-                        Ok(Some(status)) => {
-                            if status.success() {
-                                println!("\n{} Server exited normally", style("ℹ").blue().bold());
-                            } else {
-                                println!(
-                                    "\n{} Server exited with error ({})",
-                                    style("⚠").yellow().bold(),
-                                    status
-                                );
-                            }
-                            println!("{} Waiting for changes...\n", style("👀").bold());
-                            child = None;
-                        }
-                        Ok(None) => {
-                            // Still running
-                        }
-                        Err(e) => {
-                            println!(
-                                "\n{} Error checking process: {}",
-                                style("✗").red().bold(),
-                                e
-                            );
-                        }
-                    }
-                }
+                // No new events in this tick; fall through to debounce + child-exit checks.
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 break;
+            }
+        }
+
+        if let Some(at) = last_change {
+            if at.elapsed() >= debounce_duration && rebuild_needed.swap(false, Ordering::SeqCst) {
+                last_change = None;
+
+                if config.clear {
+                    let _ = term.clear_screen();
+                }
+
+                println!("\n{} Change detected, rebuilding...", style("🔄").bold());
+                flush_stdout();
+
+                // Kill existing process
+                if let Some(mut c) = child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+
+                // Rebuild and restart
+                if build_project(config.verbose) {
+                    child = start_server(&env_vars);
+                }
+
+                println!("\n{} Watching for changes...\n", style("👀").bold());
+                flush_stdout();
+            }
+        }
+
+        // Check if child has exited
+        if let Some(ref mut c) = child {
+            match c.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        println!("\n{} Server exited normally", style("ℹ").blue().bold());
+                    } else {
+                        println!(
+                            "\n{} Server exited with error ({})",
+                            style("⚠").yellow().bold(),
+                            status
+                        );
+                    }
+                    println!("{} Waiting for changes...\n", style("👀").bold());
+                    flush_stdout();
+                    child = None;
+                }
+                Ok(None) => {
+                    // Still running
+                }
+                Err(e) => {
+                    println!(
+                        "\n{} Error checking process: {}",
+                        style("✗").red().bold(),
+                        e
+                    );
+                    flush_stdout();
+                }
             }
         }
     }
@@ -2245,7 +2289,7 @@ mod tests {
                     assert!(cwd.is_none());
                     assert!(env.is_empty());
                 }
-                _ => panic!("Expected Run command"),
+                _ => assert!(false, "Expected Run command"),
             }
         }
 
@@ -2265,7 +2309,7 @@ mod tests {
                     assert_eq!(server, "./my-server");
                     assert_eq!(args, vec!["--config", "config.json"]);
                 }
-                _ => panic!("Expected Run command"),
+                _ => assert!(false, "Expected Run command"),
             }
         }
 
@@ -2277,7 +2321,7 @@ mod tests {
                 Commands::Run { cwd, .. } => {
                     assert_eq!(cwd, Some(PathBuf::from("/tmp/workdir")));
                 }
-                _ => panic!("Expected Run command"),
+                _ => assert!(false, "Expected Run command"),
             }
         }
 
@@ -2291,7 +2335,7 @@ mod tests {
                 Commands::Run { env, .. } => {
                     assert_eq!(env, vec!["FOO=bar", "BAZ=qux"]);
                 }
-                _ => panic!("Expected Run command"),
+                _ => assert!(false, "Expected Run command"),
             }
         }
 
@@ -2309,7 +2353,7 @@ mod tests {
                     assert_eq!(format, InspectFormat::Text);
                     assert!(output.is_none());
                 }
-                _ => panic!("Expected Inspect command"),
+                _ => assert!(false, "Expected Inspect command"),
             }
         }
 
@@ -2321,7 +2365,7 @@ mod tests {
                 Commands::Inspect { format, .. } => {
                     assert_eq!(format, InspectFormat::Json);
                 }
-                _ => panic!("Expected Inspect command"),
+                _ => assert!(false, "Expected Inspect command"),
             }
         }
 
@@ -2333,7 +2377,7 @@ mod tests {
                 Commands::Inspect { format, .. } => {
                     assert_eq!(format, InspectFormat::Mcp);
                 }
-                _ => panic!("Expected Inspect command"),
+                _ => assert!(false, "Expected Inspect command"),
             }
         }
 
@@ -2345,7 +2389,7 @@ mod tests {
                 Commands::Inspect { output, .. } => {
                     assert_eq!(output, Some(PathBuf::from("output.json")));
                 }
-                _ => panic!("Expected Inspect command"),
+                _ => assert!(false, "Expected Inspect command"),
             }
         }
 
@@ -2365,7 +2409,7 @@ mod tests {
                     assert_eq!(target, InstallTarget::Claude);
                     assert!(!dry_run);
                 }
-                _ => panic!("Expected Install command"),
+                _ => assert!(false, "Expected Install command"),
             }
         }
 
@@ -2384,7 +2428,7 @@ mod tests {
                 Commands::Install { target, .. } => {
                     assert_eq!(target, InstallTarget::Cursor);
                 }
-                _ => panic!("Expected Install command"),
+                _ => assert!(false, "Expected Install command"),
             }
         }
 
@@ -2397,7 +2441,7 @@ mod tests {
                 Commands::Install { dry_run, .. } => {
                     assert!(dry_run);
                 }
-                _ => panic!("Expected Install command"),
+                _ => assert!(false, "Expected Install command"),
             }
         }
 
@@ -2416,7 +2460,7 @@ mod tests {
                     assert_eq!(format, ListFormat::Table);
                     assert!(!verbose);
                 }
-                _ => panic!("Expected List command"),
+                _ => assert!(false, "Expected List command"),
             }
         }
 
@@ -2435,7 +2479,7 @@ mod tests {
                     assert_eq!(format, ListFormat::Json);
                     assert!(verbose);
                 }
-                _ => panic!("Expected List command"),
+                _ => assert!(false, "Expected List command"),
             }
         }
 
@@ -2446,7 +2490,7 @@ mod tests {
                 Commands::List { format, .. } => {
                     assert_eq!(format, ListFormat::Yaml);
                 }
-                _ => panic!("Expected List command"),
+                _ => assert!(false, "Expected List command"),
             }
         }
 
@@ -2466,7 +2510,7 @@ mod tests {
                     assert!(!verbose);
                     assert!(!json);
                 }
-                _ => panic!("Expected Test command"),
+                _ => assert!(false, "Expected Test command"),
             }
         }
 
@@ -2493,7 +2537,7 @@ mod tests {
                     assert!(verbose);
                     assert!(json);
                 }
-                _ => panic!("Expected Test command"),
+                _ => assert!(false, "Expected Test command"),
             }
         }
 
@@ -2521,7 +2565,7 @@ mod tests {
                     assert!(!clear);
                     assert!(!verbose);
                 }
-                _ => panic!("Expected Dev command"),
+                _ => assert!(false, "Expected Dev command"),
             }
         }
 
@@ -2559,7 +2603,7 @@ mod tests {
                     assert!(clear);
                     assert!(verbose);
                 }
-                _ => panic!("Expected Dev command"),
+                _ => assert!(false, "Expected Dev command"),
             }
         }
 
@@ -2570,7 +2614,7 @@ mod tests {
                 Commands::Dev { transport, .. } => {
                     assert_eq!(transport, DevTransport::Http);
                 }
-                _ => panic!("Expected Dev command"),
+                _ => assert!(false, "Expected Dev command"),
             }
         }
 
@@ -2593,7 +2637,7 @@ mod tests {
                     assert_eq!(limit, 20);
                     assert!(!json);
                 }
-                _ => panic!("Expected Tasks List command"),
+                _ => assert!(false, "Expected Tasks List command"),
             }
         }
 
@@ -2617,7 +2661,7 @@ mod tests {
                     assert_eq!(limit, 50);
                     assert!(json);
                 }
-                _ => panic!("Expected Tasks List command"),
+                _ => assert!(false, "Expected Tasks List command"),
             }
         }
 
@@ -2639,7 +2683,7 @@ mod tests {
                     assert_eq!(task_id, "task-001");
                     assert!(!json);
                 }
-                _ => panic!("Expected Tasks Show command"),
+                _ => assert!(false, "Expected Tasks Show command"),
             }
         }
 
@@ -2669,7 +2713,7 @@ mod tests {
                     assert_eq!(task_id, "task-001");
                     assert_eq!(reason, Some("no longer needed".to_string()));
                 }
-                _ => panic!("Expected Tasks Cancel command"),
+                _ => assert!(false, "Expected Tasks Cancel command"),
             }
         }
 
@@ -2684,7 +2728,7 @@ mod tests {
                     assert_eq!(server, "./server");
                     assert!(json);
                 }
-                _ => panic!("Expected Tasks Stats command"),
+                _ => assert!(false, "Expected Tasks Stats command"),
             }
         }
     }
