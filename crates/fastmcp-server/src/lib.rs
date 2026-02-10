@@ -520,6 +520,43 @@ impl Server {
         )
     }
 
+    /// Runs the server on a custom transport and returns when the transport closes or the Cx is cancelled.
+    ///
+    /// Unlike [`run_transport_with_cx`](Self::run_transport_with_cx), this does not call
+    /// `std::process::exit` on shutdown. This is useful for tests and embedding where you need
+    /// the server loop to be joinable.
+    pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T)
+    where
+        T: Transport + Send + 'static,
+    {
+        self.init_rich_logging();
+
+        let shared = SharedTransport::new(transport);
+        let notification_sender = create_transport_notification_sender(shared.clone());
+
+        let shared_recv = shared.clone();
+        let shared_send = shared;
+        self.run_loop_returning(
+            cx,
+            move |cx| shared_recv.recv(cx),
+            move |cx, message| shared_send.send(cx, message),
+            notification_sender,
+        );
+    }
+
+    /// Runs the server on a custom transport and returns when the transport closes.
+    ///
+    /// This uses a request-scoped [`Cx`], but unlike [`run_transport`](Self::run_transport) it does
+    /// not exit the process.
+    pub fn run_transport_returning<T>(self, transport: T)
+    where
+        T: Transport + Send + 'static,
+    {
+        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
+        let cx = Cx::for_request();
+        self.run_transport_returning_with_cx(&cx, transport);
+    }
+
     /// Runs the server using SSE transport with a testing Cx.
     ///
     /// This is a convenience wrapper around [`SseServerTransport`].
@@ -625,6 +662,18 @@ impl Server {
             stats.connection_closed();
         }
         std::process::exit(exit_code)
+    }
+
+    /// Performs graceful shutdown without exiting the process.
+    ///
+    /// This is intended for embedding/testing scenarios where the server loop is
+    /// running on a thread and the caller wants to `join()` it.
+    fn graceful_shutdown_returning(&self) {
+        self.cancel_active_requests(CancelKind::Shutdown, true);
+        self.run_shutdown_hook();
+        if let Some(ref stats) = self.stats {
+            stats.connection_closed();
+        }
     }
 
     /// Shared server loop for any transport, using closure-based recv/send.
@@ -752,6 +801,182 @@ impl Server {
                         debug!(target: targets::SERVER, "Routed response to pending request");
                     } else {
                         debug!(target: targets::SERVER, "Received unexpected response: {:?}", response.id);
+                    }
+                    continue;
+                }
+            };
+
+            let duration = start_time.elapsed();
+
+            if let Some(response) = response_opt {
+                // Log response traffic
+                if let Some(renderer) = &traffic_renderer {
+                    renderer.render_response(&response, Some(duration), console());
+                }
+
+                // Track bytes sent (approximate from serialized response size)
+                if let Some(ref stats) = self.stats {
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        stats.add_bytes_sent(json.len() as u64 + 1); // +1 for newline
+                    }
+                }
+
+                // Send response
+                let send_result = {
+                    let mut guard = match send.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            error!(
+                                target: targets::TRANSPORT,
+                                "Send channel lock poisoned; continuing with inner guard"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
+                    guard(cx, &JsonRpcMessage::Response(response))
+                };
+                if let Err(e) = send_result {
+                    error!(target: targets::TRANSPORT, "Failed to send response: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Shared server loop for embedding/testing, returning on shutdown instead of exiting.
+    ///
+    /// This is intentionally separate from [`run_loop`](Self::run_loop) because the primary server
+    /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases.
+    #[allow(clippy::too_many_lines)]
+    fn run_loop_returning<R, S>(
+        self,
+        cx: &Cx,
+        mut recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+    ) where
+        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        let mut session = Session::new(self.info.clone(), self.capabilities.clone());
+
+        // Wrap send in Arc<Mutex> for shared access from bidirectional requests
+        let send = Arc::new(Mutex::new(send));
+
+        // Create a RequestSender for bidirectional communication
+        let request_sender = {
+            let send_clone = send.clone();
+            let send_cx = cx.clone();
+            let send_fn: bidirectional::TransportSendFn = Arc::new(move |message| {
+                let mut guard = send_clone
+                    .lock()
+                    .map_err(|e| format!("Lock poisoned: {}", e))?;
+                guard(&send_cx, message).map_err(|e| format!("Send failed: {}", e))
+            });
+            bidirectional::RequestSender::new(self.pending_requests.clone(), send_fn)
+        };
+
+        // Track connection opened
+        if let Some(ref stats) = self.stats {
+            stats.connection_opened();
+        }
+
+        // Render startup banner if enabled (respects both config and legacy env var)
+        if self.console_config.show_banner && !banner_suppressed() {
+            self.render_startup_banner();
+        }
+
+        // Run startup hook
+        if !self.run_startup_hook() {
+            error!(target: targets::SERVER, "Startup hook failed, stopping");
+            self.graceful_shutdown_returning();
+            return;
+        }
+
+        // Create traffic renderer if enabled
+        let traffic_renderer = if self.console_config.show_request_traffic {
+            let mut renderer = RequestResponseRenderer::new(self.console_config.resolve_context());
+            renderer.truncate_at = self.console_config.truncate_at;
+            match self.console_config.traffic_verbosity {
+                TrafficVerbosity::None => {} // Should not happen given the if check
+                TrafficVerbosity::Summary | TrafficVerbosity::Headers => {
+                    renderer.show_params = false;
+                    renderer.show_result = false;
+                }
+                TrafficVerbosity::Full => {
+                    renderer.show_params = true;
+                    renderer.show_result = true;
+                }
+            }
+            Some(renderer)
+        } else {
+            None
+        };
+
+        // Main request loop
+        loop {
+            // Check for cancellation
+            if cx.is_cancel_requested() {
+                info!(target: targets::SERVER, "Cancellation requested, stopping");
+                self.graceful_shutdown_returning();
+                return;
+            }
+
+            // Receive next message
+            let message = match recv(cx) {
+                Ok(msg) => msg,
+                Err(TransportError::Closed) => {
+                    self.graceful_shutdown_returning();
+                    return;
+                }
+                Err(TransportError::Cancelled) => {
+                    info!(target: targets::SERVER, "Transport cancelled");
+                    self.graceful_shutdown_returning();
+                    return;
+                }
+                Err(e) => {
+                    error!(target: targets::TRANSPORT, "Transport error: {}", e);
+                    continue;
+                }
+            };
+
+            // Log request traffic
+            if let Some(renderer) = &traffic_renderer {
+                if let JsonRpcMessage::Request(req) = &message {
+                    renderer.render_request(req, console());
+                }
+            }
+
+            let start_time = Instant::now();
+
+            // Handle the message
+            let response_opt = match message {
+                JsonRpcMessage::Request(request) => {
+                    // Track bytes received (approximate from serialized request size)
+                    if let Some(ref stats) = self.stats {
+                        // Estimate request size by serializing back to JSON
+                        // This is approximate but accurate enough for statistics
+                        if let Ok(json) = serde_json::to_string(&request) {
+                            stats.add_bytes_received(json.len() as u64 + 1); // +1 for newline
+                        }
+                    }
+                    self.handle_request(
+                        cx,
+                        &mut session,
+                        request,
+                        &notification_sender,
+                        &request_sender,
+                    )
+                }
+                JsonRpcMessage::Response(response) => {
+                    // Route response to pending server-initiated request (bidirectional)
+                    if self.pending_requests.route_response(&response) {
+                        debug!(target: targets::SERVER, "Routed response to pending request");
+                    } else {
+                        debug!(
+                            target: targets::SERVER,
+                            "Received unexpected response: {:?}",
+                            response.id
+                        );
                     }
                     continue;
                 }

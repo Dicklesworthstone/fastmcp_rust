@@ -287,10 +287,11 @@ mod tests {
         let req: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc":"2.1","method":"tools/list","id":1}"#)
                 .expect("deserialize");
-        match req.jsonrpc {
-            Cow::Owned(s) => assert_eq!(s, "2.1"),
-            Cow::Borrowed(_) => assert!(false, "expected owned jsonrpc version"),
-        }
+        let owned = match req.jsonrpc {
+            Cow::Owned(s) => Some(s),
+            Cow::Borrowed(_) => None,
+        };
+        assert_eq!(owned.as_deref(), Some("2.1"));
     }
 
     #[test]
@@ -451,10 +452,11 @@ mod tests {
         let resp: JsonRpcResponse =
             serde_json::from_str(r#"{"jsonrpc":"2.1","result":{"tools":[]},"id":1}"#)
                 .expect("deserialize");
-        match resp.jsonrpc {
-            Cow::Owned(s) => assert_eq!(s, "2.1"),
-            Cow::Borrowed(_) => assert!(false, "expected owned jsonrpc version"),
-        }
+        let owned = match resp.jsonrpc {
+            Cow::Owned(s) => Some(s),
+            Cow::Borrowed(_) => None,
+        };
+        assert_eq!(owned.as_deref(), Some("2.1"));
     }
 
     #[test]
@@ -532,25 +534,24 @@ mod tests {
     fn message_deserialize_as_request() {
         let json_str = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json_str).expect("deserialize");
-        if let JsonRpcMessage::Request(req) = msg {
-            assert_eq!(req.method, "tools/list");
-            assert_eq!(req.id, Some(RequestId::Number(1)));
-        } else {
-            assert!(false, "expected request variant");
-        }
+        let (method, id) = match msg {
+            JsonRpcMessage::Request(req) => (req.method, req.id),
+            JsonRpcMessage::Response(_) => (String::new(), None),
+        };
+        assert_eq!(method, "tools/list");
+        assert_eq!(id, Some(RequestId::Number(1)));
     }
 
     #[test]
     fn message_deserialize_as_response() {
         let json_str = r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json_str).expect("deserialize");
-        match msg {
-            JsonRpcMessage::Response(resp) => {
-                assert!(!resp.is_error());
-                assert_eq!(resp.id, Some(RequestId::Number(1)));
-            }
-            JsonRpcMessage::Request(_) => assert!(false, "expected response variant"),
-        }
+        let (is_error, id) = match msg {
+            JsonRpcMessage::Response(resp) => (resp.is_error(), resp.id),
+            JsonRpcMessage::Request(_) => (true, None),
+        };
+        assert!(!is_error);
+        assert_eq!(id, Some(RequestId::Number(1)));
     }
 
     // ========================================================================

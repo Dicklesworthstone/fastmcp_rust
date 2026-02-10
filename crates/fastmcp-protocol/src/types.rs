@@ -1220,35 +1220,35 @@ mod tests {
     fn content_text_deserialization() {
         let json = json!({"type": "text", "text": "Hello!"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        if let Content::Text { text } = content {
-            assert_eq!(text, "Hello!");
-        } else {
-            assert!(false, "expected text content");
-        }
+        let text = match content {
+            Content::Text { text } => Some(text),
+            _ => None,
+        };
+        assert_eq!(text.as_deref(), Some("Hello!"));
     }
 
     #[test]
     fn content_image_deserialization() {
         let json = json!({"type": "image", "data": "abc123", "mimeType": "image/jpeg"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        if let Content::Image { data, mime_type } = content {
-            assert_eq!(data, "abc123");
-            assert_eq!(mime_type, "image/jpeg");
-        } else {
-            assert!(false, "expected image content");
-        }
+        let (data, mime_type) = match content {
+            Content::Image { data, mime_type } => (Some(data), Some(mime_type)),
+            _ => (None, None),
+        };
+        assert_eq!(data.as_deref(), Some("abc123"));
+        assert_eq!(mime_type.as_deref(), Some("image/jpeg"));
     }
 
     #[test]
     fn content_audio_deserialization() {
         let json = json!({"type": "audio", "data": "abc123", "mimeType": "audio/mpeg"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        if let Content::Audio { data, mime_type } = content {
-            assert_eq!(data, "abc123");
-            assert_eq!(mime_type, "audio/mpeg");
-        } else {
-            assert!(false, "expected audio content");
-        }
+        let (data, mime_type) = match content {
+            Content::Audio { data, mime_type } => (Some(data), Some(mime_type)),
+            _ => (None, None),
+        };
+        assert_eq!(data.as_deref(), Some("abc123"));
+        assert_eq!(mime_type.as_deref(), Some("audio/mpeg"));
     }
 
     // ========================================================================
