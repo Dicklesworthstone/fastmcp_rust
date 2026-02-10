@@ -438,17 +438,16 @@ fn middleware_short_circuit_still_runs_entered_response_stack() {
     let _ = take_events(&events);
 
     let call_res = client.call_tool("echo", json!({"message": "ignored"}));
-    assert!(call_res.is_ok());
-    let contents = match call_res {
-        Ok(v) => v,
-        Err(e) => {
-            trace.log_with_data(
-                TraceLevel::Error,
-                "unexpected tool error",
-                serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
-            );
-            panic!("unexpected tool error: {e:?}");
-        }
+    if let Err(e) = &call_res {
+        trace.log_with_data(
+            TraceLevel::Error,
+            "unexpected tool error",
+            serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
+        );
+    }
+    assert!(call_res.is_ok(), "unexpected tool error: {call_res:?}");
+    let Ok(contents) = call_res else {
+        return;
     };
     let text = first_text(&contents).unwrap_or_default();
     trace.log_with_data(
@@ -538,15 +537,17 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
     ];
     assert_eq!(expected, got);
 
-    if let (Some(code), Some(message)) = (err_code, err_message) {
-        let _ = code; // code is part of trace payload; message rewrite is the invariant we assert.
-        assert!(
-            message.starts_with("mw:"),
-            "error message not rewritten: {message}"
-        );
-    } else {
-        panic!("expected error from invalid tools/call params");
-    }
+    assert!(
+        err_code.is_some() && err_message.is_some(),
+        "expected error from invalid tools/call params"
+    );
+    let Some(message) = err_message else {
+        return;
+    };
+    assert!(
+        message.starts_with("mw:"),
+        "error message not rewritten: {message}"
+    );
 }
 
 #[test]
@@ -566,17 +567,16 @@ fn middleware_response_transformation_is_observable_in_client() {
     assert!(client.initialize().is_ok());
 
     let res = client.call_tool("echo", json!({"message": "hello"}));
-    assert!(res.is_ok());
-    let contents = match res {
-        Ok(v) => v,
-        Err(e) => {
-            trace.log_with_data(
-                TraceLevel::Error,
-                "unexpected tool error",
-                serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
-            );
-            panic!("unexpected tool error: {e:?}");
-        }
+    if let Err(e) = &res {
+        trace.log_with_data(
+            TraceLevel::Error,
+            "unexpected tool error",
+            serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
+        );
+    }
+    assert!(res.is_ok(), "unexpected tool error: {res:?}");
+    let Ok(contents) = res else {
+        return;
     };
     let text = first_text(&contents).unwrap_or_default();
     trace.log_with_data(
@@ -611,32 +611,32 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
     assert!(client.initialize().is_ok());
 
     let res1 = client.call_tool("echo", json!({"message": "a"}));
-    assert!(res1.is_ok());
-    let text1 = match res1 {
-        Ok(v) => first_text(&v).unwrap_or_default(),
-        Err(e) => {
-            trace.log_with_data(
-                TraceLevel::Error,
-                "unexpected tool error",
-                serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
-            );
-            panic!("unexpected tool error: {e:?}");
-        }
+    if let Err(e) = &res1 {
+        trace.log_with_data(
+            TraceLevel::Error,
+            "unexpected tool error",
+            serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
+        );
+    }
+    assert!(res1.is_ok(), "unexpected tool error: {res1:?}");
+    let Ok(v1) = res1 else {
+        return;
     };
+    let text1 = first_text(&v1).unwrap_or_default();
 
     let res2 = client.call_tool("echo", json!({"message": "a"}));
-    assert!(res2.is_ok());
-    let text2 = match res2 {
-        Ok(v) => first_text(&v).unwrap_or_default(),
-        Err(e) => {
-            trace.log_with_data(
-                TraceLevel::Error,
-                "unexpected tool error",
-                serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
-            );
-            panic!("unexpected tool error: {e:?}");
-        }
+    if let Err(e) = &res2 {
+        trace.log_with_data(
+            TraceLevel::Error,
+            "unexpected tool error",
+            serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
+        );
+    }
+    assert!(res2.is_ok(), "unexpected tool error: {res2:?}");
+    let Ok(v2) = res2 else {
+        return;
     };
+    let text2 = first_text(&v2).unwrap_or_default();
 
     trace.log_with_data(
         TraceLevel::Info,
@@ -653,19 +653,16 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
     std::thread::sleep(Duration::from_millis(1200));
 
     let res3 = client.call_tool("echo", json!({"message": "a"}));
-    assert!(res3.is_ok());
-    match res3 {
-        Ok(v) => {
-            let _ = first_text(&v);
-        }
-        Err(e) => {
-            trace.log_with_data(
-                TraceLevel::Error,
-                "unexpected tool error",
-                serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
-            );
-            panic!("unexpected tool error: {e:?}");
-        }
+    if let Err(e) = &res3 {
+        trace.log_with_data(
+            TraceLevel::Error,
+            "unexpected tool error",
+            serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
+        );
+    }
+    assert!(res3.is_ok(), "unexpected tool error: {res3:?}");
+    if let Ok(v) = res3 {
+        let _ = first_text(&v);
     }
 
     drop(client);
