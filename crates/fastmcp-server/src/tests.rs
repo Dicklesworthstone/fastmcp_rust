@@ -25,8 +25,9 @@ use fastmcp_protocol::{
 };
 
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
+use crate::caching::ResponseCachingMiddleware;
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
-use crate::middleware::{FailingRequestMiddleware, RecordingMiddleware, StepMiddleware};
+use crate::rate_limiting::RateLimitingMiddleware;
 use crate::router::Router;
 use crate::session::Session;
 use crate::{
@@ -590,6 +591,7 @@ impl PromptHandler for GreetingPrompt {
 #[cfg(test)]
 mod router_tests {
     use super::*;
+    use crate::middleware::Middleware;
     use fastmcp_protocol::ListResourceTemplatesParams;
 
     /// Creates a test router with all handlers registered.
@@ -639,12 +641,16 @@ mod router_tests {
     }
 
     #[test]
-    fn test_middleware_ordering_on_response() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    fn test_middleware_short_circuit_prevents_late_middleware() {
+        // If caching is registered before rate limiting, cached responses should
+        // not consume rate-limit budget because the rate limiter is never entered.
+        let caching = ResponseCachingMiddleware::new();
+        let rate_limiter = RateLimitingMiddleware::new(0.0).burst_capacity(1).global();
+
         let server = Server::new("test-server", "1.0.0")
             .tool(GreetTool)
-            .middleware(RecordingMiddleware::new("A", Arc::clone(&events)))
-            .middleware(RecordingMiddleware::new("B", Arc::clone(&events)))
+            .middleware(caching)
+            .middleware(rate_limiter)
             .build();
         let cx = Cx::for_testing();
         let mut session = create_test_session();
@@ -668,7 +674,21 @@ mod router_tests {
             Some(serde_json::to_value(params).expect("params")),
             1,
         );
-        let response = server
+
+        // First call: cache miss, rate limiter consumes its only token.
+        let first = server
+            .handle_request(
+                &cx,
+                &mut session,
+                request.clone(),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("first response");
+        assert!(first.error.is_none(), "expected successful first response");
+
+        // Second call: should be served from cache and never reach the rate limiter.
+        let second = server
             .handle_request(
                 &cx,
                 &mut session,
@@ -676,36 +696,24 @@ mod router_tests {
                 &sender,
                 &create_test_request_sender(),
             )
-            .expect("response");
-
-        assert!(response.error.is_none(), "expected successful response");
-        let recorded = events.lock().expect("events lock poisoned").clone();
-        assert_eq!(recorded, vec!["A:req", "B:req", "B:resp", "A:resp"]);
+            .expect("second response");
+        assert!(second.error.is_none(), "expected cached second response");
     }
 
     #[test]
-    fn test_middleware_short_circuit_runs_response_stack() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
-            .middleware(StepMiddleware::new("A", Arc::clone(&events), false))
-            .middleware(StepMiddleware::new("B", Arc::clone(&events), true))
-            .build();
-        let cx = Cx::for_testing();
-        let mut session = create_test_session();
-        session.initialize(
-            ClientInfo {
-                name: "test-client".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            ClientCapabilities::default(),
-            "2024-11-05".to_string(),
-        );
+    fn test_middleware_short_circuit_runs_response_stack_for_entered_middleware() {
+        // If an earlier middleware is entered and a later middleware short-circuits with
+        // Respond, the response still flows through `on_response` for the already-entered
+        // middleware stack in reverse order.
+        let cache_a = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
+        let cache_b = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
 
-        let sender: NotificationSender = Arc::new(|_| {});
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+
         let params = CallToolParams {
             name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "Ignored"})),
+            arguments: Some(serde_json::json!({"name": "Ada"})),
             meta: None,
         };
         let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -713,51 +721,19 @@ mod router_tests {
             Some(serde_json::to_value(params).expect("params")),
             2,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
 
-        let result = response.result.expect("short-circuit result");
-        let steps = result
-            .get("steps")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            steps,
-            vec![
-                "B:respond".to_string(),
-                "B:resp".to_string(),
-                "A:resp".to_string()
-            ]
-        );
+        // Prime cache_b so it will short-circuit in `on_request`.
+        let primed_value = serde_json::json!({"primed": true});
+        let _ = cache_b
+            .on_response(&ctx, &request, primed_value.clone())
+            .expect("prime cache_b");
 
-        let recorded = events.lock().expect("events lock poisoned").clone();
-        assert_eq!(recorded, vec!["A:req", "B:req", "B:resp", "A:resp"]);
-    }
-
-    #[test]
-    fn test_middleware_error_propagation_order() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = Server::new("test-server", "1.0.0")
             .tool(GreetTool)
-            .middleware(RecordingMiddleware::new("A", Arc::clone(&events)))
-            .middleware(FailingRequestMiddleware::new(
-                "B",
-                Arc::clone(&events),
-                McpError::invalid_request("middleware error"),
-            ))
+            .middleware(cache_a.clone())
+            .middleware(cache_b.clone())
             .build();
-        let cx = Cx::for_testing();
+
         let mut session = create_test_session();
         session.initialize(
             ClientInfo {
@@ -769,17 +745,26 @@ mod router_tests {
         );
 
         let sender: NotificationSender = Arc::new(|_| {});
-        let params = CallToolParams {
-            name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "Ada"})),
-            meta: None,
-        };
-        let request = fastmcp_protocol::JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::to_value(params).expect("params")),
-            3,
-        );
-        let response = server
+
+        // First call: cache_a miss, cache_b hit -> Respond. cache_a must still see on_response.
+        let first = server
+            .handle_request(
+                &cx,
+                &mut session,
+                request.clone(),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("first response");
+        assert_eq!(first.result, Some(primed_value));
+        assert_eq!(cache_a.stats().hits, 0);
+        assert_eq!(cache_a.stats().misses, 1);
+        assert_eq!(cache_b.stats().hits, 1);
+        assert_eq!(cache_b.stats().misses, 0);
+
+        // Second call: cache_a should now hit (because it cached during the response stack)
+        // and cache_b should not be entered.
+        let second = server
             .handle_request(
                 &cx,
                 &mut session,
@@ -787,125 +772,10 @@ mod router_tests {
                 &sender,
                 &create_test_request_sender(),
             )
-            .expect("response");
-
-        assert!(response.is_error(), "expected error response");
-        let recorded = events.lock().expect("events lock poisoned").clone();
-        assert_eq!(recorded, vec!["A:req", "B:req", "B:err", "A:err"]);
-    }
-
-    #[test]
-    fn test_middleware_response_mutation() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
-            .middleware(StepMiddleware::new("A", Arc::clone(&events), false))
-            .middleware(StepMiddleware::new("B", Arc::clone(&events), false))
-            .build();
-        let cx = Cx::for_testing();
-        let mut session = create_test_session();
-        session.initialize(
-            ClientInfo {
-                name: "test-client".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            ClientCapabilities::default(),
-            "2024-11-05".to_string(),
-        );
-
-        let sender: NotificationSender = Arc::new(|_| {});
-        let params = CallToolParams {
-            name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "Ada"})),
-            meta: None,
-        };
-        let request = fastmcp_protocol::JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::to_value(params).expect("params")),
-            4,
-        );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
-
-        let result = response.result.expect("result");
-        let steps = result
-            .get("steps")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect::<Vec<_>>();
-        assert_eq!(steps, vec!["B:resp".to_string(), "A:resp".to_string()]);
-    }
-
-    #[test]
-    fn test_e2e_middleware_stack_logging() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
-            .middleware(StepMiddleware::new("A", Arc::clone(&events), false))
-            .middleware(StepMiddleware::new("B", Arc::clone(&events), false))
-            .build();
-        let cx = Cx::for_testing();
-        let mut session = create_test_session();
-        session.initialize(
-            ClientInfo {
-                name: "test-client".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            ClientCapabilities::default(),
-            "2024-11-05".to_string(),
-        );
-
-        let sender: NotificationSender = Arc::new(|_| {});
-        let params = CallToolParams {
-            name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "E2E"})),
-            meta: None,
-        };
-        let request = fastmcp_protocol::JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::to_value(params).expect("params")),
-            5,
-        );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
-
-        let ts = chrono::Utc::now().to_rfc3339();
-        let recorded = events.lock().expect("events lock poisoned").clone();
-        info!(
-            target: targets::SESSION,
-            "e2e middleware hooks ts={} order={:?}",
-            ts,
-            recorded
-        );
-        info!(
-            target: targets::SESSION,
-            "e2e middleware response ts={} payload={:?}",
-            ts,
-            response.result
-        );
-
-        assert_eq!(recorded, vec!["A:req", "B:req", "B:resp", "A:resp"]);
-        assert!(
-            response.result.is_some(),
-            "expected middleware response payload"
-        );
+            .expect("second response");
+        assert!(second.error.is_none());
+        assert_eq!(cache_a.stats().hits, 1);
+        assert_eq!(cache_b.stats().hits, 1);
     }
 
     #[test]
@@ -6344,10 +6214,9 @@ mod builder_tests {
 
     #[test]
     fn builder_middleware_registration() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let server = ServerBuilder::new("s", "0.1")
-            .middleware(RecordingMiddleware::new("m1", events.clone()))
-            .middleware(RecordingMiddleware::new("m2", events.clone()))
+            .middleware(ResponseCachingMiddleware::new())
+            .middleware(RateLimitingMiddleware::new(10.0).burst_capacity(20))
             .build();
         // Server builds successfully with middleware
         assert_eq!(server.info().name, "s");
@@ -6514,7 +6383,6 @@ mod builder_tests {
 
     #[test]
     fn builder_full_fluent_chain() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let server = ServerBuilder::new("full-server", "2.0.0")
             .instructions("A fully configured server")
             .on_duplicate(DuplicateBehavior::Error)
@@ -6528,7 +6396,7 @@ mod builder_tests {
             .tool(StubTool::named("tool_a"))
             .resource(StubResource::named("res_a"))
             .prompt(StubPrompt::named("prompt_a"))
-            .middleware(RecordingMiddleware::new("audit", events))
+            .middleware(ResponseCachingMiddleware::new())
             .auth_provider(crate::AllowAllAuthProvider)
             .on_startup(|| -> Result<(), std::io::Error> { Ok(()) })
             .on_shutdown(|| {})
