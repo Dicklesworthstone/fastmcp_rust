@@ -32,7 +32,11 @@ pub struct ServerCapabilities {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsCapability {
     /// Whether the server supports tool list changes.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub list_changed: bool,
 }
 
@@ -43,7 +47,11 @@ pub struct ResourcesCapability {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subscribe: bool,
     /// Whether the server supports resource list changes.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub list_changed: bool,
 }
 
@@ -51,7 +59,11 @@ pub struct ResourcesCapability {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PromptsCapability {
     /// Whether the server supports prompt list changes.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub list_changed: bool,
 }
 
@@ -893,10 +905,10 @@ mod tests {
             tasks: Some(TasksCapability { list_changed: true }),
         };
         let value = serde_json::to_value(&caps).expect("serialize");
-        assert_eq!(value["tools"]["list_changed"], true);
+        assert_eq!(value["tools"]["listChanged"], true);
         assert_eq!(value["resources"]["subscribe"], true);
-        assert_eq!(value["resources"]["list_changed"], true);
-        assert_eq!(value["prompts"]["list_changed"], true);
+        assert_eq!(value["resources"]["listChanged"], true);
+        assert_eq!(value["prompts"]["listChanged"], true);
         assert!(value.get("logging").is_some());
         assert_eq!(value["tasks"]["listChanged"], true);
     }
@@ -948,14 +960,14 @@ mod tests {
         let cap = ToolsCapability::default();
         let value = serde_json::to_value(&cap).expect("serialize");
         // list_changed defaults to false and should be omitted
-        assert!(value.get("list_changed").is_none());
+        assert!(value.get("listChanged").is_none());
     }
 
     #[test]
     fn tools_capability_list_changed() {
         let cap = ToolsCapability { list_changed: true };
         let value = serde_json::to_value(&cap).expect("serialize");
-        assert_eq!(value["list_changed"], true);
+        assert_eq!(value["listChanged"], true);
     }
 
     // ========================================================================
@@ -967,7 +979,7 @@ mod tests {
         let cap = ResourcesCapability::default();
         let value = serde_json::to_value(&cap).expect("serialize");
         assert!(value.get("subscribe").is_none());
-        assert!(value.get("list_changed").is_none());
+        assert!(value.get("listChanged").is_none());
     }
 
     #[test]
@@ -978,7 +990,7 @@ mod tests {
         };
         let value = serde_json::to_value(&cap).expect("serialize");
         assert_eq!(value["subscribe"], true);
-        assert_eq!(value["list_changed"], true);
+        assert_eq!(value["listChanged"], true);
     }
 
     // ========================================================================
@@ -1208,9 +1220,10 @@ mod tests {
     fn content_text_deserialization() {
         let json = json!({"type": "text", "text": "Hello!"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        match content {
-            Content::Text { text } => assert_eq!(text, "Hello!"),
-            _ => panic!("Expected text content"),
+        if let Content::Text { text } = content {
+            assert_eq!(text, "Hello!");
+        } else {
+            assert!(false, "expected text content");
         }
     }
 
@@ -1218,12 +1231,11 @@ mod tests {
     fn content_image_deserialization() {
         let json = json!({"type": "image", "data": "abc123", "mimeType": "image/jpeg"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        match content {
-            Content::Image { data, mime_type } => {
-                assert_eq!(data, "abc123");
-                assert_eq!(mime_type, "image/jpeg");
-            }
-            _ => panic!("Expected image content"),
+        if let Content::Image { data, mime_type } = content {
+            assert_eq!(data, "abc123");
+            assert_eq!(mime_type, "image/jpeg");
+        } else {
+            assert!(false, "expected image content");
         }
     }
 
@@ -1231,12 +1243,11 @@ mod tests {
     fn content_audio_deserialization() {
         let json = json!({"type": "audio", "data": "abc123", "mimeType": "audio/mpeg"});
         let content: Content = serde_json::from_value(json).expect("deserialize");
-        match content {
-            Content::Audio { data, mime_type } => {
-                assert_eq!(data, "abc123");
-                assert_eq!(mime_type, "audio/mpeg");
-            }
-            _ => panic!("Expected audio content"),
+        if let Content::Audio { data, mime_type } = content {
+            assert_eq!(data, "abc123");
+            assert_eq!(mime_type, "audio/mpeg");
+        } else {
+            assert!(false, "expected audio content");
         }
     }
 

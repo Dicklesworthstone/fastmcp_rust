@@ -21,11 +21,12 @@ fn deserialize_jsonrpc_version<'de, D>(deserializer: D) -> Result<Cow<'static, s
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
+    // Deserialize as a borrowed-or-owned string so we can avoid allocating for the common "2.0".
+    let s: Cow<'de, str> = Cow::deserialize(deserializer)?;
     if s == JSONRPC_VERSION {
         Ok(Cow::Borrowed(JSONRPC_VERSION))
     } else {
-        Ok(Cow::Owned(s))
+        Ok(Cow::Owned(s.into_owned()))
     }
 }
 
@@ -274,6 +275,25 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn jsonrpc_version_deserialize_borrows_static_for_request() {
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#)
+                .expect("deserialize");
+        assert!(matches!(req.jsonrpc, Cow::Borrowed(JSONRPC_VERSION)));
+    }
+
+    #[test]
+    fn jsonrpc_version_deserialize_owns_nonstandard_for_request() {
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.1","method":"tools/list","id":1}"#)
+                .expect("deserialize");
+        match req.jsonrpc {
+            Cow::Owned(s) => assert_eq!(s, "2.1"),
+            Cow::Borrowed(_) => assert!(false, "expected owned jsonrpc version"),
+        }
+    }
+
+    #[test]
     fn request_serialization() {
         let req = JsonRpcRequest::new("tools/list", None, 1i64);
         let json = serde_json::to_string(&req).unwrap();
@@ -350,6 +370,19 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn jsonrpc_error_from_mcp_error_preserves_code_message_and_data() {
+        let err = fastmcp_core::McpError::with_data(
+            fastmcp_core::McpErrorCode::InvalidParams,
+            "bad params",
+            json!({"field":"name"}),
+        );
+        let rpc_err: JsonRpcError = err.into();
+        assert_eq!(rpc_err.code, -32602);
+        assert_eq!(rpc_err.message, "bad params");
+        assert_eq!(rpc_err.data, Some(json!({"field":"name"})));
+    }
+
+    #[test]
     fn jsonrpc_error_serialization() {
         let error = JsonRpcError {
             code: -32600,
@@ -404,6 +437,25 @@ mod tests {
     // ========================================================================
     // JsonRpcResponse Tests
     // ========================================================================
+
+    #[test]
+    fn jsonrpc_version_deserialize_borrows_static_for_response() {
+        let resp: JsonRpcResponse =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#)
+                .expect("deserialize");
+        assert!(matches!(resp.jsonrpc, Cow::Borrowed(JSONRPC_VERSION)));
+    }
+
+    #[test]
+    fn jsonrpc_version_deserialize_owns_nonstandard_for_response() {
+        let resp: JsonRpcResponse =
+            serde_json::from_str(r#"{"jsonrpc":"2.1","result":{"tools":[]},"id":1}"#)
+                .expect("deserialize");
+        match resp.jsonrpc {
+            Cow::Owned(s) => assert_eq!(s, "2.1"),
+            Cow::Borrowed(_) => assert!(false, "expected owned jsonrpc version"),
+        }
+    }
 
     #[test]
     fn response_success() {
@@ -480,12 +532,11 @@ mod tests {
     fn message_deserialize_as_request() {
         let json_str = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json_str).expect("deserialize");
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "tools/list");
-                assert_eq!(req.id, Some(RequestId::Number(1)));
-            }
-            _ => panic!("Expected request variant"),
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "tools/list");
+            assert_eq!(req.id, Some(RequestId::Number(1)));
+        } else {
+            assert!(false, "expected request variant");
         }
     }
 
@@ -498,10 +549,7 @@ mod tests {
                 assert!(!resp.is_error());
                 assert_eq!(resp.id, Some(RequestId::Number(1)));
             }
-            // The untagged enum may also parse as Request depending on field overlap
-            JsonRpcMessage::Request(_) => {
-                // This is acceptable for untagged deserialization
-            }
+            JsonRpcMessage::Request(_) => assert!(false, "expected response variant"),
         }
     }
 
