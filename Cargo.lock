@@ -721,6 +721,7 @@ dependencies = [
  "fastmcp-protocol",
  "fastmcp-server",
  "fastmcp-transport",
+ "jsonwebtoken",
  "serde",
  "serde_json",
  "trybuild",

@@ -12,12 +12,13 @@
 //! - JSON-RPC 2.0 compliance
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    McpContext, McpResult, PromptHandler, PromptMessage, Resource, ResourceContent,
-    ResourceHandler, Role, ToolHandler,
+    AuthContext, McpContext, McpErrorCode, McpResult, PromptHandler, PromptMessage, Resource,
+    ResourceContent, ResourceHandler, Role, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
 };
 use serde_json::json;
 
@@ -133,6 +134,40 @@ impl ToolHandler for ErrorToolHandler {
 
     fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         Err(McpError::tool_error("Intentional error for testing"))
+    }
+}
+
+/// A tool that returns the current request authentication context as JSON text.
+struct AuthInfoToolHandler;
+
+impl ToolHandler for AuthInfoToolHandler {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "auth_info".to_string(),
+            description: Some("Returns auth context for E2E verification".to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec!["auth".to_string(), "testing".to_string()],
+            annotations: Some(ToolAnnotations::new().read_only(true)),
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
+        let token = auth.token.as_ref();
+
+        let payload = json!({
+            "subject": auth.subject,
+            "scopes": auth.scopes,
+            "scheme": token.map(|t| t.scheme.clone()),
+            "token": token.map(|t| t.token.clone()),
+        });
+
+        Ok(vec![Content::Text {
+            text: payload.to_string(),
+        }])
     }
 }
 
@@ -309,6 +344,26 @@ fn setup_test_server_and_client() -> TestClient {
     TestClient::new(client_transport)
 }
 
+fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
+    provider: P,
+    server_name: &str,
+) -> TestClient {
+    let (builder, client_transport, server_transport) = TestServer::builder()
+        .with_name(server_name)
+        .with_version("1.0.0")
+        .build_server_builder();
+
+    let server = builder
+        .tool(GreetingToolHandler)
+        .tool(AuthInfoToolHandler)
+        .auth_provider(provider)
+        .build();
+
+    std::thread::spawn(move || server.run_transport(server_transport));
+
+    TestClient::new(client_transport)
+}
+
 // ============================================================================
 // Initialize handshake tests
 // ============================================================================
@@ -360,6 +415,354 @@ fn e2e_initialize_stores_server_info() {
         client.protocol_version().unwrap(),
         fastmcp_rust::PROTOCOL_VERSION
     );
+}
+
+// ============================================================================
+// Authentication flow tests (bd-21q)
+// ============================================================================
+
+#[test]
+fn e2e_auth_static_token_flow_allows_and_denies() {
+    let verifier = StaticTokenVerifier::new([("good-token", AuthContext::with_subject("user-1"))])
+        .with_allowed_schemes(["Bearer"]);
+    let provider = TokenAuthProvider::new(verifier);
+
+    let mut client = setup_auth_server_and_client(provider, "e2e-auth-static");
+    client.initialize().unwrap();
+
+    let mut trace = TestTrace::new("e2e-auth-static-token");
+
+    // Unauthorized tools/list.
+    let params = json!({ "cursor": null });
+    let corr = trace.log_request("tools/list", Some(&params));
+    let err = client.send_request_json("tools/list", params).unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Invalid token should be rejected.
+    let params = json!({ "cursor": null, "auth": "Bearer bad-token" });
+    let corr = trace.log_request("tools/list", Some(&params));
+    let err = client.send_request_json("tools/list", params).unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Authorized tools/list.
+    let params = json!({ "cursor": null, "auth": "Bearer good-token" });
+    let corr = trace.log_request("tools/list", Some(&params));
+    let value = client.send_request_json("tools/list", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+
+    let tools: fastmcp_protocol::ListToolsResult = serde_json::from_value(value).unwrap();
+    assert!(
+        tools.tools.iter().any(|t| t.name == "greeting"),
+        "expected greeting tool to be listed"
+    );
+
+    // Authorized tools/call.
+    let params = json!({
+        "name": "greeting",
+        "arguments": { "name": "Ada" },
+        "auth": "Bearer good-token",
+    });
+    let corr = trace.log_request("tools/call", Some(&params));
+    let value = client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    assert!(!call.is_error);
+    match call.content.first() {
+        Some(Content::Text { text }) => assert_eq!(text, "Hello, Ada!"),
+        other => panic!("Expected text content, got: {other:?}"),
+    }
+
+    // Verify the server stored auth context into McpContext (subject + token).
+    let params = json!({
+        "name": "auth_info",
+        "arguments": {},
+        "auth": "Bearer good-token",
+    });
+    let corr = trace.log_request("tools/call(auth_info)", Some(&params));
+    let value = client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    let text = match call.content.first() {
+        Some(Content::Text { text }) => text,
+        other => panic!("Expected text content, got: {other:?}"),
+    };
+    let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        auth_json.get("subject").and_then(|v| v.as_str()),
+        Some("user-1")
+    );
+    assert_eq!(
+        auth_json.get("token").and_then(|v| v.as_str()),
+        Some("good-token")
+    );
+}
+
+#[cfg(feature = "jwt")]
+#[test]
+fn e2e_auth_jwt_flow_allows_and_denies() {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secret = b"e2e-jwt-secret";
+    let verifier = fastmcp_rust::JwtTokenVerifier::hs256(secret);
+    let provider = TokenAuthProvider::new(verifier);
+
+    let mut client = setup_auth_server_and_client(provider, "e2e-auth-jwt");
+    client.initialize().unwrap();
+
+    let mut trace = TestTrace::new("e2e-auth-jwt");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let exp_ok = i64::try_from(now + 10 * 60).unwrap();
+    let token_ok = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": "user123",
+            "scope": "read write",
+            "exp": exp_ok,
+        }),
+        &EncodingKey::from_secret(secret),
+    )
+    .unwrap();
+
+    // Unauthorized tools/list.
+    let params = json!({ "cursor": null });
+    let corr = trace.log_request("tools/list", Some(&params));
+    let err = client.send_request_json("tools/list", params).unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Expired token should be rejected.
+    let exp_expired = i64::try_from(now.saturating_sub(60)).unwrap();
+    let token_expired = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": "user123",
+            "scope": "read write",
+            "exp": exp_expired,
+        }),
+        &EncodingKey::from_secret(secret),
+    )
+    .unwrap();
+    let params = json!({ "cursor": null, "auth": format!("Bearer {token_expired}") });
+    let corr = trace.log_request("tools/list(expired)", Some(&params));
+    let err = client.send_request_json("tools/list", params).unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Invalid signature should be rejected.
+    let token_bad_sig = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": "user123",
+            "scope": "read write",
+            "exp": exp_ok,
+        }),
+        &EncodingKey::from_secret(b"wrong-secret"),
+    )
+    .unwrap();
+    let params = json!({ "cursor": null, "auth": format!("Bearer {token_bad_sig}") });
+    let corr = trace.log_request("tools/list(bad_sig)", Some(&params));
+    let err = client.send_request_json("tools/list", params).unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Authorized tools/call.
+    let params = json!({
+        "name": "greeting",
+        "arguments": { "name": "Linus" },
+        "auth": format!("Bearer {token_ok}"),
+    });
+    let corr = trace.log_request("tools/call", Some(&params));
+    let value = client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    assert!(!call.is_error);
+    match call.content.first() {
+        Some(Content::Text { text }) => assert_eq!(text, "Hello, Linus!"),
+        other => panic!("Expected text content, got: {other:?}"),
+    }
+
+    // Verify claims extracted to auth context.
+    let params = json!({
+        "name": "auth_info",
+        "arguments": {},
+        "auth": format!("Bearer {token_ok}"),
+    });
+    let corr = trace.log_request("tools/call(auth_info)", Some(&params));
+    let value = client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    let text = match call.content.first() {
+        Some(Content::Text { text }) => text,
+        other => panic!("Expected text content, got: {other:?}"),
+    };
+    let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        auth_json.get("subject").and_then(|v| v.as_str()),
+        Some("user123")
+    );
+    let scopes = auth_json
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .expect("scopes array");
+    let scopes: Vec<_> = scopes.iter().filter_map(|v| v.as_str()).collect();
+    assert!(scopes.contains(&"read"));
+    assert!(scopes.contains(&"write"));
+}
+
+#[test]
+fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
+    use fastmcp_rust::oauth::{
+        AuthorizationRequest, CodeChallengeMethod, OAuthClient, OAuthServer, OAuthServerConfig,
+        TokenRequest,
+    };
+
+    let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+    let client_def = OAuthClient::builder("test-client")
+        .redirect_uri("http://localhost:3000/callback")
+        .scope("read")
+        .build()
+        .unwrap();
+    oauth.register_client(client_def).unwrap();
+
+    // OAuth 2.1 requires PKCE. Use the plain method for a fully deterministic test.
+    let code_verifier = "verifier-verifier-verifier-verifier-verifier-verifier-123";
+    let auth_request = AuthorizationRequest {
+        response_type: "code".to_string(),
+        client_id: "test-client".to_string(),
+        redirect_uri: "http://localhost:3000/callback".to_string(),
+        scopes: vec!["read".to_string()],
+        state: None,
+        code_challenge: code_verifier.to_string(),
+        code_challenge_method: CodeChallengeMethod::Plain,
+    };
+    let (code, _redirect) = oauth
+        .authorize(&auth_request, Some("user123".to_string()))
+        .unwrap();
+
+    let token_response = oauth
+        .token(&TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code),
+            redirect_uri: Some("http://localhost:3000/callback".to_string()),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            code_verifier: Some(code_verifier.to_string()),
+            refresh_token: None,
+            scopes: None,
+        })
+        .unwrap();
+
+    let access = token_response.access_token.clone();
+    let refresh = token_response.refresh_token.clone().expect("refresh token");
+
+    let provider = TokenAuthProvider::new(oauth.token_verifier());
+    let mut mcp_client = setup_auth_server_and_client(provider, "e2e-auth-oauth");
+    mcp_client.initialize().unwrap();
+
+    let mut trace = TestTrace::new("e2e-auth-oauth");
+
+    // Access token allows request.
+    let params = json!({
+        "name": "greeting",
+        "arguments": { "name": "Grace" },
+        "auth": format!("Bearer {access}"),
+    });
+    let corr = trace.log_request("tools/call", Some(&params));
+    let value = mcp_client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    assert!(!call.is_error);
+
+    // Verify auth context propagated from OAuth subject/scopes.
+    let params = json!({
+        "name": "auth_info",
+        "arguments": {},
+        "auth": format!("Bearer {access}"),
+    });
+    let corr = trace.log_request("tools/call(auth_info)", Some(&params));
+    let value = mcp_client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    let text = match call.content.first() {
+        Some(Content::Text { text }) => text,
+        other => panic!("Expected text content, got: {other:?}"),
+    };
+    let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        auth_json.get("subject").and_then(|v| v.as_str()),
+        Some("user123")
+    );
+
+    // Revoke access token: request should now be forbidden.
+    oauth.revoke(&access, "test-client", None).unwrap();
+    let params = json!({ "cursor": null, "auth": format!("Bearer {access}") });
+    let corr = trace.log_request("tools/list(revoked)", Some(&params));
+    let err = mcp_client
+        .send_request_json("tools/list", params)
+        .unwrap_err();
+    trace.log_response(
+        &corr,
+        None::<&serde_json::Value>,
+        Some(&json!({"error": err.message})),
+    );
+    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+    // Refresh: new access token should be accepted.
+    let refreshed = oauth
+        .token(&TokenRequest {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            code_verifier: None,
+            refresh_token: Some(refresh),
+            scopes: None,
+        })
+        .unwrap();
+
+    let new_access = refreshed.access_token;
+    let params = json!({
+        "name": "greeting",
+        "arguments": { "name": "Grace" },
+        "auth": format!("Bearer {new_access}"),
+    });
+    let corr = trace.log_request("tools/call(refreshed)", Some(&params));
+    let value = mcp_client.send_request_json("tools/call", params).unwrap();
+    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
+    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
+    assert!(!call.is_error);
 }
 
 // ============================================================================

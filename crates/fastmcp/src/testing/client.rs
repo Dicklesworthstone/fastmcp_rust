@@ -355,6 +355,45 @@ impl TestClient {
         &mut self.transport
     }
 
+    /// Sends a raw JSON-RPC request with already-serialized params.
+    ///
+    /// This is intended for advanced E2E tests that need to inject protocol fields
+    /// not covered by the typed helper methods (for example, auth metadata).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response contains an error payload.
+    pub fn send_request_json(
+        &mut self,
+        method: &str,
+        params_value: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        self.ensure_initialized()?;
+
+        let id = self.next_request_id();
+        #[allow(clippy::cast_possible_wrap)]
+        let request_id = RequestId::Number(id as i64);
+        #[allow(clippy::cast_possible_wrap)]
+        let request = JsonRpcRequest::new(method, Some(params_value), id as i64);
+
+        self.transport
+            .send(&self.cx, &JsonRpcMessage::Request(request))
+            .map_err(|e| McpError::internal_error(format!("Transport error: {e:?}")))?;
+
+        let response = self.recv_response(&request_id)?;
+
+        if let Some(error) = response.error {
+            return Err(McpError::new(
+                fastmcp_core::McpErrorCode::from(error.code),
+                error.message,
+            ));
+        }
+
+        response
+            .result
+            .ok_or_else(|| McpError::internal_error("No result in response"))
+    }
+
     // --- Private helpers ---
 
     fn ensure_initialized(&self) -> McpResult<()> {
