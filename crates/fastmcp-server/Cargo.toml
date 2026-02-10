@@ -28,7 +28,7 @@ getrandom.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 redis = { workspace = true, optional = true }
-jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto"], optional = true }
+jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto", "use_pem"], optional = true }
 
 [lints]
 workspace = true

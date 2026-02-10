@@ -26,7 +26,8 @@
 //! let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
 //!
 //! // Create OIDC provider on top
-//! let oidc = OidcProvider::new(oauth, OidcProviderConfig::default());
+//! let oidc = OidcProvider::new(oauth, OidcProviderConfig::default())
+//!     .expect("oidc provider");
 //!
 //! // Set up user claims provider
 //! oidc.set_claims_provider(|subject| {
@@ -57,6 +58,14 @@ pub struct OidcProviderConfig {
     pub signing_algorithm: SigningAlgorithm,
     /// Key ID for token signing.
     pub key_id: Option<String>,
+    /// RS256 signing key (PEM-encoded private key).
+    ///
+    /// Required when `signing_algorithm = RS256`.
+    pub rsa_private_key_pem: Option<Vec<u8>>,
+    /// JSON Web Key Set (JWKS) served at `/.well-known/jwks.json`.
+    ///
+    /// Required when `signing_algorithm = RS256`.
+    pub jwks: Option<serde_json::Value>,
     /// Supported claims.
     pub supported_claims: Vec<String>,
     /// Supported scopes beyond `openid`.
@@ -70,6 +79,8 @@ impl Default for OidcProviderConfig {
             id_token_lifetime: Duration::from_secs(3600), // 1 hour
             signing_algorithm: SigningAlgorithm::HS256,
             key_id: None,
+            rsa_private_key_pem: None,
+            jwks: None,
             supported_claims: vec![
                 "sub".to_string(),
                 "name".to_string(),
@@ -455,7 +466,7 @@ impl DiscoveryDocument {
             authorization_endpoint: format!("{}/authorize", base),
             token_endpoint: format!("{}/token", base),
             userinfo_endpoint: Some(format!("{}/userinfo", base)),
-            jwks_uri: Some(format!("{}/.well-known/jwks.json", base)),
+            jwks_uri: None,
             registration_endpoint: None,
             revocation_endpoint: Some(format!("{}/revoke", base)),
             scopes_supported: vec![
@@ -626,7 +637,7 @@ pub struct OidcProvider {
     oauth: Arc<OAuthServer>,
     /// OIDC configuration.
     config: OidcProviderConfig,
-    /// Signing key (HMAC secret or RSA private key).
+    /// Signing key (HMAC secret).
     signing_key: RwLock<SigningKey>,
     /// Claims provider.
     claims_provider: RwLock<Option<Arc<dyn ClaimsProvider>>>,
@@ -644,22 +655,91 @@ enum SigningKey {
     None,
 }
 
+fn validate_oidc_config(config: &OidcProviderConfig) -> Result<(), OidcError> {
+    match config.signing_algorithm {
+        SigningAlgorithm::HS256 => Ok(()),
+        SigningAlgorithm::RS256 => {
+            #[cfg(feature = "jwt")]
+            {
+                let kid = config.key_id.as_deref().ok_or_else(|| {
+                    OidcError::SigningError("RS256 requires `key_id` to be set".to_string())
+                })?;
+
+                let pem = config.rsa_private_key_pem.as_ref().ok_or_else(|| {
+                    OidcError::SigningError("RS256 requires `rsa_private_key_pem`".to_string())
+                })?;
+                // Fail fast: reject invalid PEM so we never advertise RS256 with a broken signer.
+                jsonwebtoken::EncodingKey::from_rsa_pem(pem).map_err(|e| {
+                    OidcError::SigningError(format!("invalid RSA private key PEM: {e}"))
+                })?;
+
+                let jwks = config.jwks.as_ref().ok_or_else(|| {
+                    OidcError::SigningError("RS256 requires `jwks` (JWKS JSON)".to_string())
+                })?;
+
+                // Validate JWKS shape and that it includes a plausible RSA key with the configured kid.
+                let keys = jwks.get("keys").and_then(|v| v.as_array()).ok_or_else(|| {
+                    OidcError::SigningError(
+                        "JWKS must be an object with a `keys` array".to_string(),
+                    )
+                })?;
+
+                let mut found = false;
+                for key in keys {
+                    let Some(obj) = key.as_object() else { continue };
+                    let key_kid = obj.get("kid").and_then(|v| v.as_str());
+                    if key_kid != Some(kid) {
+                        continue;
+                    }
+                    let kty = obj.get("kty").and_then(|v| v.as_str());
+                    if kty != Some("RSA") {
+                        continue;
+                    }
+                    // Require the minimal RSA public key components so the JWKS is usable.
+                    if obj.get("n").and_then(|v| v.as_str()).is_none()
+                        || obj.get("e").and_then(|v| v.as_str()).is_none()
+                    {
+                        return Err(OidcError::SigningError(format!(
+                            "JWKS key kid={kid} is missing RSA components `n`/`e`"
+                        )));
+                    }
+                    found = true;
+                    break;
+                }
+
+                if !found {
+                    return Err(OidcError::SigningError(format!(
+                        "JWKS does not contain an RSA key with kid={kid}"
+                    )));
+                }
+
+                Ok(())
+            }
+            #[cfg(not(feature = "jwt"))]
+            {
+                Err(OidcError::SigningError(
+                    "RS256 requires the `fastmcp-server/jwt` feature".to_string(),
+                ))
+            }
+        }
+    }
+}
+
 impl OidcProvider {
     /// Creates a new OIDC provider with the given OAuth server.
-    #[must_use]
-    pub fn new(oauth: Arc<OAuthServer>, config: OidcProviderConfig) -> Self {
-        Self {
+    pub fn new(oauth: Arc<OAuthServer>, config: OidcProviderConfig) -> Result<Self, OidcError> {
+        validate_oidc_config(&config)?;
+        Ok(Self {
             oauth,
             config,
             signing_key: RwLock::new(SigningKey::None),
             claims_provider: RwLock::new(None),
             id_tokens: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     /// Creates a new OIDC provider with default configuration.
-    #[must_use]
-    pub fn with_defaults(oauth: Arc<OAuthServer>) -> Self {
+    pub fn with_defaults(oauth: Arc<OAuthServer>) -> Result<Self, OidcError> {
         Self::new(oauth, OidcProviderConfig::default())
     }
 
@@ -700,12 +780,26 @@ impl OidcProvider {
     /// Generates the discovery document.
     #[must_use]
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
-        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url);
+        let base_url = base_url.into();
+        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
         doc.scopes_supported = self.config.supported_scopes.clone();
         doc.claims_supported = Some(self.config.supported_claims.clone());
         doc.id_token_signing_alg_values_supported =
             vec![self.config.signing_algorithm.as_str().to_string()];
+        doc.jwks_uri = match self.config.signing_algorithm {
+            SigningAlgorithm::HS256 => None,
+            SigningAlgorithm::RS256 => Some(format!("{}/.well-known/jwks.json", base_url)),
+        };
         doc
+    }
+
+    /// Returns the configured JSON Web Key Set (JWKS), if any.
+    ///
+    /// For HS256 this is typically `None`. For RS256 it is required and should be served at
+    /// `/.well-known/jwks.json` alongside the discovery document.
+    #[must_use]
+    pub fn jwks(&self) -> Option<serde_json::Value> {
+        self.config.jwks.clone()
     }
 
     // -------------------------------------------------------------------------
@@ -759,14 +853,14 @@ impl OidcProvider {
         // Sign the token
         let raw = self.sign_id_token(&claims)?;
 
-        let id_token = IdToken { raw, claims };
+        let issued = IdToken { raw, claims };
 
         // Cache the ID token
         if let Ok(mut guard) = self.id_tokens.write() {
-            guard.insert(access_token.token.clone(), id_token.clone());
+            guard.insert(access_token.token.clone(), issued.clone());
         }
 
-        Ok(id_token)
+        Ok(issued)
     }
 
     /// Gets the ID token associated with an access token.
@@ -787,7 +881,7 @@ impl OidcProvider {
     /// Returns the user's claims filtered by the access token's scopes.
     pub fn userinfo(&self, access_token: &str) -> Result<UserClaims, OidcError> {
         // Validate access token
-        let token = self
+        let validated = self
             .oauth
             .validate_access_token(access_token)
             .ok_or_else(|| {
@@ -797,16 +891,16 @@ impl OidcProvider {
             })?;
 
         // Verify openid scope
-        if !token.scopes.iter().any(|s| s == "openid") {
+        if !validated.scopes.iter().any(|s| s == "openid") {
             return Err(OidcError::MissingOpenIdScope);
         }
 
-        let subject = token
+        let subject = validated
             .subject
             .as_ref()
             .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
 
-        self.get_user_claims(subject, &token.scopes)
+        self.get_user_claims(subject, &validated.scopes)
     }
 
     // -------------------------------------------------------------------------
@@ -834,39 +928,71 @@ impl OidcProvider {
     }
 
     fn sign_id_token(&self, claims: &IdTokenClaims) -> Result<String, OidcError> {
-        let key = self.get_or_generate_signing_key()?;
+        match self.config.signing_algorithm {
+            SigningAlgorithm::HS256 => {
+                let key = self.get_or_generate_signing_key()?;
 
-        // Build JWT
-        let header = serde_json::json!({
-            "alg": self.config.signing_algorithm.as_str(),
-            "typ": "JWT",
-            "kid": self.config.key_id.as_deref().unwrap_or("default"),
-        });
+                // Build JWT (manual, minimal dependencies)
+                let header = serde_json::json!({
+                    "alg": "HS256",
+                    "typ": "JWT",
+                    "kid": self.config.key_id.as_deref().unwrap_or("default"),
+                });
 
-        let header_b64 =
-            base64url_encode(&serde_json::to_vec(&header).map_err(|e| {
-                OidcError::SigningError(format!("failed to serialize header: {}", e))
-            })?);
+                let header_b64 = base64url_encode(&serde_json::to_vec(&header).map_err(|e| {
+                    OidcError::SigningError(format!("failed to serialize header: {e}"))
+                })?);
 
-        let claims_b64 =
-            base64url_encode(&serde_json::to_vec(claims).map_err(|e| {
-                OidcError::SigningError(format!("failed to serialize claims: {}", e))
-            })?);
+                let claims_b64 = base64url_encode(&serde_json::to_vec(claims).map_err(|e| {
+                    OidcError::SigningError(format!("failed to serialize claims: {e}"))
+                })?);
 
-        let signing_input = format!("{}.{}", header_b64, claims_b64);
+                let signing_input = format!("{header_b64}.{claims_b64}");
 
-        let signature = match &key {
-            SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret)?,
-            SigningKey::None => {
-                return Err(OidcError::SigningError(
-                    "no signing key configured".to_string(),
-                ));
+                let signature = match &key {
+                    SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret)?,
+                    SigningKey::None => {
+                        return Err(OidcError::SigningError(
+                            "no signing key configured".to_string(),
+                        ));
+                    }
+                };
+
+                let signature_b64 = base64url_encode(&signature);
+                Ok(format!("{signing_input}.{signature_b64}"))
             }
-        };
+            SigningAlgorithm::RS256 => {
+                #[cfg(feature = "jwt")]
+                {
+                    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
-        let signature_b64 = base64url_encode(&signature);
+                    let pem = self.config.rsa_private_key_pem.as_ref().ok_or_else(|| {
+                        OidcError::SigningError("RS256 requires `rsa_private_key_pem`".to_string())
+                    })?;
 
-        Ok(format!("{}.{}", signing_input, signature_b64))
+                    let kid = self.config.key_id.as_deref().ok_or_else(|| {
+                        OidcError::SigningError("RS256 requires `key_id` to be set".to_string())
+                    })?;
+
+                    let mut header = Header::new(Algorithm::RS256);
+                    header.typ = Some("JWT".to_string());
+                    header.kid = Some(kid.to_string());
+
+                    let key = EncodingKey::from_rsa_pem(pem).map_err(|e| {
+                        OidcError::SigningError(format!("failed to parse RSA private key PEM: {e}"))
+                    })?;
+
+                    encode(&header, claims, &key)
+                        .map_err(|e| OidcError::SigningError(format!("RS256 signing failed: {e}")))
+                }
+                #[cfg(not(feature = "jwt"))]
+                {
+                    Err(OidcError::SigningError(
+                        "RS256 requires the `fastmcp-server/jwt` feature".to_string(),
+                    ))
+                }
+            }
+        }
     }
 
     fn get_or_generate_signing_key(&self) -> Result<SigningKey, OidcError> {
@@ -968,7 +1094,7 @@ mod tests {
 
     fn create_test_provider() -> OidcProvider {
         let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        OidcProvider::with_defaults(oauth)
+        OidcProvider::with_defaults(oauth).expect("create provider")
     }
 
     #[test]
@@ -1029,8 +1155,54 @@ mod tests {
         assert_eq!(doc.issuer, "fastmcp");
         assert_eq!(doc.authorization_endpoint, "https://example.com/authorize");
         assert_eq!(doc.token_endpoint, "https://example.com/token");
+        assert!(doc.jwks_uri.is_none(), "HS256 must not publish jwks_uri");
         assert!(doc.scopes_supported.contains(&"openid".to_string()));
         assert!(doc.response_types_supported.contains(&"code".to_string()));
+    }
+
+    #[test]
+    #[cfg(not(feature = "jwt"))]
+    fn test_rs256_requires_jwt_feature() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let mut config = OidcProviderConfig::default();
+        config.signing_algorithm = SigningAlgorithm::RS256;
+        config.key_id = Some("test-kid".to_string());
+        config.rsa_private_key_pem = Some(b"dummy".to_vec());
+        config.jwks = Some(serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "test-kid",
+                "n": "x",
+                "e": "AQAB"
+            }]
+        }));
+
+        let res = OidcProvider::new(oauth, config);
+        assert!(
+            res.is_err(),
+            "expected RS256 to be rejected without jwt feature"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "jwt")]
+    fn test_rs256_rejects_invalid_pem() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let mut config = OidcProviderConfig::default();
+        config.signing_algorithm = SigningAlgorithm::RS256;
+        config.key_id = Some("test-kid".to_string());
+        config.rsa_private_key_pem = Some(b"not a pem".to_vec());
+        config.jwks = Some(serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "test-kid",
+                "n": "x",
+                "e": "AQAB"
+            }]
+        }));
+
+        let res = OidcProvider::new(oauth, config);
+        assert!(res.is_err(), "expected invalid PEM to be rejected");
     }
 
     #[test]
@@ -1111,8 +1283,8 @@ mod tests {
 
         // Create a mock access token with openid scope
         let now = Instant::now();
-        let access_token = crate::oauth::OAuthToken {
-            token: "test-access-token".to_string(),
+        let oauth_at = crate::oauth::OAuthToken {
+            token: "test-access".to_string(),
             token_type: crate::oauth::TokenType::Bearer,
             client_id: "test-client".to_string(),
             scopes: vec![
@@ -1126,19 +1298,14 @@ mod tests {
             is_refresh_token: false,
         };
 
-        let result = provider.issue_id_token(&access_token, Some("nonce123"));
-        assert!(result.is_ok());
-
-        let id_token = result.unwrap();
-        assert!(!id_token.raw.is_empty());
-        assert!(id_token.raw.contains('.'));
-        assert_eq!(id_token.claims.sub, "user123");
-        assert_eq!(id_token.claims.aud, "test-client");
-        assert_eq!(id_token.claims.nonce, Some("nonce123".to_string()));
-        assert_eq!(
-            id_token.claims.user_claims.name,
-            Some("John Doe".to_string())
-        );
+        let result = provider.issue_id_token(&oauth_at, Some("nonce123"));
+        let issued = result.expect("issue id token");
+        assert!(!issued.raw.is_empty());
+        assert!(issued.raw.contains('.'));
+        assert_eq!(issued.claims.sub, "user123");
+        assert_eq!(issued.claims.aud, "test-client");
+        assert_eq!(issued.claims.nonce, Some("nonce123".to_string()));
+        assert_eq!(issued.claims.user_claims.name, Some("John Doe".to_string()));
     }
 
     #[test]
@@ -1146,8 +1313,8 @@ mod tests {
         let provider = create_test_provider();
 
         let now = Instant::now();
-        let access_token = crate::oauth::OAuthToken {
-            token: "test-access-token".to_string(),
+        let oauth_at = crate::oauth::OAuthToken {
+            token: "test-access".to_string(),
             token_type: crate::oauth::TokenType::Bearer,
             client_id: "test-client".to_string(),
             scopes: vec!["profile".to_string()], // No openid scope
@@ -1157,7 +1324,7 @@ mod tests {
             is_refresh_token: false,
         };
 
-        let result = provider.issue_id_token(&access_token, None);
+        let result = provider.issue_id_token(&oauth_at, None);
         assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
     }
 
@@ -1178,8 +1345,8 @@ mod tests {
         {
             let mut state = oauth.state.write().unwrap();
             let now = Instant::now();
-            let token = crate::oauth::OAuthToken {
-                token: "test-token".to_string(),
+            let at_entry = crate::oauth::OAuthToken {
+                token: "userinfo-value".to_string(),
                 token_type: crate::oauth::TokenType::Bearer,
                 client_id: "test-client".to_string(),
                 scopes: vec!["openid".to_string(), "profile".to_string()],
@@ -1188,17 +1355,19 @@ mod tests {
                 subject: Some("user123".to_string()),
                 is_refresh_token: false,
             };
-            state.access_tokens.insert("test-token".to_string(), token);
+            state
+                .access_tokens
+                .insert("userinfo-value".to_string(), at_entry);
         }
 
-        let provider = OidcProvider::with_defaults(oauth);
+        let provider = OidcProvider::with_defaults(oauth).expect("create provider");
 
         // Set up claims
         let claims_store = InMemoryClaimsProvider::new();
         claims_store.set_claims(UserClaims::new("user123").with_name("John Doe"));
         provider.set_claims_provider(claims_store);
 
-        let result = provider.userinfo("test-token");
+        let result = provider.userinfo("userinfo-value");
         assert!(result.is_ok());
 
         let claims = result.unwrap();
