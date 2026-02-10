@@ -829,10 +829,14 @@ mod tests {
 
         // Second request: hit, respond from cache
         let decision = middleware.on_request(&ctx, &request).unwrap();
-        match decision {
-            MiddlewareDecision::Respond(cached) => assert_eq!(cached, response),
-            MiddlewareDecision::Continue => panic!("Expected cache hit"),
-        }
+        assert!(
+            matches!(decision, MiddlewareDecision::Respond(_)),
+            "Expected cache hit"
+        );
+        let MiddlewareDecision::Respond(cached) = decision else {
+            return;
+        };
+        assert_eq!(cached, response);
 
         // Check stats
         let stats = middleware.stats();
@@ -886,10 +890,14 @@ mod tests {
 
         // Request1 should hit cache
         let decision = middleware.on_request(&ctx, &request1).unwrap();
-        match decision {
-            MiddlewareDecision::Respond(cached) => assert_eq!(cached, response1),
-            MiddlewareDecision::Continue => panic!("Expected cache hit"),
-        }
+        assert!(
+            matches!(decision, MiddlewareDecision::Respond(_)),
+            "Expected cache hit"
+        );
+        let MiddlewareDecision::Respond(cached) = decision else {
+            return;
+        };
+        assert_eq!(cached, response1);
     }
 
     #[test]
@@ -924,10 +932,14 @@ mod tests {
             .unwrap();
 
         let decision = middleware.on_request(&ctx, &included_request).unwrap();
-        match decision {
-            MiddlewareDecision::Respond(cached) => assert_eq!(cached, response),
-            MiddlewareDecision::Continue => panic!("Expected cache hit for included tool"),
-        }
+        assert!(
+            matches!(decision, MiddlewareDecision::Respond(_)),
+            "Expected cache hit for included tool"
+        );
+        let MiddlewareDecision::Respond(cached) = decision else {
+            return;
+        };
+        assert_eq!(cached, response);
     }
 
     #[test]

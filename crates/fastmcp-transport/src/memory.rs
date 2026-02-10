@@ -217,9 +217,9 @@ impl Transport for MemoryTransport {
 ///
 /// // Server receives it
 /// let msg = server.recv(&cx).unwrap();
-/// match msg {
+/// match &msg {
 ///     JsonRpcMessage::Request(req) => assert_eq!(req.method, "test/method"),
-///     _ => panic!("Expected request"),
+///     _ => assert!(matches!(msg, JsonRpcMessage::Request(_)), "Expected request"),
 /// }
 /// ```
 #[must_use]
@@ -324,13 +324,15 @@ mod tests {
 
         // Server receives it
         let msg = server.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test/method");
-                assert_eq!(req.id, Some(RequestId::Number(1)));
-            }
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        assert_eq!(req.method, "test/method");
+        assert_eq!(req.id, Some(RequestId::Number(1)));
     }
 
     #[test]
@@ -350,12 +352,14 @@ mod tests {
 
         // Client receives response
         let msg = client.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Response(resp) => {
-                assert!(resp.result.is_some());
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        let JsonRpcMessage::Response(resp) = msg else {
+            return;
+        };
+        assert!(resp.result.is_some());
     }
 
     #[test]
@@ -372,12 +376,14 @@ mod tests {
         // Receive all messages
         for i in 1..=5 {
             let msg = server.recv(&cx).unwrap();
-            match msg {
-                JsonRpcMessage::Request(req) => {
-                    assert_eq!(req.method, format!("method_{i}"));
-                }
-                _ => panic!("Expected request"),
-            }
+            assert!(
+                matches!(msg, JsonRpcMessage::Request(_)),
+                "Expected request"
+            );
+            let JsonRpcMessage::Request(req) = msg else {
+                return;
+            };
+            assert_eq!(req.method, format!("method_{i}"));
         }
     }
 
@@ -463,10 +469,14 @@ mod tests {
 
             // Receive request
             let msg = server.recv(&cx).unwrap();
-            let request_id = match &msg {
-                JsonRpcMessage::Request(req) => req.id.clone().unwrap(),
-                _ => panic!("Expected request"),
+            assert!(
+                matches!(msg, JsonRpcMessage::Request(_)),
+                "Expected request"
+            );
+            let JsonRpcMessage::Request(req) = msg else {
+                return;
             };
+            let request_id = req.id.clone().unwrap();
 
             // Send response
             let response = JsonRpcResponse::success(request_id, serde_json::json!({"ok": true}));
@@ -482,12 +492,14 @@ mod tests {
 
             // Receive response
             let msg = client.recv(&cx).unwrap();
-            match msg {
-                JsonRpcMessage::Response(resp) => {
-                    assert!(resp.result.is_some());
-                }
-                _ => panic!("Expected response"),
-            }
+            assert!(
+                matches!(msg, JsonRpcMessage::Response(_)),
+                "Expected response"
+            );
+            let JsonRpcMessage::Response(resp) = msg else {
+                return;
+            };
+            assert!(resp.result.is_some());
         });
 
         server_handle.join().unwrap();
