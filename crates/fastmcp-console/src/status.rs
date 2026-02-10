@@ -167,3 +167,33 @@ fn format_duration(d: Duration) -> String {
         format!("{}m {}s", d.as_secs() / 60, d.as_secs() % 60)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestConsole;
+
+    #[test]
+    fn format_duration_formats_ms_s_and_minutes() {
+        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_duration(Duration::from_millis(1234)), "1.23s");
+        assert_eq!(format_duration(Duration::from_secs(61)), "1m 1s");
+    }
+
+    #[test]
+    fn request_log_renders_method_and_id() {
+        let tc = TestConsole::new();
+        let log = RequestLog::new("tools/call", Some("1")).success();
+        log.render(tc.console());
+        assert!(tc.contains("tools/call"));
+        assert!(tc.contains("#1"));
+    }
+
+    #[test]
+    fn request_log_error_renders_message() {
+        let tc = TestConsole::new();
+        let log = RequestLog::new("tools/call", Some("1")).error("bad request");
+        log.render(tc.console());
+        assert!(tc.contains("bad request"));
+    }
+}

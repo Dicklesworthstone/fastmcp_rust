@@ -262,3 +262,32 @@ pub fn render_info(message: &str, console: &FastMcpConsole) {
 pub fn render_panic(message: &str, backtrace: Option<&str>, console: &FastMcpConsole) {
     RichErrorRenderer::default().render_panic(message, backtrace, console);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestConsole;
+
+    #[test]
+    fn render_warning_includes_message() {
+        let tc = TestConsole::new();
+        render_warning("something happened", tc.console());
+        assert!(tc.contains("warning"));
+        assert!(tc.contains("something happened"));
+    }
+
+    #[test]
+    fn render_info_includes_message() {
+        let tc = TestConsole::new();
+        render_info("hello", tc.console());
+        assert!(tc.contains("hello"));
+    }
+
+    #[test]
+    fn rich_error_renderer_renders_error_message() {
+        let tc = TestConsole::new();
+        let err = McpError::new(McpErrorCode::MethodNotFound, "missing method");
+        RichErrorRenderer::default().render(&err, tc.console());
+        assert!(tc.contains("missing method"));
+    }
+}

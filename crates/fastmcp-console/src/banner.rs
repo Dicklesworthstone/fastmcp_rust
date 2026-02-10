@@ -303,3 +303,38 @@ fn lerp(a: u8, b: u8, t: f64) -> u8 {
     let b = b as f64;
     (a + (b - a) * t).round() as u8
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestConsole;
+
+    #[test]
+    fn choose_logo_respects_width_thresholds() {
+        assert_eq!(choose_logo(80), LOGO_FULL);
+        assert_eq!(choose_logo(50), LOGO_FULL);
+        assert_eq!(choose_logo(49), LOGO_COMPACT);
+        assert_eq!(choose_logo(30), LOGO_COMPACT);
+        assert_eq!(choose_logo(29), LOGO_MINIMAL);
+    }
+
+    #[test]
+    fn startup_banner_renders_rich_output() {
+        let tc = TestConsole::new();
+        let console = tc.console();
+
+        StartupBanner::new("test-server", "1.2.3")
+            .description("hello")
+            .tools(2)
+            .resources(1)
+            .prompts(0)
+            .transport("stdio")
+            .render(console);
+
+        assert!(tc.contains("test-server"));
+        assert!(tc.contains("v1.2.3"));
+        assert!(tc.contains("Capabilities"));
+        assert!(tc.contains("Server ready"));
+        assert!(tc.contains("stdio"));
+    }
+}
