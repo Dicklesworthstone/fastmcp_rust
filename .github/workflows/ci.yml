@@ -93,8 +93,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (!(Test-Path ..\\asupersync)) { cmd /c "mklink /J ..\\asupersync deps\\asupersync" }
-          if (!(Test-Path ..\\rich_rust)) { cmd /c "mklink /J ..\\rich_rust deps\\rich_rust" }
+          $repo = (Get-Location).Path
+          if (!(Test-Path ..\\asupersync)) {
+            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
+          }
+          if (!(Test-Path ..\\rich_rust)) {
+            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
+          }
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -108,6 +113,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --verbose
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc --all-features
 
   check:
     name: Check (all targets)
@@ -271,8 +279,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (!(Test-Path ..\\asupersync)) { cmd /c "mklink /J ..\\asupersync deps\\asupersync" }
-          if (!(Test-Path ..\\rich_rust)) { cmd /c "mklink /J ..\\rich_rust deps\\rich_rust" }
+          $repo = (Get-Location).Path
+          if (!(Test-Path ..\\asupersync)) {
+            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
+          }
+          if (!(Test-Path ..\\rich_rust)) {
+            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
+          }
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
