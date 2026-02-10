@@ -12,10 +12,6 @@ a.out
 # Legacy source (reference only, not shipped)
 /legacy_fastmcp/
 
-# Planning/porting docs (internal only)
-EXISTING_FASTMCP_STRUCTURE.md
-PLAN_TO_PORT_FASTMCP_TO_RUST.md
-
 # IDE
 .idea/
 .vscode/
