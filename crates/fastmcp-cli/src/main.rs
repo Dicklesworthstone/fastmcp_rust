@@ -1926,6 +1926,57 @@ fn generate_server_config(name: &str, server: &str, args: &[String]) -> (String,
     )
 }
 
+fn read_json_config_or_empty(config_path: &str) -> McpResult<serde_json::Value> {
+    if !std::path::Path::new(config_path).exists() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!(
+            "Failed to read config at {config_path}: {e}"
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!(
+            "Failed to parse JSON config at {config_path}: {e}"
+        ))
+    })
+}
+
+fn write_json_config(config_path: &str, value: &serde_json::Value) -> McpResult<()> {
+    let new_content = serde_json::to_string_pretty(value).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+    })?;
+
+    if let Some(parent) = std::path::Path::new(config_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            fastmcp_core::McpError::internal_error(format!(
+                "Failed to create config directory for {config_path}: {e}"
+            ))
+        })?;
+    }
+
+    std::fs::write(config_path, new_content).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!(
+            "Failed to write config at {config_path}: {e}"
+        ))
+    })
+}
+
+fn create_backup_if_exists(config_path: &str) -> McpResult<Option<String>> {
+    if !std::path::Path::new(config_path).exists() {
+        return Ok(None);
+    }
+
+    let backup_path = format!("{config_path}.bak");
+    std::fs::copy(config_path, &backup_path).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!(
+            "Failed to create backup {backup_path} from {config_path}: {e}"
+        ))
+    })?;
+    Ok(Some(backup_path))
+}
+
 fn install_claude_desktop(config: &(String, McpServerConfig), dry_run: bool) -> McpResult<()> {
     let config_path = get_claude_desktop_config_path()?;
 
@@ -1941,23 +1992,16 @@ fn install_claude_desktop(config: &(String, McpServerConfig), dry_run: bool) -> 
     })?;
 
     if dry_run {
-        println!("Would add to {config_path}:\n\n{snippet_str}");
+        println!("Dry-run: proposed update to {config_path}:\n\n{snippet_str}");
         return Ok(());
     }
 
     // Read existing config or create new one
-    let mut existing_config: serde_json::Value = if std::path::Path::new(&config_path).exists() {
-        let content = std::fs::read_to_string(&config_path).map_err(|e| {
-            fastmcp_core::McpError::internal_error(format!("Failed to read config: {e}"))
-        })?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Merge the server config
+    let mut existing_config = read_json_config_or_empty(&config_path)?;
     if !existing_config.is_object() {
-        existing_config = serde_json::json!({});
+        return Err(fastmcp_core::McpError::internal_error(format!(
+            "Config root at {config_path} must be a JSON object"
+        )));
     }
 
     let obj = existing_config.as_object_mut().unwrap();
@@ -1966,32 +2010,27 @@ fn install_claude_desktop(config: &(String, McpServerConfig), dry_run: bool) -> 
     }
 
     let mcp_servers = obj.get_mut("mcpServers").unwrap();
-    if let Some(servers_obj) = mcp_servers.as_object_mut() {
-        servers_obj.insert(
-            config.0.clone(),
-            serde_json::to_value(&config.1).unwrap_or(serde_json::json!({})),
-        );
-    }
-
-    // Write back
-    let new_content = serde_json::to_string_pretty(&existing_config).map_err(|e| {
+    let servers_obj = mcp_servers.as_object_mut().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error(format!(
+            "mcpServers at {config_path} must be a JSON object"
+        ))
+    })?;
+    let server_val = serde_json::to_value(&config.1).map_err(|e| {
         fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
     })?;
+    servers_obj.insert(config.0.clone(), server_val);
 
-    // Create parent directory if needed
-    if let Some(parent) = std::path::Path::new(&config_path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            fastmcp_core::McpError::internal_error(format!(
-                "Failed to create config directory: {e}"
-            ))
-        })?;
+    let backup_path = create_backup_if_exists(&config_path)?;
+    write_json_config(&config_path, &existing_config)?;
+
+    if let Some(backup_path) = backup_path {
+        println!(
+            "Added '{name}' to {config_path} (backup: {backup_path})",
+            name = config.0
+        );
+    } else {
+        println!("Added '{name}' to {config_path}", name = config.0);
     }
-
-    std::fs::write(&config_path, new_content).map_err(|e| {
-        fastmcp_core::McpError::internal_error(format!("Failed to write config: {e}"))
-    })?;
-
-    println!("Added '{name}' to {config_path}", name = config.0);
     Ok(())
 }
 
@@ -2039,22 +2078,16 @@ fn install_cursor(config: &(String, McpServerConfig), dry_run: bool) -> McpResul
     })?;
 
     if dry_run {
-        println!("Would add to {config_path}:\n\n{snippet_str}");
+        println!("Dry-run: proposed update to {config_path}:\n\n{snippet_str}");
         return Ok(());
     }
 
     // Similar merge logic as Claude Desktop
-    let mut existing_config: serde_json::Value = if std::path::Path::new(&config_path).exists() {
-        let content = std::fs::read_to_string(&config_path).map_err(|e| {
-            fastmcp_core::McpError::internal_error(format!("Failed to read config: {e}"))
-        })?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
+    let mut existing_config = read_json_config_or_empty(&config_path)?;
     if !existing_config.is_object() {
-        existing_config = serde_json::json!({});
+        return Err(fastmcp_core::McpError::internal_error(format!(
+            "Config root at {config_path} must be a JSON object"
+        )));
     }
 
     let obj = existing_config.as_object_mut().unwrap();
@@ -2063,30 +2096,27 @@ fn install_cursor(config: &(String, McpServerConfig), dry_run: bool) -> McpResul
     }
 
     let mcp_servers = obj.get_mut("mcpServers").unwrap();
-    if let Some(servers_obj) = mcp_servers.as_object_mut() {
-        servers_obj.insert(
-            config.0.clone(),
-            serde_json::to_value(&config.1).unwrap_or(serde_json::json!({})),
-        );
-    }
-
-    let new_content = serde_json::to_string_pretty(&existing_config).map_err(|e| {
+    let servers_obj = mcp_servers.as_object_mut().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error(format!(
+            "mcpServers at {config_path} must be a JSON object"
+        ))
+    })?;
+    let server_val = serde_json::to_value(&config.1).map_err(|e| {
         fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
     })?;
+    servers_obj.insert(config.0.clone(), server_val);
 
-    if let Some(parent) = std::path::Path::new(&config_path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            fastmcp_core::McpError::internal_error(format!(
-                "Failed to create config directory: {e}"
-            ))
-        })?;
+    let backup_path = create_backup_if_exists(&config_path)?;
+    write_json_config(&config_path, &existing_config)?;
+
+    if let Some(backup_path) = backup_path {
+        println!(
+            "Added '{name}' to {config_path} (backup: {backup_path})",
+            name = config.0
+        );
+    } else {
+        println!("Added '{name}' to {config_path}", name = config.0);
     }
-
-    std::fs::write(&config_path, new_content).map_err(|e| {
-        fastmcp_core::McpError::internal_error(format!("Failed to write config: {e}"))
-    })?;
-
-    println!("Added '{name}' to {config_path}", name = config.0);
     Ok(())
 }
 
@@ -2116,18 +2146,46 @@ fn install_cline(config: &(String, McpServerConfig), dry_run: bool) -> McpResult
     })?;
 
     if dry_run {
-        println!("Would add to VS Code settings.json:\n\n{snippet_str}");
-        println!("\nSettings path: {config_path}");
+        println!("Dry-run: proposed update to VS Code settings at {config_path}:\n\n{snippet_str}");
         return Ok(());
     }
 
-    // VSCode settings.json is more complex - just print instructions
-    println!(
-        "To add '{name}' to Cline, add the following to your VS Code settings.json:",
-        name = config.0
-    );
-    println!("\n{snippet_str}");
-    println!("\nSettings file: {config_path}");
+    // Merge into VS Code settings.json under `cline.mcpServers`.
+    let mut existing_config = read_json_config_or_empty(&config_path)?;
+    if !existing_config.is_object() {
+        return Err(fastmcp_core::McpError::internal_error(format!(
+            "VS Code settings at {config_path} must be a JSON object"
+        )));
+    }
+
+    let obj = existing_config.as_object_mut().unwrap();
+    if !obj.contains_key("cline.mcpServers") {
+        obj.insert("cline.mcpServers".to_string(), serde_json::json!({}));
+    }
+
+    let mcp_servers = obj.get_mut("cline.mcpServers").unwrap();
+    let servers_obj = mcp_servers.as_object_mut().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error(format!(
+            "cline.mcpServers at {config_path} must be a JSON object"
+        ))
+    })?;
+
+    let server_val = serde_json::to_value(&config.1).map_err(|e| {
+        fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+    })?;
+    servers_obj.insert(config.0.clone(), server_val);
+
+    let backup_path = create_backup_if_exists(&config_path)?;
+    write_json_config(&config_path, &existing_config)?;
+
+    if let Some(backup_path) = backup_path {
+        println!(
+            "Added '{name}' to {config_path} (backup: {backup_path})",
+            name = config.0
+        );
+    } else {
+        println!("Added '{name}' to {config_path}", name = config.0);
+    }
 
     Ok(())
 }
