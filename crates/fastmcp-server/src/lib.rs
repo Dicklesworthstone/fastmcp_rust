@@ -1220,170 +1220,183 @@ impl Server {
             }
         }
 
-        if self.should_authenticate(&request.method) {
-            let auth_request = AuthRequest {
-                method: &request.method,
-                params: request.params.as_ref(),
-                request_id,
-            };
-            self.authenticate_request(cx, request_id, session, auth_request)?;
-        }
-
-        let method = &request.method;
-        let params = request.params.clone();
-
-        // Create bidirectional senders based on client capabilities
-        let bidirectional_senders = self.create_bidirectional_senders(session, request_sender);
-
-        let result = match method.as_str() {
-            "initialize" => {
-                let params: InitializeParams = parse_params(params)?;
-                let result = self.router.handle_initialize(
-                    cx,
-                    session,
-                    params,
-                    self.instructions.as_deref(),
-                )?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "initialized" => {
-                // Notification, no response needed (but we send empty ok)
-                Ok(serde_json::Value::Null)
-            }
-            "notifications/cancelled" => {
-                let params: CancelledParams = parse_params(params)?;
-                self.handle_cancelled_notification(params);
-                Ok(serde_json::Value::Null)
-            }
-            "logging/setLevel" => {
-                let params: SetLogLevelParams = parse_params(params)?;
-                self.handle_set_log_level(session, params);
-                Ok(serde_json::Value::Null)
-            }
-            "tools/list" => {
-                let params: ListToolsParams = parse_params_or_default(params)?;
-                let result = self
-                    .router
-                    .handle_tools_list(cx, params, Some(session.state()))?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "tools/call" => {
-                let params: CallToolParams = parse_params(params)?;
-                let result = self.router.handle_tools_call(
-                    cx,
+        // Everything after middleware entry must flow through `result` so that:
+        // - `on_response` runs for successes in reverse middleware order
+        // - `on_error` runs for *all* errors (including parsing/auth) in reverse middleware order
+        //
+        // Without this, `?` would early-return from `dispatch_method` and bypass middleware error
+        // rewriting, contradicting the ordering semantics documented in `middleware.rs`.
+        let result: Result<serde_json::Value, McpError> = (|| {
+            if self.should_authenticate(&request.method) {
+                let auth_request = AuthRequest {
+                    method: &request.method,
+                    params: request.params.as_ref(),
                     request_id,
-                    params,
-                    budget,
-                    session.state().clone(),
-                    Some(notification_sender),
-                    bidirectional_senders.as_ref(),
-                )?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                };
+                self.authenticate_request(cx, request_id, session, auth_request)?;
             }
-            "resources/list" => {
-                let params: ListResourcesParams = parse_params_or_default(params)?;
-                let result =
-                    self.router
-                        .handle_resources_list(cx, params, Some(session.state()))?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "resources/templates/list" => {
-                let params: ListResourceTemplatesParams = parse_params_or_default(params)?;
-                let result = self.router.handle_resource_templates_list(
-                    cx,
-                    params,
-                    Some(session.state()),
-                )?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "resources/read" => {
-                let params: ReadResourceParams = parse_params(params)?;
-                let result = self.router.handle_resources_read(
-                    cx,
-                    request_id,
-                    &params,
-                    budget,
-                    session.state().clone(),
-                    Some(notification_sender),
-                    bidirectional_senders.as_ref(),
-                )?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "resources/subscribe" => {
-                let params: SubscribeResourceParams = parse_params(params)?;
-                if !self.router.resource_exists(&params.uri) {
-                    return Err(McpError::resource_not_found(&params.uri));
+
+            let method = &request.method;
+            let params = request.params.clone();
+
+            // Create bidirectional senders based on client capabilities
+            let bidirectional_senders = self.create_bidirectional_senders(session, request_sender);
+
+            match method.as_str() {
+                "initialize" => {
+                    let params: InitializeParams = parse_params(params)?;
+                    let result = self.router.handle_initialize(
+                        cx,
+                        session,
+                        params,
+                        self.instructions.as_deref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                session.subscribe_resource(params.uri);
-                Ok(serde_json::json!({}))
+                "initialized" => {
+                    // Notification, no response needed (but we send empty ok)
+                    Ok(serde_json::Value::Null)
+                }
+                "notifications/cancelled" => {
+                    let params: CancelledParams = parse_params(params)?;
+                    self.handle_cancelled_notification(params);
+                    Ok(serde_json::Value::Null)
+                }
+                "logging/setLevel" => {
+                    let params: SetLogLevelParams = parse_params(params)?;
+                    self.handle_set_log_level(session, params);
+                    Ok(serde_json::Value::Null)
+                }
+                "tools/list" => {
+                    let params: ListToolsParams = parse_params_or_default(params)?;
+                    let result =
+                        self.router
+                            .handle_tools_list(cx, params, Some(session.state()))?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "tools/call" => {
+                    let params: CallToolParams = parse_params(params)?;
+                    let result = self.router.handle_tools_call(
+                        cx,
+                        request_id,
+                        params,
+                        budget,
+                        session.state().clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "resources/list" => {
+                    let params: ListResourcesParams = parse_params_or_default(params)?;
+                    let result =
+                        self.router
+                            .handle_resources_list(cx, params, Some(session.state()))?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "resources/templates/list" => {
+                    let params: ListResourceTemplatesParams = parse_params_or_default(params)?;
+                    let result = self.router.handle_resource_templates_list(
+                        cx,
+                        params,
+                        Some(session.state()),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "resources/read" => {
+                    let params: ReadResourceParams = parse_params(params)?;
+                    let result = self.router.handle_resources_read(
+                        cx,
+                        request_id,
+                        &params,
+                        budget,
+                        session.state().clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "resources/subscribe" => {
+                    let params: SubscribeResourceParams = parse_params(params)?;
+                    if !self.router.resource_exists(&params.uri) {
+                        return Err(McpError::resource_not_found(&params.uri));
+                    }
+                    session.subscribe_resource(params.uri);
+                    Ok(serde_json::json!({}))
+                }
+                "resources/unsubscribe" => {
+                    let params: UnsubscribeResourceParams = parse_params(params)?;
+                    session.unsubscribe_resource(&params.uri);
+                    Ok(serde_json::json!({}))
+                }
+                "prompts/list" => {
+                    let params: ListPromptsParams = parse_params_or_default(params)?;
+                    let result =
+                        self.router
+                            .handle_prompts_list(cx, params, Some(session.state()))?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "prompts/get" => {
+                    let params: GetPromptParams = parse_params(params)?;
+                    let result = self.router.handle_prompts_get(
+                        cx,
+                        request_id,
+                        params,
+                        budget,
+                        session.state().clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "ping" => {
+                    // Simple ping-pong for health checks
+                    Ok(serde_json::json!({}))
+                }
+                // Task methods (Docket/SEP-1686)
+                "tasks/list" => {
+                    let params: ListTasksParams = parse_params_or_default(params)?;
+                    let result =
+                        self.router
+                            .handle_tasks_list(cx, params, self.task_manager.as_ref())?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "tasks/get" => {
+                    let params: GetTaskParams = parse_params(params)?;
+                    let result =
+                        self.router
+                            .handle_tasks_get(cx, params, self.task_manager.as_ref())?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "tasks/cancel" => {
+                    let params: CancelTaskParams = parse_params(params)?;
+                    let result =
+                        self.router
+                            .handle_tasks_cancel(cx, params, self.task_manager.as_ref())?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "tasks/submit" => {
+                    let params: SubmitTaskParams = parse_params(params)?;
+                    let result =
+                        self.router
+                            .handle_tasks_submit(cx, params, self.task_manager.as_ref())?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                _ => Err(McpError::method_not_found(method)),
             }
-            "resources/unsubscribe" => {
-                let params: UnsubscribeResourceParams = parse_params(params)?;
-                session.unsubscribe_resource(&params.uri);
-                Ok(serde_json::json!({}))
-            }
-            "prompts/list" => {
-                let params: ListPromptsParams = parse_params_or_default(params)?;
-                let result = self
-                    .router
-                    .handle_prompts_list(cx, params, Some(session.state()))?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "prompts/get" => {
-                let params: GetPromptParams = parse_params(params)?;
-                let result = self.router.handle_prompts_get(
-                    cx,
-                    request_id,
-                    params,
-                    budget,
-                    session.state().clone(),
-                    Some(notification_sender),
-                    bidirectional_senders.as_ref(),
-                )?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "ping" => {
-                // Simple ping-pong for health checks
-                Ok(serde_json::json!({}))
-            }
-            // Task methods (Docket/SEP-1686)
-            "tasks/list" => {
-                let params: ListTasksParams = parse_params_or_default(params)?;
-                let result =
-                    self.router
-                        .handle_tasks_list(cx, params, self.task_manager.as_ref())?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "tasks/get" => {
-                let params: GetTaskParams = parse_params(params)?;
-                let result =
-                    self.router
-                        .handle_tasks_get(cx, params, self.task_manager.as_ref())?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "tasks/cancel" => {
-                let params: CancelTaskParams = parse_params(params)?;
-                let result =
-                    self.router
-                        .handle_tasks_cancel(cx, params, self.task_manager.as_ref())?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            "tasks/submit" => {
-                let params: SubmitTaskParams = parse_params(params)?;
-                let result =
-                    self.router
-                        .handle_tasks_submit(cx, params, self.task_manager.as_ref())?;
-                Ok(serde_json::to_value(result).map_err(McpError::from)?)
-            }
-            _ => Err(McpError::method_not_found(method)),
-        };
+        })();
 
         let final_result = match result {
             Ok(v) => self.apply_middleware_response(&entered_middleware, &mw_ctx, &request, v),
             Err(e) => Err(self.apply_middleware_error(&entered_middleware, &mw_ctx, &request, e)),
         };
 
-        self.maybe_emit_log_notification(session, notification_sender, method, &final_result);
+        self.maybe_emit_log_notification(
+            session,
+            notification_sender,
+            &request.method,
+            &final_result,
+        );
 
         final_result
     }

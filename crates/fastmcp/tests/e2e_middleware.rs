@@ -448,7 +448,6 @@ fn middleware_short_circuit_still_runs_entered_response_stack() {
                 serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
             );
             panic!("unexpected tool error: {e:?}");
-            Vec::new()
         }
     };
     let text = first_text(&contents).unwrap_or_default();
@@ -577,7 +576,6 @@ fn middleware_response_transformation_is_observable_in_client() {
                 serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
             );
             panic!("unexpected tool error: {e:?}");
-            Vec::new()
         }
     };
     let text = first_text(&contents).unwrap_or_default();
@@ -623,7 +621,6 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
                 serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
             );
             panic!("unexpected tool error: {e:?}");
-            String::new()
         }
     };
 
@@ -638,7 +635,6 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
                 serde_json::json!({"message": e.message, "code": i32::from(e.code)}),
             );
             panic!("unexpected tool error: {e:?}");
-            String::new()
         }
     };
 
