@@ -474,7 +474,7 @@ async fn critical_write(ctx: &McpContext, data: String) -> String {
 | **Nightly Required** | Uses Rust 2024 edition features |
 | **Network Transports** | SSE and WebSocket transports are implemented at the transport layer, but HTTP/WS server integration is external |
 | **No Built-in TLS** | Transport encryption must be handled externally |
-| **Single-threaded Loop** | Main server loop is sequential (parallel handlers planned) |
+| **Single-threaded Loop** | Main server loop is sequential |
 | **Sibling Dependency** | Requires asupersync at `../asupersync` |
 | **Early Development** | API may change before 1.0 |
 

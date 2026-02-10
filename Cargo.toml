@@ -59,6 +59,10 @@ dirs = "6"
 # Cryptographic RNG (for WebSocket masking)
 getrandom = "0.3"
 
+# Cryptography (OAuth PKCE, OIDC signing)
+sha2 = "0.10.8"
+hmac = "0.12.1"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 

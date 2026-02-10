@@ -737,11 +737,14 @@ dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
  "fastmcp-transport",
+ "getrandom 0.3.4",
+ "hmac",
  "jsonwebtoken",
  "log",
  "redis",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1457,6 +1460,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1803,10 +1816,12 @@ dependencies = [
  "lru",
  "num-rational",
  "once_cell",
+ "os_pipe",
  "pulldown-cmark",
  "regex",
  "serde_json",
  "smallvec",
+ "stdio-override",
  "syntect",
  "time",
  "unicode-width",
@@ -2182,6 +2197,16 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stdio-override"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffa8a2e517b4e9f270c47e1c4120df90506d9451c1efa67e3698d66446d30ce"
+dependencies = [
+ "libc",
+ "winapi",
+]
 
 [[package]]
 name = "strip-ansi-escapes"

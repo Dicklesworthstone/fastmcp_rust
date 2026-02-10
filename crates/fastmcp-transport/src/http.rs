@@ -309,6 +309,12 @@ pub enum HttpError {
     InvalidMethod(String),
     /// Invalid Content-Type.
     InvalidContentType(String),
+    /// HTTP headers exceeded the maximum allowed size.
+    HeadersTooLarge { size: usize, max: usize },
+    /// HTTP body exceeded the maximum allowed size.
+    BodyTooLarge { size: usize, max: usize },
+    /// Unsupported Transfer-Encoding.
+    UnsupportedTransferEncoding(String),
     /// JSON parsing error.
     JsonError(serde_json::Error),
     /// Codec error.
@@ -326,6 +332,13 @@ impl std::fmt::Display for HttpError {
         match self {
             Self::InvalidMethod(m) => write!(f, "invalid HTTP method: {}", m),
             Self::InvalidContentType(ct) => write!(f, "invalid content type: {}", ct),
+            Self::HeadersTooLarge { size, max } => {
+                write!(f, "headers too large: {size} > {max} bytes")
+            }
+            Self::BodyTooLarge { size, max } => write!(f, "body too large: {size} > {max} bytes"),
+            Self::UnsupportedTransferEncoding(te) => {
+                write!(f, "unsupported transfer encoding: {}", te)
+            }
             Self::JsonError(e) => write!(f, "JSON error: {}", e),
             Self::CodecError(e) => write!(f, "codec error: {}", e),
             Self::Timeout => write!(f, "request timeout"),
@@ -463,11 +476,10 @@ impl HttpRequestHandler {
 
         // Validate body size
         if request.body.len() > self.config.max_body_size {
-            return Err(HttpError::InvalidContentType(format!(
-                "body size {} exceeds limit {}",
-                request.body.len(),
-                self.config.max_body_size
-            )));
+            return Err(HttpError::BodyTooLarge {
+                size: request.body.len(),
+                max: self.config.max_body_size,
+            });
         }
 
         // Parse JSON-RPC request
@@ -550,10 +562,10 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
     }
 
     /// Reads an HTTP request from the reader.
-    ///
-    /// This is a simplified HTTP parser for demonstration.
-    /// In production, use a proper HTTP parsing library.
     pub fn read_request(&mut self) -> Result<HttpRequest, HttpError> {
+        const MAX_HEADERS_SIZE: usize = 64 * 1024;
+        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
         let mut buffer = Vec::new();
         let mut byte = [0u8; 1];
 
@@ -574,10 +586,11 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             }
 
             // Prevent infinite loops
-            if buffer.len() > 64 * 1024 {
-                return Err(HttpError::InvalidContentType(
-                    "headers too large".to_string(),
-                ));
+            if buffer.len() > MAX_HEADERS_SIZE {
+                return Err(HttpError::HeadersTooLarge {
+                    size: buffer.len(),
+                    max: MAX_HEADERS_SIZE,
+                });
             }
         }
 
@@ -597,7 +610,23 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         let method = HttpMethod::parse(parts[0])
             .ok_or_else(|| HttpError::InvalidMethod(parts[0].to_string()))?;
 
-        let path = parts[1].to_string();
+        let full_path = parts[1];
+        let (path, query_str) = full_path
+            .split_once('?')
+            .map_or((full_path.to_string(), None), |(p, q)| {
+                (p.to_string(), Some(q))
+            });
+
+        let mut query = HashMap::new();
+        if let Some(qs) = query_str {
+            for pair in qs.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                query.insert(k.to_string(), v.to_string());
+            }
+        }
 
         // Parse headers
         let mut headers = HashMap::new();
@@ -610,17 +639,121 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             }
         }
 
-        // Read body if Content-Length is present
-        let content_length: usize = headers
-            .get("content-length")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Read body.
+        //
+        // We support Content-Length or Transfer-Encoding: chunked. This is sufficient for MCP's
+        // JSON-RPC-over-HTTP payloads and avoids pulling in a full HTTP server stack here.
+        let mut body = Vec::new();
 
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            self.reader
-                .read_exact(&mut body)
-                .map_err(|e| HttpError::Transport(e.into()))?;
+        if let Some(te) = headers.get("transfer-encoding") {
+            if te.to_ascii_lowercase().contains("chunked") {
+                // Chunked transfer encoding
+                loop {
+                    // Read chunk size line (hex), terminated by CRLF.
+                    let mut line = Vec::new();
+                    loop {
+                        if self
+                            .reader
+                            .read(&mut byte)
+                            .map_err(|e| HttpError::Transport(e.into()))?
+                            == 0
+                        {
+                            return Err(HttpError::Closed);
+                        }
+                        line.push(byte[0]);
+                        if line.ends_with(b"\r\n") {
+                            break;
+                        }
+                        if line.len() > 1024 {
+                            return Err(HttpError::InvalidMethod(
+                                "invalid chunk size line".to_string(),
+                            ));
+                        }
+                    }
+
+                    let line_str = String::from_utf8_lossy(&line);
+                    let size_str = line_str.trim().split(';').next().unwrap_or("");
+                    let size = usize::from_str_radix(size_str, 16)
+                        .map_err(|_| HttpError::InvalidMethod("invalid chunk size".to_string()))?;
+
+                    if size == 0 {
+                        // Read and discard trailer headers until CRLF.
+                        let mut trailer = Vec::new();
+                        loop {
+                            trailer.clear();
+                            loop {
+                                if self
+                                    .reader
+                                    .read(&mut byte)
+                                    .map_err(|e| HttpError::Transport(e.into()))?
+                                    == 0
+                                {
+                                    return Err(HttpError::Closed);
+                                }
+                                trailer.push(byte[0]);
+                                if trailer.ends_with(b"\r\n") {
+                                    break;
+                                }
+                                if trailer.len() > MAX_HEADERS_SIZE {
+                                    return Err(HttpError::HeadersTooLarge {
+                                        size: trailer.len(),
+                                        max: MAX_HEADERS_SIZE,
+                                    });
+                                }
+                            }
+                            if trailer == b"\r\n" {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+
+                    let mut chunk = vec![0u8; size];
+                    self.reader
+                        .read_exact(&mut chunk)
+                        .map_err(|e| HttpError::Transport(e.into()))?;
+                    body.extend_from_slice(&chunk);
+                    if body.len() > MAX_BODY_SIZE {
+                        return Err(HttpError::BodyTooLarge {
+                            size: body.len(),
+                            max: MAX_BODY_SIZE,
+                        });
+                    }
+
+                    // Consume trailing CRLF after the chunk.
+                    let mut crlf = [0u8; 2];
+                    self.reader
+                        .read_exact(&mut crlf)
+                        .map_err(|e| HttpError::Transport(e.into()))?;
+                    if &crlf != b"\r\n" {
+                        return Err(HttpError::InvalidMethod(
+                            "invalid chunk terminator".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(HttpError::UnsupportedTransferEncoding(te.clone()));
+            }
+        } else {
+            // Content-Length (if present)
+            let content_length: usize = headers
+                .get("content-length")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            if content_length > MAX_BODY_SIZE {
+                return Err(HttpError::BodyTooLarge {
+                    size: content_length,
+                    max: MAX_BODY_SIZE,
+                });
+            }
+
+            body.resize(content_length, 0);
+            if content_length > 0 {
+                self.reader
+                    .read_exact(&mut body)
+                    .map_err(|e| HttpError::Transport(e.into()))?;
+            }
         }
 
         Ok(HttpRequest {
@@ -628,7 +761,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             path,
             headers,
             body,
-            query: HashMap::new(),
+            query,
         })
     }
 
@@ -1190,6 +1323,44 @@ mod tests {
         assert_eq!(id1.len(), 16);
     }
 
+    #[test]
+    fn test_http_transport_read_request_chunked_body_and_query() {
+        use std::io::Cursor;
+
+        let body = br#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+        let body1 = &body[..10];
+        let body2 = &body[10..];
+
+        let raw = format!(
+            "POST /mcp/v1?foo=bar&x=y HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Type: application/json\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+{:x}\r\n\
+{}\r\n\
+{:x}\r\n\
+{}\r\n\
+0\r\n\
+\r\n",
+            body1.len(),
+            std::str::from_utf8(body1).unwrap(),
+            body2.len(),
+            std::str::from_utf8(body2).unwrap(),
+        );
+
+        let reader = Cursor::new(raw.into_bytes());
+        let mut output = Vec::new();
+        let mut transport = HttpTransport::new(reader, &mut output);
+
+        let req = transport.read_request().unwrap();
+        assert_eq!(req.method, HttpMethod::Post);
+        assert_eq!(req.path, "/mcp/v1");
+        assert_eq!(req.query.get("foo"), Some(&"bar".to_string()));
+        assert_eq!(req.query.get("x"), Some(&"y".to_string()));
+        assert_eq!(req.body, body);
+    }
+
     // =========================================================================
     // E2E HTTP Transport Tests (bd-2kv / bd-3fq1)
     // =========================================================================
@@ -1465,7 +1636,6 @@ mod tests {
             .with_body(large_body);
 
         let result = handler.parse_request(&request);
-        // The error message contains "body size"
-        assert!(matches!(result, Err(HttpError::InvalidContentType(_))));
+        assert!(matches!(result, Err(HttpError::BodyTooLarge { .. })));
     }
 }

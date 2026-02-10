@@ -856,7 +856,7 @@ impl OidcProvider {
         let signing_input = format!("{}.{}", header_b64, claims_b64);
 
         let signature = match &key {
-            SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret),
+            SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret)?,
             SigningKey::None => {
                 return Err(OidcError::SigningError(
                     "no signing key configured".to_string(),
@@ -885,7 +885,7 @@ impl OidcProvider {
 
                 // Double-check after acquiring write lock
                 if matches!(&*write_guard, SigningKey::None) {
-                    let key = generate_random_bytes(32);
+                    let key = generate_random_bytes(32)?;
                     *write_guard = SigningKey::Hmac(key.clone());
                     Ok(SigningKey::Hmac(key))
                 } else {
@@ -921,84 +921,39 @@ impl OidcProvider {
 
 /// Base64url encodes bytes (no padding).
 fn base64url_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-    let mut result = String::with_capacity((data.len() * 4 + 2) / 3);
-    let mut i = 0;
-
-    while i + 2 < data.len() {
-        let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8) | u32::from(data[i + 2]);
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-        result.push(ALPHABET[n as usize & 0x3F] as char);
-        i += 3;
-    }
-
-    if i + 1 == data.len() {
-        let n = u32::from(data[i]) << 16;
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-    } else if i + 2 == data.len() {
-        let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8);
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-    }
-
-    result
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Simple SHA-256 (for demonstration - use a real crypto library in production).
 fn simple_sha256(data: &[u8]) -> [u8; 32] {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut result = [0u8; 32];
-    let state = RandomState::new();
-
-    for (i, chunk) in result.chunks_mut(8).enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write(data);
-        hasher.write_usize(i);
-        let hash = hasher.finish().to_le_bytes();
-        chunk.copy_from_slice(&hash[..chunk.len()]);
-    }
-
-    result
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
-/// HMAC-SHA256 (simplified - use a real crypto library in production).
-fn hmac_sha256(message: &str, key: &[u8]) -> [u8; 32] {
-    // This is a simplified HMAC for demonstration.
-    // In production, use ring, hmac, or similar crates.
-    let mut combined = Vec::with_capacity(key.len() + message.len());
-    combined.extend_from_slice(key);
-    combined.extend_from_slice(message.as_bytes());
-    simple_sha256(&combined)
+fn hmac_sha256(message: &str, key: &[u8]) -> Result<[u8; 32], OidcError> {
+    use hmac::Mac;
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|e| OidcError::SigningError(format!("invalid HMAC key: {e}")))?;
+    mac.update(message.as_bytes());
+
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Generates random bytes.
-fn generate_random_bytes(len: usize) -> Vec<u8> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut result = Vec::with_capacity(len);
-    let state = RandomState::new();
-
-    for i in 0..len {
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(i);
-        hasher.write_u128(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        );
-        result.push((hasher.finish() & 0xFF) as u8);
-    }
-
-    result
+fn generate_random_bytes(len: usize) -> Result<Vec<u8>, OidcError> {
+    let mut buf = vec![0u8; len];
+    getrandom::fill(&mut buf)
+        .map_err(|e| OidcError::SigningError(format!("secure random generation failed: {e}")))?;
+    Ok(buf)
 }
 
 // =============================================================================

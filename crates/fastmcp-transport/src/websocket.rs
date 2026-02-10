@@ -622,11 +622,16 @@ impl<W: Write> WsClientWriter<W> {
     /// Generates a cryptographically secure mask key.
     ///
     /// RFC 6455 Section 5.3: The masking key MUST be unpredictable.
-    fn generate_mask() -> [u8; 4] {
+    fn generate_mask() -> Result<[u8; 4], TransportError> {
         let mut mask = [0u8; 4];
         // Use CSPRNG for unpredictable mask keys per RFC 6455
-        getrandom::fill(&mut mask).expect("getrandom should never fail on supported platforms");
-        mask
+        getrandom::fill(&mut mask).map_err(|e| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("getrandom failed: {e}"),
+            ))
+        })?;
+        Ok(mask)
     }
 
     /// Writes a WebSocket frame with client masking.
@@ -654,7 +659,7 @@ impl<W: Write> WsClientWriter<W> {
         }
 
         // Write mask key (cryptographically random per RFC 6455)
-        let mask = Self::generate_mask();
+        let mask = Self::generate_mask()?;
         self.writer.write_all(&mask)?;
 
         // Write masked payload

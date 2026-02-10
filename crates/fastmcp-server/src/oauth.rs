@@ -52,7 +52,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult};
 
@@ -805,7 +805,7 @@ impl OAuthServer {
         }
 
         // Generate authorization code
-        let code_value = generate_token(self.config.token_entropy_bytes);
+        let code_value = generate_token(self.config.token_entropy_bytes)?;
         let now = Instant::now();
         let code = AuthorizationCode {
             code: code_value.clone(),
@@ -1014,7 +1014,7 @@ impl OAuthServer {
 
         // Issue new access token (keep same refresh token)
         let now = Instant::now();
-        let access_token_value = generate_token(self.config.token_entropy_bytes);
+        let access_token_value = generate_token(self.config.token_entropy_bytes)?;
         let access_token = OAuthToken {
             token: access_token_value.clone(),
             token_type: TokenType::Bearer,
@@ -1059,7 +1059,7 @@ impl OAuthServer {
         let now = Instant::now();
 
         // Generate access token
-        let access_token_value = generate_token(self.config.token_entropy_bytes);
+        let access_token_value = generate_token(self.config.token_entropy_bytes)?;
         let access_token = OAuthToken {
             token: access_token_value.clone(),
             token_type: TokenType::Bearer,
@@ -1072,7 +1072,7 @@ impl OAuthServer {
         };
 
         // Generate refresh token
-        let refresh_token_value = generate_token(self.config.token_entropy_bytes);
+        let refresh_token_value = generate_token(self.config.token_entropy_bytes)?;
         let refresh_token = OAuthToken {
             token: refresh_token_value.clone(),
             token_type: TokenType::Bearer,
@@ -1307,89 +1307,27 @@ impl TokenVerifier for OAuthTokenVerifier {
 // =============================================================================
 
 /// Generates a cryptographically secure random token.
-fn generate_token(bytes: usize) -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+fn generate_token(bytes: usize) -> Result<String, OAuthError> {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf)
+        .map_err(|e| OAuthError::ServerError(format!("secure random generation failed: {e}")))?;
 
-    // Use system randomness via multiple hash iterations
-    let mut result = Vec::with_capacity(bytes * 2);
-    let state = RandomState::new();
-
-    for i in 0..bytes {
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(i);
-        hasher.write_u128(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        );
-        let hash = hasher.finish();
-        result.extend_from_slice(&hash.to_le_bytes()[..2]);
-    }
-
-    // Base64url encode (URL-safe, no padding)
-    base64url_encode(&result[..bytes])
+    // Base64url encode (URL-safe, no padding).
+    Ok(base64url_encode(&buf))
 }
 
 /// Base64url encodes bytes (URL-safe, no padding).
 fn base64url_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-    let mut result = String::with_capacity((data.len() * 4).div_ceil(3));
-    let mut i = 0;
-
-    while i + 2 < data.len() {
-        let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8) | u32::from(data[i + 2]);
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-        result.push(ALPHABET[n as usize & 0x3F] as char);
-        i += 3;
-    }
-
-    if i + 1 == data.len() {
-        let n = u32::from(data[i]) << 16;
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-    } else if i + 2 == data.len() {
-        let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8);
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-    }
-
-    result
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.encode(data)
 }
 
 /// Computes S256 code challenge from a verifier.
 fn compute_s256_challenge(verifier: &str) -> String {
-    // Simple SHA-256 implementation for PKCE
-    // In production, use a proper crypto library
-    let hash = simple_sha256(verifier.as_bytes());
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(verifier.as_bytes());
     base64url_encode(&hash)
-}
-
-/// Simple SHA-256 implementation (for PKCE code challenge).
-/// Note: In production, use a proper cryptographic library.
-fn simple_sha256(data: &[u8]) -> [u8; 32] {
-    // This is a simplified hash for demonstration.
-    // In a real implementation, use ring, sha2, or similar.
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut result = [0u8; 32];
-    let state = RandomState::new();
-
-    for (i, chunk) in result.chunks_mut(8).enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write(data);
-        hasher.write_usize(i);
-        let hash = hasher.finish().to_le_bytes();
-        chunk.copy_from_slice(&hash[..chunk.len()]);
-    }
-
-    result
 }
 
 /// URL-encodes a string.
@@ -1615,8 +1553,8 @@ mod tests {
 
     #[test]
     fn test_token_generation() {
-        let token1 = generate_token(32);
-        let token2 = generate_token(32);
+        let token1 = generate_token(32).unwrap();
+        let token2 = generate_token(32).unwrap();
 
         // Tokens should be unique
         assert_ne!(token1, token2);
