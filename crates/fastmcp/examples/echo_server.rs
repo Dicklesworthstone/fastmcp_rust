@@ -15,6 +15,7 @@
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
+use fastmcp_rust::TaskManager;
 use fastmcp_rust::prelude::*;
 
 // ============================================================================
@@ -138,6 +139,8 @@ fn main() {
         .instructions(
             "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!",
         )
+        // Enable background task capability for CLI task-management E2E tests.
+        .with_task_manager(TaskManager::new().into_shared())
         // Build and run on stdio
         .build()
         .run_stdio();

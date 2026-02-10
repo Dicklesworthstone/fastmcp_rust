@@ -33,6 +33,29 @@ fn stderr_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+#[cfg(unix)]
+fn inspect_echo_server(format: &str) -> Output {
+    run_cli(&[
+        "inspect",
+        "-f",
+        format,
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ])
+}
+
+#[cfg(unix)]
+fn inspect_json_stdout(output: &Output) -> serde_json::Value {
+    let stdout = stdout_str(output);
+    serde_json::from_str(&stdout).expect("inspect output should be valid JSON")
+}
+
 // =============================================================================
 // Help Command Tests
 // =============================================================================
@@ -296,6 +319,181 @@ fn e2e_cli_inspect_missing_server_fails() {
     assert!(!output.status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_text_lists_server_capabilities_and_items() {
+    let output = inspect_echo_server("text");
+    assert!(
+        output.status.success(),
+        "inspect text should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+
+    let stdout = stdout_str(&output);
+    assert!(stdout.contains("Server: echo-server v1.0.0"));
+    assert!(stdout.contains("Capabilities: tools=true resources=true prompts=true"));
+
+    assert!(stdout.contains("Tools (4):"));
+    assert!(stdout.contains("  - echo: Echo the input message back."));
+    assert!(stdout.contains("  - add: Calculate the sum of two numbers"));
+    assert!(stdout.contains("  - reverse: Reverse a string."));
+    assert!(stdout.contains("  - word_count: Count the number of words in text"));
+
+    assert!(stdout.contains("Resources (2):"));
+    assert!(stdout.contains("  - info://server"));
+    assert!(stdout.contains("  - info://time"));
+
+    assert!(stdout.contains("Prompts (2):"));
+    assert!(stdout.contains("  - greeting: Generate a friendly greeting"));
+    assert!(stdout.contains("  - review_code: A code review prompt."));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_json_lists_tools_resources_and_prompts() {
+    let output = inspect_echo_server("json");
+    assert!(
+        output.status.success(),
+        "inspect json should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+
+    let json = inspect_json_stdout(&output);
+
+    assert_eq!(json["server"]["name"], "echo-server");
+    assert_eq!(json["server"]["version"], "1.0.0");
+    assert_eq!(json["capabilities"]["tools"], true);
+    assert_eq!(json["capabilities"]["resources"], true);
+    assert_eq!(json["capabilities"]["prompts"], true);
+
+    let tools = json["tools"]
+        .as_array()
+        .expect("tools should be an array in inspect json");
+    assert!(tools.iter().any(|tool| tool["name"] == "echo"));
+    assert!(tools.iter().any(|tool| tool["name"] == "add"));
+    assert!(tools.iter().any(|tool| tool["name"] == "reverse"));
+    assert!(tools.iter().any(|tool| tool["name"] == "word_count"));
+
+    let resources = json["resources"]
+        .as_array()
+        .expect("resources should be an array in inspect json");
+    assert!(
+        resources
+            .iter()
+            .any(|resource| resource["uri"] == "info://server")
+    );
+    assert!(
+        resources
+            .iter()
+            .any(|resource| resource["uri"] == "info://time")
+    );
+
+    let prompts = json["prompts"]
+        .as_array()
+        .expect("prompts should be an array in inspect json");
+    assert!(prompts.iter().any(|prompt| prompt["name"] == "greeting"));
+    assert!(prompts.iter().any(|prompt| prompt["name"] == "review_code"));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_mcp_format_outputs_json_payload() {
+    let output = inspect_echo_server("mcp");
+    assert!(
+        output.status.success(),
+        "inspect mcp should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+
+    let json = inspect_json_stdout(&output);
+    assert_eq!(json["server"]["name"], "echo-server");
+    assert!(
+        json["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert!(
+        json["resources"]
+            .as_array()
+            .is_some_and(|resources| !resources.is_empty())
+    );
+    assert!(
+        json["prompts"]
+            .as_array()
+            .is_some_and(|prompts| !prompts.is_empty())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_output_file_writes_payload() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current time should be after epoch")
+        .as_nanos();
+    let output_path = std::env::temp_dir().join(format!(
+        "fastmcp-cli-inspect-output-{}-{nanos}.json",
+        std::process::id()
+    ));
+
+    let output = run_cli(&[
+        "inspect",
+        "-f",
+        "json",
+        "-o",
+        output_path
+            .to_str()
+            .expect("temp output path should be valid utf-8"),
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "inspect with output file should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+    assert_eq!(
+        stdout_str(&output).trim(),
+        "",
+        "stdout should be empty when --output is used"
+    );
+
+    let contents = std::fs::read_to_string(&output_path)
+        .expect("inspect --output should create and populate output file");
+    let json: serde_json::Value =
+        serde_json::from_str(&contents).expect("output file should contain valid json");
+    assert_eq!(json["server"]["name"], "echo-server");
+    assert!(
+        json["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+}
+
+#[test]
+fn e2e_cli_inspect_unreachable_server_fails_with_error() {
+    let output = run_cli(&["inspect", "definitely_missing_server_command_abc123"]);
+
+    assert!(!output.status.success());
+
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("Failed to spawn subprocess")
+            || stderr.contains("No such file")
+            || stderr.contains("not found"),
+        "inspect unreachable server should explain spawn failure; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn e2e_cli_install_missing_args_fails() {
     let output = run_cli(&["install"]);
@@ -322,6 +520,182 @@ fn e2e_cli_tasks_missing_subcommand_fails() {
     let output = run_cli(&["tasks"]);
 
     assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_list_against_echo_server_succeeds() {
+    let output = run_cli(&[
+        "tasks",
+        "list",
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "tasks list should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+    assert!(
+        stdout_str(&output).contains("No tasks found."),
+        "expected empty task list output, got stdout: {}",
+        stdout_str(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_list_json_against_echo_server_outputs_array() {
+    let output = run_cli(&[
+        "tasks",
+        "list",
+        "--json",
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "tasks list --json should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+
+    let stdout = stdout_str(&output);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("tasks list --json should produce valid json");
+    assert_eq!(
+        json.as_array().map(std::vec::Vec::len),
+        Some(0),
+        "expected empty task array for fresh echo server"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_list_with_status_filter_succeeds() {
+    let output = run_cli(&[
+        "tasks",
+        "list",
+        "--status",
+        "pending",
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "tasks list --status pending should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+    assert!(stdout_str(&output).contains("No tasks found."));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_stats_json_against_echo_server_outputs_zero_counts() {
+    let output = run_cli(&[
+        "tasks",
+        "stats",
+        "--json",
+        "cargo",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "tasks stats --json should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+
+    let stdout = stdout_str(&output);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("tasks stats --json should produce valid json");
+    for key in [
+        "total",
+        "active",
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+    ] {
+        assert_eq!(json[key], 0, "expected {key} to be 0 for fresh echo server");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_show_unknown_id_fails_with_not_found_error() {
+    let output = run_cli(&[
+        "tasks",
+        "show",
+        "cargo",
+        "task-999",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_str(&output).contains("Task not found"),
+        "expected task-not-found error, stderr: {}",
+        stderr_str(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_tasks_cancel_unknown_id_fails_with_not_found_error() {
+    let output = run_cli(&[
+        "tasks",
+        "cancel",
+        "cargo",
+        "task-999",
+        "--",
+        "run",
+        "-q",
+        "-p",
+        "fastmcp-rust",
+        "--example",
+        "echo_server",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_str(&output).contains("Task not found"),
+        "expected task-not-found error, stderr: {}",
+        stderr_str(&output)
+    );
 }
 
 // =============================================================================
