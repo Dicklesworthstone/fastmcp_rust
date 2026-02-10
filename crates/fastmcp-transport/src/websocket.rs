@@ -1335,21 +1335,24 @@ mod tests {
             // Receive and process each request
             for expected_id in 1..=3 {
                 let msg = transport.recv(&cx).unwrap();
-                match msg {
-                    JsonRpcMessage::Request(req) => {
-                        assert_eq!(req.id, Some(RequestId::Number(expected_id)));
+                assert!(
+                    matches!(msg, JsonRpcMessage::Request(_)),
+                    "Expected request"
+                );
+                let JsonRpcMessage::Request(req) = msg else {
+                    return;
+                };
 
-                        // Send response
-                        let response = JsonRpcResponse {
-                            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                            result: Some(serde_json::json!({"ok": true})),
-                            error: None,
-                            id: req.id,
-                        };
-                        transport.send_response(&cx, &response).unwrap();
-                    }
-                    _ => panic!("Expected request"),
-                }
+                assert_eq!(req.id, Some(RequestId::Number(expected_id)));
+
+                // Send response
+                let response = JsonRpcResponse {
+                    jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                    result: Some(serde_json::json!({"ok": true})),
+                    error: None,
+                    id: req.id,
+                };
+                transport.send_response(&cx, &response).unwrap();
             }
         }
 
@@ -1382,14 +1385,16 @@ mod tests {
         let mut transport = WsTransport::new(Cursor::new(buffer), writer);
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-                let params = req.params.unwrap();
-                assert_eq!(params.get("data").unwrap(), "hello world");
-            }
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        assert_eq!(req.method, "test");
+        let params = req.params.unwrap();
+        assert_eq!(params.get("data").unwrap(), "hello world");
     }
 
     #[test]
@@ -1427,11 +1432,14 @@ mod tests {
         // Should receive all 3 messages, with pings handled automatically
         for i in 1..=3 {
             let msg = transport.recv(&cx).unwrap();
-            if let JsonRpcMessage::Request(req) = msg {
-                assert_eq!(req.method, format!("msg{i}"));
-            } else {
-                panic!("Expected request");
-            }
+            assert!(
+                matches!(msg, JsonRpcMessage::Request(_)),
+                "Expected request"
+            );
+            let JsonRpcMessage::Request(req) = msg else {
+                return;
+            };
+            assert_eq!(req.method, format!("msg{i}"));
         }
 
         // Verify pongs were sent - the response buffer should contain pong frames
@@ -1516,15 +1524,18 @@ mod tests {
         let mut transport = WsTransport::new(Cursor::new(buffer), writer);
 
         let msg = transport.recv(&cx).unwrap();
-        if let JsonRpcMessage::Request(req) = msg {
-            let params = req.params.unwrap();
-            let text = params.get("text").unwrap().as_str().unwrap();
-            assert!(text.contains("世界"));
-            assert!(text.contains("👋"));
-            assert!(text.contains("éèê"));
-        } else {
-            panic!("Expected request");
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        let params = req.params.unwrap();
+        let text = params.get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("世界"));
+        assert!(text.contains("👋"));
+        assert!(text.contains("éèê"));
     }
 
     #[test]
@@ -1570,12 +1581,15 @@ mod tests {
                 WsClientTransport::new(Cursor::new(server_response), Vec::<u8>::new());
 
             let msg = transport.recv(&cx).unwrap();
-            if let JsonRpcMessage::Response(resp) = msg {
-                assert_eq!(resp.id, Some(RequestId::Number(1)));
-                assert!(resp.result.is_some());
-            } else {
-                panic!("Expected response");
-            }
+            assert!(
+                matches!(msg, JsonRpcMessage::Response(_)),
+                "Expected response"
+            );
+            let JsonRpcMessage::Response(resp) = msg else {
+                return;
+            };
+            assert_eq!(resp.id, Some(RequestId::Number(1)));
+            assert!(resp.result.is_some());
         }
     }
 }

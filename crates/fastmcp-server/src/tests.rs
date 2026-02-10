@@ -5148,10 +5148,14 @@ mod handler_direct_tests {
         assert!(result.is_ok());
         let contents = result.unwrap();
         assert_eq!(contents.len(), 1);
-        match &contents[0] {
-            Content::Text { text } => assert_eq!(text, "Hello, Alice!"),
-            _ => panic!("Expected text content"),
-        }
+        assert!(
+            matches!(contents[0], Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &contents[0] else {
+            return;
+        };
+        assert_eq!(text, "Hello, Alice!");
     }
 
     #[test]
@@ -5160,10 +5164,15 @@ mod handler_direct_tests {
         let ctx = test_ctx();
         let result = tool.call(&ctx, serde_json::json!({}));
         assert!(result.is_ok());
-        match &result.unwrap()[0] {
-            Content::Text { text } => assert_eq!(text, "Hello, World!"),
-            _ => panic!("Expected text content"),
-        }
+        let content = result.unwrap();
+        assert!(
+            matches!(content[0], Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &content[0] else {
+            return;
+        };
+        assert_eq!(text, "Hello, World!");
     }
 
     #[test]
@@ -5476,10 +5485,14 @@ mod handler_direct_tests {
         assert!(result.is_ok());
         let messages = result.unwrap();
         assert_eq!(messages.len(), 1);
-        match &messages[0].content {
-            Content::Text { text } => assert!(text.contains("Bob")),
-            _ => panic!("Expected text content"),
-        }
+        assert!(
+            matches!(messages[0].content, Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &messages[0].content else {
+            return;
+        };
+        assert!(text.contains("Bob"));
     }
 
     #[test]
@@ -5524,10 +5537,15 @@ mod handler_direct_tests {
         let args = HashMap::new(); // no "name" argument
         let result = prompt.get(&ctx, args);
         assert!(result.is_ok());
-        match &result.unwrap()[0].content {
-            Content::Text { text } => assert!(text.contains("User")),
-            _ => panic!("Expected text content"),
-        }
+        let messages = result.unwrap();
+        assert!(
+            matches!(messages[0].content, Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &messages[0].content else {
+            return;
+        };
+        assert!(text.contains("User"));
     }
 
     // ── MountedToolHandler ───────────────────────────────────────────
@@ -5549,10 +5567,15 @@ mod handler_direct_tests {
         let ctx = test_ctx();
         let result = mounted.call(&ctx, serde_json::json!({"name": "Mounted"}));
         assert!(result.is_ok());
-        match &result.unwrap()[0] {
-            Content::Text { text } => assert_eq!(text, "Hello, Mounted!"),
-            _ => panic!("Expected text content"),
-        }
+        let contents = result.unwrap();
+        assert!(
+            matches!(contents[0], Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &contents[0] else {
+            return;
+        };
+        assert_eq!(text, "Hello, Mounted!");
     }
 
     #[test]
@@ -5645,10 +5668,15 @@ mod handler_direct_tests {
         args.insert("name".to_string(), "MountedUser".to_string());
         let result = mounted.get(&ctx, args);
         assert!(result.is_ok());
-        match &result.unwrap()[0].content {
-            Content::Text { text } => assert!(text.contains("MountedUser")),
-            _ => panic!("Expected text content"),
-        }
+        let messages = result.unwrap();
+        assert!(
+            matches!(messages[0].content, Content::Text { .. }),
+            "Expected text content"
+        );
+        let Content::Text { text } = &messages[0].content else {
+            return;
+        };
+        assert!(text.contains("MountedUser"));
     }
 
     // ── ProgressNotificationSender ───────────────────────────────────

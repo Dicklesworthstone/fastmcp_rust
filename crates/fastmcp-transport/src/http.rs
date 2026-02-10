@@ -1403,24 +1403,27 @@ Transfer-Encoding: chunked\r\n\
 
             // Receive the request
             let msg = transport.recv(&cx).unwrap();
-            match msg {
-                JsonRpcMessage::Request(req) => {
-                    assert_eq!(req.method, "tools/list");
-                    assert_eq!(req.id, Some(RequestId::Number(1)));
+            assert!(
+                matches!(msg, JsonRpcMessage::Request(_)),
+                "Expected request"
+            );
+            let JsonRpcMessage::Request(req) = msg else {
+                return;
+            };
 
-                    // Send response
-                    let response = JsonRpcResponse {
-                        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                        result: Some(serde_json::json!({"tools": []})),
-                        error: None,
-                        id: Some(RequestId::Number(1)),
-                    };
-                    transport
-                        .send(&cx, &JsonRpcMessage::Response(response))
-                        .unwrap();
-                }
-                _ => panic!("Expected request"),
-            }
+            assert_eq!(req.method, "tools/list");
+            assert_eq!(req.id, Some(RequestId::Number(1)));
+
+            // Send response
+            let response = JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"tools": []})),
+                error: None,
+                id: Some(RequestId::Number(1)),
+            };
+            transport
+                .send(&cx, &JsonRpcMessage::Response(response))
+                .unwrap();
         }
 
         // Verify HTTP response

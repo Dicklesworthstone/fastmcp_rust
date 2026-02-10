@@ -615,27 +615,37 @@ mod tests {
 
         // Receive first message
         let msg1 = transport.recv(&cx).unwrap();
-        match msg1 {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "init"),
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg1, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg1 else {
+            return;
+        };
+        assert_eq!(req.method, "init");
 
         // Receive second message
         let msg2 = transport.recv(&cx).unwrap();
-        match msg2 {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "tools/list"),
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg2, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg2 else {
+            return;
+        };
+        assert_eq!(req.method, "tools/list");
 
         // Receive third message
         let msg3 = transport.recv(&cx).unwrap();
-        match msg3 {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "tools/call");
-                assert!(req.params.is_some());
-            }
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg3, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg3 else {
+            return;
+        };
+        assert_eq!(req.method, "tools/call");
+        assert!(req.params.is_some());
 
         // Fourth recv should return EOF (Closed)
         let result = transport.recv(&cx);
@@ -662,13 +672,15 @@ mod tests {
 
         // Receive response
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Response(resp) => {
-                assert!(resp.result.is_some());
-                assert!(resp.error.is_none());
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        let JsonRpcMessage::Response(resp) = msg else {
+            return;
+        };
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
     }
 
     #[test]
@@ -683,16 +695,24 @@ mod tests {
 
         // Should receive both messages despite empty lines
         let msg1 = transport.recv(&cx).unwrap();
-        match msg1 {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test1"),
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg1, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg1 else {
+            return;
+        };
+        assert_eq!(req.method, "test1");
 
         let msg2 = transport.recv(&cx).unwrap();
-        match msg2 {
-            JsonRpcMessage::Request(req) => assert_eq!(req.method, "test2"),
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg2, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg2 else {
+            return;
+        };
+        assert_eq!(req.method, "test2");
     }
 
     #[test]
@@ -706,18 +726,20 @@ mod tests {
         let cx = Cx::for_testing();
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-                let params = req.params.as_ref().unwrap();
-                let message = params.get("message").unwrap().as_str().unwrap();
-                // Contains: éèê中文👋
-                assert!(message.contains("é"));
-                assert!(message.contains("中"));
-                assert!(message.contains("👋"));
-            }
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        assert_eq!(req.method, "test");
+        let params = req.params.as_ref().unwrap();
+        let message = params.get("message").unwrap().as_str().unwrap();
+        // Contains: éèê中文👋
+        assert!(message.contains("é"));
+        assert!(message.contains("中"));
+        assert!(message.contains("👋"));
     }
 
     #[test]
@@ -735,15 +757,17 @@ mod tests {
         let cx = Cx::for_testing();
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "test");
-                let params = req.params.as_ref().unwrap();
-                let data = params.get("data").unwrap().as_str().unwrap();
-                assert_eq!(data.len(), 100_000);
-            }
-            _ => panic!("Expected request"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        assert_eq!(req.method, "test");
+        let params = req.params.as_ref().unwrap();
+        let data = params.get("data").unwrap().as_str().unwrap();
+        assert_eq!(data.len(), 100_000);
     }
 
     #[test]
@@ -757,13 +781,15 @@ mod tests {
         let cx = Cx::for_testing();
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Request(req) => {
-                assert_eq!(req.method, "notifications/initialized");
-                assert!(req.id.is_none());
-            }
-            _ => panic!("Expected request/notification"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "Expected request/notification"
+        );
+        let JsonRpcMessage::Request(req) = msg else {
+            return;
+        };
+        assert_eq!(req.method, "notifications/initialized");
+        assert!(req.id.is_none());
     }
 
     #[test]
@@ -777,16 +803,18 @@ mod tests {
         let cx = Cx::for_testing();
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Response(resp) => {
-                assert!(resp.result.is_none());
-                assert!(resp.error.is_some());
-                let error = resp.error.unwrap();
-                assert_eq!(error.code, -32601);
-                assert_eq!(error.message, "Method not found");
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        let JsonRpcMessage::Response(resp) = msg else {
+            return;
+        };
+        assert!(resp.result.is_none());
+        assert!(resp.error.is_some());
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32601);
+        assert_eq!(error.message, "Method not found");
     }
 
     #[test]
@@ -842,15 +870,17 @@ mod tests {
         let cx = Cx::for_testing();
 
         let msg = transport.recv(&cx).unwrap();
-        match msg {
-            JsonRpcMessage::Response(resp) => {
-                let result = resp.result.unwrap();
-                let tools = result.get("tools").unwrap().as_array().unwrap();
-                assert_eq!(tools.len(), 1);
-                assert_eq!(tools[0].get("name").unwrap(), "tool1");
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(
+            matches!(msg, JsonRpcMessage::Response(_)),
+            "Expected response"
+        );
+        let JsonRpcMessage::Response(resp) = msg else {
+            return;
+        };
+        let result = resp.result.unwrap();
+        let tools = result.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), "tool1");
     }
 
     #[test]
