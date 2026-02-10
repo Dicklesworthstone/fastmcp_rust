@@ -169,6 +169,63 @@ jobs:
       - name: Check all targets
         run: cargo check --all-targets --all-features
 
+  coverage:
+    name: Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: deps/asupersync
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: deps/rich_rust
+
+      - name: Override dependency paths for CI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          data = path.read_text()
+          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
+          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
+          path.write_text(data)
+          PY
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            deps/asupersync -> deps/asupersync/target
+            deps/rich_rust -> deps/rich_rust/target
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Run coverage
+        run: |
+          cargo llvm-cov --all-features --workspace \
+            --lcov --output-path lcov.info \
+            --fail-under-lines 72
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
