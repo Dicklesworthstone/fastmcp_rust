@@ -1104,9 +1104,9 @@ impl Server {
             return None;
         }
 
-        // For success, we need a non-None id (checked above, so unwrap is safe-ish, but let's be correct)
-        // We only reach here if id is Some.
-        let response_id = id.clone().unwrap();
+        // We only reach here if `is_notification` is false, which implies `id` is present.
+        // Use `?` to avoid `unwrap()` and keep the control-flow explicit.
+        let response_id = id.clone()?;
 
         match result {
             Ok(value) => Some(JsonRpcResponse::success(response_id, value)),
