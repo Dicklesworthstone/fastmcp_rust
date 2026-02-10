@@ -310,3 +310,359 @@ impl AuthProvider for AllowAllAuthProvider {
         Ok(AuthContext::anonymous())
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::Cx;
+
+    fn ctx() -> McpContext {
+        McpContext::new(Cx::for_testing(), 1)
+    }
+
+    #[test]
+    fn access_token_parse_accepts_bearer_and_bare_token() {
+        assert_eq!(
+            fastmcp_core::AccessToken::parse("Bearer abc"),
+            Some(fastmcp_core::AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+        assert_eq!(
+            fastmcp_core::AccessToken::parse("abc"),
+            Some(fastmcp_core::AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+        // Bare token parsing treats the entire value as a bearer token, even if it
+        // happens to be the literal string "Bearer".
+        assert_eq!(
+            fastmcp_core::AccessToken::parse(" Bearer"),
+            Some(fastmcp_core::AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "Bearer".to_string(),
+            })
+        );
+        assert_eq!(fastmcp_core::AccessToken::parse(""), None);
+        assert_eq!(fastmcp_core::AccessToken::parse("   "), None);
+        assert_eq!(fastmcp_core::AccessToken::parse("Bearer "), None);
+    }
+
+    #[test]
+    fn auth_request_extracts_access_token_from_common_locations() {
+        // params as string
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&serde_json::Value::String("Bearer t1".to_string())),
+            request_id: 1,
+        };
+        assert_eq!(
+            req.access_token(),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "t1".to_string(),
+            })
+        );
+
+        // params as object with authorization field
+        let params = serde_json::json!({"authorization": "Bearer t2"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert_eq!(
+            req.access_token(),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "t2".to_string(),
+            })
+        );
+
+        // params as object with {scheme, token}
+        let params = serde_json::json!({"auth": {"scheme": "Bearer", "token": "t3"}});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert_eq!(
+            req.access_token(),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "t3".to_string(),
+            })
+        );
+
+        // params as object with _meta.authorization
+        let params = serde_json::json!({"_meta": {"authorization": "Bearer t4"}});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert_eq!(
+            req.access_token(),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "t4".to_string(),
+            })
+        );
+
+        // params as object with headers.Authorization
+        let params = serde_json::json!({"headers": {"Authorization": "Bearer t5"}});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert_eq!(
+            req.access_token(),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "t5".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn token_auth_provider_errors_on_missing_token_and_allows_override() {
+        #[derive(Debug)]
+        struct AcceptAll;
+        impl TokenVerifier for AcceptAll {
+            fn verify(
+                &self,
+                _ctx: &McpContext,
+                _request: AuthRequest<'_>,
+                _token: &AccessToken,
+            ) -> McpResult<AuthContext> {
+                Ok(AuthContext::with_subject("ok"))
+            }
+        }
+
+        let provider = TokenAuthProvider::new(AcceptAll);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        let err = provider.authenticate(&ctx(), req).unwrap_err();
+        assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+        assert!(err.message.contains("Missing access token"));
+
+        let provider =
+            TokenAuthProvider::new(AcceptAll).with_missing_token_error(auth_error("no token"));
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        let err = provider.authenticate(&ctx(), req).unwrap_err();
+        assert!(err.message.contains("no token"));
+    }
+
+    #[test]
+    fn static_token_verifier_enforces_scheme_and_sets_token_if_missing() {
+        let mut base = AuthContext::with_subject("user123");
+        base.scopes = vec!["read".to_string()];
+
+        let verifier =
+            StaticTokenVerifier::new([("token-1", base.clone())]).with_allowed_schemes(["Bearer"]);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+
+        // Wrong scheme
+        let err = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Basic".to_string(),
+                    token: "token-1".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.message.contains("Unsupported auth scheme"));
+
+        // Valid scheme (case-insensitive)
+        let auth = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "bearer".to_string(),
+                    token: "token-1".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(auth.subject, Some("user123".to_string()));
+        assert_eq!(auth.scopes, vec!["read".to_string()]);
+        assert_eq!(
+            auth.token,
+            Some(AccessToken {
+                scheme: "bearer".to_string(),
+                token: "token-1".to_string(),
+            })
+        );
+
+        // If the stored context already has a token, we keep it (do not override).
+        let mut stored_with_token = base.clone();
+        stored_with_token.token = Some(AccessToken {
+            scheme: "Bearer".to_string(),
+            token: "stored".to_string(),
+        });
+        let verifier = StaticTokenVerifier::new([("token-2", stored_with_token)]);
+        let auth = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: "token-2".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            auth.token,
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "stored".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn allow_all_provider_returns_anonymous_context() {
+        let provider = AllowAllAuthProvider;
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        let auth = provider.authenticate(&ctx(), req).unwrap();
+        assert_eq!(auth.subject, None);
+        assert!(auth.scopes.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "jwt"))]
+mod jwt_tests {
+    use super::*;
+    use asupersync::Cx;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    fn ctx() -> McpContext {
+        McpContext::new(Cx::for_testing(), 1)
+    }
+
+    fn hs256_token(secret: &[u8], claims: serde_json::Value) -> String {
+        encode(
+            &Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("encode jwt")
+    }
+
+    #[test]
+    fn jwt_token_verifier_extracts_subject_and_scopes() {
+        let secret = b"unit-test-secret";
+        let exp = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
+        let token = hs256_token(
+            secret,
+            serde_json::json!({
+                "sub": "user123",
+                "scope": "openid profile",
+                "scopes": ["email"],
+                "exp": exp,
+            }),
+        );
+
+        let verifier = JwtTokenVerifier::hs256(secret);
+        let req = AuthRequest {
+            method: "initialize",
+            params: None,
+            request_id: 1,
+        };
+
+        let access = AccessToken {
+            scheme: "Bearer".to_string(),
+            token,
+        };
+        let auth = verifier.verify(&ctx(), req, &access).unwrap();
+        assert_eq!(auth.subject, Some("user123".to_string()));
+        assert_eq!(
+            auth.scopes,
+            vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string()
+            ]
+        );
+        assert!(auth.claims.is_some());
+        assert!(auth.token.is_some());
+    }
+
+    #[test]
+    fn jwt_token_verifier_rejects_wrong_scheme_and_invalid_token() {
+        let secret = b"unit-test-secret";
+        let exp = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
+        let token = hs256_token(
+            secret,
+            serde_json::json!({
+                "sub": "user123",
+                "exp": exp,
+            }),
+        );
+
+        let verifier = JwtTokenVerifier::hs256(secret);
+        let req = AuthRequest {
+            method: "initialize",
+            params: None,
+            request_id: 1,
+        };
+
+        // Wrong scheme
+        let err = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Basic".to_string(),
+                    token: token.clone(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+        assert!(err.message.contains("Unsupported auth scheme"));
+
+        // Invalid token (wrong secret)
+        let bad = hs256_token(
+            b"other-secret",
+            serde_json::json!({
+                "sub": "user123",
+                "exp": exp,
+            }),
+        );
+        let err = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: bad,
+                },
+            )
+            .unwrap_err();
+        assert!(err.message.contains("Invalid token"));
+    }
+}

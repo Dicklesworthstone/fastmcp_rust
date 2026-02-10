@@ -31,6 +31,25 @@ impl AccessToken {
             return None;
         }
 
+        // Special-case a common malformed Authorization value:
+        // "Bearer " (scheme with a missing token) should be rejected, even though trimming
+        // would otherwise collapse it into a single-word "Bearer" (which we treat as a
+        // bare token for non-header usages).
+        let leading = value.trim_start();
+        if let Some(prefix) = leading.get(..6) {
+            if prefix.eq_ignore_ascii_case("Bearer") {
+                let rest = &leading[6..];
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_whitespace())
+                    && rest.trim().is_empty()
+                {
+                    return None;
+                }
+            }
+        }
+
         if let Some((scheme, token)) = trimmed.split_once(' ') {
             let scheme = scheme.trim();
             let token = token.trim();
@@ -47,6 +66,45 @@ impl AccessToken {
             scheme: "Bearer".to_string(),
             token: trimmed.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccessToken;
+
+    #[test]
+    fn parse_rejects_empty_and_scheme_without_token() {
+        assert_eq!(AccessToken::parse(""), None);
+        assert_eq!(AccessToken::parse("   "), None);
+        assert_eq!(AccessToken::parse("Bearer "), None);
+        assert_eq!(AccessToken::parse("bearer\t"), None);
+    }
+
+    #[test]
+    fn parse_accepts_bearer_scheme_and_bare_tokens() {
+        assert_eq!(
+            AccessToken::parse("Bearer abc"),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+        assert_eq!(
+            AccessToken::parse("abc"),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "abc".to_string(),
+            })
+        );
+        // A single "Bearer" token is accepted as a bare token.
+        assert_eq!(
+            AccessToken::parse("Bearer"),
+            Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "Bearer".to_string(),
+            })
+        );
     }
 }
 

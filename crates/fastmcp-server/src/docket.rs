@@ -785,8 +785,7 @@ impl RedisDocketBackend {
 
 #[cfg(feature = "redis")]
 impl DocketBackend for RedisDocketBackend {
-    fn enqueue(&self, _task: DocketTask) -> DocketResult<()> {
-        let task = _task;
+    fn enqueue(&self, task: DocketTask) -> DocketResult<()> {
         let task_id = task.id.0.clone();
         let task_type = task.task_type.clone();
         let member = Self::encode_member(&task);
@@ -832,8 +831,8 @@ impl DocketBackend for RedisDocketBackend {
         Ok(())
     }
 
-    fn dequeue(&self, _task_types: &[String]) -> DocketResult<Option<DocketTask>> {
-        if _task_types.is_empty() {
+    fn dequeue(&self, task_types: &[String]) -> DocketResult<Option<DocketTask>> {
+        if task_types.is_empty() {
             return Ok(None);
         }
 
@@ -841,7 +840,7 @@ impl DocketBackend for RedisDocketBackend {
         let _ = self.requeue_stale();
 
         let mut pending_keys: Vec<String> =
-            _task_types.iter().map(|t| self.key_pending(t)).collect();
+            task_types.iter().map(|t| self.key_pending(t)).collect();
         let tasks_key = self.key_tasks();
         let running_key = self.key_running();
         let member_key = self.key_queue_member();
@@ -923,18 +922,18 @@ return out
         Ok(Some(task))
     }
 
-    fn ack(&self, _task_id: &TaskId, _result: serde_json::Value) -> DocketResult<()> {
-        let task_id = _task_id.0.clone();
+    fn ack(&self, task_id: &TaskId, result: serde_json::Value) -> DocketResult<()> {
+        let task_id_str = task_id.0.clone();
         let tasks_key = self.key_tasks();
         let running_key = self.key_running();
         let member_key = self.key_queue_member();
         let type_key = self.key_queue_type();
 
         let mut task = self
-            .get_task(_task_id)?
-            .ok_or_else(|| DocketError::NotFound(task_id.clone()))?;
+            .get_task(task_id)?
+            .ok_or_else(|| DocketError::NotFound(task_id_str.clone()))?;
         task.status = TaskStatus::Completed;
-        task.result = Some(_result);
+        task.result = Some(result);
 
         let json = serde_json::to_string(&task)
             .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
@@ -944,20 +943,20 @@ return out
                 .atomic()
                 .cmd("HSET")
                 .arg(&tasks_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .arg(&json)
                 .ignore()
                 .cmd("ZREM")
                 .arg(&running_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .cmd("HDEL")
                 .arg(&member_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .cmd("HDEL")
                 .arg(&type_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .query::<()>(conn)
         })?;
@@ -965,25 +964,25 @@ return out
         Ok(())
     }
 
-    fn nack(&self, _task_id: &TaskId, _error: &str) -> DocketResult<()> {
-        let task_id = _task_id.0.clone();
+    fn nack(&self, task_id: &TaskId, error: &str) -> DocketResult<()> {
+        let task_id_str = task_id.0.clone();
         let tasks_key = self.key_tasks();
         let running_key = self.key_running();
         let member_key = self.key_queue_member();
         let type_key = self.key_queue_type();
 
         let mut task = self
-            .get_task(_task_id)?
-            .ok_or_else(|| DocketError::NotFound(task_id.clone()))?;
+            .get_task(task_id)?
+            .ok_or_else(|| DocketError::NotFound(task_id_str.clone()))?;
 
         task.retry_count += 1;
-        task.error = Some(_error.to_string());
+        task.error = Some(error.to_string());
 
         // Remove from running
         self.with_conn(|conn| {
             redis::cmd("ZREM")
                 .arg(&running_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .query::<()>(conn)
         })?;
 
@@ -996,16 +995,16 @@ return out
                     .atomic()
                     .cmd("HSET")
                     .arg(&tasks_key)
-                    .arg(&task_id)
+                    .arg(&task_id_str)
                     .arg(&json)
                     .ignore()
                     .cmd("HDEL")
                     .arg(&member_key)
-                    .arg(&task_id)
+                    .arg(&task_id_str)
                     .ignore()
                     .cmd("HDEL")
                     .arg(&type_key)
-                    .arg(&task_id)
+                    .arg(&task_id_str)
                     .ignore()
                     .query::<()>(conn)
             })?;
@@ -1029,17 +1028,17 @@ return out
                 .atomic()
                 .cmd("HSET")
                 .arg(&tasks_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .arg(&json)
                 .ignore()
                 .cmd("HSET")
                 .arg(&member_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .arg(&member)
                 .ignore()
                 .cmd("HSET")
                 .arg(&type_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .arg(&task_type)
                 .ignore()
                 .cmd("ZADD")
@@ -1053,11 +1052,15 @@ return out
         Ok(())
     }
 
-    fn get_task(&self, _task_id: &TaskId) -> DocketResult<Option<DocketTask>> {
+    fn get_task(&self, task_id: &TaskId) -> DocketResult<Option<DocketTask>> {
         let tasks_key = self.key_tasks();
-        let task_id = _task_id.0.clone();
-        let json: Option<String> =
-            self.with_conn(|conn| redis::cmd("HGET").arg(&tasks_key).arg(&task_id).query(conn))?;
+        let task_id_str = task_id.0.clone();
+        let json: Option<String> = self.with_conn(|conn| {
+            redis::cmd("HGET")
+                .arg(&tasks_key)
+                .arg(&task_id_str)
+                .query(conn)
+        })?;
         let Some(json) = json else {
             return Ok(None);
         };
@@ -1068,8 +1071,8 @@ return out
 
     fn list_tasks(
         &self,
-        _status: Option<TaskStatus>,
-        _limit: usize,
+        status: Option<TaskStatus>,
+        limit: usize,
     ) -> DocketResult<Vec<DocketTask>> {
         let tasks_key = self.key_tasks();
         let values: Vec<String> =
@@ -1078,7 +1081,7 @@ return out
         let mut tasks = Vec::new();
         for json in values {
             if let Ok(task) = serde_json::from_str::<DocketTask>(&json) {
-                if _status.is_none_or(|s| task.status == s) {
+                if status.is_none_or(|s| task.status == s) {
                     tasks.push(task);
                 }
             }
@@ -1089,23 +1092,23 @@ return out
                 .cmp(&b.created_at)
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
-        tasks.truncate(_limit);
+        tasks.truncate(limit);
         Ok(tasks)
     }
 
-    fn cancel(&self, _task_id: &TaskId, _reason: Option<&str>) -> DocketResult<()> {
-        let task_id = _task_id.0.clone();
+    fn cancel(&self, task_id: &TaskId, reason: Option<&str>) -> DocketResult<()> {
+        let task_id_str = task_id.0.clone();
         let tasks_key = self.key_tasks();
         let running_key = self.key_running();
         let member_key = self.key_queue_member();
         let type_key = self.key_queue_type();
 
-        let Some(mut task) = self.get_task(_task_id)? else {
-            return Err(DocketError::NotFound(task_id));
+        let Some(mut task) = self.get_task(task_id)? else {
+            return Err(DocketError::NotFound(task_id_str));
         };
 
         task.status = TaskStatus::Cancelled;
-        task.error = Some(_reason.unwrap_or("Cancelled").to_string());
+        task.error = Some(reason.unwrap_or("Cancelled").to_string());
         task.result = Some(serde_json::json!({"cancelled": true}));
 
         let json = serde_json::to_string(&task)
@@ -1114,31 +1117,35 @@ return out
         let member: Option<String> = self.with_conn(|conn| {
             redis::cmd("HGET")
                 .arg(&member_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .query(conn)
         })?;
-        let task_type: Option<String> =
-            self.with_conn(|conn| redis::cmd("HGET").arg(&type_key).arg(&task_id).query(conn))?;
+        let task_type: Option<String> = self.with_conn(|conn| {
+            redis::cmd("HGET")
+                .arg(&type_key)
+                .arg(&task_id_str)
+                .query(conn)
+        })?;
 
         self.with_conn(|conn| {
             redis::pipe()
                 .atomic()
                 .cmd("HSET")
                 .arg(&tasks_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .arg(&json)
                 .ignore()
                 .cmd("ZREM")
                 .arg(&running_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .cmd("HDEL")
                 .arg(&member_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .cmd("HDEL")
                 .arg(&type_key)
-                .arg(&task_id)
+                .arg(&task_id_str)
                 .ignore()
                 .query::<()>(conn)
         })?;
