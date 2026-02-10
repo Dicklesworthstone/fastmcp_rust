@@ -38,6 +38,11 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+// Proc-macros (fastmcp-derive) reference this crate by its external name
+// (`fastmcp_server::...`). This alias makes those macros usable inside this crate too
+// (including in unit tests).
+extern crate self as fastmcp_server;
+
 mod auth;
 pub mod bidirectional;
 mod builder;

@@ -374,13 +374,19 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
         ReturnTypeKind::String => quote! {
             Ok(vec![fastmcp_protocol::Content::Text { text: result }])
         },
-        ReturnTypeKind::ResultVecContent | ReturnTypeKind::McpResultVecContent => quote! {
+        ReturnTypeKind::ResultVecContent => quote! {
             result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
         },
-        ReturnTypeKind::ResultString | ReturnTypeKind::McpResultString => quote! {
+        ReturnTypeKind::McpResultVecContent => quote! {
+            result
+        },
+        ReturnTypeKind::ResultString => quote! {
             result
                 .map(|s| vec![fastmcp_protocol::Content::Text { text: s }])
                 .map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
+        },
+        ReturnTypeKind::McpResultString => quote! {
+            result.map(|s| vec![fastmcp_protocol::Content::Text { text: s }])
         },
         ReturnTypeKind::Other => quote! {
             // Convert via ToString or Debug as fallback

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use asupersync::{Budget, CancelKind, Cx};
 use fastmcp_core::logging::{info, targets};
 use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
+use fastmcp_derive::tool;
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelledParams, ClientCapabilities, ClientInfo, Content,
     GetPromptParams, GetTaskParams, InitializeParams, JsonRpcResponse, ListTasksParams, LogLevel,
@@ -53,98 +54,37 @@ fn create_test_request_sender() -> RequestSender {
 // Test Tool Handlers
 // ============================================================================
 
-/// A simple tool that greets a user.
-struct GreetTool;
-
-impl ToolHandler for GreetTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "greet".to_string(),
-            description: Some("Greets a user by name".to_string()),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"}
-                },
-                "required": ["name"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let name = arguments
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("World");
-        Ok(vec![Content::Text {
-            text: format!("Hello, {name}!"),
-        }])
-    }
+#[tool(name = "greet", description = "Greets a user by name")]
+fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok(format!("Hello, {name}!"))
 }
 
-/// A tool that checks cancellation.
-struct CancellationCheckTool;
-
-impl ToolHandler for CancellationCheckTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "cancellation_check".to_string(),
-            description: Some("Tool that checks cancellation status".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        // Check for cancellation
-        if ctx.is_cancelled() {
-            return Err(McpError::request_cancelled());
-        }
-        Ok(vec![Content::Text {
-            text: "Not cancelled".to_string(),
-        }])
-    }
+#[tool(
+    name = "greet_default",
+    description = "Greets a user by name (with a default)",
+    defaults(name = "World")
+)]
+fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok(format!("Hello, {name}!"))
 }
 
-/// A tool that simulates slow work.
-struct SlowTool;
+#[tool(
+    name = "cancellation_check",
+    description = "Tool that checks cancellation status"
+)]
+fn cancellation_check(ctx: &McpContext) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok("Not cancelled".to_string())
+}
 
-impl ToolHandler for SlowTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "slow_tool".to_string(),
-            description: Some("Simulates a slow operation".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
+#[tool(name = "slow_tool", description = "Simulates a slow operation")]
+fn slow_tool(ctx: &McpContext) -> McpResult<String> {
+    for _ in 0..5 {
+        ctx.checkpoint()?;
     }
-
-    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        // Simulate work with checkpoint checks
-        for i in 0..5 {
-            if ctx.checkpoint().is_err() {
-                return Err(McpError::request_cancelled());
-            }
-            // Normally we'd do work here
-            let _ = i;
-        }
-        Ok(vec![Content::Text {
-            text: "Slow work completed".to_string(),
-        }])
-    }
+    Ok("Slow work completed".to_string())
 }
 
 /// A tool that blocks until the request is cancelled.
@@ -599,8 +539,8 @@ mod router_tests {
         let mut router = Router::new();
 
         // Register tools
-        router.add_tool(GreetTool);
-        router.add_tool(CancellationCheckTool);
+        router.add_tool(Greet);
+        router.add_tool(CancellationCheck);
         router.add_tool(SlowTool);
         router.add_tool(ErrorTool);
 
@@ -648,7 +588,7 @@ mod router_tests {
         let rate_limiter = RateLimitingMiddleware::new(0.0).burst_capacity(1).global();
 
         let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
+            .tool(Greet)
             .middleware(caching)
             .middleware(rate_limiter)
             .build();
@@ -729,7 +669,7 @@ mod router_tests {
             .expect("prime cache_b");
 
         let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
+            .tool(Greet)
             .middleware(cache_a.clone())
             .middleware(cache_b.clone())
             .build();
@@ -809,7 +749,7 @@ mod router_tests {
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
+            .tool(Greet)
             .auth_provider(provider)
             .build();
         let cx = Cx::for_testing();
@@ -936,7 +876,7 @@ mod router_tests {
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
-            .tool(GreetTool)
+            .tool(Greet)
             .auth_provider(provider)
             .build();
         let cx = Cx::for_testing();
@@ -2040,7 +1980,7 @@ mod router_tests {
 
     #[test]
     fn test_logging_set_level_emits_notifications() {
-        let server = Server::new("test-server", "1.0.0").tool(GreetTool).build();
+        let server = Server::new("test-server", "1.0.0").tool(Greet).build();
         let cx = Cx::for_testing();
         let mut session = create_test_session();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2128,7 +2068,7 @@ mod router_tests {
 
     #[test]
     fn test_logging_set_level_filters_notifications() {
-        let server = Server::new("test-server", "1.0.0").tool(GreetTool).build();
+        let server = Server::new("test-server", "1.0.0").tool(Greet).build();
         let cx = Cx::for_testing();
         let mut session = create_test_session();
         let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2856,7 +2796,7 @@ mod handler_definition_tests {
 
     #[test]
     fn test_tool_definition() {
-        let tool = GreetTool;
+        let tool = Greet;
         let def = tool.definition();
 
         assert_eq!(def.name, "greet");
@@ -3102,7 +3042,7 @@ mod multi_handler_tests {
     #[test]
     fn test_multiple_tools() {
         let mut router = Router::new();
-        router.add_tool(GreetTool);
+        router.add_tool(Greet);
         router.add_tool(FormalGreetTool);
 
         let tools = router.tools();
@@ -3549,7 +3489,7 @@ mod lab_runtime_tests {
 
             LabRuntimeTarget::block_on(runtime, async move {
                 let mut router = Router::new();
-                router.add_tool(CancellationCheckTool);
+                router.add_tool(CancellationCheck);
 
                 let cx = Cx::for_testing();
                 cx.cancel_with(CancelKind::User, None);
@@ -3947,7 +3887,7 @@ mod mount_tests {
         let api_server = Server::new("api", "1.0").prompt(GreetingPrompt).build();
 
         let main = Server::new("main", "1.0")
-            .tool(GreetTool)
+            .tool(Greet)
             .mount(db_server, Some("db"))
             .mount(api_server, Some("api"))
             .build();
@@ -5012,7 +4952,7 @@ mod handler_direct_tests {
 
     #[test]
     fn tool_handler_call_returns_content() {
-        let tool = GreetTool;
+        let tool = Greet;
         let ctx = test_ctx();
         let result = tool.call(&ctx, serde_json::json!({"name": "Alice"}));
         assert!(result.is_ok());
@@ -5030,7 +4970,7 @@ mod handler_direct_tests {
 
     #[test]
     fn tool_handler_call_default_arg() {
-        let tool = GreetTool;
+        let tool = GreetDefault;
         let ctx = test_ctx();
         let result = tool.call(&ctx, serde_json::json!({}));
         assert!(result.is_ok());
@@ -5057,7 +4997,7 @@ mod handler_direct_tests {
 
     #[test]
     fn tool_handler_definition_has_expected_fields() {
-        let tool = GreetTool;
+        let tool = Greet;
         let def = tool.definition();
         assert_eq!(def.name, "greet");
         assert!(def.description.is_some());
@@ -5067,37 +5007,37 @@ mod handler_direct_tests {
 
     #[test]
     fn tool_handler_default_icon_is_none() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.icon().is_none());
     }
 
     #[test]
     fn tool_handler_default_version_is_none() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.version().is_none());
     }
 
     #[test]
     fn tool_handler_default_tags_is_empty() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.tags().is_empty());
     }
 
     #[test]
     fn tool_handler_default_annotations_is_none() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.annotations().is_none());
     }
 
     #[test]
     fn tool_handler_default_output_schema_is_none() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.output_schema().is_none());
     }
 
     #[test]
     fn tool_handler_default_timeout_is_none() {
-        let tool = GreetTool;
+        let tool = Greet;
         assert!(tool.timeout().is_none());
     }
 
@@ -5422,7 +5362,7 @@ mod handler_direct_tests {
 
     #[test]
     fn mounted_tool_handler_overrides_name() {
-        let inner: Box<dyn ToolHandler> = Box::new(GreetTool);
+        let inner: Box<dyn ToolHandler> = Box::new(Greet);
         let mounted = MountedToolHandler::new(inner, "ns/greet".to_string());
         let def = mounted.definition();
         assert_eq!(def.name, "ns/greet");
@@ -5432,7 +5372,7 @@ mod handler_direct_tests {
 
     #[test]
     fn mounted_tool_handler_delegates_call() {
-        let inner: Box<dyn ToolHandler> = Box::new(GreetTool);
+        let inner: Box<dyn ToolHandler> = Box::new(Greet);
         let mounted = MountedToolHandler::new(inner, "ns/greet".to_string());
         let ctx = test_ctx();
         let result = mounted.call(&ctx, serde_json::json!({"name": "Mounted"}));
@@ -5621,7 +5561,7 @@ mod handler_direct_tests {
     #[test]
     fn router_registers_tool_and_lists_it() {
         let mut router = Router::new();
-        router.add_tool(GreetTool);
+        router.add_tool(Greet);
         let tools = router.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "greet");
@@ -5651,7 +5591,7 @@ mod handler_direct_tests {
     #[test]
     fn router_counts_match_registrations() {
         let mut router = Router::new();
-        router.add_tool(GreetTool);
+        router.add_tool(Greet);
         router.add_tool(ErrorTool);
         router.add_resource(StaticResource {
             uri: "test://a".to_string(),

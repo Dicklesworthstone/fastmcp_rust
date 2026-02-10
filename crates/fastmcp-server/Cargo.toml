@@ -30,6 +30,9 @@ hmac.workspace = true
 redis = { workspace = true, optional = true }
 jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto", "use_pem"], optional = true }
 
+[dev-dependencies]
+fastmcp-derive.workspace = true
+
 [lints]
 workspace = true
 
