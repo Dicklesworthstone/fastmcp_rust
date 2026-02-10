@@ -26,18 +26,25 @@ use fastmcp_protocol::{
 
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
+use crate::middleware::{FailingRequestMiddleware, RecordingMiddleware, StepMiddleware};
 use crate::router::Router;
 use crate::session::Session;
 use crate::{
-    ActiveRequest, ActiveRequestGuard, AuthRequest, Middleware, MiddlewareDecision,
-    NotificationSender, RequestCompletion, Server, StaticTokenVerifier, TaskManager,
-    TokenAuthProvider,
+    ActiveRequest, ActiveRequestGuard, AuthRequest, NotificationSender, RequestCompletion, Server,
+    StaticTokenVerifier, TaskManager, TokenAuthProvider,
 };
 
-/// Creates a mock request sender for tests that does nothing.
+/// Creates a request sender for tests that should not perform server-to-client requests.
+///
+/// If a test unexpectedly triggers bidirectional server->client communication (sampling,
+/// elicitation, roots), the send will fail and the request path should surface an error.
 fn create_test_request_sender() -> RequestSender {
     let pending = Arc::new(PendingRequests::new());
-    let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+    let send_fn: TransportSendFn = Arc::new(|message| {
+        Err(format!(
+            "unexpected server-to-client message in unit test: {message:?}"
+        ))
+    });
     RequestSender::new(pending, send_fn)
 }
 
@@ -203,112 +210,6 @@ struct LoggingBlockingTool {
     start: Instant,
 }
 
-#[derive(Debug)]
-struct RecordingMiddleware {
-    name: &'static str,
-    events: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-impl RecordingMiddleware {
-    fn new(name: &'static str, events: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
-        Self { name, events }
-    }
-
-    fn record(&self, phase: &str) {
-        let mut guard = self.events.lock().expect("events lock poisoned");
-        guard.push(format!("{}:{}", self.name, phase));
-    }
-}
-
-impl Middleware for RecordingMiddleware {
-    fn on_request(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-    ) -> McpResult<MiddlewareDecision> {
-        self.record("req");
-        Ok(MiddlewareDecision::Continue)
-    }
-
-    fn on_response(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        response: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
-        self.record("resp");
-        Ok(response)
-    }
-
-    fn on_error(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        error: McpError,
-    ) -> McpError {
-        self.record("err");
-        error
-    }
-}
-
-#[derive(Debug)]
-struct StepMiddleware {
-    name: &'static str,
-    events: Arc<std::sync::Mutex<Vec<String>>>,
-    respond: bool,
-}
-
-impl StepMiddleware {
-    fn new(name: &'static str, events: Arc<std::sync::Mutex<Vec<String>>>, respond: bool) -> Self {
-        Self {
-            name,
-            events,
-            respond,
-        }
-    }
-
-    fn record(&self, phase: &str) {
-        let mut guard = self.events.lock().expect("events lock poisoned");
-        guard.push(format!("{}:{}", self.name, phase));
-    }
-}
-
-impl Middleware for StepMiddleware {
-    fn on_request(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-    ) -> McpResult<MiddlewareDecision> {
-        self.record("req");
-        if self.respond {
-            return Ok(MiddlewareDecision::Respond(serde_json::json!({
-                "steps": [format!("{}:respond", self.name)]
-            })));
-        }
-        Ok(MiddlewareDecision::Continue)
-    }
-
-    fn on_response(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        response: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
-        self.record("resp");
-        Ok(push_step(response, &format!("{}:resp", self.name)))
-    }
-
-    fn on_error(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        error: McpError,
-    ) -> McpError {
-        self.record("err");
-        error
-    }
-}
-
 #[test]
 fn request_id_to_u64_number() {
     let id = RequestId::Number(42);
@@ -333,82 +234,6 @@ fn request_id_to_u64_string_stable_nonzero() {
 #[test]
 fn request_id_to_u64_none_is_zero() {
     assert_eq!(crate::request_id_to_u64(None), 0);
-}
-
-#[derive(Debug)]
-struct FailingRequestMiddleware {
-    name: &'static str,
-    events: Arc<std::sync::Mutex<Vec<String>>>,
-    error: McpError,
-}
-
-impl FailingRequestMiddleware {
-    fn new(
-        name: &'static str,
-        events: Arc<std::sync::Mutex<Vec<String>>>,
-        error: McpError,
-    ) -> Self {
-        Self {
-            name,
-            events,
-            error,
-        }
-    }
-
-    fn record(&self, phase: &str) {
-        let mut guard = self.events.lock().expect("events lock poisoned");
-        guard.push(format!("{}:{}", self.name, phase));
-    }
-}
-
-impl Middleware for FailingRequestMiddleware {
-    fn on_request(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-    ) -> McpResult<MiddlewareDecision> {
-        self.record("req");
-        Err(self.error.clone())
-    }
-
-    fn on_response(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        response: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
-        self.record("resp");
-        Ok(response)
-    }
-
-    fn on_error(
-        &self,
-        _ctx: &McpContext,
-        _request: &fastmcp_protocol::JsonRpcRequest,
-        error: McpError,
-    ) -> McpError {
-        self.record("err");
-        error
-    }
-}
-
-fn push_step(value: serde_json::Value, step: &str) -> serde_json::Value {
-    let mut obj = match value {
-        serde_json::Value::Object(map) => map,
-        other => {
-            let mut map = serde_json::Map::new();
-            map.insert("value".to_string(), other);
-            map
-        }
-    };
-    let mut steps = obj
-        .get("steps")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    steps.push(serde_json::Value::String(step.to_string()));
-    obj.insert("steps".to_string(), serde_json::Value::Array(steps));
-    serde_json::Value::Object(obj)
 }
 
 impl ToolHandler for LoggingBlockingTool {
