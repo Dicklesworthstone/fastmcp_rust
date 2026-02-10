@@ -221,6 +221,9 @@ pub struct ListResourceTemplatesResult {
     /// List of resource templates.
     #[serde(rename = "resourceTemplates")]
     pub resource_templates: Vec<ResourceTemplate>,
+    /// Next cursor for pagination.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// resources/read request params.
@@ -447,6 +450,9 @@ pub struct ListTasksParams {
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Maximum number of tasks to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
     /// Filter by task status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
@@ -1069,9 +1075,9 @@ mod tests {
 
     #[test]
     fn progress_token_string_serialization() {
-        let token = ProgressToken::String("tok-1".to_string());
+        let token = ProgressToken::String("progress_token_test_1".to_string());
         let value = serde_json::to_value(&token).expect("serialize");
-        assert_eq!(value, "tok-1");
+        assert_eq!(value, "progress_token_test_1");
     }
 
     #[test]
@@ -1096,8 +1102,11 @@ mod tests {
     #[test]
     fn progress_token_display() {
         assert_eq!(
-            format!("{}", ProgressToken::String("tok-1".to_string())),
-            "tok-1"
+            format!(
+                "{}",
+                ProgressToken::String("progress_token_test_1".to_string())
+            ),
+            "progress_token_test_1"
         );
         assert_eq!(format!("{}", ProgressToken::Number(42)), "42");
     }
@@ -1126,10 +1135,10 @@ mod tests {
     #[test]
     fn request_meta_with_token() {
         let meta = RequestMeta {
-            progress_token: Some(ProgressToken::String("pt-1".to_string())),
+            progress_token: Some(ProgressToken::String("progress_token_test_2".to_string())),
         };
         let value = serde_json::to_value(&meta).expect("serialize");
-        assert_eq!(value["progressToken"], "pt-1");
+        assert_eq!(value["progressToken"], "progress_token_test_2");
     }
 
     // ========================================================================
@@ -1673,6 +1682,7 @@ mod tests {
                 version: None,
                 tags: vec![],
             }],
+            next_cursor: None,
         };
 
         let value = serde_json::to_value(&result).expect("serialize result");
@@ -1734,6 +1744,7 @@ mod tests {
     fn list_tasks_params_serialization() {
         let params = ListTasksParams {
             cursor: None,
+            limit: None,
             status: None,
         };
         let value = serde_json::to_value(&params).expect("serialize list tasks params");
@@ -1741,12 +1752,13 @@ mod tests {
 
         let params = ListTasksParams {
             cursor: Some("next".to_string()),
+            limit: Some(10),
             status: Some(TaskStatus::Running),
         };
         let value = serde_json::to_value(&params).expect("serialize list tasks params");
         assert_eq!(
             value,
-            serde_json::json!({"cursor": "next", "status": "running"})
+            serde_json::json!({"cursor": "next", "limit": 10, "status": "running"})
         );
     }
 

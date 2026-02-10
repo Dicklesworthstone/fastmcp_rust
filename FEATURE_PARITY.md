@@ -27,7 +27,7 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 - ✅ **OIDC Provider** - ID tokens, UserInfo, discovery document
 - ✅ **Tool Transformations** - Dynamic schema modification, argument transforms
 - ✅ **Middleware Ecosystem** - ResponseCachingMiddleware, RateLimitingMiddleware, SlidingWindowRateLimiting
-- ✅ **Docket Distributed Task Queue** - Memory backend + Redis stub
+- ✅ **Docket Distributed Task Queue** - Memory backend + Redis backend (feature-gated)
 - ✅ **CLI Tooling** - fastmcp run/inspect/install commands
 - ✅ **EventStore** - SSE resumability with TTL
 - ✅ **HTTP Transport** - Stateless and streamable modes
@@ -90,7 +90,7 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 | `@prompt` / `#[prompt]` | ✅ | ✅ | Full functionality |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
-| Default parameter values | ✅ | 🟡 | Via Option<T> |
+| Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]` (e.g. `#[tool(defaults(foo = 123, bar = \"baz\"))]`) |
 | name/description override | ✅ | ✅ | Attribute parameters supported |
 
 ### Decorator Gaps (All Completed ✅)
@@ -306,7 +306,7 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 |--------|--------|------|-------|
 | **include_tags/exclude_tags** | ✅ | ✅ | Component filtering in router.rs |
 | **mask_error_details** | ✅ | ✅ | Implemented in builder.rs |
-| **check_for_updates** | ✅ | ⊘ | Intentionally not implemented (binary distribution) |
+| **check_for_updates** | ✅ | ✅ | Implemented in `fastmcp-cli` (crates.io max_version check; opt-out via `FASTMCP_CHECK_FOR_UPDATES=0`) |
 
 ---
 
@@ -341,9 +341,9 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Docket (distributed tasks)** | ✅ | ✅ | `docket.rs` - Memory backend + Redis stub |
+| **Docket (distributed tasks)** | ✅ | ✅ | `docket.rs` - Memory backend + Redis backend (feature-gated: `fastmcp-server/redis`) |
 | **EventStore** | ✅ | ✅ | `event_store.rs` - SSE resumability with TTL |
-| **Rich content types** | ✅ | 🟡 | Audio/File/Image helpers (basic) |
+| **Rich content types** | ✅ | ✅ | `Content` supports `audio` and includes helpers: `Content::{text,image_base64,image_bytes,audio_base64,audio_bytes,resource_text,resource_blob_base64,resource_blob_bytes}` |
 
 ---
 
@@ -377,7 +377,7 @@ All previously identified gaps have been implemented:
 3. TestClient (httpx) → Using Lab runtime + MemoryTransport
 4. OpenAPI provider → Out of scope
 5. TypeAdapter caching → serde handles differently
-6. check_for_updates → Not relevant for binary distribution
+6. check_for_updates → Implemented for the CLI (crates.io version check)
 
 ---
 

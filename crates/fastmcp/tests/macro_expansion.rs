@@ -200,6 +200,36 @@ fn tool_call_missing_required_param_errors() {
     assert!(result.is_err());
 }
 
+// --- Tool with default parameter value ---
+
+/// Greets with a default punctuation suffix.
+#[tool(defaults(punctuation = "!"))]
+fn greet_with_default(name: String, punctuation: String) -> String {
+    format!("Hello, {name}{punctuation}")
+}
+
+#[test]
+fn tool_default_param_not_required_and_in_schema() {
+    let handler = GreetWithDefault;
+    let def = handler.definition();
+    let required = def.input_schema["required"].as_array().unwrap();
+    assert!(!required.iter().any(|v| v.as_str() == Some("punctuation")));
+
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["punctuation"]["default"], "!");
+}
+
+#[test]
+fn tool_call_uses_default_param_when_missing() {
+    let handler = GreetWithDefault;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"name": "World"})).unwrap();
+    match &result[0] {
+        Content::Text { text } => assert_eq!(text, "Hello, World!"),
+        _ => panic!("Expected Text content"),
+    }
+}
+
 // --- Tool with context parameter ---
 
 /// Tool that uses context.
@@ -1208,6 +1238,41 @@ fn prompt_definition_arguments() {
     assert!(def.arguments[0].required);
     // No doc comment on parameter, so description is None
     assert!(def.arguments[0].description.is_none());
+}
+
+/// A greeting prompt with a default argument.
+#[prompt(defaults(greeting = "Hi"))]
+fn greeting_prompt_with_default(name: String, greeting: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("{greeting} {name}"),
+        },
+    }]
+}
+
+#[test]
+fn prompt_default_argument_is_not_required() {
+    let handler = GreetingPromptWithDefaultPrompt;
+    let def = handler.definition();
+    assert_eq!(def.arguments.len(), 2);
+    assert_eq!(def.arguments[0].name, "name");
+    assert!(def.arguments[0].required);
+    assert_eq!(def.arguments[1].name, "greeting");
+    assert!(!def.arguments[1].required);
+}
+
+#[test]
+fn prompt_get_uses_default_argument_when_missing() {
+    let handler = GreetingPromptWithDefaultPrompt;
+    let ctx = test_ctx();
+    let mut args = HashMap::new();
+    args.insert("name".to_string(), "Alice".to_string());
+    let result = handler.get(&ctx, args).unwrap();
+    match &result[0].content {
+        Content::Text { text } => assert_eq!(text, "Hi Alice"),
+        _ => panic!("Expected Text content"),
+    }
 }
 
 #[test]

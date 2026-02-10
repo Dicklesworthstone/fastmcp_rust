@@ -664,7 +664,7 @@ impl DocketBackend for MemoryDocketBackend {
 }
 
 // ============================================================================
-// Redis Backend (stub - requires redis crate feature)
+// Redis Backend
 // ============================================================================
 
 /// Redis Docket backend for production distributed deployments.
@@ -673,55 +673,397 @@ impl DocketBackend for MemoryDocketBackend {
 /// visibility timeout and atomic operations.
 #[cfg(feature = "redis")]
 pub struct RedisDocketBackend {
-    // Redis client would go here
-    _settings: RedisSettings,
-    _docket_settings: DocketSettings,
+    client: redis::Client,
+    pool: Vec<std::sync::Mutex<redis::Connection>>,
+    next_conn: std::sync::atomic::AtomicUsize,
+    settings: RedisSettings,
+    docket_settings: DocketSettings,
 }
 
 #[cfg(feature = "redis")]
 impl RedisDocketBackend {
     /// Creates a new Redis backend.
     pub fn new(
-        _redis_settings: RedisSettings,
-        _docket_settings: DocketSettings,
+        redis_settings: RedisSettings,
+        docket_settings: DocketSettings,
     ) -> DocketResult<Self> {
-        // TODO: Initialize Redis connection pool
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let client = redis::Client::open(redis_settings.url.as_str())
+            .map_err(|e| DocketError::Backend(format!("Redis client init failed: {e}")))?;
+
+        let mut pool = Vec::new();
+        let pool_size = redis_settings.pool_size.max(1);
+        for _ in 0..pool_size {
+            let conn = client
+                .get_connection()
+                .map_err(|e| DocketError::Backend(format!("Redis connect failed: {e}")))?;
+            pool.push(std::sync::Mutex::new(conn));
+        }
+
+        Ok(Self {
+            client,
+            pool,
+            next_conn: std::sync::atomic::AtomicUsize::new(0),
+            settings: redis_settings,
+            docket_settings,
+        })
+    }
+
+    fn key_tasks(&self) -> String {
+        format!("{}:tasks", self.docket_settings.queue_prefix)
+    }
+
+    fn key_running(&self) -> String {
+        format!("{}:running", self.docket_settings.queue_prefix)
+    }
+
+    fn key_types(&self) -> String {
+        format!("{}:types", self.docket_settings.queue_prefix)
+    }
+
+    fn key_queue_member(&self) -> String {
+        // task_id -> queue member encoding (used for pending/delayed removal)
+        format!("{}:queue_member", self.docket_settings.queue_prefix)
+    }
+
+    fn key_queue_type(&self) -> String {
+        // task_id -> task_type (used for pending/delayed key selection)
+        format!("{}:queue_type", self.docket_settings.queue_prefix)
+    }
+
+    fn key_pending(&self, task_type: &str) -> String {
+        format!("{}:pending:{task_type}", self.docket_settings.queue_prefix)
+    }
+
+    fn key_delayed(&self, task_type: &str) -> String {
+        format!("{}:delayed:{task_type}", self.docket_settings.queue_prefix)
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    fn now_rfc3339() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn encode_member(task: &DocketTask) -> String {
+        let created_ms = chrono::DateTime::parse_from_rfc3339(&task.created_at)
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+        let prio_key: i64 = (i32::MAX as i64) - (task.priority as i64);
+        format!("{prio_key:010}:{created_ms:013}:{}", task.id.0)
+    }
+
+    fn retry_delay_ms(&self, retry_count: u32) -> i64 {
+        let base = self
+            .docket_settings
+            .retry_delay
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        if base <= 0 {
+            return 0;
+        }
+        let exp = retry_count.saturating_sub(1).min(30);
+        let factor: i64 = 1i64.checked_shl(exp).unwrap_or(i64::MAX);
+        base.saturating_mul(factor)
+    }
+
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> DocketResult<T> {
+        let idx = self
+            .next_conn
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.pool.len();
+        let mut guard = self.pool[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard).map_err(|e| DocketError::Backend(format!("Redis error: {e}")))
     }
 }
 
 #[cfg(feature = "redis")]
 impl DocketBackend for RedisDocketBackend {
     fn enqueue(&self, _task: DocketTask) -> DocketResult<()> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let task = _task;
+        let task_id = task.id.0.clone();
+        let task_type = task.task_type.clone();
+        let member = Self::encode_member(&task);
+        let json = serde_json::to_string(&task)
+            .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+
+        let tasks_key = self.key_tasks();
+        let types_key = self.key_types();
+        let member_key = self.key_queue_member();
+        let type_key = self.key_queue_type();
+        let pending_key = self.key_pending(&task_type);
+
+        self.with_conn(|conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&tasks_key)
+                .arg(&task_id)
+                .arg(&json)
+                .ignore()
+                .cmd("SADD")
+                .arg(&types_key)
+                .arg(&task_type)
+                .ignore()
+                .cmd("HSET")
+                .arg(&member_key)
+                .arg(&task_id)
+                .arg(&member)
+                .ignore()
+                .cmd("HSET")
+                .arg(&type_key)
+                .arg(&task_id)
+                .arg(&task_type)
+                .ignore()
+                .cmd("ZADD")
+                .arg(&pending_key)
+                .arg(0)
+                .arg(&member)
+                .ignore()
+                .query::<()>(conn)
+        })?;
+
+        Ok(())
     }
 
     fn dequeue(&self, _task_types: &[String]) -> DocketResult<Option<DocketTask>> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        if _task_types.is_empty() {
+            return Ok(None);
+        }
+
+        // Move any delayed tasks that are now due into the pending queues.
+        let _ = self.requeue_stale();
+
+        let mut pending_keys: Vec<String> =
+            _task_types.iter().map(|t| self.key_pending(t)).collect();
+        let tasks_key = self.key_tasks();
+        let running_key = self.key_running();
+        let member_key = self.key_queue_member();
+
+        // KEYS: pending..., tasks_key, running_key, member_key
+        pending_keys.push(tasks_key.clone());
+        pending_keys.push(running_key.clone());
+        pending_keys.push(member_key.clone());
+
+        let now_rfc = Self::now_rfc3339();
+        let now_ms = Self::now_ms();
+
+        // Atomically pick the best pending task across the subscribed queues.
+        const LUA: &str = r#"
+local tasks_key = KEYS[#KEYS-2]
+local running_key = KEYS[#KEYS-1]
+local member_key = KEYS[#KEYS]
+
+local now_rfc = ARGV[1]
+local now_ms = tonumber(ARGV[2])
+
+local best = nil
+local best_key = nil
+for i=1,(#KEYS-3) do
+  local k = KEYS[i]
+  local r = redis.call('ZRANGE', k, 0, 0)
+  if r and r[1] then
+    local m = r[1]
+    if (not best) or (m < best) then
+      best = m
+      best_key = k
+    end
+  end
+end
+
+if not best then
+  return nil
+end
+
+redis.call('ZREM', best_key, best)
+
+-- Extract task_id from member "{prio}:{created}:{task_id}"
+local _, _, task_id = string.find(best, "^[^:]+:[^:]+:(.+)$")
+if not task_id then
+  return nil
+end
+
+redis.call('HDEL', member_key, task_id)
+redis.call('ZADD', running_key, now_ms, task_id)
+
+local tjson = redis.call('HGET', tasks_key, task_id)
+if not tjson then
+  return nil
+end
+
+local t = cjson.decode(tjson)
+t["status"] = "running"
+t["claimed_at"] = now_rfc
+local out = cjson.encode(t)
+redis.call('HSET', tasks_key, task_id, out)
+return out
+"#;
+
+        let task_json: Option<String> = self.with_conn(|conn| {
+            let script = redis::Script::new(LUA);
+            let mut inv = script.prepare_invoke();
+            for k in &pending_keys {
+                inv.key(k);
+            }
+            inv.arg(now_rfc).arg(now_ms).invoke(conn)
+        })?;
+
+        let Some(task_json) = task_json else {
+            return Ok(None);
+        };
+
+        let task: DocketTask = serde_json::from_str(&task_json)
+            .map_err(|e| DocketError::Backend(format!("Task deserialize failed: {e}")))?;
+        Ok(Some(task))
     }
 
     fn ack(&self, _task_id: &TaskId, _result: serde_json::Value) -> DocketResult<()> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let task_id = _task_id.0.clone();
+        let tasks_key = self.key_tasks();
+        let running_key = self.key_running();
+        let member_key = self.key_queue_member();
+        let type_key = self.key_queue_type();
+
+        let mut task = self
+            .get_task(_task_id)?
+            .ok_or_else(|| DocketError::NotFound(task_id.clone()))?;
+        task.status = TaskStatus::Completed;
+        task.result = Some(_result);
+
+        let json = serde_json::to_string(&task)
+            .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+
+        self.with_conn(|conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&tasks_key)
+                .arg(&task_id)
+                .arg(&json)
+                .ignore()
+                .cmd("ZREM")
+                .arg(&running_key)
+                .arg(&task_id)
+                .ignore()
+                .cmd("HDEL")
+                .arg(&member_key)
+                .arg(&task_id)
+                .ignore()
+                .cmd("HDEL")
+                .arg(&type_key)
+                .arg(&task_id)
+                .ignore()
+                .query::<()>(conn)
+        })?;
+
+        Ok(())
     }
 
     fn nack(&self, _task_id: &TaskId, _error: &str) -> DocketResult<()> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let task_id = _task_id.0.clone();
+        let tasks_key = self.key_tasks();
+        let running_key = self.key_running();
+        let member_key = self.key_queue_member();
+        let type_key = self.key_queue_type();
+
+        let mut task = self
+            .get_task(_task_id)?
+            .ok_or_else(|| DocketError::NotFound(task_id.clone()))?;
+
+        task.retry_count += 1;
+        task.error = Some(_error.to_string());
+
+        // Remove from running
+        self.with_conn(|conn| {
+            redis::cmd("ZREM")
+                .arg(&running_key)
+                .arg(&task_id)
+                .query::<()>(conn)
+        })?;
+
+        if task.retry_count >= task.max_retries {
+            task.status = TaskStatus::Failed;
+            let json = serde_json::to_string(&task)
+                .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+            self.with_conn(|conn| {
+                redis::pipe()
+                    .atomic()
+                    .cmd("HSET")
+                    .arg(&tasks_key)
+                    .arg(&task_id)
+                    .arg(&json)
+                    .ignore()
+                    .cmd("HDEL")
+                    .arg(&member_key)
+                    .arg(&task_id)
+                    .ignore()
+                    .cmd("HDEL")
+                    .arg(&type_key)
+                    .arg(&task_id)
+                    .ignore()
+                    .query::<()>(conn)
+            })?;
+            return Ok(());
+        }
+
+        // Schedule retry with exponential backoff.
+        task.status = TaskStatus::Pending;
+        task.claimed_at = None;
+
+        let member = Self::encode_member(&task);
+        let task_type = task.task_type.clone();
+        let delayed_key = self.key_delayed(&task_type);
+        let available_ms = Self::now_ms().saturating_add(self.retry_delay_ms(task.retry_count));
+
+        let json = serde_json::to_string(&task)
+            .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+
+        self.with_conn(|conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&tasks_key)
+                .arg(&task_id)
+                .arg(&json)
+                .ignore()
+                .cmd("HSET")
+                .arg(&member_key)
+                .arg(&task_id)
+                .arg(&member)
+                .ignore()
+                .cmd("HSET")
+                .arg(&type_key)
+                .arg(&task_id)
+                .arg(&task_type)
+                .ignore()
+                .cmd("ZADD")
+                .arg(&delayed_key)
+                .arg(available_ms)
+                .arg(&member)
+                .ignore()
+                .query::<()>(conn)
+        })?;
+
+        Ok(())
     }
 
     fn get_task(&self, _task_id: &TaskId) -> DocketResult<Option<DocketTask>> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let tasks_key = self.key_tasks();
+        let task_id = _task_id.0.clone();
+        let json: Option<String> =
+            self.with_conn(|conn| redis::cmd("HGET").arg(&tasks_key).arg(&task_id).query(conn))?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let task: DocketTask = serde_json::from_str(&json)
+            .map_err(|e| DocketError::Backend(format!("Task deserialize failed: {e}")))?;
+        Ok(Some(task))
     }
 
     fn list_tasks(
@@ -729,27 +1071,249 @@ impl DocketBackend for RedisDocketBackend {
         _status: Option<TaskStatus>,
         _limit: usize,
     ) -> DocketResult<Vec<DocketTask>> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let tasks_key = self.key_tasks();
+        let values: Vec<String> =
+            self.with_conn(|conn| redis::cmd("HVALS").arg(&tasks_key).query(conn))?;
+
+        let mut tasks = Vec::new();
+        for json in values {
+            if let Ok(task) = serde_json::from_str::<DocketTask>(&json) {
+                if _status.is_none_or(|s| task.status == s) {
+                    tasks.push(task);
+                }
+            }
+        }
+
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
+        tasks.truncate(_limit);
+        Ok(tasks)
     }
 
     fn cancel(&self, _task_id: &TaskId, _reason: Option<&str>) -> DocketResult<()> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let task_id = _task_id.0.clone();
+        let tasks_key = self.key_tasks();
+        let running_key = self.key_running();
+        let member_key = self.key_queue_member();
+        let type_key = self.key_queue_type();
+
+        let Some(mut task) = self.get_task(_task_id)? else {
+            return Err(DocketError::NotFound(task_id));
+        };
+
+        task.status = TaskStatus::Cancelled;
+        task.error = Some(_reason.unwrap_or("Cancelled").to_string());
+        task.result = Some(serde_json::json!({"cancelled": true}));
+
+        let json = serde_json::to_string(&task)
+            .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+
+        let member: Option<String> = self.with_conn(|conn| {
+            redis::cmd("HGET")
+                .arg(&member_key)
+                .arg(&task_id)
+                .query(conn)
+        })?;
+        let task_type: Option<String> =
+            self.with_conn(|conn| redis::cmd("HGET").arg(&type_key).arg(&task_id).query(conn))?;
+
+        self.with_conn(|conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&tasks_key)
+                .arg(&task_id)
+                .arg(&json)
+                .ignore()
+                .cmd("ZREM")
+                .arg(&running_key)
+                .arg(&task_id)
+                .ignore()
+                .cmd("HDEL")
+                .arg(&member_key)
+                .arg(&task_id)
+                .ignore()
+                .cmd("HDEL")
+                .arg(&type_key)
+                .arg(&task_id)
+                .ignore()
+                .query::<()>(conn)
+        })?;
+
+        if let (Some(member), Some(task_type)) = (member, task_type) {
+            let pending_key = self.key_pending(&task_type);
+            let delayed_key = self.key_delayed(&task_type);
+            let _ = self.with_conn(|conn| {
+                redis::pipe()
+                    .atomic()
+                    .cmd("ZREM")
+                    .arg(&pending_key)
+                    .arg(&member)
+                    .ignore()
+                    .cmd("ZREM")
+                    .arg(&delayed_key)
+                    .arg(&member)
+                    .ignore()
+                    .query::<()>(conn)
+            });
+        }
+
+        Ok(())
     }
 
     fn stats(&self) -> DocketResult<QueueStats> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let tasks = self.list_tasks(None, usize::MAX)?;
+        let mut stats = QueueStats::default();
+        for t in tasks {
+            match t.status {
+                TaskStatus::Pending => stats.pending += 1,
+                TaskStatus::Running => stats.in_progress += 1,
+                TaskStatus::Completed => stats.completed += 1,
+                TaskStatus::Failed => stats.failed += 1,
+                TaskStatus::Cancelled => stats.cancelled += 1,
+            }
+        }
+        Ok(stats)
     }
 
     fn requeue_stale(&self) -> DocketResult<usize> {
-        Err(DocketError::Backend(
-            "Redis backend not yet implemented".to_string(),
-        ))
+        let now_ms = Self::now_ms();
+        let visibility_ms: i64 = self
+            .docket_settings
+            .visibility_timeout
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let cutoff = now_ms.saturating_sub(visibility_ms);
+
+        let tasks_key = self.key_tasks();
+        let running_key = self.key_running();
+        let types_key = self.key_types();
+        let member_key = self.key_queue_member();
+        let type_key = self.key_queue_type();
+
+        // 1) Promote due delayed tasks into pending queues.
+        let types: Vec<String> =
+            self.with_conn(|conn| redis::cmd("SMEMBERS").arg(&types_key).query(conn))?;
+        for t in &types {
+            let delayed_key = self.key_delayed(t);
+            let pending_key = self.key_pending(t);
+            let due_members: Vec<String> = self.with_conn(|conn| {
+                redis::cmd("ZRANGEBYSCORE")
+                    .arg(&delayed_key)
+                    .arg("-inf")
+                    .arg(now_ms)
+                    .query(conn)
+            })?;
+            if due_members.is_empty() {
+                continue;
+            }
+            self.with_conn(|conn| {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for m in &due_members {
+                    pipe.cmd("ZREM").arg(&delayed_key).arg(m).ignore();
+                    pipe.cmd("ZADD").arg(&pending_key).arg(0).arg(m).ignore();
+                }
+                pipe.query::<()>(conn)
+            })?;
+        }
+
+        // 2) Requeue running tasks past visibility timeout.
+        let stale: Vec<String> = self.with_conn(|conn| {
+            redis::cmd("ZRANGEBYSCORE")
+                .arg(&running_key)
+                .arg("-inf")
+                .arg(cutoff)
+                .query(conn)
+        })?;
+
+        let mut requeued = 0usize;
+        for task_id in stale {
+            // Claim the stale record: if another worker already handled it, skip.
+            let removed: i64 = self.with_conn(|conn| {
+                redis::cmd("ZREM")
+                    .arg(&running_key)
+                    .arg(&task_id)
+                    .query(conn)
+            })?;
+            if removed == 0 {
+                continue;
+            }
+
+            let id = TaskId::from_string(task_id.clone());
+            let Some(mut task) = self.get_task(&id)? else {
+                continue;
+            };
+
+            task.retry_count += 1;
+            task.claimed_at = None;
+            task.error = Some("Exceeded visibility timeout".to_string());
+
+            if task.retry_count >= task.max_retries {
+                task.status = TaskStatus::Failed;
+                let json = serde_json::to_string(&task)
+                    .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+                self.with_conn(|conn| {
+                    redis::pipe()
+                        .atomic()
+                        .cmd("HSET")
+                        .arg(&tasks_key)
+                        .arg(&task_id)
+                        .arg(&json)
+                        .ignore()
+                        .cmd("HDEL")
+                        .arg(&member_key)
+                        .arg(&task_id)
+                        .ignore()
+                        .cmd("HDEL")
+                        .arg(&type_key)
+                        .arg(&task_id)
+                        .ignore()
+                        .query::<()>(conn)
+                })?;
+                continue;
+            }
+
+            task.status = TaskStatus::Pending;
+            let member = Self::encode_member(&task);
+            let task_type = task.task_type.clone();
+            let delayed_key = self.key_delayed(&task_type);
+            let available_ms = now_ms.saturating_add(self.retry_delay_ms(task.retry_count));
+
+            let json = serde_json::to_string(&task)
+                .map_err(|e| DocketError::Backend(format!("Task serialize failed: {e}")))?;
+            self.with_conn(|conn| {
+                redis::pipe()
+                    .atomic()
+                    .cmd("HSET")
+                    .arg(&tasks_key)
+                    .arg(&task_id)
+                    .arg(&json)
+                    .ignore()
+                    .cmd("HSET")
+                    .arg(&member_key)
+                    .arg(&task_id)
+                    .arg(&member)
+                    .ignore()
+                    .cmd("HSET")
+                    .arg(&type_key)
+                    .arg(&task_id)
+                    .arg(&task_type)
+                    .ignore()
+                    .cmd("ZADD")
+                    .arg(&delayed_key)
+                    .arg(available_ms)
+                    .arg(&member)
+                    .ignore()
+                    .query::<()>(conn)
+            })?;
+            requeued += 1;
+        }
+
+        Ok(requeued)
     }
 }
 

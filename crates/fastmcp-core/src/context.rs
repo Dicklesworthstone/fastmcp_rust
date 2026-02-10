@@ -593,6 +593,13 @@ pub enum ToolContentItem {
         /// MIME type of the image.
         mime_type: String,
     },
+    /// Audio content (base64-encoded).
+    Audio {
+        /// Base64-encoded audio data.
+        data: String,
+        /// MIME type of the audio.
+        mime_type: String,
+    },
     /// Embedded resource reference.
     Resource {
         /// Resource URI.
@@ -601,6 +608,8 @@ pub enum ToolContentItem {
         mime_type: Option<String>,
         /// Text content.
         text: Option<String>,
+        /// Binary content (base64 blob).
+        blob: Option<String>,
     },
 }
 

@@ -52,9 +52,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use syn::spanned::Spanned as _;
 use syn::{
     Attribute, FnArg, Ident, ItemFn, Lit, LitStr, Meta, Pat, Token, Type, parse::Parse,
     parse::ParseStream, parse_macro_input,
@@ -138,6 +141,31 @@ fn is_string_type(ty: &Type) -> bool {
             .is_some_and(|s| s.ident == "String");
     }
     false
+}
+
+fn default_lit_expr_for_type(lit: &Lit, ty: &Type) -> syn::Result<TokenStream2> {
+    if is_option_type(ty) {
+        let inner = option_inner_type(ty).ok_or_else(|| {
+            syn::Error::new(
+                ty.span(),
+                "Option<T> default requires a concrete inner type",
+            )
+        })?;
+        let inner_expr = default_lit_expr_for_type(lit, inner)?;
+        return Ok(quote! { Some(#inner_expr) });
+    }
+
+    if is_string_type(ty) {
+        let Lit::Str(s) = lit else {
+            return Err(syn::Error::new(
+                lit.span(),
+                "default for String must be a string literal",
+            ));
+        };
+        return Ok(quote! { #s.to_string() });
+    }
+
+    Ok(quote! { #lit })
 }
 
 /// Parses a human-readable duration string and returns milliseconds.
@@ -658,6 +686,7 @@ struct ToolAttrs {
     name: Option<String>,
     description: Option<String>,
     timeout: Option<String>,
+    defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
     output_schema: Option<syn::Expr>,
 }
@@ -667,26 +696,43 @@ impl Parse for ToolAttrs {
         let mut name = None;
         let mut description = None;
         let mut timeout = None;
+        let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
 
             match ident.to_string().as_str() {
                 "name" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     name = Some(lit.value());
                 }
                 "description" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     description = Some(lit.value());
                 }
                 "timeout" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
                 }
+                "defaults" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    while !content.is_empty() {
+                        let key: Ident = content.parse()?;
+                        content.parse::<Token![=]>()?;
+                        let lit: Lit = content.parse()?;
+                        defaults.insert(key.to_string(), lit);
+                        if !content.is_empty() {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 "output_schema" => {
+                    input.parse::<Token![=]>()?;
                     // Accept any expression (json!(...), type name, etc.)
                     let expr: syn::Expr = input.parse()?;
                     output_schema = Some(expr);
@@ -705,6 +751,7 @@ impl Parse for ToolAttrs {
             name,
             description,
             timeout,
+            defaults,
             output_schema,
         })
     }
@@ -721,6 +768,20 @@ impl Parse for ToolAttrs {
 ///
 /// - `name` - Override the tool name (default: function name)
 /// - `description` - Tool description (default: doc comment)
+///
+/// # Parameter Defaults
+///
+/// Rust has no default function arguments. For feature parity with Python FastMCP,
+/// `#[tool]` supports per-parameter defaults via `defaults(...)`:
+///
+/// ```ignore
+/// #[tool(defaults(title = "World"))]
+/// fn greet(name: String, title: String) -> String {
+///     format!("Hello {title} {name}")
+/// }
+/// ```
+///
+/// If the argument is omitted in the JSON-RPC call, the default expression is used.
 #[proc_macro_attribute]
 #[allow(clippy::too_many_lines)]
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -784,7 +845,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
     // Parse parameters (skip first if it's &McpContext)
-    let mut params: Vec<(&Ident, &Type, Option<String>)> = Vec::new();
+    let mut params: Vec<(&Ident, &Type, Option<String>, Option<Lit>)> = Vec::new();
     let mut required_params: Vec<String> = Vec::new();
     let mut expects_context = false;
 
@@ -800,15 +861,16 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let param_name = &pat_ident.ident;
                 let param_type = pat_type.ty.as_ref();
                 let param_doc = extract_doc_comments(&pat_type.attrs);
+                let param_default = attrs.defaults.get(&param_name.to_string()).cloned();
 
-                // Check if parameter is required (not Option<T>)
+                // Check if parameter is required (not Option<T> and no default)
                 let is_optional = is_option_type(param_type);
 
-                if !is_optional {
+                if !is_optional && param_default.is_none() {
                     required_params.push(param_name.to_string());
                 }
 
-                params.push((param_name, param_type, param_doc));
+                params.push((param_name, param_type, param_doc, param_default));
             }
         }
     }
@@ -816,36 +878,70 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate JSON schema for input
     let property_entries: Vec<TokenStream2> = params
         .iter()
-        .map(|(name, ty, doc)| {
+        .map(|(name, ty, doc, default_expr)| {
             let name_str = name.to_string();
             let schema = type_to_json_schema(ty);
-            if let Some(desc) = doc {
-                quote! {
+
+            let default_insert = default_expr.as_ref().map_or_else(
+                || quote! {},
+                |lit| {
+                    quote! {
+                        obj.insert("default".to_string(), serde_json::json!(#lit));
+                    }
+                },
+            );
+
+            match (doc.as_ref(), default_expr.as_ref()) {
+                (None, None) => quote! {
+                    (#name_str.to_string(), #schema)
+                },
+                (Some(desc), _) => quote! {
                     (#name_str.to_string(), {
                         let mut s = #schema;
                         if let Some(obj) = s.as_object_mut() {
                             obj.insert("description".to_string(), serde_json::json!(#desc));
+                            #default_insert
                         }
                         s
                     })
-                }
-            } else {
-                quote! {
-                    (#name_str.to_string(), #schema)
-                }
+                },
+                (None, Some(_)) => quote! {
+                    (#name_str.to_string(), {
+                        let mut s = #schema;
+                        if let Some(obj) = s.as_object_mut() {
+                            #default_insert
+                        }
+                        s
+                    })
+                },
             }
         })
         .collect();
 
     // Generate parameter extraction code
-    let param_extractions: Vec<TokenStream2> = params
-        .iter()
-        .map(|(name, ty, _)| {
-            let name_str = name.to_string();
-            let is_optional = is_option_type(ty);
+    let mut param_extractions: Vec<TokenStream2> = Vec::new();
+    for (name, ty, _, default_lit) in &params {
+        let name_str = name.to_string();
+        let is_optional = is_option_type(ty);
 
-            if is_optional {
-                quote! {
+        if is_optional {
+            if let Some(default_lit) = default_lit {
+                let default_expr = match default_lit_expr_for_type(default_lit, ty) {
+                    Ok(v) => v,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                param_extractions.push(quote! {
+                    let #name: #ty = match arguments.get(#name_str) {
+                        Some(value) => Some(
+                            serde_json::from_value(value.clone()).map_err(|e| {
+                                fastmcp_core::McpError::invalid_params(e.to_string())
+                            })?,
+                        ),
+                        None => #default_expr,
+                    };
+                });
+            } else {
+                param_extractions.push(quote! {
                     let #name: #ty = match arguments.get(#name_str) {
                         Some(value) => Some(
                             serde_json::from_value(value.clone()).map_err(|e| {
@@ -854,22 +950,34 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         None => None,
                     };
-                }
-            } else {
-                quote! {
-                    let #name: #ty = arguments.get(#name_str)
-                        .ok_or_else(|| fastmcp_core::McpError::invalid_params(
-                            format!("missing required parameter: {}", #name_str)
-                        ))
-                        .and_then(|v| serde_json::from_value(v.clone())
-                            .map_err(|e| fastmcp_core::McpError::invalid_params(e.to_string())))?;
-                }
+                });
             }
-        })
-        .collect();
+        } else if let Some(default_lit) = default_lit {
+            let default_expr = match default_lit_expr_for_type(default_lit, ty) {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            param_extractions.push(quote! {
+                let #name: #ty = match arguments.get(#name_str) {
+                    Some(v) => serde_json::from_value(v.clone())
+                        .map_err(|e| fastmcp_core::McpError::invalid_params(e.to_string()))?,
+                    None => #default_expr,
+                };
+            });
+        } else {
+            param_extractions.push(quote! {
+                let #name: #ty = arguments.get(#name_str)
+                    .ok_or_else(|| fastmcp_core::McpError::invalid_params(
+                        format!("missing required parameter: {}", #name_str)
+                    ))
+                    .and_then(|v| serde_json::from_value(v.clone())
+                        .map_err(|e| fastmcp_core::McpError::invalid_params(e.to_string())))?;
+            });
+        }
+    }
 
     // Generate parameter names for function call
-    let param_names: Vec<&Ident> = params.iter().map(|(name, _, _)| *name).collect();
+    let param_names: Vec<&Ident> = params.iter().map(|(name, _, _, _)| *name).collect();
 
     // Check if function is async
     let is_async = input_fn.sig.asyncness.is_some();
@@ -1305,6 +1413,7 @@ struct PromptAttrs {
     name: Option<String>,
     description: Option<String>,
     timeout: Option<String>,
+    defaults: HashMap<String, Lit>,
 }
 
 impl Parse for PromptAttrs {
@@ -1312,23 +1421,39 @@ impl Parse for PromptAttrs {
         let mut name = None;
         let mut description = None;
         let mut timeout = None;
+        let mut defaults: HashMap<String, Lit> = HashMap::new();
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
 
             match ident.to_string().as_str() {
                 "name" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     name = Some(lit.value());
                 }
                 "description" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     description = Some(lit.value());
                 }
                 "timeout" => {
+                    input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
+                }
+                "defaults" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    while !content.is_empty() {
+                        let key: Ident = content.parse()?;
+                        content.parse::<Token![=]>()?;
+                        let lit: Lit = content.parse()?;
+                        defaults.insert(key.to_string(), lit);
+                        if !content.is_empty() {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
                 }
                 _ => {
                     return Err(syn::Error::new(ident.span(), "unknown attribute"));
@@ -1344,6 +1469,7 @@ impl Parse for PromptAttrs {
             name,
             description,
             timeout,
+            defaults,
         })
     }
 }
@@ -1354,6 +1480,18 @@ impl Parse for PromptAttrs {
 ///
 /// - `name` - Override the prompt name (default: function name)
 /// - `description` - Prompt description (default: doc comment)
+///
+/// # Argument Defaults
+///
+/// Prompt handlers take a `HashMap<String, String>` of arguments. For feature
+/// parity with Python FastMCP, `#[prompt]` supports defaults via `defaults(...)`:
+///
+/// ```ignore
+/// #[prompt(defaults(greeting = "Hi"))]
+/// fn greet(name: String, greeting: String) -> Vec<PromptMessage> {
+///     vec![PromptMessage::user(format!("{greeting} {name}"))]
+/// }
+/// ```
 #[proc_macro_attribute]
 #[allow(clippy::too_many_lines)]
 pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -1417,6 +1555,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let param_name = pat_ident.ident.to_string();
                 let param_doc = extract_doc_comments(&pat_type.attrs);
                 let is_optional = is_option_type(pat_type.ty.as_ref());
+                let has_default = attrs.defaults.contains_key(&param_name);
+                let required = !(is_optional || has_default);
 
                 let desc_tokens = param_doc
                     .as_ref()
@@ -1426,7 +1566,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                     fastmcp_protocol::PromptArgument {
                         name: #param_name.to_string(),
                         description: #desc_tokens,
-                        required: !#is_optional,
+                        required: #required,
                     }
                 });
             }
@@ -1447,24 +1587,54 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
             if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
                 let param_name = &pat_ident.ident;
                 let param_name_str = param_name.to_string();
-                let is_optional = is_option_type(pat_type.ty.as_ref());
+                let param_ty = pat_type.ty.as_ref();
+                let is_optional = is_option_type(param_ty);
+                let default_lit = attrs.defaults.get(&param_name_str).cloned();
 
                 param_names.push(param_name.clone());
 
                 if is_optional {
-                    // Optional parameters: return None if not provided
-                    param_extractions.push(quote! {
-                        let #param_name = arguments.get(#param_name_str).cloned();
-                    });
+                    if let Some(default_lit) = default_lit {
+                        let default_expr = match default_lit_expr_for_type(&default_lit, param_ty) {
+                            Ok(v) => v,
+                            Err(e) => return e.to_compile_error().into(),
+                        };
+                        // Optional parameters with defaults: use default if missing
+                        param_extractions.push(quote! {
+                            let #param_name: #param_ty = match arguments.get(#param_name_str) {
+                                Some(v) => Some(v.clone()),
+                                None => #default_expr,
+                            };
+                        });
+                    } else {
+                        // Optional parameters: return None if not provided
+                        param_extractions.push(quote! {
+                            let #param_name: #param_ty = arguments.get(#param_name_str).cloned();
+                        });
+                    }
                 } else {
-                    // Required parameters: return an error if missing
-                    param_extractions.push(quote! {
-                        let #param_name = arguments.get(#param_name_str)
-                            .cloned()
-                            .ok_or_else(|| fastmcp_core::McpError::invalid_params(
-                                format!("missing required argument: {}", #param_name_str)
-                            ))?;
-                    });
+                    if let Some(default_lit) = default_lit {
+                        let default_expr = match default_lit_expr_for_type(&default_lit, param_ty) {
+                            Ok(v) => v,
+                            Err(e) => return e.to_compile_error().into(),
+                        };
+                        // Required-typed parameters with defaults: use default if missing.
+                        param_extractions.push(quote! {
+                            let #param_name: #param_ty = match arguments.get(#param_name_str) {
+                                Some(v) => v.clone(),
+                                None => #default_expr,
+                            };
+                        });
+                    } else {
+                        // Required parameters: return an error if missing
+                        param_extractions.push(quote! {
+                            let #param_name: #param_ty = arguments.get(#param_name_str)
+                                .cloned()
+                                .ok_or_else(|| fastmcp_core::McpError::invalid_params(
+                                    format!("missing required argument: {}", #param_name_str)
+                                ))?;
+                        });
+                    }
                 }
             }
         }

@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use asupersync::Cx;
 use fastmcp_core::{
@@ -179,7 +180,7 @@ impl RequestSender {
     /// - The connection is closed
     pub fn send_request<T: serde::de::DeserializeOwned>(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         method: &str,
         params: serde_json::Value,
     ) -> McpResult<T> {
@@ -198,15 +199,35 @@ impl RequestSender {
             )));
         }
 
-        // Wait for response
-        // TODO: Add timeout based on budget
-        match receiver.recv() {
-            Ok(Ok(value)) => serde_json::from_value(value)
-                .map_err(|e| McpError::internal_error(format!("Failed to parse response: {}", e))),
-            Ok(Err(error)) => Err(McpError::new(McpErrorCode::from(error.code), error.message)),
-            Err(_) => Err(McpError::internal_error(
-                "Response channel closed unexpectedly",
-            )),
+        // Wait for response while observing cancellation/budget via checkpoints.
+        //
+        // This uses periodic `recv_timeout` polling so we can call `cx.checkpoint()`
+        // to notice budget exhaustion or explicit cancellation.
+        let tick = Duration::from_millis(25);
+        loop {
+            if cx.checkpoint().is_err() {
+                self.pending.remove(&id);
+                return Err(McpError::request_cancelled());
+            }
+
+            match receiver.recv_timeout(tick) {
+                Ok(Ok(value)) => {
+                    return serde_json::from_value(value).map_err(|e| {
+                        McpError::internal_error(format!("Failed to parse response: {e}"))
+                    });
+                }
+                Ok(Err(error)) => {
+                    return Err(McpError::new(McpErrorCode::from(error.code), error.message));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Keep waiting, but allow budget/cancellation to be observed.
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(McpError::internal_error(
+                        "Response channel closed unexpectedly",
+                    ));
+                }
+            }
         }
     }
 }

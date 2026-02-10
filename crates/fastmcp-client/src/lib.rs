@@ -481,9 +481,21 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
-        let params = ListToolsParams::default();
-        let result: ListToolsResult = self.send_request("tools/list", params)?;
-        Ok(result.tools)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = ListToolsParams::default();
+            params.cursor = cursor.clone();
+            let result: ListToolsResult = self.send_request("tools/list", params)?;
+            all.extend(result.tools);
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Calls a tool with the given arguments.
@@ -708,9 +720,21 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
-        let params = ListResourcesParams::default();
-        let result: ListResourcesResult = self.send_request("resources/list", params)?;
-        Ok(result.resources)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = ListResourcesParams::default();
+            params.cursor = cursor.clone();
+            let result: ListResourcesResult = self.send_request("resources/list", params)?;
+            all.extend(result.resources);
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Lists available resource templates.
@@ -720,10 +744,22 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
         self.ensure_initialized()?;
-        let params = ListResourceTemplatesParams::default();
-        let result: ListResourceTemplatesResult =
-            self.send_request("resources/templates/list", params)?;
-        Ok(result.resource_templates)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = ListResourceTemplatesParams::default();
+            params.cursor = cursor.clone();
+            let result: ListResourceTemplatesResult =
+                self.send_request("resources/templates/list", params)?;
+            all.extend(result.resource_templates);
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Sets the server log level (if supported).
@@ -760,9 +796,21 @@ impl Client {
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
-        let params = ListPromptsParams::default();
-        let result: ListPromptsResult = self.send_request("prompts/list", params)?;
-        Ok(result.prompts)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut params = ListPromptsParams::default();
+            params.cursor = cursor.clone();
+            let result: ListPromptsResult = self.send_request("prompts/list", params)?;
+            all.extend(result.prompts);
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Gets a prompt with the given arguments.
@@ -831,13 +879,37 @@ impl Client {
         &mut self,
         status: Option<TaskStatus>,
         cursor: Option<&str>,
+        limit: Option<u32>,
     ) -> McpResult<ListTasksResult> {
         self.ensure_initialized()?;
         let params = ListTasksParams {
             cursor: cursor.map(ToString::to_string),
+            limit,
             status,
         };
         self.send_request("tasks/list", params)
+    }
+
+    /// Lists all tasks by following pagination cursors until exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any request fails.
+    pub fn list_tasks_all(&mut self, status: Option<TaskStatus>) -> McpResult<Vec<TaskInfo>> {
+        self.ensure_initialized()?;
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let result = self.list_tasks(status, cursor.as_deref(), Some(200))?;
+            all.extend(result.tasks);
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Gets detailed information about a specific task.

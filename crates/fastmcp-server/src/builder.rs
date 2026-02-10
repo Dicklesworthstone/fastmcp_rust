@@ -140,6 +140,17 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the pagination page size for list methods.
+    ///
+    /// When set, list methods will return up to `page_size` items and provide an
+    /// opaque `nextCursor` for retrieving the next page. When not set (default),
+    /// list methods return all items in a single response.
+    #[must_use]
+    pub fn list_page_size(mut self, page_size: usize) -> Self {
+        self.router.set_list_page_size(Some(page_size));
+        self
+    }
+
     /// Enables or disables error detail masking.
     ///
     /// When enabled, internal error details are hidden from client responses:

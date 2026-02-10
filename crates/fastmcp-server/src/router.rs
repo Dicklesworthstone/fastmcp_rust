@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use asupersync::{Budget, Cx, Outcome};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{debug, targets, trace};
 use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
@@ -88,17 +90,51 @@ impl<'a> TagFilters<'a> {
     }
 }
 
+fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+
+    let decoded = BASE64_STANDARD.decode(cursor).map_err(|_| {
+        McpError::invalid_params("Invalid cursor (base64 decode failed)".to_string())
+    })?;
+    let v: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|_| McpError::invalid_params("Invalid cursor (JSON parse failed)".to_string()))?;
+    let offset = v
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| McpError::invalid_params("Invalid cursor (missing offset)".to_string()))?;
+
+    usize::try_from(offset)
+        .map_err(|_| McpError::invalid_params("Invalid cursor (offset too large)".to_string()))
+}
+
+fn encode_cursor_offset(offset: usize) -> String {
+    let payload = serde_json::json!({ "offset": offset });
+    let bytes = serde_json::to_vec(&payload).expect("cursor state must serialize");
+    BASE64_STANDARD.encode(bytes)
+}
+
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
+    tool_order: Vec<String>,
     resources: HashMap<String, BoxedResourceHandler>,
+    resource_order: Vec<String>,
     prompts: HashMap<String, BoxedPromptHandler>,
+    prompt_order: Vec<String>,
     resource_templates: HashMap<String, ResourceTemplateEntry>,
+    resource_template_order: Vec<String>,
     /// Pre-sorted template keys by specificity (most specific first).
     /// Updated whenever templates are added/modified.
     sorted_template_keys: Vec<String>,
     /// Whether to enforce strict input validation (reject extra properties).
     strict_input_validation: bool,
+    /// Optional list page size for cursor-based pagination.
+    ///
+    /// When `None`, list methods return all items in a single response and
+    /// `nextCursor` is always omitted.
+    list_page_size: Option<usize>,
 }
 
 impl Router {
@@ -107,12 +143,25 @@ impl Router {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            tool_order: Vec::new(),
             resources: HashMap::new(),
+            resource_order: Vec::new(),
             prompts: HashMap::new(),
+            prompt_order: Vec::new(),
             resource_templates: HashMap::new(),
+            resource_template_order: Vec::new(),
             sorted_template_keys: Vec::new(),
             strict_input_validation: false,
+            list_page_size: None,
         }
+    }
+
+    /// Sets the list pagination page size.
+    ///
+    /// When set, list methods (`tools/list`, `resources/list`, `resources/templates/list`,
+    /// `prompts/list`, `tasks/list`) will page results using opaque base64 cursors.
+    pub fn set_list_page_size(&mut self, page_size: Option<usize>) {
+        self.list_page_size = page_size.filter(|n| *n > 0);
     }
 
     /// Sets whether to use strict input validation.
@@ -156,7 +205,11 @@ impl Router {
     /// finer control over duplicate handling.
     pub fn add_tool<H: ToolHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
+        let is_new = !self.tools.contains_key(&def.name);
         self.tools.insert(def.name.clone(), Box::new(handler));
+        if is_new {
+            self.tool_order.push(def.name);
+        }
     }
 
     /// Adds a tool handler with specified duplicate behavior.
@@ -171,7 +224,8 @@ impl Router {
         let def = handler.definition();
         let name = &def.name;
 
-        if self.tools.contains_key(name) {
+        let existed = self.tools.contains_key(name);
+        if existed {
             match behavior {
                 crate::DuplicateBehavior::Error => {
                     return Err(McpError::invalid_request(format!(
@@ -194,6 +248,9 @@ impl Router {
         }
 
         self.tools.insert(def.name.clone(), Box::new(handler));
+        if !existed {
+            self.tool_order.push(def.name);
+        }
         Ok(())
     }
 
@@ -208,6 +265,7 @@ impl Router {
         let boxed: BoxedResourceHandler = Box::new(handler);
 
         if let Some(template) = template {
+            let is_new = !self.resource_templates.contains_key(&template.uri_template);
             let entry = ResourceTemplateEntry {
                 matcher: UriTemplate::new(&template.uri_template),
                 template: template.clone(),
@@ -215,9 +273,16 @@ impl Router {
             };
             self.resource_templates
                 .insert(template.uri_template.clone(), entry);
+            if is_new {
+                self.resource_template_order.push(template.uri_template);
+            }
             self.rebuild_sorted_template_keys();
         } else {
+            let is_new = !self.resources.contains_key(&def.uri);
             self.resources.insert(def.uri.clone(), boxed);
+            if is_new {
+                self.resource_order.push(def.uri);
+            }
         }
     }
 
@@ -271,6 +336,7 @@ impl Router {
         let boxed: BoxedResourceHandler = Box::new(handler);
 
         if let Some(template) = template {
+            let is_new = !self.resource_templates.contains_key(&template.uri_template);
             let entry = ResourceTemplateEntry {
                 matcher: UriTemplate::new(&template.uri_template),
                 template: template.clone(),
@@ -278,9 +344,16 @@ impl Router {
             };
             self.resource_templates
                 .insert(template.uri_template.clone(), entry);
+            if is_new {
+                self.resource_template_order.push(template.uri_template);
+            }
             self.rebuild_sorted_template_keys();
         } else {
+            let is_new = !self.resources.contains_key(&def.uri);
             self.resources.insert(def.uri.clone(), boxed);
+            if is_new {
+                self.resource_order.push(def.uri);
+            }
         }
 
         Ok(())
@@ -288,25 +361,26 @@ impl Router {
 
     /// Adds a resource template definition.
     pub fn add_resource_template(&mut self, template: ResourceTemplate) {
-        let matcher = UriTemplate::new(&template.uri_template);
+        let key = template.uri_template.clone();
+        let matcher = UriTemplate::new(&key);
         let entry = ResourceTemplateEntry {
             matcher,
             template: template.clone(),
             handler: None,
         };
-        let needs_rebuild = match self.resource_templates.get_mut(&template.uri_template) {
+        let needs_rebuild = match self.resource_templates.get_mut(&key) {
             Some(existing) => {
                 existing.template = template;
                 existing.matcher = entry.matcher;
                 false // Key already exists, order unchanged
             }
             None => {
-                self.resource_templates
-                    .insert(template.uri_template.clone(), entry);
+                self.resource_templates.insert(key.clone(), entry);
                 true // New key added, need to rebuild
             }
         };
         if needs_rebuild {
+            self.resource_template_order.push(key);
             self.rebuild_sorted_template_keys();
         }
     }
@@ -319,7 +393,11 @@ impl Router {
     /// finer control over duplicate handling.
     pub fn add_prompt<H: PromptHandler + 'static>(&mut self, handler: H) {
         let def = handler.definition();
+        let is_new = !self.prompts.contains_key(&def.name);
         self.prompts.insert(def.name.clone(), Box::new(handler));
+        if is_new {
+            self.prompt_order.push(def.name);
+        }
     }
 
     /// Adds a prompt handler with specified duplicate behavior.
@@ -334,7 +412,8 @@ impl Router {
         let def = handler.definition();
         let name = &def.name;
 
-        if self.prompts.contains_key(name) {
+        let existed = self.prompts.contains_key(name);
+        if existed {
             match behavior {
                 crate::DuplicateBehavior::Error => {
                     return Err(McpError::invalid_request(format!(
@@ -357,13 +436,20 @@ impl Router {
         }
 
         self.prompts.insert(def.name.clone(), Box::new(handler));
+        if !existed {
+            self.prompt_order.push(def.name);
+        }
         Ok(())
     }
 
     /// Returns all tool definitions.
     #[must_use]
     pub fn tools(&self) -> Vec<Tool> {
-        self.tools.values().map(|h| h.definition()).collect()
+        self.tool_order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns tool definitions filtered by session state and tags.
@@ -376,32 +462,36 @@ impl Router {
         session_state: Option<&SessionState>,
         tag_filters: Option<&TagFilters<'_>>,
     ) -> Vec<Tool> {
-        self.tools
-            .values()
-            .filter(|h| {
+        self.tool_order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter_map(|h| {
                 let def = h.definition();
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_tool_enabled(&def.name) {
-                        return false;
+                        return None;
                     }
                 }
                 // Check tag filters
                 if let Some(filters) = tag_filters {
                     if !filters.matches(&def.tags) {
-                        return false;
+                        return None;
                     }
                 }
-                true
+                Some(def)
             })
-            .map(|h| h.definition())
             .collect()
     }
 
     /// Returns all resource definitions.
     #[must_use]
     pub fn resources(&self) -> Vec<Resource> {
-        self.resources.values().map(|h| h.definition()).collect()
+        self.resource_order
+            .iter()
+            .filter_map(|uri| self.resources.get(uri))
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns resource definitions filtered by session state and tags.
@@ -414,38 +504,36 @@ impl Router {
         session_state: Option<&SessionState>,
         tag_filters: Option<&TagFilters<'_>>,
     ) -> Vec<Resource> {
-        self.resources
-            .values()
-            .filter(|h| {
+        self.resource_order
+            .iter()
+            .filter_map(|uri| self.resources.get(uri))
+            .filter_map(|h| {
                 let def = h.definition();
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_resource_enabled(&def.uri) {
-                        return false;
+                        return None;
                     }
                 }
                 // Check tag filters
                 if let Some(filters) = tag_filters {
                     if !filters.matches(&def.tags) {
-                        return false;
+                        return None;
                     }
                 }
-                true
+                Some(def)
             })
-            .map(|h| h.definition())
             .collect()
     }
 
     /// Returns all resource templates.
     #[must_use]
     pub fn resource_templates(&self) -> Vec<ResourceTemplate> {
-        let mut templates: Vec<ResourceTemplate> = self
-            .resource_templates
-            .values()
+        self.resource_template_order
+            .iter()
+            .filter_map(|t| self.resource_templates.get(t))
             .map(|entry| entry.template.clone())
-            .collect();
-        templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
-        templates
+            .collect()
     }
 
     /// Returns resource templates filtered by session state and tags.
@@ -458,34 +546,35 @@ impl Router {
         session_state: Option<&SessionState>,
         tag_filters: Option<&TagFilters<'_>>,
     ) -> Vec<ResourceTemplate> {
-        let mut templates: Vec<ResourceTemplate> = self
-            .resource_templates
-            .values()
-            .filter(|entry| {
+        self.resource_template_order
+            .iter()
+            .filter_map(|t| self.resource_templates.get(t))
+            .filter_map(|entry| {
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_resource_enabled(&entry.template.uri_template) {
-                        return false;
+                        return None;
                     }
                 }
                 // Check tag filters
                 if let Some(filters) = tag_filters {
                     if !filters.matches(&entry.template.tags) {
-                        return false;
+                        return None;
                     }
                 }
-                true
+                Some(entry.template.clone())
             })
-            .map(|entry| entry.template.clone())
-            .collect();
-        templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
-        templates
+            .collect()
     }
 
     /// Returns all prompt definitions.
     #[must_use]
     pub fn prompts(&self) -> Vec<Prompt> {
-        self.prompts.values().map(|h| h.definition()).collect()
+        self.prompt_order
+            .iter()
+            .filter_map(|name| self.prompts.get(name))
+            .map(|h| h.definition())
+            .collect()
     }
 
     /// Returns prompt definitions filtered by session state and tags.
@@ -498,25 +587,25 @@ impl Router {
         session_state: Option<&SessionState>,
         tag_filters: Option<&TagFilters<'_>>,
     ) -> Vec<Prompt> {
-        self.prompts
-            .values()
-            .filter(|h| {
+        self.prompt_order
+            .iter()
+            .filter_map(|name| self.prompts.get(name))
+            .filter_map(|h| {
                 let def = h.definition();
                 // Check session state filter
                 if let Some(state) = session_state {
                     if !state.is_prompt_enabled(&def.name) {
-                        return false;
+                        return None;
                     }
                 }
                 // Check tag filters
                 if let Some(filters) = tag_filters {
                     if !filters.matches(&def.tags) {
-                        return false;
+                        return None;
                     }
                 }
-                true
+                Some(def)
             })
-            .map(|h| h.definition())
             .collect()
     }
 
@@ -648,9 +737,24 @@ impl Router {
         } else {
             None
         };
+        let tools = self.tools_filtered(session_state, tag_filters);
+        let Some(page_size) = self.list_page_size else {
+            return Ok(ListToolsResult {
+                tools,
+                next_cursor: None,
+            });
+        };
+
+        let offset = decode_cursor_offset(params.cursor.as_deref())?;
+        let end = (offset + page_size).min(tools.len());
+        let next_cursor = if end < tools.len() {
+            Some(encode_cursor_offset(end))
+        } else {
+            None
+        };
         Ok(ListToolsResult {
-            tools: self.tools_filtered(session_state, tag_filters),
-            next_cursor: None,
+            tools: tools.get(offset..end).unwrap_or_default().to_vec(),
+            next_cursor,
         })
     }
 
@@ -812,9 +916,24 @@ impl Router {
         } else {
             None
         };
+        let resources = self.resources_filtered(session_state, tag_filters);
+        let Some(page_size) = self.list_page_size else {
+            return Ok(ListResourcesResult {
+                resources,
+                next_cursor: None,
+            });
+        };
+
+        let offset = decode_cursor_offset(params.cursor.as_deref())?;
+        let end = (offset + page_size).min(resources.len());
+        let next_cursor = if end < resources.len() {
+            Some(encode_cursor_offset(end))
+        } else {
+            None
+        };
         Ok(ListResourcesResult {
-            resources: self.resources_filtered(session_state, tag_filters),
-            next_cursor: None,
+            resources: resources.get(offset..end).unwrap_or_default().to_vec(),
+            next_cursor,
         })
     }
 
@@ -835,8 +954,24 @@ impl Router {
         } else {
             None
         };
+        let templates = self.resource_templates_filtered(session_state, tag_filters);
+        let Some(page_size) = self.list_page_size else {
+            return Ok(ListResourceTemplatesResult {
+                resource_templates: templates,
+                next_cursor: None,
+            });
+        };
+
+        let offset = decode_cursor_offset(params.cursor.as_deref())?;
+        let end = (offset + page_size).min(templates.len());
+        let next_cursor = if end < templates.len() {
+            Some(encode_cursor_offset(end))
+        } else {
+            None
+        };
         Ok(ListResourceTemplatesResult {
-            resource_templates: self.resource_templates_filtered(session_state, tag_filters),
+            resource_templates: templates.get(offset..end).unwrap_or_default().to_vec(),
+            next_cursor,
         })
     }
 
@@ -952,9 +1087,24 @@ impl Router {
         } else {
             None
         };
+        let prompts = self.prompts_filtered(session_state, tag_filters);
+        let Some(page_size) = self.list_page_size else {
+            return Ok(ListPromptsResult {
+                prompts,
+                next_cursor: None,
+            });
+        };
+
+        let offset = decode_cursor_offset(params.cursor.as_deref())?;
+        let end = (offset + page_size).min(prompts.len());
+        let next_cursor = if end < prompts.len() {
+            Some(encode_cursor_offset(end))
+        } else {
+            None
+        };
         Ok(ListPromptsResult {
-            prompts: self.prompts_filtered(session_state, tag_filters),
-            next_cursor: None,
+            prompts: prompts.get(offset..end).unwrap_or_default().to_vec(),
+            next_cursor,
         })
     }
 
@@ -1080,10 +1230,26 @@ impl Router {
 
         debug!(target: targets::HANDLER, "Listing tasks (status filter: {:?})", params.status);
 
-        let tasks = task_manager.list_tasks(params.status);
+        let mut tasks = task_manager.list_tasks(params.status);
+        // Stable ordering for pagination: created_at then id.
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        });
+
+        let limit = params.limit.unwrap_or(50).max(1) as usize;
+        let offset = decode_cursor_offset(params.cursor.as_deref())?;
+        let end = (offset + limit).min(tasks.len());
+        let next_cursor = if end < tasks.len() {
+            Some(encode_cursor_offset(end))
+        } else {
+            None
+        };
+
         Ok(ListTasksResult {
-            tasks,
-            next_cursor: None, // Pagination not yet implemented
+            tasks: tasks.get(offset..end).unwrap_or_default().to_vec(),
+            next_cursor,
         })
     }
 
@@ -1256,6 +1422,18 @@ impl Router {
     pub fn mount(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
         let mut result = MountResult::default();
 
+        let Router {
+            tools,
+            tool_order,
+            resources,
+            resource_order,
+            prompts,
+            prompt_order,
+            resource_templates,
+            resource_template_order,
+            ..
+        } = other;
+
         // Validate prefix
         if let Some(p) = prefix {
             if let Err(e) = Self::validate_prefix(p) {
@@ -1265,22 +1443,23 @@ impl Router {
         }
 
         // Mount tools
-        let tool_result = self.mount_tools_from(other.tools, prefix);
+        let tool_result = self.mount_tools_from(tools, tool_order, prefix);
         result.tools = tool_result.tools;
         result.warnings.extend(tool_result.warnings);
 
         // Mount resources
-        let resource_result = self.mount_resources_from(other.resources, prefix);
+        let resource_result = self.mount_resources_from(resources, resource_order, prefix);
         result.resources = resource_result.resources;
         result.warnings.extend(resource_result.warnings);
 
         // Mount resource templates
-        let template_result = self.mount_resource_templates_from(other.resource_templates, prefix);
+        let template_result =
+            self.mount_resource_templates_from(resource_templates, resource_template_order, prefix);
         result.resource_templates = template_result.resource_templates;
         result.warnings.extend(template_result.warnings);
 
         // Mount prompts
-        let prompt_result = self.mount_prompts_from(other.prompts, prefix);
+        let prompt_result = self.mount_prompts_from(prompts, prompt_order, prefix);
         result.prompts = prompt_result.prompts;
         result.warnings.extend(prompt_result.warnings);
 
@@ -1302,20 +1481,24 @@ impl Router {
 
     /// Mounts only tools from a router.
     pub fn mount_tools(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        self.mount_tools_from(other.tools, prefix)
+        self.mount_tools_from(other.tools, other.tool_order, prefix)
     }
 
     /// Internal: mount tools from a HashMap.
     fn mount_tools_from(
         &mut self,
-        tools: HashMap<String, BoxedToolHandler>,
+        mut tools: HashMap<String, BoxedToolHandler>,
+        tool_order: Vec<String>,
         prefix: Option<&str>,
     ) -> MountResult {
         use crate::handler::MountedToolHandler;
 
         let mut result = MountResult::default();
 
-        for (name, handler) in tools {
+        for name in tool_order {
+            let Some(handler) = tools.remove(&name) else {
+                continue;
+            };
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -1325,7 +1508,8 @@ impl Router {
             );
 
             // Check for conflicts
-            if self.tools.contains_key(&mounted_name) {
+            let existed = self.tools.contains_key(&mounted_name);
+            if existed {
                 result.warnings.push(format!(
                     "Tool '{}' already exists, will be overwritten",
                     mounted_name
@@ -1334,8 +1518,37 @@ impl Router {
 
             // Wrap with mounted name and insert
             let mounted = MountedToolHandler::new(handler, mounted_name.clone());
-            self.tools.insert(mounted_name, Box::new(mounted));
+            let needs_order_push = !existed && !self.tool_order.iter().any(|n| n == &mounted_name);
+            self.tools.insert(mounted_name.clone(), Box::new(mounted));
+            if needs_order_push {
+                self.tool_order.push(mounted_name);
+            }
             result.tools += 1;
+        }
+
+        if !tools.is_empty() {
+            // Defensive: older Routers or unusual construction could leave items untracked by
+            // tool_order. Mount them deterministically to avoid HashMap iteration order leaks.
+            let mut remaining: Vec<(String, BoxedToolHandler)> = tools.into_iter().collect();
+            remaining.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, handler) in remaining {
+                let mounted_name = Self::apply_prefix(&name, prefix);
+
+                let existed = self.tools.contains_key(&mounted_name);
+                if existed {
+                    result.warnings.push(format!(
+                        "Tool '{}' already exists, will be overwritten",
+                        mounted_name
+                    ));
+                }
+
+                let mounted = MountedToolHandler::new(handler, mounted_name.clone());
+                self.tools.insert(mounted_name.clone(), Box::new(mounted));
+                if !existed && !self.tool_order.iter().any(|n| n == &mounted_name) {
+                    self.tool_order.push(mounted_name);
+                }
+                result.tools += 1;
+            }
         }
 
         result
@@ -1343,8 +1556,12 @@ impl Router {
 
     /// Mounts only resources from a router.
     pub fn mount_resources(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        let mut result = self.mount_resources_from(other.resources, prefix);
-        let template_result = self.mount_resource_templates_from(other.resource_templates, prefix);
+        let mut result = self.mount_resources_from(other.resources, other.resource_order, prefix);
+        let template_result = self.mount_resource_templates_from(
+            other.resource_templates,
+            other.resource_template_order,
+            prefix,
+        );
         result.resource_templates = template_result.resource_templates;
         result.warnings.extend(template_result.warnings);
         result
@@ -1353,14 +1570,18 @@ impl Router {
     /// Internal: mount resources from a HashMap.
     fn mount_resources_from(
         &mut self,
-        resources: HashMap<String, BoxedResourceHandler>,
+        mut resources: HashMap<String, BoxedResourceHandler>,
+        resource_order: Vec<String>,
         prefix: Option<&str>,
     ) -> MountResult {
         use crate::handler::MountedResourceHandler;
 
         let mut result = MountResult::default();
 
-        for (uri, handler) in resources {
+        for uri in resource_order {
+            let Some(handler) = resources.remove(&uri) else {
+                continue;
+            };
             let mounted_uri = Self::apply_prefix(&uri, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -1370,7 +1591,8 @@ impl Router {
             );
 
             // Check for conflicts
-            if self.resources.contains_key(&mounted_uri) {
+            let existed = self.resources.contains_key(&mounted_uri);
+            if existed {
                 result.warnings.push(format!(
                     "Resource '{}' already exists, will be overwritten",
                     mounted_uri
@@ -1379,8 +1601,39 @@ impl Router {
 
             // Wrap with mounted URI and insert
             let mounted = MountedResourceHandler::new(handler, mounted_uri.clone());
-            self.resources.insert(mounted_uri, Box::new(mounted));
+            let needs_order_push =
+                !existed && !self.resource_order.iter().any(|u| u == &mounted_uri);
+            self.resources
+                .insert(mounted_uri.clone(), Box::new(mounted));
+            if needs_order_push {
+                self.resource_order.push(mounted_uri);
+            }
             result.resources += 1;
+        }
+
+        if !resources.is_empty() {
+            let mut remaining: Vec<(String, BoxedResourceHandler)> =
+                resources.into_iter().collect();
+            remaining.sort_by(|a, b| a.0.cmp(&b.0));
+            for (uri, handler) in remaining {
+                let mounted_uri = Self::apply_prefix(&uri, prefix);
+
+                let existed = self.resources.contains_key(&mounted_uri);
+                if existed {
+                    result.warnings.push(format!(
+                        "Resource '{}' already exists, will be overwritten",
+                        mounted_uri
+                    ));
+                }
+
+                let mounted = MountedResourceHandler::new(handler, mounted_uri.clone());
+                self.resources
+                    .insert(mounted_uri.clone(), Box::new(mounted));
+                if !existed && !self.resource_order.iter().any(|u| u == &mounted_uri) {
+                    self.resource_order.push(mounted_uri);
+                }
+                result.resources += 1;
+            }
         }
 
         result
@@ -1389,14 +1642,18 @@ impl Router {
     /// Internal: mount resource templates from a HashMap.
     fn mount_resource_templates_from(
         &mut self,
-        templates: HashMap<String, ResourceTemplateEntry>,
+        mut templates: HashMap<String, ResourceTemplateEntry>,
+        resource_template_order: Vec<String>,
         prefix: Option<&str>,
     ) -> MountResult {
         use crate::handler::MountedResourceHandler;
 
         let mut result = MountResult::default();
 
-        for (uri_template, entry) in templates {
+        for uri_template in resource_template_order {
+            let Some(entry) = templates.remove(&uri_template) else {
+                continue;
+            };
             let mounted_uri_template = Self::apply_prefix(&uri_template, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -1406,7 +1663,8 @@ impl Router {
             );
 
             // Check for conflicts
-            if self.resource_templates.contains_key(&mounted_uri_template) {
+            let existed = self.resource_templates.contains_key(&mounted_uri_template);
+            if existed {
                 result.warnings.push(format!(
                     "Resource template '{}' already exists, will be overwritten",
                     mounted_uri_template
@@ -1435,9 +1693,66 @@ impl Router {
                 handler: mounted_handler,
             };
 
+            let needs_order_push = !existed
+                && !self
+                    .resource_template_order
+                    .iter()
+                    .any(|t| t == &mounted_uri_template);
             self.resource_templates
-                .insert(mounted_uri_template, mounted_entry);
+                .insert(mounted_uri_template.clone(), mounted_entry);
+            if needs_order_push {
+                self.resource_template_order.push(mounted_uri_template);
+            }
             result.resource_templates += 1;
+        }
+
+        if !templates.is_empty() {
+            let mut remaining: Vec<(String, ResourceTemplateEntry)> =
+                templates.into_iter().collect();
+            remaining.sort_by(|a, b| a.0.cmp(&b.0));
+            for (uri_template, entry) in remaining {
+                let mounted_uri_template = Self::apply_prefix(&uri_template, prefix);
+
+                let existed = self.resource_templates.contains_key(&mounted_uri_template);
+                if existed {
+                    result.warnings.push(format!(
+                        "Resource template '{}' already exists, will be overwritten",
+                        mounted_uri_template
+                    ));
+                }
+
+                let mut mounted_template = entry.template.clone();
+                mounted_template.uri_template = mounted_uri_template.clone();
+
+                let mounted_handler = entry.handler.map(|h| {
+                    let wrapped: BoxedResourceHandler =
+                        Box::new(MountedResourceHandler::with_template(
+                            h,
+                            mounted_uri_template.clone(),
+                            mounted_template.clone(),
+                        ));
+                    wrapped
+                });
+
+                let mounted_entry = ResourceTemplateEntry {
+                    matcher: UriTemplate::new(&mounted_uri_template),
+                    template: mounted_template,
+                    handler: mounted_handler,
+                };
+
+                self.resource_templates
+                    .insert(mounted_uri_template.clone(), mounted_entry);
+                if !existed
+                    && !self
+                        .resource_template_order
+                        .iter()
+                        .any(|t| t == &mounted_uri_template)
+                {
+                    self.resource_template_order
+                        .push(mounted_uri_template.clone());
+                }
+                result.resource_templates += 1;
+            }
         }
 
         // Rebuild sorted keys if we added templates
@@ -1450,20 +1765,24 @@ impl Router {
 
     /// Mounts only prompts from a router.
     pub fn mount_prompts(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        self.mount_prompts_from(other.prompts, prefix)
+        self.mount_prompts_from(other.prompts, other.prompt_order, prefix)
     }
 
     /// Internal: mount prompts from a HashMap.
     fn mount_prompts_from(
         &mut self,
-        prompts: HashMap<String, BoxedPromptHandler>,
+        mut prompts: HashMap<String, BoxedPromptHandler>,
+        prompt_order: Vec<String>,
         prefix: Option<&str>,
     ) -> MountResult {
         use crate::handler::MountedPromptHandler;
 
         let mut result = MountResult::default();
 
-        for (name, handler) in prompts {
+        for name in prompt_order {
+            let Some(handler) = prompts.remove(&name) else {
+                continue;
+            };
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
@@ -1473,7 +1792,8 @@ impl Router {
             );
 
             // Check for conflicts
-            if self.prompts.contains_key(&mounted_name) {
+            let existed = self.prompts.contains_key(&mounted_name);
+            if existed {
                 result.warnings.push(format!(
                     "Prompt '{}' already exists, will be overwritten",
                     mounted_name
@@ -1482,8 +1802,36 @@ impl Router {
 
             // Wrap with mounted name and insert
             let mounted = MountedPromptHandler::new(handler, mounted_name.clone());
-            self.prompts.insert(mounted_name, Box::new(mounted));
+            let needs_order_push =
+                !existed && !self.prompt_order.iter().any(|n| n == &mounted_name);
+            self.prompts.insert(mounted_name.clone(), Box::new(mounted));
+            if needs_order_push {
+                self.prompt_order.push(mounted_name);
+            }
             result.prompts += 1;
+        }
+
+        if !prompts.is_empty() {
+            let mut remaining: Vec<(String, BoxedPromptHandler)> = prompts.into_iter().collect();
+            remaining.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, handler) in remaining {
+                let mounted_name = Self::apply_prefix(&name, prefix);
+
+                let existed = self.prompts.contains_key(&mounted_name);
+                if existed {
+                    result.warnings.push(format!(
+                        "Prompt '{}' already exists, will be overwritten",
+                        mounted_name
+                    ));
+                }
+
+                let mounted = MountedPromptHandler::new(handler, mounted_name.clone());
+                self.prompts.insert(mounted_name.clone(), Box::new(mounted));
+                if !existed && !self.prompt_order.iter().any(|n| n == &mounted_name) {
+                    self.prompt_order.push(mounted_name);
+                }
+                result.prompts += 1;
+            }
         }
 
         result
@@ -1976,10 +2324,14 @@ impl ToolCaller for RouterToolCaller {
                             Content::Image { data, mime_type } => {
                                 ToolContentItem::Image { data, mime_type }
                             }
+                            Content::Audio { data, mime_type } => {
+                                ToolContentItem::Audio { data, mime_type }
+                            }
                             Content::Resource { resource } => ToolContentItem::Resource {
                                 uri: resource.uri,
                                 mime_type: resource.mime_type,
                                 text: resource.text,
+                                blob: resource.blob,
                             },
                         })
                         .collect();

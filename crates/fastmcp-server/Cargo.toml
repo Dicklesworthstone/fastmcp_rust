@@ -23,6 +23,8 @@ serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 chrono.workspace = true
+base64.workspace = true
+redis = { workspace = true, optional = true }
 jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto"], optional = true }
 
 [lints]
@@ -30,4 +32,4 @@ workspace = true
 
 [features]
 jwt = ["dep:jsonwebtoken"]
-redis = []
+redis = ["dep:redis"]

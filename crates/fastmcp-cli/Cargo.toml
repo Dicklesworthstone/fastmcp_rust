@@ -51,5 +51,9 @@ glob = { workspace = true }
 # Console output
 console = { workspace = true }
 
+# Update checking (parity with Python's check_for_updates)
+semver = { workspace = true }
+ureq = { workspace = true }
+
 [lints]
 workspace = true

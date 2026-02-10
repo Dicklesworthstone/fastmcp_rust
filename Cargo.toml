@@ -34,6 +34,11 @@ serde_yaml = "0.9"
 # Logging (facade only, zero-cost when disabled)
 log = "0.4"
 
+# Opaque cursor encoding for pagination
+base64 = "0.22"
+semver = "1.0.27"
+ureq = "3.2.0"
+
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
@@ -43,6 +48,9 @@ glob = "0.3"
 
 # Console output
 console = "0.15"
+
+# Redis (optional, for Docket distributed backend)
+redis = "1.0.3"
 
 # Configuration file parsing
 toml = "0.8"

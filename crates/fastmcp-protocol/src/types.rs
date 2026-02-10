@@ -2,6 +2,7 @@
 //!
 //! Core types used in MCP communication.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// MCP protocol version.
@@ -479,11 +480,104 @@ pub enum Content {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    /// Audio content.
+    Audio {
+        /// Base64-encoded audio data.
+        data: String,
+        /// MIME type (e.g., "audio/wav").
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
     /// Resource content.
     Resource {
         /// The resource being referenced.
         resource: ResourceContent,
     },
+}
+
+impl Content {
+    /// Creates text content.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    /// Creates image content from base64-encoded data.
+    #[must_use]
+    pub fn image_base64(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::Image {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
+
+    /// Creates image content from raw bytes (base64-encodes internally).
+    #[must_use]
+    pub fn image_bytes(bytes: impl AsRef<[u8]>, mime_type: impl Into<String>) -> Self {
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+        Self::image_base64(data, mime_type)
+    }
+
+    /// Creates audio content from base64-encoded data.
+    #[must_use]
+    pub fn audio_base64(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::Audio {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
+
+    /// Creates audio content from raw bytes (base64-encodes internally).
+    #[must_use]
+    pub fn audio_bytes(bytes: impl AsRef<[u8]>, mime_type: impl Into<String>) -> Self {
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+        Self::audio_base64(data, mime_type)
+    }
+
+    /// Creates an embedded resource content with text payload.
+    #[must_use]
+    pub fn resource_text(
+        uri: impl Into<String>,
+        mime_type: Option<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self::Resource {
+            resource: ResourceContent {
+                uri: uri.into(),
+                mime_type,
+                text: Some(text.into()),
+                blob: None,
+            },
+        }
+    }
+
+    /// Creates an embedded resource content with base64 blob payload.
+    #[must_use]
+    pub fn resource_blob_base64(
+        uri: impl Into<String>,
+        mime_type: Option<String>,
+        blob: impl Into<String>,
+    ) -> Self {
+        Self::Resource {
+            resource: ResourceContent {
+                uri: uri.into(),
+                mime_type,
+                text: None,
+                blob: Some(blob.into()),
+            },
+        }
+    }
+
+    /// Creates an embedded resource content with raw bytes payload (base64-encodes internally).
+    #[must_use]
+    pub fn resource_blob_bytes(
+        uri: impl Into<String>,
+        mime_type: Option<String>,
+        bytes: impl AsRef<[u8]>,
+    ) -> Self {
+        let blob = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+        Self::resource_blob_base64(uri, mime_type, blob)
+    }
 }
 
 /// Resource content in a message.
@@ -1081,6 +1175,18 @@ mod tests {
     }
 
     #[test]
+    fn content_audio_serialization() {
+        let content = Content::Audio {
+            data: "UklGRg==".to_string(),
+            mime_type: "audio/wav".to_string(),
+        };
+        let value = serde_json::to_value(&content).expect("serialize");
+        assert_eq!(value["type"], "audio");
+        assert_eq!(value["data"], "UklGRg==");
+        assert_eq!(value["mimeType"], "audio/wav");
+    }
+
+    #[test]
     fn content_resource_serialization() {
         let content = Content::Resource {
             resource: ResourceContent {
@@ -1118,6 +1224,19 @@ mod tests {
                 assert_eq!(mime_type, "image/jpeg");
             }
             _ => panic!("Expected image content"),
+        }
+    }
+
+    #[test]
+    fn content_audio_deserialization() {
+        let json = json!({"type": "audio", "data": "abc123", "mimeType": "audio/mpeg"});
+        let content: Content = serde_json::from_value(json).expect("deserialize");
+        match content {
+            Content::Audio { data, mime_type } => {
+                assert_eq!(data, "abc123");
+                assert_eq!(mime_type, "audio/mpeg");
+            }
+            _ => panic!("Expected audio content"),
         }
     }
 

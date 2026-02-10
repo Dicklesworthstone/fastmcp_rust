@@ -1523,6 +1523,7 @@ mod router_tests {
                 ListTasksParams {
                     status: None,
                     cursor: None,
+                    limit: None,
                 },
                 Some(&shared),
             )
@@ -1559,6 +1560,7 @@ mod router_tests {
                 ListTasksParams {
                     status: Some(TaskStatus::Cancelled),
                     cursor: None,
+                    limit: None,
                 },
                 Some(&shared),
             )
@@ -1667,6 +1669,7 @@ mod router_tests {
                 ListTasksParams {
                     status: None,
                     cursor: None,
+                    limit: None,
                 },
                 Some(&shared),
             )
@@ -6722,5 +6725,60 @@ mod builder_tests {
             .build();
         assert!(server.task_manager().is_some());
         assert!(server.capabilities().tasks.is_some());
+    }
+
+    // ── List Pagination ─────────────────────────────────────────────
+
+    #[test]
+    fn builder_list_page_size_enables_tools_pagination() {
+        let router = ServerBuilder::new("s", "0.1")
+            .list_page_size(2)
+            .tool(StubTool::named("t1"))
+            .tool(StubTool::named("t2"))
+            .tool(StubTool::named("t3"))
+            .build()
+            .into_router();
+
+        let cx = Cx::for_testing();
+        let first = router
+            .handle_tools_list(&cx, fastmcp_protocol::ListToolsParams::default(), None)
+            .expect("tools/list first page");
+        assert_eq!(first.tools.len(), 2);
+        let cursor = first.next_cursor.expect("nextCursor present");
+
+        let second = router
+            .handle_tools_list(
+                &cx,
+                fastmcp_protocol::ListToolsParams {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("tools/list second page");
+        assert_eq!(second.tools.len(), 1);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn tools_list_rejects_invalid_cursor() {
+        let router = ServerBuilder::new("s", "0.1")
+            .list_page_size(2)
+            .tool(StubTool::named("t1"))
+            .build()
+            .into_router();
+
+        let cx = Cx::for_testing();
+        let err = router
+            .handle_tools_list(
+                &cx,
+                fastmcp_protocol::ListToolsParams {
+                    cursor: Some("not-base64".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 }
