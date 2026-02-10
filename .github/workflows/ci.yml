@@ -38,17 +38,10 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -90,25 +83,18 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI (Unix)
+      - name: Setup sibling path dependencies (Unix)
         if: runner.os != 'Windows'
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
-
-      - name: Override dependency paths for CI (Windows)
+      - name: Setup sibling path dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          (Get-Content Cargo.toml) -replace 'path = "../asupersync"', 'path = "deps/asupersync"' | Set-Content Cargo.toml
-          (Get-Content Cargo.toml) -replace 'path = "../rich_rust"', 'path = "deps/rich_rust"' | Set-Content Cargo.toml
+          if (!(Test-Path ..\\asupersync)) { cmd /c "mklink /J ..\\asupersync deps\\asupersync" }
+          if (!(Test-Path ..\\rich_rust)) { cmd /c "mklink /J ..\\rich_rust deps\\rich_rust" }
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -121,10 +107,7 @@ jobs:
             deps/rich_rust -> deps/rich_rust/target
 
       - name: Run tests
-        run: cargo test --all-features --verbose
-
-      - name: Run doc tests
-        run: cargo test --doc
+        run: cargo test --workspace --all-targets --all-features --verbose
 
   check:
     name: Check (all targets)
@@ -145,17 +128,10 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -188,17 +164,10 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -212,7 +181,9 @@ jobs:
             deps/rich_rust -> deps/rich_rust/target
 
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Run coverage
         run: |
@@ -245,22 +216,17 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Run security audit
         run: cargo audit || true  # Don't fail CI on advisories in deps
@@ -295,25 +261,18 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI (Unix)
+      - name: Setup sibling path dependencies (Unix)
         if: runner.os != 'Windows'
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
-
-      - name: Override dependency paths for CI (Windows)
+      - name: Setup sibling path dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          (Get-Content Cargo.toml) -replace 'path = "../asupersync"', 'path = "deps/asupersync"' | Set-Content Cargo.toml
-          (Get-Content Cargo.toml) -replace 'path = "../rich_rust"', 'path = "deps/rich_rust"' | Set-Content Cargo.toml
+          if (!(Test-Path ..\\asupersync)) { cmd /c "mklink /J ..\\asupersync deps\\asupersync" }
+          if (!(Test-Path ..\\rich_rust)) { cmd /c "mklink /J ..\\rich_rust deps\\rich_rust" }
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -358,17 +317,10 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("Cargo.toml")
-          data = path.read_text()
-          data = data.replace('path = "../asupersync"', 'path = "deps/asupersync"')
-          data = data.replace('path = "../rich_rust"', 'path = "deps/rich_rust"')
-          path.write_text(data)
-          PY
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -403,10 +355,10 @@ jobs:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
 
-      - name: Override dependency paths for CI
+      - name: Setup sibling path dependencies
         run: |
-          sed -i 's|path = "../asupersync"|path = "deps/asupersync"|g' Cargo.toml
-          sed -i 's|path = "../rich_rust"|path = "deps/rich_rust"|g' Cargo.toml
+          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
+          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
 
       # Using nightly since edition 2024 requires it
       - uses: dtolnay/rust-toolchain@nightly
