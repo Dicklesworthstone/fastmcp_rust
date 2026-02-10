@@ -32,9 +32,7 @@ fn write_file(path: &Path, content: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create parent dir");
     }
-    std::fs::write(path, content).unwrap_or_else(|e| {
-        assert!(false, "write {}: {e}", path.display());
-    });
+    std::fs::write(path, content).unwrap();
 }
 
 fn init_cargo_project(root: &Path, body: &str) {
@@ -102,11 +100,11 @@ fn wait_for_contains(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duratio
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    assert!(
-        false,
+    let msg = format!(
         "timed out waiting for output containing {needle:?}. Last output:\n{}",
         tail.into_iter().collect::<Vec<_>>().join("\n")
     );
+    assert!(msg.is_empty(), "{msg}");
 }
 
 fn assert_not_contains_for(rx: &mpsc::Receiver<String>, needle: &str, duration: Duration) {
@@ -115,7 +113,8 @@ fn assert_not_contains_for(rx: &mpsc::Receiver<String>, needle: &str, duration: 
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
                 if line.contains(needle) {
-                    assert!(false, "unexpected output containing {needle:?}: {line}");
+                    let msg = format!("unexpected output containing {needle:?}: {line}");
+                    assert!(msg.is_empty(), "{msg}");
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

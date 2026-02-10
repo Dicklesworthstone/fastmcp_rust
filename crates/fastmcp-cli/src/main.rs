@@ -681,7 +681,12 @@ fn cmd_list(
             if let Ok(path) = config_path {
                 let path = PathBuf::from(path);
                 if path.exists() {
-                    let _ = load_servers_from_client_config(&path, name, t, &mut servers);
+                    if let Err(e) = load_servers_from_client_config(&path, name, t, &mut servers) {
+                        eprintln!(
+                            "Warning: failed to load {name} config at {}: {e}",
+                            path.display()
+                        );
+                    }
                 }
             }
         }
@@ -766,14 +771,17 @@ fn cmd_list(
         }
         ListFormat::Json => {
             let output = ListOutput { servers };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+            let json = serde_json::to_string_pretty(&output).map_err(|e| {
+                fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+            })?;
+            println!("{json}");
         }
         ListFormat::Yaml => {
             let output = ListOutput { servers };
-            println!("{}", serde_yaml::to_string(&output).unwrap_or_default());
+            let yaml = serde_yaml::to_string(&output).map_err(|e| {
+                fastmcp_core::McpError::internal_error(format!("YAML serialization error: {e}"))
+            })?;
+            println!("{yaml}");
         }
     }
 
@@ -933,13 +941,23 @@ fn load_project_local_servers(servers: &mut Vec<ServerEntry>) {
     // Check for ./mcp.json
     let mcp_json = PathBuf::from("./mcp.json");
     if mcp_json.exists() {
-        let _ = load_servers_from_path(&mcp_json, "Project (mcp.json)", servers);
+        if let Err(e) = load_servers_from_path(&mcp_json, "Project (mcp.json)", servers) {
+            eprintln!(
+                "Warning: failed to load project config at {}: {e}",
+                mcp_json.display()
+            );
+        }
     }
 
     // Check for ./mcp.toml
     let mcp_toml = PathBuf::from("./mcp.toml");
     if mcp_toml.exists() {
-        let _ = load_servers_from_path(&mcp_toml, "Project (mcp.toml)", servers);
+        if let Err(e) = load_servers_from_path(&mcp_toml, "Project (mcp.toml)", servers) {
+            eprintln!(
+                "Warning: failed to load project config at {}: {e}",
+                mcp_toml.display()
+            );
+        }
     }
 }
 
@@ -1047,10 +1065,10 @@ fn cmd_test(
     };
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        let json = serde_json::to_string_pretty(&report).map_err(|e| {
+            fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+        })?;
+        println!("{json}");
     } else {
         println!();
         if all_passed {
@@ -2289,7 +2307,7 @@ mod tests {
                     assert!(cwd.is_none());
                     assert!(env.is_empty());
                 }
-                _ => assert!(false, "Expected Run command"),
+                _ => unreachable!("Expected Run command"),
             }
         }
 
@@ -2309,7 +2327,7 @@ mod tests {
                     assert_eq!(server, "./my-server");
                     assert_eq!(args, vec!["--config", "config.json"]);
                 }
-                _ => assert!(false, "Expected Run command"),
+                _ => unreachable!("Expected Run command"),
             }
         }
 
@@ -2321,7 +2339,7 @@ mod tests {
                 Commands::Run { cwd, .. } => {
                     assert_eq!(cwd, Some(PathBuf::from("/tmp/workdir")));
                 }
-                _ => assert!(false, "Expected Run command"),
+                _ => unreachable!("Expected Run command"),
             }
         }
 
@@ -2335,7 +2353,7 @@ mod tests {
                 Commands::Run { env, .. } => {
                     assert_eq!(env, vec!["FOO=bar", "BAZ=qux"]);
                 }
-                _ => assert!(false, "Expected Run command"),
+                _ => unreachable!("Expected Run command"),
             }
         }
 
@@ -2353,7 +2371,7 @@ mod tests {
                     assert_eq!(format, InspectFormat::Text);
                     assert!(output.is_none());
                 }
-                _ => assert!(false, "Expected Inspect command"),
+                _ => unreachable!("Expected Inspect command"),
             }
         }
 
@@ -2365,7 +2383,7 @@ mod tests {
                 Commands::Inspect { format, .. } => {
                     assert_eq!(format, InspectFormat::Json);
                 }
-                _ => assert!(false, "Expected Inspect command"),
+                _ => unreachable!("Expected Inspect command"),
             }
         }
 
@@ -2377,7 +2395,7 @@ mod tests {
                 Commands::Inspect { format, .. } => {
                     assert_eq!(format, InspectFormat::Mcp);
                 }
-                _ => assert!(false, "Expected Inspect command"),
+                _ => unreachable!("Expected Inspect command"),
             }
         }
 
@@ -2389,7 +2407,7 @@ mod tests {
                 Commands::Inspect { output, .. } => {
                     assert_eq!(output, Some(PathBuf::from("output.json")));
                 }
-                _ => assert!(false, "Expected Inspect command"),
+                _ => unreachable!("Expected Inspect command"),
             }
         }
 
@@ -2409,7 +2427,7 @@ mod tests {
                     assert_eq!(target, InstallTarget::Claude);
                     assert!(!dry_run);
                 }
-                _ => assert!(false, "Expected Install command"),
+                _ => unreachable!("Expected Install command"),
             }
         }
 
@@ -2428,7 +2446,7 @@ mod tests {
                 Commands::Install { target, .. } => {
                     assert_eq!(target, InstallTarget::Cursor);
                 }
-                _ => assert!(false, "Expected Install command"),
+                _ => unreachable!("Expected Install command"),
             }
         }
 
@@ -2441,7 +2459,7 @@ mod tests {
                 Commands::Install { dry_run, .. } => {
                     assert!(dry_run);
                 }
-                _ => assert!(false, "Expected Install command"),
+                _ => unreachable!("Expected Install command"),
             }
         }
 
@@ -2460,7 +2478,7 @@ mod tests {
                     assert_eq!(format, ListFormat::Table);
                     assert!(!verbose);
                 }
-                _ => assert!(false, "Expected List command"),
+                _ => unreachable!("Expected List command"),
             }
         }
 
@@ -2479,7 +2497,7 @@ mod tests {
                     assert_eq!(format, ListFormat::Json);
                     assert!(verbose);
                 }
-                _ => assert!(false, "Expected List command"),
+                _ => unreachable!("Expected List command"),
             }
         }
 
@@ -2490,7 +2508,7 @@ mod tests {
                 Commands::List { format, .. } => {
                     assert_eq!(format, ListFormat::Yaml);
                 }
-                _ => assert!(false, "Expected List command"),
+                _ => unreachable!("Expected List command"),
             }
         }
 
@@ -2510,7 +2528,7 @@ mod tests {
                     assert!(!verbose);
                     assert!(!json);
                 }
-                _ => assert!(false, "Expected Test command"),
+                _ => unreachable!("Expected Test command"),
             }
         }
 
@@ -2537,7 +2555,7 @@ mod tests {
                     assert!(verbose);
                     assert!(json);
                 }
-                _ => assert!(false, "Expected Test command"),
+                _ => unreachable!("Expected Test command"),
             }
         }
 
@@ -2565,7 +2583,7 @@ mod tests {
                     assert!(!clear);
                     assert!(!verbose);
                 }
-                _ => assert!(false, "Expected Dev command"),
+                _ => unreachable!("Expected Dev command"),
             }
         }
 
@@ -2603,7 +2621,7 @@ mod tests {
                     assert!(clear);
                     assert!(verbose);
                 }
-                _ => assert!(false, "Expected Dev command"),
+                _ => unreachable!("Expected Dev command"),
             }
         }
 
@@ -2614,7 +2632,7 @@ mod tests {
                 Commands::Dev { transport, .. } => {
                     assert_eq!(transport, DevTransport::Http);
                 }
-                _ => assert!(false, "Expected Dev command"),
+                _ => unreachable!("Expected Dev command"),
             }
         }
 
@@ -2637,7 +2655,7 @@ mod tests {
                     assert_eq!(limit, 20);
                     assert!(!json);
                 }
-                _ => assert!(false, "Expected Tasks List command"),
+                _ => unreachable!("Expected Tasks List command"),
             }
         }
 
@@ -2661,7 +2679,7 @@ mod tests {
                     assert_eq!(limit, 50);
                     assert!(json);
                 }
-                _ => assert!(false, "Expected Tasks List command"),
+                _ => unreachable!("Expected Tasks List command"),
             }
         }
 
@@ -2683,7 +2701,7 @@ mod tests {
                     assert_eq!(task_id, "task-001");
                     assert!(!json);
                 }
-                _ => assert!(false, "Expected Tasks Show command"),
+                _ => unreachable!("Expected Tasks Show command"),
             }
         }
 
@@ -2713,7 +2731,7 @@ mod tests {
                     assert_eq!(task_id, "task-001");
                     assert_eq!(reason, Some("no longer needed".to_string()));
                 }
-                _ => assert!(false, "Expected Tasks Cancel command"),
+                _ => unreachable!("Expected Tasks Cancel command"),
             }
         }
 
@@ -2728,7 +2746,7 @@ mod tests {
                     assert_eq!(server, "./server");
                     assert!(json);
                 }
-                _ => assert!(false, "Expected Tasks Stats command"),
+                _ => unreachable!("Expected Tasks Stats command"),
             }
         }
     }
