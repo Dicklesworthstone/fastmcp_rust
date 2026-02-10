@@ -117,6 +117,16 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc --all-features
 
+      - name: Upload test trace artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-traces-${{ matrix.os }}
+          path: |
+            crates/**/test_traces/**/*.json
+            crates/**/test_traces/**/*.txt
+          if-no-files-found: ignore
+
   check:
     name: Check (all targets)
     runs-on: ubuntu-latest
@@ -197,13 +207,21 @@ jobs:
         run: |
           cargo llvm-cov --all-features --workspace \
             --lcov --output-path lcov.info \
-            --fail-under-lines 72
+            --fail-under-lines 80
+
+      - name: Generate coverage summary JSON
+        run: |
+          cargo llvm-cov --all-features --workspace \
+            --json --summary-only --output-path coverage-summary.json \
+            --no-run --no-clean
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lcov
-          path: lcov.info
+          name: coverage-reports
+          path: |
+            lcov.info
+            coverage-summary.json
 
   security:
     name: Security Audit
