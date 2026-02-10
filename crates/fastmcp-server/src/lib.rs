@@ -90,6 +90,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use asupersync::time::wall_now;
 use asupersync::{Budget, CancelKind, Cx, RegionId};
 use fastmcp_console::client::RequestResponseRenderer;
 use fastmcp_console::logging::RichLoggerBuilder;
@@ -452,10 +453,10 @@ impl Server {
     /// Runs the server on stdio transport.
     ///
     /// This is the primary way to run MCP servers as subprocesses.
-    /// Creates a testing Cx and runs the server loop.
+    /// Creates a request-scoped Cx and runs the server loop.
     pub fn run_stdio(self) -> ! {
-        // Create a Cx for the server (for now, use testing Cx)
-        let cx = Cx::for_testing();
+        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
+        let cx = Cx::for_request();
         self.run_stdio_with_cx(&cx)
     }
 
@@ -484,7 +485,7 @@ impl Server {
         )
     }
 
-    /// Runs the server on a custom transport with a testing Cx.
+    /// Runs the server on a custom transport with a request-scoped Cx.
     ///
     /// This is useful for SSE/WebSocket integrations where the transport is
     /// provided by an external server framework.
@@ -492,7 +493,8 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        let cx = Cx::for_testing();
+        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
+        let cx = Cx::for_request();
         self.run_transport_with_cx(&cx, transport)
     }
 
@@ -645,13 +647,12 @@ impl Server {
         // Create a RequestSender for bidirectional communication
         let request_sender = {
             let send_clone = send.clone();
+            let send_cx = cx.clone();
             let send_fn: bidirectional::TransportSendFn = Arc::new(move |message| {
                 let mut guard = send_clone
                     .lock()
                     .map_err(|e| format!("Lock poisoned: {}", e))?;
-                // We need a Cx for the send call, but we're sending async so use a basic one
-                let cx = Cx::for_testing();
-                guard(&cx, message).map_err(|e| format!("Send failed: {}", e))
+                guard(&send_cx, message).map_err(|e| format!("Send failed: {}", e))
             });
             bidirectional::RequestSender::new(self.pending_requests.clone(), send_fn)
         };
@@ -915,8 +916,12 @@ impl Server {
             // No timeout - unlimited budget
             Budget::INFINITE
         } else {
-            // Create budget with deadline
-            Budget::with_deadline_secs(self.request_timeout_secs)
+            // Budget deadlines are absolute (`Time` since runtime epoch). We use `wall_now()`
+            // so timeouts work even when running outside a full asupersync scheduler.
+            let now = wall_now();
+            let timeout_ns = self.request_timeout_secs.saturating_mul(1_000_000_000);
+            let deadline = now.saturating_add_nanos(timeout_ns);
+            Budget::new().with_deadline(deadline)
         }
     }
 
@@ -942,6 +947,14 @@ impl Server {
             return Err(McpError::new(
                 McpErrorCode::RequestCancelled,
                 "Request budget exhausted",
+            ));
+        }
+        // Deadline exhaustion is time-based and must be checked against current time.
+        if budget.is_past_deadline(wall_now()) {
+            cx.cancel_fast(CancelKind::Deadline);
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
             ));
         }
 
@@ -1680,7 +1693,7 @@ fn create_transport_notification_sender<T>(transport: SharedTransport<T>) -> Not
 where
     T: Transport + Send + 'static,
 {
-    let cx = Cx::for_testing();
+    let cx = Cx::for_request();
 
     Arc::new(move |request: JsonRpcRequest| {
         let message = JsonRpcMessage::Request(request);

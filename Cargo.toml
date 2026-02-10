@@ -63,6 +63,9 @@ getrandom = "0.3"
 sha2 = "0.10.8"
 hmac = "0.12.1"
 
+# Regex (JSON Schema `pattern` validation)
+regex = "1.11.1"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 

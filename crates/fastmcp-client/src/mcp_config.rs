@@ -289,7 +289,7 @@ impl McpConfig {
     ///
     /// Returns an error if the server is not found, disabled, or fails to start.
     pub fn client(&self, name: &str) -> Result<Client, ConfigError> {
-        self.client_with_cx(name, Cx::for_testing())
+        self.client_with_cx(name, Cx::for_request())
     }
 
     /// Creates a client with a provided Cx for cancellation support.

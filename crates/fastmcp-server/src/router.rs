@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use asupersync::time::wall_now;
 use asupersync::{Budget, Cx, Outcome};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -794,6 +795,12 @@ impl Router {
                 "Request budget exhausted",
             ));
         }
+        if budget.is_past_deadline(wall_now()) {
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
+            ));
+        }
 
         // Check if tool is disabled for this session
         if !session_state.is_tool_enabled(&params.name) {
@@ -1010,6 +1017,12 @@ impl Router {
                 "Request budget exhausted",
             ));
         }
+        if budget.is_past_deadline(wall_now()) {
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
+            ));
+        }
 
         // Check if resource is disabled for this session
         if !session_state.is_resource_enabled(&params.uri) {
@@ -1142,6 +1155,12 @@ impl Router {
             return Err(McpError::new(
                 McpErrorCode::RequestCancelled,
                 "Request budget exhausted",
+            ));
+        }
+        if budget.is_past_deadline(wall_now()) {
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
             ));
         }
 

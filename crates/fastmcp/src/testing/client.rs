@@ -11,10 +11,11 @@ use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
     GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
-    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, RequestId, Resource,
-    ResourceContent, ResourceTemplate, ServerCapabilities, ServerInfo, Tool,
+    JsonRpcResponse, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
+    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
+    ListToolsResult, PROTOCOL_VERSION, Prompt, PromptMessage, ReadResourceParams,
+    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use fastmcp_transport::Transport;
 use fastmcp_transport::memory::MemoryTransport;
@@ -441,9 +442,20 @@ impl TestClient {
                     }
                     return Ok(response);
                 }
-                JsonRpcMessage::Request(_request) => {
-                    // Ignore server-initiated requests for now
-                    // (notifications, progress updates, etc.)
+                JsonRpcMessage::Request(request) => {
+                    // Notifications don't require a response.
+                    let Some(id) = request.id.clone() else {
+                        continue;
+                    };
+
+                    // This test client does not implement server-initiated protocols.
+                    // To avoid deadlocks (server awaiting a response), respond with MethodNotFound.
+                    let err = McpError::method_not_found(&request.method);
+                    let response = JsonRpcResponse::error(Some(id), err.into());
+                    self.transport
+                        .send(&self.cx, &JsonRpcMessage::Response(response))
+                        .map_err(|e| McpError::internal_error(format!("Transport error: {e:?}")))?;
+
                     continue;
                 }
             }

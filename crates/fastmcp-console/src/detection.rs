@@ -67,6 +67,8 @@ pub fn is_agent_context() -> bool {
 /// Determine if rich output should be enabled
 #[must_use]
 pub fn should_enable_rich() -> bool {
+    use std::io::IsTerminal;
+
     // Explicit enable always wins
     if std::env::var("FASTMCP_RICH").is_ok() {
         return true;
@@ -77,13 +79,8 @@ pub fn should_enable_rich() -> bool {
         return false;
     }
 
-    // Check if stderr is a terminal (human watching)
-    // For now we assume true if not an agent, but ideally we check is_terminal
-    // rich_rust::console::Console handles this internally too, but we need to know upfront
-    // for detection.
-
-    // We'll leave it to Console to decide based on force_terminal=false default if not explicit
-    true
+    // Human context only when stderr is an interactive terminal.
+    std::io::stderr().is_terminal()
 }
 
 #[cfg(test)]

@@ -7,8 +7,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use asupersync::time::wall_now;
 use asupersync::types::CancelReason;
-use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
+use asupersync::{Budget, CancelKind, Cx, Outcome, RegionId, TaskId};
 
 use crate::{AUTH_STATE_KEY, AuthContext, SessionState};
 
@@ -1231,7 +1232,10 @@ impl McpContext {
     /// Handlers should check this periodically and exit early if true.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cx.is_cancel_requested() || self.cx.budget().is_exhausted()
+        let budget = self.cx.budget();
+        self.cx.is_cancel_requested()
+            || budget.is_exhausted()
+            || budget.is_past_deadline(wall_now())
     }
 
     /// Cooperative cancellation checkpoint.
@@ -1257,7 +1261,14 @@ impl McpContext {
     /// ```
     pub fn checkpoint(&self) -> Result<(), CancelledError> {
         self.cx.checkpoint().map_err(|_| CancelledError)?;
-        if self.cx.budget().is_exhausted() {
+        let budget = self.cx.budget();
+        if budget.is_exhausted() {
+            return Err(CancelledError);
+        }
+        if budget.is_past_deadline(wall_now()) {
+            // Ensure subsequent checkpoints observe cancellation even if the caller doesn't
+            // keep checking wall clock time.
+            self.cx.cancel_fast(CancelKind::Deadline);
             return Err(CancelledError);
         }
         Ok(())

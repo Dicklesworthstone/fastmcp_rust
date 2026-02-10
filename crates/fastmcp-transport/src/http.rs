@@ -832,9 +832,13 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
             JsonRpcMessage::Request(r) => {
                 // For HTTP transport, requests from server to client
                 // are typically sent as notifications or SSE events.
-                // For now, we just ignore them.
+                // This transport is request/response only and cannot deliver server-to-client
+                // requests. Returning Ok() would silently drop messages and can deadlock
+                // bidirectional protocols, so we fail explicitly.
                 let _ = r;
-                return Ok(());
+                return Err(TransportError::Io(std::io::Error::other(
+                    "HttpTransport cannot send server-to-client requests",
+                )));
             }
         };
 

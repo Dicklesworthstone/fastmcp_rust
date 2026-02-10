@@ -245,7 +245,7 @@ impl ClientBuilder {
     /// - The initialization handshake fails
     /// - All retry attempts are exhausted
     pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-        self.connect_stdio_with_cx(command, args, &Cx::for_testing())
+        self.connect_stdio_with_cx(command, args, &Cx::for_request())
     }
 
     /// Connects to a server via stdio subprocess with a provided Cx.

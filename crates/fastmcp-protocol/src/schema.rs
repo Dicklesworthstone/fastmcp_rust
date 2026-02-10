@@ -11,6 +11,7 @@
 //!
 //! This is not a full JSON Schema implementation but covers the subset used by MCP.
 
+use regex::Regex;
 use serde_json::Value;
 use std::fmt;
 
@@ -487,8 +488,26 @@ fn validate_string(
         }
     }
 
-    // Check pattern (basic regex support could be added here)
-    // For now, we skip pattern validation to avoid regex dependency
+    // Check pattern (JSON Schema semantics: pattern matches if any substring matches).
+    if let Some(pattern) = schema.get("pattern").and_then(serde_json::Value::as_str) {
+        match Regex::new(pattern) {
+            Ok(re) => {
+                if !re.is_match(s) {
+                    errors.push(ValidationError {
+                        path: path.to_string(),
+                        message: format!("string does not match pattern {pattern:?}"),
+                    });
+                }
+            }
+            Err(e) => {
+                // Invalid schema: treat as a validation error rather than silently skipping.
+                errors.push(ValidationError {
+                    path: path.to_string(),
+                    message: format!("invalid schema pattern {pattern:?}: {e}"),
+                });
+            }
+        }
+    }
 }
 
 /// Validates number-specific constraints.
@@ -662,6 +681,28 @@ mod tests {
         assert!(validate(&schema, &json!("abcde")).is_ok());
         assert!(validate(&schema, &json!("a")).is_err());
         assert!(validate(&schema, &json!("abcdef")).is_err());
+    }
+
+    #[test]
+    fn test_string_pattern() {
+        let schema = json!({
+            "type": "string",
+            "pattern": "^[a-z]+$"
+        });
+
+        assert!(validate(&schema, &json!("hello")).is_ok());
+        assert!(validate(&schema, &json!("Hello")).is_err());
+        assert!(validate(&schema, &json!("hello123")).is_err());
+    }
+
+    #[test]
+    fn test_string_pattern_invalid_regex_is_error() {
+        let schema = json!({
+            "type": "string",
+            "pattern": "("
+        });
+
+        assert!(validate(&schema, &json!("anything")).is_err());
     }
 
     #[test]

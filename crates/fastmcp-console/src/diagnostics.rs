@@ -52,7 +52,8 @@ impl RichErrorRenderer {
 
         // Context/backtrace
         if self.show_backtrace {
-            self.render_panic(&error.message, None, console); // Reuse render_panic for now if no backtrace in Error
+            // Fallback: reuse render_panic when McpError doesn't carry a backtrace.
+            self.render_panic(&error.message, None, console);
         }
     }
 

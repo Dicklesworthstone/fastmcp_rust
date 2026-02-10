@@ -119,7 +119,7 @@ impl Client {
     ///
     /// Returns an error if the subprocess fails to start or initialization fails.
     pub fn stdio(command: &str, args: &[&str]) -> McpResult<Self> {
-        Self::stdio_with_cx(command, args, Cx::for_testing())
+        Self::stdio_with_cx(command, args, Cx::for_request())
     }
 
     /// Creates a client with a provided Cx for cancellation support.
