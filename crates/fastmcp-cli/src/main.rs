@@ -550,6 +550,26 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            // `fastmcp run` should propagate the child process exit code.
+            // We encode that in `McpError.data.exit_code` so the top-level can
+            // return the right `ExitCode` without changing the command handler
+            // signatures for the whole CLI.
+            if let Some(code) = e
+                .data
+                .as_ref()
+                .and_then(|data| data.get("exit_code"))
+                .and_then(serde_json::Value::as_i64)
+            {
+                // Avoid duplicating the child's stderr with our own error line on
+                // normal non-zero exits.
+                if !e.message.starts_with("Server exited with code") {
+                    eprintln!("Error: {e}");
+                }
+                return u8::try_from(code)
+                    .map(ExitCode::from)
+                    .unwrap_or(ExitCode::FAILURE);
+            }
+
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
@@ -592,9 +612,11 @@ fn cmd_run(
 
     if !status.success() {
         if let Some(code) = status.code() {
-            return Err(fastmcp_core::McpError::internal_error(format!(
-                "Server exited with code {code}"
-            )));
+            return Err(fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InternalError,
+                format!("Server exited with code {code}"),
+                serde_json::json!({ "exit_code": code }),
+            ));
         }
         return Err(fastmcp_core::McpError::internal_error(
             "Server terminated by signal",

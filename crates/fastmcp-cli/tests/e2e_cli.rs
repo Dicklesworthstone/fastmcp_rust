@@ -17,6 +17,8 @@ fn get_binary_path() -> String {
 fn run_cli(args: &[&str]) -> Output {
     Command::new(get_binary_path())
         .args(args)
+        // Keep E2E output deterministic: no network checks and no "update available" noise.
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
         .output()
         .expect("Failed to execute CLI binary")
 }
@@ -195,6 +197,95 @@ fn e2e_cli_run_missing_server_fails() {
     assert!(
         stderr.contains("required") || stderr.contains("<SERVER>"),
         "Should indicate missing required arg"
+    );
+}
+
+// =============================================================================
+// Run Command Execution Tests (bd-23x)
+// =============================================================================
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_propagates_exit_code() {
+    let output = run_cli(&["run", "sh", "--", "-c", "exit 42"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "expected exit code propagation"
+    );
+
+    // The child process is responsible for its own stderr; we should not add an extra
+    // wrapper error line for normal non-zero exits.
+    assert!(
+        !stderr_str(&output).contains("Error:"),
+        "unexpected wrapper error output: {}",
+        stderr_str(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_inherits_stdout_and_stderr() {
+    let output = run_cli(&[
+        "run",
+        "sh",
+        "--",
+        "-c",
+        "echo RUN_STDOUT; echo RUN_STDERR 1>&2",
+    ]);
+
+    assert!(output.status.success());
+    assert!(stdout_str(&output).contains("RUN_STDOUT"));
+    assert!(stderr_str(&output).contains("RUN_STDERR"));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_respects_cwd() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "fastmcp-cli-run-cwd-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp cwd");
+
+    let output = run_cli(&[
+        "run",
+        "-C",
+        dir.to_str().expect("cwd utf-8"),
+        "sh",
+        "--",
+        "-c",
+        "pwd",
+    ]);
+
+    assert!(output.status.success());
+
+    let expected = std::fs::canonicalize(&dir).expect("canonicalize temp cwd");
+    assert_eq!(stdout_str(&output).trim(), expected.to_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_sets_env_vars_and_warns_on_invalid_format() {
+    let output = run_cli(&["run", "-e", "FOO=bar", "sh", "--", "-c", "echo $FOO"]);
+
+    assert!(output.status.success());
+    assert_eq!(stdout_str(&output).trim(), "bar");
+
+    let output = run_cli(&["run", "-e", "NOT_A_PAIR", "sh", "--", "-c", "echo ok"]);
+    assert!(output.status.success());
+    assert!(stdout_str(&output).contains("ok"));
+    assert!(
+        stderr_str(&output).contains("Warning: Invalid env var format"),
+        "expected invalid env var warning, got: {}",
+        stderr_str(&output)
     );
 }
 
