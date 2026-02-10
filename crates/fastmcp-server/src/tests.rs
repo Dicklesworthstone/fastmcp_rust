@@ -8,7 +8,7 @@
 //! - Error handling
 
 use std::collections::HashMap;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,12 @@ fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("Hello, {name}!"))
 }
 
+#[tool(name = "formal_greet", description = "Formally greets a user")]
+fn formal_greet(_ctx: &McpContext, name: Option<String>) -> String {
+    let name = name.as_deref().unwrap_or("Sir/Madam");
+    format!("Good day, {name}.")
+}
+
 #[tool(
     name = "cancellation_check",
     description = "Tool that checks cancellation status"
@@ -87,32 +93,137 @@ fn slow_tool(ctx: &McpContext) -> McpResult<String> {
     Ok("Slow work completed".to_string())
 }
 
-/// A tool that blocks until the request is cancelled.
-struct BlockingTool {
-    barrier: Arc<Barrier>,
+static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+static BLOCKING_TOOL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn blocking_tool_state() -> &'static Mutex<Option<Arc<Barrier>>> {
+    BLOCKING_TOOL_STATE.get_or_init(|| Mutex::new(None))
 }
 
-impl ToolHandler for BlockingTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "block_until_cancelled".to_string(),
-            description: Some("Blocks until cancellation is observed".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
+fn blocking_tool_lock() -> &'static Mutex<()> {
+    BLOCKING_TOOL_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct BlockingToolConfigGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for BlockingToolConfigGuard {
+    fn drop(&mut self) {
+        *blocking_tool_state()
+            .lock()
+            .expect("blocking tool state lock poisoned") = None;
+    }
+}
+
+fn configure_blocking_tool(barrier: Arc<Barrier>) -> BlockingToolConfigGuard {
+    let lock = blocking_tool_lock()
+        .lock()
+        .expect("blocking tool lock poisoned");
+    *blocking_tool_state()
+        .lock()
+        .expect("blocking tool state lock poisoned") = Some(barrier);
+    BlockingToolConfigGuard { _lock: lock }
+}
+
+#[tool(
+    name = "block_until_cancelled",
+    description = "Blocks until cancellation is observed"
+)]
+fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
+    let barrier = blocking_tool_state()
+        .lock()
+        .expect("blocking tool state lock poisoned")
+        .clone()
+        .ok_or_else(|| McpError::internal_error("blocking tool not configured for test"))?;
+
+    barrier.wait();
+    while !ctx.is_cancelled() {
+        std::thread::yield_now();
+    }
+    Err(McpError::request_cancelled())
+}
+
+struct LoggingBlockingToolState {
+    barrier: Arc<Barrier>,
+    events: Arc<Mutex<Vec<RequestEvent>>>,
+    start: Instant,
+}
+
+static LOGGING_BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<LoggingBlockingToolState>>> =
+    OnceLock::new();
+static LOGGING_BLOCKING_TOOL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn logging_blocking_tool_state() -> &'static Mutex<Option<LoggingBlockingToolState>> {
+    LOGGING_BLOCKING_TOOL_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn logging_blocking_tool_lock() -> &'static Mutex<()> {
+    LOGGING_BLOCKING_TOOL_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct LoggingBlockingToolConfigGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for LoggingBlockingToolConfigGuard {
+    fn drop(&mut self) {
+        *logging_blocking_tool_state()
+            .lock()
+            .expect("logging blocking tool state lock poisoned") = None;
+    }
+}
+
+fn configure_logging_blocking_tool(
+    barrier: Arc<Barrier>,
+    events: Arc<Mutex<Vec<RequestEvent>>>,
+    start: Instant,
+) -> LoggingBlockingToolConfigGuard {
+    let lock = logging_blocking_tool_lock()
+        .lock()
+        .expect("logging blocking tool lock poisoned");
+    *logging_blocking_tool_state()
+        .lock()
+        .expect("logging blocking tool state lock poisoned") = Some(LoggingBlockingToolState {
+        barrier,
+        events,
+        start,
+    });
+    LoggingBlockingToolConfigGuard { _lock: lock }
+}
+
+#[tool(
+    name = "block_until_cancelled_logged",
+    description = "Blocks until cancellation; records timing logs"
+)]
+fn block_until_cancelled_logged(ctx: &McpContext, request_id: i64) -> McpResult<String> {
+    let (barrier, events, start) = {
+        let guard = logging_blocking_tool_state()
+            .lock()
+            .expect("logging blocking tool state lock poisoned");
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("logging blocking tool not configured"))?;
+        (
+            Arc::clone(&state.barrier),
+            Arc::clone(&state.events),
+            state.start,
+        )
+    };
+
+    record_event(&events, request_id, "start", start);
+    barrier.wait();
+
+    loop {
+        if ctx.checkpoint().is_err() || ctx.is_cancelled() {
+            record_event(&events, request_id, "cancelled", start);
+            break;
         }
+        std::thread::yield_now();
     }
 
-    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        self.barrier.wait();
-        while !ctx.is_cancelled() {
-            std::thread::yield_now();
-        }
-        Err(McpError::request_cancelled())
-    }
+    record_event(&events, request_id, "finish", start);
+    Err(McpError::request_cancelled())
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +234,7 @@ struct RequestEvent {
 }
 
 fn record_event(
-    events: &Arc<std::sync::Mutex<Vec<RequestEvent>>>,
+    events: &Arc<Mutex<Vec<RequestEvent>>>,
     request_id: i64,
     phase: &'static str,
     start: Instant,
@@ -142,13 +253,6 @@ fn record_event(
         phase,
         elapsed.as_millis()
     );
-}
-
-/// A tool that logs start/cancel/finish events with timing.
-struct LoggingBlockingTool {
-    barrier: Arc<Barrier>,
-    events: Arc<std::sync::Mutex<Vec<RequestEvent>>>,
-    start: Instant,
 }
 
 #[test]
@@ -177,65 +281,9 @@ fn request_id_to_u64_none_is_zero() {
     assert_eq!(crate::request_id_to_u64(None), 0);
 }
 
-impl ToolHandler for LoggingBlockingTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "block_until_cancelled_logged".to_string(),
-            description: Some("Blocks until cancellation; records timing logs".to_string()),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": { "request_id": { "type": "integer" } }
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let request_id = arguments
-            .get("request_id")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| McpError::invalid_params("missing request_id"))?;
-
-        record_event(&self.events, request_id, "start", self.start);
-        self.barrier.wait();
-
-        loop {
-            if ctx.checkpoint().is_err() || ctx.is_cancelled() {
-                record_event(&self.events, request_id, "cancelled", self.start);
-                break;
-            }
-            std::thread::yield_now();
-        }
-
-        record_event(&self.events, request_id, "finish", self.start);
-        Err(McpError::request_cancelled())
-    }
-}
-
-/// A tool that returns an error.
-struct ErrorTool;
-
-impl ToolHandler for ErrorTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "error_tool".to_string(),
-            description: Some("Always returns an error".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        Err(McpError::internal_error("Intentional error for testing"))
-    }
+#[tool(name = "error_tool", description = "Always returns an error")]
+fn error_tool(_ctx: &McpContext) -> McpResult<String> {
+    Err(McpError::internal_error("Intentional error for testing"))
 }
 
 // ============================================================================
@@ -1688,11 +1736,10 @@ mod router_tests {
     fn test_server_cancels_inflight_requests() {
         let thread_count = 3usize;
         let barrier = Arc::new(Barrier::new(thread_count + 1));
+        let _tool_config = configure_blocking_tool(Arc::clone(&barrier));
         let server = Arc::new(
             Server::new("test-server", "1.0.0")
-                .tool(BlockingTool {
-                    barrier: Arc::clone(&barrier),
-                })
+                .tool(BlockUntilCancelled)
                 .build(),
         );
         let sender: NotificationSender = Arc::new(|_| {});
@@ -1773,16 +1820,13 @@ mod router_tests {
     fn test_e2e_cancel_drain_logs() {
         let thread_count = 3usize;
         let barrier = Arc::new(Barrier::new(thread_count + 1));
-        let events: Arc<std::sync::Mutex<Vec<RequestEvent>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events: Arc<Mutex<Vec<RequestEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let start = Instant::now();
+        let _tool_config =
+            configure_logging_blocking_tool(Arc::clone(&barrier), Arc::clone(&events), start);
         let server = Arc::new(
             Server::new("test-server", "1.0.0")
-                .tool(LoggingBlockingTool {
-                    barrier: Arc::clone(&barrier),
-                    events: Arc::clone(&events),
-                    start,
-                })
+                .tool(BlockUntilCancelledLogged)
                 .build(),
         );
         let sender: NotificationSender = Arc::new(|_| {});
@@ -3006,44 +3050,11 @@ mod handler_definition_tests {
 mod multi_handler_tests {
     use super::*;
 
-    /// Second greeting tool with different behavior.
-    struct FormalGreetTool;
-
-    impl ToolHandler for FormalGreetTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "formal_greet".to_string(),
-                description: Some("Formally greets a user".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"}
-                    }
-                }),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-            let name = arguments
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sir/Madam");
-            Ok(vec![Content::Text {
-                text: format!("Good day, {name}."),
-            }])
-        }
-    }
-
     #[test]
     fn test_multiple_tools() {
         let mut router = Router::new();
         router.add_tool(Greet);
-        router.add_tool(FormalGreetTool);
+        router.add_tool(FormalGreet);
 
         let tools = router.tools();
         assert_eq!(tools.len(), 2);
