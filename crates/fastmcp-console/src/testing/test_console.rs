@@ -279,6 +279,17 @@ impl Write for BufferWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{self, AssertUnwindSafe};
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(msg) => *msg,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(msg) => (*msg).to_string(),
+                Err(_) => "<non-string panic payload>".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn test_new_creates_plain_console() {
@@ -348,6 +359,70 @@ mod tests {
         tc.console().print("Error code: 42");
         assert!(tc.matches(r"code: \d+"));
         assert!(!tc.matches(r"code: [a-z]+"));
+    }
+
+    #[test]
+    fn test_matches_invalid_regex_returns_false() {
+        let tc = TestConsole::new();
+        tc.console().print("anything");
+        assert!(!tc.matches("("));
+    }
+
+    #[test]
+    fn test_assert_contains_failure_includes_output() {
+        let tc = TestConsole::new();
+        tc.console().print("present text");
+        let panic = panic::catch_unwind(AssertUnwindSafe(|| tc.assert_contains("missing text")));
+        let message = panic_message(panic.expect_err("assert_contains should panic"));
+        assert!(message.contains("did not contain"));
+        assert!(message.contains("present text"));
+    }
+
+    #[test]
+    fn test_assert_not_contains_failure_includes_output() {
+        let tc = TestConsole::new();
+        tc.console().print("contains marker");
+        let panic = panic::catch_unwind(AssertUnwindSafe(|| {
+            tc.assert_not_contains("contains marker");
+        }));
+        let message = panic_message(panic.expect_err("assert_not_contains should panic"));
+        assert!(message.contains("unexpectedly contained"));
+        assert!(message.contains("contains marker"));
+    }
+
+    #[test]
+    fn test_assert_line_count_success_and_failure() {
+        let tc = TestConsole::new();
+        tc.console().print("line one");
+        let baseline = tc.output().len();
+        tc.assert_line_count(baseline);
+
+        let expected = baseline + 1;
+        let panic = panic::catch_unwind(AssertUnwindSafe(|| tc.assert_line_count(expected)));
+        let message = panic_message(panic.expect_err("assert_line_count should panic"));
+        assert!(message.contains(&format!("Expected {} lines but got {}", expected, baseline)));
+        assert!(message.contains("line one"));
+    }
+
+    #[test]
+    fn test_debug_print_executes() {
+        let tc = TestConsole::new();
+        tc.console().print("debug line");
+        tc.debug_print();
+    }
+
+    #[test]
+    fn test_debug_impls() {
+        let tc = TestConsole::new_rich();
+        tc.console().print("x");
+        let tc_debug = format!("{tc:?}");
+        assert!(tc_debug.contains("TestConsole"));
+        assert!(tc_debug.contains("is_rich"));
+        assert!(tc_debug.contains("line_count"));
+
+        let writer = BufferWriter(Arc::new(Mutex::new(TestBuffer::default())));
+        let writer_debug = format!("{writer:?}");
+        assert!(writer_debug.contains("BufferWriter"));
     }
 
     #[test]
