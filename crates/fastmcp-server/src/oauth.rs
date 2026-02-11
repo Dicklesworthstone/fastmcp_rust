@@ -1228,7 +1228,11 @@ impl OAuthServer {
     /// Returns statistics about the server state.
     #[must_use]
     pub fn stats(&self) -> OAuthServerStats {
-        let state = self.state.read().unwrap();
+        let state = match self.state.read() {
+            Ok(guard) => guard,
+            // Preserve observability during partial failure instead of panicking on poison.
+            Err(poisoned) => poisoned.into_inner(),
+        };
         OAuthServerStats {
             clients: state.clients.len(),
             authorization_codes: state.authorization_codes.len(),
