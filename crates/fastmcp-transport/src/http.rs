@@ -971,9 +971,12 @@ impl Transport for StreamableHttpTransport {
 
         match message {
             JsonRpcMessage::Response(response) => {
-                if let Ok(mut guard) = self.responses.lock() {
-                    guard.push(response.clone());
-                }
+                let mut guard = self.responses.lock().map_err(|_| {
+                    TransportError::Io(std::io::Error::other(
+                        "streamable response queue lock poisoned",
+                    ))
+                })?;
+                guard.push(response.clone());
             }
             JsonRpcMessage::Request(_) => {
                 // This transport currently streams only JSON-RPC responses.
@@ -1004,11 +1007,15 @@ impl Transport for StreamableHttpTransport {
                 return Err(TransportError::Cancelled);
             }
 
-            if let Ok(mut guard) = self.requests.lock() {
-                if !guard.is_empty() {
-                    return Ok(JsonRpcMessage::Request(guard.remove(0)));
-                }
+            let mut guard = self.requests.lock().map_err(|_| {
+                TransportError::Io(std::io::Error::other(
+                    "streamable request queue lock poisoned",
+                ))
+            })?;
+            if !guard.is_empty() {
+                return Ok(JsonRpcMessage::Request(guard.remove(0)));
             }
+            drop(guard);
 
             // Sleep briefly before polling again
             std::thread::sleep(self.poll_interval);
@@ -1613,6 +1620,52 @@ Transfer-Encoding: chunked\r\n\
             .send(&cx, &JsonRpcMessage::Request(request))
             .expect_err("streamable transport must reject server-to-client requests");
 
+        assert!(matches!(err, TransportError::Io(_)));
+    }
+
+    #[test]
+    fn e2e_http_streaming_send_fails_when_response_queue_poisoned() {
+        use fastmcp_protocol::RequestId;
+        use std::thread;
+
+        let mut transport = StreamableHttpTransport::new();
+        let queue = transport.response_queue();
+        let poison = thread::spawn(move || {
+            let _guard = queue.lock().expect("lock response queue");
+            std::panic::panic_any("poison response queue");
+        });
+        assert!(poison.join().is_err());
+
+        let cx = Cx::for_testing();
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            id: Some(RequestId::Number(1)),
+        };
+
+        let err = transport
+            .send(&cx, &JsonRpcMessage::Response(response))
+            .expect_err("poisoned response queue must fail send");
+        assert!(matches!(err, TransportError::Io(_)));
+    }
+
+    #[test]
+    fn e2e_http_streaming_recv_fails_when_request_queue_poisoned() {
+        use std::thread;
+
+        let mut transport = StreamableHttpTransport::new();
+        let queue = transport.request_queue();
+        let poison = thread::spawn(move || {
+            let _guard = queue.lock().expect("lock request queue");
+            std::panic::panic_any("poison request queue");
+        });
+        assert!(poison.join().is_err());
+
+        let cx = Cx::for_testing();
+        let err = transport
+            .recv(&cx)
+            .expect_err("poisoned request queue must fail recv");
         assert!(matches!(err, TransportError::Io(_)));
     }
 
