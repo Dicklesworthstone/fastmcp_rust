@@ -1089,7 +1089,9 @@ fn generate_random_bytes(len: usize) -> Result<Vec<u8>, OidcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::{OAuthClient, OAuthServerConfig};
+    use crate::oauth::{
+        AuthorizationRequest, CodeChallengeMethod, OAuthClient, OAuthServerConfig, TokenRequest,
+    };
     use std::time::Instant;
 
     fn create_test_provider() -> OidcProvider {
@@ -1341,24 +1343,32 @@ mod tests {
             .unwrap();
         oauth.register_client(client).unwrap();
 
-        // Create an access token manually
-        {
-            let mut state = oauth.state.write().unwrap();
-            let now = Instant::now();
-            let at_entry = crate::oauth::OAuthToken {
-                token: "userinfo-value".to_string(),
-                token_type: crate::oauth::TokenType::Bearer,
+        // Issue an access token through a real OAuth authorization-code flow.
+        let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string();
+        let auth_request = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "test-client".to_string(),
+            redirect_uri: "http://localhost:3000/callback".to_string(),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            state: Some("state-123".to_string()),
+            code_challenge: code_verifier.clone(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+        };
+        let (code, _redirect) = oauth
+            .authorize(&auth_request, Some("user123".to_string()))
+            .expect("authorize");
+        let token_response = oauth
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost:3000/callback".to_string()),
                 client_id: "test-client".to_string(),
-                scopes: vec!["openid".to_string(), "profile".to_string()],
-                issued_at: now,
-                expires_at: now + Duration::from_secs(3600),
-                subject: Some("user123".to_string()),
-                is_refresh_token: false,
-            };
-            state
-                .access_tokens
-                .insert("userinfo-value".to_string(), at_entry);
-        }
+                client_secret: None,
+                code_verifier: Some(code_verifier),
+                refresh_token: None,
+                scopes: None,
+            })
+            .expect("exchange token");
 
         let provider = OidcProvider::with_defaults(oauth).expect("create provider");
 
@@ -1367,7 +1377,7 @@ mod tests {
         claims_store.set_claims(UserClaims::new("user123").with_name("John Doe"));
         provider.set_claims_provider(claims_store);
 
-        let result = provider.userinfo("userinfo-value");
+        let result = provider.userinfo(&token_response.access_token);
         assert!(result.is_ok());
 
         let claims = result.unwrap();
