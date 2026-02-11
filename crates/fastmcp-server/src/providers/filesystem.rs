@@ -915,6 +915,61 @@ fn glob_match_recursive(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::SeqCst);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos();
+            path.push(format!(
+                "fastmcp-fs-tests-{label}-{}-{seq}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp test dir");
+            Self { path }
+        }
+
+        fn join(&self, relative: &str) -> PathBuf {
+            self.path.join(relative)
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_text(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, content).expect("write text file");
+    }
+
+    fn write_bytes(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, bytes).expect("write binary file");
+    }
 
     #[test]
     fn test_glob_match_star() {
@@ -964,5 +1019,208 @@ mod tests {
         assert!(is_binary_mime_type("application/pdf"));
         assert!(!is_binary_mime_type("text/plain"));
         assert!(!is_binary_mime_type("application/json"));
+    }
+
+    #[test]
+    fn test_provider_list_files_respects_patterns_and_recursion() {
+        let root = TestDir::new("list-recursive");
+        write_text(&root.join("README.md"), "# readme");
+        write_text(&root.join("notes.txt"), "notes");
+        write_text(&root.join("nested/info.md"), "# nested");
+        write_text(&root.join("nested/code.rs"), "fn main() {}");
+
+        let provider = FilesystemProvider::new(root.path())
+            .with_patterns(&["**/*.md", "**/*.txt"])
+            .with_recursive(true);
+
+        let files = provider.list_files().expect("list files");
+        let mut relative_paths = files
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<Vec<_>>();
+        relative_paths.sort_unstable();
+
+        assert_eq!(
+            relative_paths,
+            vec!["README.md", "nested/info.md", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn test_provider_list_files_non_recursive_skips_subdirectories() {
+        let root = TestDir::new("list-flat");
+        write_text(&root.join("root.md"), "root");
+        write_text(&root.join("nested/child.md"), "child");
+
+        let provider = FilesystemProvider::new(root.path())
+            .with_patterns(&["**/*.md"])
+            .with_recursive(false);
+
+        let files = provider.list_files().expect("list files");
+        let relative_paths = files
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(relative_paths, vec!["root.md"]);
+    }
+
+    #[test]
+    fn test_validate_path_rejects_absolute_and_parent_escape() {
+        let root = TestDir::new("validate-path");
+        write_text(&root.join("safe.txt"), "safe");
+
+        let outside_file = root
+            .path()
+            .parent()
+            .expect("temp dir has parent")
+            .join("outside-fastmcp-provider-test.txt");
+        write_text(&outside_file, "outside");
+
+        let provider = FilesystemProvider::new(root.path());
+
+        let absolute = provider.validate_path("/tmp/absolute.txt");
+        assert!(matches!(
+            absolute,
+            Err(FilesystemProviderError::PathTraversal { .. })
+        ));
+
+        let escape = provider.validate_path("../outside-fastmcp-provider-test.txt");
+        assert!(matches!(
+            escape,
+            Err(FilesystemProviderError::PathTraversal { .. })
+        ));
+
+        let ok = provider.validate_path("safe.txt").expect("safe path");
+        assert!(ok.ends_with("safe.txt"));
+    }
+
+    #[test]
+    fn test_read_file_text_binary_and_size_limit() {
+        let root = TestDir::new("read-file");
+        write_text(&root.join("doc.txt"), "hello world");
+        write_bytes(&root.join("blob.bin"), &[0x00, 0x7F, 0xAA, 0x55]);
+        write_bytes(&root.join("large.bin"), &[0u8; 8]);
+
+        let provider = FilesystemProvider::new(root.path()).with_max_size(32);
+
+        let text = provider.read_file("doc.txt").expect("read text");
+        assert!(matches!(text, FileContent::Text(ref t) if t == "hello world"));
+
+        let binary = provider.read_file("blob.bin").expect("read binary");
+        assert!(matches!(binary, FileContent::Binary(ref b) if b == &[0x00, 0x7F, 0xAA, 0x55]));
+
+        let size_limited = FilesystemProvider::new(root.path()).with_max_size(4);
+        let too_large = size_limited.read_file("large.bin");
+        assert!(matches!(
+            too_large,
+            Err(FilesystemProviderError::TooLarge { path, size: 8, max: 4 })
+                if path == "large.bin"
+        ));
+    }
+
+    #[test]
+    fn test_handler_read_listing_and_read_with_uri() {
+        let root = TestDir::new("handler-read");
+        write_text(&root.join("docs/readme.md"), "# docs");
+
+        let handler = FilesystemProvider::new(root.path())
+            .with_prefix("docs")
+            .with_patterns(&["**/*.md"])
+            .with_recursive(true)
+            .with_description("Documentation")
+            .build();
+
+        let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
+
+        let definition = handler.definition();
+        assert_eq!(definition.uri, "file://docs/{path}");
+        assert_eq!(definition.name, "docs");
+        assert_eq!(definition.description.as_deref(), Some("Documentation"));
+
+        let template = handler.template().expect("resource template");
+        assert_eq!(template.uri_template, "file://docs/{path}");
+
+        let listing = handler.read(&ctx).expect("read listing");
+        let listing_text = listing[0].text.as_deref().expect("listing text");
+        assert!(listing_text.contains("docs/readme.md: text/markdown"));
+
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "docs/readme.md".to_string());
+        let content = handler
+            .read_with_uri(&ctx, "file://docs/docs/readme.md", &params)
+            .expect("read with params");
+        assert_eq!(content[0].text.as_deref(), Some("# docs"));
+
+        let empty_params = HashMap::new();
+        let content_from_uri = handler
+            .read_with_uri(&ctx, "file://docs/docs/readme.md", &empty_params)
+            .expect("read using uri path");
+        assert_eq!(content_from_uri[0].text.as_deref(), Some("# docs"));
+
+        let invalid = handler.read_with_uri(&ctx, "file://wrong-prefix/readme.md", &empty_params);
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn test_handler_read_async_with_uri() {
+        let root = TestDir::new("handler-async");
+        write_text(&root.join("notes.md"), "async content");
+
+        let handler = FilesystemProvider::new(root.path())
+            .with_patterns(&["*.md"])
+            .build();
+        let ctx = McpContext::new(asupersync::Cx::for_testing(), 9);
+
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "notes.md".to_string());
+        let outcome =
+            fastmcp_core::block_on(handler.read_async_with_uri(&ctx, "file://notes.md", &params));
+        match outcome {
+            Outcome::Ok(content) => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].text.as_deref(), Some("async content"));
+            }
+            other => panic!("unexpected async outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_base64_encode_padding_variants() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_validation_denied_and_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("symlink-root");
+        let outside = TestDir::new("symlink-outside");
+
+        write_text(&root.join("inside.txt"), "inside");
+        write_text(&outside.join("outside.txt"), "outside");
+
+        let inside_link = root.join("inside-link.txt");
+        let escape_link = root.join("escape-link.txt");
+        symlink(root.join("inside.txt"), &inside_link).expect("create inside symlink");
+        symlink(outside.join("outside.txt"), &escape_link).expect("create escape symlink");
+
+        let deny_provider = FilesystemProvider::new(root.path()).with_follow_symlinks(false);
+        let denied = deny_provider.validate_path("inside-link.txt");
+        assert!(matches!(
+            denied,
+            Err(FilesystemProviderError::SymlinkDenied { .. })
+        ));
+
+        let allow_provider = FilesystemProvider::new(root.path()).with_follow_symlinks(true);
+        let canonical_root = root.path().canonicalize().expect("canonical root");
+        let escaped = allow_provider.check_symlink(&escape_link, &canonical_root);
+        assert!(matches!(
+            escaped,
+            Err(FilesystemProviderError::SymlinkEscapesRoot { .. })
+        ));
     }
 }

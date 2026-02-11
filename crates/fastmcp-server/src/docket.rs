@@ -1667,6 +1667,93 @@ impl std::fmt::Debug for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "redis")]
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    #[cfg(feature = "redis")]
+    use std::net::TcpListener;
+    #[cfg(feature = "redis")]
+    use std::process::{Child, Command, Stdio};
+    #[cfg(feature = "redis")]
+    use std::time::Instant;
+
+    #[cfg(feature = "redis")]
+    static REDIS_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(feature = "redis")]
+    fn next_test_token(label: &str) -> String {
+        let seq = REDIS_TEST_SEQ.fetch_add(1, AtomicOrdering::SeqCst);
+        format!("{label}-{}-{seq}", std::process::id())
+    }
+
+    #[cfg(feature = "redis")]
+    struct TestRedisServer {
+        child: Child,
+        url: String,
+    }
+
+    #[cfg(feature = "redis")]
+    impl TestRedisServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral redis port");
+            let port = listener.local_addr().expect("redis test local addr").port();
+            drop(listener);
+
+            let child = Command::new("redis-server")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--save")
+                .arg("")
+                .arg("--appendonly")
+                .arg("no")
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--protected-mode")
+                .arg("no")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn redis-server");
+
+            let url = format!("redis://127.0.0.1:{port}/");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let ready = redis::Client::open(url.as_str())
+                    .ok()
+                    .and_then(|client| client.get_connection().ok())
+                    .and_then(|mut conn| redis::cmd("PING").query::<String>(&mut conn).ok())
+                    .is_some_and(|pong| pong == "PONG");
+
+                if ready {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "redis-server did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            Self { child, url }
+        }
+    }
+
+    #[cfg(feature = "redis")]
+    impl Drop for TestRedisServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(feature = "redis")]
+    fn redis_settings_for_test(url: &str) -> DocketSettings {
+        let mut settings = DocketSettings::redis(url);
+        settings.queue_prefix = format!("fastmcp:docket:test:{}", next_test_token("queue"));
+        settings.poll_interval = Duration::from_millis(1);
+        settings.retry_delay = Duration::from_millis(0);
+        settings
+    }
 
     #[test]
     fn test_docket_settings_default() {
@@ -1953,5 +2040,162 @@ mod tests {
         for (error, expected) in errors {
             assert_eq!(error.to_string(), expected);
         }
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_redis_worker_process_round_trip() {
+        use fastmcp_core::block_on;
+
+        let redis_server = TestRedisServer::start();
+        let settings = redis_settings_for_test(&redis_server.url);
+        let docket = Docket::new(settings).expect("redis docket");
+
+        let task_id = docket
+            .submit("redis_round_trip", serde_json::json!({"value": 21}))
+            .expect("submit");
+
+        let worker = docket
+            .worker()
+            .subscribe("redis_round_trip", |task| async move {
+                let value = task
+                    .params
+                    .get("value")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Ok(serde_json::json!({"doubled": value * 2}))
+            })
+            .build();
+
+        let cx = Cx::for_testing();
+        let processed = block_on(worker.process_one(&cx)).expect("process one");
+        assert!(processed);
+
+        let task = docket
+            .get_task(&task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.result, Some(serde_json::json!({"doubled": 42})));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_redis_worker_retries_then_marks_failed() {
+        use fastmcp_core::block_on;
+
+        let redis_server = TestRedisServer::start();
+        let mut settings = redis_settings_for_test(&redis_server.url);
+        settings.max_retries = 2;
+        let docket = Docket::new(settings).expect("redis docket");
+
+        let task_id = docket
+            .submit("redis_retry", serde_json::json!({"attempt": 0}))
+            .expect("submit");
+
+        let worker = docket
+            .worker()
+            .subscribe("redis_retry", |_task| async move {
+                Err(DocketError::Handler("boom".to_string()))
+            })
+            .build();
+
+        let cx = Cx::for_testing();
+        assert!(block_on(worker.process_one(&cx)).expect("process first"));
+        assert!(block_on(worker.process_one(&cx)).expect("process second"));
+
+        let task = docket
+            .get_task(&task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.retry_count, 2);
+        assert!(task.error.unwrap_or_default().contains("boom"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_redis_cancel_pending_task() {
+        let redis_server = TestRedisServer::start();
+        let settings = redis_settings_for_test(&redis_server.url);
+        let docket = Docket::new(settings).expect("redis docket");
+
+        let task_id = docket
+            .submit("redis_cancel", serde_json::json!({"x": 1}))
+            .expect("submit");
+        docket
+            .cancel(&task_id, Some("stopped by test"))
+            .expect("cancel task");
+
+        let task = docket
+            .get_task(&task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error, Some("stopped by test".to_string()));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_redis_requeue_stale_running_task() {
+        let redis_server = TestRedisServer::start();
+        let mut settings = redis_settings_for_test(&redis_server.url);
+        settings.visibility_timeout = Duration::from_millis(0);
+        let docket = Docket::new(settings).expect("redis docket");
+
+        let task_id = docket
+            .submit("redis_stale", serde_json::json!({"x": 1}))
+            .expect("submit");
+
+        let task_types = vec!["redis_stale".to_string()];
+        let claimed = docket
+            .backend
+            .dequeue(&task_types)
+            .expect("dequeue")
+            .expect("claimed task");
+        assert_eq!(claimed.id, task_id);
+        assert_eq!(claimed.status, TaskStatus::Running);
+
+        let requeued = docket.backend.requeue_stale().expect("requeue stale");
+        assert_eq!(requeued, 1);
+
+        let reclaimed = docket
+            .backend
+            .dequeue(&task_types)
+            .expect("dequeue after requeue")
+            .expect("task available again");
+        assert_eq!(reclaimed.id, task_id);
+        assert_eq!(reclaimed.retry_count, 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_redis_requeue_stale_marks_failed_at_retry_limit() {
+        let redis_server = TestRedisServer::start();
+        let mut settings = redis_settings_for_test(&redis_server.url);
+        settings.visibility_timeout = Duration::from_millis(0);
+        settings.max_retries = 1;
+        let docket = Docket::new(settings).expect("redis docket");
+
+        let task_id = docket
+            .submit("redis_stale_fail", serde_json::json!({}))
+            .expect("submit");
+
+        let task_types = vec!["redis_stale_fail".to_string()];
+        let _claimed = docket
+            .backend
+            .dequeue(&task_types)
+            .expect("dequeue")
+            .expect("claimed");
+
+        let requeued = docket.backend.requeue_stale().expect("requeue stale");
+        assert_eq!(requeued, 0);
+
+        let task = docket
+            .get_task(&task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_deref(), Some("Exceeded visibility timeout"));
     }
 }

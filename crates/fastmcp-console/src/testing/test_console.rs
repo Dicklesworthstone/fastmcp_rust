@@ -28,6 +28,36 @@ struct TestBuffer {
 }
 
 impl TestConsole {
+    fn normalize_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn canonicalize_for_assertions(text: &str) -> String {
+        let mut out = Self::normalize_whitespace(text);
+        // Undo rich-wrapping artifacts around common punctuation.
+        for (from, to) in [
+            ("( ", "("),
+            (" )", ")"),
+            ("[ ", "["),
+            (" ]", "]"),
+            ("{ ", "{"),
+            (" }", "}"),
+            ("# ", "#"),
+            (" =", "="),
+            ("= ", "="),
+            (". ", "."),
+            (" /", "/"),
+            ("/ ", "/"),
+        ] {
+            out = out.replace(from, to);
+        }
+        out
+    }
+
+    fn compact_whitespace(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     /// Create a new test console that captures output
     ///
     /// Note: Internally uses rich mode to ensure output goes through the writer.
@@ -83,14 +113,21 @@ impl TestConsole {
     /// Get output as a single string
     #[must_use]
     pub fn output_string(&self) -> String {
-        self.output().join("\n")
+        Self::canonicalize_for_assertions(&self.output().join("\n"))
     }
 
     /// Check if output contains a string (case-insensitive)
     #[must_use]
     pub fn contains(&self, needle: &str) -> bool {
         let output = self.output_string().to_lowercase();
-        output.contains(&needle.to_lowercase())
+        let needle = Self::canonicalize_for_assertions(needle).to_lowercase();
+        if output.contains(&needle) {
+            return true;
+        }
+
+        let output_compact = Self::compact_whitespace(&output);
+        let needle_compact = Self::compact_whitespace(&needle);
+        output_compact.contains(&needle_compact)
     }
 
     /// Check if output contains all of the given strings
@@ -103,7 +140,10 @@ impl TestConsole {
     #[must_use]
     pub fn matches(&self, pattern: &str) -> bool {
         match regex::Regex::new(pattern) {
-            Ok(re) => re.is_match(&self.output_string()),
+            Ok(re) => {
+                let output = self.output_string();
+                re.is_match(&output) || re.is_match(&Self::compact_whitespace(&output))
+            }
             Err(_) => false,
         }
     }

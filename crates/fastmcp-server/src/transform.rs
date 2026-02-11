@@ -473,17 +473,17 @@ mod tests {
     use super::*;
     use fastmcp_protocol::Content;
 
-    struct MockTool {
+    struct SearchToolFixture {
         name: String,
         description: Option<String>,
         schema: serde_json::Value,
     }
 
-    impl MockTool {
+    impl SearchToolFixture {
         fn new(name: &str) -> Self {
             Self {
                 name: name.to_string(),
-                description: Some("Mock tool".to_string()),
+                description: Some("Search tool".to_string()),
                 schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -502,7 +502,7 @@ mod tests {
         }
     }
 
-    impl ToolHandler for MockTool {
+    impl ToolHandler for SearchToolFixture {
         fn definition(&self) -> Tool {
             Tool {
                 name: self.name.clone(),
@@ -518,14 +518,14 @@ mod tests {
 
         fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::Text {
-                text: format!("Called with: {}", arguments),
+                text: format!("Search called with: {}", arguments),
             }])
         }
     }
 
     #[test]
     fn test_rename_tool() {
-        let tool = MockTool::new("search");
+        let tool = SearchToolFixture::new("search");
         let transformed = TransformedTool::from_tool(tool)
             .name("semantic_search")
             .description("Search semantically")
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_rename_arg() {
-        let tool = MockTool::new("search");
+        let tool = SearchToolFixture::new("search");
         let transformed = TransformedTool::from_tool(tool)
             .rename_arg("q", "query")
             .build();
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_hide_arg() {
-        let tool = MockTool::new("search");
+        let tool = SearchToolFixture::new("search");
         let transformed = TransformedTool::from_tool(tool).hide_arg("n", 10).build();
 
         let def = transformed.definition();
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_transform_arguments() {
-        let tool = MockTool::new("search");
+        let tool = SearchToolFixture::new("search");
         let transformed = TransformedTool::from_tool(tool)
             .rename_arg("q", "query")
             .hide_arg("n", 10)

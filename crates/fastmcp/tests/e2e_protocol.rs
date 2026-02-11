@@ -613,7 +613,7 @@ fn e2e_auth_jwt_flow_allows_and_denies() {
             "scope": "read write",
             "exp": exp_expired,
         }),
-        &EncodingKey::from_secret(secret),
+        &EncodingKey::from_secret(signing_bytes),
     )
     .unwrap();
     let params = json!({ "cursor": null, "auth": format!("Bearer {token_expired}") });

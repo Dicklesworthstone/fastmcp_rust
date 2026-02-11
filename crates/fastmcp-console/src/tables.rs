@@ -1139,4 +1139,266 @@ mod tests {
         renderer.render_tree(&[], console.console());
         console.assert_contains("No resources registered");
     }
+
+    #[test]
+    fn test_tool_table_plain_without_parameter_summary() {
+        let tools = sample_tools();
+        let console = TestConsole::new();
+        let mut renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        renderer.show_parameters = false;
+        renderer.render(&tools, console.console());
+        console.assert_contains("Registered Tools (2)");
+        console.assert_not_contains("[");
+    }
+
+    #[test]
+    fn test_tool_detail_plain_and_rich() {
+        let tools = sample_tools();
+
+        let plain = TestConsole::new();
+        let renderer_plain = ToolTableRenderer::new(DisplayContext::new_agent());
+        renderer_plain.render_detail(&tools[0], plain.console());
+        plain.assert_contains("Tool: calculate");
+        plain.assert_contains("Parameters:");
+        plain.assert_contains("expression: string (required)");
+
+        let rich = TestConsole::new_rich();
+        let renderer_rich = ToolTableRenderer::new(DisplayContext::new_human());
+        renderer_rich.render_detail(&tools[0], rich.console());
+        rich.assert_contains("calculate");
+        rich.assert_contains("Parameters");
+    }
+
+    #[test]
+    fn test_tool_detail_plain_no_parameters() {
+        let tool = Tool {
+            name: "ping".to_string(),
+            description: Some("No args".to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let console = TestConsole::new();
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        renderer.render_detail(&tool, console.console());
+        console.assert_contains("Parameters: none");
+    }
+
+    #[test]
+    fn test_tool_format_parameters_variants() {
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        assert_eq!(
+            renderer.format_parameters(&json!({"type": "object"})),
+            "none"
+        );
+        assert_eq!(
+            renderer.format_parameters(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"]
+            })),
+            "1 required"
+        );
+        assert_eq!(
+            renderer.format_parameters(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}}
+            })),
+            "1 optional"
+        );
+        assert_eq!(
+            renderer.format_parameters(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "number"}},
+                "required": ["a"]
+            })),
+            "1 req, 1 opt"
+        );
+    }
+
+    #[test]
+    fn test_tool_extract_parameters_defaults_to_any() {
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        let params = renderer.extract_parameters(&json!({
+            "type": "object",
+            "properties": {
+                "raw": {}
+            }
+        }));
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "raw");
+        assert_eq!(params[0].type_name, "any");
+        assert!(!params[0].required);
+        assert!(params[0].description.is_none());
+    }
+
+    #[test]
+    fn test_resource_table_without_mime_column() {
+        let resources = sample_resources();
+        let console = TestConsole::new();
+        let mut renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
+        renderer.show_mime_type = false;
+        renderer.render(&resources, console.console());
+        console.assert_contains("Registered Resources (2)");
+        console.assert_contains("config (file://config.json) - Application configuration");
+    }
+
+    #[test]
+    fn test_resource_detail_plain_and_rich() {
+        let resources = sample_resources();
+
+        let plain = TestConsole::new();
+        let renderer_plain = ResourceTableRenderer::new(DisplayContext::new_agent());
+        renderer_plain.render_detail(&resources[0], plain.console());
+        plain.assert_contains("Resource: config");
+        plain.assert_contains("URI: file://config.json");
+        plain.assert_contains("MIME Type: application/json");
+
+        let rich = TestConsole::new_rich();
+        let renderer_rich = ResourceTableRenderer::new(DisplayContext::new_human());
+        renderer_rich.render_detail(&resources[0], rich.console());
+        rich.assert_contains("config");
+        rich.assert_contains("URI:");
+    }
+
+    #[test]
+    fn test_resource_detail_plain_without_mime() {
+        let resource = Resource {
+            uri: "cache://hits".to_string(),
+            name: "hits".to_string(),
+            description: Some("Cache hits".to_string()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let console = TestConsole::new();
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
+        renderer.render_detail(&resource, console.console());
+        console.assert_contains("Resource: hits");
+        console.assert_not_contains("MIME Type:");
+    }
+
+    #[test]
+    fn test_resource_tree_render_rich_groups_by_prefix() {
+        let resources = sample_resources_with_templates();
+        let console = TestConsole::new_rich();
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+        renderer.render_tree(&resources, console.console());
+        console.assert_contains("Resources");
+        console.assert_contains("(4)");
+        console.assert_contains("file");
+        console.assert_contains("db");
+        console.assert_contains("cache");
+    }
+
+    #[test]
+    fn test_resource_format_uri_unclosed_and_nested_braces() {
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_uri("file://{path"), "file://{path");
+        assert_eq!(
+            renderer.format_uri("weird://{a{b}"),
+            "weird://{a[yellow]{b}[/]"
+        );
+    }
+
+    #[test]
+    fn test_resource_extract_uri_path_no_scheme() {
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.extract_uri_path("just-a-path"), "just-a-path");
+    }
+
+    #[test]
+    fn test_prompt_table_plain_without_argument_summary() {
+        let prompts = sample_prompts();
+        let console = TestConsole::new();
+        let mut renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        renderer.show_arguments = false;
+        renderer.render(&prompts, console.console());
+        console.assert_contains("Registered Prompts (2)");
+        console.assert_contains("greeting - Generate a greeting message");
+    }
+
+    #[test]
+    fn test_prompt_detail_plain_and_rich() {
+        let prompts = sample_prompts();
+
+        let plain = TestConsole::new();
+        let renderer_plain = PromptTableRenderer::new(DisplayContext::new_agent());
+        renderer_plain.render_detail(&prompts[1], plain.console());
+        plain.assert_contains("Prompt: summarize");
+        plain.assert_contains("Arguments:");
+        plain.assert_contains("text (required)");
+        plain.assert_contains("length (optional)");
+
+        let rich = TestConsole::new_rich();
+        let renderer_rich = PromptTableRenderer::new(DisplayContext::new_human());
+        renderer_rich.render_detail(&prompts[1], rich.console());
+        rich.assert_contains("summarize");
+        rich.assert_contains("Arguments");
+    }
+
+    #[test]
+    fn test_prompt_detail_plain_no_arguments() {
+        let prompt = Prompt {
+            name: "ping".to_string(),
+            description: Some("No args".to_string()),
+            arguments: vec![],
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let console = TestConsole::new();
+        let renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        renderer.render_detail(&prompt, console.console());
+        console.assert_contains("Arguments: none");
+    }
+
+    #[test]
+    fn test_prompt_format_arguments_variants() {
+        let renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_arguments(&[]), "none");
+        assert_eq!(
+            renderer.format_arguments(&[PromptArgument {
+                name: "a".to_string(),
+                description: None,
+                required: true,
+            }]),
+            "1 required"
+        );
+        assert_eq!(
+            renderer.format_arguments(&[PromptArgument {
+                name: "b".to_string(),
+                description: None,
+                required: false,
+            }]),
+            "1 optional"
+        );
+    }
+
+    #[test]
+    fn test_legacy_render_functions() {
+        let tools = sample_tools();
+        let resources = sample_resources();
+        let prompts = sample_prompts();
+        let console = TestConsole::new();
+
+        render_tools_table(&tools, console.console());
+        render_resources_table(&resources, console.console());
+        render_prompts_table(&prompts, console.console());
+
+        console.assert_contains("Registered Tools (2)");
+        console.assert_contains("Registered Resources (2)");
+        console.assert_contains("Registered Prompts (2)");
+    }
+
+    #[test]
+    fn test_renderer_defaults_detect() {
+        let _tool = ToolTableRenderer::default();
+        let _resource = ResourceTableRenderer::default();
+        let _prompt = PromptTableRenderer::default();
+    }
 }

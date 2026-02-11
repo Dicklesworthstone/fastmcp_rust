@@ -1171,6 +1171,42 @@ fn transport_error_to_mcp(e: TransportError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+
+    fn make_closed_client(initialized: bool) -> Client {
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let mut child = Command::new(rustc)
+            .arg("--version")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rustc --version");
+
+        let stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let transport = StdioTransport::new(stdout, stdin);
+        let session = ClientSession::new(
+            ClientInfo {
+                name: "test-client".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            ServerInfo {
+                name: "test-server".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ServerCapabilities::default(),
+            PROTOCOL_VERSION.to_string(),
+        );
+
+        if initialized {
+            Client::from_parts(child, transport, Cx::for_request(), session, 100)
+        } else {
+            Client::from_parts_uninitialized(child, transport, Cx::for_request(), session, 100)
+        }
+    }
 
     // ========================================
     // method_not_found_response tests
@@ -1298,5 +1334,120 @@ mod tests {
         assert_eq!(params.marker, ProgressMarker::String("tok-1".to_string()));
         assert!(params.total.is_none());
         assert!(params.message.is_none());
+    }
+
+    #[test]
+    fn client_from_parts_accessors_and_request_counter() {
+        let client = make_closed_client(true);
+        assert!(client.is_initialized());
+        assert_eq!(client.server_info().name, "test-server");
+        let caps_json = serde_json::to_value(client.server_capabilities()).expect("caps json");
+        assert_eq!(caps_json, serde_json::json!({}));
+        assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
+        assert_eq!(client.next_request_id(), 2);
+        assert_eq!(client.next_request_id(), 3);
+    }
+
+    #[test]
+    fn ensure_initialized_noop_when_already_initialized() {
+        let mut client = make_closed_client(true);
+        assert!(client.ensure_initialized().is_ok());
+        assert!(client.is_initialized());
+    }
+
+    #[test]
+    fn ensure_initialized_fails_for_uninitialized_closed_transport() {
+        let mut client = make_closed_client(false);
+        std::thread::sleep(Duration::from_millis(50));
+        let err = client
+            .ensure_initialized()
+            .expect_err("expected init failure");
+        assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
+        assert!(!client.is_initialized());
+    }
+
+    #[test]
+    fn client_core_api_methods_error_cleanly_on_closed_transport() {
+        let mut client = make_closed_client(true);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let _ = client.cancel_request(7i64, Some("stop".to_string()), true);
+        assert!(client.list_tools().is_err());
+        assert!(
+            client
+                .call_tool("echo", serde_json::json!({"text": "hi"}))
+                .is_err()
+        );
+
+        let mut progress_events: Vec<(f64, Option<f64>, Option<String>)> = Vec::new();
+        let mut on_progress = |p: f64, total: Option<f64>, msg: Option<&str>| {
+            progress_events.push((p, total, msg.map(ToString::to_string)));
+        };
+        assert!(
+            client
+                .call_tool_with_progress(
+                    "echo",
+                    serde_json::json!({"text": "hi"}),
+                    &mut on_progress
+                )
+                .is_err()
+        );
+        assert!(progress_events.is_empty());
+
+        assert!(client.list_resources().is_err());
+        assert!(client.list_resource_templates().is_err());
+        assert!(client.set_log_level(LogLevel::Debug).is_err());
+        assert!(client.read_resource("resource://test").is_err());
+        assert!(client.list_prompts().is_err());
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "world".to_string());
+        assert!(client.get_prompt("greeting", args).is_err());
+
+        assert!(
+            client
+                .submit_task("data_export", serde_json::json!({"batch": 1}))
+                .is_err()
+        );
+        assert!(
+            client
+                .list_tasks(Some(TaskStatus::Running), Some("c1"), Some(10))
+                .is_err()
+        );
+        assert!(client.list_tasks_all(None).is_err());
+        assert!(client.get_task("task-1").is_err());
+        assert!(client.cancel_task("task-1").is_err());
+        assert!(
+            client
+                .cancel_task_with_reason("task-1", Some("no longer needed"))
+                .is_err()
+        );
+        assert!(
+            client
+                .wait_for_task("task-1", Duration::from_millis(1))
+                .is_err()
+        );
+
+        let mut task_progress = Vec::new();
+        let mut on_task_progress = |p: f64, msg: Option<&str>| {
+            task_progress.push((p, msg.map(ToString::to_string)));
+        };
+        assert!(
+            client
+                .wait_for_task_with_progress(
+                    "task-1",
+                    Duration::from_millis(1),
+                    &mut on_task_progress
+                )
+                .is_err()
+        );
+        assert!(task_progress.is_empty());
+    }
+
+    #[test]
+    fn close_handles_already_exited_subprocess() {
+        let client = make_closed_client(true);
+        std::thread::sleep(Duration::from_millis(50));
+        client.close();
     }
 }

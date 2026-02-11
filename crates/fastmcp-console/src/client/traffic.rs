@@ -356,7 +356,8 @@ impl RequestResponseRenderer {
 mod tests {
     use super::*;
     use crate::testing::TestConsole;
-    use fastmcp_protocol::{JsonRpcResponse, RequestId};
+    use fastmcp_protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId};
+    use serde_json::json;
 
     #[test]
     fn test_render_request_plain() {
@@ -407,5 +408,272 @@ mod tests {
         let output = console.output_string();
         assert!(output.contains("resources/list"));
         assert!(output.contains("OK"));
+    }
+
+    #[test]
+    fn test_render_request_plain_with_params() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({"name": "echo", "args": {"text": "hi"}})),
+            7i64,
+        );
+
+        renderer.render_request(&request, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("-> tools/call"));
+        assert!(output.contains("id=7"));
+        assert!(output.contains("Params"));
+        assert!(output.contains("echo"));
+    }
+
+    #[test]
+    fn test_render_request_plain_hides_params_when_disabled() {
+        let mut renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        renderer.show_params = false;
+        let console = TestConsole::new();
+        let request = JsonRpcRequest::new("tools/call", Some(json!({"x": 1})), 1i64);
+
+        renderer.render_request(&request, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("-> tools/call"));
+        assert!(!output.contains("Params"));
+    }
+
+    #[test]
+    fn test_render_request_plain_notification_id_is_null() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let request = JsonRpcRequest::notification("notifications/progress", Some(json!({"n": 1})));
+
+        renderer.render_request(&request, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("id=null"));
+    }
+
+    #[test]
+    fn test_render_response_plain_success_with_result() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let response = JsonRpcResponse::success(
+            RequestId::String("req-1".to_string()),
+            json!({"items": [1, 2, 3]}),
+        );
+
+        renderer.render_response(
+            &response,
+            Some(Duration::from_micros(1500)),
+            console.console(),
+        );
+
+        let output = console.output_string();
+        assert!(output.contains("<- ok"));
+        assert!(output.contains("1.5ms"));
+        assert!(output.contains("Result"));
+    }
+
+    #[test]
+    fn test_render_response_plain_hides_result_and_timing() {
+        let mut renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        renderer.show_result = false;
+        renderer.show_timing = false;
+        let console = TestConsole::new();
+        let response = JsonRpcResponse::success(RequestId::Number(9), json!({"ok": true}));
+
+        renderer.render_response(&response, Some(Duration::from_millis(8)), console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("<- ok (id=9)"));
+        assert!(!output.contains("8.0ms"));
+        assert!(!output.contains("Result"));
+    }
+
+    #[test]
+    fn test_render_response_plain_error_without_data() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let response = JsonRpcResponse::error(
+            None,
+            JsonRpcError {
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: None,
+            },
+        );
+
+        renderer.render_response(&response, None, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("<- error (id=null)"));
+        assert!(output.contains("-32601"));
+        assert!(output.contains("Method not found"));
+        assert!(!output.contains("Data:"));
+    }
+
+    #[test]
+    fn test_render_pair_plain_fail() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let request = JsonRpcRequest::new("tools/call", None, 10i64);
+        let response = JsonRpcResponse::error(
+            Some(RequestId::Number(10)),
+            JsonRpcError {
+                code: -32000,
+                message: "boom".to_string(),
+                data: None,
+            },
+        );
+
+        renderer.render_pair(
+            &request,
+            &response,
+            Duration::from_micros(320),
+            console.console(),
+        );
+
+        let output = console.output_string();
+        assert!(output.contains("tools/call"));
+        assert!(output.contains("FAIL"));
+        assert!(output.contains("320us"));
+    }
+
+    #[test]
+    fn test_render_request_rich_path() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let request =
+            JsonRpcRequest::new("resources/read", Some(json!({"uri": "file://a"})), 42i64);
+
+        renderer.render_request(&request, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("resources/read"));
+        assert!(output.contains("id=42"));
+        assert!(output.contains("Params"));
+    }
+
+    #[test]
+    fn test_render_response_rich_error_with_data() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let response = JsonRpcResponse::error(
+            Some(RequestId::String("abc".to_string())),
+            JsonRpcError {
+                code: -32042,
+                message: "failed".to_string(),
+                data: Some(json!({"retryable": false})),
+            },
+        );
+
+        renderer.render_response(&response, Some(Duration::from_secs(2)), console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("ERR"));
+        assert!(output.contains("id=abc"));
+        assert!(output.contains("2.00s"));
+        assert!(output.contains("Error -32042"));
+        assert!(output.contains("Data:"));
+    }
+
+    #[test]
+    fn test_render_pair_rich_ok_and_fail() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let request = JsonRpcRequest::new("initialize", None, 1i64);
+        let ok = JsonRpcResponse::success(RequestId::Number(1), json!({"ok": true}));
+        renderer.render_pair(&request, &ok, Duration::from_millis(7), console.console());
+        console.assert_contains("initialize");
+        console.assert_contains("OK");
+
+        let err = JsonRpcResponse::error(
+            Some(RequestId::Number(1)),
+            JsonRpcError {
+                code: -1,
+                message: "nope".to_string(),
+                data: None,
+            },
+        );
+        renderer.render_pair(&request, &err, Duration::from_millis(7), console.console());
+        console.assert_contains("FAIL");
+    }
+
+    #[test]
+    fn test_method_and_color_helpers_return_values() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+
+        assert!(!renderer.method_color("tools/list").is_empty());
+        assert!(!renderer.method_color("resources/list").is_empty());
+        assert!(!renderer.method_color("prompts/list").is_empty());
+        assert!(!renderer.method_color("initialize").is_empty());
+        assert!(!renderer.method_color("misc/method").is_empty());
+        assert!(!renderer.dim_color().is_empty());
+        assert!(!renderer.success_color().is_empty());
+        assert!(!renderer.error_color().is_empty());
+    }
+
+    #[test]
+    fn test_format_id_variants() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_id(&Some(RequestId::Number(5))), "5");
+        assert_eq!(
+            renderer.format_id(&Some(RequestId::String("r-1".to_string()))),
+            "r-1"
+        );
+        assert_eq!(renderer.format_id(&None), "null");
+    }
+
+    #[test]
+    fn test_format_duration_branches() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        assert_eq!(
+            renderer.format_duration(Duration::from_micros(999)),
+            "999us"
+        );
+        assert_eq!(
+            renderer.format_duration(Duration::from_micros(1234)),
+            "1.2ms"
+        );
+        assert_eq!(
+            renderer.format_duration(Duration::from_millis(2500)),
+            "2.50s"
+        );
+    }
+
+    #[test]
+    fn test_truncate_string_branches() {
+        let mut renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        renderer.truncate_at = 8;
+        assert_eq!(renderer.truncate_string("short"), "short");
+        assert_eq!(renderer.truncate_string("123456789"), "12345678...");
+    }
+
+    #[test]
+    fn test_plain_json_and_error_preview_helpers() {
+        let mut renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        renderer.truncate_at = 10;
+        let console = TestConsole::new();
+
+        renderer.render_json_preview_plain(
+            "Payload",
+            &json!({"long": "abcdefghijklmnopqrstuvwxyz"}),
+            console.console(),
+        );
+        console.assert_contains("Payload:");
+        console.assert_contains("...");
+
+        renderer.render_error_preview_plain(
+            &JsonRpcError {
+                code: -32001,
+                message: "boom".to_string(),
+                data: Some(json!({"details": "abcdefghijklmnopqrstuvwxyz"})),
+            },
+            console.console(),
+        );
+        console.assert_contains("Error -32001: boom");
+        console.assert_contains("Data:");
     }
 }
