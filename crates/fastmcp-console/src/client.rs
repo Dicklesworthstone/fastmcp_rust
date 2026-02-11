@@ -254,6 +254,7 @@ impl Default for ClientInfoRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console::FastMcpConsole;
     use crate::testing::TestConsole;
     use fastmcp_protocol::RootsCapability;
 
@@ -362,5 +363,78 @@ mod tests {
             }),
         };
         assert_eq!(renderer.format_capabilities(&caps), "roots");
+    }
+
+    #[test]
+    fn test_render_connected_rich() {
+        let client = sample_client();
+        let console = TestConsole::new_rich();
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_human());
+        renderer.render_connected(&client, console.console());
+        console.assert_contains("Client Connected");
+        console.assert_contains("Claude Desktop");
+    }
+
+    #[test]
+    fn test_render_connected_with_caps_rich_and_empty_caps() {
+        let client = sample_client();
+        let caps = sample_capabilities();
+        let console = TestConsole::new_rich();
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_human());
+
+        renderer.render_connected_with_caps(&client, &caps, console.console());
+        console.assert_contains("Capabilities: sampling, roots (list_changed)");
+
+        console.clear();
+        renderer.render_connected_with_caps(
+            &client,
+            &ClientCapabilities::default(),
+            console.console(),
+        );
+        console.assert_not_contains("Capabilities:");
+    }
+
+    #[test]
+    fn test_render_disconnected_rich_paths() {
+        let client = sample_client();
+        let console = TestConsole::new_rich();
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_human());
+
+        renderer.render_disconnected(&client, console.console());
+        console.assert_contains("Client Disconnected: Claude Desktop");
+
+        console.clear();
+        renderer.render_disconnected_with_reason(&client, "closed by peer", console.console());
+        console.assert_contains("Client Disconnected: Claude Desktop (closed by peer)");
+    }
+
+    #[test]
+    fn test_render_detail_rich_paths_and_should_use_rich_gate() {
+        let client = sample_client();
+        let caps = sample_capabilities();
+        let console = TestConsole::new_rich();
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_human());
+
+        renderer.render_detail(&client, console.console());
+        console.assert_contains("Connected Client");
+        console.assert_contains("Name");
+        console.assert_contains("Version");
+
+        console.clear();
+        renderer.render_detail_with_caps(&client, &caps, console.console());
+        console.assert_contains("Capabilities");
+        console.assert_contains("sampling, roots (list_changed)");
+
+        console.clear();
+        renderer.render_detail_with_caps(
+            &client,
+            &ClientCapabilities::default(),
+            console.console(),
+        );
+        console.assert_contains("Capabilities");
+        console.assert_contains("none");
+
+        let plain_console = FastMcpConsole::with_enabled(false);
+        assert!(!renderer.should_use_rich(&plain_console));
     }
 }
