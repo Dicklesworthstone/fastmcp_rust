@@ -161,18 +161,25 @@ impl ConsoleConfig {
     /// | `RUST_BACKTRACE` | 1/full | Show backtraces |
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    fn from_lookup<F>(lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut config = Self::default();
 
         // Display mode
-        if env::var("FASTMCP_FORCE_COLOR").is_ok() {
+        if lookup("FASTMCP_FORCE_COLOR").is_some() {
             config.force_color = Some(true);
         }
-        if env::var("FASTMCP_PLAIN").is_ok() || env::var("NO_COLOR").is_ok() {
+        if lookup("FASTMCP_PLAIN").is_some() || lookup("NO_COLOR").is_some() {
             config.force_plain = true;
         }
 
         // Banner
-        if let Ok(val) = env::var("FASTMCP_BANNER") {
+        if let Some(val) = lookup("FASTMCP_BANNER") {
             config.banner_style = match val.to_lowercase().as_str() {
                 "compact" => BannerStyle::Compact,
                 "minimal" => BannerStyle::Minimal,
@@ -184,7 +191,7 @@ impl ConsoleConfig {
         }
 
         // Logging
-        if let Ok(level) = env::var("FASTMCP_LOG") {
+        if let Some(level) = lookup("FASTMCP_LOG") {
             config.log_level = match level.to_lowercase().as_str() {
                 "trace" => Some(log::Level::Trace),
                 "debug" => Some(log::Level::Debug),
@@ -194,7 +201,7 @@ impl ConsoleConfig {
                 _ => None,
             };
         }
-        if env::var("FASTMCP_LOG_TIMESTAMPS")
+        if lookup("FASTMCP_LOG_TIMESTAMPS")
             .map(|v| v == "0" || v.to_lowercase() == "false")
             .unwrap_or(false)
         {
@@ -202,7 +209,7 @@ impl ConsoleConfig {
         }
 
         // Traffic
-        if let Ok(val) = env::var("FASTMCP_TRAFFIC") {
+        if let Some(val) = lookup("FASTMCP_TRAFFIC") {
             config.traffic_verbosity = match val.to_lowercase().as_str() {
                 "summary" | "1" => TrafficVerbosity::Summary,
                 "headers" | "2" => TrafficVerbosity::Headers,
@@ -215,7 +222,7 @@ impl ConsoleConfig {
         }
 
         // Errors
-        if env::var("RUST_BACKTRACE").is_ok() {
+        if lookup("RUST_BACKTRACE").is_some() {
             config.show_backtrace = true;
         }
 
@@ -357,6 +364,12 @@ impl ConsoleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn config_from_pairs(pairs: &[(&str, &str)]) -> ConsoleConfig {
+        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+        ConsoleConfig::from_lookup(|key| map.get(key).map(|v| (*v).to_string()))
+    }
 
     #[test]
     fn test_default_config() {
@@ -403,5 +416,152 @@ mod tests {
         let config = ConsoleConfig::new().without_banner();
         assert!(!config.show_banner);
         assert_eq!(config.banner_style, BannerStyle::None);
+    }
+
+    #[test]
+    fn test_from_lookup_defaults_when_empty() {
+        let config = config_from_pairs(&[]);
+        assert_eq!(config.banner_style, BannerStyle::Full);
+        assert_eq!(config.log_level, None);
+        assert!(config.log_timestamps);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::None);
+        assert!(!config.show_request_traffic);
+        assert!(!config.show_backtrace);
+    }
+
+    #[test]
+    fn test_from_lookup_display_mode_flags() {
+        let config = config_from_pairs(&[("FASTMCP_FORCE_COLOR", "1"), ("FASTMCP_PLAIN", "1")]);
+        assert_eq!(config.force_color, Some(true));
+        assert!(config.force_plain);
+
+        let no_color = config_from_pairs(&[("NO_COLOR", "1")]);
+        assert!(no_color.force_plain);
+    }
+
+    #[test]
+    fn test_from_lookup_banner_variants() {
+        let compact = config_from_pairs(&[("FASTMCP_BANNER", "compact")]);
+        assert_eq!(compact.banner_style, BannerStyle::Compact);
+        assert!(compact.show_banner);
+
+        let minimal = config_from_pairs(&[("FASTMCP_BANNER", "minimal")]);
+        assert_eq!(minimal.banner_style, BannerStyle::Minimal);
+        assert!(minimal.show_banner);
+
+        let none_false = config_from_pairs(&[("FASTMCP_BANNER", "false")]);
+        assert_eq!(none_false.banner_style, BannerStyle::None);
+        assert!(!none_false.show_banner);
+
+        let none_zero = config_from_pairs(&[("FASTMCP_BANNER", "0")]);
+        assert_eq!(none_zero.banner_style, BannerStyle::None);
+        assert!(!none_zero.show_banner);
+
+        let fallback = config_from_pairs(&[("FASTMCP_BANNER", "unknown")]);
+        assert_eq!(fallback.banner_style, BannerStyle::Full);
+        assert!(fallback.show_banner);
+    }
+
+    #[test]
+    fn test_from_lookup_log_levels_and_timestamp_toggle() {
+        let trace = config_from_pairs(&[("FASTMCP_LOG", "trace")]);
+        assert_eq!(trace.log_level, Some(log::Level::Trace));
+
+        let debug = config_from_pairs(&[("FASTMCP_LOG", "debug")]);
+        assert_eq!(debug.log_level, Some(log::Level::Debug));
+
+        let warn_alias = config_from_pairs(&[("FASTMCP_LOG", "warning")]);
+        assert_eq!(warn_alias.log_level, Some(log::Level::Warn));
+
+        let invalid = config_from_pairs(&[("FASTMCP_LOG", "verbose")]);
+        assert_eq!(invalid.log_level, None);
+
+        let timestamps_disabled_zero = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "0")]);
+        assert!(!timestamps_disabled_zero.log_timestamps);
+
+        let timestamps_disabled_false = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "false")]);
+        assert!(!timestamps_disabled_false.log_timestamps);
+
+        let timestamps_enabled = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "1")]);
+        assert!(timestamps_enabled.log_timestamps);
+    }
+
+    #[test]
+    fn test_from_lookup_traffic_variants_and_backtrace() {
+        let summary = config_from_pairs(&[("FASTMCP_TRAFFIC", "summary")]);
+        assert_eq!(summary.traffic_verbosity, TrafficVerbosity::Summary);
+        assert!(summary.show_request_traffic);
+
+        let headers = config_from_pairs(&[("FASTMCP_TRAFFIC", "2")]);
+        assert_eq!(headers.traffic_verbosity, TrafficVerbosity::Headers);
+        assert!(headers.show_request_traffic);
+
+        let full = config_from_pairs(&[("FASTMCP_TRAFFIC", "3")]);
+        assert_eq!(full.traffic_verbosity, TrafficVerbosity::Full);
+        assert!(full.show_request_traffic);
+
+        let none = config_from_pairs(&[("FASTMCP_TRAFFIC", "none")]);
+        assert_eq!(none.traffic_verbosity, TrafficVerbosity::None);
+        assert!(!none.show_request_traffic);
+
+        let unknown = config_from_pairs(&[("FASTMCP_TRAFFIC", "loud")]);
+        assert_eq!(unknown.traffic_verbosity, TrafficVerbosity::None);
+        assert!(!unknown.show_request_traffic);
+
+        let backtrace = config_from_pairs(&[("RUST_BACKTRACE", "full")]);
+        assert!(backtrace.show_backtrace);
+    }
+
+    #[test]
+    fn test_additional_builder_methods_and_accessors() {
+        let custom = CustomColors {
+            primary: Some("#123456".to_string()),
+            secondary: None,
+            success: Some("#22aa22".to_string()),
+            warning: None,
+            error: Some("#ff0000".to_string()),
+        };
+
+        let config = ConsoleConfig::new()
+            .without_suggestions()
+            .with_custom_colors(custom.clone())
+            .with_context(DisplayContext::new_agent())
+            .with_max_table_rows(50)
+            .with_max_json_depth(3)
+            .with_truncate_at(80);
+
+        assert!(!config.show_suggestions);
+        assert!(config.custom_colors.is_some());
+        assert_eq!(
+            config
+                .custom_colors
+                .as_ref()
+                .and_then(|c| c.primary.as_deref()),
+            Some("#123456")
+        );
+        assert_eq!(config.context, Some(DisplayContext::Agent));
+        assert_eq!(config.max_table_rows, 50);
+        assert_eq!(config.max_json_depth, 3);
+        assert_eq!(config.truncate_at, 80);
+        assert!(std::ptr::eq(config.theme(), crate::theme::theme()));
+    }
+
+    #[test]
+    fn test_context_resolution_and_should_use_rich() {
+        let plain = ConsoleConfig::new().plain_mode();
+        assert_eq!(plain.resolve_context(), DisplayContext::Agent);
+        assert!(!plain.should_use_rich());
+
+        let forced_rich = ConsoleConfig::new().force_color(true);
+        assert_eq!(forced_rich.resolve_context(), DisplayContext::Human);
+        assert!(forced_rich.should_use_rich());
+
+        let explicit_agent = ConsoleConfig::new().with_context(DisplayContext::new_agent());
+        assert_eq!(explicit_agent.resolve_context(), DisplayContext::Agent);
+        assert!(!explicit_agent.should_use_rich());
+
+        let explicit_human = ConsoleConfig::new().with_context(DisplayContext::new_human());
+        assert_eq!(explicit_human.resolve_context(), DisplayContext::Human);
+        assert!(explicit_human.should_use_rich());
     }
 }
