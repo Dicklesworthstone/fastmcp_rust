@@ -1092,11 +1092,51 @@ mod tests {
     use crate::oauth::{
         AuthorizationRequest, CodeChallengeMethod, OAuthClient, OAuthServerConfig, TokenRequest,
     };
-    use std::time::Instant;
+
+    const TEST_CLIENT_ID: &str = "test-client";
+    const TEST_REDIRECT_URI: &str = "http://localhost:3000/callback";
+    const TEST_CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
     fn create_test_provider() -> OidcProvider {
         let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
         OidcProvider::with_defaults(oauth).expect("create provider")
+    }
+
+    fn issue_token_via_auth_code(oauth: &OAuthServer, scopes: &[&str], subject: &str) -> String {
+        let mut client_builder =
+            OAuthClient::builder(TEST_CLIENT_ID).redirect_uri(TEST_REDIRECT_URI);
+        for scope in scopes {
+            client_builder = client_builder.scope(*scope);
+        }
+        let client = client_builder.build().expect("build client");
+        oauth.register_client(client).expect("register client");
+
+        let auth_request = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: TEST_CLIENT_ID.to_string(),
+            redirect_uri: TEST_REDIRECT_URI.to_string(),
+            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            state: Some("state-123".to_string()),
+            code_challenge: TEST_CODE_VERIFIER.to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+        };
+
+        let (code, _redirect) = oauth
+            .authorize(&auth_request, Some(subject.to_string()))
+            .expect("authorize");
+        oauth
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some(TEST_REDIRECT_URI.to_string()),
+                client_id: TEST_CLIENT_ID.to_string(),
+                client_secret: None,
+                code_verifier: Some(TEST_CODE_VERIFIER.to_string()),
+                refresh_token: None,
+                scopes: None,
+            })
+            .expect("exchange token")
+            .access_token
     }
 
     #[test]
@@ -1283,29 +1323,21 @@ mod tests {
         // Set signing key
         provider.set_hmac_key(b"test-secret-key");
 
-        // Create a mock access token with openid scope
-        let now = Instant::now();
-        let oauth_at = crate::oauth::OAuthToken {
-            token: "test-access".to_string(),
-            token_type: crate::oauth::TokenType::Bearer,
-            client_id: "test-client".to_string(),
-            scopes: vec![
-                "openid".to_string(),
-                "profile".to_string(),
-                "email".to_string(),
-            ],
-            issued_at: now,
-            expires_at: now + Duration::from_secs(3600),
-            subject: Some("user123".to_string()),
-            is_refresh_token: false,
-        };
+        let oauth_at = provider
+            .oauth()
+            .validate_access_token(&issue_token_via_auth_code(
+                provider.oauth().as_ref(),
+                &["openid", "profile", "email"],
+                "user123",
+            ))
+            .expect("valid access token");
 
         let result = provider.issue_id_token(&oauth_at, Some("nonce123"));
         let issued = result.expect("issue id token");
         assert!(!issued.raw.is_empty());
         assert!(issued.raw.contains('.'));
         assert_eq!(issued.claims.sub, "user123");
-        assert_eq!(issued.claims.aud, "test-client");
+        assert_eq!(issued.claims.aud, TEST_CLIENT_ID);
         assert_eq!(issued.claims.nonce, Some("nonce123".to_string()));
         assert_eq!(issued.claims.user_claims.name, Some("John Doe".to_string()));
     }
@@ -1313,18 +1345,14 @@ mod tests {
     #[test]
     fn test_id_token_requires_openid_scope() {
         let provider = create_test_provider();
-
-        let now = Instant::now();
-        let oauth_at = crate::oauth::OAuthToken {
-            token: "test-access".to_string(),
-            token_type: crate::oauth::TokenType::Bearer,
-            client_id: "test-client".to_string(),
-            scopes: vec!["profile".to_string()], // No openid scope
-            issued_at: now,
-            expires_at: now + Duration::from_secs(3600),
-            subject: Some("user123".to_string()),
-            is_refresh_token: false,
-        };
+        let oauth_at = provider
+            .oauth()
+            .validate_access_token(&issue_token_via_auth_code(
+                provider.oauth().as_ref(),
+                &["profile"],
+                "user123",
+            ))
+            .expect("valid access token");
 
         let result = provider.issue_id_token(&oauth_at, None);
         assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
@@ -1334,42 +1362,6 @@ mod tests {
     fn test_userinfo() {
         let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
 
-        // Register a client
-        let client = OAuthClient::builder("test-client")
-            .redirect_uri("http://localhost:3000/callback")
-            .scope("openid")
-            .scope("profile")
-            .build()
-            .unwrap();
-        oauth.register_client(client).unwrap();
-
-        // Issue an access token through a real OAuth authorization-code flow.
-        let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string();
-        let auth_request = AuthorizationRequest {
-            response_type: "code".to_string(),
-            client_id: "test-client".to_string(),
-            redirect_uri: "http://localhost:3000/callback".to_string(),
-            scopes: vec!["openid".to_string(), "profile".to_string()],
-            state: Some("state-123".to_string()),
-            code_challenge: code_verifier.clone(),
-            code_challenge_method: CodeChallengeMethod::Plain,
-        };
-        let (code, _redirect) = oauth
-            .authorize(&auth_request, Some("user123".to_string()))
-            .expect("authorize");
-        let token_response = oauth
-            .token(&TokenRequest {
-                grant_type: "authorization_code".to_string(),
-                code: Some(code),
-                redirect_uri: Some("http://localhost:3000/callback".to_string()),
-                client_id: "test-client".to_string(),
-                client_secret: None,
-                code_verifier: Some(code_verifier),
-                refresh_token: None,
-                scopes: None,
-            })
-            .expect("exchange token");
-
         let provider = OidcProvider::with_defaults(oauth).expect("create provider");
 
         // Set up claims
@@ -1377,7 +1369,11 @@ mod tests {
         claims_store.set_claims(UserClaims::new("user123").with_name("John Doe"));
         provider.set_claims_provider(claims_store);
 
-        let result = provider.userinfo(&token_response.access_token);
+        let result = provider.userinfo(&issue_token_via_auth_code(
+            provider.oauth().as_ref(),
+            &["openid", "profile"],
+            "user123",
+        ));
         assert!(result.is_ok());
 
         let claims = result.unwrap();
