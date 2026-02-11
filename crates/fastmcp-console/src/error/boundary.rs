@@ -477,4 +477,46 @@ mod tests {
         assert_eq!(boundary.wrap(mcp_result), None);
         assert_eq!(boundary.error_count(), 1);
     }
+
+    #[test]
+    fn test_with_exit_on_error_builder_flag() {
+        let console = test_console();
+
+        // Builder should be chainable and preserve behavior when disabled.
+        let boundary = ErrorBoundary::new(&console).with_exit_on_error(false);
+        let result: Result<i32, McpError> = Ok(7);
+        assert_eq!(boundary.wrap(result), Some(7));
+        assert_eq!(boundary.error_count(), 0);
+    }
+
+    #[test]
+    fn test_wrap_with_context_success_path() {
+        let console = test_console();
+        let boundary = ErrorBoundary::new(&console);
+
+        let result: Result<&str, McpError> = Ok("ok");
+        assert_eq!(
+            boundary.wrap_with_context(result, "unused context"),
+            Some("ok")
+        );
+        assert_eq!(boundary.error_count(), 0);
+    }
+
+    #[test]
+    fn test_wrap_result_with_context_success_and_error_paths() {
+        let console = test_console();
+        let boundary = ErrorBoundary::new(&console);
+
+        let ok: Result<i32, McpError> = Ok(123);
+        let wrapped_ok = boundary.wrap_result_with_context(ok, "computing value");
+        assert!(wrapped_ok.is_ok());
+        assert_eq!(wrapped_ok.unwrap(), 123);
+        assert_eq!(boundary.error_count(), 0);
+
+        let err: Result<i32, McpError> = Err(McpError::internal_error("boom"));
+        let wrapped = boundary.wrap_result_with_context(err, "computing value");
+        assert!(wrapped.is_err());
+        assert_eq!(wrapped.unwrap_err().code, McpErrorCode::InternalError);
+        assert_eq!(boundary.error_count(), 1);
+    }
 }
