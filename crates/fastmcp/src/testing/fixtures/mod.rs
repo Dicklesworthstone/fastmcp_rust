@@ -92,7 +92,7 @@ pub mod prelude {
 
     // Auth
     pub use super::auth::{
-        INVALID_API_VALUE, INVALID_BEARER_VALUE, MockJwt, TestCredentials, VALID_API_VALUE,
+        INVALID_API_VALUE, INVALID_BEARER_VALUE, TestCredentials, TestJwt, VALID_API_VALUE,
         VALID_BEARER_VALUE, VALID_SESSION_VALUE, admin_jwt, api_value_header, basic_auth_header,
         bearer_auth_header, expired_jwt, generate_api_value, generate_bearer_value,
         generate_session_value, generate_test_value, jwt_with_roles, readonly_jwt, valid_jwt,

@@ -106,21 +106,21 @@ pub fn generate_session_value() -> String {
 // JWT-like Values (for testing only, not secure)
 // ============================================================================
 
-/// A mock JWT-like structure for testing.
+/// A test JWT-like structure for testing.
 ///
 /// WARNING: This is NOT a real JWT implementation and should only be used for testing.
 #[derive(Debug, Clone)]
-pub struct MockJwt {
+pub struct TestJwt {
     /// Header claims.
     pub header: HashMap<String, String>,
     /// Payload claims.
     pub payload: HashMap<String, serde_json::Value>,
-    /// Mock signature (not cryptographic).
+    /// Test signature (not cryptographic).
     pub signature: String,
 }
 
-impl MockJwt {
-    /// Creates a new mock JWT with default header.
+impl TestJwt {
+    /// Creates a new test JWT with default header.
     #[must_use]
     pub fn new() -> Self {
         let mut header = HashMap::new();
@@ -130,7 +130,7 @@ impl MockJwt {
         Self {
             header,
             payload: HashMap::new(),
-            signature: "mock-signature".to_string(),
+            signature: "test-signature".to_string(),
         }
     }
 
@@ -236,7 +236,7 @@ impl MockJwt {
     }
 }
 
-impl Default for MockJwt {
+impl Default for TestJwt {
     fn default() -> Self {
         Self::new()
     }
@@ -248,8 +248,8 @@ impl Default for MockJwt {
 
 /// Creates a valid test JWT with standard claims.
 #[must_use]
-pub fn valid_jwt() -> MockJwt {
-    MockJwt::new()
+pub fn valid_jwt() -> TestJwt {
+    TestJwt::new()
         .subject("test-user")
         .issuer("test-issuer")
         .audience("test-audience")
@@ -259,8 +259,8 @@ pub fn valid_jwt() -> MockJwt {
 
 /// Creates an expired JWT for testing expiration handling.
 #[must_use]
-pub fn expired_jwt() -> MockJwt {
-    MockJwt::new()
+pub fn expired_jwt() -> TestJwt {
+    TestJwt::new()
         .subject("test-user")
         .issuer("test-issuer")
         .expired()
@@ -268,20 +268,20 @@ pub fn expired_jwt() -> MockJwt {
 
 /// Creates a JWT with custom roles claim.
 #[must_use]
-pub fn jwt_with_roles(roles: Vec<&str>) -> MockJwt {
+pub fn jwt_with_roles(roles: Vec<&str>) -> TestJwt {
     let roles: Vec<String> = roles.into_iter().map(String::from).collect();
     valid_jwt().claim("roles", serde_json::json!(roles))
 }
 
 /// Creates a JWT with admin role.
 #[must_use]
-pub fn admin_jwt() -> MockJwt {
+pub fn admin_jwt() -> TestJwt {
     jwt_with_roles(vec!["admin", "user"])
 }
 
 /// Creates a JWT with read-only role.
 #[must_use]
-pub fn readonly_jwt() -> MockJwt {
+pub fn readonly_jwt() -> TestJwt {
     jwt_with_roles(vec!["readonly"])
 }
 
@@ -401,8 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_jwt_creation() {
-        let jwt = MockJwt::new()
+    fn test_test_jwt_creation() {
+        let jwt = TestJwt::new()
             .subject("user123")
             .issuer("test-app")
             .expires_in(3600);
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_jwt_encode() {
+    fn test_test_jwt_encode() {
         let jwt = valid_jwt();
         let encoded = jwt.encode();
 
@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_jwt_expired() {
+    fn test_test_jwt_expired() {
         let expired = expired_jwt();
         assert!(expired.is_expired());
 
