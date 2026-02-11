@@ -943,6 +943,14 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_table_empty_rich() {
+        let console = TestConsole::new_rich();
+        let renderer = ToolTableRenderer::new(DisplayContext::new_human());
+        renderer.render(&[], console.console());
+        console.assert_contains("No tools registered");
+    }
+
+    #[test]
     fn test_tool_parameter_extraction() {
         let tools = sample_tools();
         let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
@@ -972,6 +980,14 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_table_empty_rich() {
+        let console = TestConsole::new_rich();
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+        renderer.render(&[], console.console());
+        console.assert_contains("No resources registered");
+    }
+
+    #[test]
     fn test_prompt_table_render_plain() {
         let prompts = sample_prompts();
         let console = TestConsole::new();
@@ -986,6 +1002,14 @@ mod tests {
     fn test_prompt_table_empty() {
         let console = TestConsole::new();
         let renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        renderer.render(&[], console.console());
+        console.assert_contains("No prompts registered");
+    }
+
+    #[test]
+    fn test_prompt_table_empty_rich() {
+        let console = TestConsole::new_rich();
+        let renderer = PromptTableRenderer::new(DisplayContext::new_human());
         renderer.render(&[], console.console());
         console.assert_contains("No prompts registered");
     }
@@ -1152,6 +1176,17 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_table_rich_without_parameter_summary() {
+        let tools = sample_tools();
+        let console = TestConsole::new_rich();
+        let mut renderer = ToolTableRenderer::new(DisplayContext::new_human());
+        renderer.show_parameters = false;
+        renderer.render(&tools, console.console());
+        console.assert_contains("Registered Tools");
+        console.assert_contains("calculate");
+    }
+
+    #[test]
     fn test_tool_detail_plain_and_rich() {
         let tools = sample_tools();
 
@@ -1185,6 +1220,25 @@ mod tests {
         let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
         renderer.render_detail(&tool, console.console());
         console.assert_contains("Parameters: none");
+    }
+
+    #[test]
+    fn test_tool_detail_rich_no_parameters() {
+        let tool = Tool {
+            name: "ping".to_string(),
+            description: Some("No args".to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let console = TestConsole::new_rich();
+        let renderer = ToolTableRenderer::new(DisplayContext::new_human());
+        renderer.render_detail(&tool, console.console());
+        console.assert_contains("ping");
+        console.assert_contains("No parameters");
     }
 
     #[test]
@@ -1236,6 +1290,24 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_extract_parameters_sorts_required_before_optional() {
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        let params = renderer.extract_parameters(&json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "z": {"type": "number"}
+            },
+            "required": ["z"]
+        }));
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "z");
+        assert!(params[0].required);
+        assert_eq!(params[1].name, "a");
+        assert!(!params[1].required);
+    }
+
+    #[test]
     fn test_resource_table_without_mime_column() {
         let resources = sample_resources();
         let console = TestConsole::new();
@@ -1244,6 +1316,23 @@ mod tests {
         renderer.render(&resources, console.console());
         console.assert_contains("Registered Resources (2)");
         console.assert_contains("config (file://config.json) - Application configuration");
+    }
+
+    #[test]
+    fn test_resource_table_rich_with_and_without_mime_column() {
+        let resources = sample_resources();
+        let console = TestConsole::new_rich();
+        let mut renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+
+        renderer.render(&resources, console.console());
+        console.assert_contains("Registered Resources");
+        console.assert_contains("application/json");
+
+        console.clear();
+        renderer.show_mime_type = false;
+        renderer.render(&resources, console.console());
+        console.assert_contains("Registered Resources");
+        console.assert_not_contains("application/json");
     }
 
     #[test]
@@ -1296,6 +1385,26 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_tree_render_rich_with_empty_description_leaf() {
+        let mut resources = sample_resources_with_templates();
+        resources.push(Resource {
+            uri: "file://no-desc".to_string(),
+            name: "no_desc".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+
+        let console = TestConsole::new_rich();
+        let renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+        renderer.render_tree(&resources, console.console());
+        console.assert_contains("no-desc");
+        console.assert_not_contains("no-desc -");
+    }
+
+    #[test]
     fn test_resource_format_uri_unclosed_and_nested_braces() {
         let renderer = ResourceTableRenderer::new(DisplayContext::new_agent());
         assert_eq!(renderer.format_uri("file://{path"), "file://{path");
@@ -1320,6 +1429,17 @@ mod tests {
         renderer.render(&prompts, console.console());
         console.assert_contains("Registered Prompts (2)");
         console.assert_contains("greeting - Generate a greeting message");
+    }
+
+    #[test]
+    fn test_prompt_table_rich_without_argument_summary() {
+        let prompts = sample_prompts();
+        let console = TestConsole::new_rich();
+        let mut renderer = PromptTableRenderer::new(DisplayContext::new_human());
+        renderer.show_arguments = false;
+        renderer.render(&prompts, console.console());
+        console.assert_contains("Registered Prompts");
+        console.assert_contains("greeting");
     }
 
     #[test]
@@ -1355,6 +1475,50 @@ mod tests {
         let renderer = PromptTableRenderer::new(DisplayContext::new_agent());
         renderer.render_detail(&prompt, console.console());
         console.assert_contains("Arguments: none");
+    }
+
+    #[test]
+    fn test_prompt_detail_rich_no_arguments() {
+        let prompt = Prompt {
+            name: "ping".to_string(),
+            description: Some("No args".to_string()),
+            arguments: vec![],
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let console = TestConsole::new_rich();
+        let renderer = PromptTableRenderer::new(DisplayContext::new_human());
+        renderer.render_detail(&prompt, console.console());
+        console.assert_contains("ping");
+        console.assert_contains("No arguments");
+    }
+
+    #[test]
+    fn test_resource_and_prompt_description_truncation_helpers() {
+        let resource_renderer = ResourceTableRenderer {
+            theme: crate::theme::theme(),
+            context: DisplayContext::new_human(),
+            max_description_width: 12,
+            show_mime_type: true,
+        };
+        assert_eq!(resource_renderer.truncate_description("short"), "short");
+        assert_eq!(
+            resource_renderer.truncate_description("this description is too long"),
+            "this desc..."
+        );
+
+        let prompt_renderer = PromptTableRenderer {
+            theme: crate::theme::theme(),
+            context: DisplayContext::new_human(),
+            max_description_width: 12,
+            show_arguments: true,
+        };
+        assert_eq!(prompt_renderer.truncate_description("short"), "short");
+        assert_eq!(
+            prompt_renderer.truncate_description("this description is too long"),
+            "this desc..."
+        );
     }
 
     #[test]
