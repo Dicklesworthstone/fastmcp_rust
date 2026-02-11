@@ -572,4 +572,115 @@ mod tests {
         let snap_check = SnapshotTest::new("exists_test").with_snapshot_dir(temp_dir.path());
         assert!(snap_check.snapshot_exists());
     }
+
+    #[test]
+    #[should_panic(expected = "Failed to read snapshot file")]
+    fn test_snapshot_read_error_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let snap = SnapshotTest::new("read_error")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(false);
+
+        // Make the snapshot path exist as a directory so read_to_string fails.
+        std::fs::create_dir_all(snap.snapshot_path()).expect("failed to create snapshot directory");
+        snap.assert_snapshot_string("content");
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to create snapshot directory")]
+    fn test_snapshot_create_dir_error_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let not_a_directory = temp_dir.path().join("not_a_directory");
+        std::fs::write(&not_a_directory, "blocker").expect("failed to create blocker file");
+
+        let snap = SnapshotTest::new("create_dir_error")
+            .with_snapshot_dir(&not_a_directory)
+            .with_update_mode(true);
+        snap.assert_snapshot_string("content");
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to write snapshot")]
+    fn test_snapshot_write_error_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let snap = SnapshotTest::new("nested/write_error")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(true);
+
+        // Parent subdirectory "nested" is intentionally missing.
+        snap.assert_snapshot_string("content");
+    }
+
+    #[test]
+    #[should_panic(expected = "Raw snapshot 'missing_raw' does not exist")]
+    fn test_missing_raw_snapshot_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let snap = SnapshotTest::new("missing_raw")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(false);
+        let console = TestConsole::new_rich();
+        console.console().print("raw output");
+        snap.assert_raw_snapshot(&console);
+    }
+
+    #[test]
+    #[should_panic(expected = "Raw snapshot 'raw_mismatch' does not match")]
+    fn test_raw_snapshot_mismatch_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+
+        let create = SnapshotTest::new("raw_mismatch")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(true);
+        let first = TestConsole::new_rich();
+        first.console().print("[bold]first[/]");
+        create.assert_raw_snapshot(&first);
+
+        let verify = SnapshotTest::new("raw_mismatch")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(false);
+        let second = TestConsole::new_rich();
+        second.console().print("[bold]second[/]");
+        verify.assert_raw_snapshot(&second);
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to write raw snapshot")]
+    fn test_raw_snapshot_write_error_panics() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let snap = SnapshotTest::new("nested/raw_write_error")
+            .with_snapshot_dir(temp_dir.path())
+            .with_update_mode(true);
+        let console = TestConsole::new_rich();
+        console.console().print("[bold]raw[/]");
+        snap.assert_raw_snapshot(&console);
+    }
+
+    #[test]
+    fn test_generate_diff_truncates_when_many_differences() {
+        let snap = SnapshotTest::new("diff_truncate_test");
+        let expected = (0..70)
+            .map(|i| format!("expected-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let actual = (0..70)
+            .map(|i| format!("actual-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let diff = snap.generate_diff(&expected, &actual);
+        assert!(diff.contains("more differences truncated"));
+    }
+
+    #[test]
+    fn test_generate_diff_reports_equal_lines_with_different_byte_lengths() {
+        let snap = SnapshotTest::new("diff_length_test");
+
+        // Same line content after line splitting, but different byte lengths.
+        let expected = "same-line\n";
+        let actual = "same-line";
+        let diff = snap.generate_diff(expected, actual);
+
+        assert!(diff.contains("no line differences"));
+        assert!(diff.contains("Byte lengths differ"));
+    }
 }
