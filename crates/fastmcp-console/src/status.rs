@@ -171,7 +171,40 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use crate::testing::TestConsole;
+
+    #[derive(Clone, Debug)]
+    struct SharedWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    buf: Arc::clone(&buf),
+                },
+                buf,
+            )
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.buf.lock() {
+                guard.extend_from_slice(input);
+            }
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn format_duration_formats_ms_s_and_minutes() {
@@ -195,5 +228,52 @@ mod tests {
         let log = RequestLog::new("tools/call", Some("1")).error("bad request");
         log.render(tc.console());
         assert!(tc.contains("bad request"));
+    }
+
+    #[test]
+    fn request_log_builders_cover_all_status_variants() {
+        let pending = RequestLog::new("tools/call", None);
+        assert!(matches!(pending.status, RequestStatus::Pending));
+
+        let success = RequestLog::new("tools/call", Some("1")).success();
+        assert!(matches!(success.status, RequestStatus::Success(_)));
+
+        let error = RequestLog::new("tools/call", Some("2")).error("oops");
+        assert!(matches!(error.status, RequestStatus::Error(_, _)));
+
+        let cancelled = RequestLog::new("tools/call", Some("3")).cancelled();
+        assert!(matches!(cancelled.status, RequestStatus::Cancelled(_)));
+    }
+
+    #[test]
+    fn request_log_pending_and_cancelled_render_without_id_in_rich_mode() {
+        let (writer, captured) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, true);
+
+        RequestLog::new("tools/list", None).render(&console);
+        RequestLog::new("tools/list", None)
+            .cancelled()
+            .render(&console);
+
+        let output = String::from_utf8(captured.lock().expect("writer lock poisoned").clone())
+            .unwrap_or_default();
+        assert!(output.contains("tools/list"));
+        assert!(output.contains("◐"));
+        assert!(output.contains("⊘"));
+        assert!(!output.contains('#'));
+    }
+
+    #[test]
+    fn request_log_render_plain_covers_all_statuses() {
+        RequestLog::new("tools/list", None).render_plain();
+        RequestLog::new("tools/list", Some("1"))
+            .success()
+            .render_plain();
+        RequestLog::new("tools/list", Some("2"))
+            .error("bad request")
+            .render_plain();
+        RequestLog::new("tools/list", Some("3"))
+            .cancelled()
+            .render_plain();
     }
 }
