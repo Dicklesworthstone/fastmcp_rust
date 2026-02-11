@@ -923,7 +923,12 @@ impl StreamableHttpTransport {
     /// Pops a response from the queue (for HTTP streaming).
     #[must_use]
     pub fn pop_response(&self) -> Option<JsonRpcResponse> {
-        self.responses.lock().ok()?.pop()
+        let mut guard = self.responses.lock().ok()?;
+        if guard.is_empty() {
+            None
+        } else {
+            Some(guard.remove(0))
+        }
     }
 
     /// Checks if there are pending responses.
@@ -964,9 +969,20 @@ impl Transport for StreamableHttpTransport {
             return Err(TransportError::Closed);
         }
 
-        if let JsonRpcMessage::Response(response) = message {
-            if let Ok(mut guard) = self.responses.lock() {
-                guard.push(response.clone());
+        match message {
+            JsonRpcMessage::Response(response) => {
+                if let Ok(mut guard) = self.responses.lock() {
+                    guard.push(response.clone());
+                }
+            }
+            JsonRpcMessage::Request(_) => {
+                // This transport currently streams only JSON-RPC responses.
+                // Server-to-client requests/notifications cannot be represented
+                // in the current response queue shape, so fail explicitly to avoid
+                // silent message loss and potential protocol deadlocks.
+                return Err(TransportError::Io(std::io::Error::other(
+                    "StreamableHttpTransport cannot send server-to-client requests",
+                )));
             }
         }
 
@@ -989,8 +1005,8 @@ impl Transport for StreamableHttpTransport {
             }
 
             if let Ok(mut guard) = self.requests.lock() {
-                if let Some(request) = guard.pop() {
-                    return Ok(JsonRpcMessage::Request(request));
+                if !guard.is_empty() {
+                    return Ok(JsonRpcMessage::Request(guard.remove(0)));
                 }
             }
 
@@ -1531,10 +1547,10 @@ Transfer-Encoding: chunked\r\n\
         transport.push_request(req1);
         transport.push_request(req2);
 
-        // Transport should receive requests in LIFO order (pop from vec)
+        // Transport should receive requests in FIFO order.
         let msg = transport.recv(&cx).unwrap();
         if let JsonRpcMessage::Request(req) = msg {
-            assert_eq!(req.method, "method2"); // Last pushed, first popped
+            assert_eq!(req.method, "method1");
         }
 
         // Send a response
@@ -1552,6 +1568,52 @@ Transfer-Encoding: chunked\r\n\
         assert!(transport.has_responses());
         let resp = transport.pop_response().unwrap();
         assert_eq!(resp.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn e2e_http_streaming_response_queue_is_fifo() {
+        use fastmcp_protocol::RequestId;
+
+        let mut transport = StreamableHttpTransport::new();
+        let cx = Cx::for_testing();
+
+        let first = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({"seq": 1})),
+            error: None,
+            id: Some(RequestId::Number(1)),
+        };
+        let second = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({"seq": 2})),
+            error: None,
+            id: Some(RequestId::Number(2)),
+        };
+
+        transport
+            .send(&cx, &JsonRpcMessage::Response(first))
+            .unwrap();
+        transport
+            .send(&cx, &JsonRpcMessage::Response(second))
+            .unwrap();
+
+        let first_out = transport.pop_response().expect("first response");
+        let second_out = transport.pop_response().expect("second response");
+        assert_eq!(first_out.id, Some(RequestId::Number(1)));
+        assert_eq!(second_out.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn e2e_http_streaming_rejects_server_to_client_requests() {
+        let mut transport = StreamableHttpTransport::new();
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::notification("notifications/message", None);
+
+        let err = transport
+            .send(&cx, &JsonRpcMessage::Request(request))
+            .expect_err("streamable transport must reject server-to-client requests");
+
+        assert!(matches!(err, TransportError::Io(_)));
     }
 
     #[test]
