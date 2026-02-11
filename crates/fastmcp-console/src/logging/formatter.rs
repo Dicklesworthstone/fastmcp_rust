@@ -425,6 +425,21 @@ mod tests {
     }
 
     #[test]
+    fn test_level_badge_formatting_rich_all_levels() {
+        let formatter = test_formatter_human();
+        for level in [
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            let badge = formatter.format_level_badge(level);
+            assert!(badge.contains("[/]"));
+            assert!(badge.contains(level.as_str().trim()));
+        }
+    }
+
+    #[test]
     fn test_timestamp_formatting() {
         let formatter = test_formatter_agent();
         let ts = formatter.format_timestamp("2026-01-21 12:00:00");
@@ -451,6 +466,22 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_and_target_formatting_rich() {
+        let formatter = test_formatter_human();
+        let ts = formatter
+            .format_timestamp("2026-01-21 12:00:00")
+            .expect("timestamp should be present");
+        assert!(ts.contains("[/]"));
+        assert!(ts.contains("2026-01-21 12:00:00"));
+
+        let target = formatter
+            .format_target("fastmcp_rust::server::router")
+            .expect("target should be present");
+        assert!(target.contains("[/]"));
+        assert!(target.contains("server::router"));
+    }
+
+    #[test]
     fn test_target_disabled() {
         let formatter = test_formatter_agent().with_target(false);
         assert_eq!(formatter.format_target("any::target"), None);
@@ -474,6 +505,20 @@ mod tests {
             formatter.format_fields(&fields),
             "request_id=123 method=GET"
         );
+    }
+
+    #[test]
+    fn test_fields_formatting_rich() {
+        let formatter = test_formatter_human();
+        let fields = vec![
+            ("request_id".to_string(), "123".to_string()),
+            ("method".to_string(), "GET".to_string()),
+        ];
+
+        let rendered = formatter.format_fields(&fields);
+        assert!(rendered.contains("[/]"));
+        assert!(rendered.contains("request_id"));
+        assert!(rendered.contains("method"));
     }
 
     #[test]
@@ -507,11 +552,29 @@ mod tests {
     }
 
     #[test]
+    fn test_file_field_without_line_number() {
+        let formatter = test_formatter_agent().with_file_line(true);
+        let event = LogEvent::new(LogLevel::Info, "File info").with_file("src/main.rs");
+
+        let formatted = formatter.format_event(&event);
+        assert!(formatted.fields.contains("file=src/main.rs"));
+        assert!(!formatted.fields.contains("src/main.rs:"));
+    }
+
+    #[test]
     fn test_message_truncation() {
         let formatter = test_formatter_agent().with_max_width(Some(8));
         let event = LogEvent::new(LogLevel::Info, "HelloWorld");
         let formatted = formatter.format_event(&event);
         assert_eq!(formatted.message, "Hello...");
+    }
+
+    #[test]
+    fn test_message_truncation_for_tiny_width() {
+        let formatter = test_formatter_agent().with_max_width(Some(3));
+        let event = LogEvent::new(LogLevel::Info, "HelloWorld");
+        let formatted = formatter.format_event(&event);
+        assert_eq!(formatted.message, "Hel");
     }
 
     #[test]
@@ -536,6 +599,15 @@ mod tests {
         assert_eq!(LogLevel::from(log::Level::Info), LogLevel::Info);
         assert_eq!(LogLevel::from(log::Level::Debug), LogLevel::Debug);
         assert_eq!(LogLevel::from(log::Level::Trace), LogLevel::Trace);
+    }
+
+    #[test]
+    fn test_log_level_from_tracing_crate() {
+        assert_eq!(LogLevel::from(tracing::Level::ERROR), LogLevel::Error);
+        assert_eq!(LogLevel::from(tracing::Level::WARN), LogLevel::Warn);
+        assert_eq!(LogLevel::from(tracing::Level::INFO), LogLevel::Info);
+        assert_eq!(LogLevel::from(tracing::Level::DEBUG), LogLevel::Debug);
+        assert_eq!(LogLevel::from(tracing::Level::TRACE), LogLevel::Trace);
     }
 
     #[test]
