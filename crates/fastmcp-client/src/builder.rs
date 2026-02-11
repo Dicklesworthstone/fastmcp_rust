@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 /// Guard that kills and waits for a child process when dropped.
 /// Call `disarm()` to prevent cleanup (e.g., when ownership transfers to Client).
@@ -257,9 +258,24 @@ impl ClientBuilder {
         let attempts = self.max_retries + 1;
 
         for attempt in 0..attempts {
+            // Honor cancellation/budget before each attempt.
+            if cx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+
             if attempt > 0 {
-                // Delay before retry
-                std::thread::sleep(std::time::Duration::from_millis(self.retry_delay_ms));
+                // Delay before retry while still observing cancellation.
+                // Slice sleeps so cancellation is detected promptly even for long delays.
+                let mut remaining_ms = self.retry_delay_ms;
+                while remaining_ms > 0 {
+                    if cx.checkpoint().is_err() {
+                        return Err(McpError::request_cancelled());
+                    }
+
+                    let sleep_ms = remaining_ms.min(25);
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                    remaining_ms = remaining_ms.saturating_sub(sleep_ms);
+                }
             }
 
             match self.try_connect(command, args, cx) {
@@ -447,6 +463,7 @@ impl Default for ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_core::McpErrorCode;
 
     #[test]
     fn test_builder_defaults() {
@@ -555,5 +572,22 @@ mod tests {
         assert_eq!(builder.env_vars.get("B"), Some(&"2".to_string()));
         assert_eq!(builder.env_vars.get("C"), Some(&"3".to_string()));
         assert_eq!(builder.env_vars.get("D"), Some(&"4".to_string()));
+    }
+
+    #[test]
+    fn test_connect_stdio_with_cx_respects_cancellation_during_retries() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let result = ClientBuilder::new()
+            .max_retries(2)
+            .retry_delay_ms(100)
+            .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx);
+
+        assert!(
+            result.is_err(),
+            "cancelled context should abort before retry attempts"
+        );
+        let err = result.err().expect("error result");
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 }
