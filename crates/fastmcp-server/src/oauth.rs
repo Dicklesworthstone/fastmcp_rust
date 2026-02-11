@@ -1410,6 +1410,41 @@ fn normalize_localhost(host: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn issue_access_token_via_auth_code(
+        server: &OAuthServer,
+        client_id: &str,
+        redirect_uri: &str,
+        scopes: &[&str],
+        subject: &str,
+    ) -> TokenResponse {
+        let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string();
+        let auth_request = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            state: Some("oauth-test-state".to_string()),
+            code_challenge: code_verifier.clone(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+        };
+
+        let (code, _redirect) = server
+            .authorize(&auth_request, Some(subject.to_string()))
+            .expect("authorize");
+        server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some(redirect_uri.to_string()),
+                client_id: client_id.to_string(),
+                client_secret: None,
+                code_verifier: Some(code_verifier),
+                refresh_token: None,
+                scopes: None,
+            })
+            .expect("token exchange")
+    }
+
     #[test]
     fn test_client_builder() {
         let client = OAuthClient::builder("test-client")
@@ -1663,31 +1698,13 @@ mod tests {
             .unwrap();
         server.register_client(client).unwrap();
 
-        // Manually create a token for testing
-        let token_response = {
-            let mut state = server.state.write().unwrap();
-            let now = Instant::now();
-            let access_cred = OAuthToken {
-                token: "test-access".to_string(),
-                token_type: TokenType::Bearer,
-                client_id: "test-client".to_string(),
-                scopes: vec!["read".to_string()],
-                issued_at: now,
-                expires_at: now + Duration::from_secs(3600),
-                subject: Some("user123".to_string()),
-                is_refresh_token: false,
-            };
-            state
-                .access_tokens
-                .insert("test-access".to_string(), access_cred);
-            TokenResponse {
-                access_token: "test-access".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                refresh_token: None,
-                scope: Some("read".to_string()),
-            }
-        };
+        let token_response = issue_access_token_via_auth_code(
+            server.as_ref(),
+            "test-client",
+            "http://localhost:3000/callback",
+            &["read"],
+            "user123",
+        );
 
         // Token should be valid
         assert!(
@@ -1741,24 +1758,13 @@ mod tests {
             .unwrap();
         server.register_client(client).unwrap();
 
-        // Create a token manually
-        {
-            let mut state = server.state.write().unwrap();
-            let now = Instant::now();
-            let access_cred = OAuthToken {
-                token: "valid-value".to_string(),
-                token_type: TokenType::Bearer,
-                client_id: "test-client".to_string(),
-                scopes: vec!["read".to_string()],
-                issued_at: now,
-                expires_at: now + Duration::from_secs(3600),
-                subject: Some("user123".to_string()),
-                is_refresh_token: false,
-            };
-            state
-                .access_tokens
-                .insert("valid-value".to_string(), access_cred);
-        }
+        let token_response = issue_access_token_via_auth_code(
+            server.as_ref(),
+            "test-client",
+            "http://localhost:3000/callback",
+            &["read"],
+            "user123",
+        );
 
         // Create verifier
         let verifier = server.token_verifier();
@@ -1773,7 +1779,7 @@ mod tests {
         // Valid token
         let access = AccessToken {
             scheme: "Bearer".to_string(),
-            token: "valid-value".to_string(),
+            token: token_response.access_token.clone(),
         };
         let result = verifier.verify(&mcp_ctx, auth_request, &access);
         assert!(result.is_ok());
@@ -1792,7 +1798,7 @@ mod tests {
         // Wrong scheme
         let wrong_scheme = AccessToken {
             scheme: "Basic".to_string(),
-            token: "valid-value".to_string(),
+            token: token_response.access_token,
         };
         let result = verifier.verify(&mcp_ctx, auth_request, &wrong_scheme);
         assert!(result.is_err());
