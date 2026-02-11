@@ -3964,48 +3964,22 @@ mod duplicate_behavior_tests {
     use super::*;
     use crate::{DuplicateBehavior, Router};
 
-    /// A simple tool for duplicate tests.
-    struct DupTool {
-        id: u32,
+    #[tool(name = "dup_tool", description = "Tool #1")]
+    fn dup_tool_1() -> String {
+        "Tool #1".to_string()
     }
 
-    impl DupTool {
-        fn new(id: u32) -> Self {
-            Self { id }
-        }
-    }
-
-    impl ToolHandler for DupTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "dup_tool".to_string(),
-                description: Some(format!("Tool #{}", self.id)),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(
-            &self,
-            _ctx: &McpContext,
-            _arguments: serde_json::Value,
-        ) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text {
-                text: format!("Tool #{}", self.id),
-            }])
-        }
+    #[tool(name = "dup_tool", description = "Tool #2")]
+    fn dup_tool_2() -> String {
+        "Tool #2".to_string()
     }
 
     #[test]
     fn test_duplicate_behavior_error_returns_error() {
         let mut router = Router::new();
-        router.add_tool(DupTool::new(1));
+        router.add_tool(DupTool1);
 
-        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Error);
+        let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Error);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("already exists"));
     }
@@ -4013,9 +3987,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_warn_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool::new(1));
+        router.add_tool(DupTool1);
 
-        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Warn);
+        let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Warn);
         assert!(result.is_ok());
 
         // Original should be kept
@@ -4026,9 +4000,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_replace_replaces() {
         let mut router = Router::new();
-        router.add_tool(DupTool::new(1));
+        router.add_tool(DupTool1);
 
-        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Replace);
+        let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Replace);
         assert!(result.is_ok());
 
         // New one should replace original
@@ -4039,9 +4013,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_ignore_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool::new(1));
+        router.add_tool(DupTool1);
 
-        let result = router.add_tool_with_behavior(DupTool::new(2), DuplicateBehavior::Ignore);
+        let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Ignore);
         assert!(result.is_ok());
 
         // Original should be kept
@@ -4063,7 +4037,7 @@ mod duplicate_behavior_tests {
             DuplicateBehavior::Ignore,
         ] {
             let mut router = Router::new();
-            let result = router.add_tool_with_behavior(DupTool::new(1), behavior);
+            let result = router.add_tool_with_behavior(DupTool1, behavior);
             assert!(result.is_ok(), "Failed for {:?}", behavior);
         }
     }
@@ -4073,8 +4047,8 @@ mod duplicate_behavior_tests {
         // Create server with strict duplicate checking
         let server = Server::new("test", "1.0")
             .on_duplicate(DuplicateBehavior::Replace)
-            .tool(DupTool::new(1))
-            .tool(DupTool::new(2)) // Should replace
+            .tool(DupTool1)
+            .tool(DupTool2) // Should replace
             .build();
 
         let tools = server.tools();
@@ -4088,8 +4062,8 @@ mod duplicate_behavior_tests {
         // Create server with error behavior
         let server = Server::new("test", "1.0")
             .on_duplicate(DuplicateBehavior::Error)
-            .tool(DupTool::new(1))
-            .tool(DupTool::new(2)) // Should fail silently in builder
+            .tool(DupTool1)
+            .tool(DupTool2) // Should fail silently in builder
             .build();
 
         let tools = server.tools();
@@ -5479,39 +5453,69 @@ mod builder_tests {
 
     // ── Minimal concrete handlers for builder coverage ─────────────────
 
-    struct NamedTool {
-        name: &'static str,
+    #[tool(name = "alpha", description = "Test tool alpha")]
+    fn builder_alpha_tool() -> String {
+        "test:alpha".to_string()
     }
 
-    impl NamedTool {
-        fn named(name: &'static str) -> Self {
-            Self { name }
-        }
+    #[tool(name = "a", description = "Test tool a")]
+    fn builder_a_tool() -> String {
+        "test:a".to_string()
     }
 
-    impl ToolHandler for NamedTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: self.name.to_string(),
-                description: Some(format!("Test tool {}", self.name)),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
+    #[tool(name = "b", description = "Test tool b")]
+    fn builder_b_tool() -> String {
+        "test:b".to_string()
+    }
 
-        fn call(
-            &self,
-            _ctx: &McpContext,
-            _arguments: serde_json::Value,
-        ) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text {
-                text: format!("test:{}", self.name),
-            }])
-        }
+    #[tool(name = "c", description = "Test tool c")]
+    fn builder_c_tool() -> String {
+        "test:c".to_string()
+    }
+
+    #[tool(name = "do_thing", description = "Test tool do_thing")]
+    fn builder_do_thing_tool() -> String {
+        "test:do_thing".to_string()
+    }
+
+    #[tool(name = "dup", description = "Test tool dup")]
+    fn builder_dup_tool() -> String {
+        "test:dup".to_string()
+    }
+
+    #[tool(name = "fetch", description = "Test tool fetch")]
+    fn builder_fetch_tool() -> String {
+        "test:fetch".to_string()
+    }
+
+    #[tool(name = "query", description = "Test tool query")]
+    fn builder_query_tool() -> String {
+        "test:query".to_string()
+    }
+
+    #[tool(name = "t", description = "Test tool t")]
+    fn builder_t_tool() -> String {
+        "test:t".to_string()
+    }
+
+    #[tool(name = "t1", description = "Test tool t1")]
+    fn builder_t1_tool() -> String {
+        "test:t1".to_string()
+    }
+
+    #[tool(name = "t2", description = "Test tool t2")]
+    fn builder_t2_tool() -> String {
+        "test:t2".to_string()
+    }
+
+    #[tool(name = "t3", description = "Test tool t3")]
+    fn builder_t3_tool() -> String {
+        "test:t3".to_string()
+    }
+
+    #[tool(name = "tool_a", description = "Test tool tool_a")]
+    fn builder_tool_a_tool() -> String {
+        "test:tool_a".to_string()
     }
 
     struct NamedResource {
@@ -5618,7 +5622,7 @@ mod builder_tests {
     #[test]
     fn builder_tool_enables_tools_capability() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(NamedTool::named("alpha"))
+            .tool(BuilderAlphaTool)
             .build();
         assert!(server.capabilities().tools.is_some());
         assert!(server.has_tools());
@@ -5627,9 +5631,9 @@ mod builder_tests {
     #[test]
     fn builder_registers_multiple_tools() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(NamedTool::named("a"))
-            .tool(NamedTool::named("b"))
-            .tool(NamedTool::named("c"))
+            .tool(BuilderATool)
+            .tool(BuilderBTool)
+            .tool(BuilderCTool)
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 3);
@@ -5708,7 +5712,7 @@ mod builder_tests {
     #[test]
     fn builder_mixed_handlers_enable_all_capabilities() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(NamedTool::named("t"))
+            .tool(BuilderTTool)
             .resource(NamedResource::named("r"))
             .prompt(NamedPrompt::named("p"))
             .build();
@@ -5923,8 +5927,8 @@ mod builder_tests {
     fn builder_on_duplicate_default_is_warn() {
         // Default behavior is Warn (keeps original, logs warning)
         let server = ServerBuilder::new("s", "0.1")
-            .tool(NamedTool::named("dup"))
-            .tool(NamedTool::named("dup"))
+            .tool(BuilderDupTool)
+            .tool(BuilderDupTool)
             .build();
         // With Warn default, the second registration keeps original
         let tools = server.tools();
@@ -5936,8 +5940,8 @@ mod builder_tests {
     fn builder_on_duplicate_ignore_keeps_original() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Ignore)
-            .tool(NamedTool::named("dup"))
-            .tool(NamedTool::named("dup"))
+            .tool(BuilderDupTool)
+            .tool(BuilderDupTool)
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 1);
@@ -5947,8 +5951,8 @@ mod builder_tests {
     fn builder_on_duplicate_replace() {
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Replace)
-            .tool(NamedTool::named("dup"))
-            .tool(NamedTool::named("dup"))
+            .tool(BuilderDupTool)
+            .tool(BuilderDupTool)
             .build();
         let tools = server.tools();
         assert_eq!(tools.len(), 1);
@@ -5960,8 +5964,8 @@ mod builder_tests {
         // With Error behavior, duplicate registration fails but builder doesn't panic
         let server = ServerBuilder::new("s", "0.1")
             .on_duplicate(DuplicateBehavior::Error)
-            .tool(NamedTool::named("dup"))
-            .tool(NamedTool::named("dup"))
+            .tool(BuilderDupTool)
+            .tool(BuilderDupTool)
             .build();
         // Only the first registration succeeds
         let tools = server.tools();
@@ -6058,7 +6062,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_server_with_prefix() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(NamedTool::named("do_thing"))
+            .tool(BuilderDoThingTool)
             .resource(NamedResource::named("data"))
             .prompt(NamedPrompt::named("ask"))
             .build();
@@ -6079,7 +6083,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_server_without_prefix() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(NamedTool::named("alpha"))
+            .tool(BuilderAlphaTool)
             .build();
 
         let parent = ServerBuilder::new("parent", "0.1")
@@ -6094,7 +6098,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_tools_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(NamedTool::named("t"))
+            .tool(BuilderTTool)
             .resource(NamedResource::named("r"))
             .prompt(NamedPrompt::named("p"))
             .build();
@@ -6111,7 +6115,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_resources_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(NamedTool::named("t"))
+            .tool(BuilderTTool)
             .resource(NamedResource::named("r"))
             .build();
 
@@ -6126,7 +6130,7 @@ mod builder_tests {
     #[test]
     fn builder_mount_prompts_only() {
         let child = ServerBuilder::new("child", "0.1")
-            .tool(NamedTool::named("t"))
+            .tool(BuilderTTool)
             .prompt(NamedPrompt::named("p"))
             .build();
 
@@ -6141,10 +6145,10 @@ mod builder_tests {
     #[test]
     fn builder_mount_multiple_servers() {
         let db = ServerBuilder::new("db", "0.1")
-            .tool(NamedTool::named("query"))
+            .tool(BuilderQueryTool)
             .build();
         let api = ServerBuilder::new("api", "0.1")
-            .tool(NamedTool::named("fetch"))
+            .tool(BuilderFetchTool)
             .build();
 
         let main = ServerBuilder::new("main", "0.1")
@@ -6173,7 +6177,7 @@ mod builder_tests {
             .log_timestamps(false)
             .without_banner()
             .plain_mode()
-            .tool(NamedTool::named("tool_a"))
+            .tool(BuilderToolATool)
             .resource(NamedResource::named("res_a"))
             .prompt(NamedPrompt::named("prompt_a"))
             .middleware(ResponseCachingMiddleware::new())
@@ -6197,8 +6201,8 @@ mod builder_tests {
     #[test]
     fn builder_into_router_preserves_components() {
         let server = ServerBuilder::new("s", "0.1")
-            .tool(NamedTool::named("t1"))
-            .tool(NamedTool::named("t2"))
+            .tool(BuilderT1Tool)
+            .tool(BuilderT2Tool)
             .resource(NamedResource::named("r1"))
             .prompt(NamedPrompt::named("p1"))
             .build();
@@ -6234,9 +6238,9 @@ mod builder_tests {
     fn builder_list_page_size_enables_tools_pagination() {
         let router = ServerBuilder::new("s", "0.1")
             .list_page_size(2)
-            .tool(NamedTool::named("t1"))
-            .tool(NamedTool::named("t2"))
-            .tool(NamedTool::named("t3"))
+            .tool(BuilderT1Tool)
+            .tool(BuilderT2Tool)
+            .tool(BuilderT3Tool)
             .build()
             .into_router();
 
@@ -6265,7 +6269,7 @@ mod builder_tests {
     fn tools_list_rejects_invalid_cursor() {
         let router = ServerBuilder::new("s", "0.1")
             .list_page_size(2)
-            .tool(NamedTool::named("t1"))
+            .tool(BuilderT1Tool)
             .build()
             .into_router();
 
