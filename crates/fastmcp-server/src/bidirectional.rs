@@ -67,6 +67,14 @@ pub struct PendingRequests {
 }
 
 impl PendingRequests {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, ResponseSender>> {
+        match self.pending.lock() {
+            Ok(guard) => guard,
+            // Prefer availability over panic if another task panicked while holding the lock.
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Creates a new pending request tracker.
     #[must_use]
     pub fn new() -> Self {
@@ -87,7 +95,7 @@ impl PendingRequests {
     /// Registers a pending request and returns a receiver for the response.
     pub fn register(&self, id: RequestId) -> ResponseReceiver {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.lock_pending();
         pending.insert(id, tx);
         rx
     }
@@ -101,7 +109,7 @@ impl PendingRequests {
         };
 
         let sender = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.lock_pending();
             pending.remove(id)
         };
 
@@ -121,13 +129,13 @@ impl PendingRequests {
 
     /// Removes a pending request (e.g., on timeout or cancellation).
     pub fn remove(&self, id: &RequestId) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.lock_pending();
         pending.remove(id);
     }
 
     /// Cancels all pending requests with a connection closed error.
     pub fn cancel_all(&self) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.lock_pending();
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(JsonRpcError {
                 code: McpErrorCode::InternalError.into(),
