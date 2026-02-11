@@ -312,6 +312,7 @@ fn color_hex(color: &Color) -> String {
 mod tests {
     use super::*;
     use crate::testing::TestConsole;
+    use crate::theme::theme;
 
     fn sample_snapshot() -> StatsSnapshot {
         StatsSnapshot {
@@ -340,16 +341,19 @@ mod tests {
         assert_eq!(renderer.format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(renderer.format_duration(Duration::from_secs(90)), "1m 30s");
         assert_eq!(renderer.format_duration(Duration::from_mins(185)), "3h 5m");
+        assert_eq!(renderer.format_duration(Duration::from_secs(3600)), "1h 0m");
     }
 
     #[test]
     fn test_format_latency() {
         let renderer = StatsRenderer::new(DisplayContext::new_agent());
         assert_eq!(renderer.format_latency(Duration::from_micros(500)), "500us");
+        assert_eq!(renderer.format_latency(Duration::from_millis(1)), "1.0ms");
         assert_eq!(
             renderer.format_latency(Duration::from_micros(1500)),
             "1.5ms"
         );
+        assert_eq!(renderer.format_latency(Duration::from_secs(1)), "1.00s");
         assert_eq!(renderer.format_latency(Duration::from_secs(2)), "2.00s");
     }
 
@@ -359,6 +363,7 @@ mod tests {
         assert_eq!(renderer.format_bytes(500), "500 B");
         assert_eq!(renderer.format_bytes(2048), "2.0 KB");
         assert_eq!(renderer.format_bytes(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(renderer.format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
     }
 
     #[test]
@@ -379,5 +384,91 @@ mod tests {
         renderer.render_oneline(&stats, console.console());
         console.assert_contains("Uptime");
         console.assert_contains("Requests");
+    }
+
+    #[test]
+    fn test_render_panel_rich_and_plain_fallback() {
+        let stats = sample_snapshot();
+
+        let rich_console = TestConsole::new_rich();
+        let rich_renderer = StatsRenderer::new(DisplayContext::new_human());
+        rich_renderer.render_panel(&stats, rich_console.console());
+        rich_console.assert_contains("Server Statistics");
+        rich_console.assert_contains("Total Requests");
+        rich_console.assert_contains("Data Sent");
+
+        let plain_console = TestConsole::new();
+        let plain_renderer = StatsRenderer::new(DisplayContext::new_agent());
+        plain_renderer.render_panel(&stats, plain_console.console());
+        plain_console.assert_contains("=== Server Statistics ===");
+        plain_console.assert_contains("Requests:");
+        plain_console.assert_contains("Connections:");
+    }
+
+    #[test]
+    fn test_render_table_plain_fallback() {
+        let stats = sample_snapshot();
+        let console = TestConsole::new();
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        renderer.render_table(&stats, console.console());
+        console.assert_contains("=== Server Statistics ===");
+        console.assert_contains("Ops:");
+        console.assert_contains("Data:");
+    }
+
+    #[test]
+    fn test_render_oneline_rich() {
+        let stats = sample_snapshot();
+        let console = TestConsole::new_rich();
+        let renderer = StatsRenderer::new(DisplayContext::new_human());
+        renderer.render_oneline(&stats, console.console());
+        console.assert_contains("reqs");
+        console.assert_contains("avg");
+        console.assert_contains("90.0%");
+    }
+
+    #[test]
+    fn test_percentage_and_success_rate_edge_cases() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_percentage(0, 0), "N/A");
+        assert_eq!(renderer.format_percentage(1, 3), "33.3%");
+
+        let mut zero = sample_snapshot();
+        zero.total_requests = 0;
+        zero.successful_requests = 0;
+        assert!((renderer.success_rate(&zero) - 1.0).abs() < f64::EPSILON);
+
+        let normal = sample_snapshot();
+        assert!((renderer.success_rate(&normal) - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_panel_text_contains_expected_rows() {
+        let renderer = StatsRenderer::new(DisplayContext::new_human());
+        let content = renderer.build_panel_text(&sample_snapshot());
+        assert!(content.contains("Uptime"));
+        assert!(content.contains("Total Requests"));
+        assert!(content.contains("Data Sent"));
+    }
+
+    #[test]
+    fn test_should_use_rich_respects_context_and_console() {
+        let human = StatsRenderer::new(DisplayContext::new_human());
+        let agent = StatsRenderer::new(DisplayContext::new_agent());
+        let rich_console = FastMcpConsole::with_enabled(true);
+        let plain_console = FastMcpConsole::with_enabled(false);
+
+        assert!(human.should_use_rich(&rich_console));
+        assert!(!human.should_use_rich(&plain_console));
+        assert!(!agent.should_use_rich(&rich_console));
+    }
+
+    #[test]
+    fn test_default_detect_and_color_hex() {
+        let _default = StatsRenderer::default();
+        let _detect = StatsRenderer::detect();
+        let hex = color_hex(&theme().info);
+        assert_eq!(hex.len(), 7);
+        assert!(hex.starts_with('#'));
     }
 }
