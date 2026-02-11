@@ -274,4 +274,68 @@ mod tests {
         assert_eq!(snap.tool_calls, 4_000);
         assert_eq!(snap.resource_reads, 500);
     }
+
+    #[test]
+    fn test_default_and_zero_snapshot_values() {
+        let stats = ServerStats::default();
+        let snap = stats.snapshot();
+
+        assert_eq!(snap.total_requests, 0);
+        assert_eq!(snap.successful_requests, 0);
+        assert_eq!(snap.failed_requests, 0);
+        assert_eq!(snap.cancelled_requests, 0);
+        assert_eq!(snap.tool_calls, 0);
+        assert_eq!(snap.resource_reads, 0);
+        assert_eq!(snap.prompt_gets, 0);
+        assert_eq!(snap.list_operations, 0);
+        assert_eq!(snap.avg_latency, Duration::ZERO);
+        assert_eq!(snap.max_latency, Duration::ZERO);
+        assert_eq!(snap.min_latency, Duration::ZERO);
+        assert_eq!(snap.active_connections, 0);
+        assert_eq!(snap.total_connections, 0);
+        assert_eq!(snap.bytes_received, 0);
+        assert_eq!(snap.bytes_sent, 0);
+        assert!(snap.uptime <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_cancelled_and_method_buckets() {
+        let stats = ServerStats::new();
+        stats.record_cancelled("resources/list", Duration::from_millis(11));
+        stats.record_request("other/method", Duration::from_millis(3), true);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.total_requests, 2);
+        assert_eq!(snap.cancelled_requests, 1);
+        assert_eq!(snap.successful_requests, 1);
+        assert_eq!(snap.failed_requests, 0);
+        assert_eq!(snap.resource_reads, 1);
+        assert_eq!(snap.tool_calls, 0);
+        assert_eq!(snap.prompt_gets, 0);
+        assert_eq!(snap.list_operations, 1);
+        assert_eq!(snap.max_latency, Duration::from_millis(11));
+        assert_eq!(snap.min_latency, Duration::from_millis(3));
+    }
+
+    #[test]
+    fn test_connection_and_byte_counters() {
+        let stats = ServerStats::new();
+
+        stats.connection_opened();
+        stats.connection_opened();
+        stats.connection_closed();
+        stats.connection_closed();
+        // Should stay at zero when already zero.
+        stats.connection_closed();
+
+        stats.add_bytes_received(128);
+        stats.add_bytes_received(72);
+        stats.add_bytes_sent(64);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.active_connections, 0);
+        assert_eq!(snap.total_connections, 2);
+        assert_eq!(snap.bytes_received, 200);
+        assert_eq!(snap.bytes_sent, 64);
+    }
 }
