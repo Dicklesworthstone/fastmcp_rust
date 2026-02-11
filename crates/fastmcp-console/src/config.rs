@@ -564,4 +564,102 @@ mod tests {
         assert_eq!(explicit_human.resolve_context(), DisplayContext::Human);
         assert!(explicit_human.should_use_rich());
     }
+
+    #[test]
+    fn test_builder_methods_via_fn_pointers() {
+        let set_force_color: fn(ConsoleConfig, bool) -> ConsoleConfig = ConsoleConfig::force_color;
+        let set_banner: fn(ConsoleConfig, BannerStyle) -> ConsoleConfig =
+            ConsoleConfig::with_banner;
+        let set_log: fn(ConsoleConfig, log::Level) -> ConsoleConfig = ConsoleConfig::with_log_level;
+        let set_traffic: fn(ConsoleConfig, TrafficVerbosity) -> ConsoleConfig =
+            ConsoleConfig::with_traffic;
+        let set_stats: fn(ConsoleConfig, u64) -> ConsoleConfig = ConsoleConfig::with_periodic_stats;
+        let disable_suggestions: fn(ConsoleConfig) -> ConsoleConfig =
+            ConsoleConfig::without_suggestions;
+        let set_custom: fn(ConsoleConfig, CustomColors) -> ConsoleConfig =
+            ConsoleConfig::with_custom_colors;
+        let set_context: fn(ConsoleConfig, DisplayContext) -> ConsoleConfig =
+            ConsoleConfig::with_context;
+        let set_rows: fn(ConsoleConfig, usize) -> ConsoleConfig =
+            ConsoleConfig::with_max_table_rows;
+        let set_depth: fn(ConsoleConfig, usize) -> ConsoleConfig =
+            ConsoleConfig::with_max_json_depth;
+        let set_truncate: fn(ConsoleConfig, usize) -> ConsoleConfig =
+            ConsoleConfig::with_truncate_at;
+
+        let custom = CustomColors {
+            primary: Some("#111111".to_string()),
+            secondary: Some("#222222".to_string()),
+            success: None,
+            warning: Some("#ffaa00".to_string()),
+            error: None,
+        };
+
+        let config = set_truncate(
+            set_depth(
+                set_rows(
+                    set_context(
+                        set_custom(
+                            disable_suggestions(set_stats(
+                                set_traffic(
+                                    set_log(
+                                        set_banner(
+                                            set_force_color(ConsoleConfig::new(), false),
+                                            BannerStyle::None,
+                                        ),
+                                        log::Level::Error,
+                                    ),
+                                    TrafficVerbosity::Headers,
+                                ),
+                                15,
+                            )),
+                            custom.clone(),
+                        ),
+                        DisplayContext::new_human(),
+                    ),
+                    12,
+                ),
+                7,
+            ),
+            42,
+        );
+
+        assert_eq!(config.force_color, Some(false));
+        assert_eq!(config.banner_style, BannerStyle::None);
+        assert!(!config.show_banner);
+        assert_eq!(config.log_level, Some(log::Level::Error));
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Headers);
+        assert!(config.show_request_traffic);
+        assert!(config.show_stats_periodic);
+        assert_eq!(config.stats_interval_secs, 15);
+        assert!(!config.show_suggestions);
+        assert_eq!(
+            config
+                .custom_colors
+                .as_ref()
+                .and_then(|c| c.secondary.as_deref()),
+            Some("#222222")
+        );
+        assert_eq!(config.context, Some(DisplayContext::Human));
+        assert_eq!(config.max_table_rows, 12);
+        assert_eq!(config.max_json_depth, 7);
+        assert_eq!(config.truncate_at, 42);
+    }
+
+    #[test]
+    fn test_from_env_and_fallback_context_resolution_paths() {
+        let _ = ConsoleConfig::from_env();
+
+        let forced_false = ConsoleConfig::new()
+            .force_color(false)
+            .with_context(DisplayContext::new_agent());
+        assert_eq!(forced_false.resolve_context(), DisplayContext::Agent);
+        assert!(!forced_false.should_use_rich());
+
+        let explicit_human = ConsoleConfig::new()
+            .force_color(false)
+            .with_context(DisplayContext::new_human());
+        assert_eq!(explicit_human.resolve_context(), DisplayContext::Human);
+        assert!(explicit_human.should_use_rich());
+    }
 }
