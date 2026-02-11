@@ -491,4 +491,126 @@ mod tests {
         let non_empty = ServerCapabilities::with(sample_tools(), vec![], vec![]);
         assert!(!non_empty.is_empty());
     }
+
+    #[test]
+    fn test_render_resources_only_plain() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_agent());
+        let caps = ServerCapabilities::with(vec![], sample_resources(), vec![]);
+
+        renderer.render(&caps, tc.console());
+
+        tc.assert_contains("Server Capabilities");
+        tc.assert_contains("1 total");
+        tc.assert_contains("example.txt");
+        tc.assert_contains("0 tools");
+        tc.assert_contains("1 resource");
+        tc.assert_contains("0 prompts");
+    }
+
+    #[test]
+    fn test_render_prompts_only_plain() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_agent());
+        let caps = ServerCapabilities::with(vec![], vec![], sample_prompts());
+
+        renderer.render(&caps, tc.console());
+
+        tc.assert_contains("Server Capabilities");
+        tc.assert_contains("1 total");
+        tc.assert_contains("code_review");
+        tc.assert_contains("0 tools");
+        tc.assert_contains("0 resources");
+        tc.assert_contains("1 prompt");
+    }
+
+    #[test]
+    fn test_render_empty_capabilities_rich_context() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
+        let caps = ServerCapabilities::new();
+
+        renderer.render(&caps, tc.console());
+
+        tc.assert_contains("No capabilities registered");
+    }
+
+    #[test]
+    fn test_render_summary_rich_with_none_and_counts() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
+
+        let empty = ServerCapabilities::new();
+        renderer.render_summary(&empty, tc.console());
+        tc.assert_contains("Tools:");
+        tc.assert_contains("Resources:");
+        tc.assert_contains("Prompts:");
+        tc.assert_contains("none");
+        tc.assert_contains("Total: 0 capabilities");
+
+        tc.clear();
+
+        let caps = ServerCapabilities::with(sample_tools(), sample_resources(), sample_prompts());
+        renderer.render_summary(&caps, tc.console());
+        tc.assert_contains("Total: 4 capabilities");
+    }
+
+    #[test]
+    fn test_render_header_and_footer_pluralization_paths() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
+
+        let single_each = ServerCapabilities::with(
+            vec![sample_tools()[0].clone()],
+            sample_resources(),
+            sample_prompts(),
+        );
+        renderer.render_header(&single_each, tc.console());
+        renderer.render_footer(&single_each, tc.console());
+        tc.assert_contains("Server Capabilities (3 total)");
+        tc.assert_contains("Summary: 1 tool, 1 resource, 1 prompt");
+
+        tc.clear();
+
+        let mixed = ServerCapabilities::with(sample_tools(), sample_resources(), vec![]);
+        renderer.render_footer(&mixed, tc.console());
+        tc.assert_contains("Summary: 2 tools, 1 resource, 0 prompts");
+    }
+
+    #[test]
+    fn test_render_summary_footer_plain_pluralization_paths() {
+        let tc = TestConsole::new();
+        let renderer = HandlerRegistryRenderer::new(DisplayContext::new_agent());
+
+        let single_each = ServerCapabilities::with(
+            vec![sample_tools()[0].clone()],
+            sample_resources(),
+            sample_prompts(),
+        );
+        renderer.render_summary_footer_plain(&single_each, tc.console());
+        tc.assert_contains("Summary: 1 tool, 1 resource, 1 prompt");
+
+        tc.clear();
+        let mixed = ServerCapabilities::with(sample_tools(), sample_resources(), vec![]);
+        renderer.render_summary_footer_plain(&mixed, tc.console());
+        tc.assert_contains("Summary: 2 tools, 1 resource, 0 prompts");
+    }
+
+    #[test]
+    fn test_should_use_rich_respects_context_and_console_mode() {
+        let human_renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
+        let agent_renderer = HandlerRegistryRenderer::new(DisplayContext::new_agent());
+        let rich_console = FastMcpConsole::with_enabled(true);
+        let plain_console = FastMcpConsole::with_enabled(false);
+
+        assert!(human_renderer.should_use_rich(&rich_console));
+        assert!(!human_renderer.should_use_rich(&plain_console));
+        assert!(!agent_renderer.should_use_rich(&rich_console));
+    }
+
+    #[test]
+    fn test_default_and_detect_construction() {
+        let _default = HandlerRegistryRenderer::default();
+        let _detect = HandlerRegistryRenderer::detect();
+    }
 }
