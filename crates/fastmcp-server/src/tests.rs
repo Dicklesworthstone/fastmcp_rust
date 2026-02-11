@@ -93,6 +93,63 @@ fn slow_tool(ctx: &McpContext) -> McpResult<String> {
     Ok("Slow work completed".to_string())
 }
 
+#[tool(
+    name = "increment",
+    description = "Increments a counter in session state"
+)]
+fn increment(ctx: &McpContext) -> String {
+    let count: i32 = ctx.get_state("counter").unwrap_or(0);
+    let new_count = count + 1;
+    ctx.set_state("counter", new_count);
+    format!("Counter: {new_count}")
+}
+
+#[tool(name = "query", description = "Executes a query")]
+fn mount_query(_ctx: &McpContext, sql: Option<String>) -> String {
+    let sql = sql.unwrap_or_default();
+    format!("Query result: {sql}")
+}
+
+#[tool(name = "insert", description = "Inserts data")]
+fn mount_insert(_ctx: &McpContext) -> String {
+    "Inserted".to_string()
+}
+
+#[tool(name = "add", description = "Adds two numbers")]
+fn add_numbers_tool(_ctx: &McpContext, a: i64, b: i64) -> String {
+    (a + b).to_string()
+}
+
+#[tool(name = "compute", description = "Returns a JSON result")]
+fn compute_json_tool(_ctx: &McpContext) -> String {
+    r#"{"value": 42}"#.to_string()
+}
+
+#[tool(name = "failing", description = "Always fails")]
+fn failing_tool_test(_ctx: &McpContext) -> McpResult<String> {
+    Err(McpError::new(
+        McpErrorCode::InternalError,
+        "Something went wrong",
+    ))
+}
+
+#[tool(name = "get_state", description = "Returns session state value")]
+fn get_state_from_ctx(ctx: &McpContext) -> String {
+    let value: Option<String> = ctx.get_state("tool_test_key");
+    value.unwrap_or_else(|| "no_value".to_string())
+}
+
+#[tool(
+    name = "nested_state",
+    description = "Sets state then calls another tool"
+)]
+fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
+    ctx.set_state("tool_test_key", "tool_propagated_value");
+    let inner_result = fastmcp_core::block_on(ctx.call_tool("get_state", serde_json::json!({})))?;
+    let text = inner_result.first_text().unwrap_or("(no content)");
+    Ok(format!("Inner tool saw: {}", text))
+}
+
 static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 static BLOCKING_TOOL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -3163,37 +3220,10 @@ mod multi_handler_tests {
 mod session_state_tests {
     use super::*;
 
-    /// Tool that increments a counter in session state.
-    struct CounterTool;
-
-    impl ToolHandler for CounterTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "increment".to_string(),
-                description: Some("Increments a counter in session state".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-            let count: i32 = ctx.get_state("counter").unwrap_or(0);
-            let new_count = count + 1;
-            ctx.set_state("counter", new_count);
-            Ok(vec![Content::Text {
-                text: format!("Counter: {new_count}"),
-            }])
-        }
-    }
-
     #[test]
     fn test_session_state_persists_across_calls() {
         let mut router = Router::new();
-        router.add_tool(CounterTool);
+        router.add_tool(Increment);
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -3233,7 +3263,7 @@ mod session_state_tests {
     #[test]
     fn test_different_session_states_are_independent() {
         let mut router = Router::new();
-        router.add_tool(CounterTool);
+        router.add_tool(Increment);
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -3616,64 +3646,6 @@ mod mount_tests {
     use super::*;
     use crate::Router;
 
-    /// A simple tool for mount tests.
-    struct QueryTool;
-
-    impl ToolHandler for QueryTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "query".to_string(),
-                description: Some("Executes a query".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sql": {"type": "string"}
-                    }
-                }),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-            let sql = arguments.get("sql").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(vec![Content::Text {
-                text: format!("Query result: {sql}"),
-            }])
-        }
-    }
-
-    /// Another tool for mount tests.
-    struct InsertTool;
-
-    impl ToolHandler for InsertTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "insert".to_string(),
-                description: Some("Inserts data".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(
-            &self,
-            _ctx: &McpContext,
-            _arguments: serde_json::Value,
-        ) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text {
-                text: "Inserted".to_string(),
-            }])
-        }
-    }
-
     /// A resource for mount tests.
     struct ConfigResource;
 
@@ -3733,8 +3705,8 @@ mod mount_tests {
     fn test_mount_with_prefix_renames_tools() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(QueryTool);
-        db_router.add_tool(InsertTool);
+        db_router.add_tool(MountQuery);
+        db_router.add_tool(MountInsert);
 
         let result = main_router.mount(db_router, Some("db"));
 
@@ -3749,7 +3721,7 @@ mod mount_tests {
     fn test_mount_without_prefix_keeps_names() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(QueryTool);
+        other_router.add_tool(MountQuery);
 
         let result = main_router.mount(other_router, None);
 
@@ -3786,10 +3758,10 @@ mod mount_tests {
     #[test]
     fn test_mount_conflict_generates_warning() {
         let mut main_router = Router::new();
-        main_router.add_tool(QueryTool);
+        main_router.add_tool(MountQuery);
 
         let mut other_router = Router::new();
-        other_router.add_tool(QueryTool);
+        other_router.add_tool(MountQuery);
 
         // Mount without prefix, causing a conflict
         let result = main_router.mount(other_router, None);
@@ -3803,7 +3775,7 @@ mod mount_tests {
     fn test_mount_preserves_tool_definition() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(QueryTool);
+        db_router.add_tool(MountQuery);
 
         main_router.mount(db_router, Some("db"));
 
@@ -3816,7 +3788,7 @@ mod mount_tests {
     fn test_mount_all_components() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(QueryTool);
+        other_router.add_tool(MountQuery);
         other_router.add_resource(ConfigResource);
         other_router.add_prompt(GreetingPrompt);
 
@@ -3831,7 +3803,7 @@ mod mount_tests {
     #[test]
     fn test_selective_mount_tools_only() {
         let db_server = Server::new("db", "1.0")
-            .tool(QueryTool)
+            .tool(MountQuery)
             .resource(ConfigResource)
             .prompt(GreetingPrompt)
             .build();
@@ -3853,7 +3825,7 @@ mod mount_tests {
     #[test]
     fn test_selective_mount_resources_only() {
         let data_server = Server::new("data", "1.0")
-            .tool(QueryTool)
+            .tool(MountQuery)
             .resource(ConfigResource)
             .build();
 
@@ -3872,7 +3844,7 @@ mod mount_tests {
     #[test]
     fn test_selective_mount_prompts_only() {
         let templates_server = Server::new("templates", "1.0")
-            .tool(QueryTool)
+            .tool(MountQuery)
             .prompt(GreetingPrompt)
             .build();
 
@@ -3891,8 +3863,8 @@ mod mount_tests {
     #[test]
     fn test_full_mount_via_server_builder() {
         let db_server = Server::new("db", "1.0")
-            .tool(QueryTool)
-            .tool(InsertTool)
+            .tool(MountQuery)
+            .tool(MountInsert)
             .build();
 
         let api_server = Server::new("api", "1.0").prompt(GreetingPrompt).build();
@@ -3921,7 +3893,7 @@ mod mount_tests {
     #[test]
     fn test_nested_mounting() {
         // Create inner server
-        let inner = Server::new("inner", "1.0").tool(QueryTool).build();
+        let inner = Server::new("inner", "1.0").tool(MountQuery).build();
 
         // Mount inner into middle
         let middle = Server::new("middle", "1.0")
@@ -3943,7 +3915,7 @@ mod mount_tests {
     fn test_prefix_validation_rejects_slashes() {
         let mut router = Router::new();
         let mut other = Router::new();
-        other.add_tool(QueryTool);
+        other.add_tool(MountQuery);
 
         let result = router.mount(other, Some("bad/prefix"));
 
@@ -3954,7 +3926,7 @@ mod mount_tests {
 
     #[test]
     fn test_mounted_tool_can_be_called() {
-        let db_server = Server::new("db", "1.0").tool(QueryTool).build();
+        let db_server = Server::new("db", "1.0").tool(MountQuery).build();
 
         let main = Server::new("main", "1.0")
             .mount(db_server, Some("db"))
@@ -4528,92 +4500,6 @@ mod ctx_call_tool_tests {
     use crate::RouterToolCaller;
     use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCallResult, ToolCaller, ToolContentItem};
 
-    /// A simple tool that adds two numbers.
-    struct AddTool;
-
-    impl ToolHandler for AddTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "add".to_string(),
-                description: Some("Adds two numbers".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "integer"},
-                        "b": {"type": "integer"}
-                    },
-                    "required": ["a", "b"]
-                }),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-            let a = args["a"].as_i64().unwrap_or(0);
-            let b = args["b"].as_i64().unwrap_or(0);
-            let sum = a + b;
-            Ok(vec![Content::Text {
-                text: sum.to_string(),
-            }])
-        }
-    }
-
-    /// A tool that returns JSON.
-    struct JsonTool;
-
-    impl ToolHandler for JsonTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "compute".to_string(),
-                description: Some("Returns a JSON result".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text {
-                text: r#"{"value": 42}"#.to_string(),
-            }])
-        }
-    }
-
-    /// A tool that always fails.
-    struct FailingTool;
-
-    impl ToolHandler for FailingTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "failing".to_string(),
-                description: Some("Always fails".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            Err(McpError::new(
-                McpErrorCode::InternalError,
-                "Something went wrong",
-            ))
-        }
-    }
-
     #[test]
     fn test_tool_content_item_constructors() {
         let text_item = ToolContentItem::text("hello world");
@@ -4655,7 +4541,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_router_tool_caller_calls_tool() {
         let mut router = Router::new();
-        router.add_tool(AddTool);
+        router.add_tool(AddNumbersTool);
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
@@ -4712,7 +4598,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_with_tool_caller() {
         let mut router = Router::new();
-        router.add_tool(AddTool);
+        router.add_tool(AddNumbersTool);
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4735,7 +4621,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text() {
         let mut router = Router::new();
-        router.add_tool(AddTool);
+        router.add_tool(AddNumbersTool);
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4753,7 +4639,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_json() {
         let mut router = Router::new();
-        router.add_tool(JsonTool);
+        router.add_tool(ComputeJsonTool);
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4776,7 +4662,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_returns_error_result() {
         let mut router = Router::new();
-        router.add_tool(FailingTool);
+        router.add_tool(FailingToolTest);
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4795,7 +4681,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text_propagates_error() {
         let mut router = Router::new();
-        router.add_tool(FailingTool);
+        router.add_tool(FailingToolTest);
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4828,7 +4714,7 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_tool_validation_error() {
         let mut router = Router::new();
-        router.add_tool(AddTool);
+        router.add_tool(AddNumbersTool);
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
@@ -4847,70 +4733,13 @@ mod ctx_call_tool_tests {
         assert!(err.message.contains("validation"));
     }
 
-    /// A tool that reads session state.
-    struct GetStateTool;
-
-    impl ToolHandler for GetStateTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "get_state".to_string(),
-                description: Some("Returns session state value".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            let value: Option<String> = ctx.get_state("tool_test_key");
-            Ok(vec![Content::Text {
-                text: value.unwrap_or_else(|| "no_value".to_string()),
-            }])
-        }
-    }
-
-    /// A tool that sets session state and calls another tool to verify propagation.
-    struct NestedStateTool;
-
-    impl ToolHandler for NestedStateTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: "nested_state".to_string(),
-                description: Some("Sets state then calls another tool".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: vec![],
-                annotations: None,
-            }
-        }
-
-        fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            // Set a value in session state
-            ctx.set_state("tool_test_key", "tool_propagated_value");
-
-            // Call another tool - it should see our session state
-            let inner_result =
-                fastmcp_core::block_on(ctx.call_tool("get_state", serde_json::json!({})))?;
-            let text = inner_result.first_text().unwrap_or("(no content)");
-
-            Ok(vec![Content::Text {
-                text: format!("Inner tool saw: {}", text),
-            }])
-        }
-    }
-
     #[test]
     fn test_session_state_propagates_through_nested_tool_calls() {
         use crate::RouterResourceReader;
 
         let mut router = Router::new();
-        router.add_tool(GetStateTool);
-        router.add_tool(NestedStateTool);
+        router.add_tool(GetStateFromCtx);
+        router.add_tool(NestedStateCall);
 
         let router_arc = Arc::new(router);
         let session_state = SessionState::new();
