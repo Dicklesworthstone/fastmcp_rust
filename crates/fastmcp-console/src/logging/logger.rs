@@ -337,6 +337,12 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_level_filter_off_falls_back_to_trace() {
+        let builder = RichLoggerBuilder::new().level_filter(LevelFilter::Off);
+        assert_eq!(builder.min_level, Level::Trace);
+    }
+
+    #[test]
     fn test_builder_timestamps() {
         let builder = RichLoggerBuilder::new().with_timestamps(false);
         assert!(!builder.show_timestamps);
@@ -384,5 +390,68 @@ mod tests {
         let builder = RichLogger::builder();
         // Should create a default builder
         assert_eq!(builder.min_level, Level::Info);
+    }
+
+    #[test]
+    fn test_record_to_event_with_timestamp_and_location() {
+        let logger = RichLogger::new(Level::Trace);
+
+        let record = log::Record::builder()
+            .args(format_args!("hello world"))
+            .level(Level::Warn)
+            .target("fastmcp_rust::logger")
+            .file(Some("src/logger.rs"))
+            .line(Some(77))
+            .build();
+
+        let event = logger.record_to_event(&record);
+        assert_eq!(event.level, LogLevel::Warn);
+        assert_eq!(event.message, "hello world");
+        assert_eq!(event.target.as_deref(), Some("fastmcp_rust::logger"));
+        assert_eq!(event.file.as_deref(), Some("src/logger.rs"));
+        assert_eq!(event.line, Some(77));
+        assert!(event.timestamp.is_some());
+    }
+
+    #[test]
+    fn test_record_to_event_without_timestamp_or_location() {
+        let logger = RichLoggerBuilder::new().with_timestamps(false).build();
+
+        let record = log::Record::builder()
+            .args(format_args!("no timestamp"))
+            .level(Level::Info)
+            .target("fastmcp_rust::logger")
+            .build();
+
+        let event = logger.record_to_event(&record);
+        assert_eq!(event.level, LogLevel::Info);
+        assert_eq!(event.message, "no timestamp");
+        assert_eq!(event.timestamp, None);
+        assert_eq!(event.file, None);
+        assert_eq!(event.line, None);
+    }
+
+    #[test]
+    fn test_log_and_flush_paths() {
+        let logger = RichLoggerBuilder::new()
+            .level(Level::Info)
+            .with_timestamps(false)
+            .build();
+
+        let debug_record = log::Record::builder()
+            .args(format_args!("ignored debug"))
+            .level(Level::Debug)
+            .target("fastmcp_rust::logger")
+            .build();
+        logger.log(&debug_record);
+
+        let error_record = log::Record::builder()
+            .args(format_args!("emitted error"))
+            .level(Level::Error)
+            .target("fastmcp_rust::logger")
+            .build();
+        logger.log(&error_record);
+
+        logger.flush();
     }
 }

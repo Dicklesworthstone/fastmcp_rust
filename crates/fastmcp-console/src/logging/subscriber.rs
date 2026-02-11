@@ -247,6 +247,7 @@ impl RichSubscriberBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::{Level, debug, event, info, info_span};
 
     #[test]
     fn test_builder_defaults() {
@@ -261,5 +262,90 @@ mod tests {
     #[test]
     fn test_builder_builds() {
         let _subscriber = RichSubscriberBuilder::new().build();
+    }
+
+    #[test]
+    fn test_builder_option_setters() {
+        let builder = RichSubscriberBuilder::new()
+            .with_theme(crate::theme::theme())
+            .with_timestamps(false)
+            .with_targets(false)
+            .with_file_line(true)
+            .with_max_width(Some(64))
+            .with_level_filter(LevelFilter::DEBUG);
+
+        assert!(builder.theme.is_some());
+        assert!(!builder.show_timestamps);
+        assert!(!builder.show_targets);
+        assert!(builder.show_file_line);
+        assert_eq!(builder.max_width, Some(64));
+        assert_eq!(builder.level_filter, LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn test_rich_layer_timestamp_toggle() {
+        let formatter = RichLogFormatter::new(crate::theme::theme(), DisplayContext::new_agent());
+
+        let no_ts_layer = RichLayer::new(formatter, false);
+        assert_eq!(no_ts_layer.timestamp_string(), None);
+
+        let with_ts_layer = RichLayer::new(
+            RichLogFormatter::new(crate::theme::theme(), DisplayContext::new_agent()),
+            true,
+        );
+        let timestamp = with_ts_layer.timestamp_string();
+        assert!(timestamp.is_some());
+        let timestamp = timestamp.unwrap_or_default();
+        assert_eq!(timestamp.len(), 8);
+        assert_eq!(timestamp.chars().nth(2), Some(':'));
+        assert_eq!(timestamp.chars().nth(5), Some(':'));
+    }
+
+    #[test]
+    fn test_layer_processes_event_without_span_scope() {
+        let formatter = RichLogFormatter::new(crate::theme::theme(), DisplayContext::new_agent())
+            .with_timestamp(false)
+            .with_target(true)
+            .with_file_line(true)
+            .with_max_width(Some(80));
+        let layer = RichLayer::new(formatter, false);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            event!(Level::INFO, action = "sync");
+            info!(
+                message = "plain_event",
+                user = "alice",
+                retries = 2_u64,
+                ok = true
+            );
+        });
+    }
+
+    #[test]
+    fn test_layer_processes_event_with_span_scope_and_all_field_types() {
+        let formatter = RichLogFormatter::new(crate::theme::theme(), DisplayContext::new_agent())
+            .with_timestamp(true)
+            .with_target(true)
+            .with_file_line(true)
+            .with_max_width(Some(120));
+        let layer = RichLayer::new(formatter, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = info_span!("subscriber_scope");
+            let _guard = span.enter();
+
+            info!(
+                message = "structured",
+                flag = true,
+                count_i = -5_i64,
+                count_u = 42_u64,
+                ratio = 3.5_f64,
+                debug_val = ?vec![1, 2, 3]
+            );
+
+            debug!(message = "second_message");
+        });
     }
 }
