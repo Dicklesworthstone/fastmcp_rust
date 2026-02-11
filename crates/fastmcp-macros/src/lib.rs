@@ -692,6 +692,7 @@ struct ToolAttrs {
     name: Option<String>,
     description: Option<String>,
     timeout: Option<String>,
+    tags: Vec<String>,
     defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
     output_schema: Option<syn::Expr>,
@@ -702,6 +703,7 @@ impl Parse for ToolAttrs {
         let mut name = None;
         let mut description = None;
         let mut timeout = None;
+        let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
 
@@ -723,6 +725,23 @@ impl Parse for ToolAttrs {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
+                }
+                "tags" => {
+                    input.parse::<Token![=]>()?;
+                    let expr_array: syn::ExprArray = input.parse()?;
+                    for expr in expr_array.elems {
+                        match expr {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: Lit::Str(tag), ..
+                            }) => tags.push(tag.value()),
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    other,
+                                    "tags entries must be string literals",
+                                ));
+                            }
+                        }
+                    }
                 }
                 "defaults" => {
                     let content;
@@ -757,6 +776,7 @@ impl Parse for ToolAttrs {
             name,
             description,
             timeout,
+            tags,
             defaults,
             output_schema,
         })
@@ -774,6 +794,7 @@ impl Parse for ToolAttrs {
 ///
 /// - `name` - Override the tool name (default: function name)
 /// - `description` - Tool description (default: doc comment)
+/// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
 ///
 /// # Parameter Defaults
 ///
@@ -849,6 +870,12 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             (quote! { None }, quote! {})
         };
+
+    let tag_entries: Vec<TokenStream2> = attrs
+        .tags
+        .iter()
+        .map(|tag| quote! { #tag.to_string() })
+        .collect();
 
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type, Option<String>, Option<Lit>)> = Vec::new();
@@ -1047,7 +1074,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                     output_schema: #output_schema_field,
                     icon: None,
                     version: None,
-                    tags: vec![],
+                    tags: vec![#(#tag_entries),*],
                     annotations: None,
                 }
             }

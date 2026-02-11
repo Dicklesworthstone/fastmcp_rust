@@ -2931,50 +2931,55 @@ mod handler_definition_tests {
     // Tag Filtering Tests
     // ========================================================================
 
-    /// A tool with tags for testing tag filtering.
-    struct TaggedTool {
-        name: String,
-        tags: Vec<String>,
+    #[tool(
+        name = "search",
+        description = "Tool with tags: api/public/read",
+        tags = ["api", "public", "read"]
+    )]
+    fn tagged_search_tool() -> String {
+        "ok".to_string()
     }
 
-    impl TaggedTool {
-        fn new(name: &str, tags: &[&str]) -> Self {
-            Self {
-                name: name.to_string(),
-                tags: tags.iter().map(|s| s.to_string()).collect(),
-            }
-        }
+    #[tool(
+        name = "create",
+        description = "Tool with tags: api/public/write",
+        tags = ["api", "public", "write"]
+    )]
+    fn tagged_create_tool() -> String {
+        "ok".to_string()
     }
 
-    impl ToolHandler for TaggedTool {
-        fn definition(&self) -> Tool {
-            Tool {
-                name: self.name.clone(),
-                description: Some(format!("Tool with tags: {:?}", self.tags)),
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: self.tags.clone(),
-                annotations: None,
-            }
-        }
+    #[tool(
+        name = "admin",
+        description = "Tool with tags: api/private/admin",
+        tags = ["api", "private", "admin"]
+    )]
+    fn tagged_admin_tool() -> String {
+        "ok".to_string()
+    }
 
-        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
-            Ok(vec![Content::Text {
-                text: "ok".to_string(),
-            }])
-        }
+    #[tool(
+        name = "debug",
+        description = "Tool with tags: internal/debug",
+        tags = ["internal", "debug"]
+    )]
+    fn tagged_debug_tool() -> String {
+        "ok".to_string()
+    }
+
+    #[tool(name = "untagged", description = "Tool with no tags")]
+    fn tagged_untagged_tool() -> String {
+        "ok".to_string()
     }
 
     fn create_tagged_tools_router() -> Router {
         let mut router = Router::new();
         // Tools with various tag combinations
-        router.add_tool(TaggedTool::new("search", &["api", "public", "read"]));
-        router.add_tool(TaggedTool::new("create", &["api", "public", "write"]));
-        router.add_tool(TaggedTool::new("admin", &["api", "private", "admin"]));
-        router.add_tool(TaggedTool::new("debug", &["internal", "debug"]));
-        router.add_tool(TaggedTool::new("untagged", &[]));
+        router.add_tool(TaggedSearchTool);
+        router.add_tool(TaggedCreateTool);
+        router.add_tool(TaggedAdminTool);
+        router.add_tool(TaggedDebugTool);
+        router.add_tool(TaggedUntaggedTool);
         router
     }
 
