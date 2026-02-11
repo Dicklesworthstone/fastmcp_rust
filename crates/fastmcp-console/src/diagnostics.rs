@@ -214,7 +214,7 @@ impl RichErrorRenderer {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum ErrorCategory {
     Connection,
@@ -289,5 +289,137 @@ mod tests {
         let err = McpError::new(McpErrorCode::MethodNotFound, "missing method");
         RichErrorRenderer::default().render(&err, tc.console());
         assert!(tc.contains("missing method"));
+    }
+
+    #[test]
+    fn categorize_error_maps_codes() {
+        let renderer = RichErrorRenderer::default();
+
+        let protocol = McpError::new(McpErrorCode::ParseError, "bad parse");
+        assert_eq!(
+            renderer.categorize_error(&protocol),
+            ErrorCategory::Protocol
+        );
+
+        let handler = McpError::new(McpErrorCode::ResourceNotFound, "missing");
+        assert_eq!(renderer.categorize_error(&handler), ErrorCategory::Handler);
+
+        let cancelled = McpError::new(McpErrorCode::RequestCancelled, "cancelled");
+        assert_eq!(
+            renderer.categorize_error(&cancelled),
+            ErrorCategory::Cancelled
+        );
+
+        let internal = McpError::new(McpErrorCode::InternalError, "boom");
+        assert_eq!(
+            renderer.categorize_error(&internal),
+            ErrorCategory::Internal
+        );
+
+        let unknown = McpError::new(McpErrorCode::Custom(42), "custom");
+        assert_eq!(renderer.categorize_error(&unknown), ErrorCategory::Unknown);
+    }
+
+    #[test]
+    fn suggestions_exist_for_selected_codes() {
+        let renderer = RichErrorRenderer::default();
+
+        let missing = McpError::new(McpErrorCode::MethodNotFound, "missing");
+        let method_suggestions = renderer.get_suggestions(&missing).unwrap_or_default();
+        assert!(method_suggestions.len() >= 2);
+
+        let parse = McpError::new(McpErrorCode::ParseError, "parse");
+        let parse_suggestions = renderer.get_suggestions(&parse).unwrap_or_default();
+        assert!(parse_suggestions.iter().any(|s| s.contains("JSON")));
+
+        let internal = McpError::new(McpErrorCode::InternalError, "internal");
+        assert!(renderer.get_suggestions(&internal).is_none());
+    }
+
+    #[test]
+    fn render_header_renders_all_categories() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer::default();
+        let theme = tc.console().theme();
+
+        renderer.render_header(ErrorCategory::Connection, theme, tc.console());
+        assert!(tc.contains("Connection Error"));
+        tc.clear();
+
+        renderer.render_header(ErrorCategory::Timeout, theme, tc.console());
+        assert!(tc.contains("Timeout"));
+        tc.clear();
+
+        renderer.render_header(ErrorCategory::Cancelled, theme, tc.console());
+        assert!(tc.contains("Cancelled"));
+    }
+
+    #[test]
+    fn render_error_panel_and_suggestions_include_expected_text() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer {
+            show_suggestions: true,
+            show_backtrace: false,
+            show_error_code: true,
+        };
+
+        let err = McpError::with_data(
+            McpErrorCode::MethodNotFound,
+            "missing method",
+            serde_json::json!({ "method": "tools/missing" }),
+        );
+        renderer.render_error_panel(&err, tc.console().theme(), tc.console());
+        assert!(tc.contains("missing method"));
+        assert!(tc.contains("-32601"));
+        assert!(tc.contains("tools/missing"));
+
+        tc.clear();
+        renderer.render_suggestions(
+            &["Check handler registration".to_string()],
+            tc.console().theme(),
+            tc.console(),
+        );
+        assert!(tc.contains("Suggestions"));
+        assert!(tc.contains("Check handler registration"));
+    }
+
+    #[test]
+    fn render_respects_show_error_code_flag() {
+        let tc = TestConsole::new();
+        let with_code = RichErrorRenderer {
+            show_suggestions: false,
+            show_backtrace: false,
+            show_error_code: true,
+        };
+        let without_code = RichErrorRenderer {
+            show_suggestions: false,
+            show_backtrace: false,
+            show_error_code: false,
+        };
+        let err = McpError::new(McpErrorCode::InvalidParams, "invalid params");
+
+        with_code.render(&err, tc.console());
+        assert!(tc.contains("-32602"));
+        tc.clear();
+
+        without_code.render(&err, tc.console());
+        assert!(!tc.contains("-32602"));
+        assert!(tc.contains("invalid params"));
+    }
+
+    #[test]
+    fn render_panic_with_backtrace_and_helper_wrapper() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer::default();
+
+        renderer.render_panic("panic happened", Some("frame1\nframe2"), tc.console());
+        assert!(tc.contains("PANIC"));
+        assert!(tc.contains("panic happened"));
+        assert!(tc.contains("Backtrace"));
+        assert!(tc.contains("frame1"));
+
+        tc.clear();
+        render_panic("wrapped panic", Some("trace"), tc.console());
+        assert!(tc.contains("wrapped panic"));
     }
 }
