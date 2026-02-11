@@ -343,6 +343,38 @@ pub fn strip_markup(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct SharedWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    buf: Arc::clone(&buf),
+                },
+                buf,
+            )
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.buf.lock() {
+                guard.extend_from_slice(input);
+            }
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_strip_markup_simple() {
@@ -393,6 +425,11 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_markup_double_bracket_escape() {
+        assert_eq!(strip_markup("[[literal]]"), "[literal]]");
+    }
+
+    #[test]
     fn test_console_with_enabled_true() {
         let console = FastMcpConsole::with_enabled(true);
         assert!(console.is_rich());
@@ -418,5 +455,81 @@ mod tests {
         // Non-TTY should return defaults
         assert!(console.width() > 0);
         assert!(console.height() > 0);
+    }
+
+    #[test]
+    fn test_with_writer_print_and_print_plain_paths() {
+        let (writer, captured) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, true);
+
+        console.print("[bold]Hello[/]");
+        console.print_plain("[literal]");
+
+        let output = String::from_utf8(captured.lock().expect("writer lock poisoned").clone())
+            .unwrap_or_default();
+        assert!(output.contains("Hello"));
+        assert!(output.contains("literal"));
+    }
+
+    #[test]
+    fn test_render_and_convenience_methods_in_rich_mode() {
+        let (writer, captured) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, true);
+
+        let mut table = Table::new()
+            .with_column(Column::new("A"))
+            .with_column(Column::new("B"));
+        table.add_row(Row::new(vec![Cell::new("1"), Cell::new("2")]));
+        let panel = Panel::from_text("Panel body");
+
+        console.rule(Some("Section"));
+        console.rule(None);
+        console.print_styled("Styled", Style::new().bold());
+        console.print_table(&table, "table fallback");
+        console.print_panel(&panel, "panel fallback");
+        console.render(&Rule::new());
+
+        let mut called = false;
+        console.render_or(
+            |c| {
+                called = true;
+                c.print("render_or rich");
+            },
+            "render_or fallback",
+        );
+        assert!(called);
+
+        let output = String::from_utf8(captured.lock().expect("writer lock poisoned").clone())
+            .unwrap_or_default();
+        assert!(output.contains("Section"));
+        assert!(output.contains("Styled"));
+        assert!(output.contains("Panel body"));
+        assert!(output.contains("render_or rich"));
+    }
+
+    #[test]
+    fn test_disabled_mode_branches_execute() {
+        let console = FastMcpConsole::with_enabled(false);
+        let table = Table::new().with_column(Column::new("A"));
+        let panel = Panel::from_text("panel");
+
+        console.print("[bold]Hello[/]");
+        console.print_plain("plain");
+        console.render(&Rule::new());
+        console.rule(Some("Title"));
+        console.rule(None);
+        console.newline();
+        console.print_styled("styled", Style::new());
+        console.print_table(&table, "table fallback");
+        console.print_panel(&panel, "panel fallback");
+
+        let mut called = false;
+        console.render_or(
+            |_| {
+                called = true;
+            },
+            "fallback",
+        );
+        assert!(!called);
     }
 }
