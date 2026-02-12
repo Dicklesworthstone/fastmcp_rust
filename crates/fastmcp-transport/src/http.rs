@@ -915,15 +915,20 @@ impl StreamableHttpTransport {
 
     /// Pushes a request into the queue (from HTTP handler).
     pub fn push_request(&self, request: JsonRpcRequest) {
-        if let Ok(mut guard) = self.requests.lock() {
-            guard.push(request);
-        }
+        let mut guard = match self.requests.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(request);
     }
 
     /// Pops a response from the queue (for HTTP streaming).
     #[must_use]
     pub fn pop_response(&self) -> Option<JsonRpcResponse> {
-        let mut guard = self.responses.lock().ok()?;
+        let mut guard = match self.responses.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if guard.is_empty() {
             None
         } else {
@@ -934,10 +939,10 @@ impl StreamableHttpTransport {
     /// Checks if there are pending responses.
     #[must_use]
     pub fn has_responses(&self) -> bool {
-        self.responses
-            .lock()
-            .map(|g| !g.is_empty())
-            .unwrap_or(false)
+        match self.responses.lock() {
+            Ok(guard) => !guard.is_empty(),
+            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        }
     }
 
     /// Returns the request queue for external access.
@@ -1667,6 +1672,60 @@ Transfer-Encoding: chunked\r\n\
             .recv(&cx)
             .expect_err("poisoned request queue must fail recv");
         assert!(matches!(err, TransportError::Io(_)));
+    }
+
+    #[test]
+    fn e2e_http_streaming_push_request_recovers_from_poisoned_queue() {
+        use std::thread;
+
+        let transport = StreamableHttpTransport::new();
+        let queue = transport.request_queue();
+        let poison_queue = Arc::clone(&queue);
+        let poison = thread::spawn(move || {
+            let _guard = poison_queue.lock().expect("lock request queue");
+            std::panic::panic_any("poison request queue");
+        });
+        assert!(poison.join().is_err());
+
+        transport.push_request(JsonRpcRequest::new("recovered-method", None, 7i64));
+
+        let guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].method, "recovered-method");
+    }
+
+    #[test]
+    fn e2e_http_streaming_response_helpers_recover_from_poisoned_queue() {
+        use fastmcp_protocol::RequestId;
+        use std::thread;
+
+        let transport = StreamableHttpTransport::new();
+        let queue = transport.response_queue();
+        {
+            let mut guard = queue.lock().expect("lock response queue");
+            guard.push(JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"seq": 9})),
+                error: None,
+                id: Some(RequestId::Number(9)),
+            });
+        }
+
+        let poison_queue = Arc::clone(&queue);
+        let poison = thread::spawn(move || {
+            let _guard = poison_queue.lock().expect("lock response queue");
+            std::panic::panic_any("poison response queue");
+        });
+        assert!(poison.join().is_err());
+
+        assert!(transport.has_responses());
+        let response = transport
+            .pop_response()
+            .expect("poisoned queue should still yield response");
+        assert_eq!(response.id, Some(RequestId::Number(9)));
     }
 
     #[test]
