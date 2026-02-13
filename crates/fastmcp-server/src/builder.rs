@@ -1616,4 +1616,222 @@ mod tests {
             .strict_input_validation(false);
         assert!(!builder.is_strict_input_validation_enabled());
     }
+
+    // ── Task manager ──────────────────────────────────────────────────
+
+    #[test]
+    fn builder_with_task_manager_enables_capability() {
+        use crate::tasks::TaskManager;
+        let tm = TaskManager::new().into_shared();
+        let server = ServerBuilder::new("srv", "1.0")
+            .with_task_manager(tm)
+            .build();
+        assert!(server.capabilities().tasks.is_some());
+    }
+
+    #[test]
+    fn builder_with_task_manager_list_changed_true() {
+        use crate::tasks::TaskManager;
+        let tm = TaskManager::with_list_changed_notifications().into_shared();
+        let server = ServerBuilder::new("srv", "1.0")
+            .with_task_manager(tm)
+            .build();
+        let cap = server.capabilities().tasks.as_ref().unwrap();
+        assert!(cap.list_changed);
+    }
+
+    #[test]
+    fn builder_with_task_manager_list_changed_false() {
+        use crate::tasks::TaskManager;
+        let tm = TaskManager::new().into_shared();
+        let server = ServerBuilder::new("srv", "1.0")
+            .with_task_manager(tm)
+            .build();
+        let cap = server.capabilities().tasks.as_ref().unwrap();
+        assert!(!cap.list_changed);
+    }
+
+    // ── Duplicate behavior for resources and prompts ─────────────────
+
+    struct DupResource(&'static str);
+    impl crate::ResourceHandler for DupResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: format!("file:///{}", self.0),
+                name: self.0.to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+    }
+
+    struct DupPrompt(&'static str);
+    impl crate::PromptHandler for DupPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: self.0.to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn builder_on_duplicate_error_resource_logs_but_continues() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Error)
+            .resource(DupResource("dup"))
+            .resource(DupResource("dup"))
+            .build();
+        assert!(server.has_resources());
+    }
+
+    #[test]
+    fn builder_on_duplicate_error_prompt_logs_but_continues() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Error)
+            .prompt(DupPrompt("dup"))
+            .prompt(DupPrompt("dup"))
+            .build();
+        assert!(server.has_prompts());
+    }
+
+    // ── Proxy with resources and prompts ─────────────────────────────
+
+    #[test]
+    fn builder_proxy_with_resources_and_prompts() {
+        use crate::proxy::{ProxyCatalog, ProxyClient};
+
+        struct DummyBackend2;
+        impl crate::proxy::ProxyBackend for DummyBackend2 {
+            fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+                Ok(vec![])
+            }
+            fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+                Ok(vec![])
+            }
+            fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+                Ok(vec![])
+            }
+            fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+                Ok(vec![])
+            }
+            fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn call_tool_with_progress(
+                &mut self,
+                _: &str,
+                _: serde_json::Value,
+                _: crate::proxy::ProgressCallback<'_>,
+            ) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+            fn get_prompt(
+                &mut self,
+                _: &str,
+                _: std::collections::HashMap<String, String>,
+            ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                Ok(vec![])
+            }
+        }
+
+        let client = ProxyClient::from_backend(DummyBackend2);
+        let catalog = ProxyCatalog {
+            resources: vec![Resource {
+                uri: "file:///proxy-res".to_string(),
+                name: "proxy-res".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }],
+            prompts: vec![Prompt {
+                name: "proxy-prompt".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }],
+            resource_templates: vec![ResourceTemplate {
+                uri_template: "db://{table}".to_string(),
+                name: "db".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }],
+            ..ProxyCatalog::default()
+        };
+
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(client, catalog)
+            .build();
+        assert!(server.has_resources());
+        assert!(server.has_prompts());
+        assert!(!server.has_tools());
+    }
+
+    // ── Build propagates strict validation to router ─────────────────
+
+    #[test]
+    fn build_propagates_strict_validation_to_router() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .strict_input_validation(true)
+            .build();
+        let router = server.into_router();
+        assert!(router.strict_input_validation());
+    }
+
+    #[test]
+    fn build_propagates_strict_validation_false_to_router() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .strict_input_validation(false)
+            .build();
+        let router = server.into_router();
+        assert!(!router.strict_input_validation());
+    }
+
+    // ── log_level_filter with Off defaults to Info ───────────────────
+
+    #[test]
+    fn builder_log_level_filter_off() {
+        let _builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Off);
+        // LevelFilter::Off.to_level() is None, so logging.level defaults to Info
+    }
+
+    // ── mount does not update capabilities when nothing mounted ──────
+
+    #[test]
+    fn builder_mount_no_op_leaves_capabilities_unchanged() {
+        let source = ServerBuilder::new("sub", "1.0").build();
+        let main = ServerBuilder::new("main", "1.0")
+            .mount(source, Some("ns"))
+            .build();
+        assert!(!main.has_tools());
+        assert!(!main.has_resources());
+        assert!(!main.has_prompts());
+    }
 }
