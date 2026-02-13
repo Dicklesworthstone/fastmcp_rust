@@ -1486,4 +1486,127 @@ mod tests {
         let entry = CacheEntry::new(serde_json::json!(1), Duration::from_secs(60));
         assert!(!entry.is_expired());
     }
+
+    #[test]
+    fn caches_resources_read() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let req = test_request(
+            "resources/read",
+            Some(serde_json::json!({"uri": "file:///a.txt"})),
+        );
+
+        m.on_request(&ctx, &req).unwrap();
+        m.on_response(&ctx, &req, serde_json::json!({"contents": []}))
+            .unwrap();
+
+        let decision = m.on_request(&ctx, &req).unwrap();
+        assert!(matches!(decision, MiddlewareDecision::Respond(_)));
+    }
+
+    #[test]
+    fn caches_prompts_get() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let req = test_request("prompts/get", Some(serde_json::json!({"name": "greeting"})));
+
+        m.on_request(&ctx, &req).unwrap();
+        m.on_response(&ctx, &req, serde_json::json!({"messages": []}))
+            .unwrap();
+
+        let decision = m.on_request(&ctx, &req).unwrap();
+        assert!(matches!(decision, MiddlewareDecision::Respond(_)));
+    }
+
+    #[test]
+    fn lru_cache_evict_expired_frees_entries() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        // Insert two entries with tiny TTL
+        cache.insert(
+            CacheKey::new("a", None),
+            serde_json::json!(1),
+            Duration::from_millis(1),
+        );
+        cache.insert(
+            CacheKey::new("b", None),
+            serde_json::json!(2),
+            Duration::from_millis(1),
+        );
+        assert_eq!(cache.len(), 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.evict_expired();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_insert_replaces_updates_size() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        let key = CacheKey::new("k", None);
+        cache.insert(
+            key.clone(),
+            serde_json::json!("short"),
+            Duration::from_secs(60),
+        );
+        let size_after_first = cache.current_size_bytes;
+
+        cache.insert(
+            key.clone(),
+            serde_json::json!("much longer value here"),
+            Duration::from_secs(60),
+        );
+        let size_after_second = cache.current_size_bytes;
+
+        // Size should reflect only the new entry (old was removed first)
+        assert_ne!(size_after_first, size_after_second);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn tool_call_cache_config_debug_and_clone() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: true,
+                ttl_secs: 120,
+            },
+            included_tools: vec!["t1".to_string()],
+            excluded_tools: vec!["t2".to_string()],
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("ToolCallCacheConfig"));
+        let cloned = config.clone();
+        assert_eq!(cloned.included_tools, vec!["t1".to_string()]);
+        assert_eq!(cloned.excluded_tools, vec!["t2".to_string()]);
+    }
+
+    #[test]
+    fn cache_stats_clone() {
+        let stats = CacheStats {
+            hits: 10,
+            misses: 5,
+            entries: 3,
+            size_bytes: 100,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.hits, 10);
+        assert_eq!(cloned.misses, 5);
+        assert_eq!(cloned.entries, 3);
+        assert_eq!(cloned.size_bytes, 100);
+    }
+
+    #[test]
+    fn should_cache_tool_empty_lists_allows_all() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: true,
+                ttl_secs: 60,
+            },
+            included_tools: vec![],
+            excluded_tools: vec![],
+        };
+        assert!(config.should_cache_tool("any_tool"));
+        assert!(config.should_cache_tool("another_tool"));
+    }
 }
