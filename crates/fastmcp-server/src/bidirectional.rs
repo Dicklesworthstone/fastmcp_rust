@@ -1192,6 +1192,153 @@ mod tests {
 
     // ── RequestSender ID cleanup after success ───────────────────────
 
+    // ── RequestSender — cancelled cx path ──────────────────────────
+
+    #[test]
+    fn request_sender_cancelled_cx_returns_cancelled_error() {
+        let pending = Arc::new(PendingRequests::new());
+        // Transport succeeds but never sends a response
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let result: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/cancel", serde_json::json!({}));
+        let err = result.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    // ── ElicitationSender url mode with None url/elicitation_id ──
+
+    #[test]
+    fn transport_elicitation_sender_url_mode_defaults() {
+        let sender = make_sender_with_responder(|req| {
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            assert_eq!(params["mode"], "url");
+            // url and elicitation_id default to empty strings
+            assert_eq!(params["url"], "");
+            assert_eq!(params["elicitationId"], "");
+            serde_json::json!({ "action": "accept" })
+        });
+        let elicitation = TransportElicitationSender::new(sender);
+
+        let request = ElicitationRequest {
+            message: "Auth".to_string(),
+            mode: ElicitationMode::Url,
+            schema: None,
+            url: None,
+            elicitation_id: None,
+        };
+
+        let future = ElicitationSender::elicit(&elicitation, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert!(matches!(result.action, ElicitationAction::Accept));
+    }
+
+    // ── TransportRootsProvider — transport failure ───────────────
+
+    #[test]
+    fn transport_roots_provider_transport_failure() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Err("network error".to_string()));
+        let sender = RequestSender::new(pending, send_fn);
+        let roots = TransportRootsProvider::new(sender);
+
+        let result = roots.list_roots();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Failed to send request")
+        );
+    }
+
+    // ── SamplingSender — transport failure ───────────────────────
+
+    #[test]
+    fn transport_sampling_sender_transport_failure() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Err("connection reset".to_string()));
+        let sender = RequestSender::new(pending, send_fn);
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![fastmcp_core::SamplingRequestMessage {
+                role: SamplingRole::User,
+                text: "Hi".to_string(),
+            }],
+            max_tokens: 10,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: vec![],
+            model_hints: vec![],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Failed to send request")
+        );
+    }
+
+    // ── SamplingSender — multiple messages ───────────────────────
+
+    #[test]
+    fn transport_sampling_sender_multiple_messages() {
+        let sender = make_sender_with_responder(|req| {
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            let messages = params["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0]["role"], "user");
+            assert_eq!(messages[1]["role"], "assistant");
+            assert_eq!(messages[2]["role"], "user");
+            serde_json::json!({
+                "content": {"type": "text", "text": "done"},
+                "role": "assistant",
+                "model": "m",
+                "stopReason": "endTurn"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![
+                fastmcp_core::SamplingRequestMessage {
+                    role: SamplingRole::User,
+                    text: "Hello".to_string(),
+                },
+                fastmcp_core::SamplingRequestMessage {
+                    role: SamplingRole::Assistant,
+                    text: "Hi".to_string(),
+                },
+                fastmcp_core::SamplingRequestMessage {
+                    role: SamplingRole::User,
+                    text: "Follow up".to_string(),
+                },
+            ],
+            max_tokens: 100,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: vec![],
+            model_hints: vec![],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert_eq!(result.text, "done");
+    }
+
+    // ── RequestSender — ID cleanup after success ────────────────
+
     #[test]
     fn request_sender_id_cleaned_from_pending_after_success() {
         let pending = Arc::new(PendingRequests::new());
