@@ -1491,4 +1491,209 @@ mod tests {
         let messages = sent.lock().unwrap();
         assert_eq!(messages.len(), 3);
     }
+
+    // ── ToolHandler with custom tags and annotations ────────────────
+
+    struct TaggedTool;
+    impl ToolHandler for TaggedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "tagged".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec!["db".to_string(), "read".to_string()],
+                annotations: Some(ToolAnnotations {
+                    destructive: Some(false),
+                    idempotent: Some(true),
+                    read_only: Some(true),
+                    open_world_hint: None,
+                }),
+            }
+        }
+        fn tags(&self) -> &[String] {
+            // Return from definition for consistency
+            &[]
+        }
+        fn annotations(&self) -> Option<&ToolAnnotations> {
+            None
+        }
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("tagged")])
+        }
+    }
+
+    #[test]
+    fn tool_definition_includes_tags_and_annotations() {
+        let def = TaggedTool.definition();
+        assert_eq!(def.tags, vec!["db".to_string(), "read".to_string()]);
+        let ann = def.annotations.unwrap();
+        assert_eq!(ann.destructive, Some(false));
+        assert_eq!(ann.idempotent, Some(true));
+        assert_eq!(ann.read_only, Some(true));
+    }
+
+    // ── Async delegation via block_on ───────────────────────────────
+
+    #[test]
+    fn tool_call_async_delegates_to_sync() {
+        let tool = StubTool;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(tool.call_async(&ctx, serde_json::json!({"x": 1})));
+        match outcome {
+            Outcome::Ok(content) => assert!(!content.is_empty()),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_read_async_delegates_to_sync() {
+        let res = StubResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(res.read_async(&ctx));
+        match outcome {
+            Outcome::Ok(content) => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].text.as_deref(), Some("hello"));
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_read_async_with_uri_empty_params_uses_read_async() {
+        let res = StubResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let params = UriParams::new(); // empty
+        let outcome =
+            fastmcp_core::block_on(res.read_async_with_uri(&ctx, "file:///stub", &params));
+        match outcome {
+            Outcome::Ok(content) => assert_eq!(content[0].text.as_deref(), Some("hello")),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_read_async_with_uri_nonempty_params_uses_read_with_uri() {
+        let res = CustomResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut params = UriParams::new();
+        params.insert("id".to_string(), "7".to_string());
+        let outcome =
+            fastmcp_core::block_on(res.read_async_with_uri(&ctx, "file:///items/7", &params));
+        match outcome {
+            Outcome::Ok(content) => assert_eq!(content[0].text.as_deref(), Some("item:7")),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prompt_get_async_delegates_to_sync() {
+        let prompt = StubPrompt;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(prompt.get_async(&ctx, HashMap::new()));
+        match outcome {
+            Outcome::Ok(messages) => assert!(messages.is_empty()),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    // ── Async error delegation ──────────────────────────────────────
+
+    #[test]
+    fn tool_call_async_propagates_error() {
+        struct ErrTool;
+        impl ToolHandler for ErrTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "err".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Err(McpError::internal_error("async-err"))
+            }
+        }
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(ErrTool.call_async(&ctx, serde_json::json!({})));
+        match outcome {
+            Outcome::Err(e) => assert!(e.message.contains("async-err")),
+            other => panic!("expected Err, got {:?}", other),
+        }
+    }
+
+    // ── MountedToolHandler async delegation ──────────────────────────
+
+    #[test]
+    fn mounted_tool_handler_delegates_call_async() {
+        let inner = Box::new(StubTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_stub".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(mounted.call_async(&ctx, serde_json::json!({})));
+        match outcome {
+            Outcome::Ok(content) => assert!(!content.is_empty()),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    // ── MountedResourceHandler async delegation ─────────────────────
+
+    #[test]
+    fn mounted_resource_handler_delegates_read_async() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(mounted.read_async(&ctx));
+        match outcome {
+            Outcome::Ok(content) => assert_eq!(content.len(), 1),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mounted_resource_handler_delegates_read_async_with_uri() {
+        let inner = Box::new(CustomResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut params = UriParams::new();
+        params.insert("id".to_string(), "5".to_string());
+        let outcome =
+            fastmcp_core::block_on(mounted.read_async_with_uri(&ctx, "file:///items/5", &params));
+        match outcome {
+            Outcome::Ok(content) => assert_eq!(content[0].text.as_deref(), Some("item:5")),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    // ── MountedPromptHandler async delegation ────────────────────────
+
+    #[test]
+    fn mounted_prompt_handler_delegates_get_async() {
+        let inner = Box::new(StubPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(mounted.get_async(&ctx, HashMap::new()));
+        match outcome {
+            Outcome::Ok(messages) => assert!(messages.is_empty()),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
 }
