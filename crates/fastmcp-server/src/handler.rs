@@ -1084,4 +1084,411 @@ mod tests {
         let result = mounted.get(&ctx, HashMap::new()).unwrap();
         assert!(result.is_empty());
     }
+
+    // ── BidirectionalSenders builders ────────────────────────────────
+
+    struct DummySamplingSender;
+    impl fastmcp_core::SamplingSender for DummySamplingSender {
+        fn create_message(
+            &self,
+            _request: fastmcp_core::SamplingRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = McpResult<fastmcp_core::SamplingResponse>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(McpError::internal_error("stub")) })
+        }
+    }
+
+    struct DummyElicitationSender;
+    impl fastmcp_core::ElicitationSender for DummyElicitationSender {
+        fn elicit(
+            &self,
+            _request: fastmcp_core::ElicitationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = McpResult<fastmcp_core::ElicitationResponse>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(McpError::internal_error("stub")) })
+        }
+    }
+
+    #[test]
+    fn bidirectional_senders_with_sampling() {
+        let senders =
+            BidirectionalSenders::new().with_sampling(Arc::new(DummySamplingSender) as Arc<_>);
+        assert!(senders.sampling.is_some());
+        assert!(senders.elicitation.is_none());
+    }
+
+    #[test]
+    fn bidirectional_senders_with_elicitation() {
+        let senders = BidirectionalSenders::new()
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        assert!(senders.sampling.is_none());
+        assert!(senders.elicitation.is_some());
+    }
+
+    #[test]
+    fn bidirectional_senders_with_both() {
+        let senders = BidirectionalSenders::new()
+            .with_sampling(Arc::new(DummySamplingSender) as Arc<_>)
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        assert!(senders.sampling.is_some());
+        assert!(senders.elicitation.is_some());
+    }
+
+    #[test]
+    fn bidirectional_senders_clone() {
+        let senders =
+            BidirectionalSenders::new().with_sampling(Arc::new(DummySamplingSender) as Arc<_>);
+        let cloned = senders.clone();
+        assert!(cloned.sampling.is_some());
+    }
+
+    #[test]
+    fn bidirectional_senders_debug_with_present() {
+        let senders = BidirectionalSenders::new()
+            .with_sampling(Arc::new(DummySamplingSender) as Arc<_>)
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        let debug = format!("{:?}", senders);
+        assert!(debug.contains("sampling: true"));
+        assert!(debug.contains("elicitation: true"));
+    }
+
+    // ── create_context_with_progress_and_senders ─────────────────────
+
+    #[test]
+    fn create_context_with_senders_sampling() {
+        let cx = Cx::for_testing();
+        let senders =
+            BidirectionalSenders::new().with_sampling(Arc::new(DummySamplingSender) as Arc<_>);
+        let ctx =
+            create_context_with_progress_and_senders(cx, 1, None, None, |_| {}, Some(&senders));
+        assert_eq!(ctx.request_id(), 1);
+    }
+
+    #[test]
+    fn create_context_with_senders_elicitation() {
+        let cx = Cx::for_testing();
+        let senders = BidirectionalSenders::new()
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        let ctx =
+            create_context_with_progress_and_senders(cx, 2, None, None, |_| {}, Some(&senders));
+        assert_eq!(ctx.request_id(), 2);
+    }
+
+    #[test]
+    fn create_context_with_senders_and_progress() {
+        let cx = Cx::for_testing();
+        let marker = ProgressMarker::from("sp");
+        let senders =
+            BidirectionalSenders::new().with_sampling(Arc::new(DummySamplingSender) as Arc<_>);
+        let ctx = create_context_with_progress_and_senders(
+            cx,
+            3,
+            Some(marker),
+            None,
+            |_| {},
+            Some(&senders),
+        );
+        assert_eq!(ctx.request_id(), 3);
+    }
+
+    #[test]
+    fn create_context_with_senders_and_state() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        state.set("key", &"val");
+        let senders = BidirectionalSenders::new()
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        let ctx = create_context_with_progress_and_senders(
+            cx,
+            4,
+            None,
+            Some(state),
+            |_| {},
+            Some(&senders),
+        );
+        let val: Option<String> = ctx.get_state("key");
+        assert_eq!(val.as_deref(), Some("val"));
+    }
+
+    #[test]
+    fn create_context_with_all_options() {
+        let cx = Cx::for_testing();
+        let marker = ProgressMarker::from("all");
+        let state = SessionState::new();
+        let senders = BidirectionalSenders::new()
+            .with_sampling(Arc::new(DummySamplingSender) as Arc<_>)
+            .with_elicitation(Arc::new(DummyElicitationSender) as Arc<_>);
+        let ctx = create_context_with_progress_and_senders(
+            cx,
+            5,
+            Some(marker),
+            Some(state),
+            |_| {},
+            Some(&senders),
+        );
+        assert_eq!(ctx.request_id(), 5);
+    }
+
+    #[test]
+    fn create_context_with_senders_none() {
+        let cx = Cx::for_testing();
+        let ctx = create_context_with_progress_and_senders(cx, 6, None, None, |_| {}, None);
+        assert_eq!(ctx.request_id(), 6);
+    }
+
+    // ── ToolHandler with overrides ───────────────────────────────────
+
+    struct CustomTool;
+    impl ToolHandler for CustomTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "custom".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn icon(&self) -> Option<&Icon> {
+            None // Still None but explicitly overridden
+        }
+
+        fn version(&self) -> Option<&str> {
+            Some("2.0")
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(60))
+        }
+
+        fn output_schema(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"type": "string"}))
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("custom")])
+        }
+    }
+
+    #[test]
+    fn tool_handler_custom_version() {
+        assert_eq!(CustomTool.version(), Some("2.0"));
+    }
+
+    #[test]
+    fn tool_handler_custom_timeout() {
+        assert_eq!(CustomTool.timeout(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn tool_handler_custom_output_schema() {
+        let schema = CustomTool.output_schema().unwrap();
+        assert_eq!(schema["type"], "string");
+    }
+
+    // ── ResourceHandler with overrides ───────────────────────────────
+
+    struct CustomResource;
+    impl ResourceHandler for CustomResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///custom".to_string(),
+                name: "custom".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn version(&self) -> Option<&str> {
+            Some("1.5")
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(30))
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "file:///custom".to_string(),
+                mime_type: None,
+                text: Some("data".to_string()),
+                blob: None,
+            }])
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            params: &UriParams,
+        ) -> McpResult<Vec<ResourceContent>> {
+            let id = params.get("id").cloned().unwrap_or_default();
+            Ok(vec![ResourceContent {
+                uri: uri.to_string(),
+                mime_type: None,
+                text: Some(format!("item:{id}")),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn resource_handler_custom_version() {
+        assert_eq!(CustomResource.version(), Some("1.5"));
+    }
+
+    #[test]
+    fn resource_handler_custom_timeout() {
+        assert_eq!(CustomResource.timeout(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn resource_handler_read_with_uri_custom() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut params = UriParams::new();
+        params.insert("id".to_string(), "42".to_string());
+        let result = CustomResource
+            .read_with_uri(&ctx, "file:///items/42", &params)
+            .unwrap();
+        assert_eq!(result[0].text.as_deref(), Some("item:42"));
+    }
+
+    // ── PromptHandler with overrides ─────────────────────────────────
+
+    struct CustomPrompt;
+    impl PromptHandler for CustomPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "custom".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn version(&self) -> Option<&str> {
+            Some("3.0")
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(10))
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn prompt_handler_custom_version() {
+        assert_eq!(CustomPrompt.version(), Some("3.0"));
+    }
+
+    #[test]
+    fn prompt_handler_custom_timeout() {
+        assert_eq!(CustomPrompt.timeout(), Some(Duration::from_secs(10)));
+    }
+
+    // ── MountedToolHandler icon/version delegation ───────────────────
+
+    #[test]
+    fn mounted_tool_handler_delegates_timeout() {
+        let inner = Box::new(CustomTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_custom".to_string());
+        assert_eq!(mounted.timeout(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn mounted_tool_handler_delegates_output_schema() {
+        let inner = Box::new(CustomTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_custom".to_string());
+        let schema = mounted.output_schema().unwrap();
+        assert_eq!(schema["type"], "string");
+    }
+
+    // ── MountedResourceHandler delegates ─────────────────────────────
+
+    #[test]
+    fn mounted_resource_handler_delegates_read_with_uri() {
+        let inner = Box::new(CustomResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///mounted".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut params = UriParams::new();
+        params.insert("id".to_string(), "99".to_string());
+        let result = mounted
+            .read_with_uri(&ctx, "file:///items/99", &params)
+            .unwrap();
+        assert_eq!(result[0].text.as_deref(), Some("item:99"));
+    }
+
+    #[test]
+    fn mounted_resource_handler_delegates_timeout() {
+        let inner = Box::new(CustomResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        assert_eq!(mounted.timeout(), Some(Duration::from_secs(30)));
+    }
+
+    // ── MountedPromptHandler delegates ───────────────────────────────
+
+    #[test]
+    fn mounted_prompt_handler_delegates_timeout() {
+        let inner = Box::new(CustomPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns_custom".to_string());
+        assert_eq!(mounted.timeout(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn mounted_prompt_handler_delegates_get_with_args() {
+        let inner = Box::new(StubPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut args = HashMap::new();
+        args.insert("key".to_string(), "value".to_string());
+        let result = mounted.get(&ctx, args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── ProgressNotificationSender multiple sends ────────────────────
+
+    #[test]
+    fn progress_sender_multiple_notifications() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("multi"), move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        sender.send_progress(0.0, Some(100.0), Some("starting"));
+        sender.send_progress(50.0, Some(100.0), None);
+        sender.send_progress(100.0, Some(100.0), Some("done"));
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 3);
+    }
 }
