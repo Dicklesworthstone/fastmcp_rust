@@ -6322,3 +6322,207 @@ mod builder_tests {
         assert!(page.next_cursor.is_none());
     }
 }
+
+// ============================================================================
+// Helper Function Tests
+// ============================================================================
+
+#[cfg(test)]
+mod helper_function_tests {
+    use super::*;
+    use crate::{
+        DuplicateBehavior, LoggingConfig, RequestCompletion, parse_params, parse_params_or_default,
+        stable_hash_request_id, transport_lock_error,
+    };
+    use fastmcp_transport::TransportError;
+
+    // ── parse_params ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_params_none_returns_error() {
+        let result = parse_params::<serde_json::Value>(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn parse_params_valid_json_succeeds() {
+        let val = serde_json::json!({"name": "test"});
+        let result = parse_params::<serde_json::Value>(Some(val.clone()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), val);
+    }
+
+    #[test]
+    fn parse_params_invalid_type_returns_error() {
+        // Try to parse a string as a struct that expects an object
+        let val = serde_json::json!("just a string");
+        let result = parse_params::<std::collections::HashMap<String, String>>(Some(val));
+        assert!(result.is_err());
+    }
+
+    // ── parse_params_or_default ─────────────────────────────────────
+
+    #[test]
+    fn parse_params_or_default_none_returns_default() {
+        let result = parse_params_or_default::<Vec<String>>(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_params_or_default_valid_json_succeeds() {
+        let val = serde_json::json!(["a", "b"]);
+        let result = parse_params_or_default::<Vec<String>>(Some(val));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_params_or_default_invalid_type_returns_error() {
+        let val = serde_json::json!(42);
+        let result = parse_params_or_default::<Vec<String>>(Some(val));
+        assert!(result.is_err());
+    }
+
+    // ── stable_hash_request_id ──────────────────────────────────────
+
+    #[test]
+    fn stable_hash_deterministic() {
+        let h1 = stable_hash_request_id("test-id-123");
+        let h2 = stable_hash_request_id("test-id-123");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_different_strings_differ() {
+        let h1 = stable_hash_request_id("alpha");
+        let h2 = stable_hash_request_id("beta");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_never_zero() {
+        // Even an empty string should produce non-zero
+        let h = stable_hash_request_id("");
+        assert_ne!(h, 0);
+        // And various other strings
+        for s in &["a", "b", "test", "0", ""] {
+            assert_ne!(stable_hash_request_id(s), 0);
+        }
+    }
+
+    // ── transport_lock_error ────────────────────────────────────────
+
+    #[test]
+    fn transport_lock_error_is_io_error() {
+        let err = transport_lock_error();
+        match err {
+            TransportError::Io(e) => {
+                assert!(e.to_string().contains("poisoned"));
+            }
+            other => panic!("expected Io error, got {:?}", other),
+        }
+    }
+
+    // ── RequestCompletion ───────────────────────────────────────────
+
+    #[test]
+    fn request_completion_starts_not_done() {
+        let rc = RequestCompletion::new();
+        assert!(!rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_mark_done() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        assert!(rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_mark_done_idempotent() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        rc.mark_done(); // should not panic
+        assert!(rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_wait_timeout_already_done() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        // Should return immediately
+        assert!(rc.wait_timeout(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn request_completion_wait_timeout_not_done_times_out() {
+        let rc = RequestCompletion::new();
+        let start = Instant::now();
+        assert!(!rc.wait_timeout(Duration::from_millis(50)));
+        assert!(start.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn request_completion_wait_timeout_done_by_another_thread() {
+        let rc = Arc::new(RequestCompletion::new());
+        let rc2 = Arc::clone(&rc);
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            rc2.mark_done();
+        });
+
+        assert!(rc.wait_timeout(Duration::from_secs(2)));
+        assert!(rc.is_done());
+    }
+
+    // ── LoggingConfig ───────────────────────────────────────────────
+
+    #[test]
+    fn logging_config_default() {
+        let cfg = LoggingConfig::default();
+        assert_eq!(cfg.level, log::Level::Info);
+        assert!(cfg.timestamps);
+        assert!(cfg.targets);
+        assert!(!cfg.file_line);
+    }
+
+    // ── DuplicateBehavior ───────────────────────────────────────────
+
+    #[test]
+    fn duplicate_behavior_default_is_warn() {
+        assert_eq!(DuplicateBehavior::default(), DuplicateBehavior::Warn);
+    }
+
+    #[test]
+    fn duplicate_behavior_debug_and_clone() {
+        let d = DuplicateBehavior::Error;
+        let debug = format!("{:?}", d);
+        assert!(debug.contains("Error"));
+        let cloned = d;
+        assert_eq!(cloned, DuplicateBehavior::Error);
+    }
+
+    #[test]
+    fn duplicate_behavior_eq_variants() {
+        assert_ne!(DuplicateBehavior::Error, DuplicateBehavior::Warn);
+        assert_ne!(DuplicateBehavior::Warn, DuplicateBehavior::Replace);
+        assert_ne!(DuplicateBehavior::Replace, DuplicateBehavior::Ignore);
+    }
+
+    // ── Server::log_level_rank ──────────────────────────────────────
+
+    #[test]
+    fn log_level_rank_ordering() {
+        let d = Server::log_level_rank(LogLevel::Debug);
+        let i = Server::log_level_rank(LogLevel::Info);
+        let w = Server::log_level_rank(LogLevel::Warning);
+        let e = Server::log_level_rank(LogLevel::Error);
+        assert!(d < i);
+        assert!(i < w);
+        assert!(w < e);
+    }
+}
