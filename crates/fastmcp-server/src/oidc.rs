@@ -2272,4 +2272,143 @@ mod tests {
             SigningKey::None => panic!("expected Hmac"),
         }
     }
+
+    #[test]
+    fn userinfo_claims_not_found() {
+        let provider = create_test_provider();
+        // Set a claims provider that only knows about "other-user"
+        let store = InMemoryClaimsProvider::new();
+        store.set_claims(UserClaims::new("other-user"));
+        provider.set_claims_provider(store);
+
+        let at = issue_token_via_auth_code(
+            provider.oauth().as_ref(),
+            &["openid", "profile"],
+            "missing-user",
+        );
+        let result = provider.userinfo(&at);
+        assert!(matches!(result, Err(OidcError::ClaimsNotFound(_))));
+    }
+
+    #[test]
+    fn filter_by_scopes_profile_all_fields() {
+        let claims = UserClaims {
+            sub: "u".to_string(),
+            name: Some("N".to_string()),
+            given_name: Some("G".to_string()),
+            family_name: Some("F".to_string()),
+            middle_name: Some("M".to_string()),
+            nickname: Some("Nick".to_string()),
+            preferred_username: Some("Pref".to_string()),
+            profile: Some("http://profile".to_string()),
+            picture: Some("http://pic".to_string()),
+            website: Some("http://web".to_string()),
+            gender: Some("other".to_string()),
+            birthdate: Some("2000-01-01".to_string()),
+            zoneinfo: Some("UTC".to_string()),
+            locale: Some("en-US".to_string()),
+            updated_at: Some(12345),
+            ..Default::default()
+        };
+
+        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
+        assert_eq!(filtered.name, Some("N".to_string()));
+        assert_eq!(filtered.given_name, Some("G".to_string()));
+        assert_eq!(filtered.family_name, Some("F".to_string()));
+        assert_eq!(filtered.middle_name, Some("M".to_string()));
+        assert_eq!(filtered.nickname, Some("Nick".to_string()));
+        assert_eq!(filtered.preferred_username, Some("Pref".to_string()));
+        assert_eq!(filtered.profile, Some("http://profile".to_string()));
+        assert_eq!(filtered.picture, Some("http://pic".to_string()));
+        assert_eq!(filtered.website, Some("http://web".to_string()));
+        assert_eq!(filtered.gender, Some("other".to_string()));
+        assert_eq!(filtered.birthdate, Some("2000-01-01".to_string()));
+        assert_eq!(filtered.zoneinfo, Some("UTC".to_string()));
+        assert_eq!(filtered.locale, Some("en-US".to_string()));
+        assert_eq!(filtered.updated_at, Some(12345));
+    }
+
+    #[test]
+    fn filter_by_scopes_does_not_include_custom_claims() {
+        let claims = UserClaims::new("u")
+            .with_name("Name")
+            .with_custom("role", serde_json::json!("admin"));
+
+        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
+        assert_eq!(filtered.name, Some("Name".to_string()));
+        assert!(
+            filtered.custom.is_empty(),
+            "custom claims should not pass through scope filtering"
+        );
+    }
+
+    #[test]
+    fn issue_id_token_fields_populated() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"key");
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "field-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
+
+        assert_eq!(id_token.claims.iss, "fastmcp");
+        assert_eq!(id_token.claims.aud, TEST_CLIENT_ID);
+        assert_eq!(id_token.claims.azp, Some(TEST_CLIENT_ID.to_string()));
+        assert!(id_token.claims.at_hash.is_some());
+        assert!(id_token.claims.auth_time.is_some());
+        assert!(id_token.claims.nonce.is_none());
+        assert!(id_token.claims.exp > id_token.claims.iat);
+    }
+
+    #[test]
+    fn base64url_encode_url_safe_characters() {
+        // Bytes 0xFB, 0xFF, 0xFE produce +//+ in standard base64,
+        // but base64url should use - and _ instead.
+        let encoded = base64url_encode(&[0xFB, 0xFF, 0xFE]);
+        assert!(
+            !encoded.contains('+') && !encoded.contains('/'),
+            "base64url must not contain + or /: {encoded}"
+        );
+        assert!(
+            encoded.contains('-') || encoded.contains('_'),
+            "base64url should use URL-safe chars: {encoded}"
+        );
+    }
+
+    #[test]
+    fn discovery_document_serde_skip_nones() {
+        let mut doc = DiscoveryDocument::new("iss", "http://base");
+        doc.jwks_uri = None;
+        doc.registration_endpoint = None;
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("jwks_uri"));
+        assert!(!json.contains("registration_endpoint"));
+        // Present optional fields should be in the JSON
+        assert!(json.contains("userinfo_endpoint"));
+        assert!(json.contains("revocation_endpoint"));
+    }
+
+    #[test]
+    fn issue_id_token_with_nonce_round_trips() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"key");
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "nonce-rt-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+
+        // With nonce
+        let with = provider
+            .issue_id_token(&oauth_token, Some("my-nonce"))
+            .unwrap();
+        assert_eq!(with.claims.nonce, Some("my-nonce".to_string()));
+
+        // Verify the nonce appears in the raw JWT payload
+        let parts: Vec<&str> = with.raw.split('.').collect();
+        use base64::Engine;
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["nonce"], "my-nonce");
+    }
 }
