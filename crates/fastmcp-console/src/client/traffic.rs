@@ -690,7 +690,7 @@ mod tests {
         assert!(debug.contains("truncate_at"));
 
         let cloned = renderer.clone();
-        assert_eq!(cloned.show_params, true);
+        assert!(cloned.show_params);
         assert_eq!(cloned.truncate_at, 200);
     }
 

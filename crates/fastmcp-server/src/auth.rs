@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn allow_all_provider_default() {
-        let _provider = AllowAllAuthProvider::default();
+        let _ = AllowAllAuthProvider;
     }
 
     #[test]

@@ -1569,7 +1569,7 @@ mod tests {
     fn method_timing_default_values() {
         let t = MethodTiming::default();
         assert_eq!(t.count, 0);
-        assert_eq!(t.total_ms, 0.0);
+        assert!((t.total_ms).abs() < f64::EPSILON);
         assert!(t.min_ms.is_none());
         assert!(t.max_ms.is_none());
         assert!(t.mean_ms.is_none());

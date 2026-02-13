@@ -902,7 +902,7 @@ mod tests {
     fn pending_requests_lock_pending_recovers_from_poison() {
         let pr = Arc::new(PendingRequests::new());
         let id = pr.next_request_id();
-        let _rx = pr.register(id.clone());
+        let rx = pr.register(id.clone());
 
         // Poison the mutex by panicking while holding the lock
         let pr2 = Arc::clone(&pr);
@@ -915,7 +915,7 @@ mod tests {
         // Routing should still work
         let response = JsonRpcResponse::success(id, serde_json::json!("recovered"));
         assert!(pr.route_response(&response));
-        let result = _rx.recv().unwrap().unwrap();
+        let result = rx.recv().unwrap().unwrap();
         assert_eq!(result, serde_json::json!("recovered"));
     }
 

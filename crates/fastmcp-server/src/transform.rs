@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn not_set_default() {
-        let _n = NotSet::default();
+        let _ = NotSet;
     }
 
     // ── ArgTransform defaults ────────────────────────────────────────

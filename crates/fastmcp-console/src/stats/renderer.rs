@@ -503,10 +503,7 @@ mod tests {
         let renderer = StatsRenderer::new(DisplayContext::new_agent());
         assert_eq!(renderer.format_latency(Duration::from_micros(0)), "0us");
         assert_eq!(renderer.format_latency(Duration::from_micros(999)), "999us");
-        assert_eq!(
-            renderer.format_latency(Duration::from_micros(1000)),
-            "1.0ms"
-        );
+        assert_eq!(renderer.format_latency(Duration::from_millis(1)), "1.0ms");
         assert_eq!(
             renderer.format_latency(Duration::from_micros(999_999)),
             "1000.0ms"

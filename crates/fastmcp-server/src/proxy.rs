@@ -1754,8 +1754,8 @@ mod tests {
         // which triggers ctx.report_progress_with_total
         let calls = sender.calls.lock().unwrap();
         assert!(!calls.is_empty());
-        assert_eq!(calls[0].0, 0.5);
-        assert_eq!(calls[0].1, Some(1.0));
+        assert!((calls[0].0 - 0.5).abs() < f64::EPSILON);
+        assert!(calls[0].1.is_some_and(|v| (v - 1.0).abs() < f64::EPSILON));
     }
 
     // =========================================================================

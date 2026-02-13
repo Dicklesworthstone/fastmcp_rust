@@ -296,7 +296,7 @@ mod tests {
     fn combined_with_ms() {
         assert_eq!(
             parse_duration("1h 30m 45s 500ms").unwrap(),
-            Duration::from_millis(1 * 3600_000 + 30 * 60_000 + 45_000 + 500)
+            Duration::from_millis(3_600_000 + 30 * 60_000 + 45_000 + 500)
         );
     }
 }
