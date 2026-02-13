@@ -2496,6 +2496,65 @@ mod uri_template_tests {
         let params = t.matches("file://{a}/42").expect("match");
         assert_eq!(params.get("id").map(String::as_str), Some("42"));
     }
+
+    #[test]
+    fn uri_template_try_new_ok() {
+        let t = UriTemplate::try_new("file://{path}");
+        assert!(t.is_ok());
+    }
+
+    #[test]
+    fn uri_template_try_new_err() {
+        let t = UriTemplate::try_new("file://{");
+        assert!(t.is_err());
+    }
+
+    #[test]
+    fn uri_template_new_invalid_returns_non_matching() {
+        // Invalid template: UriTemplate::new should log a warning and return
+        // a template that never matches any URI (fail-safe).
+        let t = UriTemplate::new("file://{");
+        assert!(t.matches("file://anything").is_none());
+        assert!(t.matches("").is_none());
+    }
+
+    #[test]
+    fn uri_template_literal_only_no_match_empty() {
+        let t = UriTemplate::new("file://exact");
+        assert!(t.matches("").is_none());
+        assert!(t.matches("file://exact").is_some());
+    }
+
+    #[test]
+    fn uri_template_multiple_params_empty_last() {
+        // Last param must not be empty
+        let t = UriTemplate::new("db://{table}/{id}");
+        assert!(t.matches("db://users/").is_none());
+    }
+
+    #[test]
+    fn uri_template_adjacent_params_not_supported() {
+        // Two adjacent params (no literal between them) should fail to match
+        let t = UriTemplate::new("{a}{b}");
+        assert!(t.matches("xy").is_none());
+    }
+
+    #[test]
+    fn uri_template_escaped_double_close_brace() {
+        // Escaped closing braces: }} -> }
+        let t = UriTemplate::new("a}}b/{id}");
+        let params = t.matches("a}b/42").expect("match");
+        assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn uri_template_specificity_param_only() {
+        let t = UriTemplate::new("{all}");
+        let (lit_len, lit_segs, total_segs) = t.specificity();
+        assert_eq!(lit_len, 0);
+        assert_eq!(lit_segs, 0);
+        assert_eq!(total_segs, 1);
+    }
 }
 
 #[cfg(test)]
@@ -3563,5 +3622,619 @@ mod router_tests {
         };
         let err = r.handle_tasks_submit(&cx, params, None).unwrap_err();
         assert!(err.message.contains("not enabled"));
+    }
+
+    // ── add_resource_with_behavior (Warn / Replace) ─────────────────────
+
+    #[test]
+    fn add_resource_behavior_warn_keeps_original() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource_with_behavior(
+            NamedResource::new("file:///a"),
+            crate::DuplicateBehavior::Warn,
+        )
+        .unwrap();
+        assert_eq!(r.resources_count(), 1);
+    }
+
+    #[test]
+    fn add_resource_behavior_replace() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource_with_behavior(
+            NamedResource::new("file:///a"),
+            crate::DuplicateBehavior::Replace,
+        )
+        .unwrap();
+        assert_eq!(r.resources_count(), 1);
+    }
+
+    #[test]
+    fn add_resource_behavior_new_resource_ok() {
+        let mut r = Router::new();
+        r.add_resource_with_behavior(
+            NamedResource::new("file:///a"),
+            crate::DuplicateBehavior::Error,
+        )
+        .unwrap();
+        assert_eq!(r.resources_count(), 1);
+    }
+
+    // ── add_prompt_with_behavior (Replace / Ignore / new) ───────────────
+
+    #[test]
+    fn add_prompt_behavior_replace() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        r.add_prompt_with_behavior(NamedPrompt::new("p"), crate::DuplicateBehavior::Replace)
+            .unwrap();
+        assert_eq!(r.prompts_count(), 1);
+    }
+
+    #[test]
+    fn add_prompt_behavior_ignore() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        r.add_prompt_with_behavior(NamedPrompt::new("p"), crate::DuplicateBehavior::Ignore)
+            .unwrap();
+        assert_eq!(r.prompts_count(), 1);
+    }
+
+    #[test]
+    fn add_prompt_behavior_new_prompt_ok() {
+        let mut r = Router::new();
+        r.add_prompt_with_behavior(NamedPrompt::new("p"), crate::DuplicateBehavior::Error)
+            .unwrap();
+        assert_eq!(r.prompts_count(), 1);
+    }
+
+    // ── add_resource / add_prompt duplicate replace ─────────────────────
+
+    #[test]
+    fn add_resource_replaces_on_duplicate() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource(NamedResource::new("file:///a"));
+        assert_eq!(r.resources_count(), 1);
+        assert_eq!(r.resources().len(), 1);
+    }
+
+    #[test]
+    fn add_prompt_replaces_on_duplicate() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        r.add_prompt(NamedPrompt::new("p"));
+        assert_eq!(r.prompts_count(), 1);
+        assert_eq!(r.prompts().len(), 1);
+    }
+
+    // ── resource_exists for template match ──────────────────────────────
+
+    #[test]
+    fn resource_exists_for_template_match() {
+        struct DbResource;
+        impl ResourceHandler for DbResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "db://placeholder".to_string(),
+                    name: "db".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "db://{table}".to_string(),
+                    name: "db".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                Ok(vec![])
+            }
+        }
+        let mut r = Router::new();
+        r.add_resource(DbResource);
+        assert!(r.resource_exists("db://users"));
+        assert!(!r.resource_exists("file://other"));
+    }
+
+    // ── resources_filtered by tags ──────────────────────────────────────
+
+    #[test]
+    fn resources_filtered_by_tags() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::with_tags(
+            "file:///a",
+            vec!["internal".to_string()],
+        ));
+        r.add_resource(NamedResource::with_tags(
+            "file:///b",
+            vec!["public".to_string()],
+        ));
+        let include = vec!["public".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
+        let res = r.resources_filtered(None, Some(&filters));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].uri, "file:///b");
+    }
+
+    // ── resource_templates_filtered by tags ─────────────────────────────
+
+    #[test]
+    fn resource_templates_filtered_by_tags() {
+        let mut r = Router::new();
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["admin".to_string()],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "cache://{key}".to_string(),
+            name: "cache".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["public".to_string()],
+        });
+        let exclude = vec!["admin".to_string()];
+        let filters = TagFilters::new(None, Some(&exclude));
+        let tmpls = r.resource_templates_filtered(None, Some(&filters));
+        assert_eq!(tmpls.len(), 1);
+        assert_eq!(tmpls[0].name, "cache");
+    }
+
+    // ── handle_tools_list with session state ────────────────────────────
+
+    #[test]
+    fn handle_tools_list_with_session_state_filter() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_tools", &disabled);
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, Some(&state)).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "b");
+    }
+
+    // ── handle_resources_list with tag filter ────────────────────────────
+
+    #[test]
+    fn handle_resources_list_with_tag_filter() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::with_tags(
+            "file:///a",
+            vec!["db".to_string()],
+        ));
+        r.add_resource(NamedResource::with_tags(
+            "file:///b",
+            vec!["web".to_string()],
+        ));
+        let cx = Cx::for_testing();
+        let params = ListResourcesParams {
+            cursor: None,
+            include_tags: Some(vec!["web".to_string()]),
+            exclude_tags: None,
+        };
+        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].uri, "file:///b");
+    }
+
+    // ── handle_prompts_list with pagination ──────────────────────────────
+
+    #[test]
+    fn handle_prompts_list_with_pagination() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_prompt(NamedPrompt::new("a"));
+        r.add_prompt(NamedPrompt::new("b"));
+        let cx = Cx::for_testing();
+        let params = ListPromptsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "a");
+        assert!(result.next_cursor.is_some());
+
+        let params = ListPromptsParams {
+            cursor: result.next_cursor,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "b");
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── handle_prompts_list with tag filter ──────────────────────────────
+
+    #[test]
+    fn handle_prompts_list_with_tag_filter() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::with_tags("a", vec!["internal".to_string()]));
+        r.add_prompt(NamedPrompt::with_tags("b", vec!["public".to_string()]));
+        let cx = Cx::for_testing();
+        let params = ListPromptsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: Some(vec!["internal".to_string()]),
+        };
+        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "b");
+    }
+
+    // ── handle_resource_templates_list with pagination ───────────────────
+
+    #[test]
+    fn handle_resource_templates_list_with_pagination() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "cache://{key}".to_string(),
+            name: "cache".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let cx = Cx::for_testing();
+        let params = ListResourceTemplatesParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        assert_eq!(result.resource_templates.len(), 1);
+        assert!(result.next_cursor.is_some());
+
+        let params = ListResourceTemplatesParams {
+            cursor: result.next_cursor,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        assert_eq!(result.resource_templates.len(), 1);
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── handle_resource_templates_list with tag filter ───────────────────
+
+    #[test]
+    fn handle_resource_templates_list_with_tag_filter() {
+        let mut r = Router::new();
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["admin".to_string()],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "cache://{key}".to_string(),
+            name: "cache".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["public".to_string()],
+        });
+        let cx = Cx::for_testing();
+        let params = ListResourceTemplatesParams {
+            cursor: None,
+            include_tags: Some(vec!["public".to_string()]),
+            exclude_tags: None,
+        };
+        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        assert_eq!(result.resource_templates.len(), 1);
+        assert_eq!(result.resource_templates[0].name, "cache");
+    }
+
+    // ── mount_resources (selective method) ───────────────────────────────
+
+    #[test]
+    fn mount_resources_only() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_resource(NamedResource::new("file:///a"));
+        sub.add_tool(NamedTool::new("t1"));
+        sub.add_resource_template(ResourceTemplate {
+            uri_template: "db://{t}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let result = main.mount_resources(sub, Some("ns"));
+        assert_eq!(result.resources, 1);
+        assert_eq!(result.resource_templates, 1);
+        assert!(main.get_resource("ns/file:///a").is_some());
+        assert_eq!(main.tools_count(), 0); // tools not mounted
+    }
+
+    // ── MountResult has_components with all fields ──────────────────────
+
+    #[test]
+    fn mount_result_with_resources_has_components() {
+        let mut r = MountResult::default();
+        r.resources = 1;
+        assert!(r.has_components());
+    }
+
+    #[test]
+    fn mount_result_with_templates_has_components() {
+        let mut r = MountResult::default();
+        r.resource_templates = 1;
+        assert!(r.has_components());
+    }
+
+    #[test]
+    fn mount_result_with_prompts_has_components() {
+        let mut r = MountResult::default();
+        r.prompts = 1;
+        assert!(r.has_components());
+    }
+
+    #[test]
+    fn mount_result_is_success_with_warnings() {
+        let mut r = MountResult::default();
+        r.warnings.push("something".to_string());
+        assert!(r.is_success()); // always true
+    }
+
+    // ── mount with all component types ──────────────────────────────────
+
+    #[test]
+    fn mount_all_component_types() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("t1"));
+        sub.add_resource(NamedResource::new("file:///r1"));
+        sub.add_prompt(NamedPrompt::new("p1"));
+        sub.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let result = main.mount(sub, Some("ns"));
+        assert_eq!(result.tools, 1);
+        assert_eq!(result.resources, 1);
+        assert_eq!(result.prompts, 1);
+        assert_eq!(result.resource_templates, 1);
+        assert!(result.has_components());
+        assert!(main.get_tool("ns/t1").is_some());
+        assert!(main.get_resource("ns/file:///r1").is_some());
+        assert!(main.get_prompt("ns/p1").is_some());
+    }
+
+    // ── mount resource conflict warnings ────────────────────────────────
+
+    #[test]
+    fn mount_warns_on_resource_conflict() {
+        let mut main = Router::new();
+        main.add_resource(NamedResource::new("file:///a"));
+        let mut sub = Router::new();
+        sub.add_resource(NamedResource::new("file:///a"));
+        let result = main.mount(sub, None);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("Resource"));
+    }
+
+    #[test]
+    fn mount_warns_on_prompt_conflict() {
+        let mut main = Router::new();
+        main.add_prompt(NamedPrompt::new("p"));
+        let mut sub = Router::new();
+        sub.add_prompt(NamedPrompt::new("p"));
+        let result = main.mount(sub, None);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("Prompt"));
+    }
+
+    // ── TagFilters::clone ───────────────────────────────────────────────
+
+    #[test]
+    fn tag_filters_clone() {
+        let include = vec!["a".to_string()];
+        let f = TagFilters::new(Some(&include), None);
+        let cloned = f.clone();
+        assert!(cloned.matches(&["a".to_string()]));
+        assert!(!cloned.matches(&["b".to_string()]));
+    }
+
+    // ── handle_tools_list with pagination AND tags ───────────────────────
+
+    #[test]
+    fn handle_tools_list_pagination_with_tags() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
+        r.add_tool(NamedTool::with_tags("b", vec!["db".to_string()]));
+        r.add_tool(NamedTool::with_tags("c", vec!["web".to_string()]));
+        let cx = Cx::for_testing();
+
+        // Only "db" tagged tools, page 1
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["db".to_string()]),
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "a");
+        assert!(result.next_cursor.is_some());
+
+        // Page 2
+        let params = ListToolsParams {
+            cursor: result.next_cursor,
+            include_tags: Some(vec!["db".to_string()]),
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "b");
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── handle_resources_list with session state filter ──────────────────
+
+    #[test]
+    fn handle_resources_list_with_session_state_filter() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource(NamedResource::new("file:///b"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["file:///a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_resources", &disabled);
+        let params = ListResourcesParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resources_list(&cx, params, Some(&state)).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].uri, "file:///b");
+    }
+
+    // ── handle_prompts_list with session state filter ────────────────────
+
+    #[test]
+    fn handle_prompts_list_with_session_state_filter() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("a"));
+        r.add_prompt(NamedPrompt::new("b"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_prompts", &disabled);
+        let params = ListPromptsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_prompts_list(&cx, params, Some(&state)).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "b");
+    }
+
+    // ── resource_templates_filtered by session + tags combined ───────────
+
+    #[test]
+    fn resource_templates_filtered_session_and_tags_combined() {
+        let mut r = Router::new();
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["admin".to_string()],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "cache://{key}".to_string(),
+            name: "cache".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["admin".to_string()],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "log://{entry}".to_string(),
+            name: "log".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["public".to_string()],
+        });
+        // Disable db template via session state
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["db://{table}".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_resources", &disabled);
+        // Also filter by admin tag
+        let include = vec!["admin".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
+        let tmpls = r.resource_templates_filtered(Some(&state), Some(&filters));
+        // db is disabled, log doesn't have admin tag => only cache
+        assert_eq!(tmpls.len(), 1);
+        assert_eq!(tmpls[0].name, "cache");
+    }
+
+    // ── mount_tools warns on template conflict ──────────────────────────
+
+    #[test]
+    fn mount_resource_template_warns_on_conflict() {
+        let mut main = Router::new();
+        main.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let mut sub = Router::new();
+        sub.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db2".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let result = main.mount(sub, None);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("Resource template"));
     }
 }
