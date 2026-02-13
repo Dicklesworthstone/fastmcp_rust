@@ -4237,4 +4237,444 @@ mod router_tests {
         assert!(!result.warnings.is_empty());
         assert!(result.warnings[0].contains("Resource template"));
     }
+
+    // ── handle_tools_call: tool disabled via session ─────────────────────
+
+    #[test]
+    fn handle_tools_call_disabled_tool_returns_error() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("my_tool"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["my_tool".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_tools", &disabled);
+        let params = CallToolParams {
+            name: "my_tool".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_tools_call(&cx, 1, params, &budget, state, None, None)
+            .unwrap_err();
+        assert!(err.message.contains("disabled"));
+    }
+
+    // ── handle_tools_call: success path ──────────────────────────────────
+
+    #[test]
+    fn handle_tools_call_success() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("echo"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = CallToolParams {
+            name: "echo".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let result = r
+            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(!result.content.is_empty());
+    }
+
+    // ── handle_tools_call: not found ─────────────────────────────────────
+
+    #[test]
+    fn handle_tools_call_not_found() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = CallToolParams {
+            name: "missing".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(err.message.contains("missing"));
+    }
+
+    // ── handle_tools_call: budget exhausted ──────────────────────────────
+
+    #[test]
+    fn handle_tools_call_budget_exhausted() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        let cx = Cx::for_testing();
+        let budget = Budget::unlimited().with_poll_quota(0);
+        let params = CallToolParams {
+            name: "t".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(
+            err.message.contains("budget") || err.message.contains("exhausted"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    // ── handle_resources_read: resource disabled via session ──────────────
+
+    #[test]
+    fn handle_resources_read_disabled_resource_returns_error() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///secret"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["file:///secret".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_resources", &disabled);
+        let params = ReadResourceParams {
+            uri: "file:///secret".to_string(),
+            meta: None,
+        };
+        let err = r
+            .handle_resources_read(&cx, 1, &params, &budget, state, None, None)
+            .unwrap_err();
+        assert!(err.message.contains("disabled"));
+    }
+
+    // ── handle_resources_read: success path ──────────────────────────────
+
+    #[test]
+    fn handle_resources_read_success() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = ReadResourceParams {
+            uri: "file:///a".to_string(),
+            meta: None,
+        };
+        let result = r
+            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+        assert_eq!(result.contents[0].uri, "file:///a");
+    }
+
+    // ── handle_resources_read: not found ─────────────────────────────────
+
+    #[test]
+    fn handle_resources_read_not_found() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = ReadResourceParams {
+            uri: "file:///nonexistent".to_string(),
+            meta: None,
+        };
+        let err = r
+            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(err.message.contains("nonexistent") || err.message.contains("not found"));
+    }
+
+    // ── handle_resources_read: budget exhausted ──────────────────────────
+
+    #[test]
+    fn handle_resources_read_budget_exhausted() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        let cx = Cx::for_testing();
+        let budget = Budget::unlimited().with_poll_quota(0);
+        let params = ReadResourceParams {
+            uri: "file:///a".to_string(),
+            meta: None,
+        };
+        let err = r
+            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(
+            err.message.contains("budget") || err.message.contains("exhausted"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    // ── handle_prompts_get: prompt disabled via session ───────────────────
+
+    #[test]
+    fn handle_prompts_get_disabled_prompt_returns_error() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("secret_prompt"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["secret_prompt".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_prompts", &disabled);
+        let params = GetPromptParams {
+            name: "secret_prompt".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_prompts_get(&cx, 1, params, &budget, state, None, None)
+            .unwrap_err();
+        assert!(err.message.contains("disabled"));
+    }
+
+    // ── handle_prompts_get: success path ─────────────────────────────────
+
+    #[test]
+    fn handle_prompts_get_success() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("greet"));
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = GetPromptParams {
+            name: "greet".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let result = r
+            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap();
+        assert!(result.description.is_some());
+    }
+
+    // ── handle_prompts_get: not found ────────────────────────────────────
+
+    #[test]
+    fn handle_prompts_get_not_found() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let budget = Budget::INFINITE;
+        let params = GetPromptParams {
+            name: "missing".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(err.message.contains("missing") || err.message.contains("not found"));
+    }
+
+    // ── handle_prompts_get: budget exhausted ─────────────────────────────
+
+    #[test]
+    fn handle_prompts_get_budget_exhausted() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        let cx = Cx::for_testing();
+        let budget = Budget::unlimited().with_poll_quota(0);
+        let params = GetPromptParams {
+            name: "p".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert!(
+            err.message.contains("budget") || err.message.contains("exhausted"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    // ── add_resource_with_behavior: template resource Error ───────────────
+
+    #[test]
+    fn add_resource_with_behavior_template_error_on_duplicate() {
+        struct TmplResource;
+        impl ResourceHandler for TmplResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "db://placeholder".to_string(),
+                    name: "db".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "db://{table}".to_string(),
+                    name: "db".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+        }
+        let mut r = Router::new();
+        r.add_resource(TmplResource);
+        let err = r
+            .add_resource_with_behavior(TmplResource, crate::DuplicateBehavior::Error)
+            .unwrap_err();
+        assert!(err.message.contains("already exists"));
+    }
+
+    // ── add_resource_with_behavior: template resource Ignore ─────────────
+
+    #[test]
+    fn add_resource_with_behavior_template_ignore_on_duplicate() {
+        struct TmplResource2;
+        impl ResourceHandler for TmplResource2 {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "cache://placeholder".to_string(),
+                    name: "cache".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "cache://{key}".to_string(),
+                    name: "cache".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+        }
+        let mut r = Router::new();
+        r.add_resource(TmplResource2);
+        r.add_resource_with_behavior(TmplResource2, crate::DuplicateBehavior::Ignore)
+            .unwrap();
+        assert_eq!(r.resource_templates_count(), 1);
+    }
+
+    // ── add_resource_with_behavior: template resource Warn ───────────────
+
+    #[test]
+    fn add_resource_with_behavior_template_warn_on_duplicate() {
+        struct TmplResource3;
+        impl ResourceHandler for TmplResource3 {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "log://placeholder".to_string(),
+                    name: "log".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "log://{entry}".to_string(),
+                    name: "log".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+        }
+        let mut r = Router::new();
+        r.add_resource(TmplResource3);
+        r.add_resource_with_behavior(TmplResource3, crate::DuplicateBehavior::Warn)
+            .unwrap();
+        assert_eq!(r.resource_templates_count(), 1);
+    }
+
+    // ── mount_tools warns on conflict ────────────────────────────────
+
+    #[test]
+    fn mount_tools_warns_on_tool_conflict() {
+        let mut main = Router::new();
+        main.add_tool(NamedTool::new("t"));
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("t"));
+        let result = main.mount_tools(sub, None);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("Tool"));
+    }
+
+    // ── mount_prompts warns on conflict ──────────────────────────────────
+
+    #[test]
+    fn mount_prompts_warns_on_prompt_conflict() {
+        let mut main = Router::new();
+        main.add_prompt(NamedPrompt::new("p"));
+        let mut sub = Router::new();
+        sub.add_prompt(NamedPrompt::new("p"));
+        let result = main.mount_prompts(sub, None);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("Prompt"));
+    }
+
+    // ── invalid cursor returns error ─────────────────────────────────────
+
+    #[test]
+    fn invalid_cursor_returns_error() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_tool(NamedTool::new("a"));
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: Some("not-valid-base64!!!".to_string()),
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let err = r.handle_tools_list(&cx, params, None).unwrap_err();
+        assert!(err.message.contains("cursor") || err.message.contains("Invalid"));
+    }
+
+    // ── set_list_page_size zero is treated as None ───────────────────────
+
+    #[test]
+    fn set_list_page_size_zero_disables_pagination() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(0));
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        // With page_size = 0, all items returned (no pagination)
+        assert_eq!(result.tools.len(), 2);
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── strict_input_validation getter ───────────────────────────────────
+
+    #[test]
+    fn strict_input_validation_toggle() {
+        let mut r = Router::new();
+        assert!(!r.strict_input_validation());
+        r.set_strict_input_validation(true);
+        assert!(r.strict_input_validation());
+        r.set_strict_input_validation(false);
+        assert!(!r.strict_input_validation());
+    }
 }

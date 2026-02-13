@@ -3105,9 +3105,7 @@ mod tests {
         let _claimed = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
 
         // First nack — requeued
-        backend
-            .nack(&TaskId::from_string("t1"), "fail1")
-            .unwrap();
+        backend.nack(&TaskId::from_string("t1"), "fail1").unwrap();
 
         let task = backend
             .get_task(&TaskId::from_string("t1"))
@@ -3135,9 +3133,7 @@ mod tests {
         let _claimed = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
 
         // First nack at max_retries=1 — fails
-        backend
-            .nack(&TaskId::from_string("t1"), "fatal")
-            .unwrap();
+        backend.nack(&TaskId::from_string("t1"), "fatal").unwrap();
 
         let task = backend
             .get_task(&TaskId::from_string("t1"))
