@@ -3016,4 +3016,124 @@ mod tests {
         let ctx = McpContext::new(cx, 1);
         assert_eq!(ctx.tool_call_depth(), 0);
     }
+
+    // ========================================================================
+    // Additional coverage tests (bd-3fcm)
+    // ========================================================================
+
+    #[test]
+    fn sampling_request_builder_chain() {
+        let req = SamplingRequest::prompt("hello", 100)
+            .with_system_prompt("You are helpful")
+            .with_temperature(0.7)
+            .with_stop_sequences(vec!["STOP".into()])
+            .with_model_hints(vec!["gpt-4".into()]);
+
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.max_tokens, 100);
+        assert_eq!(req.system_prompt.as_deref(), Some("You are helpful"));
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.stop_sequences, vec!["STOP"]);
+        assert_eq!(req.model_hints, vec!["gpt-4"]);
+    }
+
+    #[test]
+    fn sampling_request_message_roles() {
+        let user = SamplingRequestMessage::user("hi");
+        assert_eq!(user.role, SamplingRole::User);
+        assert_eq!(user.text, "hi");
+
+        let asst = SamplingRequestMessage::assistant("hello");
+        assert_eq!(asst.role, SamplingRole::Assistant);
+        assert_eq!(asst.text, "hello");
+    }
+
+    #[test]
+    fn sampling_response_new_default_stop_reason() {
+        let resp = SamplingResponse::new("output", "model-1");
+        assert_eq!(resp.text, "output");
+        assert_eq!(resp.model, "model-1");
+        assert_eq!(resp.stop_reason, SamplingStopReason::EndTurn);
+        assert_eq!(SamplingStopReason::default(), SamplingStopReason::EndTurn);
+    }
+
+    #[test]
+    fn noop_sampling_sender_returns_error() {
+        let sender = NoOpSamplingSender;
+        let req = SamplingRequest::prompt("test", 10);
+        let result = crate::block_on(sender.create_message(req));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn noop_elicitation_sender_returns_error() {
+        let sender = NoOpElicitationSender;
+        let req = ElicitationRequest::form("msg", serde_json::json!({}));
+        let result = crate::block_on(sender.elicit(req));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn elicitation_request_form_constructor() {
+        let req = ElicitationRequest::form("Enter name", serde_json::json!({"type": "string"}));
+        assert_eq!(req.mode, ElicitationMode::Form);
+        assert_eq!(req.message, "Enter name");
+        assert!(req.schema.is_some());
+        assert!(req.url.is_none());
+        assert!(req.elicitation_id.is_none());
+    }
+
+    #[test]
+    fn elicitation_request_url_constructor() {
+        let req = ElicitationRequest::url("Login", "https://example.com", "id-1");
+        assert_eq!(req.mode, ElicitationMode::Url);
+        assert_eq!(req.message, "Login");
+        assert_eq!(req.url.as_deref(), Some("https://example.com"));
+        assert_eq!(req.elicitation_id.as_deref(), Some("id-1"));
+        assert!(req.schema.is_none());
+    }
+
+    #[test]
+    fn mcp_context_with_sampling_enables_can_sample() {
+        let cx = Cx::for_testing();
+        let sender = Arc::new(NoOpSamplingSender);
+        let ctx = McpContext::new(cx, 1).with_sampling(sender);
+        assert!(ctx.can_sample());
+    }
+
+    #[test]
+    fn mcp_context_with_elicitation_enables_can_elicit() {
+        let cx = Cx::for_testing();
+        let sender = Arc::new(NoOpElicitationSender);
+        let ctx = McpContext::new(cx, 1).with_elicitation(sender);
+        assert!(ctx.can_elicit());
+    }
+
+    #[test]
+    fn mcp_context_depth_setters() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1)
+            .with_resource_read_depth(3)
+            .with_tool_call_depth(5);
+        assert_eq!(ctx.resource_read_depth(), 3);
+        assert_eq!(ctx.tool_call_depth(), 5);
+    }
+
+    #[test]
+    fn mcp_context_debug_includes_request_id() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 99);
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("request_id: 99"));
+    }
+
+    #[test]
+    fn mcp_context_cx_and_trace() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        // cx() should return a reference without panic
+        let _ = ctx.cx();
+        // trace() should not panic
+        ctx.trace("test event");
+    }
 }
