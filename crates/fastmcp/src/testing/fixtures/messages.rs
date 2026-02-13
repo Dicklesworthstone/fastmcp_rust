@@ -630,4 +630,171 @@ mod tests {
         let data = req["params"]["arguments"]["data"].as_str().unwrap();
         assert!(data.len() >= 5 * 1024);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-3qqy)
+    // =========================================================================
+
+    #[test]
+    fn valid_initialized_notification_has_no_id() {
+        let notif = valid_initialized_notification();
+        assert!(notif.get("id").is_none());
+        assert_eq!(notif["method"], "notifications/initialized");
+    }
+
+    #[test]
+    fn valid_resources_and_prompts_requests() {
+        let rl = valid_resources_list_request(10);
+        assert_eq!(rl["method"], "resources/list");
+        assert_eq!(rl["id"], 10);
+
+        let rr = valid_resources_read_request(11, "file:///test.txt");
+        assert_eq!(rr["params"]["uri"], "file:///test.txt");
+
+        let pl = valid_prompts_list_request(12);
+        assert_eq!(pl["method"], "prompts/list");
+
+        let pg = valid_prompts_get_request(13, "greet", Some(json!({"name": "Alice"})));
+        assert_eq!(pg["params"]["name"], "greet");
+        assert_eq!(pg["params"]["arguments"]["name"], "Alice");
+
+        let pg_no_args = valid_prompts_get_request(14, "simple", None);
+        assert!(pg_no_args["params"].get("arguments").is_none());
+    }
+
+    #[test]
+    fn valid_ping_pong() {
+        let ping = valid_ping_request(20);
+        assert_eq!(ping["method"], "ping");
+
+        let pong = valid_pong_response(20);
+        assert_eq!(pong["id"], 20);
+        assert!(pong["result"].is_object());
+    }
+
+    #[test]
+    fn valid_initialize_response_structure() {
+        let resp = valid_initialize_response(1);
+        assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert!(resp["result"]["serverInfo"].is_object());
+        assert!(resp["result"]["capabilities"].is_object());
+    }
+
+    #[test]
+    fn valid_list_and_call_responses() {
+        let tl = valid_tools_list_response(1, vec![json!({"name": "t1"})]);
+        assert_eq!(tl["result"]["tools"].as_array().unwrap().len(), 1);
+
+        let tc = valid_tools_call_response(2, vec![json!({"type": "text", "text": "hi"})], false);
+        assert_eq!(tc["result"]["isError"], false);
+
+        let tc_err = valid_tools_call_response(3, vec![], true);
+        assert_eq!(tc_err["result"]["isError"], true);
+
+        let rl = valid_resources_list_response(4, vec![]);
+        assert!(rl["result"]["resources"].as_array().unwrap().is_empty());
+
+        let rr = valid_resources_read_response(5, vec![json!({"uri": "x", "text": "data"})]);
+        assert_eq!(rr["result"]["contents"].as_array().unwrap().len(), 1);
+
+        let pl = valid_prompts_list_response(6, vec![json!({"name": "p1"})]);
+        assert_eq!(pl["result"]["prompts"].as_array().unwrap().len(), 1);
+
+        let pg = valid_prompts_get_response(7, Some("desc"), vec![]);
+        assert_eq!(pg["result"]["description"], "desc");
+
+        let pg_no_desc = valid_prompts_get_response(8, None, vec![]);
+        assert!(pg_no_desc["result"].get("description").is_none());
+    }
+
+    #[test]
+    fn error_response_variants() {
+        let ir = invalid_request_error_response(1);
+        assert_eq!(ir["error"]["code"], -32600);
+
+        let ip = invalid_params_error_response(2, "bad param");
+        assert_eq!(ip["error"]["code"], -32602);
+        assert_eq!(ip["error"]["data"]["details"], "bad param");
+
+        let ie = internal_error_response(3, Some("crash"));
+        assert_eq!(ie["error"]["code"], -32603);
+        assert_eq!(ie["error"]["data"]["details"], "crash");
+
+        let ie_none = internal_error_response(4, None);
+        assert!(ie_none["error"].get("data").is_none());
+
+        let rnf = resource_not_found_error_response(5, "file:///x");
+        assert!(
+            rnf["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("file:///x")
+        );
+
+        let tnf = tool_not_found_error_response(6, "missing_tool");
+        assert!(
+            tnf["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing_tool")
+        );
+
+        let pnf = prompt_not_found_error_response(7, "missing_prompt");
+        assert!(
+            pnf["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing_prompt")
+        );
+    }
+
+    #[test]
+    fn invalid_message_remaining_variants() {
+        let imt = invalid::invalid_method_type();
+        assert_eq!(imt["method"], 123);
+
+        let iid = invalid::invalid_id_type();
+        assert!(iid["id"].is_array());
+
+        let bre = invalid::both_result_and_error();
+        assert!(bre.get("result").is_some());
+        assert!(bre.get("error").is_some());
+
+        let mjs = invalid::malformed_json_string();
+        assert!(!mjs.is_empty());
+
+        let eo = invalid::empty_object();
+        assert!(eo.as_object().unwrap().is_empty());
+
+        let nv = invalid::null_value();
+        assert!(nv.is_null());
+
+        let aio = invalid::array_instead_of_object();
+        assert!(aio.is_array());
+    }
+
+    #[test]
+    fn notification_without_params() {
+        let notif = notification("test/event", None);
+        assert!(notif.get("params").is_none());
+        assert!(notif.get("id").is_none());
+    }
+
+    #[test]
+    fn log_and_cancelled_notifications() {
+        let log = log_notification("error", json!("something failed"));
+        assert_eq!(log["method"], "notifications/log");
+        assert_eq!(log["params"]["level"], "error");
+
+        let cancel = cancelled_notification(42, Some("timeout"));
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], 42);
+        assert_eq!(cancel["params"]["reason"], "timeout");
+    }
+
+    #[test]
+    fn error_response_with_data() {
+        let resp = error_response(1, -32000, "Custom error", Some(json!({"extra": true})));
+        assert_eq!(resp["error"]["data"]["extra"], true);
+    }
 }
