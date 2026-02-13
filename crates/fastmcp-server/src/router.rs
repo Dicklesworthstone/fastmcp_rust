@@ -387,7 +387,6 @@ impl Router {
     }
 
     /// Adds a prompt handler.
-    /// Adds a prompt handler.
     ///
     /// If a prompt with the same name already exists, it will be replaced.
     /// Use [`add_prompt_with_behavior`](Self::add_prompt_with_behavior) for
