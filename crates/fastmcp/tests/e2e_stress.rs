@@ -16,69 +16,34 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use asupersync::types::CancelReason;
-use fastmcp_protocol::ToolAnnotations;
 use fastmcp_rust::testing::TraceRetentionConfig;
 use fastmcp_rust::testing::prelude::*;
-use fastmcp_rust::{McpContext, McpResult, ResourceContent, ResourceHandler, ToolHandler};
 
 // ============================================================================
 // Handlers
 // ============================================================================
 
-struct EchoTool;
-
-impl ToolHandler for EchoTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "echo".to_string(),
-            description: Some("Echo the input".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "message": { "type": "string" } },
-                "required": ["message"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["stress".to_string()],
-            annotations: Some(ToolAnnotations::new().read_only(true).idempotent(true)),
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let message = arguments
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Ok(vec![Content::Text {
-            text: message.to_string(),
-        }])
-    }
+#[fastmcp_rust::tool(
+    name = "echo",
+    description = "Echo the input",
+    version = "1.0.0",
+    tags = ["stress"],
+    annotations(read_only, idempotent)
+)]
+fn echo_tool(message: String) -> String {
+    message
 }
 
-struct StaticResource;
-
-impl ResourceHandler for StaticResource {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "text://static".to_string(),
-            name: "Static".to_string(),
-            description: Some("Static text resource".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["stress".to_string()],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent {
-            uri: "text://static".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            text: Some("ok".to_string()),
-            blob: None,
-        }])
-    }
+#[fastmcp_rust::resource(
+    uri = "text://static",
+    name = "Static",
+    description = "Static text resource",
+    mime_type = "text/plain",
+    version = "1.0.0",
+    tags = ["stress"]
+)]
+fn static_resource() -> String {
+    "ok".to_string()
 }
 
 // ============================================================================
@@ -123,7 +88,10 @@ fn spawn_stress_server(
         .with_version("1.0.0")
         .build_server_builder();
 
-    let server = builder.tool(EchoTool).resource(StaticResource).build();
+    let server = builder
+        .tool(EchoTool)
+        .resource(StaticResourceResource)
+        .build();
 
     let server_handle = std::thread::spawn(move || {
         let cx = Cx::for_testing();

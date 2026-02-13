@@ -9,14 +9,15 @@
 //!   - Rate limiting
 //! - Verify response transformations are observable by clients (no mocks)
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fastmcp_protocol::{JsonRpcRequest, Tool, ToolAnnotations};
+use fastmcp_protocol::JsonRpcRequest;
 use fastmcp_rust::testing::prelude::*;
-use fastmcp_rust::{McpContext, McpError, McpErrorCode, McpResult, ToolHandler};
+use fastmcp_rust::{McpContext, McpError, McpErrorCode, McpResult};
 
 use fastmcp_server::Middleware;
 use fastmcp_server::MiddlewareDecision;
@@ -240,65 +241,40 @@ impl Middleware for PrefixTextMw {
 // Test Handlers
 // ============================================================================
 
-struct EchoTool {
-    calls: Arc<AtomicUsize>,
+thread_local! {
+    static ECHO_TOOL_CALLS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
 }
 
-impl EchoTool {
-    fn new(calls: Arc<AtomicUsize>) -> Self {
-        Self { calls }
-    }
+fn set_echo_tool_calls(calls: Option<Arc<AtomicUsize>>) {
+    ECHO_TOOL_CALLS.with(|slot| {
+        *slot.borrow_mut() = calls;
+    });
 }
 
-impl ToolHandler for EchoTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "echo".to_string(),
-            description: Some("Echo tool".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "message": { "type": "string" } },
-                "required": ["message"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["middleware".to_string()],
-            annotations: Some(ToolAnnotations::new().read_only(true).idempotent(true)),
+#[fastmcp_rust::tool(
+    name = "echo",
+    description = "Echo tool",
+    version = "1.0.0",
+    tags = ["middleware"],
+    annotations(read_only, idempotent)
+)]
+fn echo_tool(_ctx: &McpContext, message: String) -> String {
+    ECHO_TOOL_CALLS.with(|slot| {
+        if let Some(calls) = slot.borrow().as_ref() {
+            calls.fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let message = arguments
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Ok(vec![Content::Text {
-            text: message.to_string(),
-        }])
-    }
+    });
+    message
 }
 
-struct FailingTool;
-
-impl ToolHandler for FailingTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "fail".to_string(),
-            description: Some("Always fails".to_string()),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["middleware".to_string()],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        Err(McpError::tool_error("boom"))
-    }
+#[fastmcp_rust::tool(
+    name = "fail",
+    description = "Always fails",
+    version = "1.0.0",
+    tags = ["middleware"]
+)]
+fn failing_tool() -> McpResult<String> {
+    Err(McpError::tool_error("boom"))
 }
 
 // ============================================================================
@@ -307,6 +283,7 @@ impl ToolHandler for FailingTool {
 
 fn spawn_middleware_server(
     name: &str,
+    echo_calls: Option<Arc<AtomicUsize>>,
     build: impl FnOnce(fastmcp_server::ServerBuilder) -> fastmcp_server::Server,
 ) -> (
     fastmcp_transport::memory::MemoryTransport,
@@ -320,8 +297,10 @@ fn spawn_middleware_server(
     let server = build(builder);
 
     let handle = std::thread::spawn(move || {
+        set_echo_tool_calls(echo_calls);
         let cx = Cx::for_testing();
         server.run_transport_returning_with_cx(&cx, server_transport);
+        set_echo_tool_calls(None);
     });
 
     (client_transport, handle)
@@ -358,13 +337,14 @@ fn middleware_ordering_success_request_in_order_response_in_reverse() {
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let (transport, server_handle) = spawn_middleware_server("mw-order-success", |builder| {
-        builder
-            .middleware(RecordingMw::new("A", Arc::clone(&events)))
-            .middleware(RecordingMw::new("B", Arc::clone(&events)))
-            .tool(EchoTool::new(Arc::clone(&calls)))
-            .build()
-    });
+    let (transport, server_handle) =
+        spawn_middleware_server("mw-order-success", Some(Arc::clone(&calls)), |builder| {
+            builder
+                .middleware(RecordingMw::new("A", Arc::clone(&events)))
+                .middleware(RecordingMw::new("B", Arc::clone(&events)))
+                .tool(EchoTool)
+                .build()
+        });
 
     let mut client = TestClient::new(transport);
     let init_res = client.initialize();
@@ -419,13 +399,14 @@ fn middleware_short_circuit_still_runs_entered_response_stack() {
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let (transport, server_handle) = spawn_middleware_server("mw-short-circuit", |builder| {
-        builder
-            .middleware(ShortCircuitMw::new("A", Arc::clone(&events), false))
-            .middleware(ShortCircuitMw::new("B", Arc::clone(&events), true))
-            .tool(EchoTool::new(Arc::clone(&calls)))
-            .build()
-    });
+    let (transport, server_handle) =
+        spawn_middleware_server("mw-short-circuit", Some(Arc::clone(&calls)), |builder| {
+            builder
+                .middleware(ShortCircuitMw::new("A", Arc::clone(&events), false))
+                .middleware(ShortCircuitMw::new("B", Arc::clone(&events), true))
+                .tool(EchoTool)
+                .build()
+        });
 
     let mut client = TestClient::new(transport);
     let init_res = client.initialize();
@@ -485,7 +466,7 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
 
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    let (transport, server_handle) = spawn_middleware_server("mw-error-rewrite", |builder| {
+    let (transport, server_handle) = spawn_middleware_server("mw-error-rewrite", None, |builder| {
         builder
             .middleware(RecordingMw::new("A", Arc::clone(&events)))
             .middleware(RewriteErrorMw::new("B", Arc::clone(&events), "mw:"))
@@ -556,12 +537,13 @@ fn middleware_response_transformation_is_observable_in_client() {
 
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let (transport, server_handle) = spawn_middleware_server("mw-transform", |builder| {
-        builder
-            .middleware(PrefixTextMw { prefix: "mw:" })
-            .tool(EchoTool::new(Arc::clone(&calls)))
-            .build()
-    });
+    let (transport, server_handle) =
+        spawn_middleware_server("mw-transform", Some(Arc::clone(&calls)), |builder| {
+            builder
+                .middleware(PrefixTextMw { prefix: "mw:" })
+                .tool(EchoTool)
+                .build()
+        });
 
     let mut client = TestClient::new(transport);
     assert!(client.initialize().is_ok());
@@ -600,12 +582,10 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
 
     let caching = ResponseCachingMiddleware::new().call_ttl_secs(1);
 
-    let (transport, server_handle) = spawn_middleware_server("mw-caching", |builder| {
-        builder
-            .middleware(caching)
-            .tool(EchoTool::new(Arc::clone(&calls)))
-            .build()
-    });
+    let (transport, server_handle) =
+        spawn_middleware_server("mw-caching", Some(Arc::clone(&calls)), |builder| {
+            builder.middleware(caching).tool(EchoTool).build()
+        });
 
     let mut client = TestClient::new(transport);
     assert!(client.initialize().is_ok());
@@ -681,12 +661,10 @@ fn rate_limiting_middleware_blocks_second_tool_call_deterministically() {
         .client_id_extractor(|_, req| Some(req.method.clone()));
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let (transport, server_handle) = spawn_middleware_server("mw-rate-limit", |builder| {
-        builder
-            .middleware(limiter)
-            .tool(EchoTool::new(Arc::clone(&calls)))
-            .build()
-    });
+    let (transport, server_handle) =
+        spawn_middleware_server("mw-rate-limit", Some(Arc::clone(&calls)), |builder| {
+            builder.middleware(limiter).tool(EchoTool).build()
+        });
 
     let mut client = TestClient::new(transport);
     assert!(client.initialize().is_ok());
