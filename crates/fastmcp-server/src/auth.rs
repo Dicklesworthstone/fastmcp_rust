@@ -554,6 +554,229 @@ mod tests {
         assert_eq!(auth.subject, None);
         assert!(auth.scopes.is_empty());
     }
+
+    #[test]
+    fn access_token_from_none_params() {
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn access_token_from_array_params() {
+        let params = serde_json::json!([1, 2, 3]);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn access_token_from_number_params() {
+        let params = serde_json::json!(42);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn access_token_from_object_with_token_field() {
+        let params = serde_json::json!({"token": "Bearer my-secret"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("should extract token");
+        assert_eq!(token.scheme, "Bearer");
+        assert_eq!(token.token, "my-secret");
+    }
+
+    #[test]
+    fn access_token_from_object_with_access_token_field() {
+        let params = serde_json::json!({"access_token": "abc123"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("should extract");
+        // Bare token defaults to Bearer scheme
+        assert_eq!(token.scheme, "Bearer");
+        assert_eq!(token.token, "abc123");
+    }
+
+    #[test]
+    fn access_token_from_camel_case_field() {
+        let params = serde_json::json!({"accessToken": "Bearer xyz"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("should extract");
+        assert_eq!(token.token, "xyz");
+    }
+
+    #[test]
+    fn access_token_from_nested_scheme_token_object_with_empty_scheme() {
+        // Empty scheme falls through to the alternate path which finds "token" as a bare string
+        let params = serde_json::json!({"auth": {"scheme": "", "token": "abc"}});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("falls through to string parse");
+        assert_eq!(token.scheme, "Bearer");
+        assert_eq!(token.token, "abc");
+    }
+
+    #[test]
+    fn access_token_from_nested_scheme_token_object_with_whitespace_token() {
+        // Whitespace-only token should be rejected by the scheme/token path
+        // and also by AccessToken::parse which trims empty values
+        let params = serde_json::json!({"authorization": "  "});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn static_verifier_rejects_unknown_token() {
+        let verifier = StaticTokenVerifier::new([("valid-token", AuthContext::anonymous())]);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        let err = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: "wrong-token".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+        assert!(err.message.contains("Invalid access token"));
+    }
+
+    #[test]
+    fn static_verifier_no_scheme_restriction_allows_any() {
+        let verifier = StaticTokenVerifier::new([("tok", AuthContext::with_subject("alice"))]);
+        let req = AuthRequest {
+            method: "tools/call",
+            params: None,
+            request_id: 1,
+        };
+        let auth = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "CustomScheme".to_string(),
+                    token: "tok".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(auth.subject, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn token_auth_provider_succeeds_with_valid_token() {
+        let verifier = StaticTokenVerifier::new([("secret", AuthContext::with_subject("bob"))]);
+        let provider = TokenAuthProvider::new(verifier);
+        let params = serde_json::json!({"authorization": "Bearer secret"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let auth = provider.authenticate(&ctx(), req).unwrap();
+        assert_eq!(auth.subject, Some("bob".to_string()));
+    }
+
+    #[test]
+    fn token_auth_provider_fails_with_wrong_token() {
+        let verifier = StaticTokenVerifier::new([("secret", AuthContext::with_subject("bob"))]);
+        let provider = TokenAuthProvider::new(verifier);
+        let params = serde_json::json!({"authorization": "Bearer wrong"});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let err = provider.authenticate(&ctx(), req).unwrap_err();
+        assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+    }
+
+    #[test]
+    fn auth_request_debug() {
+        let params = serde_json::json!({"key": "val"});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 42,
+        };
+        let debug = format!("{req:?}");
+        assert!(debug.contains("test"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn auth_request_clone_copy() {
+        let req = AuthRequest {
+            method: "test",
+            params: None,
+            request_id: 1,
+        };
+        let req2 = req; // Copy
+        assert_eq!(req.method, req2.method);
+        assert_eq!(req.request_id, req2.request_id);
+    }
+
+    #[test]
+    fn access_token_from_headers_nested_object() {
+        // headers containing an object with scheme and token
+        let params = serde_json::json!({
+            "headers": {
+                "Authorization": {"scheme": "Bearer", "token": "hdr-tok"}
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("should extract from headers");
+        assert_eq!(token.scheme, "Bearer");
+        assert_eq!(token.token, "hdr-tok");
+    }
+
+    #[test]
+    fn access_token_from_empty_object() {
+        let params = serde_json::json!({});
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
 }
 
 #[cfg(all(test, feature = "jwt"))]
