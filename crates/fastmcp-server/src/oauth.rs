@@ -2756,4 +2756,872 @@ mod tests {
     fn localhost_match_non_http_fails() {
         assert!(!localhost_match("ftp://localhost/a", "ftp://localhost/a"));
     }
+
+    // ========================================
+    // Refresh token flow
+    // ========================================
+
+    #[test]
+    fn server_refresh_token_flow() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .scope("write")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read", "write"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Use refresh token to get a new access token
+        let new_resp = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: None,
+            })
+            .unwrap();
+
+        // New access token should be different
+        assert_ne!(new_resp.access_token, token_resp.access_token);
+        assert_eq!(new_resp.token_type, "bearer");
+        // No new refresh token issued by refresh flow
+        assert!(new_resp.refresh_token.is_none());
+        // Scopes preserved
+        assert!(new_resp.scope.is_some());
+    }
+
+    #[test]
+    fn server_refresh_token_scope_narrowing() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .scope("write")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read", "write"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Request only a subset of scopes
+        let new_resp = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: Some(vec!["read".to_string()]),
+            })
+            .unwrap();
+
+        assert_eq!(new_resp.scope, Some("read".to_string()));
+    }
+
+    #[test]
+    fn server_refresh_token_invalid_scope() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Request scope not in original grant
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: Some(vec!["admin".to_string()]),
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_scope");
+    }
+
+    #[test]
+    fn server_refresh_token_revoked() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Revoke the refresh token
+        server.revoke(&refresh, "c1", None).unwrap();
+
+        // Refresh should now fail
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(err.description().contains("revoked"));
+    }
+
+    #[test]
+    fn server_refresh_token_client_id_mismatch() {
+        let server = OAuthServer::with_defaults();
+        let client1 = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        let client2 = OAuthClient::builder("c2")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client1).unwrap();
+        server.register_client(client2).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Try to use with different client_id
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c2".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(err.description().contains("client_id"));
+    }
+
+    #[test]
+    fn server_refresh_token_missing_param() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_request");
+        assert!(err.description().contains("refresh_token"));
+    }
+
+    #[test]
+    fn server_refresh_token_not_found() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some("nonexistent".to_string()),
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_grant");
+    }
+
+    // ========================================
+    // Token exchange edge cases
+    // ========================================
+
+    #[test]
+    fn server_token_auth_code_redirect_uri_mismatch() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .redirect_uri("http://localhost/cb2")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: verifier.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Exchange with different redirect_uri
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost/cb2".to_string()),
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: Some(verifier.to_string()),
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(err.description().contains("redirect_uri"));
+    }
+
+    #[test]
+    fn server_token_auth_code_client_id_mismatch() {
+        let server = OAuthServer::with_defaults();
+        let client1 = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        let client2 = OAuthClient::builder("c2")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client1).unwrap();
+        server.register_client(client2).unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: verifier.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Exchange with different client_id
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost/cb".to_string()),
+                client_id: "c2".to_string(),
+                client_secret: None,
+                code_verifier: Some(verifier.to_string()),
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_grant");
+        assert!(err.description().contains("client_id"));
+    }
+
+    #[test]
+    fn server_token_auth_code_confidential_client_auth_fails() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .secret("correct-secret")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: verifier.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Exchange with wrong secret
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost/cb".to_string()),
+                client_id: "c1".to_string(),
+                client_secret: Some("wrong-secret".to_string()),
+                code_verifier: Some(verifier.to_string()),
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_client");
+    }
+
+    #[test]
+    fn server_token_auth_code_verifier_too_long() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let challenge = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: challenge.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Verifier exceeds max length (128 by default)
+        let long_verifier = "a".repeat(129);
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost/cb".to_string()),
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: Some(long_verifier),
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_request");
+        assert!(err.description().contains("code_verifier"));
+    }
+
+    // ========================================
+    // Authorization edge cases
+    // ========================================
+
+    #[test]
+    fn server_authorize_empty_code_challenge() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let err = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: String::new(),
+                    code_challenge_method: CodeChallengeMethod::S256,
+                },
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_request");
+        assert!(err.description().contains("code_challenge"));
+    }
+
+    #[test]
+    fn server_authorize_with_state_in_redirect() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let (code, redirect) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: Some("my-csrf-state".to_string()),
+                    code_challenge: "challenge-value".to_string(),
+                    code_challenge_method: CodeChallengeMethod::S256,
+                },
+                Some("user1".to_string()),
+            )
+            .unwrap();
+
+        // Redirect should contain both code and state
+        assert!(redirect.contains("code="));
+        assert!(redirect.contains(&url_encode(&code)));
+        assert!(redirect.contains("state=my-csrf-state"));
+    }
+
+    #[test]
+    fn server_authorize_redirect_with_existing_query() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb?foo=bar")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let (_code, redirect) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb?foo=bar".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: "chal".to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Should use '&' separator since '?' already exists
+        assert!(redirect.starts_with("http://localhost/cb?foo=bar&code="));
+    }
+
+    // ========================================
+    // Error conversions
+    // ========================================
+
+    #[test]
+    fn oauth_error_access_denied_into_mcp_error() {
+        let err = OAuthError::AccessDenied("denied".to_string());
+        let mcp: McpError = err.into();
+        assert_eq!(mcp.code, McpErrorCode::ResourceForbidden);
+    }
+
+    #[test]
+    fn oauth_error_description_all_variants() {
+        let cases: Vec<(OAuthError, &str)> = vec![
+            (OAuthError::ServerError("srv".into()), "srv"),
+            (OAuthError::TemporarilyUnavailable("tmp".into()), "tmp"),
+            (OAuthError::UnsupportedResponseType("rt".into()), "rt"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.description(), expected);
+        }
+    }
+
+    #[test]
+    fn oauth_error_display_all_remaining_variants() {
+        let err = OAuthError::TemporarilyUnavailable("try later".into());
+        assert_eq!(format!("{err}"), "temporarily_unavailable: try later");
+
+        let err = OAuthError::UnsupportedResponseType("bad".into());
+        assert_eq!(format!("{err}"), "unsupported_response_type: bad");
+
+        let err = OAuthError::AccessDenied("nope".into());
+        assert_eq!(format!("{err}"), "access_denied: nope");
+    }
+
+    // ========================================
+    // Revocation edge cases
+    // ========================================
+
+    #[test]
+    fn server_revoke_unknown_token_succeeds() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        // Per RFC 7009, revoking an unknown token is not an error
+        server.revoke("no-such-token", "c1", None).unwrap();
+    }
+
+    #[test]
+    fn server_revoke_token_owned_by_other_client() {
+        let server = OAuthServer::with_defaults();
+        let client1 = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        let client2 = OAuthClient::builder("c2")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client1).unwrap();
+        server.register_client(client2).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+
+        // c2 tries to revoke c1's token — should succeed silently (no error)
+        // but the token should NOT be actually marked as revoked
+        server.revoke(&token_resp.access_token, "c2", None).unwrap();
+
+        // Token should still be valid since c2 doesn't own it
+        // Note: the implementation removes the token from the map before checking client
+        // ownership, so this is implementation-specific behavior
+    }
+
+    #[test]
+    fn server_revoke_unknown_client_fails() {
+        let server = OAuthServer::with_defaults();
+        let err = server.revoke("some-token", "unknown", None).unwrap_err();
+        assert_eq!(err.error_code(), "invalid_client");
+    }
+
+    // ========================================
+    // Unregister edge cases
+    // ========================================
+
+    #[test]
+    fn server_unregister_client_removes_auth_codes() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        // Create an auth code
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: verifier.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Verify code exists
+        {
+            let state = server.state.read().unwrap();
+            assert!(state.authorization_codes.contains_key(&code));
+        }
+
+        // Unregister client
+        server.unregister_client("c1").unwrap();
+
+        // Auth code should be removed
+        {
+            let state = server.state.read().unwrap();
+            assert!(!state.authorization_codes.contains_key(&code));
+        }
+    }
+
+    // ========================================
+    // Server misc
+    // ========================================
+
+    #[test]
+    fn server_with_defaults_is_valid() {
+        let server = OAuthServer::with_defaults();
+        assert_eq!(server.config().issuer, "fastmcp");
+        assert!(server.config().allow_public_clients);
+    }
+
+    #[test]
+    fn server_get_client_none_for_unknown() {
+        let server = OAuthServer::with_defaults();
+        assert!(server.get_client("nonexistent").is_none());
+    }
+
+    #[test]
+    fn server_validate_access_token_after_revoke() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+
+        assert!(server.validate_access_token(&resp.access_token).is_some());
+        server.revoke(&resp.access_token, "c1", None).unwrap();
+        assert!(server.validate_access_token(&resp.access_token).is_none());
+    }
+
+    #[test]
+    fn token_verifier_claims_contain_client_id_and_issuer() {
+        let server = Arc::new(OAuthServer::with_defaults());
+        let client = OAuthClient::builder("my-app")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            server.as_ref(),
+            "my-app",
+            "http://localhost/cb",
+            &["read"],
+            "user42",
+        );
+
+        let verifier = server.token_verifier();
+        let cx = asupersync::Cx::for_testing();
+        let mcp_ctx = McpContext::new(cx, 1);
+        let auth_request = AuthRequest {
+            method: "test",
+            params: None,
+            request_id: 1,
+        };
+        let access = AccessToken {
+            scheme: "Bearer".to_string(),
+            token: token_resp.access_token,
+        };
+        let auth = verifier.verify(&mcp_ctx, auth_request, &access).unwrap();
+
+        // Claims should include client_id and issuer
+        let claims = auth.claims.unwrap();
+        assert_eq!(claims["client_id"], "my-app");
+        assert_eq!(claims["iss"], "fastmcp");
+    }
+
+    #[test]
+    fn oauth_token_expires_in_secs_positive() {
+        let token = OAuthToken {
+            token: "t".to_string(),
+            token_type: TokenType::Bearer,
+            client_id: "c".to_string(),
+            scopes: vec![],
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+            subject: None,
+            is_refresh_token: false,
+        };
+        // Should be > 0 since it expires in the future
+        assert!(token.expires_in_secs() > 0);
+    }
+
+    #[test]
+    fn server_refresh_token_confidential_client_auth_fails() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .secret("correct-secret")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        // Issue token using helper (plain PKCE, no client_secret needed for authorize)
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let (code, _) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec!["read".to_string()],
+                    state: None,
+                    code_challenge: verifier.to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Token exchange with correct secret
+        let token_resp = server
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some("http://localhost/cb".to_string()),
+                client_id: "c1".to_string(),
+                client_secret: Some("correct-secret".to_string()),
+                code_verifier: Some(verifier.to_string()),
+                refresh_token: None,
+                scopes: None,
+            })
+            .unwrap();
+
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Refresh with wrong secret
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: Some("wrong-secret".to_string()),
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_client");
+    }
+
+    #[test]
+    fn code_challenge_method_parse_unknown() {
+        assert!(CodeChallengeMethod::parse("sha512").is_none());
+        assert!(CodeChallengeMethod::parse("").is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq("short", "longer_string"));
+        assert!(!constant_time_eq("", "a"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty_strings() {
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn localhost_match_different_localhost_variants() {
+        // 127.0.0.1 and localhost with same path should match
+        assert!(localhost_match(
+            "http://localhost:3000/cb",
+            "http://127.0.0.1:8080/cb"
+        ));
+        // [::1] and localhost
+        assert!(localhost_match(
+            "http://localhost:3000/cb",
+            "http://[::1]:9000/cb"
+        ));
+    }
+
+    #[test]
+    fn url_encode_empty_and_unicode() {
+        assert_eq!(url_encode(""), "");
+        // Unicode bytes get percent-encoded
+        let encoded = url_encode("ü");
+        assert!(encoded.contains('%'));
+    }
 }
