@@ -3624,4 +3624,179 @@ mod tests {
         let encoded = url_encode("ü");
         assert!(encoded.contains('%'));
     }
+
+    // ========================================
+    // Additional coverage — uncovered paths
+    // ========================================
+
+    #[test]
+    fn server_revoke_confidential_client_wrong_secret() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .secret("correct")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let err = server
+            .revoke("any-token", "c1", Some("wrong"))
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_client");
+    }
+
+    #[test]
+    fn server_validate_access_token_expired_returns_none() {
+        let config = OAuthServerConfig {
+            access_token_lifetime: Duration::from_millis(1),
+            ..OAuthServerConfig::default()
+        };
+        let server = OAuthServer::new(config);
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(server.validate_access_token(&resp.access_token).is_none());
+    }
+
+    #[test]
+    fn server_authorize_without_state_omits_state_from_redirect() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let (_code, redirect) = server
+            .authorize(
+                &AuthorizationRequest {
+                    response_type: "code".to_string(),
+                    client_id: "c1".to_string(),
+                    redirect_uri: "http://localhost/cb".to_string(),
+                    scopes: vec![],
+                    state: None,
+                    code_challenge: "chal".to_string(),
+                    code_challenge_method: CodeChallengeMethod::Plain,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(redirect.contains("code="));
+        assert!(!redirect.contains("state="));
+    }
+
+    #[test]
+    fn server_refresh_token_client_deleted_after_issue() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let token_resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+        let refresh = token_resp.refresh_token.unwrap();
+
+        // Delete client, then try to refresh
+        server.unregister_client("c1").unwrap();
+
+        let err = server
+            .token(&TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                redirect_uri: None,
+                client_id: "c1".to_string(),
+                client_secret: None,
+                code_verifier: None,
+                refresh_token: Some(refresh),
+                scopes: None,
+            })
+            .unwrap_err();
+
+        // Refresh token was revoked when client was unregistered
+        assert_eq!(err.error_code(), "invalid_grant");
+    }
+
+    #[test]
+    fn server_issue_tokens_empty_scopes_returns_no_scope() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &[],
+            "user1",
+        );
+
+        assert!(resp.scope.is_none());
+    }
+
+    #[test]
+    fn server_revoke_refresh_token_specifically() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let resp = issue_access_token_via_auth_code(
+            &server,
+            "c1",
+            "http://localhost/cb",
+            &["read"],
+            "user1",
+        );
+        let refresh = resp.refresh_token.unwrap();
+
+        // Revoke the refresh token specifically
+        server.revoke(&refresh, "c1", None).unwrap();
+
+        // Verify it's in revoked set
+        {
+            let state = server.state.read().unwrap();
+            assert!(state.revoked_tokens.contains(&refresh));
+        }
+    }
+
+    #[test]
+    fn localhost_match_no_explicit_port() {
+        assert!(localhost_match(
+            "http://localhost/callback",
+            "http://localhost:8080/callback"
+        ));
+        assert!(localhost_match(
+            "http://localhost/callback",
+            "http://localhost/callback"
+        ));
+    }
 }
