@@ -541,4 +541,135 @@ mod tests {
 
         assert_eq!(client.poll_interval, Duration::from_millis(100));
     }
+
+    #[test]
+    fn test_debug_format() {
+        let (client, _server) = create_memory_transport_pair();
+        let debug = format!("{client:?}");
+        assert!(debug.contains("MemoryTransport"));
+        assert!(debug.contains("closed: false"));
+    }
+
+    #[test]
+    fn test_debug_format_closed() {
+        let (mut client, _server) = create_memory_transport_pair();
+        client.close().unwrap();
+        let debug = format!("{client:?}");
+        assert!(debug.contains("closed: true"));
+    }
+
+    #[test]
+    fn test_send_response_and_receive() {
+        let (mut client, mut server) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+
+        let response =
+            JsonRpcResponse::success(RequestId::Number(99), serde_json::json!({"val": 42}));
+        server.send_response(&cx, &response).unwrap();
+
+        let msg = client.recv(&cx).unwrap();
+        let JsonRpcMessage::Response(resp) = msg else {
+            panic!("expected response");
+        };
+        assert_eq!(resp.id, Some(RequestId::Number(99)));
+    }
+
+    #[test]
+    fn test_send_to_dropped_peer_fails() {
+        let (mut client, server) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+
+        // Drop server, so the receiver is gone
+        drop(server);
+
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        let result = client.send_request(&cx, &request);
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn test_recv_from_dropped_peer_returns_closed() {
+        let (client, mut server) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+
+        // Drop client sender
+        drop(client);
+
+        let result = server.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Closed)));
+        assert!(server.is_closed());
+    }
+
+    #[test]
+    fn test_create_pair_with_capacity() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(2);
+        let cx = Cx::for_testing();
+
+        // Should still work - capacity is advisory since std mpsc is unbounded
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        client.send_request(&cx, &request).unwrap();
+        let msg = server.recv(&cx).unwrap();
+        assert!(matches!(msg, JsonRpcMessage::Request(_)));
+    }
+
+    #[test]
+    fn test_builder_default() {
+        let builder = MemoryTransportBuilder::default();
+        let (client, server) = builder.build();
+        assert_eq!(client.poll_interval, DEFAULT_POLL_INTERVAL);
+        assert_eq!(server.poll_interval, DEFAULT_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn test_close_is_idempotent() {
+        let (mut client, _server) = create_memory_transport_pair();
+        client.close().unwrap();
+        assert!(client.is_closed());
+        // Close again - should not panic
+        client.close().unwrap();
+        assert!(client.is_closed());
+    }
+
+    #[test]
+    fn test_message_ordering() {
+        let (mut client, mut server) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+
+        // Send 10 messages
+        for i in 0..10 {
+            let request = JsonRpcRequest::new(format!("msg_{i}"), None, i as i64);
+            client.send_request(&cx, &request).unwrap();
+        }
+
+        // Verify they arrive in order
+        for i in 0..10 {
+            let msg = server.recv(&cx).unwrap();
+            let JsonRpcMessage::Request(req) = msg else {
+                panic!("expected request");
+            };
+            assert_eq!(req.method, format!("msg_{i}"));
+        }
+    }
+
+    #[test]
+    fn test_cancellation_during_poll() {
+        let (_client, mut server) = MemoryTransportBuilder::new()
+            .poll_interval(Duration::from_millis(5))
+            .build();
+
+        let cx = Cx::for_testing();
+
+        // Cancel after a short delay from another thread
+        let cx_clone = cx.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            cx_clone.set_cancel_requested(true);
+        });
+
+        // recv should eventually return Cancelled
+        let result = server.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+
+        handle.join().unwrap();
+    }
 }

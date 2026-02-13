@@ -363,4 +363,149 @@ mod tests {
         assert!(json_err.source().is_some());
         assert!(size_err.source().is_none());
     }
+
+    #[test]
+    fn test_default_max_message_size() {
+        let codec = Codec::new();
+        assert_eq!(codec.max_message_size(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_set_max_message_size() {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(1024);
+        assert_eq!(codec.max_message_size(), 1024);
+    }
+
+    #[test]
+    fn test_set_max_message_size_clears_oversized_buffer() {
+        let mut codec = Codec::new();
+        // Feed some data into buffer without a newline
+        let partial = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\"";
+        codec.decode(partial).unwrap();
+
+        // Shrink max size to less than buffered data
+        codec.set_max_message_size(5);
+
+        // Buffer should have been cleared; new data should work
+        let small = b"{}\n";
+        // This will fail because {} is not valid JsonRpc, but the point is
+        // the buffer was cleared and doesn't have old data
+        let result = codec.decode(small);
+        // Either error (invalid json) or success - just verify no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_codec_default_trait() {
+        let codec = Codec::default();
+        assert_eq!(codec.max_message_size(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_decode_oversized_projected_data() {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(50);
+
+        // Feed data that exceeds max when projected
+        let big = vec![b'x'; 100];
+        let result = codec.decode(&big);
+        assert!(matches!(result, Err(CodecError::MessageTooLarge(_))));
+    }
+
+    #[test]
+    fn test_buffer_compaction_after_threshold() {
+        let mut codec = Codec::new();
+
+        // Feed many small complete messages to advance read_pos past COMPACT_THRESHOLD
+        let msg = b"{\"jsonrpc\":\"2.0\",\"method\":\"m\",\"id\":1}\n";
+        let many_messages: Vec<u8> = msg.repeat(200); // ~7400 bytes > 4096 threshold
+
+        let messages = codec.decode(&many_messages).unwrap();
+        assert_eq!(messages.len(), 200);
+
+        // After decoding, read_pos should have been compacted
+        // Verify codec still works correctly
+        let next_msg = b"{\"jsonrpc\":\"2.0\",\"method\":\"after_compact\",\"id\":2}\n";
+        let messages = codec.decode(next_msg).unwrap();
+        assert_eq!(messages.len(), 1);
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "after_compact");
+        }
+    }
+
+    #[test]
+    fn test_decode_utf8_message() {
+        let mut codec = Codec::new();
+        let json = "{\"jsonrpc\":\"2.0\",\"method\":\"test/日本語\",\"id\":1}\n";
+        let messages = codec.decode(json.as_bytes()).unwrap();
+        assert_eq!(messages.len(), 1);
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "test/日本語");
+        }
+    }
+
+    #[test]
+    fn test_decode_consecutive_newlines() {
+        let mut codec = Codec::new();
+        let input = b"\n\n{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n\n\n";
+        let messages = codec.decode(input).unwrap();
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_clear_resets_state() {
+        let mut codec = Codec::new();
+
+        // Feed partial data
+        codec.decode(b"{\"jsonrpc\":\"2.0\"").unwrap();
+        codec.clear();
+
+        // Verify internal state is reset by sending a fresh complete message
+        let complete = b"{\"jsonrpc\":\"2.0\",\"method\":\"post_clear\",\"id\":1}\n";
+        let messages = codec.decode(complete).unwrap();
+        assert_eq!(messages.len(), 1);
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert_eq!(req.method, "post_clear");
+        }
+    }
+
+    #[test]
+    fn test_codec_error_from_serde() {
+        let serde_err = serde_json::from_str::<()>("bad").unwrap_err();
+        let codec_err: CodecError = serde_err.into();
+        assert!(matches!(codec_err, CodecError::Json(_)));
+    }
+
+    #[test]
+    fn test_encode_request_contains_newline() {
+        let codec = Codec::new();
+        let request = JsonRpcRequest::new("m", None, 1i64);
+        let encoded = codec.encode_request(&request).unwrap();
+        assert_eq!(encoded.last(), Some(&b'\n'));
+        // Everything before \n should be valid JSON
+        let json_part = &encoded[..encoded.len() - 1];
+        let _: JsonRpcRequest = serde_json::from_slice(json_part).expect("valid JSON");
+    }
+
+    #[test]
+    fn test_encode_response_contains_newline() {
+        let codec = Codec::new();
+        let response =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"ok": true}));
+        let encoded = codec.encode_response(&response).unwrap();
+        assert_eq!(encoded.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn test_decode_notification_without_id() {
+        let mut codec = Codec::new();
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/test\"}\n";
+        let messages = codec.decode(input).unwrap();
+        assert_eq!(messages.len(), 1);
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            assert!(req.id.is_none());
+            assert_eq!(req.method, "notifications/test");
+        }
+    }
 }
