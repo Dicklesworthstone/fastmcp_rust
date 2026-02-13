@@ -452,4 +452,150 @@ mod tests {
         let request = JsonRpcRequest::new("test", None, 1i64);
         assert_is_request(&request);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1fnm)
+    // =========================================================================
+
+    #[test]
+    fn error_response_without_expected_code() {
+        let error = fastmcp_protocol::JsonRpcError {
+            code: -32600,
+            message: "Invalid request".to_string(),
+            data: None,
+        };
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(JSONRPC_VERSION),
+            id: Some(RequestId::Number(1)),
+            result: None,
+            error: Some(error),
+        };
+        // None code means we only check that it IS an error, not the code value
+        assert_json_rpc_error(&response, None);
+    }
+
+    #[test]
+    fn mcp_compliant_tools_call() {
+        let response = JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({ "content": [{"type": "text", "text": "hello"}] }),
+        );
+        assert_mcp_compliant("tools/call", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_resources_list() {
+        let response =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({ "resources": [] }));
+        assert_mcp_compliant("resources/list", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_resources_read() {
+        let response = JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({ "contents": [{"uri": "file:///a", "text": "data"}] }),
+        );
+        assert_mcp_compliant("resources/read", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_resource_templates_list() {
+        let response = JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({ "resourceTemplates": [] }),
+        );
+        assert_mcp_compliant("resources/templates/list", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_prompts_list() {
+        let response =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({ "prompts": [] }));
+        assert_mcp_compliant("prompts/list", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_prompts_get() {
+        let response = JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({ "messages": [{"role": "user", "content": {}}] }),
+        );
+        assert_mcp_compliant("prompts/get", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_error_response_early_return() {
+        let error = fastmcp_protocol::JsonRpcError {
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: None,
+        };
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(JSONRPC_VERSION),
+            id: Some(RequestId::Number(1)),
+            result: None,
+            error: Some(error),
+        };
+        // Error responses skip MCP-specific checks and return early
+        assert_mcp_compliant("tools/list", &response);
+    }
+
+    #[test]
+    fn mcp_compliant_unknown_method() {
+        let response = JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({ "anything": true }),
+        );
+        // Unknown methods only get JSON-RPC validation
+        assert_mcp_compliant("custom/method", &response);
+    }
+
+    #[test]
+    fn content_valid_image() {
+        let content = serde_json::json!({
+            "type": "image",
+            "data": "base64data",
+            "mimeType": "image/png"
+        });
+        assert_content_valid(&content);
+    }
+
+    #[test]
+    fn content_valid_audio() {
+        let content = serde_json::json!({
+            "type": "audio",
+            "data": "base64data",
+            "mimeType": "audio/wav"
+        });
+        assert_content_valid(&content);
+    }
+
+    #[test]
+    fn content_valid_resource() {
+        let content = serde_json::json!({
+            "type": "resource",
+            "resource": { "uri": "file:///test.txt", "text": "data" }
+        });
+        assert_content_valid(&content);
+    }
+
+    #[test]
+    fn content_valid_unknown_type() {
+        let content = serde_json::json!({
+            "type": "custom_extension",
+            "data": "whatever"
+        });
+        // Unknown types pass for extensibility
+        assert_content_valid(&content);
+    }
+
+    #[test]
+    fn tool_valid_without_input_schema() {
+        let tool = serde_json::json!({
+            "name": "simple_tool"
+        });
+        // inputSchema is optional
+        assert_tool_valid(&tool);
+    }
 }

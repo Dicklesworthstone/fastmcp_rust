@@ -386,4 +386,87 @@ mod tests {
         assert!(report.contains("execute"));
         assert!(report.contains("teardown"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1fnm)
+    // =========================================================================
+
+    #[test]
+    fn stopwatch_stopped_constructor() {
+        let sw = Stopwatch::stopped();
+        assert_eq!(sw.lap_count(), 0);
+        assert!(sw.laps().is_empty());
+    }
+
+    #[test]
+    fn stopwatch_default_matches_new() {
+        let def = Stopwatch::default();
+        let new = Stopwatch::new();
+        assert_eq!(def.lap_count(), new.lap_count());
+    }
+
+    #[test]
+    fn stopwatch_since_last_lap() {
+        let sw = Stopwatch::new();
+        let since = sw.since_last_lap();
+        assert!(since < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stopwatch_total_lap_time() {
+        let mut sw = Stopwatch::new();
+        sw.lap("a");
+        sw.lap("b");
+        let total = sw.total_lap_time();
+        assert!(total > Duration::ZERO);
+    }
+
+    #[test]
+    fn stopwatch_debug_and_clone() {
+        let mut sw = Stopwatch::new();
+        sw.lap("x");
+        let debug = format!("{sw:?}");
+        assert!(debug.contains("Stopwatch"));
+
+        let cloned = sw.clone();
+        assert_eq!(cloned.lap_count(), 1);
+    }
+
+    #[test]
+    fn timing_stats_debug_clone_and_is_empty() {
+        let mut sw = Stopwatch::new();
+        sw.lap("a");
+        let stats = sw.stats();
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("TimingStats"));
+
+        let cloned = stats.clone();
+        assert_eq!(cloned.count, 1);
+        assert!(!cloned.is_empty());
+    }
+
+    #[test]
+    fn timer_from_secs() {
+        let timer = Timer::from_secs(60);
+        assert!(!timer.is_expired());
+        assert!(timer.remaining() > Duration::from_secs(59));
+    }
+
+    #[test]
+    fn timer_debug_and_clone() {
+        let timer = Timer::from_millis(100);
+        let debug = format!("{timer:?}");
+        assert!(debug.contains("Timer"));
+
+        let cloned = timer.clone();
+        assert!(!cloned.is_expired());
+    }
+
+    #[test]
+    fn report_empty_laps() {
+        let sw = Stopwatch::new();
+        let report = sw.report();
+        assert!(report.contains("Laps: 0"));
+        assert!(!report.contains("Statistics"));
+    }
 }

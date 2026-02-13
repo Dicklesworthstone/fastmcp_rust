@@ -239,4 +239,54 @@ mod tests {
         let ctx = TestContext::new();
         assert!(ctx.checkpoint().is_ok());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1fnm)
+    // =========================================================================
+
+    #[test]
+    fn default_matches_new() {
+        let def = TestContext::default();
+        let new = TestContext::new();
+        assert!(def.budget().is_none());
+        assert!(new.budget().is_none());
+        assert!(!def.is_cancelled());
+    }
+
+    #[test]
+    fn debug_output() {
+        let ctx = TestContext::new();
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("TestContext"));
+        assert!(debug.contains("has_budget"));
+        assert!(debug.contains("has_session_state"));
+    }
+
+    #[test]
+    fn clone_produces_independent_context() {
+        let ctx = TestContext::new().with_budget_secs(30);
+        let cloned = ctx.clone();
+        assert!(cloned.budget().is_some());
+    }
+
+    #[test]
+    fn with_budget_ms_sets_budget() {
+        let ctx = TestContext::new().with_budget_ms(5000);
+        assert!(ctx.budget().is_some());
+    }
+
+    #[test]
+    fn cx_and_cx_clone_accessors() {
+        let ctx = TestContext::new();
+        let _cx_ref = ctx.cx();
+        let _cx_owned = ctx.cx_clone();
+    }
+
+    #[test]
+    fn mcp_context_with_state_method() {
+        let state = SessionState::new();
+        let ctx = TestContext::new();
+        let mcp_ctx = ctx.mcp_context_with_state(99, state);
+        assert_eq!(mcp_ctx.request_id(), 99);
+    }
 }
