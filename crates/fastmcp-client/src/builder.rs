@@ -609,4 +609,28 @@ mod tests {
         let err = result.err().expect("error result");
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
+
+    #[test]
+    fn builder_debug_includes_client_info() {
+        let builder = ClientBuilder::new().client_info("dbg-test", "0.1");
+        let debug = format!("{:?}", builder);
+        assert!(debug.contains("dbg-test"));
+        assert!(debug.contains("0.1"));
+    }
+
+    #[test]
+    fn connect_stdio_nonexistent_command_fails() {
+        let result = ClientBuilder::new()
+            .max_retries(0)
+            .connect_stdio("fastmcp_nonexistent_binary_xyz", &["--version"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_working_dir_last_wins() {
+        let builder = ClientBuilder::new()
+            .working_dir("/first")
+            .working_dir("/second");
+        assert_eq!(builder.working_dir, Some(PathBuf::from("/second")));
+    }
 }
