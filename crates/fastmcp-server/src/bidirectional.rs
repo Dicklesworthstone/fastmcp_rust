@@ -536,4 +536,163 @@ mod tests {
         );
         assert!(!pending.route_response(&response));
     }
+
+    // ── PendingRequests additional coverage ───────────────────────────
+
+    #[test]
+    fn pending_requests_default_is_same_as_new() {
+        let pr = PendingRequests::default();
+        let id = pr.next_request_id();
+        // IDs start at 1_000_000
+        assert_eq!(id, RequestId::Number(1_000_000));
+    }
+
+    #[test]
+    fn pending_requests_ids_are_sequential() {
+        let pr = PendingRequests::new();
+        let id1 = pr.next_request_id();
+        let id2 = pr.next_request_id();
+        let id3 = pr.next_request_id();
+        assert_eq!(id1, RequestId::Number(1_000_000));
+        assert_eq!(id2, RequestId::Number(1_000_001));
+        assert_eq!(id3, RequestId::Number(1_000_002));
+    }
+
+    #[test]
+    fn pending_requests_remove_prevents_routing() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let _receiver = pr.register(id.clone());
+
+        // Remove the pending request
+        pr.remove(&id);
+
+        // Routing should fail now
+        let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert!(!pr.route_response(&response));
+    }
+
+    #[test]
+    fn pending_requests_route_response_without_id_returns_false() {
+        let pr = PendingRequests::new();
+        // A response with no id
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
+            id: None,
+            result: Some(serde_json::json!(null)),
+            error: None,
+        };
+        assert!(!pr.route_response(&response));
+    }
+
+    #[test]
+    fn pending_requests_route_response_with_null_result() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let receiver = pr.register(id.clone());
+
+        // Response with no result field (result is None → becomes Null)
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
+            id: Some(id),
+            result: None,
+            error: None,
+        };
+        assert!(pr.route_response(&response));
+
+        let result = receiver.recv().unwrap().unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn pending_requests_route_after_receiver_dropped_does_not_panic() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let receiver = pr.register(id.clone());
+
+        // Drop the receiver
+        drop(receiver);
+
+        // Routing should still succeed (sender.send returns Err but is ignored)
+        let response = JsonRpcResponse::success(id, serde_json::json!(42));
+        assert!(pr.route_response(&response));
+    }
+
+    #[test]
+    fn pending_requests_cancel_all_clears_pending() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let _receiver = pr.register(id.clone());
+
+        pr.cancel_all();
+
+        // No more pending requests to route to
+        let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert!(!pr.route_response(&response));
+    }
+
+    #[test]
+    fn pending_requests_cancel_all_empty_is_noop() {
+        let pr = PendingRequests::new();
+        // Should not panic on empty
+        pr.cancel_all();
+    }
+
+    #[test]
+    fn pending_requests_debug_format() {
+        let pr = PendingRequests::new();
+        let debug = format!("{:?}", pr);
+        assert!(debug.contains("PendingRequests"));
+    }
+
+    // ── RequestSender ────────────────────────────────────────────────
+
+    #[test]
+    fn request_sender_debug_format() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(pending, send_fn);
+        let debug = format!("{:?}", sender);
+        assert!(debug.contains("RequestSender"));
+    }
+
+    #[test]
+    fn request_sender_transport_failure_returns_error() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Err("transport down".to_string()));
+        let sender = RequestSender::new(pending, send_fn);
+
+        let cx = Cx::for_testing();
+        let result: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Failed to send request"));
+        assert!(err.message.contains("transport down"));
+    }
+
+    #[test]
+    fn request_sender_transport_failure_cleans_up_pending() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Err("fail".to_string()));
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+
+        let cx = Cx::for_testing();
+        let _err: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+
+        // The pending request should have been cleaned up
+        let id = RequestId::Number(1_000_000); // first ID
+        let response = JsonRpcResponse::success(id, serde_json::json!(null));
+        assert!(!pending.route_response(&response));
+    }
+
+    #[test]
+    fn request_sender_clone() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(pending, send_fn);
+        let cloned = sender.clone();
+        let debug = format!("{:?}", cloned);
+        assert!(debug.contains("RequestSender"));
+    }
 }
