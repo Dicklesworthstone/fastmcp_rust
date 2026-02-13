@@ -1803,4 +1803,957 @@ mod tests {
         let result = verifier.verify(&mcp_ctx, auth_request, &wrong_scheme);
         assert!(result.is_err());
     }
+
+    // ========================================
+    // OAuthServerConfig
+    // ========================================
+
+    #[test]
+    fn config_default_values() {
+        let c = OAuthServerConfig::default();
+        assert_eq!(c.issuer, "fastmcp");
+        assert_eq!(c.access_token_lifetime, Duration::from_secs(3600));
+        assert_eq!(c.refresh_token_lifetime, Duration::from_secs(86400 * 30));
+        assert_eq!(c.authorization_code_lifetime, Duration::from_secs(600));
+        assert!(c.allow_public_clients);
+        assert_eq!(c.min_code_verifier_length, 43);
+        assert_eq!(c.max_code_verifier_length, 128);
+        assert_eq!(c.token_entropy_bytes, 32);
+    }
+
+    #[test]
+    fn config_debug_and_clone() {
+        let c = OAuthServerConfig::default();
+        let debug = format!("{:?}", c);
+        assert!(debug.contains("OAuthServerConfig"));
+        assert!(debug.contains("fastmcp"));
+
+        let cloned = c.clone();
+        assert_eq!(cloned.issuer, "fastmcp");
+    }
+
+    // ========================================
+    // ClientType
+    // ========================================
+
+    #[test]
+    fn client_type_debug_and_eq() {
+        assert_eq!(ClientType::Public, ClientType::Public);
+        assert_ne!(ClientType::Public, ClientType::Confidential);
+        let debug = format!("{:?}", ClientType::Confidential);
+        assert!(debug.contains("Confidential"));
+    }
+
+    #[test]
+    fn client_type_copy() {
+        let t = ClientType::Public;
+        let t2 = t; // Copy
+        assert_eq!(t, t2);
+    }
+
+    // ========================================
+    // OAuthClient — additional
+    // ========================================
+
+    #[test]
+    fn client_debug_and_clone() {
+        let client = OAuthClient::builder("dbg")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        let debug = format!("{:?}", client);
+        assert!(debug.contains("OAuthClient"));
+        assert!(debug.contains("dbg"));
+
+        let cloned = client.clone();
+        assert_eq!(cloned.client_id, "dbg");
+    }
+
+    #[test]
+    fn client_authenticate_public_no_secret() {
+        let client = OAuthClient::builder("pub")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        // Public client with no secret provided: should succeed
+        assert!(client.authenticate(None));
+        // Public client with secret provided: should fail
+        assert!(!client.authenticate(Some("any")));
+    }
+
+    #[test]
+    fn client_validate_redirect_uri_non_localhost() {
+        let client = OAuthClient::builder("c")
+            .redirect_uri("https://example.com/cb")
+            .build()
+            .unwrap();
+        // Non-localhost requires exact match
+        assert!(client.validate_redirect_uri("https://example.com/cb"));
+        assert!(!client.validate_redirect_uri("https://example.com/cb2"));
+        assert!(!client.validate_redirect_uri("https://other.com/cb"));
+    }
+
+    #[test]
+    fn client_validate_redirect_uri_localhost_ipv6() {
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://[::1]:3000/callback")
+            .build()
+            .unwrap();
+        // IPv6 localhost with different port
+        assert!(client.validate_redirect_uri("http://[::1]:8080/callback"));
+        // Cross-localhost variant match
+        assert!(client.validate_redirect_uri("http://localhost:9000/callback"));
+    }
+
+    #[test]
+    fn client_validate_scopes_empty() {
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        // Empty scopes should always be valid
+        assert!(client.validate_scopes(&[]));
+    }
+
+    // ========================================
+    // OAuthClientBuilder — additional
+    // ========================================
+
+    #[test]
+    fn client_builder_debug() {
+        let builder = OAuthClient::builder("test-id");
+        let debug = format!("{:?}", builder);
+        assert!(debug.contains("OAuthClientBuilder"));
+        assert!(debug.contains("test-id"));
+    }
+
+    #[test]
+    fn client_builder_empty_id_fails() {
+        let result = OAuthClient::builder("")
+            .redirect_uri("http://localhost/cb")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_builder_no_redirect_uris_fails() {
+        let result = OAuthClient::builder("c").build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_builder_redirect_uris_multiple() {
+        let client = OAuthClient::builder("c")
+            .redirect_uris(vec!["http://localhost/a", "http://localhost/b"])
+            .build()
+            .unwrap();
+        assert_eq!(client.redirect_uris.len(), 2);
+    }
+
+    #[test]
+    fn client_builder_scopes_multiple() {
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .scopes(vec!["r", "w", "admin"])
+            .build()
+            .unwrap();
+        assert_eq!(client.allowed_scopes.len(), 3);
+    }
+
+    #[test]
+    fn client_builder_description() {
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .description("A test app")
+            .build()
+            .unwrap();
+        assert_eq!(client.description, Some("A test app".to_string()));
+    }
+
+    // ========================================
+    // CodeChallengeMethod — additional
+    // ========================================
+
+    #[test]
+    fn code_challenge_method_as_str() {
+        assert_eq!(CodeChallengeMethod::Plain.as_str(), "plain");
+        assert_eq!(CodeChallengeMethod::S256.as_str(), "S256");
+    }
+
+    #[test]
+    fn code_challenge_method_clone_copy_eq() {
+        let m = CodeChallengeMethod::S256;
+        let m2 = m; // Copy
+        assert_eq!(m, m2);
+        let m3 = m.clone();
+        assert_eq!(m, m3);
+    }
+
+    // ========================================
+    // AuthorizationCode
+    // ========================================
+
+    #[test]
+    fn authorization_code_not_expired_initially() {
+        let code = AuthorizationCode {
+            code: "test-code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(600),
+            subject: None,
+            state: None,
+        };
+        assert!(!code.is_expired());
+    }
+
+    #[test]
+    fn authorization_code_expired() {
+        let code = AuthorizationCode {
+            code: "test-code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+            issued_at: Instant::now() - Duration::from_secs(100),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            subject: None,
+            state: None,
+        };
+        assert!(code.is_expired());
+    }
+
+    #[test]
+    fn authorization_code_validate_plain() {
+        let code = AuthorizationCode {
+            code: "test".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            code_challenge: "my-verifier".to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(600),
+            subject: None,
+            state: None,
+        };
+        assert!(code.validate_code_verifier("my-verifier"));
+        assert!(!code.validate_code_verifier("wrong"));
+    }
+
+    #[test]
+    fn authorization_code_validate_s256() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = compute_s256_challenge(verifier);
+        let code = AuthorizationCode {
+            code: "test".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            code_challenge: challenge,
+            code_challenge_method: CodeChallengeMethod::S256,
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(600),
+            subject: None,
+            state: None,
+        };
+        assert!(code.validate_code_verifier(verifier));
+        assert!(!code.validate_code_verifier("wrong-verifier"));
+    }
+
+    #[test]
+    fn authorization_code_debug_and_clone() {
+        let code = AuthorizationCode {
+            code: "c".to_string(),
+            client_id: "cid".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec!["read".to_string()],
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            subject: Some("user".to_string()),
+            state: Some("state".to_string()),
+        };
+        let debug = format!("{:?}", code);
+        assert!(debug.contains("AuthorizationCode"));
+        let cloned = code.clone();
+        assert_eq!(cloned.client_id, "cid");
+    }
+
+    // ========================================
+    // TokenType
+    // ========================================
+
+    #[test]
+    fn token_type_as_str() {
+        assert_eq!(TokenType::Bearer.as_str(), "bearer");
+    }
+
+    #[test]
+    fn token_type_debug_clone_copy_eq() {
+        let t = TokenType::Bearer;
+        let t2 = t; // Copy
+        assert_eq!(t, t2);
+        let t3 = t.clone();
+        assert_eq!(t, t3);
+        let debug = format!("{:?}", t);
+        assert!(debug.contains("Bearer"));
+    }
+
+    // ========================================
+    // OAuthToken
+    // ========================================
+
+    #[test]
+    fn oauth_token_not_expired() {
+        let token = OAuthToken {
+            token: "t".to_string(),
+            token_type: TokenType::Bearer,
+            client_id: "c".to_string(),
+            scopes: vec![],
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+            subject: None,
+            is_refresh_token: false,
+        };
+        assert!(!token.is_expired());
+        assert!(token.expires_in_secs() > 0);
+    }
+
+    #[test]
+    fn oauth_token_expired() {
+        let token = OAuthToken {
+            token: "t".to_string(),
+            token_type: TokenType::Bearer,
+            client_id: "c".to_string(),
+            scopes: vec![],
+            issued_at: Instant::now() - Duration::from_secs(100),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            subject: None,
+            is_refresh_token: false,
+        };
+        assert!(token.is_expired());
+        assert_eq!(token.expires_in_secs(), 0);
+    }
+
+    #[test]
+    fn oauth_token_debug_and_clone() {
+        let token = OAuthToken {
+            token: "tok".to_string(),
+            token_type: TokenType::Bearer,
+            client_id: "c".to_string(),
+            scopes: vec!["read".to_string()],
+            issued_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            subject: Some("user".to_string()),
+            is_refresh_token: true,
+        };
+        let debug = format!("{:?}", token);
+        assert!(debug.contains("OAuthToken"));
+        let cloned = token.clone();
+        assert_eq!(cloned.token, "tok");
+        assert!(cloned.is_refresh_token);
+    }
+
+    // ========================================
+    // TokenResponse
+    // ========================================
+
+    #[test]
+    fn token_response_serialize_without_optional_fields() {
+        let resp = TokenResponse {
+            access_token: "at".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            refresh_token: None,
+            scope: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("refresh_token"));
+        assert!(!json.contains("scope"));
+    }
+
+    #[test]
+    fn token_response_serialize_with_optional_fields() {
+        let resp = TokenResponse {
+            access_token: "at".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            refresh_token: Some("rt".to_string()),
+            scope: Some("read write".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("refresh_token"));
+        assert!(json.contains("scope"));
+    }
+
+    // ========================================
+    // AuthorizationRequest / TokenRequest
+    // ========================================
+
+    #[test]
+    fn authorization_request_debug_and_clone() {
+        let req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec!["read".to_string()],
+            state: Some("s".to_string()),
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let debug = format!("{:?}", req);
+        assert!(debug.contains("AuthorizationRequest"));
+        let cloned = req.clone();
+        assert_eq!(cloned.client_id, "c");
+    }
+
+    #[test]
+    fn token_request_debug_and_clone() {
+        let req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some("code".to_string()),
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some("verifier".to_string()),
+            refresh_token: None,
+            scopes: None,
+        };
+        let debug = format!("{:?}", req);
+        assert!(debug.contains("TokenRequest"));
+        let cloned = req.clone();
+        assert_eq!(cloned.grant_type, "authorization_code");
+    }
+
+    // ========================================
+    // OAuthError — additional
+    // ========================================
+
+    #[test]
+    fn oauth_error_all_codes() {
+        let cases: Vec<(OAuthError, &str)> = vec![
+            (OAuthError::InvalidRequest("x".into()), "invalid_request"),
+            (OAuthError::InvalidClient("x".into()), "invalid_client"),
+            (OAuthError::InvalidGrant("x".into()), "invalid_grant"),
+            (
+                OAuthError::UnauthorizedClient("x".into()),
+                "unauthorized_client",
+            ),
+            (
+                OAuthError::UnsupportedGrantType("x".into()),
+                "unsupported_grant_type",
+            ),
+            (OAuthError::InvalidScope("x".into()), "invalid_scope"),
+            (OAuthError::ServerError("x".into()), "server_error"),
+            (
+                OAuthError::TemporarilyUnavailable("x".into()),
+                "temporarily_unavailable",
+            ),
+            (OAuthError::AccessDenied("x".into()), "access_denied"),
+            (
+                OAuthError::UnsupportedResponseType("x".into()),
+                "unsupported_response_type",
+            ),
+        ];
+        for (err, expected_code) in cases {
+            assert_eq!(err.error_code(), expected_code);
+            assert_eq!(err.description(), "x");
+        }
+    }
+
+    #[test]
+    fn oauth_error_debug_and_clone() {
+        let err = OAuthError::ServerError("test".into());
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("ServerError"));
+        let cloned = err.clone();
+        assert_eq!(cloned.description(), "test");
+    }
+
+    #[test]
+    fn oauth_error_is_std_error() {
+        let err = OAuthError::InvalidGrant("x".into());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn oauth_error_into_mcp_error_forbidden() {
+        // InvalidClient and UnauthorizedClient and AccessDenied → ResourceForbidden
+        let err: McpError = OAuthError::InvalidClient("c".into()).into();
+        assert!(err.message.contains("invalid_client"));
+        let err: McpError = OAuthError::UnauthorizedClient("c".into()).into();
+        assert!(err.message.contains("unauthorized_client"));
+        let err: McpError = OAuthError::AccessDenied("d".into()).into();
+        assert!(err.message.contains("access_denied"));
+    }
+
+    #[test]
+    fn oauth_error_into_mcp_error_invalid_request() {
+        // Other variants → InvalidRequest
+        let err: McpError = OAuthError::InvalidScope("s".into()).into();
+        assert!(err.message.contains("invalid_scope"));
+        let err: McpError = OAuthError::UnsupportedGrantType("g".into()).into();
+        assert!(err.message.contains("unsupported_grant_type"));
+    }
+
+    // ========================================
+    // OAuthServer — additional
+    // ========================================
+
+    #[test]
+    fn server_config_accessor() {
+        let config = OAuthServerConfig {
+            issuer: "custom-issuer".to_string(),
+            ..OAuthServerConfig::default()
+        };
+        let server = OAuthServer::new(config);
+        assert_eq!(server.config().issuer, "custom-issuer");
+    }
+
+    #[test]
+    fn server_register_public_not_allowed() {
+        let config = OAuthServerConfig {
+            allow_public_clients: false,
+            ..OAuthServerConfig::default()
+        };
+        let server = OAuthServer::new(config);
+
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        let result = server.register_client(client);
+        assert!(matches!(result, Err(OAuthError::InvalidClient(_))));
+    }
+
+    #[test]
+    fn server_list_clients() {
+        let server = OAuthServer::with_defaults();
+        assert!(server.list_clients().is_empty());
+
+        let client = OAuthClient::builder("a")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+        assert_eq!(server.list_clients().len(), 1);
+    }
+
+    #[test]
+    fn server_authorize_unsupported_response_type() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let req = AuthorizationRequest {
+            response_type: "token".to_string(), // not "code"
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let result = server.authorize(&req, None);
+        assert!(matches!(
+            result,
+            Err(OAuthError::UnsupportedResponseType(_))
+        ));
+    }
+
+    #[test]
+    fn server_authorize_invalid_redirect() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "https://evil.com/cb".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let result = server.authorize(&req, None);
+        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn server_authorize_invalid_scope() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec!["admin".to_string()],
+            state: None,
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let result = server.authorize(&req, None);
+        assert!(matches!(result, Err(OAuthError::InvalidScope(_))));
+    }
+
+    #[test]
+    fn server_authorize_unknown_client() {
+        let server = OAuthServer::with_defaults();
+        let req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "nonexistent".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: "ch".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let result = server.authorize(&req, None);
+        assert!(matches!(result, Err(OAuthError::InvalidClient(_))));
+    }
+
+    #[test]
+    fn server_token_unsupported_grant_type() {
+        let server = OAuthServer::with_defaults();
+        let req = TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: None,
+            refresh_token: None,
+            scopes: None,
+        };
+        let result = server.token(&req);
+        assert!(matches!(result, Err(OAuthError::UnsupportedGrantType(_))));
+    }
+
+    #[test]
+    fn server_token_auth_code_missing_code() {
+        let server = OAuthServer::with_defaults();
+        let req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: None, // missing
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some("v".repeat(43)),
+            refresh_token: None,
+            scopes: None,
+        };
+        let result = server.token(&req);
+        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn server_token_auth_code_missing_redirect() {
+        let server = OAuthServer::with_defaults();
+        let req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some("code".to_string()),
+            redirect_uri: None, // missing
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some("v".repeat(43)),
+            refresh_token: None,
+            scopes: None,
+        };
+        let result = server.token(&req);
+        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn server_token_auth_code_missing_verifier() {
+        let server = OAuthServer::with_defaults();
+        let req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some("code".to_string()),
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: None, // missing
+            refresh_token: None,
+            scopes: None,
+        };
+        let result = server.token(&req);
+        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn server_token_auth_code_verifier_too_short() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        // Authorize first
+        let verifier = "short"; // < 43 chars
+        let req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: verifier.to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+        };
+        let (code, _) = server.authorize(&req, None).unwrap();
+
+        let token_req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code),
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some(verifier.to_string()),
+            refresh_token: None,
+            scopes: None,
+        };
+        let result = server.token(&token_req);
+        assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn server_full_auth_code_flow_with_s256() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = compute_s256_challenge(verifier);
+
+        let auth_req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec!["read".to_string()],
+            state: None,
+            code_challenge: challenge,
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let (code, _) = server
+            .authorize(&auth_req, Some("user1".to_string()))
+            .unwrap();
+
+        let token_req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code),
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some(verifier.to_string()),
+            refresh_token: None,
+            scopes: None,
+        };
+        let resp = server.token(&token_req).unwrap();
+        assert!(!resp.access_token.is_empty());
+        assert!(resp.refresh_token.is_some());
+        assert_eq!(resp.token_type, "bearer");
+        assert_eq!(resp.scope, Some("read".to_string()));
+    }
+
+    #[test]
+    fn server_token_code_already_used() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let auth_req = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "c".to_string(),
+            redirect_uri: "http://localhost/cb".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: verifier.to_string(),
+            code_challenge_method: CodeChallengeMethod::Plain,
+        };
+        let (code, _) = server.authorize(&auth_req, None).unwrap();
+
+        let token_req = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code.clone()),
+            redirect_uri: Some("http://localhost/cb".to_string()),
+            client_id: "c".to_string(),
+            client_secret: None,
+            code_verifier: Some(verifier.to_string()),
+            refresh_token: None,
+            scopes: None,
+        };
+        // First use succeeds
+        server.token(&token_req).unwrap();
+        // Second use fails (code is single-use)
+        let result = server.token(&token_req);
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[test]
+    fn server_validate_access_token_nonexistent() {
+        let server = OAuthServer::with_defaults();
+        assert!(server.validate_access_token("nonexistent").is_none());
+    }
+
+    #[test]
+    fn server_unregister_client_revokes_tokens() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .scope("read")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let resp = issue_access_token_via_auth_code(
+            &server,
+            "c",
+            "http://localhost/cb",
+            &["read"],
+            "user",
+        );
+        assert!(server.validate_access_token(&resp.access_token).is_some());
+
+        server.unregister_client("c").unwrap();
+        assert!(server.validate_access_token(&resp.access_token).is_none());
+    }
+
+    #[test]
+    fn server_cleanup_expired_removes_old_tokens() {
+        let config = OAuthServerConfig {
+            access_token_lifetime: Duration::from_millis(1),
+            refresh_token_lifetime: Duration::from_millis(1),
+            authorization_code_lifetime: Duration::from_millis(1),
+            ..OAuthServerConfig::default()
+        };
+        let server = OAuthServer::new(config);
+        let client = OAuthClient::builder("c")
+            .redirect_uri("http://localhost/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let _resp =
+            issue_access_token_via_auth_code(&server, "c", "http://localhost/cb", &[], "user");
+
+        // Wait for expiry
+        std::thread::sleep(Duration::from_millis(5));
+
+        let stats_before = server.stats();
+        server.cleanup_expired();
+        let stats_after = server.stats();
+
+        assert!(stats_after.access_tokens <= stats_before.access_tokens);
+    }
+
+    // ========================================
+    // OAuthServerStats
+    // ========================================
+
+    #[test]
+    fn server_stats_default() {
+        let stats = OAuthServerStats::default();
+        assert_eq!(stats.clients, 0);
+        assert_eq!(stats.authorization_codes, 0);
+        assert_eq!(stats.access_tokens, 0);
+        assert_eq!(stats.refresh_tokens, 0);
+        assert_eq!(stats.revoked_tokens, 0);
+    }
+
+    #[test]
+    fn server_stats_debug_and_clone() {
+        let stats = OAuthServerStats {
+            clients: 1,
+            access_tokens: 5,
+            ..OAuthServerStats::default()
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("OAuthServerStats"));
+        let cloned = stats.clone();
+        assert_eq!(cloned.clients, 1);
+    }
+
+    // ========================================
+    // Helper functions — additional
+    // ========================================
+
+    #[test]
+    fn is_localhost_redirect_tests() {
+        assert!(is_localhost_redirect("http://localhost:3000/cb"));
+        assert!(is_localhost_redirect("http://127.0.0.1:8080/cb"));
+        assert!(is_localhost_redirect("http://[::1]:9000/cb"));
+        assert!(!is_localhost_redirect("https://example.com/cb"));
+        assert!(!is_localhost_redirect("http://evil.com/cb"));
+    }
+
+    #[test]
+    fn normalize_localhost_variants() {
+        assert_eq!(normalize_localhost("localhost"), "localhost");
+        assert_eq!(normalize_localhost("127.0.0.1"), "localhost");
+        assert_eq!(normalize_localhost("[::1]"), "localhost");
+        assert_eq!(normalize_localhost("example.com"), "other");
+    }
+
+    #[test]
+    fn compute_s256_challenge_deterministic() {
+        let v = "test-verifier";
+        let c1 = compute_s256_challenge(v);
+        let c2 = compute_s256_challenge(v);
+        assert_eq!(c1, c2);
+        assert!(!c1.is_empty());
+    }
+
+    #[test]
+    fn url_encode_special_chars() {
+        assert_eq!(url_encode("a b"), "a%20b");
+        assert_eq!(url_encode("a+b"), "a%2Bb");
+        assert_eq!(url_encode("a/b"), "a%2Fb");
+        assert_eq!(url_encode("safe-_~."), "safe-_~.");
+    }
+
+    #[test]
+    fn constant_time_eq_same_length_different() {
+        assert!(!constant_time_eq("abc", "abd"));
+    }
+
+    #[test]
+    fn localhost_match_different_paths_fail() {
+        assert!(!localhost_match(
+            "http://localhost:3000/a",
+            "http://localhost:3000/b"
+        ));
+    }
+
+    #[test]
+    fn localhost_match_non_http_fails() {
+        assert!(!localhost_match("ftp://localhost/a", "ftp://localhost/a"));
+    }
 }
