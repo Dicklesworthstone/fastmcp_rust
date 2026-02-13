@@ -156,4 +156,49 @@ mod tests {
         assert!(Level::Info < Level::Debug);
         assert!(Level::Debug < Level::Trace);
     }
+
+    #[test]
+    fn is_enabled_returns_bool_without_panic() {
+        // Without a logger installed, is_enabled returns false but must not panic
+        let result = is_enabled(Level::Info, targets::FASTMCP);
+        assert!(!result); // no logger configured in test
+    }
+
+    #[test]
+    fn target_constants_have_expected_values() {
+        assert_eq!(targets::FASTMCP, "fastmcp_rust");
+        assert_eq!(targets::SERVER, "fastmcp_rust::server");
+        assert_eq!(targets::TRANSPORT, "fastmcp_rust::transport");
+        assert_eq!(targets::ROUTER, "fastmcp_rust::router");
+        assert_eq!(targets::HANDLER, "fastmcp_rust::handler");
+        assert_eq!(targets::SESSION, "fastmcp_rust::session");
+        assert_eq!(targets::CODEC, "fastmcp_rust::codec");
+    }
+
+    #[test]
+    fn target_constants_are_all_distinct() {
+        let all = [
+            targets::FASTMCP,
+            targets::SERVER,
+            targets::TRANSPORT,
+            targets::ROUTER,
+            targets::HANDLER,
+            targets::SESSION,
+            targets::CODEC,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "targets at {} and {} collide", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn log_macros_compile_and_do_not_panic() {
+        // Macros expand to log calls; without a logger they are no-ops
+        log_server!("test server event: {}", 42);
+        log_transport!("test transport event");
+        log_router!("test router event: {}", "route");
+        log_handler!("test handler event");
+    }
 }
