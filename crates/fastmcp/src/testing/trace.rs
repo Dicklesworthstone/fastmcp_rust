@@ -1290,4 +1290,171 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-3cyi)
+    // =========================================================================
+
+    #[test]
+    fn trace_level_display() {
+        assert_eq!(TraceLevel::Debug.to_string(), "DEBUG");
+        assert_eq!(TraceLevel::Info.to_string(), "INFO");
+        assert_eq!(TraceLevel::Warn.to_string(), "WARN");
+        assert_eq!(TraceLevel::Error.to_string(), "ERROR");
+    }
+
+    #[test]
+    fn trace_level_equality_and_clone() {
+        let level = TraceLevel::Warn;
+        let cloned = level;
+        assert_eq!(level, cloned);
+        assert_ne!(TraceLevel::Debug, TraceLevel::Error);
+    }
+
+    #[test]
+    fn log_with_data_records_entry() {
+        let mut trace = TestTrace::builder("data-log")
+            .with_console_output(false)
+            .build();
+
+        trace.log_with_data(
+            TraceLevel::Info,
+            "with data",
+            serde_json::json!({"key": "val"}),
+        );
+
+        assert_eq!(trace.entry_count(), 1);
+        match &trace.entries()[0] {
+            TraceEntry::Log { data, message, .. } => {
+                assert_eq!(message, "with data");
+                assert!(data.is_some());
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_with_data_filtered_by_min_level() {
+        let mut trace = TestTrace::builder("filter-data")
+            .with_console_output(false)
+            .with_min_level(TraceLevel::Error)
+            .build();
+
+        trace.log_with_data(TraceLevel::Info, "filtered", serde_json::json!({}));
+        assert_eq!(trace.entry_count(), 0);
+    }
+
+    #[test]
+    fn end_span_by_id_removes_correct_span() {
+        let mut trace = TestTrace::builder("end-by-id")
+            .with_console_output(false)
+            .build();
+
+        let outer = trace.start_span("outer");
+        let _inner = trace.start_span("inner");
+
+        // End the outer span by ID (out of order)
+        trace.end_span_by_id(&outer, None);
+
+        // Inner should still be current
+        assert!(trace.current_span_id().is_some());
+
+        // End remaining span
+        trace.end_span(None);
+        assert!(trace.current_span_id().is_none());
+    }
+
+    #[test]
+    fn end_span_by_id_nonexistent_is_noop() {
+        let mut trace = TestTrace::builder("noop-end")
+            .with_console_output(false)
+            .build();
+
+        trace.end_span_by_id("nonexistent-span-id", None);
+        assert_eq!(trace.entry_count(), 0);
+    }
+
+    #[test]
+    fn log_response_with_duration_records_entry() {
+        let mut trace = TestTrace::builder("duration")
+            .with_console_output(false)
+            .build();
+
+        trace.log_response_with_duration(
+            "tools/call",
+            Duration::from_millis(42),
+            Some(&serde_json::json!({"ok": true})),
+            None::<&()>,
+        );
+
+        assert_eq!(trace.entry_count(), 1);
+        match &trace.entries()[0] {
+            TraceEntry::Response {
+                method,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(method, "tools/call");
+                assert!((duration_ms - 42.0).abs() < 0.01);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_response_unknown_correlation_uses_unknown_method() {
+        let mut trace = TestTrace::builder("unknown-corr")
+            .with_console_output(false)
+            .build();
+
+        trace.log_response("nonexistent-id", Some(&serde_json::json!({})), None::<&()>);
+
+        assert_eq!(trace.entry_count(), 1);
+        match &trace.entries()[0] {
+            TraceEntry::Response { method, .. } => {
+                assert_eq!(method, "unknown");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_metadata_stores_value() {
+        let mut trace = TestTrace::builder("meta")
+            .with_console_output(false)
+            .build();
+
+        trace.add_metadata("version", serde_json::json!("1.0"));
+        let output = trace.build_output();
+        assert_eq!(output.metadata["version"], "1.0");
+    }
+
+    #[test]
+    fn is_leap_year_correct() {
+        assert!(is_leap_year(2000)); // divisible by 400
+        assert!(!is_leap_year(1900)); // divisible by 100 but not 400
+        assert!(is_leap_year(2024)); // divisible by 4 but not 100
+        assert!(!is_leap_year(2023)); // not divisible by 4
+    }
+
+    #[test]
+    fn trace_retention_config_debug_and_clone() {
+        let config = TraceRetentionConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("TraceRetentionConfig"));
+        assert!(debug.contains("100"));
+
+        let cloned = config.clone();
+        assert_eq!(cloned.max_files, Some(100));
+    }
+
+    #[test]
+    fn correlation_ids_are_unique() {
+        let id1 = new_correlation_id();
+        let id2 = new_correlation_id();
+        let id3 = new_correlation_id();
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert!(id1.starts_with("trace-"));
+    }
 }
