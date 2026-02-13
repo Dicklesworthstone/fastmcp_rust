@@ -181,4 +181,55 @@ mod tests {
         // Router should be empty (no handlers added)
         assert!(router.tools().is_empty());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-297e)
+    // =========================================================================
+
+    #[test]
+    fn default_trait_matches_new() {
+        let default_builder = TestServerBuilder::default();
+        let new_builder = TestServerBuilder::new();
+        assert_eq!(default_builder.name, new_builder.name);
+        assert_eq!(default_builder.version, new_builder.version);
+        assert_eq!(default_builder.request_timeout, new_builder.request_timeout);
+    }
+
+    #[test]
+    fn test_server_builder_convenience() {
+        let builder = TestServer::builder();
+        assert_eq!(builder.name, "test-server");
+    }
+
+    #[test]
+    fn build_server_builder_without_timeout() {
+        let (_builder, client, server) = TestServer::builder()
+            .with_name("sb-test")
+            .build_server_builder();
+
+        assert!(!client.is_closed());
+        assert!(!server.is_closed());
+    }
+
+    #[test]
+    fn build_server_builder_with_timeout() {
+        let (_builder, client, server) = TestServer::builder()
+            .with_request_timeout(60)
+            .build_server_builder();
+
+        assert!(!client.is_closed());
+        assert!(!server.is_closed());
+    }
+
+    #[test]
+    fn build_returns_independent_transports() {
+        let (_router, client, server) = TestServer::builder().build();
+
+        // Closing one should not close the other immediately in terms of is_closed()
+        // (MemoryTransport uses channels; closing one side makes recv on the other fail)
+        drop(client);
+        // server transport itself is not marked closed by dropping the peer
+        // (it's the channel that becomes disconnected, not the transport's own state)
+        assert!(!server.is_closed());
+    }
 }
