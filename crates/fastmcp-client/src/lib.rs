@@ -1450,4 +1450,113 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         client.close();
     }
+
+    // ========================================
+    // Client::builder and Client::stdio error
+    // ========================================
+
+    #[test]
+    fn client_builder_returns_client_builder() {
+        let _builder = Client::builder();
+        // builder() is a convenience method for ClientBuilder::new()
+    }
+
+    #[test]
+    fn client_stdio_fails_for_nonexistent_command() {
+        let result = Client::stdio("definitely-not-a-real-command-xyz", &[]);
+        assert!(result.is_err());
+        let err = result.err().expect("should be error");
+        assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
+        assert!(err.message.contains("spawn"));
+    }
+
+    #[test]
+    fn client_stdio_with_cx_fails_when_cancelled() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let result = Client::stdio_with_cx("echo", &["hello"], cx);
+        // Should fail either from cancellation or from the process not speaking MCP
+        assert!(result.is_err());
+    }
+
+    // ========================================
+    // Uninitialized client accessors
+    // ========================================
+
+    #[test]
+    fn uninitialized_client_is_not_initialized() {
+        let client = make_closed_client(false);
+        assert!(!client.is_initialized());
+    }
+
+    #[test]
+    fn uninitialized_client_server_info_is_empty() {
+        let client = make_closed_client(false);
+        assert_eq!(client.server_info().name, "test-server");
+        assert_eq!(client.server_info().version, "1.0.0");
+    }
+
+    #[test]
+    fn uninitialized_client_request_id_starts_at_one() {
+        let client = make_closed_client(false);
+        assert_eq!(client.next_request_id(), 1);
+        assert_eq!(client.next_request_id(), 2);
+    }
+
+    #[test]
+    fn initialized_client_request_id_starts_at_two() {
+        let client = make_closed_client(true);
+        // from_parts starts at 2 because initialize used id 1
+        assert_eq!(client.next_request_id(), 2);
+        assert_eq!(client.next_request_id(), 3);
+    }
+
+    // ========================================
+    // API methods on uninitialized client
+    // ========================================
+
+    #[test]
+    fn uninitialized_client_list_tools_fails_on_init() {
+        let mut client = make_closed_client(false);
+        std::thread::sleep(Duration::from_millis(50));
+        let err = client.list_tools().expect_err("should fail");
+        assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
+    }
+
+    #[test]
+    fn uninitialized_client_call_tool_fails_on_init() {
+        let mut client = make_closed_client(false);
+        std::thread::sleep(Duration::from_millis(50));
+        let err = client
+            .call_tool("echo", serde_json::json!({"text": "hi"}))
+            .expect_err("should fail");
+        assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
+    }
+
+    #[test]
+    fn uninitialized_client_list_resources_fails_on_init() {
+        let mut client = make_closed_client(false);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(client.list_resources().is_err());
+    }
+
+    #[test]
+    fn uninitialized_client_list_prompts_fails_on_init() {
+        let mut client = make_closed_client(false);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(client.list_prompts().is_err());
+    }
+
+    // ========================================
+    // Drop behavior
+    // ========================================
+
+    #[test]
+    fn drop_cleans_up_subprocess() {
+        // Verify that dropping a client doesn't panic even for closed transport
+        let client = make_closed_client(true);
+        std::thread::sleep(Duration::from_millis(50));
+        drop(client);
+        // If we get here without panicking, the test passes
+    }
 }

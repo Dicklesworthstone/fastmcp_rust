@@ -820,4 +820,185 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_config_error_source() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no access");
+        let config_err = ConfigError::ReadError(io_err);
+        assert!(std::error::Error::source(&config_err).is_some());
+
+        let not_found = ConfigError::NotFound("path".into());
+        assert!(std::error::Error::source(&not_found).is_none());
+
+        let parse_err = ConfigError::ParseError("bad".into());
+        assert!(std::error::Error::source(&parse_err).is_none());
+    }
+
+    #[test]
+    fn test_config_error_into_mcp_error() {
+        let err = ConfigError::ServerNotFound("test-srv".into());
+        let mcp_err: McpError = err.into();
+        assert_eq!(mcp_err.code, fastmcp_core::McpErrorCode::InternalError);
+        assert!(mcp_err.message.contains("test-srv"));
+    }
+
+    #[test]
+    fn test_server_config_disabled_builder() {
+        let config = ServerConfig::new("echo").disabled();
+        assert!(config.disabled);
+    }
+
+    #[test]
+    fn test_config_json_round_trip() {
+        let mut config = McpConfig::new();
+        config.add_server(
+            "srv",
+            ServerConfig::new("cmd")
+                .with_args(["a1", "a2"])
+                .with_env("K", "V")
+                .with_cwd("/tmp"),
+        );
+
+        let json = config.to_json();
+        let restored = McpConfig::from_json(&json).expect("round-trip parse");
+        let srv = restored.get_server("srv").expect("server present");
+        assert_eq!(srv.command, "cmd");
+        assert_eq!(srv.args, vec!["a1", "a2"]);
+        assert_eq!(srv.env.get("K"), Some(&"V".to_string()));
+        assert_eq!(srv.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn test_config_toml_round_trip() {
+        let mut config = McpConfig::new();
+        config.add_server(
+            "srv",
+            ServerConfig::new("python").with_args(["-m", "server"]),
+        );
+
+        let toml_str = config.to_toml();
+        let restored = McpConfig::from_toml(&toml_str).expect("round-trip parse");
+        let srv = restored.get_server("srv").expect("server present");
+        assert_eq!(srv.command, "python");
+        assert_eq!(srv.args, vec!["-m", "server"]);
+    }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        let result = McpConfig::from_json("not json {{{");
+        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+    }
+
+    #[test]
+    fn test_parse_invalid_toml() {
+        let result = McpConfig::from_toml("[invalid toml = = =");
+        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+    }
+
+    #[test]
+    fn test_from_file_not_found() {
+        let result = McpConfig::from_file("/nonexistent/path/to/config.json");
+        assert!(matches!(result, Err(ConfigError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_config_merge_empty() {
+        let mut base = McpConfig::new();
+        base.add_server("a", ServerConfig::new("cmd_a"));
+        base.merge(McpConfig::new());
+        assert_eq!(base.mcp_servers.len(), 1);
+        assert!(base.get_server("a").is_some());
+    }
+
+    #[test]
+    fn test_config_loader_from_path() {
+        let loader = ConfigLoader::from_path("/specific/path.json");
+        assert_eq!(loader.search_paths().len(), 1);
+        assert_eq!(
+            loader.search_paths()[0],
+            PathBuf::from("/specific/path.json")
+        );
+    }
+
+    #[test]
+    fn test_config_loader_load_no_files_exist() {
+        let loader =
+            ConfigLoader::from_path("/nonexistent/a.json").with_path("/nonexistent/b.json");
+        let result = loader.load();
+        assert!(matches!(result, Err(ConfigError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_config_loader_load_all_no_files() {
+        let loader = ConfigLoader::from_path("/nonexistent/a.json");
+        let config = loader.load_all();
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn test_config_loader_existing_paths_empty() {
+        let loader = ConfigLoader::from_path("/nonexistent/file.json");
+        assert!(loader.existing_paths().is_empty());
+    }
+
+    #[test]
+    fn test_config_loader_default() {
+        let loader = ConfigLoader::default();
+        assert!(!loader.search_paths().is_empty());
+    }
+
+    #[test]
+    fn test_enabled_servers_all_disabled() {
+        let mut config = McpConfig::new();
+        config.add_server("a", ServerConfig::new("cmd").disabled());
+        config.add_server("b", ServerConfig::new("cmd").disabled());
+        assert!(config.enabled_servers().is_empty());
+    }
+
+    #[test]
+    fn test_claude_desktop_config_path_is_some() {
+        // On all supported platforms, this should return Some when home dir is available
+        let path = claude_desktop_config_path();
+        // Home dir is usually available in CI and dev environments
+        if dirs::home_dir().is_some() {
+            assert!(path.is_some());
+        }
+    }
+
+    #[test]
+    fn test_server_config_with_multiple_env_vars() {
+        let config = ServerConfig::new("cmd")
+            .with_env("A", "1")
+            .with_env("B", "2")
+            .with_env("C", "3");
+        assert_eq!(config.env.len(), 3);
+        assert_eq!(config.env.get("A"), Some(&"1".to_string()));
+        assert_eq!(config.env.get("B"), Some(&"2".to_string()));
+        assert_eq!(config.env.get("C"), Some(&"3".to_string()));
+    }
+
+    #[test]
+    fn test_config_spawn_error_display() {
+        let err = ConfigError::SpawnError("process died".into());
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("spawn"));
+        assert!(msg.contains("process died"));
+    }
+
+    #[test]
+    fn test_config_empty_json_object() {
+        let config = McpConfig::from_json("{}").expect("parse empty object");
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn test_config_json_with_defaults() {
+        let json = r#"{"mcpServers": {"srv": {"command": "echo"}}}"#;
+        let config = McpConfig::from_json(json).expect("parse");
+        let srv = config.get_server("srv").unwrap();
+        assert!(srv.args.is_empty());
+        assert!(srv.env.is_empty());
+        assert!(srv.cwd.is_none());
+        assert!(!srv.disabled);
+    }
 }
