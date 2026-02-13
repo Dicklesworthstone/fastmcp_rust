@@ -203,6 +203,276 @@ impl Session {
 mod tests {
     use super::*;
     use fastmcp_protocol::{ElicitationCapability, RootsCapability, SamplingCapability};
+    use std::sync::{Arc, Mutex};
+
+    fn make_server_info() -> ServerInfo {
+        ServerInfo {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+        }
+    }
+
+    fn make_client_info() -> ClientInfo {
+        ClientInfo {
+            name: "test-client".to_string(),
+            version: "1.0".to_string(),
+        }
+    }
+
+    fn make_session() -> Session {
+        Session::new(make_server_info(), ServerCapabilities::default())
+    }
+
+    // ── New session initial state ────────────────────────────────────
+
+    #[test]
+    fn new_session_is_not_initialized() {
+        let session = make_session();
+        assert!(!session.is_initialized());
+    }
+
+    #[test]
+    fn new_session_has_no_client_info() {
+        let session = make_session();
+        assert!(session.client_info().is_none());
+    }
+
+    #[test]
+    fn new_session_has_no_client_capabilities() {
+        let session = make_session();
+        assert!(session.client_capabilities().is_none());
+    }
+
+    #[test]
+    fn new_session_has_no_protocol_version() {
+        let session = make_session();
+        assert!(session.protocol_version().is_none());
+    }
+
+    #[test]
+    fn new_session_has_no_log_level() {
+        let session = make_session();
+        assert!(session.log_level().is_none());
+    }
+
+    #[test]
+    fn new_session_returns_server_info() {
+        let session = make_session();
+        assert_eq!(session.server_info().name, "test");
+        assert_eq!(session.server_info().version, "1.0");
+    }
+
+    #[test]
+    fn new_session_returns_server_capabilities() {
+        let caps = ServerCapabilities::default();
+        let session = Session::new(make_server_info(), caps);
+        // default caps should be accessible
+        let _ = session.server_capabilities();
+    }
+
+    // ── Initialization lifecycle ─────────────────────────────────────
+
+    #[test]
+    fn initialize_sets_initialized_flag() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        assert!(session.is_initialized());
+    }
+
+    #[test]
+    fn initialize_stores_client_info() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let info = session.client_info().expect("client_info set");
+        assert_eq!(info.name, "test-client");
+        assert_eq!(info.version, "1.0");
+    }
+
+    #[test]
+    fn initialize_stores_client_capabilities() {
+        let mut session = make_session();
+        let caps = ClientCapabilities {
+            sampling: Some(SamplingCapability {}),
+            elicitation: None,
+            roots: None,
+        };
+        session.initialize(make_client_info(), caps, "2024-11-05".to_string());
+        let stored = session.client_capabilities().expect("caps set");
+        assert!(stored.sampling.is_some());
+    }
+
+    #[test]
+    fn initialize_stores_protocol_version() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2025-03-26".to_string(),
+        );
+        assert_eq!(session.protocol_version(), Some("2025-03-26"));
+    }
+
+    // ── Resource subscriptions ───────────────────────────────────────
+
+    #[test]
+    fn subscribe_and_check_resource() {
+        let mut session = make_session();
+        assert!(!session.is_resource_subscribed("file:///a.txt"));
+        session.subscribe_resource("file:///a.txt".to_string());
+        assert!(session.is_resource_subscribed("file:///a.txt"));
+    }
+
+    #[test]
+    fn unsubscribe_resource_removes_it() {
+        let mut session = make_session();
+        session.subscribe_resource("file:///a.txt".to_string());
+        session.unsubscribe_resource("file:///a.txt");
+        assert!(!session.is_resource_subscribed("file:///a.txt"));
+    }
+
+    #[test]
+    fn unsubscribe_nonexistent_resource_is_noop() {
+        let mut session = make_session();
+        // should not panic
+        session.unsubscribe_resource("file:///does-not-exist");
+        assert!(!session.is_resource_subscribed("file:///does-not-exist"));
+    }
+
+    #[test]
+    fn multiple_subscriptions_are_independent() {
+        let mut session = make_session();
+        session.subscribe_resource("a://1".to_string());
+        session.subscribe_resource("b://2".to_string());
+        assert!(session.is_resource_subscribed("a://1"));
+        assert!(session.is_resource_subscribed("b://2"));
+        session.unsubscribe_resource("a://1");
+        assert!(!session.is_resource_subscribed("a://1"));
+        assert!(session.is_resource_subscribed("b://2"));
+    }
+
+    #[test]
+    fn duplicate_subscribe_is_idempotent() {
+        let mut session = make_session();
+        session.subscribe_resource("r://x".to_string());
+        session.subscribe_resource("r://x".to_string());
+        assert!(session.is_resource_subscribed("r://x"));
+        session.unsubscribe_resource("r://x");
+        assert!(!session.is_resource_subscribed("r://x"));
+    }
+
+    // ── Log level ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_log_level_and_read_back() {
+        let mut session = make_session();
+        session.set_log_level(LogLevel::Warning);
+        assert_eq!(session.log_level(), Some(LogLevel::Warning));
+    }
+
+    #[test]
+    fn set_log_level_overwrites_previous() {
+        let mut session = make_session();
+        session.set_log_level(LogLevel::Debug);
+        session.set_log_level(LogLevel::Error);
+        assert_eq!(session.log_level(), Some(LogLevel::Error));
+    }
+
+    // ── Session state ────────────────────────────────────────────────
+
+    #[test]
+    fn state_is_accessible() {
+        let session = make_session();
+        let state = session.state();
+        // fresh state should have no stored values
+        let val: Option<String> = state.get("key");
+        assert!(val.is_none());
+    }
+
+    // ── notify_resource_updated ──────────────────────────────────────
+
+    #[test]
+    fn notify_resource_updated_returns_false_when_not_subscribed() {
+        let session = make_session();
+        let sender: NotificationSender = Arc::new(|_| {});
+        assert!(!session.notify_resource_updated("file:///a.txt", &sender));
+    }
+
+    #[test]
+    fn notify_resource_updated_sends_when_subscribed() {
+        let mut session = make_session();
+        session.subscribe_resource("file:///a.txt".to_string());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        let result = session.notify_resource_updated("file:///a.txt", &sender);
+        assert!(result);
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].method, "notifications/resources/updated");
+    }
+
+    #[test]
+    fn notify_resource_updated_includes_uri_in_params() {
+        let mut session = make_session();
+        session.subscribe_resource("test://res".to_string());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        session.notify_resource_updated("test://res", &sender);
+
+        let messages = sent.lock().unwrap();
+        let params = messages[0].params.as_ref().expect("params present");
+        let uri = params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .expect("uri field");
+        assert_eq!(uri, "test://res");
+    }
+
+    #[test]
+    fn notify_resource_updated_does_not_fire_for_other_uri() {
+        let mut session = make_session();
+        session.subscribe_resource("file:///a.txt".to_string());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        let result = session.notify_resource_updated("file:///b.txt", &sender);
+        assert!(!result);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    // ── Debug impl ───────────────────────────────────────────────────
+
+    #[test]
+    fn session_debug_format_includes_fields() {
+        let session = make_session();
+        let debug = format!("{:?}", session);
+        assert!(debug.contains("Session"));
+        assert!(debug.contains("initialized: false"));
+    }
+
+    // ── Existing capability tests ────────────────────────────────────
 
     #[test]
     fn test_session_supports_sampling() {
