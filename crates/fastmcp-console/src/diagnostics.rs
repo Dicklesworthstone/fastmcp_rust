@@ -268,6 +268,19 @@ mod tests {
     use super::*;
     use crate::testing::TestConsole;
 
+    /// Minimal writer for creating a non-rich (plain) console in tests.
+    struct PlainWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlainWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn render_warning_includes_message() {
         let tc = TestConsole::new();
@@ -421,5 +434,153 @@ mod tests {
         tc.clear();
         render_panic("wrapped panic", Some("trace"), tc.console());
         assert!(tc.contains("wrapped panic"));
+    }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2z7s)
+    // =========================================================================
+
+    #[test]
+    fn categorize_error_remaining_protocol_and_handler_codes() {
+        let renderer = RichErrorRenderer::new();
+
+        // Protocol codes
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::InvalidRequest, "")),
+            ErrorCategory::Protocol
+        );
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::MethodNotFound, "")),
+            ErrorCategory::Protocol
+        );
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::InvalidParams, "")),
+            ErrorCategory::Protocol
+        );
+
+        // Handler codes
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::ToolExecutionError, "")),
+            ErrorCategory::Handler
+        );
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::ResourceForbidden, "")),
+            ErrorCategory::Handler
+        );
+        assert_eq!(
+            renderer.categorize_error(&McpError::new(McpErrorCode::PromptNotFound, "")),
+            ErrorCategory::Handler
+        );
+    }
+
+    #[test]
+    fn render_header_remaining_categories() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer::new();
+        let theme = tc.console().theme();
+
+        renderer.render_header(ErrorCategory::Protocol, theme, tc.console());
+        assert!(tc.contains("Protocol Error"));
+        tc.clear();
+
+        renderer.render_header(ErrorCategory::Handler, theme, tc.console());
+        assert!(tc.contains("Handler Error"));
+        tc.clear();
+
+        renderer.render_header(ErrorCategory::Internal, theme, tc.console());
+        assert!(tc.contains("Internal Error"));
+        tc.clear();
+
+        renderer.render_header(ErrorCategory::Unknown, theme, tc.console());
+        assert!(tc.contains("Error"));
+    }
+
+    #[test]
+    fn get_suggestions_resource_not_found() {
+        let renderer = RichErrorRenderer::new();
+        let err = McpError::new(McpErrorCode::ResourceNotFound, "missing");
+        let suggestions = renderer.get_suggestions(&err).unwrap();
+        assert!(suggestions.iter().any(|s| s.contains("URI")));
+    }
+
+    #[test]
+    fn render_plain_error_without_data() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        let err = McpError::new(McpErrorCode::InternalError, "something broke");
+        RichErrorRenderer::new().render(&err, &console);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("ERROR"));
+        assert!(output.contains("something broke"));
+    }
+
+    #[test]
+    fn render_plain_error_with_data() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        let err = McpError::with_data(
+            McpErrorCode::InvalidParams,
+            "bad params",
+            serde_json::json!({"field": "name"}),
+        );
+        RichErrorRenderer::new().render(&err, &console);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("bad params"));
+        assert!(output.contains("Context"));
+    }
+
+    #[test]
+    fn render_panic_without_backtrace() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer::new();
+        renderer.render_panic("oops", None, tc.console());
+        assert!(tc.contains("PANIC"));
+        assert!(tc.contains("oops"));
+        assert!(!tc.contains("Backtrace"));
+    }
+
+    #[test]
+    fn render_warning_and_info_plain_mode() {
+        // Warning and info in plain mode write to stderr via eprintln!, which
+        // we cannot capture through the writer. We just verify the non-rich
+        // branch doesn't panic by constructing a non-rich console.
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        assert!(!console.is_rich());
+        render_warning("disk full", &console);
+        render_info("started", &console);
+        // No panic = success; output goes to stderr, not our buffer
+    }
+
+    #[test]
+    fn error_category_debug_clone_copy() {
+        let cat = ErrorCategory::Protocol;
+        let debug = format!("{cat:?}");
+        assert!(debug.contains("Protocol"));
+
+        let cloned = cat;
+        assert_eq!(cloned, ErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn render_error_panel_without_data() {
+        let tc = TestConsole::new();
+        let renderer = RichErrorRenderer {
+            show_suggestions: false,
+            show_backtrace: false,
+            show_error_code: true,
+        };
+        let err = McpError::new(McpErrorCode::ParseError, "bad json");
+        renderer.render_error_panel(&err, tc.console().theme(), tc.console());
+        assert!(tc.contains("bad json"));
+        assert!(tc.contains("-32700"));
+    }
+
+    #[test]
+    fn render_error_helper_function() {
+        let tc = TestConsole::new();
+        let err = McpError::new(McpErrorCode::InternalError, "boom");
+        render_error(&err, tc.console());
+        assert!(tc.contains("boom"));
     }
 }
