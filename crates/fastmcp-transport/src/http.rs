@@ -1815,4 +1815,167 @@ Transfer-Encoding: chunked\r\n\
         let result = handler.parse_request(&request);
         assert!(matches!(result, Err(HttpError::BodyTooLarge { .. })));
     }
+
+    #[test]
+    fn http_method_as_str_round_trips() {
+        let methods = [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+            HttpMethod::Options,
+            HttpMethod::Head,
+            HttpMethod::Patch,
+        ];
+        for m in methods {
+            let s = m.as_str();
+            let parsed = HttpMethod::parse(s).unwrap();
+            assert_eq!(parsed, m);
+        }
+    }
+
+    #[test]
+    fn http_status_boundary_cases() {
+        assert!(HttpStatus(299).is_success());
+        assert!(!HttpStatus(300).is_success());
+        assert!(HttpStatus(499).is_client_error());
+        assert!(!HttpStatus(500).is_client_error());
+        assert!(HttpStatus(599).is_server_error());
+        assert!(!HttpStatus(600).is_server_error());
+    }
+
+    #[test]
+    fn http_request_content_type_and_authorization() {
+        let req = HttpRequest::new(HttpMethod::Get, "/")
+            .with_header("Content-Type", "text/plain")
+            .with_header("Authorization", "Bearer token123");
+        assert_eq!(req.content_type(), Some("text/plain"));
+        assert_eq!(req.authorization(), Some("Bearer token123"));
+    }
+
+    #[test]
+    fn http_request_json_parse() {
+        let body = serde_json::json!({"key": "value"});
+        let req =
+            HttpRequest::new(HttpMethod::Post, "/").with_body(serde_json::to_vec(&body).unwrap());
+        let parsed: serde_json::Value = req.json().unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn http_response_convenience_constructors() {
+        let bad = HttpResponse::bad_request();
+        assert_eq!(bad.status, HttpStatus::BAD_REQUEST);
+        let err = HttpResponse::internal_error();
+        assert_eq!(err.status, HttpStatus::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn http_handler_config_defaults() {
+        let config = HttpHandlerConfig::default();
+        assert_eq!(config.base_path, "/mcp/v1");
+        assert!(config.allow_cors);
+        assert_eq!(config.cors_origins, vec!["*".to_string()]);
+        assert_eq!(config.timeout, Duration::from_secs(30));
+        assert_eq!(config.max_body_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn http_handler_config_accessor() {
+        let handler = HttpRequestHandler::new();
+        assert_eq!(handler.config().base_path, "/mcp/v1");
+    }
+
+    #[test]
+    fn http_error_display_all_variants() {
+        let cases: Vec<(HttpError, &str)> = vec![
+            (
+                HttpError::InvalidMethod("X".into()),
+                "invalid HTTP method: X",
+            ),
+            (
+                HttpError::InvalidContentType("text/xml".into()),
+                "invalid content type: text/xml",
+            ),
+            (
+                HttpError::HeadersTooLarge { size: 100, max: 50 },
+                "headers too large: 100 > 50",
+            ),
+            (
+                HttpError::BodyTooLarge {
+                    size: 200,
+                    max: 100,
+                },
+                "body too large: 200 > 100",
+            ),
+            (
+                HttpError::UnsupportedTransferEncoding("gzip".into()),
+                "unsupported transfer encoding: gzip",
+            ),
+            (HttpError::Timeout, "request timeout"),
+            (HttpError::Closed, "connection closed"),
+        ];
+        for (err, expected) in cases {
+            assert!(
+                err.to_string().contains(expected),
+                "expected '{}' in '{}'",
+                expected,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn http_error_from_codec_error() {
+        let codec_err = CodecError::MessageTooLarge(999);
+        let http_err: HttpError = codec_err.into();
+        assert!(matches!(http_err, HttpError::CodecError(_)));
+        assert!(http_err.to_string().contains("codec error"));
+    }
+
+    #[test]
+    fn http_error_from_transport_error() {
+        let transport_err = TransportError::Closed;
+        let http_err: HttpError = transport_err.into();
+        assert!(matches!(http_err, HttpError::Transport(_)));
+        assert!(http_err.to_string().contains("transport error"));
+    }
+
+    #[test]
+    fn http_transport_send_rejects_request_messages() {
+        use std::io::Cursor;
+
+        let reader = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+        let mut transport = HttpTransport::new(reader, &mut output);
+
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        let result = transport.send(&cx, &JsonRpcMessage::Request(request));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_store_cleanup_removes_expired() {
+        let store = SessionStore::new(Duration::from_millis(50));
+        let _id1 = store.create();
+        let _id2 = store.create();
+        assert_eq!(store.count(), 2);
+
+        std::thread::sleep(Duration::from_millis(100));
+        store.cleanup();
+        assert_eq!(store.count(), 0);
+    }
+
+    #[test]
+    fn handle_options_cors_disabled() {
+        let config = HttpHandlerConfig {
+            allow_cors: false,
+            ..Default::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+        let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1");
+        let response = handler.handle_options(&request);
+        assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
+    }
 }
