@@ -3640,9 +3640,7 @@ mod tests {
             .unwrap();
         server.register_client(client).unwrap();
 
-        let err = server
-            .revoke("any-token", "c1", Some("wrong"))
-            .unwrap_err();
+        let err = server.revoke("any-token", "c1", Some("wrong")).unwrap_err();
         assert_eq!(err.error_code(), "invalid_client");
     }
 
@@ -3748,13 +3746,8 @@ mod tests {
             .unwrap();
         server.register_client(client).unwrap();
 
-        let resp = issue_access_token_via_auth_code(
-            &server,
-            "c1",
-            "http://localhost/cb",
-            &[],
-            "user1",
-        );
+        let resp =
+            issue_access_token_via_auth_code(&server, "c1", "http://localhost/cb", &[], "user1");
 
         assert!(resp.scope.is_none());
     }

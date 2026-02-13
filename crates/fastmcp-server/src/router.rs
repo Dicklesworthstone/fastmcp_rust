@@ -4677,4 +4677,125 @@ mod router_tests {
         r.set_strict_input_validation(false);
         assert!(!r.strict_input_validation());
     }
+
+    // ── cx-cancelled early return paths ──────────────────────────────────
+
+    #[test]
+    fn handle_tools_call_cancelled_cx_returns_error() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let budget = Budget::INFINITE;
+        let params = CallToolParams {
+            name: "t".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn handle_resources_read_cancelled_cx_returns_error() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a.txt"));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let budget = Budget::INFINITE;
+        let params = ReadResourceParams {
+            uri: "file:///a.txt".to_string(),
+            meta: None,
+        };
+        let err = r
+            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn handle_prompts_get_cancelled_cx_returns_error() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let budget = Budget::INFINITE;
+        let params = GetPromptParams {
+            name: "p".to_string(),
+            arguments: None,
+            meta: None,
+        };
+        let err = r
+            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    // ── handle_tasks with real task manager ──────────────────────────────
+
+    #[test]
+    fn handle_tasks_list_with_manager_returns_tasks() {
+        use crate::tasks::TaskManager;
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let tm = TaskManager::new_for_testing();
+        tm.register_handler("analyze", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
+        let _ = tm.submit(&cx, "analyze", None).unwrap();
+        let _ = tm.submit(&cx, "analyze", None).unwrap();
+        let shared = tm.into_shared();
+        let params = ListTasksParams {
+            cursor: None,
+            status: None,
+            limit: None,
+        };
+        let result = r.handle_tasks_list(&cx, params, Some(&shared)).unwrap();
+        assert_eq!(result.tasks.len(), 2);
+    }
+
+    #[test]
+    fn handle_tasks_get_with_manager_returns_task() {
+        use crate::tasks::TaskManager;
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let tm = TaskManager::new_for_testing();
+        tm.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = tm.submit(&cx, "t", None).unwrap();
+        let shared = tm.into_shared();
+        let params = GetTaskParams { id: id.clone() };
+        let result = r.handle_tasks_get(&cx, params, Some(&shared)).unwrap();
+        assert_eq!(result.task.id, id);
+        assert!(result.result.is_none());
+    }
+
+    #[test]
+    fn handle_tasks_get_task_not_found() {
+        use crate::tasks::TaskManager;
+        use fastmcp_protocol::TaskId;
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let tm = TaskManager::new_for_testing();
+        let shared = tm.into_shared();
+        let params = GetTaskParams {
+            id: TaskId::from_string("nonexistent".to_string()),
+        };
+        let err = r.handle_tasks_get(&cx, params, Some(&shared)).unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn mount_result_is_success_always_true() {
+        let result = MountResult {
+            tools: 0,
+            resources: 0,
+            resource_templates: 0,
+            prompts: 0,
+            warnings: vec!["something".to_string()],
+        };
+        assert!(result.is_success());
+        assert!(!result.has_components());
+    }
 }
