@@ -745,4 +745,110 @@ mod tests {
             assert_eq!(session.log_level(), Some(level));
         }
     }
+
+    // ── Persistence across re-initialization ────────────────────────
+
+    #[test]
+    fn log_level_persists_across_reinitialization() {
+        let mut session = make_session();
+        session.set_log_level(LogLevel::Warning);
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        assert_eq!(session.log_level(), Some(LogLevel::Warning));
+        // Re-initialize with different client info
+        session.initialize(
+            ClientInfo {
+                name: "other".to_string(),
+                version: "2.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2025-03-26".to_string(),
+        );
+        assert_eq!(session.log_level(), Some(LogLevel::Warning));
+    }
+
+    #[test]
+    fn resource_subscriptions_persist_across_reinitialization() {
+        let mut session = make_session();
+        session.subscribe_resource("file:///keep.txt".to_string());
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        assert!(session.is_resource_subscribed("file:///keep.txt"));
+    }
+
+    #[test]
+    fn state_set_after_init_persists_through_reinit() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        session.state().set("counter", 42);
+        // Re-initialize
+        session.initialize(
+            ClientInfo {
+                name: "new".to_string(),
+                version: "3.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2025-03-26".to_string(),
+        );
+        let val: Option<i32> = session.state().get("counter");
+        assert_eq!(val, Some(42));
+    }
+
+    #[test]
+    fn notify_resource_updated_fires_independently_per_subscription() {
+        let mut session = make_session();
+        session.subscribe_resource("a://1".to_string());
+        session.subscribe_resource("b://2".to_string());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        // Notify first URI
+        assert!(session.notify_resource_updated("a://1", &sender));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let uri = sent.lock().unwrap()[0]
+            .params
+            .as_ref()
+            .unwrap()
+            .get("uri")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(uri, "a://1");
+
+        // Notify second URI
+        assert!(session.notify_resource_updated("b://2", &sender));
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        let uri2 = sent.lock().unwrap()[1]
+            .params
+            .as_ref()
+            .unwrap()
+            .get("uri")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(uri2, "b://2");
+    }
+
+    #[test]
+    fn supports_elicitation_and_roots_false_before_init() {
+        let session = make_session();
+        assert!(!session.supports_elicitation());
+        assert!(!session.supports_roots());
+    }
 }
