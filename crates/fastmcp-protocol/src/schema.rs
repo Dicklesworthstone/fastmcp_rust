@@ -1027,4 +1027,174 @@ mod tests {
         let array_schema = json!({"type": "array"});
         assert!(validate_strict(&array_schema, &json!([1, 2, 3])).is_ok());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-qpwf)
+    // =========================================================================
+
+    #[test]
+    fn validation_error_display_and_error_trait() {
+        let err = ValidationError {
+            path: "root.name".to_string(),
+            message: "expected string".to_string(),
+        };
+        assert_eq!(err.to_string(), "root.name: expected string");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn validation_error_debug_and_clone() {
+        let err = ValidationError {
+            path: "root".to_string(),
+            message: "missing".to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("ValidationError"));
+
+        let cloned = err.clone();
+        assert_eq!(cloned.path, "root");
+        assert_eq!(cloned.message, "missing");
+    }
+
+    #[test]
+    fn json_type_name_all_types() {
+        assert_eq!(json_type_name(&json!(null)), "null");
+        assert_eq!(json_type_name(&json!(true)), "boolean");
+        assert_eq!(json_type_name(&json!(42)), "integer");
+        assert_eq!(json_type_name(&json!(3.14)), "number");
+        assert_eq!(json_type_name(&json!("hello")), "string");
+        assert_eq!(json_type_name(&json!([])), "array");
+        assert_eq!(json_type_name(&json!({})), "object");
+    }
+
+    #[test]
+    fn number_multiple_of() {
+        let schema = json!({"type": "number", "multipleOf": 3});
+        assert!(validate(&schema, &json!(9)).is_ok());
+        assert!(validate(&schema, &json!(6)).is_ok());
+        assert!(validate(&schema, &json!(0)).is_ok());
+        assert!(validate(&schema, &json!(7)).is_err());
+    }
+
+    #[test]
+    fn object_min_max_properties() {
+        let schema = json!({
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 2
+        });
+
+        assert!(validate(&schema, &json!({"a": 1})).is_ok());
+        assert!(validate(&schema, &json!({"a": 1, "b": 2})).is_ok());
+        assert!(validate(&schema, &json!({})).is_err());
+        assert!(validate(&schema, &json!({"a": 1, "b": 2, "c": 3})).is_err());
+    }
+
+    #[test]
+    fn prefix_items_tuple_validation() {
+        let schema = json!({
+            "type": "array",
+            "prefixItems": [
+                {"type": "string"},
+                {"type": "integer"}
+            ]
+        });
+
+        assert!(validate(&schema, &json!(["hello", 42])).is_ok());
+        assert!(validate(&schema, &json!(["hello", 42, true])).is_ok()); // extra items allowed by default
+        assert!(validate(&schema, &json!([123, "wrong"])).is_err()); // first should be string
+    }
+
+    #[test]
+    fn prefix_items_with_additional_items_schema() {
+        let schema = json!({
+            "type": "array",
+            "prefixItems": [
+                {"type": "string"}
+            ],
+            "items": {"type": "integer"}
+        });
+
+        // First item must be string, rest must be integers
+        assert!(validate(&schema, &json!(["hello", 1, 2])).is_ok());
+        assert!(validate(&schema, &json!(["hello", "bad"])).is_err());
+    }
+
+    #[test]
+    fn items_as_array_draft4_fallback() {
+        // Draft 4-7 style: items is an array (treated as prefixItems when no prefixItems present)
+        let schema = json!({
+            "type": "array",
+            "items": [
+                {"type": "string"},
+                {"type": "integer"}
+            ]
+        });
+
+        assert!(validate(&schema, &json!(["hello", 42])).is_ok());
+        assert!(validate(&schema, &json!([123, "wrong"])).is_err());
+    }
+
+    #[test]
+    fn additional_properties_as_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "additionalProperties": {"type": "integer"}
+        });
+
+        assert!(validate(&schema, &json!({"name": "Alice", "count": 42})).is_ok());
+        assert!(validate(&schema, &json!({"name": "Alice", "bad": "string"})).is_err());
+    }
+
+    #[test]
+    fn strict_schema_with_prefix_items() {
+        let schema = json!({
+            "type": "array",
+            "prefixItems": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"}
+                    }
+                }
+            ]
+        });
+
+        // Strict mode adds additionalProperties: false to nested objects in prefixItems
+        assert!(validate_strict(&schema, &json!([{"id": 1}])).is_ok());
+        assert!(validate_strict(&schema, &json!([{"id": 1, "extra": "val"}])).is_err());
+    }
+
+    #[test]
+    fn strict_schema_with_union_type() {
+        let schema = json!({
+            "type": ["object", "null"],
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+
+        // Strict mode should add additionalProperties for union types including object
+        assert!(validate_strict(&schema, &json!(null)).is_ok());
+        assert!(validate_strict(&schema, &json!({"name": "Alice"})).is_ok());
+        assert!(validate_strict(&schema, &json!({"name": "Alice", "extra": 1})).is_err());
+    }
+
+    #[test]
+    fn unknown_type_in_matches_type_is_permissive() {
+        let schema = json!({"type": "custom_extension"});
+        // Unknown types accept everything
+        assert!(validate(&schema, &json!("anything")).is_ok());
+        assert!(validate(&schema, &json!(42)).is_ok());
+    }
+
+    #[test]
+    fn invalid_schema_not_an_object() {
+        // Non-object, non-boolean schemas are silently skipped
+        assert!(validate(&json!(42), &json!("anything")).is_ok());
+        assert!(validate(&json!("bad_schema"), &json!(123)).is_ok());
+    }
 }
