@@ -255,7 +255,8 @@ impl ClientBuilder {
     /// a custom capability context for cancellation support.
     pub fn connect_stdio_with_cx(self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
         let mut last_error = None;
-        let attempts = self.max_retries + 1;
+        // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
+        let attempts = u64::from(self.max_retries) + 1;
 
         for attempt in 0..attempts {
             // Honor cancellation/budget before each attempt.
@@ -586,6 +587,24 @@ mod tests {
         assert!(
             result.is_err(),
             "cancelled context should abort before retry attempts"
+        );
+        let err = result.err().expect("error result");
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn test_connect_stdio_with_cx_max_retries_does_not_overflow() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+
+        let result = ClientBuilder::new()
+            .max_retries(u32::MAX)
+            .retry_delay_ms(1)
+            .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx);
+
+        assert!(
+            result.is_err(),
+            "cancelled context should return an error, not panic from retry overflow"
         );
         let err = result.err().expect("error result");
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
