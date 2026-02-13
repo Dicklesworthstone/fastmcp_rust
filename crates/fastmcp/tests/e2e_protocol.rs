@@ -16,11 +16,10 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    AuthContext, McpContext, McpErrorCode, McpResult, PromptHandler, PromptMessage, Resource,
-    ResourceContent, ResourceHandler, Role, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
+    AuthContext, McpContext, McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier,
+    TokenAuthProvider,
 };
 use serde_json::json;
 
@@ -29,289 +28,129 @@ use serde_json::json;
 // ============================================================================
 
 /// A simple greeting tool handler.
-struct GreetingToolHandler;
-
-impl ToolHandler for GreetingToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "greeting".to_string(),
-            description: Some("Returns a greeting for the given name".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" }
-                },
-                "required": ["name"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["greeting".to_string()],
-            annotations: Some(ToolAnnotations::new().read_only(true)),
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let name = arguments
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("World");
-        Ok(vec![Content::Text {
-            text: format!("Hello, {name}!"),
-        }])
-    }
+#[fastmcp_rust::tool(
+    name = "greeting",
+    description = "Returns a greeting for the given name",
+    version = "1.0.0",
+    tags = ["greeting"],
+    annotations(read_only)
+)]
+fn greeting_tool_handler(name: String) -> String {
+    format!("Hello, {name}!")
 }
 
 /// A calculator tool handler.
-struct CalculatorToolHandler;
-
-impl ToolHandler for CalculatorToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "calculator".to_string(),
-            description: Some("Performs arithmetic operations".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "a": { "type": "number" },
-                    "b": { "type": "number" },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["add", "subtract", "multiply", "divide"]
-                    }
-                },
-                "required": ["a", "b", "operation"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let a = arguments.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let b = arguments.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let op = arguments
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("add");
-
-        let result = match op {
-            "add" => a + b,
-            "subtract" => a - b,
-            "multiply" => a * b,
-            "divide" => {
-                if b == 0.0 {
-                    return Err(McpError::tool_error("Division by zero"));
-                }
-                a / b
+#[fastmcp_rust::tool(name = "calculator", description = "Performs arithmetic operations")]
+fn calculator_tool_handler(a: f64, b: f64, operation: String) -> McpResult<String> {
+    let result = match operation.as_str() {
+        "add" => a + b,
+        "subtract" => a - b,
+        "multiply" => a * b,
+        "divide" => {
+            if b == 0.0 {
+                return Err(McpError::tool_error("Division by zero"));
             }
-            _ => return Err(McpError::tool_error(format!("Unknown operation: {op}"))),
-        };
+            a / b
+        }
+        _ => {
+            return Err(McpError::tool_error(format!(
+                "Unknown operation: {operation}"
+            )));
+        }
+    };
 
-        Ok(vec![Content::Text {
-            text: result.to_string(),
-        }])
-    }
+    Ok(result.to_string())
 }
 
 /// An error-producing tool handler.
-struct ErrorToolHandler;
-
-impl ToolHandler for ErrorToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "error_tool".to_string(),
-            description: Some("Always returns an error".to_string()),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        Err(McpError::tool_error("Intentional error for testing"))
-    }
+#[fastmcp_rust::tool(name = "error_tool", description = "Always returns an error")]
+fn error_tool_handler() -> McpResult<String> {
+    Err(McpError::tool_error("Intentional error for testing"))
 }
 
 /// A tool that returns the current request authentication context as JSON text.
-struct AuthInfoToolHandler;
+#[fastmcp_rust::tool(
+    name = "auth_info",
+    description = "Returns auth context for E2E verification",
+    tags = ["auth", "testing"],
+    annotations(read_only)
+)]
+fn auth_info_tool_handler(ctx: &McpContext) -> String {
+    let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
+    let access = auth.token.as_ref();
 
-impl ToolHandler for AuthInfoToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "auth_info".to_string(),
-            description: Some("Returns auth context for E2E verification".to_string()),
-            input_schema: json!({"type": "object"}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec!["auth".to_string(), "testing".to_string()],
-            annotations: Some(ToolAnnotations::new().read_only(true)),
-        }
-    }
+    let payload = json!({
+        "subject": auth.subject,
+        "scopes": auth.scopes,
+        "scheme": access.map(|t| t.scheme.clone()),
+        "token": access.map(|t| t.token.clone()),
+    });
 
-    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
-        let access = auth.token.as_ref();
-
-        let payload = json!({
-            "subject": auth.subject,
-            "scopes": auth.scopes,
-            "scheme": access.map(|t| t.scheme.clone()),
-            "token": access.map(|t| t.token.clone()),
-        });
-
-        Ok(vec![Content::Text {
-            text: payload.to_string(),
-        }])
-    }
+    payload.to_string()
 }
 
 /// A text file resource handler.
-struct TextFileResourceHandler;
-
-impl ResourceHandler for TextFileResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "file:///test/sample.txt".to_string(),
-            name: "sample.txt".to_string(),
-            description: Some("A sample text file".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["text".to_string()],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent {
-            uri: "file:///test/sample.txt".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            text: Some("Hello, World!\nThis is sample text content.".to_string()),
-            blob: None,
-        }])
-    }
+#[fastmcp_rust::resource(
+    uri = "file:///test/sample.txt",
+    name = "sample.txt",
+    description = "A sample text file",
+    mime_type = "text/plain",
+    version = "1.0.0",
+    tags = ["text"]
+)]
+fn text_file_resource_handler() -> String {
+    "Hello, World!\nThis is sample text content.".to_string()
 }
 
 /// A JSON config resource handler.
-struct JsonConfigResourceHandler;
-
-impl ResourceHandler for JsonConfigResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "file:///config/settings.json".to_string(),
-            name: "settings.json".to_string(),
-            description: Some("Application configuration".to_string()),
-            mime_type: Some("application/json".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let config = json!({
-            "version": "1.0.0",
-            "debug": false,
-            "max_connections": 100
-        });
-        Ok(vec![ResourceContent {
-            uri: "file:///config/settings.json".to_string(),
-            mime_type: Some("application/json".to_string()),
-            text: Some(config.to_string()),
-            blob: None,
-        }])
-    }
+#[fastmcp_rust::resource(
+    uri = "file:///config/settings.json",
+    name = "settings.json",
+    description = "Application configuration",
+    mime_type = "application/json"
+)]
+fn json_config_resource_handler() -> String {
+    json!({
+        "version": "1.0.0",
+        "debug": false,
+        "max_connections": 100
+    })
+    .to_string()
 }
 
 /// A greeting prompt handler.
-struct GreetingPromptHandler;
-
-impl PromptHandler for GreetingPromptHandler {
-    fn definition(&self) -> Prompt {
-        Prompt {
-            name: "greeting".to_string(),
-            description: Some("Generate a greeting".to_string()),
-            arguments: vec![PromptArgument {
-                name: "name".to_string(),
-                description: Some("Person to greet".to_string()),
-                required: true,
-            }],
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["greeting".to_string()],
-        }
-    }
-
-    fn get(
-        &self,
-        _ctx: &McpContext,
-        arguments: HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
-        let name = arguments.get("name").map_or("World", String::as_str);
-        Ok(vec![PromptMessage {
-            role: Role::User,
-            content: Content::Text {
-                text: format!("Please greet {name} warmly."),
-            },
-        }])
-    }
+#[fastmcp_rust::prompt(
+    name = "greeting",
+    description = "Generate a greeting",
+    version = "1.0.0",
+    tags = ["greeting"]
+)]
+fn greeting_prompt_handler(name: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("Please greet {name} warmly."),
+        },
+    }]
 }
 
 /// A code review prompt handler with multiple arguments.
-struct CodeReviewPromptHandler;
-
-impl PromptHandler for CodeReviewPromptHandler {
-    fn definition(&self) -> Prompt {
-        Prompt {
-            name: "code_review".to_string(),
-            description: Some("Review code for quality".to_string()),
-            arguments: vec![
-                PromptArgument {
-                    name: "code".to_string(),
-                    description: Some("Code to review".to_string()),
-                    required: true,
-                },
-                PromptArgument {
-                    name: "language".to_string(),
-                    description: Some("Programming language".to_string()),
-                    required: true,
-                },
-            ],
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn get(
-        &self,
-        _ctx: &McpContext,
-        arguments: HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
-        let code = arguments.get("code").map_or("", String::as_str);
-        let lang = arguments.get("language").map_or("unknown", String::as_str);
-        Ok(vec![
-            PromptMessage {
-                role: Role::User,
-                content: Content::Text {
-                    text: format!("Review this {lang} code:\n```{lang}\n{code}\n```"),
-                },
+#[fastmcp_rust::prompt(name = "code_review", description = "Review code for quality")]
+fn code_review_prompt_handler(code: String, language: String) -> Vec<PromptMessage> {
+    vec![
+        PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: format!("Review this {language} code:\n```{language}\n{code}\n```"),
             },
-            PromptMessage {
-                role: Role::Assistant,
-                content: Content::Text {
-                    text: "I'll review this code for quality, bugs, and improvements.".to_string(),
-                },
+        },
+        PromptMessage {
+            role: Role::Assistant,
+            content: Content::Text {
+                text: "I'll review this code for quality, bugs, and improvements.".to_string(),
             },
-        ])
-    }
+        },
+    ]
 }
 
 // ============================================================================
@@ -376,10 +215,10 @@ fn setup_test_server_and_client() -> TestHarness {
         .tool(GreetingToolHandler)
         .tool(CalculatorToolHandler)
         .tool(ErrorToolHandler)
-        .resource(TextFileResourceHandler)
-        .resource(JsonConfigResourceHandler)
-        .prompt(GreetingPromptHandler)
-        .prompt(CodeReviewPromptHandler)
+        .resource(TextFileResourceHandlerResource)
+        .resource(JsonConfigResourceHandlerResource)
+        .prompt(GreetingPromptHandlerPrompt)
+        .prompt(CodeReviewPromptHandlerPrompt)
         .build();
 
     // Run server in background thread
@@ -1356,7 +1195,7 @@ fn e2e_server_with_resources_only() {
         .with_name("resources-only")
         .build_server_builder();
 
-    let server = builder.resource(TextFileResourceHandler).build();
+    let server = builder.resource(TextFileResourceHandlerResource).build();
 
     let handle = spawn_thread(move || {
         server.run_transport(server_transport);
@@ -1379,7 +1218,7 @@ fn e2e_server_with_prompts_only() {
         .with_name("prompts-only")
         .build_server_builder();
 
-    let server = builder.prompt(GreetingPromptHandler).build();
+    let server = builder.prompt(GreetingPromptHandlerPrompt).build();
 
     let handle = spawn_thread(move || {
         server.run_transport(server_transport);
