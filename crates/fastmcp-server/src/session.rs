@@ -615,4 +615,134 @@ mod tests {
         assert!(!session.supports_elicitation());
         assert!(!session.supports_roots());
     }
+
+    // ── Re-initialization ───────────────────────────────────────────
+
+    #[test]
+    fn reinitialize_overwrites_client_info() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        session.initialize(
+            ClientInfo {
+                name: "new-client".to_string(),
+                version: "2.0".to_string(),
+            },
+            ClientCapabilities {
+                sampling: Some(SamplingCapability {}),
+                elicitation: None,
+                roots: None,
+            },
+            "2025-03-26".to_string(),
+        );
+        assert!(session.is_initialized());
+        let info = session.client_info().unwrap();
+        assert_eq!(info.name, "new-client");
+        assert_eq!(info.version, "2.0");
+        assert_eq!(session.protocol_version(), Some("2025-03-26"));
+        assert!(session.supports_sampling());
+    }
+
+    // ── State persistence through lifecycle ──────────────────────────
+
+    #[test]
+    fn state_persists_after_initialization() {
+        let mut session = make_session();
+        session.state().set("key", "before_init");
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let val: Option<String> = session.state().get("key");
+        assert_eq!(val.as_deref(), Some("before_init"));
+    }
+
+    // ── Notification after unsubscribe ───────────────────────────────
+
+    #[test]
+    fn notify_resource_updated_after_unsubscribe_returns_false() {
+        let mut session = make_session();
+        session.subscribe_resource("r://x".to_string());
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        // First notification should fire
+        assert!(session.notify_resource_updated("r://x", &sender));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // Unsubscribe and try again
+        session.unsubscribe_resource("r://x");
+        assert!(!session.notify_resource_updated("r://x", &sender));
+        // No new notifications sent
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // ── Subscribe → unsubscribe → re-subscribe ─────────────────────
+
+    #[test]
+    fn resubscribe_after_unsubscribe_works() {
+        let mut session = make_session();
+        session.subscribe_resource("r://x".to_string());
+        session.unsubscribe_resource("r://x");
+        assert!(!session.is_resource_subscribed("r://x"));
+        session.subscribe_resource("r://x".to_string());
+        assert!(session.is_resource_subscribed("r://x"));
+    }
+
+    // ── Debug format after initialization ───────────────────────────
+
+    #[test]
+    fn session_debug_after_init_shows_initialized_true() {
+        let mut session = make_session();
+        session.initialize(
+            make_client_info(),
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let debug = format!("{:?}", session);
+        assert!(debug.contains("initialized: true"));
+    }
+
+    // ── Non-default server capabilities ─────────────────────────────
+
+    #[test]
+    fn session_with_custom_server_capabilities() {
+        use fastmcp_protocol::{LoggingCapability, TasksCapability, ToolsCapability};
+        let caps = ServerCapabilities {
+            tools: Some(ToolsCapability { list_changed: true }),
+            logging: Some(LoggingCapability {}),
+            tasks: Some(TasksCapability {
+                list_changed: false,
+            }),
+            ..ServerCapabilities::default()
+        };
+        let session = Session::new(make_server_info(), caps);
+        assert!(session.server_capabilities().tools.is_some());
+        assert!(session.server_capabilities().logging.is_some());
+        assert!(session.server_capabilities().tasks.is_some());
+    }
+
+    // ── Log level with all variants ─────────────────────────────────
+
+    #[test]
+    fn set_log_level_all_variants() {
+        let mut session = make_session();
+        for level in [
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warning,
+            LogLevel::Error,
+        ] {
+            session.set_log_level(level);
+            assert_eq!(session.log_level(), Some(level));
+        }
+    }
 }
