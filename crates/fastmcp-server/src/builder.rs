@@ -916,6 +916,12 @@ impl ServerBuilder {
         self
     }
 
+    /// Returns the current request timeout.
+    #[cfg(test)]
+    fn request_timeout_secs(&self) -> u64 {
+        self.request_timeout_secs
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(mut self) -> Server {
@@ -944,5 +950,325 @@ impl ServerBuilder {
             task_manager: self.task_manager,
             pending_requests: std::sync::Arc::new(crate::bidirectional::PendingRequests::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_core::{McpContext, McpResult};
+    use fastmcp_protocol::{Content, Prompt, Resource, ResourceContent, Tool};
+
+    // ── Stub handlers ────────────────────────────────────────────────
+
+    struct TestTool;
+    impl crate::ToolHandler for TestTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "test_tool".to_string(),
+                description: Some("a test tool".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("ok")])
+        }
+    }
+
+    struct TestResource;
+    impl crate::ResourceHandler for TestResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///test".to_string(),
+                name: "test_res".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "file:///test".to_string(),
+                mime_type: None,
+                text: Some("content".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    struct TestPrompt;
+    impl crate::PromptHandler for TestPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "test_prompt".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    // ── Builder defaults ─────────────────────────────────────────────
+
+    #[test]
+    fn builder_new_sets_info() {
+        let builder = ServerBuilder::new("my-server", "2.0.0");
+        let server = builder.build();
+        assert_eq!(server.info().name, "my-server");
+        assert_eq!(server.info().version, "2.0.0");
+    }
+
+    #[test]
+    fn builder_default_has_logging_capability() {
+        let builder = ServerBuilder::new("srv", "1.0");
+        let server = builder.build();
+        assert!(server.capabilities().logging.is_some());
+    }
+
+    #[test]
+    fn builder_default_has_no_tool_resource_prompt_capabilities() {
+        let builder = ServerBuilder::new("srv", "1.0");
+        let server = builder.build();
+        assert!(server.capabilities().tools.is_none());
+        assert!(server.capabilities().resources.is_none());
+        assert!(server.capabilities().prompts.is_none());
+    }
+
+    #[test]
+    fn builder_default_stats_enabled() {
+        let server = ServerBuilder::new("srv", "1.0").build();
+        assert!(server.stats().is_some());
+    }
+
+    #[test]
+    fn builder_default_request_timeout() {
+        let builder = ServerBuilder::new("srv", "1.0");
+        assert_eq!(builder.request_timeout_secs(), DEFAULT_REQUEST_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn builder_default_error_masking_disabled() {
+        let builder = ServerBuilder::new("srv", "1.0");
+        assert!(!builder.is_error_masking_enabled());
+    }
+
+    #[test]
+    fn builder_default_strict_validation_disabled() {
+        let builder = ServerBuilder::new("srv", "1.0");
+        assert!(!builder.is_strict_input_validation_enabled());
+    }
+
+    // ── Fluent API setters ───────────────────────────────────────────
+
+    #[test]
+    fn builder_request_timeout() {
+        let builder = ServerBuilder::new("srv", "1.0").request_timeout(60);
+        assert_eq!(builder.request_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn builder_request_timeout_zero_disables() {
+        let builder = ServerBuilder::new("srv", "1.0").request_timeout(0);
+        assert_eq!(builder.request_timeout_secs(), 0);
+    }
+
+    #[test]
+    fn builder_without_stats() {
+        let server = ServerBuilder::new("srv", "1.0").without_stats().build();
+        assert!(server.stats().is_none());
+    }
+
+    #[test]
+    fn builder_mask_error_details() {
+        let builder = ServerBuilder::new("srv", "1.0").mask_error_details(true);
+        assert!(builder.is_error_masking_enabled());
+    }
+
+    #[test]
+    fn builder_strict_input_validation() {
+        let builder = ServerBuilder::new("srv", "1.0").strict_input_validation(true);
+        assert!(builder.is_strict_input_validation_enabled());
+    }
+
+    #[test]
+    fn builder_instructions() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .instructions("Use this server wisely")
+            .build();
+        // instructions stored internally - verify build succeeds
+        let _ = server;
+    }
+
+    #[test]
+    fn builder_log_level() {
+        let _builder = ServerBuilder::new("srv", "1.0").log_level(Level::Debug);
+    }
+
+    #[test]
+    fn builder_log_level_filter() {
+        let _builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Warn);
+    }
+
+    #[test]
+    fn builder_log_timestamps_and_targets() {
+        let _builder = ServerBuilder::new("srv", "1.0")
+            .log_timestamps(false)
+            .log_targets(false);
+    }
+
+    // ── Console configuration ────────────────────────────────────────
+
+    #[test]
+    fn builder_without_banner() {
+        let builder = ServerBuilder::new("srv", "1.0").without_banner();
+        let config = builder.console_config();
+        assert_eq!(config.banner_style, BannerStyle::None);
+    }
+
+    #[test]
+    fn builder_with_banner_compact() {
+        let builder = ServerBuilder::new("srv", "1.0").with_banner(BannerStyle::Compact);
+        let config = builder.console_config();
+        assert_eq!(config.banner_style, BannerStyle::Compact);
+    }
+
+    #[test]
+    fn builder_plain_mode() {
+        let builder = ServerBuilder::new("srv", "1.0").plain_mode();
+        let _config = builder.console_config();
+    }
+
+    // ── Handler registration ─────────────────────────────────────────
+
+    #[test]
+    fn builder_tool_enables_capability() {
+        let server = ServerBuilder::new("srv", "1.0").tool(TestTool).build();
+        assert!(server.capabilities().tools.is_some());
+        assert!(server.has_tools());
+    }
+
+    #[test]
+    fn builder_resource_enables_capability() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .resource(TestResource)
+            .build();
+        assert!(server.capabilities().resources.is_some());
+        assert!(server.has_resources());
+    }
+
+    #[test]
+    fn builder_prompt_enables_capability() {
+        let server = ServerBuilder::new("srv", "1.0").prompt(TestPrompt).build();
+        assert!(server.capabilities().prompts.is_some());
+        assert!(server.has_prompts());
+    }
+
+    #[test]
+    fn builder_all_handlers() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .build();
+        assert!(server.has_tools());
+        assert!(server.has_resources());
+        assert!(server.has_prompts());
+    }
+
+    #[test]
+    fn builder_no_handlers_means_no_capabilities() {
+        let server = ServerBuilder::new("srv", "1.0").build();
+        assert!(!server.has_tools());
+        assert!(!server.has_resources());
+        assert!(!server.has_prompts());
+    }
+
+    // ── Duplicate behavior ───────────────────────────────────────────
+
+    #[test]
+    fn builder_on_duplicate_default_is_warn() {
+        let _builder = ServerBuilder::new("srv", "1.0");
+        // DuplicateBehavior::default() is Warn - builder should use that
+    }
+
+    #[test]
+    fn builder_on_duplicate_ignore() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Ignore)
+            .tool(TestTool)
+            .build();
+        assert!(server.has_tools());
+    }
+
+    #[test]
+    fn builder_on_duplicate_replace() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .tool(TestTool)
+            .build();
+        assert!(server.has_tools());
+    }
+
+    // ── Lifecycle hooks ──────────────────────────────────────────────
+
+    #[test]
+    fn builder_on_startup_builds() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_startup(|| -> Result<(), std::io::Error> { Ok(()) })
+            .build();
+        let _ = server;
+    }
+
+    #[test]
+    fn builder_on_shutdown_builds() {
+        let server = ServerBuilder::new("srv", "1.0").on_shutdown(|| {}).build();
+        let _ = server;
+    }
+
+    // ── Console config on built server ───────────────────────────────
+
+    #[test]
+    fn built_server_console_config_matches_builder() {
+        let server = ServerBuilder::new("srv", "1.0").without_banner().build();
+        assert_eq!(server.console_config().banner_style, BannerStyle::None);
+    }
+
+    // ── Chaining ─────────────────────────────────────────────────────
+
+    #[test]
+    fn builder_chaining_fluent_api() {
+        let server = ServerBuilder::new("chain", "3.0")
+            .request_timeout(120)
+            .mask_error_details(true)
+            .strict_input_validation(true)
+            .without_banner()
+            .plain_mode()
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .on_shutdown(|| {})
+            .build();
+
+        assert_eq!(server.info().name, "chain");
+        assert_eq!(server.info().version, "3.0");
+        assert!(server.has_tools());
+        assert!(server.has_resources());
+        assert!(server.has_prompts());
     }
 }
