@@ -1923,4 +1923,392 @@ mod tests {
         let resource = super::resource_from_template(&template);
         assert_eq!(resource.icon, Some(icon));
     }
+
+    // =========================================================================
+    // Progress callback — None total branch
+    // =========================================================================
+
+    /// Backend that invokes the progress callback with `None` total,
+    /// exercising the `report_progress` (no total) path in `ProxyClient::call_tool`.
+    struct NoTotalProgressBackend {
+        state: Arc<Mutex<TestState>>,
+    }
+
+    impl ProxyBackend for NoTotalProgressBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Ok(vec![])
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Ok(vec![])
+        }
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Ok(vec![])
+        }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Ok(vec![])
+        }
+        fn call_tool(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            let mut guard = self.state.lock().expect("state lock poisoned");
+            guard.last_tool.replace((name.to_string(), arguments));
+            Ok(vec![Content::Text {
+                text: "ok".to_string(),
+            }])
+        }
+        fn call_tool_with_progress(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+            on_progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            // Call with None total to exercise the else branch
+            on_progress(0.3, None, Some("partial".to_string()));
+            self.call_tool(name, arguments)
+        }
+        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+        fn get_prompt(
+            &mut self,
+            _name: &str,
+            _arguments: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn proxy_client_call_tool_with_progress_none_total() {
+        use fastmcp_core::ProgressReporter;
+
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = NoTotalProgressBackend {
+            state: Arc::clone(&state),
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        let sender = Arc::new(TestNotificationSender {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reporter =
+            ProgressReporter::new(Arc::clone(&sender) as Arc<dyn fastmcp_core::NotificationSender>);
+        let ctx = McpContext::with_progress(Cx::for_testing(), 1, reporter);
+
+        let result = proxy
+            .call_tool(&ctx, "no-total", serde_json::json!({}))
+            .expect("call ok");
+        assert_eq!(result.len(), 1);
+
+        let calls = sender.calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        // Total should be None since the backend passes None
+        assert!(calls[0].1.is_none());
+    }
+
+    // =========================================================================
+    // Partial catalog failures — list_resources, list_templates, list_prompts
+    // =========================================================================
+
+    /// A backend where list_tools succeeds but list_resources fails.
+    struct FailAtResourcesBackend;
+
+    impl ProxyBackend for FailAtResourcesBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Ok(vec![])
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "resource list failed",
+            ))
+        }
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Ok(vec![])
+        }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Ok(vec![])
+        }
+        fn call_tool(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn call_tool_with_progress(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+            _: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn read_resource(&mut self, _: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_propagates_resource_list_error_directly() {
+        let mut backend = FailAtResourcesBackend;
+        let result = ProxyCatalog::from_backend(&mut backend);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("resource list failed"));
+    }
+
+    /// A backend where list_tools and list_resources succeed but list_resource_templates fails.
+    struct FailAtTemplatesBackend;
+
+    impl ProxyBackend for FailAtTemplatesBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Ok(vec![])
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Ok(vec![])
+        }
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "template list failed",
+            ))
+        }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Ok(vec![])
+        }
+        fn call_tool(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn call_tool_with_progress(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+            _: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn read_resource(&mut self, _: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_propagates_template_list_error() {
+        let mut backend = FailAtTemplatesBackend;
+        let result = ProxyCatalog::from_backend(&mut backend);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("template list failed"));
+    }
+
+    /// A backend where everything succeeds except list_prompts.
+    struct FailAtPromptsBackend;
+
+    impl ProxyBackend for FailAtPromptsBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Ok(vec![])
+        }
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Ok(vec![])
+        }
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Ok(vec![])
+        }
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Err(fastmcp_core::McpError::internal_error("prompt list failed"))
+        }
+        fn call_tool(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn call_tool_with_progress(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+            _: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+        fn read_resource(&mut self, _: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_propagates_prompt_list_error() {
+        let mut backend = FailAtPromptsBackend;
+        let result = ProxyCatalog::from_backend(&mut backend);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("prompt list failed"));
+    }
+
+    // =========================================================================
+    // read_with_uri on template-based handlers
+    // =========================================================================
+
+    #[test]
+    fn proxy_resource_handler_from_template_read_with_uri() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let template = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "DB".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let handler = ProxyResourceHandler::from_template(template, proxy);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let mut params = HashMap::new();
+        params.insert("table".to_string(), "users".to_string());
+        let result = handler
+            .read_with_uri(&ctx, "db://users", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn proxy_resource_handler_from_template_with_prefix_read_with_uri() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let template = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "DB".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let handler = ProxyResourceHandler::from_template_with_prefix(template, "remote", proxy);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let mut params = HashMap::new();
+        params.insert("table".to_string(), "orders".to_string());
+        // Prefixed URI
+        let result = handler
+            .read_with_uri(&ctx, "remote/db://orders", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    // =========================================================================
+    // Prompt definition preserves arguments
+    // =========================================================================
+
+    #[test]
+    fn proxy_prompt_handler_definition_preserves_arguments() {
+        use fastmcp_protocol::PromptArgument;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyPromptHandler::new(
+            Prompt {
+                name: "templated".to_string(),
+                description: Some("prompt with args".to_string()),
+                arguments: vec![
+                    PromptArgument {
+                        name: "name".to_string(),
+                        description: Some("User name".to_string()),
+                        required: true,
+                    },
+                    PromptArgument {
+                        name: "lang".to_string(),
+                        description: None,
+                        required: false,
+                    },
+                ],
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+
+        let def = handler.definition();
+        assert_eq!(def.arguments.len(), 2);
+        assert_eq!(def.arguments[0].name, "name");
+        assert!(def.arguments[0].required);
+        assert_eq!(def.arguments[1].name, "lang");
+        assert!(!def.arguments[1].required);
+    }
+
+    // =========================================================================
+    // Prefixed prompt definition preserves arguments
+    // =========================================================================
+
+    #[test]
+    fn prefixed_prompt_handler_definition_preserves_arguments() {
+        use fastmcp_protocol::PromptArgument;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyPromptHandler::with_prefix(
+            Prompt {
+                name: "greet".to_string(),
+                description: None,
+                arguments: vec![PromptArgument {
+                    name: "user".to_string(),
+                    description: None,
+                    required: true,
+                }],
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            "ns",
+            proxy,
+        );
+
+        let def = handler.definition();
+        assert_eq!(def.name, "ns/greet");
+        assert_eq!(def.arguments.len(), 1);
+        assert_eq!(def.arguments[0].name, "user");
+    }
 }
