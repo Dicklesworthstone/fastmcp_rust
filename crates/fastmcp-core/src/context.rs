@@ -2741,4 +2741,279 @@ mod tests {
         assert!(caps.prompts);
         assert!(caps.logging);
     }
+
+    // ========================================================================
+    // ResourceContentItem Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resource_content_item_text() {
+        let item = ResourceContentItem::text("test://uri", "hello");
+        assert_eq!(item.uri, "test://uri");
+        assert_eq!(item.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(item.as_text(), Some("hello"));
+        assert!(item.as_blob().is_none());
+        assert!(item.is_text());
+        assert!(!item.is_blob());
+    }
+
+    #[test]
+    fn test_resource_content_item_json() {
+        let item = ResourceContentItem::json("data://config", r#"{"key":"val"}"#);
+        assert_eq!(item.uri, "data://config");
+        assert_eq!(item.mime_type.as_deref(), Some("application/json"));
+        assert_eq!(item.as_text(), Some(r#"{"key":"val"}"#));
+        assert!(item.is_text());
+        assert!(!item.is_blob());
+    }
+
+    #[test]
+    fn test_resource_content_item_blob() {
+        let item = ResourceContentItem::blob("binary://data", "application/octet-stream", "AQID");
+        assert_eq!(item.uri, "binary://data");
+        assert_eq!(item.mime_type.as_deref(), Some("application/octet-stream"));
+        assert!(item.as_text().is_none());
+        assert_eq!(item.as_blob(), Some("AQID"));
+        assert!(!item.is_text());
+        assert!(item.is_blob());
+    }
+
+    // ========================================================================
+    // ResourceReadResult Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resource_read_result_text() {
+        let result = ResourceReadResult::text("test://doc", "content");
+        assert_eq!(result.first_text(), Some("content"));
+        assert!(result.first_blob().is_none());
+        assert_eq!(result.contents.len(), 1);
+    }
+
+    #[test]
+    fn test_resource_read_result_new_multiple() {
+        let result = ResourceReadResult::new(vec![
+            ResourceContentItem::text("a://1", "first"),
+            ResourceContentItem::blob("b://2", "image/png", "base64data"),
+        ]);
+        assert_eq!(result.contents.len(), 2);
+        // first_text returns the first item's text
+        assert_eq!(result.first_text(), Some("first"));
+        // first_blob returns None because the first item is text
+        assert!(result.first_blob().is_none());
+    }
+
+    #[test]
+    fn test_resource_read_result_empty() {
+        let result = ResourceReadResult::new(vec![]);
+        assert!(result.first_text().is_none());
+        assert!(result.first_blob().is_none());
+    }
+
+    #[test]
+    fn test_resource_read_result_blob_first() {
+        let result = ResourceReadResult::new(vec![ResourceContentItem::blob(
+            "b://1",
+            "image/png",
+            "data",
+        )]);
+        assert!(result.first_text().is_none());
+        assert_eq!(result.first_blob(), Some("data"));
+    }
+
+    // ========================================================================
+    // ToolContentItem Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tool_content_item_text() {
+        let item = ToolContentItem::text("hello");
+        assert_eq!(item.as_text(), Some("hello"));
+        assert!(item.is_text());
+    }
+
+    #[test]
+    fn test_tool_content_item_image() {
+        let item = ToolContentItem::Image {
+            data: "base64img".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        assert!(item.as_text().is_none());
+        assert!(!item.is_text());
+    }
+
+    #[test]
+    fn test_tool_content_item_audio() {
+        let item = ToolContentItem::Audio {
+            data: "base64audio".to_string(),
+            mime_type: "audio/wav".to_string(),
+        };
+        assert!(item.as_text().is_none());
+        assert!(!item.is_text());
+    }
+
+    #[test]
+    fn test_tool_content_item_resource() {
+        let item = ToolContentItem::Resource {
+            uri: "file://test".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("embedded".to_string()),
+            blob: None,
+        };
+        assert!(item.as_text().is_none());
+        assert!(!item.is_text());
+    }
+
+    // ========================================================================
+    // ToolCallResult Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tool_call_result_success() {
+        let result = ToolCallResult::success(vec![
+            ToolContentItem::text("item1"),
+            ToolContentItem::text("item2"),
+        ]);
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.first_text(), Some("item1"));
+    }
+
+    #[test]
+    fn test_tool_call_result_text() {
+        let result = ToolCallResult::text("simple output");
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.first_text(), Some("simple output"));
+    }
+
+    #[test]
+    fn test_tool_call_result_error() {
+        let result = ToolCallResult::error("something failed");
+        assert!(result.is_error);
+        assert_eq!(result.first_text(), Some("something failed"));
+    }
+
+    #[test]
+    fn test_tool_call_result_empty() {
+        let result = ToolCallResult::success(vec![]);
+        assert!(!result.is_error);
+        assert!(result.first_text().is_none());
+    }
+
+    // ========================================================================
+    // ElicitationResponse Tests
+    // ========================================================================
+
+    #[test]
+    fn test_elicitation_response_accept() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("name".to_string(), serde_json::json!("Alice"));
+        data.insert("age".to_string(), serde_json::json!(30));
+        data.insert("active".to_string(), serde_json::json!(true));
+
+        let resp = ElicitationResponse::accept(data);
+        assert!(resp.is_accepted());
+        assert!(!resp.is_declined());
+        assert!(!resp.is_cancelled());
+        assert_eq!(resp.get_string("name"), Some("Alice"));
+        assert_eq!(resp.get_int("age"), Some(30));
+        assert_eq!(resp.get_bool("active"), Some(true));
+    }
+
+    #[test]
+    fn test_elicitation_response_accept_url() {
+        let resp = ElicitationResponse::accept_url();
+        assert!(resp.is_accepted());
+        assert!(resp.content.is_none());
+        assert!(resp.get_string("anything").is_none());
+    }
+
+    #[test]
+    fn test_elicitation_response_decline() {
+        let resp = ElicitationResponse::decline();
+        assert!(!resp.is_accepted());
+        assert!(resp.is_declined());
+        assert!(!resp.is_cancelled());
+        assert!(resp.get_string("key").is_none());
+    }
+
+    #[test]
+    fn test_elicitation_response_cancel() {
+        let resp = ElicitationResponse::cancel();
+        assert!(!resp.is_accepted());
+        assert!(!resp.is_declined());
+        assert!(resp.is_cancelled());
+    }
+
+    #[test]
+    fn test_elicitation_response_missing_key() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("exists".to_string(), serde_json::json!("value"));
+        let resp = ElicitationResponse::accept(data);
+
+        assert!(resp.get_string("missing").is_none());
+        assert!(resp.get_bool("missing").is_none());
+        assert!(resp.get_int("missing").is_none());
+    }
+
+    #[test]
+    fn test_elicitation_response_type_mismatch() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("num".to_string(), serde_json::json!(42));
+        let resp = ElicitationResponse::accept(data);
+
+        // get_string on a number returns None
+        assert!(resp.get_string("num").is_none());
+        // get_bool on a number returns None
+        assert!(resp.get_bool("num").is_none());
+        // get_int on a number returns Some
+        assert_eq!(resp.get_int("num"), Some(42));
+    }
+
+    // ========================================================================
+    // Capability Check Tests (can_sample, can_elicit, etc.)
+    // ========================================================================
+
+    #[test]
+    fn test_can_sample_false_by_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert!(!ctx.can_sample());
+    }
+
+    #[test]
+    fn test_can_elicit_false_by_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert!(!ctx.can_elicit());
+    }
+
+    #[test]
+    fn test_can_read_resources_false_by_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert!(!ctx.can_read_resources());
+    }
+
+    #[test]
+    fn test_can_call_tools_false_by_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert!(!ctx.can_call_tools());
+    }
+
+    #[test]
+    fn test_resource_read_depth_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert_eq!(ctx.resource_read_depth(), 0);
+    }
+
+    #[test]
+    fn test_tool_call_depth_default() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        assert_eq!(ctx.tool_call_depth(), 0);
+    }
 }
