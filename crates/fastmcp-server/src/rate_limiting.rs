@@ -1048,4 +1048,68 @@ mod tests {
         // Different client gets its own limiter
         assert!(m.is_request_allowed("c2"));
     }
+
+    #[test]
+    fn sliding_window_requests_expire_after_window() {
+        let limiter = SlidingWindowRateLimiter::new(2, 1); // 2 requests per 1 second
+        assert!(limiter.is_allowed());
+        assert!(limiter.is_allowed());
+        assert!(!limiter.is_allowed()); // exhausted
+
+        // Wait for window to expire
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Requests should be allowed again
+        assert!(limiter.is_allowed());
+    }
+
+    #[test]
+    fn sliding_window_current_requests_resets_after_window() {
+        let limiter = SlidingWindowRateLimiter::new(5, 1); // 1 second window
+        limiter.is_allowed();
+        limiter.is_allowed();
+        assert_eq!(limiter.current_requests(), 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Old requests should have expired
+        assert_eq!(limiter.current_requests(), 0);
+    }
+
+    #[test]
+    fn sliding_window_error_exactly_60_seconds_shows_minutes() {
+        let m = SlidingWindowRateLimitingMiddleware::new(1, 60);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(
+            err.message.contains("1 minute(s)"),
+            "60 seconds should display as minutes: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn token_bucket_try_consume_zero_always_succeeds() {
+        let limiter = TokenBucketRateLimiter::new(3, 1.0);
+        // Drain all tokens
+        limiter.try_consume(3);
+        assert!(!limiter.try_consume(1)); // exhausted
+
+        // Consuming zero should still succeed
+        assert!(limiter.try_consume(0));
+    }
+
+    #[test]
+    fn token_bucket_refill_rate_zero_never_refills() {
+        let limiter = TokenBucketRateLimiter::new(2, 0.0); // zero refill rate
+        assert!(limiter.try_consume(2));
+        assert!(!limiter.try_consume(1));
+
+        // Even after waiting, no refill
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!limiter.try_consume(1));
+    }
 }
