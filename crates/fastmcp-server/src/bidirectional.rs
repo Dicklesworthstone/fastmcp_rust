@@ -695,4 +695,230 @@ mod tests {
         let debug = format!("{:?}", cloned);
         assert!(debug.contains("RequestSender"));
     }
+
+    // ── RequestSender send_request paths ─────────────────────────────
+
+    #[test]
+    fn request_sender_success_path() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                let response = JsonRpcResponse::success(id, serde_json::json!({"answer": 42}));
+                pending_clone.route_response(&response);
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+        let result: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+        let value = result.unwrap();
+        assert_eq!(value["answer"], 42);
+    }
+
+    #[test]
+    fn request_sender_error_response_path() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                let response = JsonRpcResponse::error(
+                    Some(id),
+                    JsonRpcError {
+                        code: -32600,
+                        message: "bad request".to_string(),
+                        data: None,
+                    },
+                );
+                pending_clone.route_response(&response);
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+        let result: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+        let err = result.unwrap_err();
+        assert!(err.message.contains("bad request"));
+    }
+
+    #[test]
+    fn request_sender_disconnected_path() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                // Remove the pending entry so tx is dropped, causing Disconnected
+                pending_clone.remove(&id);
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+        let result: McpResult<serde_json::Value> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Response channel closed"));
+    }
+
+    #[test]
+    fn request_sender_deserialization_error() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                // Return a string value, which won't deserialize to Vec<String>
+                let response =
+                    JsonRpcResponse::success(id, serde_json::json!("not a vec of strings"));
+                pending_clone.route_response(&response);
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+        let result: McpResult<Vec<String>> =
+            sender.send_request(&cx, "test/method", serde_json::json!({}));
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Failed to parse response"));
+    }
+
+    // ── cancel_all error details ─────────────────────────────────────
+
+    #[test]
+    fn cancel_all_sends_connection_closed_error() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let receiver = pr.register(id);
+        pr.cancel_all();
+        let result = receiver.recv().unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.code, i32::from(McpErrorCode::InternalError));
+        assert!(err.message.contains("Connection closed"));
+        assert!(err.data.is_none());
+    }
+
+    // ── route_response with error containing data ────────────────────
+
+    #[test]
+    fn route_response_error_with_data() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let receiver = pr.register(id.clone());
+        let response = JsonRpcResponse::error(
+            Some(id),
+            JsonRpcError {
+                code: -32001,
+                message: "custom error".to_string(),
+                data: Some(serde_json::json!({"detail": "extra info"})),
+            },
+        );
+        assert!(pr.route_response(&response));
+        let result = receiver.recv().unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.code, -32001);
+        assert!(err.message.contains("custom error"));
+        assert!(err.data.is_some());
+    }
+
+    // ── Multiple concurrent register/route ───────────────────────────
+
+    #[test]
+    fn pending_requests_multiple_register_and_route_independently() {
+        let pr = PendingRequests::new();
+        let id1 = pr.next_request_id();
+        let id2 = pr.next_request_id();
+        let id3 = pr.next_request_id();
+        let rx1 = pr.register(id1.clone());
+        let rx2 = pr.register(id2.clone());
+        let rx3 = pr.register(id3.clone());
+
+        // Route them out of order
+        let r2 = JsonRpcResponse::success(id2.clone(), serde_json::json!("second"));
+        let r3 = JsonRpcResponse::success(id3.clone(), serde_json::json!("third"));
+        let r1 = JsonRpcResponse::success(id1.clone(), serde_json::json!("first"));
+        assert!(pr.route_response(&r2));
+        assert!(pr.route_response(&r3));
+        assert!(pr.route_response(&r1));
+
+        assert_eq!(rx1.recv().unwrap().unwrap(), serde_json::json!("first"));
+        assert_eq!(rx2.recv().unwrap().unwrap(), serde_json::json!("second"));
+        assert_eq!(rx3.recv().unwrap().unwrap(), serde_json::json!("third"));
+    }
+
+    // ── Register same id overwrites ──────────────────────────────────
+
+    #[test]
+    fn pending_requests_register_same_id_overwrites() {
+        let pr = PendingRequests::new();
+        let id = pr.next_request_id();
+        let _rx1 = pr.register(id.clone());
+        let rx2 = pr.register(id.clone()); // overwrites
+
+        let response = JsonRpcResponse::success(id, serde_json::json!("response"));
+        assert!(pr.route_response(&response));
+
+        // rx2 should receive the response (it replaced rx1)
+        let result = rx2.recv().unwrap().unwrap();
+        assert_eq!(result, serde_json::json!("response"));
+    }
+
+    // ── Transport sender constructors ────────────────────────────────
+
+    #[test]
+    fn transport_sampling_sender_new_and_clone() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(pending, send_fn);
+        let sampling = TransportSamplingSender::new(sender);
+        let _cloned = sampling.clone();
+    }
+
+    #[test]
+    fn transport_elicitation_sender_new_and_clone() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(pending, send_fn);
+        let elicitation = TransportElicitationSender::new(sender);
+        let _cloned = elicitation.clone();
+    }
+
+    #[test]
+    fn transport_roots_provider_new_and_clone() {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
+        let sender = RequestSender::new(pending, send_fn);
+        let roots = TransportRootsProvider::new(sender);
+        let _cloned = roots.clone();
+    }
+
+    // ── RequestSender ID cleanup after success ───────────────────────
+
+    #[test]
+    fn request_sender_id_cleaned_from_pending_after_success() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                let response = JsonRpcResponse::success(id, serde_json::json!(null));
+                pending_clone.route_response(&response);
+            }
+            Ok(())
+        });
+        let sender = RequestSender::new(Arc::clone(&pending), send_fn);
+        let cx = Cx::for_testing();
+        let _: serde_json::Value = sender
+            .send_request(&cx, "test/method", serde_json::json!({}))
+            .unwrap();
+
+        // The pending request should have been consumed by route_response
+        let first_id = RequestId::Number(1_000_000);
+        let response = JsonRpcResponse::success(first_id, serde_json::json!(null));
+        assert!(!pending.route_response(&response));
+    }
 }
