@@ -1595,4 +1595,111 @@ mod tests {
             assert!(resp.result.is_some());
         }
     }
+
+    #[test]
+    fn ws_continuation_opcode_roundtrip() {
+        let ft = WsFrameType::Continuation;
+        assert_eq!(WsFrameType::from_opcode(ft.opcode()), Some(ft));
+    }
+
+    #[test]
+    fn ws_unknown_opcode_returns_none() {
+        assert_eq!(WsFrameType::from_opcode(0x03), None);
+        assert_eq!(WsFrameType::from_opcode(0x0F), None);
+    }
+
+    #[test]
+    fn ws_frame_as_text_non_utf8_returns_error() {
+        let frame = WsFrame {
+            frame_type: WsFrameType::Text,
+            payload: vec![0xFF, 0xFE],
+            fin: true,
+        };
+        assert!(frame.as_text().is_err());
+    }
+
+    #[test]
+    fn ws_transport_close_sends_close_frame() {
+        let reader: &[u8] = &[];
+        let mut output = Vec::new();
+        let mut transport = WsTransport::new(reader, &mut output);
+        transport.close().unwrap();
+
+        // Close frame: FIN + opcode 0x08 = 0x88, payload length 0
+        assert!(output.len() >= 2);
+        assert_eq!(output[0], 0x88);
+        assert_eq!(output[1], 0x00);
+    }
+
+    #[test]
+    fn ws_transport_ping_sends_ping_frame() {
+        let reader: &[u8] = &[];
+        let mut output = Vec::new();
+        let mut transport = WsTransport::new(reader, &mut output);
+        transport.ping().unwrap();
+
+        // Ping frame: FIN + opcode 0x09 = 0x89, payload length 0
+        assert!(output.len() >= 2);
+        assert_eq!(output[0], 0x89);
+        assert_eq!(output[1], 0x00);
+    }
+
+    #[test]
+    fn ws_client_transport_send_cancelled() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let reader: &[u8] = &[];
+        let mut writer = Vec::new();
+        let mut transport = WsClientTransport::new(reader, &mut writer);
+
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        let result = transport.send(&cx, &JsonRpcMessage::Request(request));
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn ws_binary_frame_skipped_outside_fragmentation() {
+        // Binary frame (non-fragmented) followed by a text message
+        let mut buffer = Vec::new();
+        buffer.extend(build_masked_frame(0x02, true, b"binary-data"));
+        buffer.extend(build_masked_frame(
+            0x01,
+            true,
+            r#"{"jsonrpc":"2.0","method":"after_binary","id":1}"#.as_bytes(),
+        ));
+
+        let cx = Cx::for_testing();
+        let writer: Vec<u8> = Vec::new();
+        let mut transport = WsTransport::new(Cursor::new(buffer), writer);
+
+        let msg = transport.recv(&cx).unwrap();
+        let JsonRpcMessage::Request(req) = msg else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "after_binary");
+    }
+
+    #[test]
+    fn ws_pong_frame_skipped() {
+        // Pong frame followed by a text message
+        let mut buffer = Vec::new();
+        buffer.extend(build_masked_frame(0x0A, true, b"pong-payload"));
+        buffer.extend(build_masked_frame(
+            0x01,
+            true,
+            r#"{"jsonrpc":"2.0","method":"after_pong","id":2}"#.as_bytes(),
+        ));
+
+        let cx = Cx::for_testing();
+        let writer: Vec<u8> = Vec::new();
+        let mut transport = WsTransport::new(Cursor::new(buffer), writer);
+
+        let msg = transport.recv(&cx).unwrap();
+        let JsonRpcMessage::Request(req) = msg else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "after_pong");
+    }
 }
