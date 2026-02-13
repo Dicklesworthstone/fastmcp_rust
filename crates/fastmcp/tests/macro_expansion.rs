@@ -1178,15 +1178,19 @@ fn resource_optional_param_without_value() {
 /// Resource that can fail.
 #[resource(uri = "fallible://checked")]
 fn fallible_error_resource() -> McpResult<String> {
-    Err(fastmcp_rust::McpError::internal_error("resource failed"))
+    Err(fastmcp_rust::McpError::invalid_params(
+        "resource failed".to_string(),
+    ))
 }
 
 #[test]
 fn resource_result_err() {
     let handler = FallibleErrorResourceResource;
     let ctx = test_ctx();
-    let result = handler.read(&ctx);
-    assert!(result.is_err());
+    let err = handler
+        .read(&ctx)
+        .expect_err("resource should return an error");
+    assert_eq!(err.code, fastmcp_rust::McpErrorCode::InvalidParams);
 }
 
 // --- Async resource with context ---
@@ -1656,7 +1660,9 @@ fn prompt_no_args_call() {
 #[prompt]
 fn fallible_prompt(fail: Option<String>) -> McpResult<Vec<PromptMessage>> {
     if fail.is_some() {
-        Err(fastmcp_rust::McpError::internal_error("prompt failed"))
+        Err(fastmcp_rust::McpError::invalid_params(
+            "prompt failed".to_string(),
+        ))
     } else {
         Ok(vec![PromptMessage {
             role: Role::User,
@@ -1683,8 +1689,10 @@ fn prompt_result_err() {
     let ctx = test_ctx();
     let mut args = HashMap::new();
     args.insert("fail".to_string(), "true".to_string());
-    let result = handler.get(&ctx, args);
-    assert!(result.is_err());
+    let err = handler
+        .get(&ctx, args)
+        .expect_err("prompt should return an error");
+    assert_eq!(err.code, fastmcp_rust::McpErrorCode::InvalidParams);
 }
 
 // --- Async prompt with context ---

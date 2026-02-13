@@ -211,13 +211,21 @@ fn parse_duration_to_millis(s: &str) -> Result<u64, String> {
 
             let millis = match unit {
                 "ms" => num,
-                "s" => num * 1000,
-                "m" => num * 60 * 1000,
-                "h" => num * 60 * 60 * 1000,
+                "s" => num
+                    .checked_mul(1000)
+                    .ok_or_else(|| format!("duration overflow for component: {num}s"))?,
+                "m" => num
+                    .checked_mul(60_000)
+                    .ok_or_else(|| format!("duration overflow for component: {num}m"))?,
+                "h" => num
+                    .checked_mul(3_600_000)
+                    .ok_or_else(|| format!("duration overflow for component: {num}h"))?,
                 _ => unreachable!(),
             };
 
-            total_millis = total_millis.saturating_add(millis);
+            total_millis = total_millis
+                .checked_add(millis)
+                .ok_or_else(|| "duration overflow".to_string())?;
             current_num.clear();
         } else if c.is_whitespace() {
             continue;
@@ -237,6 +245,32 @@ fn parse_duration_to_millis(s: &str) -> Result<u64, String> {
     }
 
     Ok(total_millis)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod duration_parse_tests {
+    use super::parse_duration_to_millis;
+
+    #[test]
+    fn parse_duration_compound_values() {
+        assert_eq!(parse_duration_to_millis("1h30m"), Ok(5_400_000));
+        assert_eq!(parse_duration_to_millis("500ms"), Ok(500));
+    }
+
+    #[test]
+    fn parse_duration_component_overflow_returns_error() {
+        let input = format!("{}s", u64::MAX);
+        let err = parse_duration_to_millis(&input).expect_err("overflowing component must fail");
+        assert!(err.contains("overflow"));
+    }
+
+    #[test]
+    fn parse_duration_total_overflow_returns_error() {
+        let input = format!("{}ms1ms", u64::MAX);
+        let err = parse_duration_to_millis(&input).expect_err("overflowing total must fail");
+        assert!(err.contains("overflow"));
+    }
 }
 
 /// Extracts template parameter names from a URI template string.
@@ -477,9 +511,11 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
         PromptReturnTypeKind::VecPromptMessage => quote! {
             Ok(result)
         },
-        PromptReturnTypeKind::ResultVecPromptMessage
-        | PromptReturnTypeKind::McpResultVecPromptMessage => quote! {
+        PromptReturnTypeKind::ResultVecPromptMessage => quote! {
             result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
+        },
+        PromptReturnTypeKind::McpResultVecPromptMessage => quote! {
+            result
         },
         PromptReturnTypeKind::Other => quote! {
             // Fallback: assume the result is Vec<PromptMessage>
@@ -600,8 +636,17 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
         ResourceReturnTypeKind::VecResourceContent => quote! {
             Ok(result)
         },
-        ResourceReturnTypeKind::ResultString | ResourceReturnTypeKind::McpResultString => quote! {
+        ResourceReturnTypeKind::ResultString => quote! {
             let text = result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))?;
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
+        },
+        ResourceReturnTypeKind::McpResultString => quote! {
+            let text = result?;
             Ok(vec![fastmcp_protocol::ResourceContent {
                 uri: uri.to_string(),
                 mime_type: Some(#mime_type.to_string()),

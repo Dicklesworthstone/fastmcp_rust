@@ -48,7 +48,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -889,9 +889,9 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
 /// messages.
 pub struct StreamableHttpTransport {
     /// Request queue (from HTTP POST requests).
-    requests: Arc<Mutex<Vec<JsonRpcRequest>>>,
+    requests: Arc<Mutex<VecDeque<JsonRpcRequest>>>,
     /// Response queue (to be sent via streaming).
-    responses: Arc<Mutex<Vec<JsonRpcResponse>>>,
+    responses: Arc<Mutex<VecDeque<JsonRpcResponse>>>,
     /// Codec for message encoding.
     codec: Codec,
     /// Whether the transport is closed.
@@ -905,8 +905,8 @@ impl StreamableHttpTransport {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            requests: Arc::new(Mutex::new(Vec::new())),
-            responses: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(VecDeque::new())),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
             codec: Codec::new(),
             closed: false,
             poll_interval: Duration::from_millis(10),
@@ -919,7 +919,7 @@ impl StreamableHttpTransport {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.push(request);
+        guard.push_back(request);
     }
 
     /// Pops a response from the queue (for HTTP streaming).
@@ -929,11 +929,7 @@ impl StreamableHttpTransport {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.is_empty() {
-            None
-        } else {
-            Some(guard.remove(0))
-        }
+        guard.pop_front()
     }
 
     /// Checks if there are pending responses.
@@ -947,13 +943,13 @@ impl StreamableHttpTransport {
 
     /// Returns the request queue for external access.
     #[must_use]
-    pub fn request_queue(&self) -> Arc<Mutex<Vec<JsonRpcRequest>>> {
+    pub fn request_queue(&self) -> Arc<Mutex<VecDeque<JsonRpcRequest>>> {
         Arc::clone(&self.requests)
     }
 
     /// Returns the response queue for external access.
     #[must_use]
-    pub fn response_queue(&self) -> Arc<Mutex<Vec<JsonRpcResponse>>> {
+    pub fn response_queue(&self) -> Arc<Mutex<VecDeque<JsonRpcResponse>>> {
         Arc::clone(&self.responses)
     }
 }
@@ -981,7 +977,7 @@ impl Transport for StreamableHttpTransport {
                         "streamable response queue lock poisoned",
                     ))
                 })?;
-                guard.push(response.clone());
+                guard.push_back(response.clone());
             }
             JsonRpcMessage::Request(_) => {
                 // This transport currently streams only JSON-RPC responses.
@@ -1017,8 +1013,8 @@ impl Transport for StreamableHttpTransport {
                     "streamable request queue lock poisoned",
                 ))
             })?;
-            if !guard.is_empty() {
-                return Ok(JsonRpcMessage::Request(guard.remove(0)));
+            if let Some(request) = guard.pop_front() {
+                return Ok(JsonRpcMessage::Request(request));
             }
             drop(guard);
 
@@ -1706,7 +1702,7 @@ Transfer-Encoding: chunked\r\n\
         let queue = transport.response_queue();
         {
             let mut guard = queue.lock().expect("lock response queue");
-            guard.push(JsonRpcResponse {
+            guard.push_back(JsonRpcResponse {
                 jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
                 result: Some(serde_json::json!({"seq": 9})),
                 error: None,
