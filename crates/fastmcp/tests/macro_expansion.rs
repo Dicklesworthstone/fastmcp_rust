@@ -1290,6 +1290,50 @@ fn resource_timeout_compound() {
     assert_eq!(handler.timeout(), Some(std::time::Duration::from_secs(150)));
 }
 
+// --- Resource with version and tags ---
+
+/// Versioned resource with tags.
+#[resource(uri = "data://metrics", version = "3.0.0", tags = ["monitoring", "metrics"])]
+fn metrics_resource(_ctx: &McpContext) -> String {
+    r#"{"cpu": 42}"#.to_string()
+}
+
+#[test]
+fn resource_version_and_tags() {
+    let handler = MetricsResourceResource;
+    let def = handler.definition();
+    assert_eq!(def.version.as_deref(), Some("3.0.0"));
+    assert_eq!(def.tags, vec!["monitoring", "metrics"]);
+}
+
+/// Resource with version only.
+#[resource(uri = "data://plain", version = "1.0.0")]
+fn plain_versioned_resource() -> String {
+    "data".to_string()
+}
+
+#[test]
+fn resource_version_without_tags() {
+    let handler = PlainVersionedResourceResource;
+    let def = handler.definition();
+    assert_eq!(def.version.as_deref(), Some("1.0.0"));
+    assert!(def.tags.is_empty());
+}
+
+/// Resource with no version or tags (backwards compat).
+#[resource(uri = "data://basic")]
+fn basic_resource() -> String {
+    "basic".to_string()
+}
+
+#[test]
+fn resource_no_version_no_tags_stays_none() {
+    let handler = BasicResourceResource;
+    let def = handler.definition();
+    assert!(def.version.is_none());
+    assert!(def.tags.is_empty());
+}
+
 // ============================================================================
 // #[prompt] expansion tests
 // ============================================================================
@@ -1777,6 +1821,50 @@ fn prompt_all_optional_call_empty() {
     let result = handler.get(&ctx, args).unwrap();
     let text = expect_text(&result[0].content);
     assert_eq!(text, "a=none, b=none");
+}
+
+// --- Prompt with version and tags ---
+
+/// Versioned prompt with tags.
+#[prompt(
+    name = "tagged_prompt",
+    version = "2.0.0",
+    tags = ["greeting", "onboarding"]
+)]
+fn tagged_prompt(name: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("Welcome {name}"),
+        },
+    }]
+}
+
+#[test]
+fn prompt_version_and_tags() {
+    let handler = TaggedPromptPrompt;
+    let def = handler.definition();
+    assert_eq!(def.version.as_deref(), Some("2.0.0"));
+    assert_eq!(def.tags, vec!["greeting", "onboarding"]);
+}
+
+/// Prompt with no version or tags (backwards compat).
+#[prompt]
+fn basic_prompt() -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: "hello".to_string(),
+        },
+    }]
+}
+
+#[test]
+fn prompt_no_version_no_tags_stays_none() {
+    let handler = BasicPromptPrompt;
+    let def = handler.definition();
+    assert!(def.version.is_none());
+    assert!(def.tags.is_empty());
 }
 
 // ============================================================================

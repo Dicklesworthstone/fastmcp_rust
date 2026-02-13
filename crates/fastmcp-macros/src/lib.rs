@@ -1207,6 +1207,8 @@ struct ResourceAttrs {
     description: Option<String>,
     mime_type: Option<String>,
     timeout: Option<String>,
+    version: Option<String>,
+    tags: Vec<String>,
 }
 
 impl Parse for ResourceAttrs {
@@ -1216,34 +1218,61 @@ impl Parse for ResourceAttrs {
         let mut description = None;
         let mut mime_type = None;
         let mut timeout = None;
+        let mut version = None;
+        let mut tags = Vec::new();
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
 
             match ident.to_string().as_str() {
-                "uri" => {
-                    let lit: LitStr = input.parse()?;
-                    uri = Some(lit.value());
-                }
-                "name" => {
-                    let lit: LitStr = input.parse()?;
-                    name = Some(lit.value());
-                }
-                "description" => {
-                    let lit: LitStr = input.parse()?;
-                    description = Some(lit.value());
-                }
-                "mime_type" => {
-                    let lit: LitStr = input.parse()?;
-                    mime_type = Some(lit.value());
-                }
-                "timeout" => {
-                    let lit: LitStr = input.parse()?;
-                    timeout = Some(lit.value());
+                "tags" => {
+                    input.parse::<Token![=]>()?;
+                    let expr_array: syn::ExprArray = input.parse()?;
+                    for expr in expr_array.elems {
+                        match expr {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: Lit::Str(tag), ..
+                            }) => tags.push(tag.value()),
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    other,
+                                    "tags entries must be string literals",
+                                ));
+                            }
+                        }
+                    }
                 }
                 _ => {
-                    return Err(syn::Error::new(ident.span(), "unknown attribute"));
+                    input.parse::<Token![=]>()?;
+                    match ident.to_string().as_str() {
+                        "uri" => {
+                            let lit: LitStr = input.parse()?;
+                            uri = Some(lit.value());
+                        }
+                        "name" => {
+                            let lit: LitStr = input.parse()?;
+                            name = Some(lit.value());
+                        }
+                        "description" => {
+                            let lit: LitStr = input.parse()?;
+                            description = Some(lit.value());
+                        }
+                        "mime_type" => {
+                            let lit: LitStr = input.parse()?;
+                            mime_type = Some(lit.value());
+                        }
+                        "timeout" => {
+                            let lit: LitStr = input.parse()?;
+                            timeout = Some(lit.value());
+                        }
+                        "version" => {
+                            let lit: LitStr = input.parse()?;
+                            version = Some(lit.value());
+                        }
+                        _ => {
+                            return Err(syn::Error::new(ident.span(), "unknown attribute"));
+                        }
+                    }
                 }
             }
 
@@ -1258,6 +1287,8 @@ impl Parse for ResourceAttrs {
             description,
             mime_type,
             timeout,
+            version,
+            tags,
         })
     }
 }
@@ -1323,6 +1354,19 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+
+    // Generate version token
+    let version_tokens = attrs
+        .version
+        .as_ref()
+        .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+
+    // Generate tags
+    let tag_entries: Vec<TokenStream2> = attrs
+        .tags
+        .iter()
+        .map(|tag| quote! { #tag.to_string() })
+        .collect();
 
     let template_params = extract_template_params(&uri);
 
@@ -1448,8 +1492,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 description: #description_tokens,
                 mime_type: Some(#mime_type.to_string()),
                 icon: None,
-                version: None,
-                tags: vec![],
+                version: #version_tokens,
+                tags: vec![#(#tag_entries),*],
             })
         }
     } else {
@@ -1476,8 +1520,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                     description: #description_tokens,
                     mime_type: Some(#mime_type.to_string()),
                     icon: None,
-                    version: None,
-                    tags: vec![],
+                    version: #version_tokens,
+                    tags: vec![#(#tag_entries),*],
                 }
             }
 
@@ -1535,6 +1579,8 @@ struct PromptAttrs {
     description: Option<String>,
     timeout: Option<String>,
     defaults: HashMap<String, Lit>,
+    version: Option<String>,
+    tags: Vec<String>,
 }
 
 impl Parse for PromptAttrs {
@@ -1543,6 +1589,8 @@ impl Parse for PromptAttrs {
         let mut description = None;
         let mut timeout = None;
         let mut defaults: HashMap<String, Lit> = HashMap::new();
+        let mut version = None;
+        let mut tags = Vec::new();
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
@@ -1562,6 +1610,28 @@ impl Parse for PromptAttrs {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
+                }
+                "version" => {
+                    input.parse::<Token![=]>()?;
+                    let lit: LitStr = input.parse()?;
+                    version = Some(lit.value());
+                }
+                "tags" => {
+                    input.parse::<Token![=]>()?;
+                    let expr_array: syn::ExprArray = input.parse()?;
+                    for expr in expr_array.elems {
+                        match expr {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: Lit::Str(tag), ..
+                            }) => tags.push(tag.value()),
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    other,
+                                    "tags entries must be string literals",
+                                ));
+                            }
+                        }
+                    }
                 }
                 "defaults" => {
                     let content;
@@ -1591,6 +1661,8 @@ impl Parse for PromptAttrs {
             description,
             timeout,
             defaults,
+            version,
+            tags,
         })
     }
 }
@@ -1792,6 +1864,19 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = &input_fn.sig.output;
     let prompt_result_conversion = generate_prompt_result_conversion(return_type);
 
+    // Generate version token
+    let version_tokens = attrs
+        .version
+        .as_ref()
+        .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+
+    // Generate tags
+    let tag_entries: Vec<TokenStream2> = attrs
+        .tags
+        .iter()
+        .map(|tag| quote! { #tag.to_string() })
+        .collect();
+
     let expanded = quote! {
         // Keep the original function
         #input_fn
@@ -1807,8 +1892,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                     description: #description_tokens,
                     arguments: vec![#(#prompt_args),*],
                     icon: None,
-                    version: None,
-                    tags: vec![],
+                    version: #version_tokens,
+                    tags: vec![#(#tag_entries),*],
                 }
             }
 
