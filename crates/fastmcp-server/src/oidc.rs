@@ -1412,4 +1412,864 @@ mod tests {
             Some(&serde_json::json!(["admin", "user"]))
         );
     }
+
+    // ── OidcProviderConfig ─────────────────────────────────────────
+
+    #[test]
+    fn config_default_values() {
+        let cfg = OidcProviderConfig::default();
+        assert_eq!(cfg.issuer, "fastmcp");
+        assert_eq!(cfg.id_token_lifetime, Duration::from_secs(3600));
+        assert_eq!(cfg.signing_algorithm, SigningAlgorithm::HS256);
+        assert!(cfg.key_id.is_none());
+        assert!(cfg.rsa_private_key_pem.is_none());
+        assert!(cfg.jwks.is_none());
+        assert!(cfg.supported_claims.contains(&"sub".to_string()));
+        assert!(cfg.supported_claims.contains(&"email".to_string()));
+        assert!(cfg.supported_scopes.contains(&"openid".to_string()));
+        assert!(cfg.supported_scopes.contains(&"profile".to_string()));
+    }
+
+    #[test]
+    fn config_debug() {
+        let cfg = OidcProviderConfig::default();
+        let debug = format!("{:?}", cfg);
+        assert!(debug.contains("fastmcp"));
+        assert!(debug.contains("HS256"));
+    }
+
+    #[test]
+    fn config_clone() {
+        let cfg = OidcProviderConfig::default();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.issuer, cfg.issuer);
+        assert_eq!(cloned.signing_algorithm, cfg.signing_algorithm);
+    }
+
+    // ── SigningAlgorithm ───────────────────────────────────────────
+
+    #[test]
+    fn signing_algorithm_copy() {
+        let alg = SigningAlgorithm::HS256;
+        let copied = alg;
+        assert_eq!(alg, copied);
+    }
+
+    #[test]
+    fn signing_algorithm_eq() {
+        assert_eq!(SigningAlgorithm::HS256, SigningAlgorithm::HS256);
+        assert_eq!(SigningAlgorithm::RS256, SigningAlgorithm::RS256);
+        assert_ne!(SigningAlgorithm::HS256, SigningAlgorithm::RS256);
+    }
+
+    #[test]
+    fn signing_algorithm_debug() {
+        let debug = format!("{:?}", SigningAlgorithm::RS256);
+        assert!(debug.contains("RS256"));
+    }
+
+    #[test]
+    fn signing_algorithm_clone() {
+        let alg = SigningAlgorithm::RS256;
+        let cloned = alg.clone();
+        assert_eq!(alg, cloned);
+    }
+
+    // ── UserClaims additional builders ─────────────────────────────
+
+    #[test]
+    fn user_claims_with_given_name() {
+        let claims = UserClaims::new("u").with_given_name("Jane");
+        assert_eq!(claims.given_name, Some("Jane".to_string()));
+    }
+
+    #[test]
+    fn user_claims_with_family_name() {
+        let claims = UserClaims::new("u").with_family_name("Smith");
+        assert_eq!(claims.family_name, Some("Smith".to_string()));
+    }
+
+    #[test]
+    fn user_claims_with_phone_number() {
+        let claims = UserClaims::new("u").with_phone_number("+15551234567");
+        assert_eq!(claims.phone_number, Some("+15551234567".to_string()));
+    }
+
+    #[test]
+    fn user_claims_with_updated_at() {
+        let claims = UserClaims::new("u").with_updated_at(1700000000);
+        assert_eq!(claims.updated_at, Some(1700000000));
+    }
+
+    #[test]
+    fn user_claims_with_picture() {
+        let claims = UserClaims::new("u").with_picture("https://example.com/pic.jpg");
+        assert_eq!(
+            claims.picture,
+            Some("https://example.com/pic.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn user_claims_debug() {
+        let claims = UserClaims::new("dbg-user");
+        let debug = format!("{:?}", claims);
+        assert!(debug.contains("dbg-user"));
+    }
+
+    #[test]
+    fn user_claims_clone() {
+        let claims = UserClaims::new("u1").with_name("Alice");
+        let cloned = claims.clone();
+        assert_eq!(cloned.sub, "u1");
+        assert_eq!(cloned.name, Some("Alice".to_string()));
+    }
+
+    #[test]
+    fn user_claims_default() {
+        let claims = UserClaims::default();
+        assert_eq!(claims.sub, "");
+        assert!(claims.name.is_none());
+        assert!(claims.email.is_none());
+        assert!(claims.custom.is_empty());
+    }
+
+    #[test]
+    fn user_claims_serde_roundtrip() {
+        let claims = UserClaims::new("serde-user")
+            .with_name("Test")
+            .with_email("test@example.com")
+            .with_email_verified(true)
+            .with_given_name("T")
+            .with_family_name("Est")
+            .with_phone_number("+1")
+            .with_updated_at(123)
+            .with_picture("http://pic")
+            .with_preferred_username("tester")
+            .with_custom("role", serde_json::json!("admin"));
+
+        let json = serde_json::to_string(&claims).unwrap();
+        let deserialized: UserClaims = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.sub, "serde-user");
+        assert_eq!(deserialized.name, Some("Test".to_string()));
+        assert_eq!(deserialized.email, Some("test@example.com".to_string()));
+        assert_eq!(deserialized.email_verified, Some(true));
+        assert_eq!(deserialized.given_name, Some("T".to_string()));
+        assert_eq!(deserialized.family_name, Some("Est".to_string()));
+        assert_eq!(deserialized.phone_number, Some("+1".to_string()));
+        assert_eq!(deserialized.updated_at, Some(123));
+        assert_eq!(deserialized.picture, Some("http://pic".to_string()));
+        assert_eq!(deserialized.preferred_username, Some("tester".to_string()));
+        assert_eq!(
+            deserialized.custom.get("role"),
+            Some(&serde_json::json!("admin"))
+        );
+    }
+
+    #[test]
+    fn user_claims_serde_skip_nones() {
+        let claims = UserClaims::new("minimal");
+        let json = serde_json::to_string(&claims).unwrap();
+        // None fields should be skipped
+        assert!(!json.contains("name"));
+        assert!(!json.contains("email"));
+        assert!(!json.contains("phone_number"));
+        assert!(json.contains("sub"));
+    }
+
+    #[test]
+    fn filter_by_scopes_address() {
+        let address = AddressClaim {
+            formatted: Some("123 Main St".to_string()),
+            ..Default::default()
+        };
+        let claims = UserClaims {
+            sub: "u1".to_string(),
+            address: Some(address),
+            name: Some("Name".to_string()),
+            ..Default::default()
+        };
+
+        // Only address scope
+        let filtered = claims.filter_by_scopes(&["address".to_string()]);
+        assert!(filtered.address.is_some());
+        assert!(filtered.name.is_none());
+
+        // Without address scope
+        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
+        assert!(filtered.address.is_none());
+        assert!(filtered.name.is_some());
+    }
+
+    #[test]
+    fn filter_by_scopes_phone_verified() {
+        let claims = UserClaims {
+            sub: "u1".to_string(),
+            phone_number: Some("+1".to_string()),
+            phone_number_verified: Some(true),
+            ..Default::default()
+        };
+
+        let filtered = claims.filter_by_scopes(&["phone".to_string()]);
+        assert_eq!(filtered.phone_number, Some("+1".to_string()));
+        assert_eq!(filtered.phone_number_verified, Some(true));
+
+        let filtered = claims.filter_by_scopes(&["email".to_string()]);
+        assert!(filtered.phone_number.is_none());
+        assert!(filtered.phone_number_verified.is_none());
+    }
+
+    // ── AddressClaim ───────────────────────────────────────────────
+
+    #[test]
+    fn address_claim_default() {
+        let addr = AddressClaim::default();
+        assert!(addr.formatted.is_none());
+        assert!(addr.street_address.is_none());
+        assert!(addr.locality.is_none());
+        assert!(addr.region.is_none());
+        assert!(addr.postal_code.is_none());
+        assert!(addr.country.is_none());
+    }
+
+    #[test]
+    fn address_claim_debug() {
+        let addr = AddressClaim {
+            country: Some("US".to_string()),
+            ..Default::default()
+        };
+        let debug = format!("{:?}", addr);
+        assert!(debug.contains("US"));
+    }
+
+    #[test]
+    fn address_claim_clone() {
+        let addr = AddressClaim {
+            locality: Some("NYC".to_string()),
+            ..Default::default()
+        };
+        let cloned = addr.clone();
+        assert_eq!(cloned.locality, Some("NYC".to_string()));
+    }
+
+    #[test]
+    fn address_claim_serde_roundtrip() {
+        let addr = AddressClaim {
+            formatted: Some("123 Main St, City, ST 12345, US".to_string()),
+            street_address: Some("123 Main St".to_string()),
+            locality: Some("City".to_string()),
+            region: Some("ST".to_string()),
+            postal_code: Some("12345".to_string()),
+            country: Some("US".to_string()),
+        };
+
+        let json = serde_json::to_string(&addr).unwrap();
+        let deserialized: AddressClaim = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.formatted, addr.formatted);
+        assert_eq!(deserialized.country, addr.country);
+    }
+
+    #[test]
+    fn address_claim_serde_skip_nones() {
+        let addr = AddressClaim {
+            country: Some("US".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&addr).unwrap();
+        assert!(json.contains("country"));
+        assert!(!json.contains("formatted"));
+        assert!(!json.contains("street_address"));
+    }
+
+    // ── IdTokenClaims ──────────────────────────────────────────────
+
+    #[test]
+    fn id_token_claims_debug() {
+        let claims = IdTokenClaims {
+            iss: "iss".to_string(),
+            sub: "sub".to_string(),
+            aud: "aud".to_string(),
+            exp: 999,
+            iat: 100,
+            auth_time: None,
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            at_hash: None,
+            c_hash: None,
+            user_claims: UserClaims::new("sub"),
+        };
+        let debug = format!("{:?}", claims);
+        assert!(debug.contains("iss"));
+        assert!(debug.contains("sub"));
+    }
+
+    #[test]
+    fn id_token_claims_clone() {
+        let claims = IdTokenClaims {
+            iss: "issuer".to_string(),
+            sub: "subject".to_string(),
+            aud: "audience".to_string(),
+            exp: 999,
+            iat: 100,
+            auth_time: Some(100),
+            nonce: Some("n".to_string()),
+            acr: Some("1".to_string()),
+            amr: Some(vec!["pwd".to_string()]),
+            azp: Some("azp".to_string()),
+            at_hash: Some("hash".to_string()),
+            c_hash: Some("chash".to_string()),
+            user_claims: UserClaims::new("subject"),
+        };
+        let cloned = claims.clone();
+        assert_eq!(cloned.iss, "issuer");
+        assert_eq!(cloned.nonce, Some("n".to_string()));
+        assert_eq!(cloned.amr, Some(vec!["pwd".to_string()]));
+    }
+
+    #[test]
+    fn id_token_claims_serialization() {
+        // Note: IdTokenClaims.sub and user_claims.sub overlap due to
+        // #[serde(flatten)], so we test serialization output rather than
+        // a full roundtrip.
+        let claims = IdTokenClaims {
+            iss: "fastmcp".to_string(),
+            sub: "user1".to_string(),
+            aud: "client1".to_string(),
+            exp: 1700001000,
+            iat: 1700000000,
+            auth_time: Some(1700000000),
+            nonce: Some("abc".to_string()),
+            acr: None,
+            amr: None,
+            azp: Some("client1".to_string()),
+            at_hash: Some("h".to_string()),
+            c_hash: None,
+            user_claims: UserClaims::new("user1").with_name("Test"),
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"iss\":\"fastmcp\""));
+        assert!(json.contains("\"aud\":\"client1\""));
+        assert!(json.contains("\"exp\":1700001000"));
+        assert!(json.contains("\"nonce\":\"abc\""));
+        assert!(json.contains("\"name\":\"Test\""));
+    }
+
+    #[test]
+    fn id_token_claims_serde_skip_nones() {
+        let claims = IdTokenClaims {
+            iss: "i".to_string(),
+            sub: "s".to_string(),
+            aud: "a".to_string(),
+            exp: 1,
+            iat: 0,
+            auth_time: None,
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            at_hash: None,
+            c_hash: None,
+            user_claims: UserClaims::new("s"),
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(!json.contains("nonce"));
+        assert!(!json.contains("auth_time"));
+        assert!(!json.contains("acr"));
+    }
+
+    // ── IdToken ────────────────────────────────────────────────────
+
+    #[test]
+    fn id_token_debug() {
+        let claims = IdTokenClaims {
+            iss: "i".to_string(),
+            sub: "s".to_string(),
+            aud: "a".to_string(),
+            exp: 1,
+            iat: 0,
+            auth_time: None,
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            at_hash: None,
+            c_hash: None,
+            user_claims: UserClaims::new("s"),
+        };
+        let token = IdToken {
+            raw: "header.payload.sig".to_string(),
+            claims,
+        };
+        let debug = format!("{:?}", token);
+        assert!(debug.contains("header.payload.sig"));
+    }
+
+    #[test]
+    fn id_token_clone() {
+        let claims = IdTokenClaims {
+            iss: "i".to_string(),
+            sub: "s".to_string(),
+            aud: "a".to_string(),
+            exp: 1,
+            iat: 0,
+            auth_time: None,
+            nonce: None,
+            acr: None,
+            amr: None,
+            azp: None,
+            at_hash: None,
+            c_hash: None,
+            user_claims: UserClaims::new("s"),
+        };
+        let token = IdToken {
+            raw: "jwt-token".to_string(),
+            claims,
+        };
+        let cloned = token.clone();
+        assert_eq!(cloned.raw, "jwt-token");
+        assert_eq!(cloned.claims.sub, "s");
+    }
+
+    // ── DiscoveryDocument ──────────────────────────────────────────
+
+    #[test]
+    fn discovery_document_new_defaults() {
+        let doc = DiscoveryDocument::new("https://issuer.example", "https://api.example");
+        assert_eq!(doc.issuer, "https://issuer.example");
+        assert_eq!(doc.authorization_endpoint, "https://api.example/authorize");
+        assert_eq!(doc.token_endpoint, "https://api.example/token");
+        assert_eq!(
+            doc.userinfo_endpoint,
+            Some("https://api.example/userinfo".to_string())
+        );
+        assert_eq!(
+            doc.revocation_endpoint,
+            Some("https://api.example/revoke".to_string())
+        );
+        assert!(doc.jwks_uri.is_none());
+        assert!(doc.registration_endpoint.is_none());
+        assert!(doc.scopes_supported.contains(&"openid".to_string()));
+        assert_eq!(doc.response_types_supported, vec!["code"]);
+        assert_eq!(
+            doc.response_modes_supported,
+            Some(vec!["query".to_string()])
+        );
+        assert!(
+            doc.grant_types_supported
+                .contains(&"authorization_code".to_string())
+        );
+        assert!(
+            doc.grant_types_supported
+                .contains(&"refresh_token".to_string())
+        );
+        assert_eq!(doc.subject_types_supported, vec!["public"]);
+        assert_eq!(doc.id_token_signing_alg_values_supported, vec!["HS256"]);
+        assert!(
+            doc.token_endpoint_auth_methods_supported
+                .contains(&"client_secret_post".to_string())
+        );
+        assert!(doc.claims_supported.is_some());
+        assert!(
+            doc.code_challenge_methods_supported
+                .as_ref()
+                .unwrap()
+                .contains(&"S256".to_string())
+        );
+    }
+
+    #[test]
+    fn discovery_document_debug() {
+        let doc = DiscoveryDocument::new("iss", "http://base");
+        let debug = format!("{:?}", doc);
+        assert!(debug.contains("iss"));
+    }
+
+    #[test]
+    fn discovery_document_clone() {
+        let doc = DiscoveryDocument::new("iss", "http://base");
+        let cloned = doc.clone();
+        assert_eq!(cloned.issuer, "iss");
+        assert_eq!(cloned.token_endpoint, doc.token_endpoint);
+    }
+
+    #[test]
+    fn discovery_document_serde_roundtrip() {
+        let doc = DiscoveryDocument::new("iss", "http://base");
+        let json = serde_json::to_string(&doc).unwrap();
+        let deserialized: DiscoveryDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.issuer, "iss");
+        assert_eq!(deserialized.token_endpoint, "http://base/token");
+        assert_eq!(
+            deserialized.userinfo_endpoint,
+            Some("http://base/userinfo".to_string())
+        );
+    }
+
+    // ── OidcError ──────────────────────────────────────────────────
+
+    #[test]
+    fn oidc_error_oauth_display() {
+        let inner = OAuthError::InvalidClient("bad".to_string());
+        let err = OidcError::OAuth(inner);
+        let msg = err.to_string();
+        assert!(msg.contains("OAuth error"));
+        assert!(msg.contains("bad"));
+    }
+
+    #[test]
+    fn oidc_error_signing_error_display() {
+        let err = OidcError::SigningError("key problem".to_string());
+        assert!(err.to_string().contains("signing error"));
+        assert!(err.to_string().contains("key problem"));
+    }
+
+    #[test]
+    fn oidc_error_invalid_id_token_display() {
+        let err = OidcError::InvalidIdToken("malformed".to_string());
+        assert!(err.to_string().contains("invalid ID token"));
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn oidc_error_debug() {
+        let err = OidcError::MissingOpenIdScope;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("MissingOpenIdScope"));
+    }
+
+    #[test]
+    fn oidc_error_clone() {
+        let err = OidcError::ClaimsNotFound("u".to_string());
+        let cloned = err.clone();
+        assert!(cloned.to_string().contains('u'));
+    }
+
+    #[test]
+    fn oidc_error_std_error() {
+        let err = OidcError::SigningError("x".to_string());
+        let std_err: &dyn std::error::Error = &err;
+        assert!(std_err.to_string().contains('x'));
+    }
+
+    #[test]
+    fn oidc_error_from_oauth_error() {
+        let oauth_err = OAuthError::InvalidGrant("expired".to_string());
+        let oidc_err: OidcError = oauth_err.into();
+        match &oidc_err {
+            OidcError::OAuth(inner) => {
+                assert!(inner.to_string().contains("expired"));
+            }
+            _ => panic!("expected OAuth variant"),
+        }
+    }
+
+    // ── OidcProvider ───────────────────────────────────────────────
+
+    #[test]
+    fn provider_config_accessor() {
+        let provider = create_test_provider();
+        let cfg = provider.config();
+        assert_eq!(cfg.issuer, "fastmcp");
+        assert_eq!(cfg.signing_algorithm, SigningAlgorithm::HS256);
+    }
+
+    #[test]
+    fn provider_oauth_accessor() {
+        let provider = create_test_provider();
+        let _oauth = provider.oauth();
+        // Just check it returns without panic
+    }
+
+    #[test]
+    fn provider_set_hmac_key() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"my-secret");
+        // Verify it works by issuing a token (the key gets used during signing)
+        let claims_store = InMemoryClaimsProvider::new();
+        claims_store.set_claims(UserClaims::new("user1"));
+        provider.set_claims_provider(claims_store);
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "user1");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let result = provider.issue_id_token(&oauth_token, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_set_claims_fn() {
+        let provider = create_test_provider();
+        provider.set_claims_fn(|sub| Some(UserClaims::new(sub).with_name("FnUser")));
+        provider.set_hmac_key(b"secret");
+
+        let at =
+            issue_token_via_auth_code(provider.oauth().as_ref(), &["openid", "profile"], "fn-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
+        assert_eq!(id_token.claims.user_claims.name, Some("FnUser".to_string()));
+    }
+
+    #[test]
+    fn provider_jwks_hs256_returns_none() {
+        let provider = create_test_provider();
+        assert!(provider.jwks().is_none());
+    }
+
+    #[test]
+    fn provider_get_id_token_nonexistent() {
+        let provider = create_test_provider();
+        assert!(provider.get_id_token("nonexistent-token").is_none());
+    }
+
+    #[test]
+    fn provider_get_id_token_after_issue() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"key123");
+        let claims_store = InMemoryClaimsProvider::new();
+        claims_store.set_claims(UserClaims::new("cached-user"));
+        provider.set_claims_provider(claims_store);
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "cached-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        provider
+            .issue_id_token(&oauth_token, Some("nonce1"))
+            .unwrap();
+
+        // Should be retrievable via get_id_token
+        let retrieved = provider.get_id_token(&at);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().claims.sub, "cached-user");
+    }
+
+    #[test]
+    fn provider_cleanup_expired() {
+        let provider = create_test_provider();
+        // cleanup_expired should run without panic even with empty cache
+        provider.cleanup_expired();
+    }
+
+    #[test]
+    fn provider_issue_id_token_no_claims_provider() {
+        // Without a claims provider, should use default UserClaims (just sub)
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"key");
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "default-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
+        assert_eq!(id_token.claims.sub, "default-user");
+        // No claims provider → default claims (no name, email, etc.)
+        assert!(id_token.claims.user_claims.name.is_none());
+    }
+
+    #[test]
+    fn provider_issue_id_token_claims_not_found() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"key");
+        // Set claims provider that has no user "missing-user"
+        let claims_store = InMemoryClaimsProvider::new();
+        claims_store.set_claims(UserClaims::new("other-user"));
+        provider.set_claims_provider(claims_store);
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "missing-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let result = provider.issue_id_token(&oauth_token, None);
+        assert!(matches!(result, Err(OidcError::ClaimsNotFound(_))));
+    }
+
+    #[test]
+    fn provider_discovery_document_overrides_scopes_and_claims() {
+        let mut config = OidcProviderConfig::default();
+        config.supported_scopes = vec!["openid".to_string(), "custom".to_string()];
+        config.supported_claims = vec!["sub".to_string(), "custom_field".to_string()];
+
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::new(oauth, config).unwrap();
+        let doc = provider.discovery_document("https://api");
+
+        assert!(doc.scopes_supported.contains(&"custom".to_string()));
+        assert!(!doc.scopes_supported.contains(&"profile".to_string()));
+        assert!(
+            doc.claims_supported
+                .as_ref()
+                .unwrap()
+                .contains(&"custom_field".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_issue_id_token_jwt_structure() {
+        let provider = create_test_provider();
+        provider.set_hmac_key(b"secret");
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "jwt-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
+
+        // JWT must have 3 parts
+        let parts: Vec<&str> = id_token.raw.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        // Each part is non-empty
+        assert!(!parts[0].is_empty());
+        assert!(!parts[1].is_empty());
+        assert!(!parts[2].is_empty());
+    }
+
+    #[test]
+    fn provider_issue_id_token_auto_generates_key() {
+        // Without set_hmac_key, should auto-generate a key
+        let provider = create_test_provider();
+
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "auto-key-user");
+        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+        let result = provider.issue_id_token(&oauth_token, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_userinfo_invalid_token() {
+        let provider = create_test_provider();
+        let result = provider.userinfo("invalid-access-token");
+        assert!(matches!(result, Err(OidcError::OAuth(_))));
+    }
+
+    #[test]
+    fn provider_userinfo_without_openid_scope() {
+        let provider = create_test_provider();
+        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["profile"], "no-openid");
+        let result = provider.userinfo(&at);
+        assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
+    }
+
+    // ── Arc<dyn ClaimsProvider> delegation ──────────────────────────
+
+    #[test]
+    fn arc_claims_provider_delegation() {
+        let inner = InMemoryClaimsProvider::new();
+        inner.set_claims(UserClaims::new("arc-user").with_name("ArcUser"));
+        let arc_provider: Arc<dyn ClaimsProvider> = Arc::new(inner);
+
+        // Arc<dyn ClaimsProvider> should delegate
+        let claims = arc_provider.get_claims("arc-user");
+        assert!(claims.is_some());
+        assert_eq!(claims.unwrap().name, Some("ArcUser".to_string()));
+
+        assert!(arc_provider.get_claims("missing").is_none());
+    }
+
+    // ── InMemoryClaimsProvider ──────────────────────────────────────
+
+    #[test]
+    fn in_memory_claims_provider_debug() {
+        let provider = InMemoryClaimsProvider::new();
+        let debug = format!("{:?}", provider);
+        assert!(debug.contains("InMemoryClaimsProvider"));
+    }
+
+    #[test]
+    fn in_memory_claims_provider_default() {
+        let provider = InMemoryClaimsProvider::default();
+        assert!(provider.get_claims("any").is_none());
+    }
+
+    #[test]
+    fn in_memory_claims_provider_overwrite() {
+        let provider = InMemoryClaimsProvider::new();
+        provider.set_claims(UserClaims::new("u1").with_name("First"));
+        provider.set_claims(UserClaims::new("u1").with_name("Second"));
+        let claims = provider.get_claims("u1").unwrap();
+        assert_eq!(claims.name, Some("Second".to_string()));
+    }
+
+    // ── Helper functions ────────────────────────────────────────────
+
+    #[test]
+    fn simple_sha256_deterministic() {
+        let hash1 = simple_sha256(b"hello world");
+        let hash2 = simple_sha256(b"hello world");
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 32);
+
+        // Different input → different hash
+        let hash3 = simple_sha256(b"different");
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn hmac_sha256_deterministic() {
+        let sig1 = hmac_sha256("message", b"key").unwrap();
+        let sig2 = hmac_sha256("message", b"key").unwrap();
+        assert_eq!(sig1, sig2);
+        assert_eq!(sig1.len(), 32);
+    }
+
+    #[test]
+    fn hmac_sha256_different_keys() {
+        let sig1 = hmac_sha256("msg", b"key1").unwrap();
+        let sig2 = hmac_sha256("msg", b"key2").unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn hmac_sha256_different_messages() {
+        let sig1 = hmac_sha256("msg1", b"key").unwrap();
+        let sig2 = hmac_sha256("msg2", b"key").unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn generate_random_bytes_length() {
+        let bytes = generate_random_bytes(16).unwrap();
+        assert_eq!(bytes.len(), 16);
+
+        let bytes = generate_random_bytes(64).unwrap();
+        assert_eq!(bytes.len(), 64);
+    }
+
+    #[test]
+    fn generate_random_bytes_unique() {
+        let a = generate_random_bytes(32).unwrap();
+        let b = generate_random_bytes(32).unwrap();
+        // Probabilistically, two random 32-byte sequences should differ
+        assert_ne!(a, b);
+    }
+
+    // ── validate_oidc_config ───────────────────────────────────────
+
+    #[test]
+    fn validate_config_hs256_always_ok() {
+        let config = OidcProviderConfig::default();
+        assert!(validate_oidc_config(&config).is_ok());
+    }
+
+    #[test]
+    #[cfg(not(feature = "jwt"))]
+    fn validate_config_rs256_without_jwt_feature() {
+        let mut config = OidcProviderConfig::default();
+        config.signing_algorithm = SigningAlgorithm::RS256;
+        let result = validate_oidc_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("jwt"));
+    }
+
+    // ── SigningKey ──────────────────────────────────────────────────
+
+    #[test]
+    fn signing_key_default_is_none() {
+        let key = SigningKey::default();
+        assert!(matches!(key, SigningKey::None));
+    }
+
+    #[test]
+    fn signing_key_clone() {
+        let key = SigningKey::Hmac(vec![1, 2, 3]);
+        let cloned = key.clone();
+        match cloned {
+            SigningKey::Hmac(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
+            SigningKey::None => panic!("expected Hmac"),
+        }
+    }
 }
