@@ -271,6 +271,126 @@ mod duration_parse_tests {
         let err = parse_duration_to_millis(&input).expect_err("overflowing total must fail");
         assert!(err.contains("overflow"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1d2h)
+    // =========================================================================
+
+    #[test]
+    fn parse_single_units() {
+        assert_eq!(parse_duration_to_millis("30s"), Ok(30_000));
+        assert_eq!(parse_duration_to_millis("5m"), Ok(300_000));
+        assert_eq!(parse_duration_to_millis("2h"), Ok(7_200_000));
+        assert_eq!(parse_duration_to_millis("100ms"), Ok(100));
+    }
+
+    #[test]
+    fn parse_empty_and_whitespace() {
+        assert!(parse_duration_to_millis("").is_err());
+        assert!(parse_duration_to_millis("  ").is_err());
+    }
+
+    #[test]
+    fn parse_missing_unit() {
+        let err = parse_duration_to_millis("42").unwrap_err();
+        assert!(err.contains("missing unit"));
+    }
+
+    #[test]
+    fn parse_unit_without_number() {
+        let err = parse_duration_to_millis("s").unwrap_err();
+        assert!(err.contains("without preceding number"));
+    }
+
+    #[test]
+    fn parse_unknown_unit() {
+        let err = parse_duration_to_millis("10x").unwrap_err();
+        assert!(err.contains("unknown unit"));
+    }
+
+    #[test]
+    fn parse_unexpected_character() {
+        let err = parse_duration_to_millis("10s$").unwrap_err();
+        assert!(err.contains("unexpected character"));
+    }
+
+    #[test]
+    fn parse_zero_duration() {
+        let err = parse_duration_to_millis("0s").unwrap_err();
+        assert!(err.contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_whitespace_between_components() {
+        assert_eq!(parse_duration_to_millis("1h 30m"), Ok(5_400_000));
+    }
+
+    #[test]
+    fn parse_trimmed_input() {
+        assert_eq!(parse_duration_to_millis("  10s  "), Ok(10_000));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod helper_tests {
+    use super::{extract_template_params, to_pascal_case};
+
+    #[test]
+    fn template_params_basic() {
+        let params = extract_template_params("users/{id}/posts/{post_id}");
+        assert_eq!(params, vec!["id", "post_id"]);
+    }
+
+    #[test]
+    fn template_params_none() {
+        let params = extract_template_params("static/path/no/params");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn template_params_single() {
+        let params = extract_template_params("config://{name}");
+        assert_eq!(params, vec!["name"]);
+    }
+
+    #[test]
+    fn template_params_adjacent_braces() {
+        let params = extract_template_params("{a}{b}");
+        assert_eq!(params, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn template_params_empty_braces_skipped() {
+        let params = extract_template_params("prefix/{}");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn pascal_case_single_word() {
+        assert_eq!(to_pascal_case("hello"), "Hello");
+    }
+
+    #[test]
+    fn pascal_case_snake_case() {
+        assert_eq!(to_pascal_case("my_tool_handler"), "MyToolHandler");
+    }
+
+    #[test]
+    fn pascal_case_already_pascal() {
+        assert_eq!(to_pascal_case("Hello"), "Hello");
+    }
+
+    #[test]
+    fn pascal_case_empty() {
+        assert_eq!(to_pascal_case(""), "");
+    }
+
+    #[test]
+    fn pascal_case_leading_underscore() {
+        // Leading underscore produces an empty first segment
+        assert_eq!(to_pascal_case("_private"), "Private");
+    }
 }
 
 /// Extracts template parameter names from a URI template string.
