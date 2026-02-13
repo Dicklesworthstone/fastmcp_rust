@@ -2050,4 +2050,86 @@ mod tests {
         assert!(result.data.is_none());
         assert_eq!(result.error, Some("abort".to_string()));
     }
+
+    // ── Additional coverage — uncovered terminal-state cancel paths ──
+
+    #[test]
+    fn cancel_completed_task_returns_error() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+        let err = manager.cancel(&id, None).unwrap_err();
+        assert!(err.message.contains("terminal"));
+    }
+
+    #[test]
+    fn cancel_failed_task_returns_error() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.fail_task(&id, "broke");
+        let err = manager.cancel(&id, None).unwrap_err();
+        assert!(err.message.contains("terminal"));
+    }
+
+    #[test]
+    fn fail_task_on_pending_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        // Pending -> Failed is not a valid transition
+        manager.fail_task(&id, "too early");
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.status, TaskStatus::Pending);
+        assert!(manager.get_result(&id).is_none());
+    }
+
+    #[test]
+    fn complete_task_on_cancelled_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.cancel(&id, Some("aborted".to_string())).unwrap();
+        // Cancelled -> Completed is not valid
+        manager.complete_task(&id, serde_json::json!({"late": true}));
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn update_progress_none_message_clears_previous() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.update_progress(&id, 0.3, Some("step 1".to_string()));
+        assert_eq!(
+            manager.get_info(&id).unwrap().message,
+            Some("step 1".to_string())
+        );
+        manager.update_progress(&id, 0.6, None);
+        assert!(manager.get_info(&id).unwrap().message.is_none());
+    }
+
+    #[test]
+    fn no_notification_sender_does_not_panic() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        // No notification sender set — all operations should still work
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.update_progress(&id, 0.5, None);
+        manager.complete_task(&id, serde_json::json!({}));
+        assert_eq!(manager.get_info(&id).unwrap().status, TaskStatus::Completed);
+    }
 }
