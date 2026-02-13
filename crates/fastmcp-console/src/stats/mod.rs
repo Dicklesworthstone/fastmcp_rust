@@ -338,4 +338,82 @@ mod tests {
         assert_eq!(snap.bytes_received, 200);
         assert_eq!(snap.bytes_sent, 64);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-33a2)
+    // =========================================================================
+
+    #[test]
+    fn server_stats_debug_output() {
+        let stats = ServerStats::new();
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("ServerStats"));
+    }
+
+    #[test]
+    fn server_stats_clone_shares_underlying_data() {
+        let stats = ServerStats::new();
+        let clone = stats.clone();
+
+        clone.record_request("tools/call", Duration::from_millis(5), true);
+
+        // Original should see the update because they share the same Arc
+        let snap = stats.snapshot();
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.tool_calls, 1);
+    }
+
+    #[test]
+    fn stats_snapshot_debug_and_clone() {
+        let stats = ServerStats::new();
+        stats.record_request("tools/call", Duration::from_millis(7), true);
+        let snap = stats.snapshot();
+
+        let debug = format!("{snap:?}");
+        assert!(debug.contains("StatsSnapshot"));
+        assert!(debug.contains("total_requests: 1"));
+
+        let cloned = snap.clone();
+        assert_eq!(cloned.total_requests, snap.total_requests);
+        assert_eq!(cloned.tool_calls, snap.tool_calls);
+        assert_eq!(cloned.max_latency, snap.max_latency);
+    }
+
+    #[test]
+    fn list_operations_detected_by_contains() {
+        let stats = ServerStats::new();
+
+        // "notifications/list" contains "list" but is not tools/resources/prompts
+        stats.record_request("notifications/list", Duration::from_millis(1), true);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.list_operations, 1);
+        assert_eq!(snap.tool_calls, 0);
+        assert_eq!(snap.resource_reads, 0);
+        assert_eq!(snap.prompt_gets, 0);
+    }
+
+    #[test]
+    fn connection_closed_concurrent_cas_loop() {
+        let stats = ServerStats::new();
+        stats.connection_opened();
+        stats.connection_opened();
+        stats.connection_opened();
+
+        // Close from multiple threads to exercise the CAS retry loop
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let s = stats.clone();
+            handles.push(thread::spawn(move || {
+                s.connection_closed();
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.active_connections, 0);
+        assert_eq!(snap.total_connections, 3);
+    }
 }
