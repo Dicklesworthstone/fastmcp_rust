@@ -1864,4 +1864,57 @@ mod tests {
         assert!(provider.follow_symlinks);
         assert_eq!(provider.description, Some("Chain test".to_string()));
     }
+
+    // ── Additional coverage ─────────────────────────────────────────
+
+    #[test]
+    fn detect_mime_type_case_insensitive() {
+        assert_eq!(detect_mime_type(Path::new("README.MD")), "text/markdown");
+        assert_eq!(detect_mime_type(Path::new("photo.JPG")), "image/jpeg");
+        assert_eq!(detect_mime_type(Path::new("data.JSON")), "application/json");
+    }
+
+    #[test]
+    fn glob_match_question_mark_at_end_fails_when_no_char() {
+        assert!(!glob_match("file?", "file"));
+        assert!(glob_match("file?", "fileA"));
+    }
+
+    #[test]
+    fn base64_encode_round_trips_with_std_decoder() {
+        use base64::Engine as _;
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let encoded = base64_encode(data);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("valid base64");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn handler_empty_root_has_no_cached_resources() {
+        let root = TestDir::new("handler-empty");
+        let handler = FilesystemProvider::new(root.path()).build();
+        assert!(handler.cached_resources.is_empty());
+    }
+
+    #[test]
+    fn list_files_nonexistent_root_returns_error() {
+        let provider = FilesystemProvider::new("/nonexistent-fastmcp-test-dir-xyz");
+        let result = provider.list_files();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_file_path_traversal_blocked() {
+        let root = TestDir::new("read-traversal");
+        write_text(&root.join("safe.txt"), "ok");
+        let provider = FilesystemProvider::new(root.path());
+        let result = provider.read_file("../../../etc/passwd");
+        assert!(matches!(
+            result,
+            Err(FilesystemProviderError::PathTraversal { .. }
+                | FilesystemProviderError::NotFound { .. })
+        ));
+    }
 }
