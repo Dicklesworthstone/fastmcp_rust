@@ -348,4 +348,84 @@ mod tests {
             debug!(message = "second_message");
         });
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-i167)
+    // =========================================================================
+
+    #[test]
+    fn field_collector_default_is_empty() {
+        let collector = FieldCollector::default();
+        assert!(collector.message.is_none());
+        assert!(collector.fields.is_empty());
+    }
+
+    #[test]
+    fn field_collector_message_only_set_once() {
+        use tracing::field::FieldSet;
+
+        let mut collector = FieldCollector::default();
+
+        // Simulate first message field
+        let fields = FieldSet::new(&["message"], tracing::callsite::Identifier(&NOP_CALLSITE));
+        let field = fields.field("message").unwrap();
+        collector.record_str(&field, "first");
+        assert_eq!(collector.message.as_deref(), Some("first"));
+
+        // Second message field is ignored
+        collector.record_str(&field, "second");
+        assert_eq!(collector.message.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn field_collector_non_message_fields_accumulate() {
+        use tracing::field::FieldSet;
+
+        let mut collector = FieldCollector::default();
+
+        let fields = FieldSet::new(&["user"], tracing::callsite::Identifier(&NOP_CALLSITE));
+        let field = fields.field("user").unwrap();
+        collector.record_str(&field, "alice");
+
+        assert!(collector.message.is_none());
+        assert_eq!(collector.fields.len(), 1);
+        assert_eq!(collector.fields[0].0, "user");
+        assert_eq!(collector.fields[0].1, "alice");
+    }
+
+    #[test]
+    fn rich_subscriber_builder_debug_output() {
+        let builder = RichSubscriberBuilder::new();
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("RichSubscriberBuilder"));
+        assert!(debug.contains("show_timestamps"));
+        assert!(debug.contains("level_filter"));
+    }
+
+    // Minimal callsite for field tests.
+    static NOP_CALLSITE: NopCallsite = NopCallsite;
+
+    struct NopCallsite;
+
+    impl tracing::callsite::Callsite for NopCallsite {
+        fn set_interest(&self, _interest: tracing::subscriber::Interest) {}
+        fn metadata(&self) -> &tracing::Metadata<'_> {
+            static META: tracing::Metadata<'static> = tracing::Metadata::new(
+                "nop",
+                "test",
+                Level::INFO,
+                None,
+                None,
+                None,
+                tracing::field::FieldSet::new(
+                    &[],
+                    tracing::callsite::Identifier(&NOP_CALLSITE_INNER),
+                ),
+                tracing::metadata::Kind::EVENT,
+            );
+            &META
+        }
+    }
+
+    static NOP_CALLSITE_INNER: NopCallsite = NopCallsite;
 }
