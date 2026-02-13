@@ -1189,4 +1189,447 @@ mod tests {
         assert_eq!(resource.version, Some("1.0.0".to_string()));
         assert_eq!(resource.tags, vec!["db".to_string()]);
     }
+
+    // =========================================================================
+    // ProxyCatalog trait derives
+    // =========================================================================
+
+    #[test]
+    fn proxy_catalog_debug() {
+        let catalog = ProxyCatalog {
+            tools: vec![Tool {
+                name: "dbg-tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }],
+            ..ProxyCatalog::default()
+        };
+        let debug = format!("{:?}", catalog);
+        assert!(debug.contains("ProxyCatalog"));
+        assert!(debug.contains("dbg-tool"));
+    }
+
+    #[test]
+    fn proxy_catalog_clone() {
+        let catalog = ProxyCatalog {
+            tools: vec![Tool {
+                name: "cloned".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }],
+            ..ProxyCatalog::default()
+        };
+        let cloned = catalog.clone();
+        assert_eq!(cloned.tools.len(), 1);
+        assert_eq!(cloned.tools[0].name, "cloned");
+    }
+
+    // =========================================================================
+    // ProxyResourceHandler.read_with_uri
+    // =========================================================================
+
+    #[test]
+    fn proxy_resource_handler_read_with_uri_uses_params() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::new(
+            Resource {
+                uri: "test://r".to_string(),
+                name: "R".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = HashMap::new();
+        let result = handler
+            .read_with_uri(&ctx, "test://r", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn proxy_resource_handler_read_with_uri_strips_prefix() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::with_prefix(
+            Resource {
+                uri: "file://data".to_string(),
+                name: "Data".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            "ext",
+            proxy,
+        );
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = HashMap::new();
+        // URI with prefix should still work (prefix gets stripped)
+        let result = handler
+            .read_with_uri(&ctx, "ext/file://data", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn proxy_resource_handler_read_with_uri_no_prefix_match() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::new(
+            Resource {
+                uri: "test://r".to_string(),
+                name: "R".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = HashMap::new();
+        // URI without prefix match - used as-is
+        let result = handler
+            .read_with_uri(&ctx, "other://uri", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    // =========================================================================
+    // ProxyToolHandler.definition
+    // =========================================================================
+
+    #[test]
+    fn proxy_tool_handler_definition_returns_clone() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyToolHandler::new(
+            Tool {
+                name: "def-tool".to_string(),
+                description: Some("desc".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec!["tag1".to_string()],
+                annotations: None,
+            },
+            proxy,
+        );
+
+        let def = handler.definition();
+        assert_eq!(def.name, "def-tool");
+        assert_eq!(def.description, Some("desc".to_string()));
+        assert_eq!(def.tags, vec!["tag1".to_string()]);
+    }
+
+    // =========================================================================
+    // ProxyPromptHandler.definition
+    // =========================================================================
+
+    #[test]
+    fn proxy_prompt_handler_definition_returns_clone() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyPromptHandler::new(
+            Prompt {
+                name: "def-prompt".to_string(),
+                description: Some("A prompt".to_string()),
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: vec!["tag2".to_string()],
+            },
+            proxy,
+        );
+
+        let def = handler.definition();
+        assert_eq!(def.name, "def-prompt");
+        assert_eq!(def.description, Some("A prompt".to_string()));
+        assert_eq!(def.tags, vec!["tag2".to_string()]);
+    }
+
+    // =========================================================================
+    // ProxyClient.read_resource and get_prompt
+    // =========================================================================
+
+    #[test]
+    fn proxy_client_read_resource() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let result = proxy.read_resource(&ctx, "test://r").expect("read ok");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, Some("resource".to_string()));
+    }
+
+    #[test]
+    fn proxy_client_get_prompt() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let mut args = HashMap::new();
+        args.insert("k".to_string(), "v".to_string());
+        let result = proxy
+            .get_prompt(&ctx, "test-prompt", args.clone())
+            .expect("get ok");
+        assert_eq!(result.len(), 1);
+
+        let guard = state.lock().unwrap();
+        let (name, recorded) = guard.last_prompt.as_ref().unwrap();
+        assert_eq!(name, "test-prompt");
+        assert_eq!(recorded, &args);
+    }
+
+    #[test]
+    fn proxy_client_call_tool() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let args = serde_json::json!({"x": 42});
+        let result = proxy
+            .call_tool(&ctx, "my-tool", args.clone())
+            .expect("call ok");
+        assert_eq!(result.len(), 1);
+
+        let guard = state.lock().unwrap();
+        let (name, recorded) = guard.last_tool.as_ref().unwrap();
+        assert_eq!(name, "my-tool");
+        assert_eq!(recorded, &args);
+    }
+
+    // =========================================================================
+    // ProxyResourceHandler new/with_prefix stores external_uri
+    // =========================================================================
+
+    #[test]
+    fn proxy_resource_handler_new_stores_external_uri() {
+        use super::ProxyResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::new(
+            Resource {
+                uri: "original://uri".to_string(),
+                name: "Orig".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+        assert_eq!(handler.external_uri, "original://uri");
+    }
+
+    #[test]
+    fn proxy_resource_handler_with_prefix_stores_external_uri() {
+        use super::ProxyResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::with_prefix(
+            Resource {
+                uri: "original://uri".to_string(),
+                name: "Orig".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            "pfx",
+            proxy,
+        );
+        // External URI is the original, not the prefixed one
+        assert_eq!(handler.external_uri, "original://uri");
+        // But the resource URI is prefixed
+        assert_eq!(handler.resource.uri, "pfx/original://uri");
+    }
+
+    // =========================================================================
+    // ProxyToolHandler stores external_name
+    // =========================================================================
+
+    #[test]
+    fn proxy_tool_handler_new_stores_external_name() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyToolHandler::new(
+            Tool {
+                name: "orig-name".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            },
+            proxy,
+        );
+        assert_eq!(handler.external_name, "orig-name");
+        assert_eq!(handler.tool.name, "orig-name");
+    }
+
+    #[test]
+    fn proxy_tool_handler_with_prefix_stores_external_name() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyToolHandler::with_prefix(
+            Tool {
+                name: "orig".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            },
+            "ns",
+            proxy,
+        );
+        assert_eq!(handler.external_name, "orig");
+        assert_eq!(handler.tool.name, "ns/orig");
+    }
+
+    // =========================================================================
+    // ProxyPromptHandler stores external_name
+    // =========================================================================
+
+    #[test]
+    fn proxy_prompt_handler_new_stores_external_name() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyPromptHandler::new(
+            Prompt {
+                name: "orig-prompt".to_string(),
+                description: None,
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+        assert_eq!(handler.external_name, "orig-prompt");
+    }
+
+    #[test]
+    fn proxy_prompt_handler_with_prefix_stores_external_name() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyPromptHandler::with_prefix(
+            Prompt {
+                name: "prompt1".to_string(),
+                description: None,
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            "scope",
+            proxy,
+        );
+        assert_eq!(handler.external_name, "prompt1");
+        assert_eq!(handler.prompt.name, "scope/prompt1");
+    }
+
+    // =========================================================================
+    // resource_from_template with minimal fields
+    // =========================================================================
+
+    #[test]
+    fn resource_from_template_minimal_fields() {
+        use fastmcp_protocol::ResourceTemplate;
+
+        let template = ResourceTemplate {
+            uri_template: "test://{id}".to_string(),
+            name: "Minimal".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let resource = super::resource_from_template(&template);
+        assert_eq!(resource.uri, "test://{id}");
+        assert_eq!(resource.name, "Minimal");
+        assert!(resource.description.is_none());
+        assert!(resource.mime_type.is_none());
+        assert!(resource.icon.is_none());
+        assert!(resource.version.is_none());
+        assert!(resource.tags.is_empty());
+    }
+
+    // =========================================================================
+    // Error propagation for resource read and prompt get
+    // =========================================================================
+
+    #[test]
+    fn proxy_client_read_resource_propagates_error() {
+        let proxy = ProxyClient::from_backend(FailingBackend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let result = proxy.read_resource(&ctx, "test://x");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("resource read failed"));
+    }
+
+    #[test]
+    fn proxy_client_get_prompt_propagates_error() {
+        let proxy = ProxyClient::from_backend(FailingBackend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let result = proxy.get_prompt(&ctx, "fail", HashMap::new());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("prompt get failed"));
+    }
+
+    #[test]
+    fn proxy_client_call_tool_propagates_error() {
+        let proxy = ProxyClient::from_backend(FailingBackend);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let result = proxy.call_tool(&ctx, "fail", serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("tool call failed"));
+    }
 }
