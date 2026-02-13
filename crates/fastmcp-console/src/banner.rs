@@ -337,4 +337,105 @@ mod tests {
         assert!(tc.contains("Server ready"));
         assert!(tc.contains("stdio"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2c61)
+    // =========================================================================
+
+    #[test]
+    fn startup_banner_no_logo() {
+        let tc = TestConsole::new();
+        let console = tc.console();
+
+        StartupBanner::new("srv", "0.1.0").no_logo().render(console);
+
+        // Should still render server info, just no ASCII logo
+        assert!(tc.contains("srv"));
+    }
+
+    #[test]
+    fn startup_banner_default_transport_is_stdio() {
+        let tc = TestConsole::new();
+        let console = tc.console();
+
+        StartupBanner::new("srv", "0.1.0").render(console);
+
+        assert!(tc.contains("stdio"));
+    }
+
+    #[test]
+    fn startup_banner_custom_transport() {
+        let tc = TestConsole::new();
+        let console = tc.console();
+
+        StartupBanner::new("srv", "0.1.0")
+            .transport("sse")
+            .render(console);
+
+        assert!(tc.contains("sse"));
+    }
+
+    #[test]
+    fn startup_banner_without_description() {
+        let tc = TestConsole::new();
+        let console = tc.console();
+
+        // Render without calling .description()
+        StartupBanner::new("srv", "0.1.0").tools(1).render(console);
+
+        assert!(tc.contains("srv"));
+        assert!(tc.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn lerp_boundaries() {
+        assert_eq!(lerp(0, 255, 0.0), 0);
+        assert_eq!(lerp(0, 255, 1.0), 255);
+        assert_eq!(lerp(0, 200, 0.5), 100);
+        assert_eq!(lerp(100, 100, 0.5), 100);
+    }
+
+    #[test]
+    fn interpolate_colors_start_and_end() {
+        let start = Color::from_rgb(0, 0, 0);
+        let end = Color::from_rgb(255, 255, 255);
+
+        let at_start = interpolate_colors(&start, &end, 0.0);
+        let at_end = interpolate_colors(&start, &end, 1.0);
+        let at_mid = interpolate_colors(&start, &end, 0.5);
+
+        assert_eq!(at_start.get_truecolor().red, 0);
+        assert_eq!(at_end.get_truecolor().red, 255);
+        // Midpoint should be roughly 128
+        let mid_r = at_mid.get_truecolor().red;
+        assert!((126..=129).contains(&mid_r), "mid_r was {mid_r}");
+    }
+
+    #[test]
+    fn gradient_text_produces_markup_per_line() {
+        let text = "line1\nline2\nline3";
+        let start = Color::from_rgb(255, 0, 0);
+        let end = Color::from_rgb(0, 0, 255);
+        let result = gradient_text(text, &start, &end);
+
+        // Each line should be wrapped in color markup
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(line.starts_with('['));
+            assert!(line.ends_with("[/]"));
+        }
+    }
+
+    #[test]
+    fn gradient_text_single_line() {
+        let text = "only one";
+        let start = Color::from_rgb(100, 100, 100);
+        let end = Color::from_rgb(200, 200, 200);
+        let result = gradient_text(text, &start, &end);
+
+        // Single line: t=0.0 → uses start color
+        assert!(result.contains("only one"));
+        assert_eq!(result.lines().count(), 1);
+    }
 }
