@@ -1632,4 +1632,295 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("tool call failed"));
     }
+
+    // =========================================================================
+    // ProxyClient — lock poison error
+    // =========================================================================
+
+    #[test]
+    fn proxy_client_lock_poison_returns_error() {
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+
+        // Poison the mutex by panicking inside a lock
+        let proxy2 = proxy.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = proxy2.inner.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // Now the lock is poisoned — catalog should return an error
+        let result = proxy.catalog();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Proxy backend lock poisoned")
+        );
+    }
+
+    // =========================================================================
+    // ProxyResourceHandler — from_template stores external_uri
+    // =========================================================================
+
+    #[test]
+    fn proxy_resource_handler_from_template_stores_external_uri() {
+        use super::ProxyResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let template = ResourceTemplate {
+            uri_template: "file://{path}".to_string(),
+            name: "File".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let handler = ProxyResourceHandler::from_template(template, proxy);
+        assert_eq!(handler.external_uri, "file://{path}");
+    }
+
+    #[test]
+    fn proxy_resource_handler_from_template_with_prefix_stores_external_uri() {
+        use super::ProxyResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        let template = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "DB".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let handler = ProxyResourceHandler::from_template_with_prefix(template, "remote", proxy);
+        // External URI is the original template URI
+        assert_eq!(handler.external_uri, "db://{table}");
+        // Resource URI is prefixed
+        assert_eq!(handler.resource.uri, "remote/db://{table}");
+        // Template is also prefixed
+        let tmpl = handler.template.unwrap();
+        assert_eq!(tmpl.uri_template, "remote/db://{table}");
+    }
+
+    // =========================================================================
+    // ProxyClient — call_tool with progress reporter
+    // =========================================================================
+
+    struct TestNotificationSender {
+        calls: Mutex<Vec<(f64, Option<f64>, Option<String>)>>,
+    }
+
+    impl fastmcp_core::NotificationSender for TestNotificationSender {
+        fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((progress, total, message.map(|s| s.to_string())));
+        }
+    }
+
+    #[test]
+    fn proxy_client_call_tool_with_progress_reporter() {
+        use fastmcp_core::ProgressReporter;
+
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        let sender = Arc::new(TestNotificationSender {
+            calls: Mutex::new(Vec::new()),
+        });
+        let reporter =
+            ProgressReporter::new(Arc::clone(&sender) as Arc<dyn fastmcp_core::NotificationSender>);
+        let ctx = McpContext::with_progress(Cx::for_testing(), 1, reporter);
+
+        let result = proxy
+            .call_tool(&ctx, "progress-tool", serde_json::json!({"x": 1}))
+            .expect("call ok");
+        assert_eq!(result.len(), 1);
+
+        // The TestBackend's call_tool_with_progress calls on_progress(0.5, Some(1.0), ...)
+        // which triggers ctx.report_progress_with_total
+        let calls = sender.calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        assert_eq!(calls[0].0, 0.5);
+        assert_eq!(calls[0].1, Some(1.0));
+    }
+
+    // =========================================================================
+    // read_with_uri — URI without slash in resource URI
+    // =========================================================================
+
+    #[test]
+    fn proxy_resource_handler_read_with_uri_resource_uri_no_slash() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend::default();
+        let proxy = ProxyClient::from_backend(backend);
+        // Resource URI without any slash — split('/').next() returns the whole string
+        let handler = ProxyResourceHandler::new(
+            Resource {
+                uri: "noslash".to_string(),
+                name: "NoSlash".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy,
+        );
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = HashMap::new();
+        // URI that starts with "noslash/" — prefix will match
+        let result = handler
+            .read_with_uri(&ctx, "noslash/rest", &params)
+            .expect("read ok");
+        assert_eq!(result.len(), 1);
+    }
+
+    // =========================================================================
+    // ProxyCatalog — resource_templates populated
+    // =========================================================================
+
+    #[test]
+    fn proxy_catalog_collects_resource_templates() {
+        use fastmcp_protocol::ResourceTemplate;
+
+        struct TemplateBackend;
+        impl ProxyBackend for TemplateBackend {
+            fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+                Ok(vec![])
+            }
+            fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+                Ok(vec![])
+            }
+            fn list_resource_templates(
+                &mut self,
+            ) -> fastmcp_core::McpResult<Vec<ResourceTemplate>> {
+                Ok(vec![ResourceTemplate {
+                    uri_template: "tmpl://{id}".to_string(),
+                    name: "Template".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }])
+            }
+            fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+                Ok(vec![])
+            }
+            fn call_tool(
+                &mut self,
+                _: &str,
+                _: serde_json::Value,
+            ) -> fastmcp_core::McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn call_tool_with_progress(
+                &mut self,
+                _: &str,
+                _: serde_json::Value,
+                _: super::ProgressCallback<'_>,
+            ) -> fastmcp_core::McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn read_resource(&mut self, _: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+            fn get_prompt(
+                &mut self,
+                _: &str,
+                _: HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+                Ok(vec![])
+            }
+        }
+
+        let mut backend = TemplateBackend;
+        let catalog = ProxyCatalog::from_backend(&mut backend).expect("catalog");
+        assert_eq!(catalog.resource_templates.len(), 1);
+        assert_eq!(catalog.resource_templates[0].uri_template, "tmpl://{id}");
+    }
+
+    // =========================================================================
+    // FailingBackend — catalog errors propagate from resource list
+    // =========================================================================
+
+    #[test]
+    fn proxy_catalog_propagates_resource_list_error() {
+        // FailingBackend.list_tools fails first, but let's verify the error message
+        let mut backend = FailingBackend;
+        let result = ProxyCatalog::from_backend(&mut backend);
+        assert!(result.is_err());
+        // The first error encountered is from list_tools
+        assert!(result.unwrap_err().message.contains("tool list failed"));
+    }
+
+    // =========================================================================
+    // ProxyClient — call_tool without progress (no_progress path)
+    // =========================================================================
+
+    #[test]
+    fn proxy_client_call_tool_no_progress_uses_plain_call() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let backend = TestBackend {
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+
+        // McpContext::new has no progress reporter
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(!ctx.has_progress_reporter());
+
+        let result = proxy
+            .call_tool(&ctx, "plain-tool", serde_json::json!({"y": 2}))
+            .expect("call ok");
+        assert_eq!(result.len(), 1);
+
+        let guard = state.lock().unwrap();
+        let (name, _) = guard.last_tool.as_ref().unwrap();
+        assert_eq!(name, "plain-tool");
+    }
+
+    // =========================================================================
+    // resource_from_template — icon field
+    // =========================================================================
+
+    #[test]
+    fn resource_from_template_copies_icon() {
+        use fastmcp_protocol::{Icon, ResourceTemplate};
+
+        let icon = Icon {
+            src: Some("https://example.com/star.png".to_string()),
+            mime_type: None,
+            sizes: None,
+        };
+        let template = ResourceTemplate {
+            uri_template: "icon://{x}".to_string(),
+            name: "WithIcon".to_string(),
+            description: None,
+            mime_type: None,
+            icon: Some(icon.clone()),
+            version: None,
+            tags: vec![],
+        };
+        let resource = super::resource_from_template(&template);
+        assert_eq!(resource.icon, Some(icon));
+    }
 }
