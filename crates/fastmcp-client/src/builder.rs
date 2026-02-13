@@ -633,4 +633,69 @@ mod tests {
             .working_dir("/second");
         assert_eq!(builder.working_dir, Some(PathBuf::from("/second")));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-10fu)
+    // =========================================================================
+
+    #[test]
+    fn child_guard_disarm_returns_child() {
+        let child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn 'true'");
+        let guard = ChildGuard::new(child);
+        let mut returned = guard.disarm();
+        // disarm gives back a valid Child we can wait on
+        let status = returned.wait().expect("wait failed");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn child_guard_drop_kills_child() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn 'sleep'");
+        let pid = child.id();
+        {
+            let _guard = ChildGuard::new(child);
+            // guard dropped here → child is killed and waited
+        }
+        // Verify the process is no longer running by trying to wait on it
+        // via /proc (Linux-specific but sufficient for CI)
+        let proc_path = format!("/proc/{}/status", pid);
+        assert!(
+            !std::path::Path::new(&proc_path).exists(),
+            "process should no longer exist after drop"
+        );
+    }
+
+    #[test]
+    fn builder_capabilities_default_is_empty() {
+        let builder = ClientBuilder::new();
+        assert!(builder.capabilities.sampling.is_none());
+        assert!(builder.capabilities.elicitation.is_none());
+        assert!(builder.capabilities.roots.is_none());
+    }
+
+    #[test]
+    fn connect_stdio_spawn_failure_error_message() {
+        let result = ClientBuilder::new()
+            .max_retries(0)
+            .connect_stdio("fastmcp_no_such_binary_abc123", &[]);
+        match result {
+            Err(err) => assert!(
+                err.message.contains("spawn"),
+                "error should mention spawn failure: {}",
+                err.message
+            ),
+            Ok(_) => panic!("expected spawn to fail"),
+        }
+    }
 }
