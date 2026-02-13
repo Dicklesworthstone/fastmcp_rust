@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use fastmcp_protocol::Tool;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    McpContext, McpResult, PromptMessage, Resource, ResourceContent, ResourceHandler,
-    ResourceTemplate, Role, Server, ToolHandler, prompt, resource, tool,
+    McpContext, McpResult, PromptMessage, ResourceContent, ResourceTemplate, Role, Server,
+    ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 
@@ -2288,86 +2288,29 @@ impl ToolHandler for TypesToolHandler {
     }
 }
 
-/// Tool that requires specific arguments for validation testing.
-struct RequiredArgsToolHandler;
-
-impl ToolHandler for RequiredArgsToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "required_args".to_string(),
-            description: Some("Tool with required arguments".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "required_field": { "type": "string" },
-                    "optional_field": { "type": "string" }
-                },
-                "required": ["required_field"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let required = arguments["required_field"]
-            .as_str()
-            .ok_or_else(|| McpError::invalid_params("required_field is required"))?;
-
-        let optional = arguments["optional_field"]
-            .as_str()
-            .unwrap_or("(not provided)");
-
-        Ok(vec![Content::Text {
-            text: format!("required: {}, optional: {}", required, optional),
-        }])
-    }
+/// Tool with required and optional arguments.
+#[tool(name = "required_args")]
+fn required_args_tool(
+    _ctx: &McpContext,
+    required_field: String,
+    optional_field: Option<String>,
+) -> String {
+    let optional = optional_field.as_deref().unwrap_or("(not provided)");
+    format!("required: {}, optional: {}", required_field, optional)
 }
 
 /// Tool that returns multiple content items.
-struct MultiContentToolHandler;
+#[tool(name = "multi_content")]
+fn multi_content_tool(_ctx: &McpContext, count: Option<i64>) -> Vec<Content> {
+    let count = count.unwrap_or(1) as usize;
+    let count = count.min(10); // Limit to 10
 
-impl ToolHandler for MultiContentToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "multi_content".to_string(),
-            description: Some("Returns multiple content items".to_string()),
-            input_schema: json!({"type": "object", "properties": {"count": {"type": "integer"}}}),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let count = arguments["count"].as_i64().unwrap_or(1) as usize;
-        let count = count.min(10); // Limit to 10
-
-        (0..count)
-            .map(|i| Content::Text {
-                text: format!("Item {}", i + 1),
-            })
-            .collect::<Vec<_>>()
-            .pipe(Ok)
-    }
+    (0..count)
+        .map(|i| Content::Text {
+            text: format!("Item {}", i + 1),
+        })
+        .collect()
 }
-
-// Helper trait for pipe operator
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
 
 fn setup_tool_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
@@ -2378,8 +2321,8 @@ fn setup_tool_test_server() -> TestHarness {
     let server = builder
         .tool(EchoTool)
         .tool(TypesToolHandler)
-        .tool(RequiredArgsToolHandler)
-        .tool(MultiContentToolHandler)
+        .tool(RequiredArgsTool)
+        .tool(MultiContentTool)
         .tool(FailOnDemandTool)
         .build();
 
@@ -2854,93 +2797,45 @@ fn tool_call_alternating_success_failure() {
 // ============================================================================
 
 /// Resource that returns plain text content.
-struct PlainTextResourceHandler;
-
-impl ResourceHandler for PlainTextResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "text://plain".to_string(),
-            name: "Plain Text".to_string(),
-            description: Some("Returns plain text content".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent {
-            uri: "text://plain".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            text: Some("Hello, World!".to_string()),
-            blob: None,
-        }])
-    }
+#[resource(uri = "text://plain", name = "Plain Text", mime_type = "text/plain")]
+fn plain_text() -> String {
+    "Hello, World!".to_string()
 }
 
 /// Resource that returns JSON content.
-struct JsonResourceHandler;
-
-impl ResourceHandler for JsonResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "data://config.json".to_string(),
-            name: "JSON Config".to_string(),
-            description: Some("Returns JSON configuration".to_string()),
-            mime_type: Some("application/json".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
+#[resource(
+    uri = "data://config.json",
+    name = "JSON Config",
+    mime_type = "application/json"
+)]
+fn json_config() -> String {
+    json!({
+        "name": "test-config",
+        "version": "1.0.0",
+        "settings": {
+            "debug": true,
+            "max_connections": 100
         }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let json = serde_json::json!({
-            "name": "test-config",
-            "version": "1.0.0",
-            "settings": {
-                "debug": true,
-                "max_connections": 100
-            }
-        });
-        Ok(vec![ResourceContent {
-            uri: "data://config.json".to_string(),
-            mime_type: Some("application/json".to_string()),
-            text: Some(json.to_string()),
-            blob: None,
-        }])
-    }
+    })
+    .to_string()
 }
 
 /// Resource that returns binary content.
-struct BinaryResourceHandler;
+#[resource(
+    uri = "binary://data.bin",
+    name = "Binary Data",
+    mime_type = "application/octet-stream"
+)]
+fn binary_data() -> Vec<ResourceContent> {
+    let binary_data: Vec<u8> = (0..255u8).collect();
+    let blob = base64_encode(&binary_data);
 
-impl ResourceHandler for BinaryResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "binary://data.bin".to_string(),
-            name: "Binary Data".to_string(),
-            description: Some("Returns binary content".to_string()),
-            mime_type: Some("application/octet-stream".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        // Create some test binary data
-        let binary_data: Vec<u8> = (0..255u8).collect();
-        let blob = base64_encode(&binary_data);
-
-        Ok(vec![ResourceContent {
-            uri: "binary://data.bin".to_string(),
-            mime_type: Some("application/octet-stream".to_string()),
-            text: None,
-            blob: Some(blob),
-        }])
-    }
+    vec![ResourceContent {
+        uri: "binary://data.bin".to_string(),
+        mime_type: Some("application/octet-stream".to_string()),
+        text: None,
+        blob: Some(blob),
+    }]
 }
 
 /// Simple base64 encoding for tests (no external dependency).
@@ -2977,119 +2872,52 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Resource that returns Unicode content.
-struct UnicodeResourceHandler;
-
-impl ResourceHandler for UnicodeResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "text://unicode".to_string(),
-            name: "Unicode Text".to_string(),
-            description: Some("Returns Unicode content".to_string()),
-            mime_type: Some("text/plain; charset=utf-8".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent {
-            uri: "text://unicode".to_string(),
-            mime_type: Some("text/plain; charset=utf-8".to_string()),
-            text: Some("日本語 中文 العربية 🌍🌎🌏 Ελληνικά".to_string()),
-            blob: None,
-        }])
-    }
+#[resource(
+    uri = "text://unicode",
+    name = "Unicode Text",
+    mime_type = "text/plain; charset=utf-8"
+)]
+fn unicode_text() -> String {
+    "日本語 中文 العربية 🌍🌎🌏 Ελληνικά".to_string()
 }
 
 /// Resource that returns large content.
-struct LargeContentResourceHandler;
-
-impl ResourceHandler for LargeContentResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "data://large".to_string(),
-            name: "Large Content".to_string(),
-            description: Some("Returns large content".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let large_content = "x".repeat(100_000);
-        Ok(vec![ResourceContent {
-            uri: "data://large".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            text: Some(large_content),
-            blob: None,
-        }])
-    }
+#[resource(uri = "data://large", name = "Large Content", mime_type = "text/plain")]
+fn large_content() -> String {
+    "x".repeat(100_000)
 }
 
 /// Resource that returns multiple content items.
-struct MultiContentResourceHandler;
-
-impl ResourceHandler for MultiContentResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "data://multi".to_string(),
-            name: "Multi Content".to_string(),
-            description: Some("Returns multiple content items".to_string()),
-            mime_type: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![
-            ResourceContent {
-                uri: "data://multi/part1".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some("Part 1".to_string()),
-                blob: None,
-            },
-            ResourceContent {
-                uri: "data://multi/part2".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some("Part 2".to_string()),
-                blob: None,
-            },
-            ResourceContent {
-                uri: "data://multi/part3".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some("Part 3".to_string()),
-                blob: None,
-            },
-        ])
-    }
+#[resource(uri = "data://multi", name = "Multi Content")]
+fn multi_content_items() -> Vec<ResourceContent> {
+    vec![
+        ResourceContent {
+            uri: "data://multi/part1".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Part 1".to_string()),
+            blob: None,
+        },
+        ResourceContent {
+            uri: "data://multi/part2".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Part 2".to_string()),
+            blob: None,
+        },
+        ResourceContent {
+            uri: "data://multi/part3".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Part 3".to_string()),
+            blob: None,
+        },
+    ]
 }
 
 /// Resource that always fails.
-struct FailingResourceHandler;
-
-impl ResourceHandler for FailingResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "error://fail".to_string(),
-            name: "Failing Resource".to_string(),
-            description: Some("Always fails when read".to_string()),
-            mime_type: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Err(McpError::resource_not_found(
-            "Resource read failed intentionally",
-        ))
-    }
+#[resource(uri = "error://fail", name = "Failing Resource")]
+fn failing_res() -> McpResult<String> {
+    Err(McpError::resource_not_found(
+        "Resource read failed intentionally",
+    ))
 }
 
 fn setup_resource_test_server() -> TestHarness {
@@ -3099,13 +2927,13 @@ fn setup_resource_test_server() -> TestHarness {
         .build_server_builder();
 
     let server = builder
-        .resource(PlainTextResourceHandler)
-        .resource(JsonResourceHandler)
-        .resource(BinaryResourceHandler)
-        .resource(UnicodeResourceHandler)
-        .resource(LargeContentResourceHandler)
-        .resource(MultiContentResourceHandler)
-        .resource(FailingResourceHandler)
+        .resource(PlainTextResource)
+        .resource(JsonConfigResource)
+        .resource(BinaryDataResource)
+        .resource(UnicodeTextResource)
+        .resource(LargeContentResource)
+        .resource(MultiContentItemsResource)
+        .resource(FailingResResource)
         .build();
 
     let handle = spawn_thread(move || {
@@ -3319,7 +3147,7 @@ fn resource_read_before_init_fails() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test", "1.0.0")
-        .resource(PlainTextResourceHandler)
+        .resource(PlainTextResource)
         .build();
     thread::spawn(move || server.run_transport(server_transport));
 
