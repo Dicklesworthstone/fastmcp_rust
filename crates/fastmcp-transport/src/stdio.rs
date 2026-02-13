@@ -934,4 +934,129 @@ mod tests {
         assert!(!sent.is_empty());
         assert!(sent.contains("\"method\":\"test\""));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-19vz)
+    // =========================================================================
+
+    #[test]
+    fn send_response_direct_writes_valid_ndjson() {
+        let reader = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            let response = JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"ok": true})),
+                error: None,
+                id: Some(fastmcp_protocol::RequestId::Number(42)),
+            };
+            transport.send_response_direct(&cx, &response).unwrap();
+        }
+
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.ends_with('\n'));
+        assert!(sent.contains("\"result\""));
+        assert!(sent.contains("\"ok\":true") || sent.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn send_response_direct_cancelled() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!(null)),
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        };
+        let result = transport.send_response_direct(&cx, &response);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn transport_send_trait_method_with_response() {
+        let reader = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            let response = JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"status": "done"})),
+                error: None,
+                id: Some(fastmcp_protocol::RequestId::Number(1)),
+            };
+            transport
+                .send(&cx, &JsonRpcMessage::Response(response))
+                .unwrap();
+        }
+
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.contains("\"status\""));
+    }
+
+    #[test]
+    fn transport_send_trait_cancelled() {
+        let reader = Cursor::new(Vec::new());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        let result = transport.send(&cx, &JsonRpcMessage::Request(request));
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
+
+    #[test]
+    fn two_phase_send_response_via_permit() {
+        let reader = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+
+        {
+            let mut transport = StdioTransport::new(reader, &mut output);
+            let cx = Cx::for_testing();
+
+            let permit = transport.reserve_send(&cx).unwrap();
+            let response = JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!({"v": 1})),
+                error: None,
+                id: Some(fastmcp_protocol::RequestId::Number(1)),
+            };
+            permit.send_response(&response).unwrap();
+        }
+
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.contains("\"result\""));
+    }
+
+    #[test]
+    fn recv_handles_crlf_line_endings() {
+        // Windows-style CRLF should be handled correctly
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\r\n";
+        let reader = Cursor::new(input.to_vec());
+        let writer = Vec::new();
+        let mut transport = StdioTransport::new(reader, writer);
+        let cx = Cx::for_testing();
+
+        let msg = transport.recv(&cx).unwrap();
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.method, "test");
+        } else {
+            panic!("Expected request");
+        }
+    }
 }
