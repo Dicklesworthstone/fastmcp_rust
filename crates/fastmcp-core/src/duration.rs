@@ -199,4 +199,71 @@ mod tests {
         assert!(parse_duration("30x").is_err()); // Invalid unit
         assert!(parse_duration("0s").is_err()); // Zero duration
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1p24)
+    // =========================================================================
+
+    #[test]
+    fn error_display_format() {
+        let err = parse_duration("").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid duration"));
+        assert!(msg.contains("empty string"));
+    }
+
+    #[test]
+    fn error_is_std_error() {
+        let err = parse_duration("bad").unwrap_err();
+        // Ensure std::error::Error is implemented
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn error_debug_clone_eq() {
+        let err = parse_duration("30").unwrap_err();
+        let debug = format!("{err:?}");
+        assert!(debug.contains("ParseDurationError"));
+
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn error_unit_without_number() {
+        let err = parse_duration("s").unwrap_err();
+        assert!(err.message.contains("without preceding number"));
+    }
+
+    #[test]
+    fn error_unknown_unit() {
+        let err = parse_duration("30x").unwrap_err();
+        assert!(err.message.contains("unknown unit"));
+    }
+
+    #[test]
+    fn error_unexpected_character() {
+        let err = parse_duration("30s$").unwrap_err();
+        assert!(err.message.contains("unexpected character"));
+    }
+
+    #[test]
+    fn error_missing_unit() {
+        let err = parse_duration("42").unwrap_err();
+        assert!(err.message.contains("missing unit"));
+    }
+
+    #[test]
+    fn error_zero_duration() {
+        let err = parse_duration("0s").unwrap_err();
+        assert!(err.message.contains("greater than zero"));
+    }
+
+    #[test]
+    fn whitespace_between_components() {
+        assert_eq!(
+            parse_duration("2h 30m 15s").unwrap(),
+            Duration::from_secs(2 * 3600 + 30 * 60 + 15)
+        );
+    }
 }

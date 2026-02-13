@@ -117,4 +117,54 @@ mod tests {
         let _ = t.success_style.clone();
         let _ = t.warning_style.clone();
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1p24)
+    // =========================================================================
+
+    #[test]
+    fn theme_neutral_palette() {
+        let t = FastMcpTheme::default();
+        // text: #e5e7eb (229, 231, 235)
+        assert_eq!(t.text.triplet.map(|tr| tr.red), Some(229));
+        // text_muted: #9ca3af (156, 163, 175)
+        assert_eq!(t.text_muted.triplet.map(|tr| tr.red), Some(156));
+        // text_dim: #6b7280 (107, 114, 128)
+        assert_eq!(t.text_dim.triplet.map(|tr| tr.red), Some(107));
+        // border: #374151 (55, 65, 81)
+        assert_eq!(t.border.triplet.map(|tr| tr.red), Some(55));
+        // background: #1f2937 (31, 41, 55)
+        assert_eq!(t.background.triplet.map(|tr| tr.red), Some(31));
+    }
+
+    #[test]
+    fn theme_info_and_secondary_colors() {
+        let t = FastMcpTheme::default();
+        // info: #3b82f6 (59, 130, 246)
+        assert_eq!(t.info.triplet.map(|tr| tr.blue), Some(246));
+        // secondary: #a855f7 (168, 85, 247)
+        assert_eq!(t.secondary.triplet.map(|tr| tr.red), Some(168));
+        // accent matches success
+        assert_eq!(t.accent.triplet.map(|tr| tr.green), Some(197));
+    }
+
+    #[test]
+    fn theme_all_styles_accessible() {
+        let t = FastMcpTheme::default();
+        // Verify all remaining styles are accessible
+        let _ = t.subheader_style.clone();
+        let _ = t.label_style.clone();
+        let _ = t.value_style.clone();
+        let _ = t.key_style.clone();
+        let _ = t.muted_style.clone();
+        let _ = t.info_style.clone();
+        let _ = t.border_style.clone();
+    }
+
+    #[test]
+    fn theme_debug_impl() {
+        let t = FastMcpTheme::default();
+        let debug = format!("{t:?}");
+        assert!(debug.contains("FastMcpTheme"));
+    }
 }

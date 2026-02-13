@@ -154,6 +154,90 @@ mod tests {
         let value = serde_json::to_value(&anon).expect("serialize");
         assert_eq!(value, serde_json::json!({}));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1p24)
+    // =========================================================================
+
+    #[test]
+    fn auth_state_key_constant() {
+        assert_eq!(super::AUTH_STATE_KEY, "fastmcp.auth");
+    }
+
+    #[test]
+    fn auth_context_default_is_anonymous() {
+        let def = AuthContext::default();
+        assert!(def.subject.is_none());
+        assert!(def.scopes.is_empty());
+        assert!(def.token.is_none());
+        assert!(def.claims.is_none());
+    }
+
+    #[test]
+    fn auth_context_debug_output() {
+        let ctx = AuthContext::with_subject("alice");
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("AuthContext"));
+        assert!(debug.contains("alice"));
+    }
+
+    #[test]
+    fn auth_context_clone() {
+        let ctx = AuthContext::with_subject("bob");
+        let cloned = ctx.clone();
+        assert_eq!(cloned.subject.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn auth_context_full_serialization_roundtrip() {
+        let ctx = AuthContext {
+            subject: Some("user42".to_string()),
+            scopes: vec!["read".to_string(), "write".to_string()],
+            token: Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "tok123".to_string(),
+            }),
+            claims: Some(serde_json::json!({"aud": "api"})),
+        };
+        let json = serde_json::to_value(&ctx).expect("serialize");
+        assert_eq!(json["subject"], "user42");
+        assert_eq!(json["scopes"], serde_json::json!(["read", "write"]));
+        assert_eq!(json["token"]["scheme"], "Bearer");
+        assert_eq!(json["token"]["token"], "tok123");
+        assert_eq!(json["claims"]["aud"], "api");
+
+        // Roundtrip
+        let deserialized: AuthContext = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(deserialized.subject.as_deref(), Some("user42"));
+        assert_eq!(deserialized.scopes.len(), 2);
+        assert!(deserialized.token.is_some());
+        assert!(deserialized.claims.is_some());
+    }
+
+    #[test]
+    fn access_token_debug_clone_eq() {
+        let token = AccessToken {
+            scheme: "Bearer".to_string(),
+            token: "abc".to_string(),
+        };
+        let debug = format!("{token:?}");
+        assert!(debug.contains("AccessToken"));
+        assert!(debug.contains("abc"));
+
+        let cloned = token.clone();
+        assert_eq!(token, cloned);
+    }
+
+    #[test]
+    fn access_token_serde_roundtrip() {
+        let token = AccessToken {
+            scheme: "Custom".to_string(),
+            token: "xyz".to_string(),
+        };
+        let json = serde_json::to_string(&token).expect("serialize");
+        let deserialized: AccessToken = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized, token);
+    }
 }
 
 /// Authentication context stored for a request/session.

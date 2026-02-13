@@ -127,4 +127,43 @@ mod tests {
         let debug_str = format!("{:?}", ctx);
         assert!(debug_str.contains("Agent"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1p24)
+    // =========================================================================
+
+    #[test]
+    fn display_context_copy_semantics() {
+        let ctx = DisplayContext::Agent;
+        let copied = ctx;
+        // Both should be usable (Copy trait)
+        assert!(ctx.is_agent());
+        assert!(copied.is_agent());
+    }
+
+    #[test]
+    fn display_context_debug_human() {
+        let ctx = DisplayContext::Human;
+        let debug_str = format!("{ctx:?}");
+        assert!(debug_str.contains("Human"));
+    }
+
+    #[test]
+    fn detect_returns_valid_context() {
+        // In CI, detect() should return Agent (CI env var is set)
+        let ctx = DisplayContext::detect();
+        assert!(ctx.is_agent() || ctx.is_human());
+    }
+
+    #[test]
+    fn is_agent_context_and_should_enable_rich_are_consistent() {
+        // If is_agent_context() returns true, should_enable_rich() should return
+        // false (unless FASTMCP_RICH is set, which it shouldn't be in tests)
+        if is_agent_context() {
+            // agent context -> rich should be disabled (unless FASTMCP_RICH override)
+            if std::env::var("FASTMCP_RICH").is_err() {
+                assert!(!should_enable_rich());
+            }
+        }
+    }
 }
