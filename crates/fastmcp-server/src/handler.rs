@@ -710,7 +710,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
         let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-1"), move |req| {
-            sent_clone.lock().unwrap().push(req)
+            sent_clone.lock().unwrap().push(req);
         });
 
         sender.send_progress(0.5, None, None);
@@ -728,7 +728,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
         let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-2"), move |req| {
-            sent_clone.lock().unwrap().push(req)
+            sent_clone.lock().unwrap().push(req);
         });
 
         sender.send_progress(3.0, Some(10.0), None);
@@ -744,7 +744,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_clone = Arc::clone(&sent);
         let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-3"), move |req| {
-            sent_clone.lock().unwrap().push(req)
+            sent_clone.lock().unwrap().push(req);
         });
 
         sender.send_progress(1.0, Some(5.0), Some("loading"));

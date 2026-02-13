@@ -2443,4 +2443,1125 @@ mod uri_template_tests {
         let err = UriTemplate::parse("db://{id}/{id}").unwrap_err();
         assert_eq!(err, UriTemplateError::DuplicateParam("id".to_string()));
     }
+
+    #[test]
+    fn uri_template_rejects_unclosed_param() {
+        let err = UriTemplate::parse("file://{path").unwrap_err();
+        assert_eq!(err, UriTemplateError::UnclosedParam);
+    }
+
+    #[test]
+    fn uri_template_specificity_literal_only() {
+        let t = UriTemplate::new("file://exact/path");
+        let (lit_len, lit_segs, total_segs) = t.specificity();
+        assert_eq!(lit_len, "file://exact/path".len());
+        assert_eq!(lit_segs, 1);
+        assert_eq!(total_segs, 1);
+    }
+
+    #[test]
+    fn uri_template_specificity_with_params() {
+        let t = UriTemplate::new("db://{table}/items/{id}");
+        let (lit_len, lit_segs, total_segs) = t.specificity();
+        assert_eq!(lit_len, "db://".len() + "/items/".len());
+        assert_eq!(lit_segs, 2);
+        assert_eq!(total_segs, 4); // "db://", {table}, "/items/", {id}
+    }
+
+    #[test]
+    fn uri_template_no_match_on_literal_mismatch() {
+        let t = UriTemplate::new("file://exact");
+        assert!(t.matches("file://other").is_none());
+    }
+
+    #[test]
+    fn uri_template_rejects_empty_param_value() {
+        let t = UriTemplate::new("db://{table}/items/{id}");
+        // table would be empty
+        assert!(t.matches("db:///items/42").is_none());
+    }
+
+    #[test]
+    fn uri_template_debug_and_clone() {
+        let t = UriTemplate::new("file://{path}");
+        let debug = format!("{:?}", t);
+        assert!(debug.contains("file://{path}"));
+        let cloned = t.clone();
+        assert!(cloned.matches("file://test").is_some());
+    }
+
+    #[test]
+    fn uri_template_escaped_close_brace() {
+        let t = UriTemplate::new("file://{{a}}/{id}");
+        let params = t.matches("file://{a}/42").expect("match");
+        assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    }
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::{from_hex, percent_decode};
+
+    #[test]
+    fn no_percent_passthrough() {
+        assert_eq!(percent_decode("hello"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn basic_percent_decode() {
+        assert_eq!(percent_decode("foo%20bar"), Some("foo bar".to_string()));
+    }
+
+    #[test]
+    fn truncated_percent_returns_none() {
+        assert!(percent_decode("foo%2").is_none());
+    }
+
+    #[test]
+    fn invalid_hex_returns_none() {
+        assert!(percent_decode("foo%GG").is_none());
+    }
+
+    #[test]
+    fn from_hex_digits() {
+        assert_eq!(from_hex(b'0'), Some(0));
+        assert_eq!(from_hex(b'9'), Some(9));
+        assert_eq!(from_hex(b'a'), Some(10));
+        assert_eq!(from_hex(b'f'), Some(15));
+        assert_eq!(from_hex(b'A'), Some(10));
+        assert_eq!(from_hex(b'F'), Some(15));
+        assert_eq!(from_hex(b'G'), None);
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{decode_cursor_offset, encode_cursor_offset};
+
+    #[test]
+    fn roundtrip_zero() {
+        let encoded = encode_cursor_offset(0);
+        let decoded = decode_cursor_offset(Some(&encoded)).unwrap();
+        assert_eq!(decoded, 0);
+    }
+
+    #[test]
+    fn roundtrip_large_offset() {
+        let encoded = encode_cursor_offset(12345);
+        let decoded = decode_cursor_offset(Some(&encoded)).unwrap();
+        assert_eq!(decoded, 12345);
+    }
+
+    #[test]
+    fn none_cursor_returns_zero() {
+        assert_eq!(decode_cursor_offset(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_base64_returns_error() {
+        let err = decode_cursor_offset(Some("not-valid-base64!!!")).unwrap_err();
+        assert!(err.message.contains("base64"));
+    }
+
+    #[test]
+    fn valid_base64_but_not_json_returns_error() {
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not json");
+        let err = decode_cursor_offset(Some(&encoded)).unwrap_err();
+        assert!(err.message.contains("JSON"));
+    }
+
+    #[test]
+    fn valid_json_but_no_offset_returns_error() {
+        let payload = serde_json::json!({"other": 1});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        let err = decode_cursor_offset(Some(&encoded)).unwrap_err();
+        assert!(err.message.contains("offset"));
+    }
+}
+
+#[cfg(test)]
+mod tag_filter_tests {
+    use super::TagFilters;
+
+    #[test]
+    fn no_filters_matches_anything() {
+        let f = TagFilters::default();
+        assert!(f.matches(&[]));
+        assert!(f.matches(&["a".to_string()]));
+    }
+
+    #[test]
+    fn include_filter_requires_all_tags() {
+        let include = vec!["a".to_string(), "b".to_string()];
+        let f = TagFilters::new(Some(&include), None);
+        assert!(f.matches(&["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert!(!f.matches(&["a".to_string()])); // missing "b"
+    }
+
+    #[test]
+    fn exclude_filter_rejects_any_tag() {
+        let exclude = vec!["x".to_string()];
+        let f = TagFilters::new(None, Some(&exclude));
+        assert!(f.matches(&["a".to_string(), "b".to_string()]));
+        assert!(!f.matches(&["a".to_string(), "x".to_string()]));
+    }
+
+    #[test]
+    fn include_and_exclude_combined() {
+        let include = vec!["a".to_string()];
+        let exclude = vec!["b".to_string()];
+        let f = TagFilters::new(Some(&include), Some(&exclude));
+        assert!(f.matches(&["a".to_string()]));
+        assert!(!f.matches(&["a".to_string(), "b".to_string()])); // excluded
+        assert!(!f.matches(&["c".to_string()])); // missing "a"
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let include = vec!["Alpha".to_string()];
+        let f = TagFilters::new(Some(&include), None);
+        assert!(f.matches(&["alpha".to_string()]));
+        assert!(f.matches(&["ALPHA".to_string()]));
+    }
+
+    #[test]
+    fn empty_include_array_passes_all() {
+        let include: Vec<String> = vec![];
+        let f = TagFilters::new(Some(&include), None);
+        assert!(f.matches(&[]));
+        assert!(f.matches(&["anything".to_string()]));
+    }
+
+    #[test]
+    fn tag_filters_debug() {
+        let f = TagFilters::default();
+        let debug = format!("{:?}", f);
+        assert!(debug.contains("TagFilters"));
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
+    use fastmcp_core::{McpContext, McpResult, SessionState};
+    use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
+
+    // ── Stub handlers ──────────────────────────────────────────────────
+
+    struct NamedTool {
+        name: String,
+        tags: Vec<String>,
+    }
+
+    impl NamedTool {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                tags: vec![],
+            }
+        }
+        fn with_tags(name: &str, tags: Vec<String>) -> Self {
+            Self {
+                name: name.to_string(),
+                tags,
+            }
+        }
+    }
+
+    impl ToolHandler for NamedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.clone(),
+                description: Some(format!("Tool {}", self.name)),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: self.tags.clone(),
+                annotations: None,
+            }
+        }
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    struct NamedResource {
+        uri: String,
+        tags: Vec<String>,
+    }
+
+    impl NamedResource {
+        fn new(uri: &str) -> Self {
+            Self {
+                uri: uri.to_string(),
+                tags: vec![],
+            }
+        }
+        fn with_tags(uri: &str, tags: Vec<String>) -> Self {
+            Self {
+                uri: uri.to_string(),
+                tags,
+            }
+        }
+    }
+
+    impl ResourceHandler for NamedResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: self.uri.clone(),
+                name: self.uri.clone(),
+                description: None,
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: self.tags.clone(),
+            }
+        }
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: self.uri.clone(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("content".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    struct NamedPrompt {
+        name: String,
+        tags: Vec<String>,
+    }
+
+    impl NamedPrompt {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                tags: vec![],
+            }
+        }
+        fn with_tags(name: &str, tags: Vec<String>) -> Self {
+            Self {
+                name: name.to_string(),
+                tags,
+            }
+        }
+    }
+
+    impl PromptHandler for NamedPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: self.name.clone(),
+                description: Some(format!("Prompt {}", self.name)),
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: self.tags.clone(),
+            }
+        }
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    // ── Router::new ────────────────────────────────────────────────────
+
+    #[test]
+    fn new_router_is_empty() {
+        let r = Router::new();
+        assert_eq!(r.tools_count(), 0);
+        assert_eq!(r.resources_count(), 0);
+        assert_eq!(r.resource_templates_count(), 0);
+        assert_eq!(r.prompts_count(), 0);
+        assert!(r.tools().is_empty());
+        assert!(r.resources().is_empty());
+        assert!(r.resource_templates().is_empty());
+        assert!(r.prompts().is_empty());
+    }
+
+    #[test]
+    fn default_router_is_empty() {
+        let r = Router::default();
+        assert_eq!(r.tools_count(), 0);
+    }
+
+    // ── add_tool / get_tool ────────────────────────────────────────────
+
+    #[test]
+    fn add_and_get_tool() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("my_tool"));
+        assert_eq!(r.tools_count(), 1);
+        assert!(r.get_tool("my_tool").is_some());
+        assert!(r.get_tool("other").is_none());
+    }
+
+    #[test]
+    fn add_tool_replace_on_duplicate() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        r.add_tool(NamedTool::new("t"));
+        assert_eq!(r.tools_count(), 1);
+        // Order preserved (only one entry)
+        assert_eq!(r.tools().len(), 1);
+    }
+
+    #[test]
+    fn tools_returns_definitions_in_order() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("b"));
+        r.add_tool(NamedTool::new("a"));
+        let names: Vec<_> = r.tools().iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names, vec!["b", "a"]); // insertion order
+    }
+
+    // ── add_tool_with_behavior ─────────────────────────────────────────
+
+    #[test]
+    fn add_tool_behavior_error_on_duplicate() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        let err = r
+            .add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Error)
+            .unwrap_err();
+        assert!(err.message.contains("already exists"));
+    }
+
+    #[test]
+    fn add_tool_behavior_warn_keeps_original() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Warn)
+            .unwrap();
+        assert_eq!(r.tools_count(), 1);
+    }
+
+    #[test]
+    fn add_tool_behavior_replace() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Replace)
+            .unwrap();
+        assert_eq!(r.tools_count(), 1);
+    }
+
+    #[test]
+    fn add_tool_behavior_ignore() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("t"));
+        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Ignore)
+            .unwrap();
+        assert_eq!(r.tools_count(), 1);
+    }
+
+    #[test]
+    fn add_tool_behavior_new_tool_ok() {
+        let mut r = Router::new();
+        r.add_tool_with_behavior(NamedTool::new("t"), crate::DuplicateBehavior::Error)
+            .unwrap();
+        assert_eq!(r.tools_count(), 1);
+    }
+
+    // ── add_resource / get_resource ────────────────────────────────────
+
+    #[test]
+    fn add_and_get_resource() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a.txt"));
+        assert_eq!(r.resources_count(), 1);
+        assert!(r.get_resource("file:///a.txt").is_some());
+        assert!(r.get_resource("file:///b.txt").is_none());
+    }
+
+    #[test]
+    fn resources_returns_definitions_in_order() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///b"));
+        r.add_resource(NamedResource::new("file:///a"));
+        let uris: Vec<_> = r.resources().iter().map(|res| res.uri.clone()).collect();
+        assert_eq!(uris, vec!["file:///b", "file:///a"]);
+    }
+
+    // ── add_resource_with_behavior ─────────────────────────────────────
+
+    #[test]
+    fn add_resource_behavior_error_on_duplicate() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        let err = r
+            .add_resource_with_behavior(
+                NamedResource::new("file:///a"),
+                crate::DuplicateBehavior::Error,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("already exists"));
+    }
+
+    #[test]
+    fn add_resource_behavior_ignore() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource_with_behavior(
+            NamedResource::new("file:///a"),
+            crate::DuplicateBehavior::Ignore,
+        )
+        .unwrap();
+        assert_eq!(r.resources_count(), 1);
+    }
+
+    // ── add_prompt / get_prompt ────────────────────────────────────────
+
+    #[test]
+    fn add_and_get_prompt() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("greet"));
+        assert_eq!(r.prompts_count(), 1);
+        assert!(r.get_prompt("greet").is_some());
+        assert!(r.get_prompt("other").is_none());
+    }
+
+    #[test]
+    fn prompts_returns_definitions_in_order() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("z"));
+        r.add_prompt(NamedPrompt::new("a"));
+        let names: Vec<_> = r.prompts().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["z", "a"]);
+    }
+
+    // ── add_prompt_with_behavior ───────────────────────────────────────
+
+    #[test]
+    fn add_prompt_behavior_error_on_duplicate() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        let err = r
+            .add_prompt_with_behavior(NamedPrompt::new("p"), crate::DuplicateBehavior::Error)
+            .unwrap_err();
+        assert!(err.message.contains("already exists"));
+    }
+
+    #[test]
+    fn add_prompt_behavior_warn_keeps_original() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("p"));
+        r.add_prompt_with_behavior(NamedPrompt::new("p"), crate::DuplicateBehavior::Warn)
+            .unwrap();
+        assert_eq!(r.prompts_count(), 1);
+    }
+
+    // ── add_resource_template ──────────────────────────────────────────
+
+    #[test]
+    fn add_resource_template_and_list() {
+        let mut r = Router::new();
+        let tmpl = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        r.add_resource_template(tmpl);
+        assert_eq!(r.resource_templates_count(), 1);
+        assert!(r.get_resource_template("db://{table}").is_some());
+        assert!(r.get_resource_template("db://{other}").is_none());
+    }
+
+    #[test]
+    fn add_resource_template_replaces_existing() {
+        let mut r = Router::new();
+        let tmpl1 = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db1".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let tmpl2 = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db2".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        r.add_resource_template(tmpl1);
+        r.add_resource_template(tmpl2);
+        assert_eq!(r.resource_templates_count(), 1);
+        let tmpl = r.get_resource_template("db://{table}").unwrap();
+        assert_eq!(tmpl.name, "db2");
+    }
+
+    // ── resource_exists / resolve_resource ──────────────────────────────
+
+    #[test]
+    fn resource_exists_for_static_resource() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a.txt"));
+        assert!(r.resource_exists("file:///a.txt"));
+        assert!(!r.resource_exists("file:///b.txt"));
+    }
+
+    // ── strict_input_validation ────────────────────────────────────────
+
+    #[test]
+    fn strict_input_validation_default_off() {
+        let r = Router::new();
+        assert!(!r.strict_input_validation());
+    }
+
+    #[test]
+    fn set_strict_input_validation() {
+        let mut r = Router::new();
+        r.set_strict_input_validation(true);
+        assert!(r.strict_input_validation());
+        r.set_strict_input_validation(false);
+        assert!(!r.strict_input_validation());
+    }
+
+    // ── set_list_page_size ─────────────────────────────────────────────
+
+    #[test]
+    fn set_list_page_size_zero_treated_as_none() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(0));
+        // Zero page size is filtered to None
+        assert!(r.list_page_size.is_none());
+    }
+
+    #[test]
+    fn set_list_page_size_positive() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(10));
+        assert_eq!(r.list_page_size, Some(10));
+    }
+
+    #[test]
+    fn set_list_page_size_none() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(10));
+        r.set_list_page_size(None);
+        assert!(r.list_page_size.is_none());
+    }
+
+    // ── tools_filtered ─────────────────────────────────────────────────
+
+    #[test]
+    fn tools_filtered_no_filters_returns_all() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let tools = r.tools_filtered(None, None);
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn tools_filtered_by_session_state_disables() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_tools", &disabled);
+        let tools = r.tools_filtered(Some(&state), None);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "b");
+    }
+
+    #[test]
+    fn tools_filtered_by_tags() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
+        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]));
+        let include = vec!["db".to_string()];
+        let filters = TagFilters::new(Some(&include), None);
+        let tools = r.tools_filtered(None, Some(&filters));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "a");
+    }
+
+    // ── resources_filtered ─────────────────────────────────────────────
+
+    #[test]
+    fn resources_filtered_by_session_state() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource(NamedResource::new("file:///b"));
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["file:///a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_resources", &disabled);
+        let res = r.resources_filtered(Some(&state), None);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].uri, "file:///b");
+    }
+
+    // ── prompts_filtered ───────────────────────────────────────────────
+
+    #[test]
+    fn prompts_filtered_by_session_state() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("a"));
+        r.add_prompt(NamedPrompt::new("b"));
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_prompts", &disabled);
+        let prompts = r.prompts_filtered(Some(&state), None);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "b");
+    }
+
+    #[test]
+    fn prompts_filtered_by_tags() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::with_tags("a", vec!["internal".to_string()]));
+        r.add_prompt(NamedPrompt::with_tags("b", vec!["public".to_string()]));
+        let exclude = vec!["internal".to_string()];
+        let filters = TagFilters::new(None, Some(&exclude));
+        let prompts = r.prompts_filtered(None, Some(&filters));
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "b");
+    }
+
+    // ── resource_templates_filtered ────────────────────────────────────
+
+    #[test]
+    fn resource_templates_filtered_by_session_state() {
+        let mut r = Router::new();
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec!["admin".to_string()],
+        });
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "cache://{key}".to_string(),
+            name: "cache".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let state = SessionState::new();
+        let disabled: std::collections::HashSet<String> =
+            ["db://{table}".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_resources", &disabled);
+        let tmpls = r.resource_templates_filtered(Some(&state), None);
+        assert_eq!(tmpls.len(), 1);
+        assert_eq!(tmpls[0].name, "cache");
+    }
+
+    // ── apply_prefix / validate_prefix ─────────────────────────────────
+
+    #[test]
+    fn apply_prefix_with_prefix() {
+        assert_eq!(Router::apply_prefix("tool", Some("ns")), "ns/tool");
+    }
+
+    #[test]
+    fn apply_prefix_no_prefix() {
+        assert_eq!(Router::apply_prefix("tool", None), "tool");
+    }
+
+    #[test]
+    fn apply_prefix_empty_prefix() {
+        assert_eq!(Router::apply_prefix("tool", Some("")), "tool");
+    }
+
+    #[test]
+    fn validate_prefix_valid() {
+        assert!(Router::validate_prefix("my-prefix_1").is_ok());
+    }
+
+    #[test]
+    fn validate_prefix_empty_is_ok() {
+        assert!(Router::validate_prefix("").is_ok());
+    }
+
+    #[test]
+    fn validate_prefix_rejects_slashes() {
+        let err = Router::validate_prefix("a/b").unwrap_err();
+        assert!(err.contains("slashes"));
+    }
+
+    #[test]
+    fn validate_prefix_rejects_special_chars() {
+        let err = Router::validate_prefix("a@b").unwrap_err();
+        assert!(err.contains("invalid character"));
+    }
+
+    // ── MountResult ────────────────────────────────────────────────────
+
+    #[test]
+    fn mount_result_default_has_no_components() {
+        let r = MountResult::default();
+        assert!(!r.has_components());
+        assert!(r.is_success());
+    }
+
+    #[test]
+    fn mount_result_with_tools_has_components() {
+        let mut r = MountResult::default();
+        r.tools = 1;
+        assert!(r.has_components());
+    }
+
+    #[test]
+    fn mount_result_debug() {
+        let r = MountResult::default();
+        let debug = format!("{:?}", r);
+        assert!(debug.contains("MountResult"));
+    }
+
+    // ── mount ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mount_tools_with_prefix() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("query"));
+        let result = main.mount(sub, Some("db"));
+        assert_eq!(result.tools, 1);
+        assert!(main.get_tool("db/query").is_some());
+        assert!(main.get_tool("query").is_none());
+    }
+
+    #[test]
+    fn mount_without_prefix() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("query"));
+        let result = main.mount(sub, None);
+        assert_eq!(result.tools, 1);
+        assert!(main.get_tool("query").is_some());
+    }
+
+    #[test]
+    fn mount_resources_with_prefix() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_resource(NamedResource::new("file:///a"));
+        let result = main.mount(sub, Some("ns"));
+        assert_eq!(result.resources, 1);
+        assert!(main.get_resource("ns/file:///a").is_some());
+    }
+
+    #[test]
+    fn mount_prompts_with_prefix() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_prompt(NamedPrompt::new("greet"));
+        let result = main.mount(sub, Some("ns"));
+        assert_eq!(result.prompts, 1);
+        assert!(main.get_prompt("ns/greet").is_some());
+    }
+
+    #[test]
+    fn mount_warns_on_conflict() {
+        let mut main = Router::new();
+        main.add_tool(NamedTool::new("t"));
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("t"));
+        let result = main.mount(sub, None);
+        assert_eq!(result.tools, 1);
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("already exists"));
+    }
+
+    #[test]
+    fn mount_warns_on_invalid_prefix() {
+        let mut main = Router::new();
+        let sub = Router::new();
+        let result = main.mount(sub, Some("bad/prefix"));
+        assert!(!result.warnings.is_empty());
+        assert!(result.warnings[0].contains("slashes"));
+    }
+
+    // ── mount_tools / mount_resources / mount_prompts ──────────────────
+
+    #[test]
+    fn mount_tools_only() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("t1"));
+        sub.add_prompt(NamedPrompt::new("p1"));
+        let result = main.mount_tools(sub, Some("ns"));
+        assert_eq!(result.tools, 1);
+        assert!(main.get_tool("ns/t1").is_some());
+        assert_eq!(main.prompts_count(), 0); // prompts not mounted
+    }
+
+    #[test]
+    fn mount_prompts_only() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("t1"));
+        sub.add_prompt(NamedPrompt::new("p1"));
+        let result = main.mount_prompts(sub, Some("ns"));
+        assert_eq!(result.prompts, 1);
+        assert!(main.get_prompt("ns/p1").is_some());
+        assert_eq!(main.tools_count(), 0); // tools not mounted
+    }
+
+    // ── handle_tools_list pagination ───────────────────────────────────
+
+    #[test]
+    fn handle_tools_list_no_pagination() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 2);
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn handle_tools_list_with_pagination() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_tool(NamedTool::new("a"));
+        r.add_tool(NamedTool::new("b"));
+        let cx = Cx::for_testing();
+
+        // First page
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "a");
+        assert!(result.next_cursor.is_some());
+
+        // Second page
+        let params = ListToolsParams {
+            cursor: result.next_cursor,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "b");
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn handle_tools_list_with_tag_filter() {
+        let mut r = Router::new();
+        r.add_tool(NamedTool::with_tags("a", vec!["db".to_string()]));
+        r.add_tool(NamedTool::with_tags("b", vec!["web".to_string()]));
+        let cx = Cx::for_testing();
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["db".to_string()]),
+            exclude_tags: None,
+        };
+        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools[0].name, "a");
+    }
+
+    // ── handle_resources_list pagination ───────────────────────────────
+
+    #[test]
+    fn handle_resources_list_no_pagination() {
+        let mut r = Router::new();
+        r.add_resource(NamedResource::new("file:///a"));
+        let cx = Cx::for_testing();
+        let params = ListResourcesParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn handle_resources_list_with_pagination() {
+        let mut r = Router::new();
+        r.set_list_page_size(Some(1));
+        r.add_resource(NamedResource::new("file:///a"));
+        r.add_resource(NamedResource::new("file:///b"));
+        let cx = Cx::for_testing();
+        let params = ListResourcesParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert!(result.next_cursor.is_some());
+    }
+
+    // ── handle_prompts_list pagination ─────────────────────────────────
+
+    #[test]
+    fn handle_prompts_list_no_pagination() {
+        let mut r = Router::new();
+        r.add_prompt(NamedPrompt::new("greet"));
+        let cx = Cx::for_testing();
+        let params = ListPromptsParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── handle_resource_templates_list ──────────────────────────────────
+
+    #[test]
+    fn handle_resource_templates_list_no_pagination() {
+        let mut r = Router::new();
+        r.add_resource_template(ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "db".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        });
+        let cx = Cx::for_testing();
+        let params = ListResourceTemplatesParams {
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        };
+        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        assert_eq!(result.resource_templates.len(), 1);
+        assert!(result.next_cursor.is_none());
+    }
+
+    // ── handle_initialize ──────────────────────────────────────────────
+
+    #[test]
+    fn handle_initialize_returns_protocol_version() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let mut session = Session::new(
+            fastmcp_protocol::ServerInfo {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+            },
+            fastmcp_protocol::ServerCapabilities::default(),
+        );
+        let params = InitializeParams {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: fastmcp_protocol::ClientCapabilities::default(),
+            client_info: fastmcp_protocol::ClientInfo {
+                name: "test-client".to_string(),
+                version: "1.0".to_string(),
+            },
+        };
+        let result = r
+            .handle_initialize(&cx, &mut session, params, Some("test instructions"))
+            .unwrap();
+        assert_eq!(result.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(result.server_info.name, "test");
+        assert_eq!(result.instructions.as_deref(), Some("test instructions"));
+    }
+
+    #[test]
+    fn handle_initialize_no_instructions() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let mut session = Session::new(
+            fastmcp_protocol::ServerInfo {
+                name: "srv".to_string(),
+                version: "0.1".to_string(),
+            },
+            fastmcp_protocol::ServerCapabilities::default(),
+        );
+        let params = InitializeParams {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: fastmcp_protocol::ClientCapabilities::default(),
+            client_info: fastmcp_protocol::ClientInfo {
+                name: "c".to_string(),
+                version: "0.1".to_string(),
+            },
+        };
+        let result = r
+            .handle_initialize(&cx, &mut session, params, None)
+            .unwrap();
+        assert!(result.instructions.is_none());
+    }
+
+    // ── handle_tasks_list/get/cancel/submit without manager ────────────
+
+    #[test]
+    fn handle_tasks_list_no_manager_errors() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let params = ListTasksParams {
+            cursor: None,
+            status: None,
+            limit: None,
+        };
+        let err = r.handle_tasks_list(&cx, params, None).unwrap_err();
+        assert!(err.message.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_tasks_get_no_manager_errors() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let params = GetTaskParams {
+            id: fastmcp_protocol::TaskId("test-id".to_string()),
+        };
+        let err = r.handle_tasks_get(&cx, params, None).unwrap_err();
+        assert!(err.message.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_tasks_cancel_no_manager_errors() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let params = CancelTaskParams {
+            id: fastmcp_protocol::TaskId("test-id".to_string()),
+            reason: None,
+        };
+        let err = r.handle_tasks_cancel(&cx, params, None).unwrap_err();
+        assert!(err.message.contains("not enabled"));
+    }
+
+    #[test]
+    fn handle_tasks_submit_no_manager_errors() {
+        let r = Router::new();
+        let cx = Cx::for_testing();
+        let params = SubmitTaskParams {
+            task_type: "test".to_string(),
+            params: None,
+        };
+        let err = r.handle_tasks_submit(&cx, params, None).unwrap_err();
+        assert!(err.message.contains("not enabled"));
+    }
 }
