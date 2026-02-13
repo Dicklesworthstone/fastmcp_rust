@@ -14,237 +14,91 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::thread::JoinHandle;
 
-use fastmcp_protocol::{Prompt, PromptArgument, Tool, ToolAnnotations};
+use fastmcp_protocol::Tool;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    McpContext, McpResult, PromptHandler, PromptMessage, Resource, ResourceContent,
-    ResourceHandler, ResourceTemplate, Role, Server, ToolHandler,
+    McpContext, McpResult, PromptMessage, Resource, ResourceContent, ResourceHandler,
+    ResourceTemplate, Role, Server, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 
 // ============================================================================
-// Shared handler implementations
+// Shared handler implementations (macro-based)
 // ============================================================================
 
-struct EchoToolHandler;
-
-impl ToolHandler for EchoToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "echo".to_string(),
-            description: Some("Echoes back the input".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" }
-                },
-                "required": ["message"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec![],
-            annotations: Some(ToolAnnotations::new().read_only(true).idempotent(true)),
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let message = arguments
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Ok(vec![Content::Text {
-            text: message.to_string(),
-        }])
-    }
+/// Echoes back the input.
+#[tool(name = "echo", version = "1.0.0", annotations(read_only, idempotent))]
+fn echo_tool(_ctx: &McpContext, message: String) -> String {
+    message
 }
 
-struct CounterToolHandler;
-
-impl ToolHandler for CounterToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "counter".to_string(),
-            description: Some(
-                "Returns the call count (not truly stateful, returns arg)".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "value": { "type": "integer" }
-                },
-                "required": ["value"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
-    }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let value = arguments.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(vec![Content::Text {
-            text: value.to_string(),
-        }])
-    }
+/// Returns the call count (not truly stateful, returns arg).
+#[tool(name = "counter")]
+fn counter_tool(_ctx: &McpContext, value: i64) -> String {
+    value.to_string()
 }
 
-struct FailOnDemandToolHandler;
-
-impl ToolHandler for FailOnDemandToolHandler {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "fail_on_demand".to_string(),
-            description: Some("Fails if 'fail' argument is true".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "fail": { "type": "boolean" },
-                    "message": { "type": "string" }
-                },
-                "required": ["fail"]
-            }),
-            output_schema: None,
-            icon: None,
-            version: None,
-            tags: vec![],
-            annotations: None,
-        }
+/// Fails if 'fail' argument is true.
+#[tool(name = "fail_on_demand")]
+fn fail_on_demand_tool(
+    _ctx: &McpContext,
+    fail: bool,
+    message: Option<String>,
+) -> McpResult<String> {
+    if fail {
+        let msg = message.as_deref().unwrap_or("Requested failure");
+        return Err(McpError::tool_error(msg));
     }
-
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        let should_fail = arguments
-            .get("fail")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if should_fail {
-            let msg = arguments
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Requested failure");
-            return Err(McpError::tool_error(msg));
-        }
-        Ok(vec![Content::Text {
-            text: "Success".to_string(),
-        }])
-    }
+    Ok("Success".to_string())
 }
 
-struct StatusResourceHandler;
-
-impl ResourceHandler for StatusResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "app://status".to_string(),
-            name: "Server Status".to_string(),
-            description: Some("Current server status".to_string()),
-            mime_type: Some("application/json".to_string()),
-            icon: None,
-            version: None,
-            tags: vec!["status".to_string()],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let status = json!({
-            "status": "healthy",
-            "uptime_seconds": 42
-        });
-        Ok(vec![ResourceContent {
-            uri: "app://status".to_string(),
-            mime_type: Some("application/json".to_string()),
-            text: Some(status.to_string()),
-            blob: None,
-        }])
-    }
+/// Current server status.
+#[resource(
+    uri = "app://status",
+    name = "Server Status",
+    mime_type = "application/json",
+    tags = ["status"]
+)]
+fn status(_ctx: &McpContext) -> String {
+    json!({
+        "status": "healthy",
+        "uptime_seconds": 42
+    })
+    .to_string()
 }
 
-struct ReadmeResourceHandler;
-
-impl ResourceHandler for ReadmeResourceHandler {
-    fn definition(&self) -> Resource {
-        Resource {
-            uri: "file:///README.md".to_string(),
-            name: "README".to_string(),
-            description: Some("Project README file".to_string()),
-            mime_type: Some("text/markdown".to_string()),
-            icon: None,
-            version: Some("1.0.0".to_string()),
-            tags: vec!["docs".to_string()],
-        }
-    }
-
-    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent {
-            uri: "file:///README.md".to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            text: Some("# Test Project\n\nThis is a test project.".to_string()),
-            blob: None,
-        }])
-    }
+/// Project README file.
+#[resource(
+    uri = "file:///README.md",
+    name = "README",
+    mime_type = "text/markdown",
+    version = "1.0.0",
+    tags = ["docs"]
+)]
+fn readme() -> String {
+    "# Test Project\n\nThis is a test project.".to_string()
 }
 
-struct HelpPromptHandler;
-
-impl PromptHandler for HelpPromptHandler {
-    fn definition(&self) -> Prompt {
-        Prompt {
-            name: "help".to_string(),
-            description: Some("Get help on a topic".to_string()),
-            arguments: vec![PromptArgument {
-                name: "topic".to_string(),
-                description: Some("The topic to get help on".to_string()),
-                required: true,
-            }],
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn get(
-        &self,
-        _ctx: &McpContext,
-        arguments: HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
-        let topic = arguments.get("topic").map_or("general", String::as_str);
-        Ok(vec![PromptMessage {
-            role: Role::User,
-            content: Content::Text {
-                text: format!("Help me understand: {topic}"),
-            },
-        }])
-    }
+/// Get help on a topic.
+#[prompt(name = "help")]
+fn help_prompt(_ctx: &McpContext, topic: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("Help me understand: {topic}"),
+        },
+    }]
 }
 
-struct NoArgsPromptHandler;
-
-impl PromptHandler for NoArgsPromptHandler {
-    fn definition(&self) -> Prompt {
-        Prompt {
-            name: "system_prompt".to_string(),
-            description: Some("Default system prompt".to_string()),
-            arguments: vec![],
-            icon: None,
-            version: None,
-            tags: vec![],
-        }
-    }
-
-    fn get(
-        &self,
-        _ctx: &McpContext,
-        _arguments: HashMap<String, String>,
-    ) -> McpResult<Vec<PromptMessage>> {
-        Ok(vec![PromptMessage {
-            role: Role::Assistant,
-            content: Content::Text {
-                text: "You are a helpful assistant.".to_string(),
-            },
-        }])
-    }
+/// Default system prompt.
+#[prompt(name = "system_prompt")]
+fn system_prompt_handler() -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::Assistant,
+        content: Content::Text {
+            text: "You are a helpful assistant.".to_string(),
+        },
+    }]
 }
 
 // ============================================================================
@@ -316,11 +170,11 @@ fn setup_workflow_server() -> TestHarness {
         .build_server_builder();
 
     let server = builder
-        .tool(EchoToolHandler)
-        .tool(CounterToolHandler)
-        .tool(FailOnDemandToolHandler)
-        .resource(StatusResourceHandler)
-        .resource(ReadmeResourceHandler)
+        .tool(EchoTool)
+        .tool(CounterTool)
+        .tool(FailOnDemandTool)
+        .resource(StatusResource)
+        .resource(ReadmeResource)
         .resource_template(ResourceTemplate {
             uri_template: "file:///{path}".to_string(),
             name: "File Path".to_string(),
@@ -330,8 +184,8 @@ fn setup_workflow_server() -> TestHarness {
             version: None,
             tags: vec![],
         })
-        .prompt(HelpPromptHandler)
-        .prompt(NoArgsPromptHandler)
+        .prompt(HelpPromptPrompt)
+        .prompt(SystemPromptHandlerPrompt)
         .build();
 
     let handle = spawn_thread(move || {
@@ -582,7 +436,7 @@ fn workflow_two_independent_servers() {
     let (builder_a, client_a_transport, server_a_transport) = TestServer::builder()
         .with_name("server-a")
         .build_server_builder();
-    let server_a = builder_a.tool(EchoToolHandler).build();
+    let server_a = builder_a.tool(EchoTool).build();
     let handle_a = spawn_thread(move || {
         server_a.run_transport_returning(server_a_transport);
     });
@@ -591,7 +445,7 @@ fn workflow_two_independent_servers() {
     let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
         .with_name("server-b")
         .build_server_builder();
-    let server_b = builder_b.resource(StatusResourceHandler).build();
+    let server_b = builder_b.resource(StatusResource).build();
     let handle_b = spawn_thread(move || {
         server_b.run_transport_returning(server_b_transport);
     });
@@ -732,7 +586,7 @@ fn workflow_server_name_and_version() {
         .with_version("9.8.7")
         .build_server_builder();
 
-    let server = builder.tool(EchoToolHandler).build();
+    let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
         server.run_transport_returning(server_transport);
     });
@@ -750,10 +604,7 @@ fn workflow_capabilities_match_handlers() {
     let (builder, client_transport, server_transport) =
         TestServer::builder().build_server_builder();
 
-    let server = builder
-        .tool(EchoToolHandler)
-        .resource(StatusResourceHandler)
-        .build();
+    let server = builder.tool(EchoTool).resource(StatusResource).build();
     let handle = spawn_thread(move || {
         server.run_transport_returning(server_transport);
     });
@@ -777,7 +628,7 @@ fn workflow_custom_client_info_accepted() {
     let (builder, client_transport, server_transport) =
         TestServer::builder().build_server_builder();
 
-    let server = builder.tool(EchoToolHandler).build();
+    let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
         server.run_transport_returning(server_transport);
     });
@@ -907,7 +758,7 @@ fn setup_task_server() -> TestHarness {
     });
 
     let server = builder
-        .tool(EchoToolHandler)
+        .tool(EchoTool)
         .with_task_manager(task_manager.into_shared())
         .build();
 
@@ -1615,7 +1466,7 @@ fn workflow_concurrent_clients_isolation() {
         let (client_transport, server_transport) = create_memory_transport_pair();
 
         let server = Server::new("concurrent-server", "1.0.0")
-            .tool(EchoToolHandler)
+            .tool(EchoTool)
             .tool(SessionStoreHandler)
             .tool(SessionGetHandler)
             .build();
@@ -1697,7 +1548,7 @@ fn workflow_concurrent_interleaved_operations() {
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("interleaved-server", "1.0.0")
-                .tool(EchoToolHandler)
+                .tool(EchoTool)
                 .build();
 
             let server_handle = spawn_thread(move || {
@@ -1914,7 +1765,7 @@ fn workflow_concurrent_stress_test() {
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("stress-server", "1.0.0")
-                .tool(EchoToolHandler)
+                .tool(EchoTool)
                 .tool(SessionStoreHandler)
                 .tool(SessionGetHandler)
                 .build();
@@ -2004,9 +1855,7 @@ fn session_capabilities_reflect_server_handlers() {
 
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
-    let server = Server::new("tools-only", "1.0.0")
-        .tool(EchoToolHandler)
-        .build();
+    let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
     thread::spawn(move || server.run_transport(server_transport));
 
     let mut client = TestClient::new(client_transport);
@@ -2020,7 +1869,7 @@ fn session_capabilities_reflect_server_handlers() {
     // Server with only resources
     let (client_transport2, server_transport2) = create_memory_transport_pair();
     let server2 = Server::new("resources-only", "1.0.0")
-        .resource(StatusResourceHandler)
+        .resource(StatusResource)
         .build();
     thread::spawn(move || server2.run_transport(server_transport2));
 
@@ -2035,7 +1884,7 @@ fn session_capabilities_reflect_server_handlers() {
     // Server with only prompts
     let (client_transport3, server_transport3) = create_memory_transport_pair();
     let server3 = Server::new("prompts-only", "1.0.0")
-        .prompt(HelpPromptHandler)
+        .prompt(HelpPromptPrompt)
         .build();
     thread::spawn(move || server3.run_transport(server_transport3));
 
@@ -2067,9 +1916,7 @@ fn session_operations_fail_before_init() {
     use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
-    let server = Server::new("test-server", "1.0.0")
-        .tool(EchoToolHandler)
-        .build();
+    let server = Server::new("test-server", "1.0.0").tool(EchoTool).build();
     thread::spawn(move || server.run_transport(server_transport));
 
     let mut client = TestClient::new(client_transport);
@@ -2092,9 +1939,7 @@ fn session_close_graceful() {
     use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
-    let server = Server::new("close-test", "1.0.0")
-        .tool(EchoToolHandler)
-        .build();
+    let server = Server::new("close-test", "1.0.0").tool(EchoTool).build();
     thread::spawn(move || server.run_transport(server_transport));
 
     let mut client = TestClient::new(client_transport);
@@ -2210,7 +2055,7 @@ fn session_tracks_client_info() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("client-info-test", "1.0.0")
-        .tool(EchoToolHandler)
+        .tool(EchoTool)
         .build();
     thread::spawn(move || server.run_transport(server_transport));
 
@@ -2241,7 +2086,7 @@ fn session_multiple_clients_independent_lifecycle() {
     for i in 0..3 {
         let (client_transport, server_transport) = create_memory_transport_pair();
         let server = Server::new(&format!("lifecycle-server-{}", i), "1.0.0")
-            .tool(EchoToolHandler)
+            .tool(EchoTool)
             .build();
         let handle = spawn_thread(move || {
             server.run_transport_returning(server_transport);
@@ -2290,7 +2135,7 @@ fn session_state_persists_across_operations() {
     let server = Server::new("persistence-test", "1.0.0")
         .tool(SessionStoreHandler)
         .tool(SessionGetHandler)
-        .tool(EchoToolHandler)
+        .tool(EchoTool)
         .build();
     let handle = spawn_thread(move || {
         server.run_transport_returning(server_transport);
@@ -2531,11 +2376,11 @@ fn setup_tool_test_server() -> TestHarness {
         .build_server_builder();
 
     let server = builder
-        .tool(EchoToolHandler)
+        .tool(EchoTool)
         .tool(TypesToolHandler)
         .tool(RequiredArgsToolHandler)
         .tool(MultiContentToolHandler)
-        .tool(FailOnDemandToolHandler)
+        .tool(FailOnDemandTool)
         .build();
 
     let handle = spawn_thread(move || {
