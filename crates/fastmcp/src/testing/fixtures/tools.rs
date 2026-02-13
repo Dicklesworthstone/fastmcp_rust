@@ -573,4 +573,102 @@ mod tests {
         assert_eq!(annotations.read_only, Some(true));
         assert_eq!(annotations.idempotent, Some(true));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-3w50)
+    // =========================================================================
+
+    #[test]
+    fn error_tool_fields() {
+        let tool = error_tool();
+        assert_eq!(tool.name, "error_simulator");
+        assert!(tool.description.is_some());
+        assert_eq!(tool.version, Some("1.0.0".to_string()));
+        assert!(tool.tags.contains(&"error".to_string()));
+        assert!(tool.annotations.is_none());
+
+        let props = tool.input_schema.get("properties").unwrap();
+        assert!(props.get("error_type").is_some());
+        assert!(props.get("message").is_some());
+    }
+
+    #[test]
+    fn complex_schema_tool_fields() {
+        let tool = complex_schema_tool();
+        assert_eq!(tool.name, "complex_operation");
+        assert_eq!(tool.version, Some("2.0.0".to_string()));
+        assert!(tool.output_schema.is_none());
+        assert!(tool.annotations.is_none());
+        assert!(tool.tags.contains(&"nested".to_string()));
+
+        let props = tool.input_schema.get("properties").unwrap();
+        assert!(props.get("config").is_some());
+        assert!(props.get("items").is_some());
+    }
+
+    #[test]
+    fn greeting_tool_annotations_read_only() {
+        let tool = greeting_tool();
+        let annotations = tool.annotations.as_ref().unwrap();
+        assert_eq!(annotations.read_only, Some(true));
+        assert!(tool.tags.contains(&"greeting".to_string()));
+        assert_eq!(tool.version, Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn calculator_tool_annotations_idempotent() {
+        let tool = calculator_tool();
+        let annotations = tool.annotations.as_ref().unwrap();
+        assert_eq!(annotations.read_only, Some(true));
+        assert_eq!(annotations.idempotent, Some(true));
+        assert!(tool.tags.contains(&"math".to_string()));
+    }
+
+    #[test]
+    fn tool_builder_version_tags_output_schema() {
+        let tool = ToolBuilder::new("full")
+            .version("3.0.0")
+            .tags(vec!["a".to_string(), "b".to_string()])
+            .output_schema(json!({"type": "string"}))
+            .build();
+
+        assert_eq!(tool.version, Some("3.0.0".to_string()));
+        assert_eq!(tool.tags.len(), 2);
+        assert!(tool.output_schema.is_some());
+    }
+
+    #[test]
+    fn tool_builder_debug_and_clone() {
+        let builder = ToolBuilder::new("dbg")
+            .description("test")
+            .with_string_param("x", "desc", true);
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("ToolBuilder"));
+        assert!(debug.contains("dbg"));
+
+        let cloned = builder.clone();
+        let tool = cloned.build();
+        assert_eq!(tool.name, "dbg");
+    }
+
+    #[test]
+    fn tool_builder_required_params_tracked() {
+        let tool = ToolBuilder::new("req")
+            .with_string_param("a", "desc-a", true)
+            .with_number_param("b", "desc-b", false)
+            .with_bool_param("c", "desc-c", true)
+            .build();
+
+        let required = tool.input_schema.get("required").unwrap();
+        let required_arr = required.as_array().unwrap();
+        assert_eq!(required_arr.len(), 2);
+        assert!(required_arr.contains(&json!("a")));
+        assert!(required_arr.contains(&json!("c")));
+    }
+
+    #[test]
+    fn all_sample_tools_count() {
+        let tools = all_sample_tools();
+        assert_eq!(tools.len(), 7);
+    }
 }
