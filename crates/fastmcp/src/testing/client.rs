@@ -536,4 +536,84 @@ mod tests {
         let result = client.list_tools();
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-8zle)
+    // =========================================================================
+
+    #[test]
+    fn with_cx_sets_custom_cx() {
+        let (ct, _st) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+        let client = TestClient::with_cx(ct, cx);
+        assert!(!client.is_initialized());
+    }
+
+    #[test]
+    fn with_capabilities_sets_capabilities() {
+        let (ct, _st) = create_memory_transport_pair();
+        let caps = ClientCapabilities {
+            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            ..Default::default()
+        };
+        let client = TestClient::new(ct).with_capabilities(caps);
+        assert!(client.capabilities.sampling.is_some());
+    }
+
+    #[test]
+    fn pre_init_getters_return_none() {
+        let (ct, _st) = create_memory_transport_pair();
+        let client = TestClient::new(ct);
+        assert!(client.server_info().is_none());
+        assert!(client.server_capabilities().is_none());
+        assert!(client.protocol_version().is_none());
+    }
+
+    #[test]
+    fn debug_output_includes_key_fields() {
+        let (ct, _st) = create_memory_transport_pair();
+        let client = TestClient::new(ct);
+        let debug = format!("{client:?}");
+        assert!(debug.contains("TestClient"));
+        assert!(debug.contains("test-client"));
+        assert!(debug.contains("initialized"));
+    }
+
+    #[test]
+    fn transport_accessors() {
+        let (ct, _st) = create_memory_transport_pair();
+        let mut client = TestClient::new(ct);
+        // Immutable accessor
+        let _ = client.transport();
+        // Mutable accessor
+        let _ = client.transport_mut();
+    }
+
+    #[test]
+    fn close_does_not_panic() {
+        let (ct, _st) = create_memory_transport_pair();
+        let mut client = TestClient::new(ct);
+        client.close();
+    }
+
+    #[test]
+    fn request_id_auto_increments() {
+        let (ct, _st) = create_memory_transport_pair();
+        let client = TestClient::new(ct);
+        let id1 = client.next_request_id();
+        let id2 = client.next_request_id();
+        let id3 = client.next_request_id();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn ensure_initialized_error_message() {
+        let (ct, _st) = create_memory_transport_pair();
+        let mut client = TestClient::new(ct);
+        let err = client.list_tools().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not initialized"), "error was: {msg}");
+    }
 }
