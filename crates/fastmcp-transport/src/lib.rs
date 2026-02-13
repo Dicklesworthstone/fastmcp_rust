@@ -616,4 +616,157 @@ mod tests {
             _ => Err(test_error("reserve_send should return cancelled")),
         }
     }
+
+    #[test]
+    fn recording_transport_close() {
+        let mut transport = RecordingTransport::default();
+        assert!(!transport.closed);
+        transport.close().unwrap();
+        assert!(transport.closed);
+    }
+
+    #[test]
+    fn recording_transport_recv_returns_closed() {
+        let mut transport = RecordingTransport::default();
+        let cx = Cx::for_testing();
+        let result = transport.recv(&cx);
+        assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn transport_error_display_all_variants() {
+        assert_eq!(TransportError::Closed.to_string(), "Transport closed");
+        assert_eq!(TransportError::Timeout.to_string(), "Connection timeout");
+        assert_eq!(TransportError::Cancelled.to_string(), "Request cancelled");
+    }
+
+    #[test]
+    fn transport_error_is_cancelled_false_for_other_variants() {
+        assert!(!TransportError::Closed.is_cancelled());
+        assert!(!TransportError::Io(std::io::Error::other("err")).is_cancelled());
+        assert!(!TransportError::Codec(CodecError::MessageTooLarge(1)).is_cancelled());
+    }
+
+    #[test]
+    fn transport_error_is_closed_false_for_other_variants() {
+        assert!(!TransportError::Cancelled.is_closed());
+        assert!(!TransportError::Timeout.is_closed());
+        assert!(!TransportError::Io(std::io::Error::other("err")).is_closed());
+        assert!(!TransportError::Codec(CodecError::MessageTooLarge(1)).is_closed());
+    }
+
+    #[test]
+    fn send_permit_sends_request_as_message() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let request = JsonRpcRequest::new("tools/call", None, 1i64);
+
+        let permit = fixture.reserve_send(&cx)?;
+        permit.send(&JsonRpcMessage::Request(request))?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        match &messages[0] {
+            JsonRpcMessage::Request(req) => {
+                require(req.method == "tools/call", "method mismatch")?;
+            }
+            _ => return Err(test_error("expected request")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_permit_sends_response_as_message() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let response =
+            JsonRpcResponse::success(RequestId::Number(5), serde_json::json!({"ok": true}));
+
+        let permit = fixture.reserve_send(&cx)?;
+        permit.send(&JsonRpcMessage::Response(response))?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        assert!(matches!(&messages[0], JsonRpcMessage::Response(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn send_multiple_messages_via_transport() {
+        let mut transport = RecordingTransport::default();
+        let cx = Cx::for_testing();
+
+        for i in 0..5 {
+            let request = JsonRpcRequest::new(format!("method/{i}"), None, i as i64);
+            transport.send_request(&cx, &request).unwrap();
+        }
+
+        assert_eq!(transport.sent.len(), 5);
+        for (i, msg) in transport.sent.iter().enumerate() {
+            if let JsonRpcMessage::Request(req) = msg {
+                assert_eq!(req.method, format!("method/{i}"));
+            } else {
+                panic!("expected request at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_phase_fixture_send_via_transport_trait() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let request = JsonRpcRequest::new("test/method", None, 42i64);
+
+        // Use the Transport::send method which delegates to reserve_send
+        fixture.send(&cx, &JsonRpcMessage::Request(request))?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        Ok(())
+    }
+
+    #[test]
+    fn two_phase_fixture_close_succeeds() {
+        let mut fixture = TwoPhaseFixture::default();
+        assert!(fixture.close().is_ok());
+    }
+
+    #[test]
+    fn two_phase_multiple_sends() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+
+        // Send multiple messages through two-phase
+        for i in 0..3 {
+            let permit = fixture.reserve_send(&cx)?;
+            let request = JsonRpcRequest::new(format!("method/{i}"), None, i as i64);
+            permit.send_request(&request)?;
+        }
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 3, "expected three decoded messages")?;
+        Ok(())
+    }
+
+    #[test]
+    fn send_permit_notification_without_id() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let notification = JsonRpcRequest::notification("notifications/progress", None);
+
+        let permit = fixture.reserve_send(&cx)?;
+        permit.send_request(&notification)?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        if let JsonRpcMessage::Request(req) = &messages[0] {
+            require(req.id.is_none(), "notification should have no id")?;
+        }
+        Ok(())
+    }
 }
