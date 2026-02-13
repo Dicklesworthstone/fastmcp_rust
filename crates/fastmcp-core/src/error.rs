@@ -653,5 +653,146 @@ mod tests {
         assert!(!McpError::invalid_params("test").is_internal());
         assert!(!McpError::resource_not_found("test").is_internal());
         assert!(!McpError::request_cancelled().is_internal());
+        assert!(!McpError::new(McpErrorCode::ResourceForbidden, "forbidden").is_internal());
+        assert!(!McpError::new(McpErrorCode::PromptNotFound, "not found").is_internal());
+    }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2qlj)
+    // =========================================================================
+
+    #[test]
+    fn from_serde_json_error() {
+        // Trigger a real serde_json::Error via invalid JSON parse
+        let serde_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{{bad json").unwrap_err();
+        let mcp_err: McpError = serde_err.into();
+        assert_eq!(mcp_err.code, McpErrorCode::ParseError);
+        assert!(!mcp_err.message.is_empty());
+    }
+
+    #[test]
+    fn map_ok_err_variant() {
+        let outcome: Outcome<i32, McpError> = Outcome::Err(McpError::internal_error("oops"));
+        let mapped = outcome.map_ok(|x| x * 2);
+        match mapped {
+            Outcome::Err(e) => assert_eq!(e.code, McpErrorCode::InternalError),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_ok_cancelled_variant() {
+        let outcome: Outcome<i32, McpError> = Outcome::Cancelled(CancelReason::user("test cancel"));
+        let mapped = outcome.map_ok(|x| x * 2);
+        assert!(matches!(mapped, Outcome::Cancelled(_)));
+    }
+
+    #[test]
+    fn map_ok_panicked_variant() {
+        let outcome: Outcome<i32, McpError> = Outcome::Panicked(PanicPayload::new("boom"));
+        let mapped = outcome.map_ok(|x| x * 2);
+        assert!(matches!(mapped, Outcome::Panicked(_)));
+    }
+
+    #[test]
+    fn result_ext_cancelled_error_ok() {
+        let result: Result<i32, crate::CancelledError> = Ok(42);
+        let outcome: Outcome<i32, McpError> = result.into_outcome();
+        assert!(matches!(outcome, Outcome::Ok(42)));
+    }
+
+    #[test]
+    fn result_ext_cancelled_error_err() {
+        let result: Result<i32, crate::CancelledError> = Err(crate::CancelledError);
+        let outcome: Outcome<i32, McpError> = result.into_outcome();
+        assert!(matches!(outcome, Outcome::Cancelled(_)));
+    }
+
+    #[test]
+    fn error_code_json_serde_roundtrip() {
+        let codes = [
+            McpErrorCode::ParseError,
+            McpErrorCode::InvalidRequest,
+            McpErrorCode::MethodNotFound,
+            McpErrorCode::InvalidParams,
+            McpErrorCode::InternalError,
+            McpErrorCode::ToolExecutionError,
+            McpErrorCode::ResourceNotFound,
+            McpErrorCode::ResourceForbidden,
+            McpErrorCode::PromptNotFound,
+            McpErrorCode::RequestCancelled,
+            McpErrorCode::Custom(-12345),
+        ];
+        for code in codes {
+            let json = serde_json::to_string(&code).unwrap();
+            let deserialized: McpErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(code, deserialized, "roundtrip failed for {code:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_error_json_deserialization() {
+        let json = r#"{"code":-32601,"message":"Method not found: test","data":{"key":"val"}}"#;
+        let err: McpError = serde_json::from_str(json).unwrap();
+        assert_eq!(err.code, McpErrorCode::MethodNotFound);
+        assert!(err.message.contains("test"));
+        assert!(err.data.is_some());
+        assert_eq!(err.data.unwrap()["key"], "val");
+    }
+
+    #[test]
+    fn mcp_error_json_deserialization_no_data() {
+        let json = r#"{"code":-32603,"message":"Internal error"}"#;
+        let err: McpError = serde_json::from_str(json).unwrap();
+        assert_eq!(err.code, McpErrorCode::InternalError);
+        assert!(err.data.is_none());
+    }
+
+    #[test]
+    fn masked_preserves_resource_forbidden() {
+        let err = McpError::new(McpErrorCode::ResourceForbidden, "access denied");
+        let masked = err.masked(true);
+        assert_eq!(masked.message, "access denied");
+        assert_eq!(masked.code, McpErrorCode::ResourceForbidden);
+    }
+
+    #[test]
+    fn masked_preserves_prompt_not_found() {
+        let err = McpError::new(McpErrorCode::PromptNotFound, "no such prompt");
+        let masked = err.masked(true);
+        assert_eq!(masked.message, "no such prompt");
+        assert_eq!(masked.code, McpErrorCode::PromptNotFound);
+    }
+
+    #[test]
+    fn mcp_error_is_std_error() {
+        let err = McpError::internal_error("test");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn mcp_error_debug_and_clone() {
+        let err = McpError::with_data(
+            McpErrorCode::ToolExecutionError,
+            "fail",
+            serde_json::json!({"x": 1}),
+        );
+        let debug = format!("{err:?}");
+        assert!(debug.contains("McpError"));
+        assert!(debug.contains("fail"));
+        let cloned = err.clone();
+        assert_eq!(cloned.code, err.code);
+        assert_eq!(cloned.message, err.message);
+        assert_eq!(cloned.data, err.data);
+    }
+
+    #[test]
+    fn error_code_debug_clone_copy() {
+        let code = McpErrorCode::ResourceForbidden;
+        let debug = format!("{code:?}");
+        assert!(debug.contains("ResourceForbidden"));
+        let cloned = code;
+        assert_eq!(code, cloned);
     }
 }

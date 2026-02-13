@@ -266,4 +266,37 @@ mod tests {
             Duration::from_secs(2 * 3600 + 30 * 60 + 15)
         );
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2qlj)
+    // =========================================================================
+
+    #[test]
+    fn saturating_add_overflow() {
+        // u64::MAX millis would overflow without saturating_add
+        let result = parse_duration(&format!("{}ms {}ms", u64::MAX, 1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Duration::from_millis(u64::MAX));
+    }
+
+    #[test]
+    fn error_fields_accessible() {
+        let err = parse_duration("42").unwrap_err();
+        assert_eq!(err.input, "42");
+        assert!(err.message.contains("missing unit"));
+    }
+
+    #[test]
+    fn only_whitespace_input() {
+        let err = parse_duration("   ").unwrap_err();
+        assert!(err.message.contains("empty string"));
+    }
+
+    #[test]
+    fn combined_with_ms() {
+        assert_eq!(
+            parse_duration("1h 30m 45s 500ms").unwrap(),
+            Duration::from_millis(1 * 3600_000 + 30 * 60_000 + 45_000 + 500)
+        );
+    }
 }
