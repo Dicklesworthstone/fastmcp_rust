@@ -438,4 +438,82 @@ mod tests {
         assert!(result.contains("only one"));
         assert_eq!(result.lines().count(), 1);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2q7c)
+    // =========================================================================
+
+    #[test]
+    fn status_text_registered_and_none() {
+        let theme = crate::theme::theme();
+        let registered = status_text(true, theme);
+        let plain_reg = registered.plain();
+        assert!(plain_reg.contains("registered"));
+
+        let none = status_text(false, theme);
+        let plain_none = none.plain();
+        assert!(plain_none.contains("none"));
+    }
+
+    #[test]
+    fn color_hex_returns_hex_string() {
+        let red = Color::from_rgb(255, 0, 0);
+        let hex = color_hex(&red);
+        assert!(hex.starts_with('#'));
+        assert_eq!(hex.len(), 7);
+    }
+
+    #[test]
+    fn capabilities_table_shows_registered_and_none() {
+        let tc = TestConsole::new();
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .resources(0)
+            .prompts(0)
+            .no_logo()
+            .render(tc.console());
+
+        assert!(tc.contains("3"));
+        assert!(tc.contains("registered"));
+        assert!(tc.contains("none"));
+    }
+
+    #[test]
+    fn logo_constants_content() {
+        // LOGO_FULL uses box-drawing characters for "FAST MCP"
+        assert!(LOGO_FULL.contains("███"));
+        assert!(LOGO_COMPACT.contains("FastMCP"));
+        assert!(LOGO_MINIMAL.contains("FastMCP"));
+    }
+
+    #[test]
+    fn gradient_text_empty_produces_empty() {
+        let start = Color::from_rgb(0, 0, 0);
+        let end = Color::from_rgb(255, 255, 255);
+        let result = gradient_text("", &start, &end);
+        // Empty string → single line with start color markup
+        assert!(result.is_empty() || result.contains('#'));
+    }
+
+    #[test]
+    fn banner_new_defaults() {
+        let b = StartupBanner::new("srv", "1.0.0");
+        assert_eq!(b.server_name, "srv");
+        assert_eq!(b.version, "1.0.0");
+        assert!(b.description.is_none());
+        assert_eq!(b.tools_count, 0);
+        assert_eq!(b.resources_count, 0);
+        assert_eq!(b.prompts_count, 0);
+        assert_eq!(b.transport, "stdio");
+        assert!(b.show_logo);
+    }
+
+    #[test]
+    fn render_logo_does_not_panic() {
+        let tc = TestConsole::new();
+        let theme = tc.console().theme();
+        render_logo(tc.console(), theme);
+        // Just verify it produced some output
+        assert!(!tc.output_string().is_empty());
+    }
 }
