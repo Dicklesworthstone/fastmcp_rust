@@ -662,4 +662,103 @@ mod tests {
         assert_eq!(explicit_human.resolve_context(), DisplayContext::Human);
         assert!(explicit_human.should_use_rich());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2ebx)
+    // =========================================================================
+
+    #[test]
+    fn banner_style_and_traffic_verbosity_defaults() {
+        assert_eq!(BannerStyle::default(), BannerStyle::Full);
+        assert_eq!(TrafficVerbosity::default(), TrafficVerbosity::None);
+    }
+
+    #[test]
+    fn console_config_debug_and_clone() {
+        let config = ConsoleConfig::new()
+            .with_log_level(log::Level::Info)
+            .with_max_table_rows(42);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("ConsoleConfig"));
+        assert!(debug.contains("42"));
+
+        let cloned = config.clone();
+        assert_eq!(cloned.max_table_rows, 42);
+        assert_eq!(cloned.log_level, Some(log::Level::Info));
+    }
+
+    #[test]
+    fn custom_colors_default_all_none() {
+        let colors = CustomColors::default();
+        assert!(colors.primary.is_none());
+        assert!(colors.secondary.is_none());
+        assert!(colors.success.is_none());
+        assert!(colors.warning.is_none());
+        assert!(colors.error.is_none());
+
+        let debug = format!("{colors:?}");
+        assert!(debug.contains("CustomColors"));
+    }
+
+    #[test]
+    fn from_lookup_banner_none_literal_and_full_explicit() {
+        let none = config_from_pairs(&[("FASTMCP_BANNER", "none")]);
+        assert_eq!(none.banner_style, BannerStyle::None);
+        assert!(!none.show_banner);
+
+        let full = config_from_pairs(&[("FASTMCP_BANNER", "full")]);
+        assert_eq!(full.banner_style, BannerStyle::Full);
+        assert!(full.show_banner);
+    }
+
+    #[test]
+    fn from_lookup_remaining_log_levels() {
+        let info = config_from_pairs(&[("FASTMCP_LOG", "info")]);
+        assert_eq!(info.log_level, Some(log::Level::Info));
+
+        let warn = config_from_pairs(&[("FASTMCP_LOG", "warn")]);
+        assert_eq!(warn.log_level, Some(log::Level::Warn));
+
+        let error = config_from_pairs(&[("FASTMCP_LOG", "error")]);
+        assert_eq!(error.log_level, Some(log::Level::Error));
+    }
+
+    #[test]
+    fn from_lookup_traffic_numeric_one() {
+        let summary = config_from_pairs(&[("FASTMCP_TRAFFIC", "1")]);
+        assert_eq!(summary.traffic_verbosity, TrafficVerbosity::Summary);
+        assert!(summary.show_request_traffic);
+    }
+
+    #[test]
+    fn with_banner_none_clears_show_banner() {
+        let config = ConsoleConfig::new().with_banner(BannerStyle::None);
+        assert!(!config.show_banner);
+        assert_eq!(config.banner_style, BannerStyle::None);
+    }
+
+    #[test]
+    fn with_traffic_none_clears_show_request_traffic() {
+        let config = ConsoleConfig::new()
+            .with_traffic(TrafficVerbosity::Full)
+            .with_traffic(TrafficVerbosity::None);
+        assert!(!config.show_request_traffic);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::None);
+    }
+
+    #[test]
+    fn default_fields_full_coverage() {
+        let config = ConsoleConfig::default();
+        assert!(config.log_targets);
+        assert!(!config.log_file_line);
+        assert!(config.show_error_codes);
+        assert!(!config.show_stats_periodic);
+        assert_eq!(config.stats_interval_secs, 60);
+        assert_eq!(config.max_json_depth, 5);
+        assert_eq!(config.truncate_at, 200);
+        assert!(config.show_suggestions);
+        assert!(config.custom_colors.is_none());
+        assert!(config.context.is_none());
+        assert!(config.force_color.is_none());
+    }
 }
