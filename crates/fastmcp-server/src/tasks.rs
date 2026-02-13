@@ -1846,4 +1846,208 @@ mod tests {
         let info = manager.get_info(&id).unwrap();
         assert_eq!(info.progress, Some(1.0));
     }
+
+    // ── cleanup_completed — edge cases ─────────────────────────────────
+
+    #[test]
+    fn cleanup_completed_keeps_terminal_without_completed_at() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+
+        // Manually remove completed_at to simulate edge case
+        {
+            let mut tasks = manager.tasks.write().unwrap();
+            tasks.get_mut(&id).unwrap().info.completed_at = None;
+        }
+
+        // Cleanup should keep the task (no completed_at → can't determine age)
+        manager.cleanup_completed(std::time::Duration::from_secs(0));
+        assert_eq!(manager.total_count(), 1);
+    }
+
+    #[test]
+    fn cleanup_completed_keeps_terminal_with_unparseable_timestamp() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+
+        // Set completed_at to unparseable value
+        {
+            let mut tasks = manager.tasks.write().unwrap();
+            tasks.get_mut(&id).unwrap().info.completed_at = Some("not-a-date".to_string());
+        }
+
+        manager.cleanup_completed(std::time::Duration::from_secs(0));
+        assert_eq!(manager.total_count(), 1);
+    }
+
+    // ── Debug with populated state ──────────────────────────────────────
+
+    #[test]
+    fn debug_output_with_tasks_and_handlers() {
+        let manager = TaskManager::new_for_testing();
+        manager.register_handler("type_a", |_cx, _params| async { Ok(serde_json::json!({})) });
+        manager.register_handler("type_b", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let cx = Cx::for_testing();
+        let _ = manager.submit(&cx, "type_a", None).unwrap();
+        let _ = manager.submit(&cx, "type_b", None).unwrap();
+
+        let debug = format!("{:?}", manager);
+        assert!(debug.contains("task_count: 2"));
+        assert!(debug.contains("handler_count: 2"));
+    }
+
+    // ── Multiple handler types ──────────────────────────────────────────
+
+    #[test]
+    fn multiple_handler_types_independent() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("analyze", |_cx, _params| async {
+            Ok(serde_json::json!({"type": "analyze"}))
+        });
+        manager.register_handler("summarize", |_cx, _params| async {
+            Ok(serde_json::json!({"type": "summarize"}))
+        });
+
+        let id_a = manager.submit(&cx, "analyze", None).unwrap();
+        let id_s = manager.submit(&cx, "summarize", None).unwrap();
+
+        let info_a = manager.get_info(&id_a).unwrap();
+        let info_s = manager.get_info(&id_s).unwrap();
+        assert_eq!(info_a.task_type, "analyze");
+        assert_eq!(info_s.task_type, "summarize");
+    }
+
+    // ── list_tasks filters for all terminal statuses ────────────────────
+
+    #[test]
+    fn list_tasks_filter_failed() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.fail_task(&id, "err");
+
+        assert_eq!(manager.list_tasks(Some(TaskStatus::Failed)).len(), 1);
+        assert_eq!(manager.list_tasks(Some(TaskStatus::Completed)).len(), 0);
+    }
+
+    #[test]
+    fn list_tasks_filter_cancelled() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.cancel(&id, None).unwrap();
+
+        assert_eq!(manager.list_tasks(Some(TaskStatus::Cancelled)).len(), 1);
+        assert_eq!(manager.list_tasks(Some(TaskStatus::Pending)).len(), 0);
+    }
+
+    // ── notification content for progress ────────────────────────────────
+
+    #[test]
+    fn progress_notification_includes_message() {
+        let manager = TaskManager::new_for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let events: Arc<std::sync::Mutex<Vec<TaskStatusNotificationParams>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender_events = Arc::clone(&events);
+        let sender: TaskNotificationSender = Arc::new(move |request| {
+            if request.method == "notifications/tasks/status" {
+                let params: TaskStatusNotificationParams = request
+                    .params
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap();
+                sender_events.lock().unwrap().push(params);
+            }
+        });
+        manager.set_notification_sender(sender);
+
+        let cx = Cx::for_testing();
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.update_progress(&id, 0.75, Some("three quarters".to_string()));
+
+        let recorded = events.lock().unwrap().clone();
+        let progress_event = recorded
+            .iter()
+            .find(|e| e.progress == Some(0.75))
+            .expect("progress notification");
+        assert_eq!(progress_event.message, Some("three quarters".to_string()));
+        assert_eq!(progress_event.status, TaskStatus::Running);
+    }
+
+    // ── TaskStatusSnapshot with result ────────────────────────────────────
+
+    #[test]
+    fn task_status_snapshot_includes_result() {
+        let task_id = TaskId::from_string("snap-result");
+        let state = TaskState {
+            info: TaskInfo {
+                id: task_id.clone(),
+                task_type: "t".to_string(),
+                status: TaskStatus::Completed,
+                progress: Some(1.0),
+                message: None,
+                created_at: "now".to_string(),
+                started_at: Some("now".to_string()),
+                completed_at: Some("now".to_string()),
+                error: None,
+            },
+            cancel_requested: false,
+            result: Some(TaskResult {
+                id: task_id,
+                success: true,
+                data: Some(serde_json::json!({"done": true})),
+                error: None,
+            }),
+            cx: Cx::for_testing(),
+        };
+        let snapshot = TaskStatusSnapshot::from(&state);
+        assert!(snapshot.result.is_some());
+        let result = snapshot.result.unwrap();
+        assert!(result.success);
+        assert_eq!(result.data, Some(serde_json::json!({"done": true})));
+    }
+
+    // ── submit error message ──────────────────────────────────────────────
+
+    #[test]
+    fn submit_unknown_task_type_error_message() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        let err = manager.submit(&cx, "nonexistent_type", None).unwrap_err();
+        assert!(err.message.contains("Unknown task type"));
+        assert!(err.message.contains("nonexistent_type"));
+    }
+
+    // ── cancel result data ───────────────────────────────────────────────
+
+    #[test]
+    fn cancel_result_has_no_data() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.cancel(&id, Some("abort".to_string())).unwrap();
+        let result = manager.get_result(&id).unwrap();
+        assert!(!result.success);
+        assert!(result.data.is_none());
+        assert_eq!(result.error, Some("abort".to_string()));
+    }
 }
