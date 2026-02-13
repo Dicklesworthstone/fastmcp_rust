@@ -696,6 +696,13 @@ struct ToolAttrs {
     defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
     output_schema: Option<syn::Expr>,
+    /// Tool version string (e.g., "1.0.0").
+    version: Option<String>,
+    /// Annotation flags: `read_only`, `idempotent`, `destructive`.
+    annotations_read_only: Option<bool>,
+    annotations_idempotent: Option<bool>,
+    annotations_destructive: Option<bool>,
+    annotations_open_world_hint: Option<String>,
 }
 
 impl Parse for ToolAttrs {
@@ -706,6 +713,11 @@ impl Parse for ToolAttrs {
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
+        let mut version = None;
+        let mut annotations_read_only = None;
+        let mut annotations_idempotent = None;
+        let mut annotations_destructive = None;
+        let mut annotations_open_world_hint = None;
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
@@ -725,6 +737,11 @@ impl Parse for ToolAttrs {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     timeout = Some(lit.value());
+                }
+                "version" => {
+                    input.parse::<Token![=]>()?;
+                    let lit: LitStr = input.parse()?;
+                    version = Some(lit.value());
                 }
                 "tags" => {
                     input.parse::<Token![=]>()?;
@@ -762,6 +779,34 @@ impl Parse for ToolAttrs {
                     let expr: syn::Expr = input.parse()?;
                     output_schema = Some(expr);
                 }
+                "annotations" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    while !content.is_empty() {
+                        let ann_ident: Ident = content.parse()?;
+                        match ann_ident.to_string().as_str() {
+                            "read_only" => annotations_read_only = Some(true),
+                            "idempotent" => annotations_idempotent = Some(true),
+                            "destructive" => annotations_destructive = Some(true),
+                            "open_world_hint" => {
+                                content.parse::<Token![=]>()?;
+                                let lit: LitStr = content.parse()?;
+                                annotations_open_world_hint = Some(lit.value());
+                            }
+                            other => {
+                                return Err(syn::Error::new(
+                                    ann_ident.span(),
+                                    format!(
+                                        "unknown annotation: {other}; expected read_only, idempotent, destructive, or open_world_hint"
+                                    ),
+                                ));
+                            }
+                        }
+                        if !content.is_empty() {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 _ => {
                     return Err(syn::Error::new(ident.span(), "unknown attribute"));
                 }
@@ -779,6 +824,11 @@ impl Parse for ToolAttrs {
             tags,
             defaults,
             output_schema,
+            version,
+            annotations_read_only,
+            annotations_idempotent,
+            annotations_destructive,
+            annotations_open_world_hint,
         })
     }
 }
@@ -876,6 +926,44 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|tag| quote! { #tag.to_string() })
         .collect();
+
+    // Generate version token
+    let version_tokens = attrs
+        .version
+        .as_ref()
+        .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+
+    // Generate annotations token
+    let has_annotations = attrs.annotations_read_only.is_some()
+        || attrs.annotations_idempotent.is_some()
+        || attrs.annotations_destructive.is_some()
+        || attrs.annotations_open_world_hint.is_some();
+
+    let annotations_tokens = if has_annotations {
+        let ro = attrs
+            .annotations_read_only
+            .map_or_else(|| quote! { None }, |v| quote! { Some(#v) });
+        let idem = attrs
+            .annotations_idempotent
+            .map_or_else(|| quote! { None }, |v| quote! { Some(#v) });
+        let destr = attrs
+            .annotations_destructive
+            .map_or_else(|| quote! { None }, |v| quote! { Some(#v) });
+        let owh = attrs
+            .annotations_open_world_hint
+            .as_ref()
+            .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+        quote! {
+            Some(fastmcp_protocol::ToolAnnotations {
+                read_only: #ro,
+                idempotent: #idem,
+                destructive: #destr,
+                open_world_hint: #owh,
+            })
+        }
+    } else {
+        quote! { None }
+    };
 
     // Parse parameters (skip first if it's &McpContext)
     let mut params: Vec<(&Ident, &Type, Option<String>, Option<Lit>)> = Vec::new();
@@ -1073,9 +1161,9 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     output_schema: #output_schema_field,
                     icon: None,
-                    version: None,
+                    version: #version_tokens,
                     tags: vec![#(#tag_entries),*],
-                    annotations: None,
+                    annotations: #annotations_tokens,
                 }
             }
 

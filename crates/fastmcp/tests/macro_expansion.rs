@@ -772,6 +772,124 @@ fn async_fallible_tool_err() {
 }
 
 // ============================================================================
+// #[tool] annotations and version tests
+// ============================================================================
+
+/// A read-only, idempotent tool with a version.
+#[tool(
+    name = "annotated_tool",
+    description = "Tool with annotations",
+    version = "2.1.0",
+    annotations(read_only, idempotent)
+)]
+fn annotated_tool(_ctx: &McpContext) -> String {
+    "read-only result".to_string()
+}
+
+#[test]
+fn tool_annotations_read_only_and_idempotent() {
+    let handler = AnnotatedTool;
+    let def = handler.definition();
+    assert_eq!(def.name, "annotated_tool");
+    assert_eq!(def.version.as_deref(), Some("2.1.0"));
+    let ann = def.annotations.expect("annotations should be Some");
+    assert_eq!(ann.read_only, Some(true));
+    assert_eq!(ann.idempotent, Some(true));
+    assert_eq!(ann.destructive, None);
+    assert_eq!(ann.open_world_hint, None);
+}
+
+/// A destructive tool.
+#[tool(annotations(destructive))]
+fn destructive_tool(_ctx: &McpContext) -> String {
+    "destroyed".to_string()
+}
+
+#[test]
+fn tool_annotations_destructive_only() {
+    let handler = DestructiveTool;
+    let def = handler.definition();
+    let ann = def.annotations.expect("annotations should be Some");
+    assert_eq!(ann.destructive, Some(true));
+    assert_eq!(ann.read_only, None);
+    assert_eq!(ann.idempotent, None);
+}
+
+/// Tool with all annotations set.
+#[tool(annotations(
+    read_only,
+    idempotent,
+    destructive,
+    open_world_hint = "accepts extra fields"
+))]
+fn fully_annotated(_ctx: &McpContext) -> String {
+    "full".to_string()
+}
+
+#[test]
+fn tool_annotations_all_fields() {
+    let handler = FullyAnnotated;
+    let def = handler.definition();
+    let ann = def.annotations.expect("annotations should be Some");
+    assert_eq!(ann.read_only, Some(true));
+    assert_eq!(ann.idempotent, Some(true));
+    assert_eq!(ann.destructive, Some(true));
+    assert_eq!(ann.open_world_hint.as_deref(), Some("accepts extra fields"));
+}
+
+/// Tool with version only, no annotations.
+#[tool(version = "0.3.0")]
+fn versioned_tool(_ctx: &McpContext) -> String {
+    "v0.3.0".to_string()
+}
+
+#[test]
+fn tool_version_without_annotations() {
+    let handler = VersionedTool;
+    let def = handler.definition();
+    assert_eq!(def.version.as_deref(), Some("0.3.0"));
+    assert!(def.annotations.is_none());
+}
+
+/// Tool with no annotations and no version (backwards compat).
+#[tool]
+fn plain_tool(_ctx: &McpContext) -> String {
+    "plain".to_string()
+}
+
+#[test]
+fn tool_no_annotations_no_version_stays_none() {
+    let handler = PlainTool;
+    let def = handler.definition();
+    assert!(def.version.is_none());
+    assert!(def.annotations.is_none());
+}
+
+/// Tool with annotations, version, and tags combined.
+#[tool(
+    name = "combo_tool",
+    version = "1.0.0",
+    tags = ["api", "safe"],
+    annotations(read_only, idempotent)
+)]
+fn combo_tool(_ctx: &McpContext) -> String {
+    "combo".to_string()
+}
+
+#[test]
+fn tool_annotations_with_tags_and_version() {
+    let handler = ComboTool;
+    let def = handler.definition();
+    assert_eq!(def.name, "combo_tool");
+    assert_eq!(def.version.as_deref(), Some("1.0.0"));
+    assert_eq!(def.tags, vec!["api", "safe"]);
+    let ann = def.annotations.expect("annotations should be Some");
+    assert_eq!(ann.read_only, Some(true));
+    assert_eq!(ann.idempotent, Some(true));
+    assert_eq!(ann.destructive, None);
+}
+
+// ============================================================================
 // #[resource] expansion tests
 // ============================================================================
 
