@@ -1278,4 +1278,126 @@ data: }\n\
         assert!(event.data.contains("世界"));
         assert!(event.data.contains("👋"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-137i)
+    // =========================================================================
+
+    #[test]
+    fn sse_event_type_as_str_round_trip() {
+        for ty in [SseEventType::Endpoint, SseEventType::Message] {
+            let s = ty.as_str();
+            let parsed = SseEventType::from_str(s).unwrap();
+            assert_eq!(parsed, ty);
+        }
+    }
+
+    #[test]
+    fn sse_event_type_from_str_unknown_returns_none() {
+        assert!(SseEventType::from_str("ping").is_none());
+        assert!(SseEventType::from_str("").is_none());
+        assert!(SseEventType::from_str("MESSAGE").is_none());
+    }
+
+    #[test]
+    fn sse_event_empty_data_serialization() {
+        // Empty data should still produce a "data: " line
+        let event = SseEvent::message("");
+        let bytes = event.to_bytes();
+        let output = String::from_utf8(bytes).unwrap();
+
+        assert!(output.contains("data: \n"));
+        assert!(output.contains("event: message\n"));
+        assert!(output.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn sse_writer_event_counter_auto_increments() {
+        let buffer = Vec::new();
+        let mut writer = SseWriter::new(buffer);
+        let cx = Cx::for_testing();
+
+        // Write three messages — IDs should be 1, 2, 3
+        for _ in 0..3 {
+            let msg = JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+                result: Some(serde_json::json!(null)),
+                error: None,
+                id: Some(fastmcp_protocol::RequestId::Number(1)),
+            });
+            writer.write_message(&cx, &msg).unwrap();
+        }
+
+        let output = String::from_utf8(writer.into_inner()).unwrap();
+        // Split into individual events and verify sequential ids
+        let events: Vec<&str> = output.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert_eq!(events.len(), 3);
+        assert!(events[0].contains("id: 1\n"));
+        assert!(events[1].contains("id: 2\n"));
+        assert!(events[2].contains("id: 3\n"));
+    }
+
+    #[test]
+    fn sse_writer_inner_and_inner_mut_accessors() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut writer = SseWriter::new(buffer);
+
+        // inner() returns a reference
+        assert!(writer.inner().is_empty());
+
+        // inner_mut() allows mutation
+        writer.inner_mut().extend_from_slice(b"raw");
+        assert_eq!(writer.inner().len(), 3);
+    }
+
+    #[test]
+    fn sse_writer_write_comment_custom_text() {
+        let buffer = Vec::new();
+        let mut writer = SseWriter::new(buffer);
+        let cx = Cx::for_testing();
+
+        writer.write_comment(&cx, "hello world").unwrap();
+
+        let output = String::from_utf8(writer.into_inner()).unwrap();
+        assert_eq!(output, ": hello world\n");
+    }
+
+    #[test]
+    fn sse_reader_read_endpoint_skips_message_events() {
+        // read_endpoint should skip message events and return the endpoint
+        let input = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\n\
+event: endpoint\ndata: http://localhost/post\n\n";
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+        let cx = Cx::for_testing();
+
+        let url = sse_reader.read_endpoint(&cx).unwrap().unwrap();
+        assert_eq!(url, "http://localhost/post");
+    }
+
+    #[test]
+    fn sse_server_transport_close_flushes() {
+        let requests: Vec<JsonRpcRequest> = vec![];
+        let buffer = Vec::new();
+        let mut transport =
+            SseServerTransport::new(buffer, requests.into_iter(), "http://localhost/post");
+
+        // close() should succeed (flushes the underlying writer)
+        transport.close().unwrap();
+    }
+
+    #[test]
+    fn sse_client_transport_send_cancelled() {
+        let sse_input = b"";
+        let reader = Cursor::new(sse_input.to_vec());
+        let mut request_buffer = Vec::new();
+
+        let mut transport = SseClientTransport::new(reader, &mut request_buffer);
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let request = JsonRpcRequest::new("test", None, 1i64);
+        let result = transport.send(&cx, &JsonRpcMessage::Request(request));
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+    }
 }
