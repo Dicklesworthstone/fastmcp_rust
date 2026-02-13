@@ -1013,4 +1013,477 @@ mod tests {
 
         assert!((stats.hit_rate() - 75.0).abs() < 0.001);
     }
+
+    // ── CacheStats edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn cache_stats_hit_rate_zero_total() {
+        let stats = CacheStats::default();
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_stats_debug() {
+        let stats = CacheStats::default();
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("CacheStats"));
+    }
+
+    // ── CacheKey ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_key_same_method_same_params_are_equal() {
+        let k1 = CacheKey::new("tools/list", Some(&serde_json::json!({"a": 1})));
+        let k2 = CacheKey::new("tools/list", Some(&serde_json::json!({"a": 1})));
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_different_params_differ() {
+        let k1 = CacheKey::new("tools/list", Some(&serde_json::json!({"a": 1})));
+        let k2 = CacheKey::new("tools/list", Some(&serde_json::json!({"a": 2})));
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_none_params_hash_is_zero() {
+        let k = CacheKey::new("test", None);
+        assert_eq!(k.params_hash, 0);
+    }
+
+    #[test]
+    fn cache_key_debug_and_clone() {
+        let k = CacheKey::new("test", None);
+        let debug = format!("{:?}", k);
+        assert!(debug.contains("test"));
+        let cloned = k.clone();
+        assert_eq!(k, cloned);
+    }
+
+    // ── hash_json_value ────────────────────────────────────────────────
+
+    #[test]
+    fn hash_json_value_deterministic() {
+        let v = serde_json::json!({"key": "value", "num": 42});
+        let h1 = hash_json_value(&v);
+        let h2 = hash_json_value(&v);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_json_value_different_values_differ() {
+        let h1 = hash_json_value(&serde_json::json!(1));
+        let h2 = hash_json_value(&serde_json::json!(2));
+        assert_ne!(h1, h2);
+    }
+
+    // ── LruCache additional tests ──────────────────────────────────────
+
+    #[test]
+    fn lru_cache_clear() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        cache.insert(
+            CacheKey::new("a", None),
+            serde_json::json!(1),
+            Duration::from_secs(60),
+        );
+        cache.insert(
+            CacheKey::new("b", None),
+            serde_json::json!(2),
+            Duration::from_secs(60),
+        );
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.is_empty());
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_remove_nonexistent() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        let key = CacheKey::new("nonexistent", None);
+        cache.remove(&key); // should not panic
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn lru_cache_insert_duplicate_replaces() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        let key = CacheKey::new("test", None);
+        cache.insert(
+            key.clone(),
+            serde_json::json!("v1"),
+            Duration::from_secs(60),
+        );
+        cache.insert(
+            key.clone(),
+            serde_json::json!("v2"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&key), Some(serde_json::json!("v2")));
+    }
+
+    #[test]
+    fn lru_cache_get_miss_returns_none() {
+        let mut cache = LruCache::new(10, 1024 * 1024, 1024);
+        assert!(cache.get(&CacheKey::new("missing", None)).is_none());
+    }
+
+    #[test]
+    fn lru_cache_lru_order_updated_on_access() {
+        let mut cache = LruCache::new(2, 1024 * 1024, 1024);
+        let k1 = CacheKey::new("a", None);
+        let k2 = CacheKey::new("b", None);
+        cache.insert(k1.clone(), serde_json::json!(1), Duration::from_secs(60));
+        cache.insert(k2.clone(), serde_json::json!(2), Duration::from_secs(60));
+
+        // Access k1, making k2 the LRU
+        let _ = cache.get(&k1);
+
+        // Insert k3, should evict k2 (LRU)
+        let k3 = CacheKey::new("c", None);
+        cache.insert(k3.clone(), serde_json::json!(3), Duration::from_secs(60));
+        assert!(cache.get(&k1).is_some()); // k1 was accessed recently
+        assert!(cache.get(&k2).is_none()); // k2 was evicted
+        assert!(cache.get(&k3).is_some());
+    }
+
+    // ── ToolCallCacheConfig ────────────────────────────────────────────
+
+    #[test]
+    fn should_cache_tool_disabled_returns_false() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: false,
+                ttl_secs: 60,
+            },
+            ..ToolCallCacheConfig::default()
+        };
+        assert!(!config.should_cache_tool("any_tool"));
+    }
+
+    #[test]
+    fn should_cache_tool_excluded_returns_false() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: true,
+                ttl_secs: 60,
+            },
+            excluded_tools: vec!["excluded".to_string()],
+            included_tools: vec![],
+        };
+        assert!(!config.should_cache_tool("excluded"));
+        assert!(config.should_cache_tool("other"));
+    }
+
+    #[test]
+    fn should_cache_tool_include_list_filters() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: true,
+                ttl_secs: 60,
+            },
+            included_tools: vec!["allowed".to_string()],
+            excluded_tools: vec![],
+        };
+        assert!(config.should_cache_tool("allowed"));
+        assert!(!config.should_cache_tool("not_allowed"));
+    }
+
+    #[test]
+    fn should_cache_tool_exclude_takes_precedence_over_include() {
+        let config = ToolCallCacheConfig {
+            base: MethodCacheConfig {
+                enabled: true,
+                ttl_secs: 60,
+            },
+            included_tools: vec!["tool".to_string()],
+            excluded_tools: vec!["tool".to_string()],
+        };
+        assert!(!config.should_cache_tool("tool"));
+    }
+
+    // ── MethodCacheConfig ──────────────────────────────────────────────
+
+    #[test]
+    fn method_cache_config_default() {
+        let config = MethodCacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.ttl_secs, DEFAULT_CALL_TTL_SECS);
+    }
+
+    #[test]
+    fn method_cache_config_debug() {
+        let config = MethodCacheConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("MethodCacheConfig"));
+    }
+
+    // ── ResponseCachingMiddleware construction ──────────────────────────
+
+    #[test]
+    fn default_equals_new() {
+        let d = ResponseCachingMiddleware::default();
+        let n = ResponseCachingMiddleware::new();
+        assert_eq!(d.list_ttl, n.list_ttl);
+        assert_eq!(d.call_ttl, n.call_ttl);
+    }
+
+    #[test]
+    fn debug_output() {
+        let m = ResponseCachingMiddleware::new();
+        let debug = format!("{:?}", m);
+        assert!(debug.contains("ResponseCachingMiddleware"));
+        assert!(debug.contains("list_ttl"));
+        assert!(debug.contains("call_ttl"));
+    }
+
+    // ── Fluent setters ─────────────────────────────────────────────────
+
+    #[test]
+    fn list_ttl_secs_updates_all_list_configs() {
+        let m = ResponseCachingMiddleware::new().list_ttl_secs(600);
+        assert_eq!(m.list_ttl, Duration::from_secs(600));
+        assert_eq!(m.tools_list_config.ttl_secs, 600);
+        assert_eq!(m.resources_list_config.ttl_secs, 600);
+        assert_eq!(m.prompts_list_config.ttl_secs, 600);
+    }
+
+    #[test]
+    fn call_ttl_secs_updates_all_call_configs() {
+        let m = ResponseCachingMiddleware::new().call_ttl_secs(7200);
+        assert_eq!(m.call_ttl, Duration::from_secs(7200));
+        assert_eq!(m.tools_call_config.base.ttl_secs, 7200);
+        assert_eq!(m.resources_read_config.ttl_secs, 7200);
+        assert_eq!(m.prompts_get_config.ttl_secs, 7200);
+    }
+
+    #[test]
+    fn max_entries_setter() {
+        let m = ResponseCachingMiddleware::new().max_entries(50);
+        let cache = m
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.max_entries, 50);
+    }
+
+    #[test]
+    fn max_size_bytes_setter() {
+        let m = ResponseCachingMiddleware::new().max_size_bytes(2048);
+        let cache = m
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.max_size_bytes, 2048);
+    }
+
+    #[test]
+    fn max_item_size_setter() {
+        let m = ResponseCachingMiddleware::new().max_item_size(512);
+        let cache = m
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.max_item_size, 512);
+    }
+
+    // ── Disable method variants ────────────────────────────────────────
+
+    #[test]
+    fn disable_resources_list() {
+        let m = ResponseCachingMiddleware::new().disable_resources_list();
+        assert!(!m.resources_list_config.enabled);
+        assert!(m.tools_list_config.enabled); // others unchanged
+    }
+
+    #[test]
+    fn disable_prompts_list() {
+        let m = ResponseCachingMiddleware::new().disable_prompts_list();
+        assert!(!m.prompts_list_config.enabled);
+    }
+
+    #[test]
+    fn disable_tools_call() {
+        let m = ResponseCachingMiddleware::new().disable_tools_call();
+        assert!(!m.tools_call_config.base.enabled);
+    }
+
+    #[test]
+    fn disable_resources_read() {
+        let m = ResponseCachingMiddleware::new().disable_resources_read();
+        assert!(!m.resources_read_config.enabled);
+    }
+
+    #[test]
+    fn disable_prompts_get() {
+        let m = ResponseCachingMiddleware::new().disable_prompts_get();
+        assert!(!m.prompts_get_config.enabled);
+    }
+
+    // ── include_tools / exclude_tools ──────────────────────────────────
+
+    #[test]
+    fn include_tools_restricts_caching() {
+        let m = ResponseCachingMiddleware::new().include_tools(vec!["allowed_tool".to_string()]);
+        let _ctx = test_context();
+
+        // allowed_tool should be cached
+        let req = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "allowed_tool"})),
+        );
+        assert!(m.should_cache_method(&req.method, req.params.as_ref()));
+
+        // other_tool should not be cached
+        let req2 = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "other_tool"})),
+        );
+        assert!(!m.should_cache_method(&req2.method, req2.params.as_ref()));
+
+        // non-tool methods still work
+        let req3 = test_request("tools/list", None);
+        assert!(m.should_cache_method(&req3.method, req3.params.as_ref()));
+    }
+
+    // ── should_cache_method edge cases ─────────────────────────────────
+
+    #[test]
+    fn should_cache_tools_call_without_name_returns_false() {
+        let m = ResponseCachingMiddleware::new();
+        // tools/call with params but no "name" field
+        assert!(!m.should_cache_method("tools/call", Some(&serde_json::json!({"arguments": {}}))));
+    }
+
+    #[test]
+    fn should_cache_tools_call_with_no_params_returns_false() {
+        let m = ResponseCachingMiddleware::new();
+        assert!(!m.should_cache_method("tools/call", None));
+    }
+
+    #[test]
+    fn should_cache_unknown_method_returns_false() {
+        let m = ResponseCachingMiddleware::new();
+        assert!(!m.should_cache_method("unknown/method", None));
+    }
+
+    #[test]
+    fn should_cache_all_known_cacheable_methods() {
+        let m = ResponseCachingMiddleware::new();
+        assert!(m.should_cache_method("tools/list", None));
+        assert!(m.should_cache_method("resources/list", None));
+        assert!(m.should_cache_method("prompts/list", None));
+        assert!(m.should_cache_method("resources/read", None));
+        assert!(m.should_cache_method("prompts/get", None));
+    }
+
+    // ── get_ttl ────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_ttl_list_methods() {
+        let m = ResponseCachingMiddleware::new().list_ttl_secs(120);
+        assert_eq!(m.get_ttl("tools/list"), Duration::from_secs(120));
+        assert_eq!(m.get_ttl("resources/list"), Duration::from_secs(120));
+        assert_eq!(m.get_ttl("prompts/list"), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn get_ttl_call_methods() {
+        let m = ResponseCachingMiddleware::new().call_ttl_secs(900);
+        assert_eq!(m.get_ttl("tools/call"), Duration::from_secs(900));
+        assert_eq!(m.get_ttl("resources/read"), Duration::from_secs(900));
+        assert_eq!(m.get_ttl("prompts/get"), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn get_ttl_unknown_method_uses_call_ttl() {
+        let m = ResponseCachingMiddleware::new().call_ttl_secs(999);
+        assert_eq!(m.get_ttl("unknown/method"), Duration::from_secs(999));
+    }
+
+    // ── on_error passes through ────────────────────────────────────────
+
+    #[test]
+    fn on_error_passes_through() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let req = test_request("tools/list", None);
+        let err = McpError::internal_error("test error");
+        let result = m.on_error(&ctx, &req, err);
+        assert!(result.message.contains("test error"));
+    }
+
+    // ── stats tracks entries and size ──────────────────────────────────
+
+    #[test]
+    fn stats_tracks_entries_and_size() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+
+        let stats = m.stats();
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.size_bytes, 0);
+
+        let req = test_request("tools/list", None);
+        m.on_request(&ctx, &req).unwrap();
+        m.on_response(&ctx, &req, serde_json::json!({"tools": []}))
+            .unwrap();
+
+        let stats = m.stats();
+        assert_eq!(stats.entries, 1);
+        assert!(stats.size_bytes > 0);
+        assert_eq!(stats.misses, 1);
+    }
+
+    // ── Middleware caches resources/list and prompts/list ───────────────
+
+    #[test]
+    fn caches_resources_list() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let req = test_request("resources/list", None);
+
+        m.on_request(&ctx, &req).unwrap();
+        m.on_response(&ctx, &req, serde_json::json!({"resources": []}))
+            .unwrap();
+
+        let decision = m.on_request(&ctx, &req).unwrap();
+        assert!(matches!(decision, MiddlewareDecision::Respond(_)));
+    }
+
+    #[test]
+    fn caches_prompts_list() {
+        let m = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let req = test_request("prompts/list", None);
+
+        m.on_request(&ctx, &req).unwrap();
+        m.on_response(&ctx, &req, serde_json::json!({"prompts": []}))
+            .unwrap();
+
+        let decision = m.on_request(&ctx, &req).unwrap();
+        assert!(matches!(decision, MiddlewareDecision::Respond(_)));
+    }
+
+    // ── CacheEntry debug/clone ─────────────────────────────────────────
+
+    #[test]
+    fn cache_entry_debug_and_clone() {
+        let entry = CacheEntry::new(serde_json::json!(42), Duration::from_secs(60));
+        let debug = format!("{:?}", entry);
+        assert!(debug.contains("CacheEntry"));
+        let cloned = entry.clone();
+        assert_eq!(cloned.value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn cache_entry_not_expired_initially() {
+        let entry = CacheEntry::new(serde_json::json!(1), Duration::from_secs(60));
+        assert!(!entry.is_expired());
+    }
 }
