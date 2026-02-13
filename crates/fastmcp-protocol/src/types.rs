@@ -2084,4 +2084,141 @@ mod tests {
             _ => panic!("expected Resource content"),
         }
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1cd5)
+    // =========================================================================
+
+    #[test]
+    fn root_new_constructor() {
+        let root = Root::new("file:///home/user/project");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert!(root.name.is_none());
+    }
+
+    #[test]
+    fn root_new_from_string() {
+        let uri = String::from("file:///tmp");
+        let root = Root::new(uri);
+        assert_eq!(root.uri, "file:///tmp");
+    }
+
+    #[test]
+    fn root_with_name_constructor() {
+        let root = Root::with_name("file:///workspace", "My Project");
+        assert_eq!(root.uri, "file:///workspace");
+        assert_eq!(root.name.as_deref(), Some("My Project"));
+    }
+
+    #[test]
+    fn root_with_name_from_strings() {
+        let uri = String::from("file:///src");
+        let name = String::from("Source");
+        let root = Root::with_name(uri, name);
+        assert_eq!(root.uri, "file:///src");
+        assert_eq!(root.name.unwrap(), "Source");
+    }
+
+    #[test]
+    fn content_text_constructor() {
+        let content = Content::text("hello world");
+        match &content {
+            Content::Text { text } => assert_eq!(text, "hello world"),
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn content_text_from_string() {
+        let s = String::from("owned string");
+        let content = Content::text(s);
+        match &content {
+            Content::Text { text } => assert_eq!(text, "owned string"),
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn content_image_base64_constructor() {
+        let content = Content::image_base64("aGVsbG8=", "image/png");
+        match &content {
+            Content::Image { data, mime_type } => {
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(mime_type, "image/png");
+            }
+            _ => panic!("expected Image content"),
+        }
+    }
+
+    #[test]
+    fn content_audio_base64_constructor() {
+        let content = Content::audio_base64("AAAA", "audio/mp3");
+        match &content {
+            Content::Audio { data, mime_type } => {
+                assert_eq!(data, "AAAA");
+                assert_eq!(mime_type, "audio/mp3");
+            }
+            _ => panic!("expected Audio content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_text_constructor() {
+        let content = Content::resource_text(
+            "file:///readme.md",
+            Some("text/markdown".to_string()),
+            "# Hello",
+        );
+        match &content {
+            Content::Resource { resource } => {
+                assert_eq!(resource.uri, "file:///readme.md");
+                assert_eq!(resource.mime_type.as_deref(), Some("text/markdown"));
+                assert_eq!(resource.text.as_deref(), Some("# Hello"));
+                assert!(resource.blob.is_none());
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_text_no_mime() {
+        let content = Content::resource_text("file:///data.txt", None, "data");
+        match &content {
+            Content::Resource { resource } => {
+                assert!(resource.mime_type.is_none());
+                assert_eq!(resource.text.as_deref(), Some("data"));
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_blob_base64_constructor() {
+        let content = Content::resource_blob_base64(
+            "file:///image.png",
+            Some("image/png".to_string()),
+            "iVBOR",
+        );
+        match &content {
+            Content::Resource { resource } => {
+                assert_eq!(resource.uri, "file:///image.png");
+                assert_eq!(resource.mime_type.as_deref(), Some("image/png"));
+                assert!(resource.text.is_none());
+                assert_eq!(resource.blob.as_deref(), Some("iVBOR"));
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_blob_base64_no_mime() {
+        let content = Content::resource_blob_base64("file:///bin", None, "AQID");
+        match &content {
+            Content::Resource { resource } => {
+                assert!(resource.mime_type.is_none());
+                assert_eq!(resource.blob.as_deref(), Some("AQID"));
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
 }
