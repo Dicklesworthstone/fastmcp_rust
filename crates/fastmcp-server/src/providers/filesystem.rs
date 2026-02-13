@@ -1223,4 +1223,645 @@ mod tests {
             Err(FilesystemProviderError::SymlinkEscapesRoot { .. })
         ));
     }
+
+    // ── FilesystemProviderError ────────────────────────────────────
+
+    #[test]
+    fn error_path_traversal_display() {
+        let err = FilesystemProviderError::PathTraversal {
+            requested: "../etc/passwd".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Path traversal attempt blocked"));
+        assert!(msg.contains("../etc/passwd"));
+    }
+
+    #[test]
+    fn error_too_large_display() {
+        let err = FilesystemProviderError::TooLarge {
+            path: "big.bin".to_string(),
+            size: 50_000_000,
+            max: 10_000_000,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("File too large"));
+        assert!(msg.contains("big.bin"));
+        assert!(msg.contains("50000000"));
+        assert!(msg.contains("10000000"));
+    }
+
+    #[test]
+    fn error_symlink_denied_display() {
+        let err = FilesystemProviderError::SymlinkDenied {
+            path: "link.txt".to_string(),
+        };
+        assert!(err.to_string().contains("Symlink access denied"));
+    }
+
+    #[test]
+    fn error_symlink_escapes_root_display() {
+        let err = FilesystemProviderError::SymlinkEscapesRoot {
+            path: "evil-link".to_string(),
+        };
+        assert!(err.to_string().contains("Symlink target escapes root"));
+    }
+
+    #[test]
+    fn error_io_display() {
+        let err = FilesystemProviderError::Io {
+            message: "permission denied".to_string(),
+        };
+        assert!(err.to_string().contains("IO error"));
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn error_not_found_display() {
+        let err = FilesystemProviderError::NotFound {
+            path: "missing.txt".to_string(),
+        };
+        assert!(err.to_string().contains("File not found"));
+        assert!(err.to_string().contains("missing.txt"));
+    }
+
+    #[test]
+    fn error_debug() {
+        let err = FilesystemProviderError::PathTraversal {
+            requested: "x".to_string(),
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("PathTraversal"));
+    }
+
+    #[test]
+    fn error_clone() {
+        let err = FilesystemProviderError::NotFound {
+            path: "a.txt".to_string(),
+        };
+        let cloned = err.clone();
+        assert!(cloned.to_string().contains("a.txt"));
+    }
+
+    #[test]
+    fn error_std_error() {
+        let err = FilesystemProviderError::Io {
+            message: "oops".to_string(),
+        };
+        let std_err: &dyn std::error::Error = &err;
+        assert!(std_err.to_string().contains("oops"));
+    }
+
+    // ── From<FilesystemProviderError> for McpError ─────────────────
+
+    #[test]
+    fn error_into_mcp_error_path_traversal() {
+        let err = FilesystemProviderError::PathTraversal {
+            requested: "x".to_string(),
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("Path traversal"));
+    }
+
+    #[test]
+    fn error_into_mcp_error_too_large() {
+        let err = FilesystemProviderError::TooLarge {
+            path: "x".to_string(),
+            size: 100,
+            max: 10,
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("File too large"));
+    }
+
+    #[test]
+    fn error_into_mcp_error_symlink_denied() {
+        let err = FilesystemProviderError::SymlinkDenied {
+            path: "x".to_string(),
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("Symlink access denied"));
+    }
+
+    #[test]
+    fn error_into_mcp_error_symlink_escapes() {
+        let err = FilesystemProviderError::SymlinkEscapesRoot {
+            path: "x".to_string(),
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("Symlink target escapes"));
+    }
+
+    #[test]
+    fn error_into_mcp_error_io() {
+        let err = FilesystemProviderError::Io {
+            message: "disk fail".to_string(),
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("IO error"));
+    }
+
+    #[test]
+    fn error_into_mcp_error_not_found() {
+        let err = FilesystemProviderError::NotFound {
+            path: "gone.txt".to_string(),
+        };
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("gone.txt"));
+    }
+
+    // ── FilesystemProvider construction and builders ───────────────
+
+    #[test]
+    fn provider_new_defaults() {
+        let root = TestDir::new("defaults");
+        let provider = FilesystemProvider::new(root.path());
+        assert_eq!(provider.root, root.path().to_path_buf());
+        assert!(provider.prefix.is_none());
+        assert!(provider.include_patterns.is_empty());
+        assert_eq!(provider.exclude_patterns, vec![".*".to_string()]);
+        assert!(!provider.recursive);
+        assert_eq!(provider.max_file_size, DEFAULT_MAX_SIZE);
+        assert!(!provider.follow_symlinks);
+        assert!(provider.description.is_none());
+    }
+
+    #[test]
+    fn provider_with_prefix() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("myprefix");
+        assert_eq!(provider.prefix, Some("myprefix".to_string()));
+    }
+
+    #[test]
+    fn provider_with_patterns() {
+        let provider = FilesystemProvider::new("/tmp").with_patterns(&["*.md", "*.txt"]);
+        assert_eq!(provider.include_patterns, vec!["*.md", "*.txt"]);
+    }
+
+    #[test]
+    fn provider_with_exclude() {
+        let provider = FilesystemProvider::new("/tmp").with_exclude(&["*.bak", "*.tmp"]);
+        // Default hidden file pattern should be replaced
+        assert_eq!(provider.exclude_patterns, vec!["*.bak", "*.tmp"]);
+    }
+
+    #[test]
+    fn provider_with_recursive() {
+        let provider = FilesystemProvider::new("/tmp").with_recursive(true);
+        assert!(provider.recursive);
+    }
+
+    #[test]
+    fn provider_with_max_size() {
+        let provider = FilesystemProvider::new("/tmp").with_max_size(1024);
+        assert_eq!(provider.max_file_size, 1024);
+    }
+
+    #[test]
+    fn provider_with_follow_symlinks() {
+        let provider = FilesystemProvider::new("/tmp").with_follow_symlinks(true);
+        assert!(provider.follow_symlinks);
+    }
+
+    #[test]
+    fn provider_with_description() {
+        let provider = FilesystemProvider::new("/tmp").with_description("My files");
+        assert_eq!(provider.description, Some("My files".to_string()));
+    }
+
+    #[test]
+    fn provider_debug() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("dbg");
+        let debug = format!("{:?}", provider);
+        assert!(debug.contains("FilesystemProvider"));
+        assert!(debug.contains("dbg"));
+    }
+
+    #[test]
+    fn provider_clone() {
+        let provider = FilesystemProvider::new("/tmp")
+            .with_prefix("cloned")
+            .with_recursive(true)
+            .with_max_size(5000);
+        let cloned = provider.clone();
+        assert_eq!(cloned.prefix, Some("cloned".to_string()));
+        assert!(cloned.recursive);
+        assert_eq!(cloned.max_file_size, 5000);
+    }
+
+    // ── URI methods ───────────────────────────────────────────────
+
+    #[test]
+    fn file_uri_with_prefix() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("docs");
+        assert_eq!(provider.file_uri("readme.md"), "file://docs/readme.md");
+    }
+
+    #[test]
+    fn file_uri_without_prefix() {
+        let provider = FilesystemProvider::new("/tmp");
+        assert_eq!(provider.file_uri("readme.md"), "file://readme.md");
+    }
+
+    #[test]
+    fn uri_template_with_prefix() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("data");
+        assert_eq!(provider.uri_template(), "file://data/{path}");
+    }
+
+    #[test]
+    fn uri_template_without_prefix() {
+        let provider = FilesystemProvider::new("/tmp");
+        assert_eq!(provider.uri_template(), "file://{path}");
+    }
+
+    #[test]
+    fn path_from_uri_with_prefix() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("docs");
+        assert_eq!(
+            provider.path_from_uri("file://docs/readme.md"),
+            Some("readme.md".to_string())
+        );
+    }
+
+    #[test]
+    fn path_from_uri_without_prefix() {
+        let provider = FilesystemProvider::new("/tmp");
+        assert_eq!(
+            provider.path_from_uri("file://readme.md"),
+            Some("readme.md".to_string())
+        );
+    }
+
+    #[test]
+    fn path_from_uri_wrong_prefix() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("docs");
+        assert_eq!(provider.path_from_uri("file://other/readme.md"), None);
+    }
+
+    #[test]
+    fn path_from_uri_completely_wrong() {
+        let provider = FilesystemProvider::new("/tmp").with_prefix("docs");
+        assert_eq!(provider.path_from_uri("http://example.com"), None);
+    }
+
+    // ── matches_patterns ──────────────────────────────────────────
+
+    #[test]
+    fn matches_patterns_no_includes_no_excludes() {
+        let provider = FilesystemProvider::new("/tmp").with_exclude(&[]);
+        assert!(provider.matches_patterns("anything.txt"));
+        assert!(provider.matches_patterns(".hidden"));
+    }
+
+    #[test]
+    fn matches_patterns_excludes_only() {
+        let provider = FilesystemProvider::new("/tmp"); // default excludes .*
+        assert!(provider.matches_patterns("visible.txt"));
+        assert!(!provider.matches_patterns(".hidden"));
+    }
+
+    #[test]
+    fn matches_patterns_includes_only() {
+        let provider = FilesystemProvider::new("/tmp")
+            .with_exclude(&[])
+            .with_patterns(&["*.md"]);
+        assert!(provider.matches_patterns("readme.md"));
+        assert!(!provider.matches_patterns("readme.txt"));
+    }
+
+    #[test]
+    fn matches_patterns_exclude_takes_priority() {
+        let provider = FilesystemProvider::new("/tmp")
+            .with_patterns(&["*.md"])
+            .with_exclude(&["secret.md"]);
+        assert!(provider.matches_patterns("readme.md"));
+        assert!(!provider.matches_patterns("secret.md"));
+    }
+
+    // ── validate_path edge cases ──────────────────────────────────
+
+    #[test]
+    fn validate_path_not_found() {
+        let root = TestDir::new("validate-notfound");
+        let provider = FilesystemProvider::new(root.path());
+        let result = provider.validate_path("nonexistent.txt");
+        assert!(matches!(
+            result,
+            Err(FilesystemProviderError::NotFound { .. })
+        ));
+    }
+
+    // ── read_file edge cases ──────────────────────────────────────
+
+    #[test]
+    fn read_file_not_found() {
+        let root = TestDir::new("read-notfound");
+        let provider = FilesystemProvider::new(root.path());
+        let result = provider.read_file("missing.txt");
+        assert!(matches!(
+            result,
+            Err(FilesystemProviderError::NotFound { .. })
+        ));
+    }
+
+    // ── detect_mime_type extended ──────────────────────────────────
+
+    #[test]
+    fn detect_mime_type_text_formats() {
+        assert_eq!(detect_mime_type(Path::new("f.txt")), "text/plain");
+        assert_eq!(detect_mime_type(Path::new("f.html")), "text/html");
+        assert_eq!(detect_mime_type(Path::new("f.htm")), "text/html");
+        assert_eq!(detect_mime_type(Path::new("f.css")), "text/css");
+        assert_eq!(detect_mime_type(Path::new("f.csv")), "text/csv");
+        assert_eq!(detect_mime_type(Path::new("f.xml")), "application/xml");
+        assert_eq!(detect_mime_type(Path::new("f.markdown")), "text/markdown");
+    }
+
+    #[test]
+    fn detect_mime_type_programming_languages() {
+        assert_eq!(detect_mime_type(Path::new("f.py")), "text/x-python");
+        assert_eq!(detect_mime_type(Path::new("f.js")), "text/javascript");
+        assert_eq!(detect_mime_type(Path::new("f.mjs")), "text/javascript");
+        assert_eq!(detect_mime_type(Path::new("f.ts")), "text/typescript");
+        assert_eq!(detect_mime_type(Path::new("f.mts")), "text/typescript");
+        assert_eq!(detect_mime_type(Path::new("f.yaml")), "application/yaml");
+        assert_eq!(detect_mime_type(Path::new("f.yml")), "application/yaml");
+        assert_eq!(detect_mime_type(Path::new("f.toml")), "application/toml");
+        assert_eq!(detect_mime_type(Path::new("f.sh")), "text/x-shellscript");
+        assert_eq!(detect_mime_type(Path::new("f.bash")), "text/x-shellscript");
+        assert_eq!(detect_mime_type(Path::new("f.c")), "text/x-c");
+        assert_eq!(detect_mime_type(Path::new("f.cpp")), "text/x-c++");
+        assert_eq!(detect_mime_type(Path::new("f.cc")), "text/x-c++");
+        assert_eq!(detect_mime_type(Path::new("f.cxx")), "text/x-c++");
+        assert_eq!(detect_mime_type(Path::new("f.h")), "text/x-c-header");
+        assert_eq!(detect_mime_type(Path::new("f.hpp")), "text/x-c-header");
+        assert_eq!(detect_mime_type(Path::new("f.java")), "text/x-java");
+        assert_eq!(detect_mime_type(Path::new("f.go")), "text/x-go");
+        assert_eq!(detect_mime_type(Path::new("f.rb")), "text/x-ruby");
+        assert_eq!(detect_mime_type(Path::new("f.php")), "text/x-php");
+        assert_eq!(detect_mime_type(Path::new("f.swift")), "text/x-swift");
+        assert_eq!(detect_mime_type(Path::new("f.kt")), "text/x-kotlin");
+        assert_eq!(detect_mime_type(Path::new("f.kts")), "text/x-kotlin");
+        assert_eq!(detect_mime_type(Path::new("f.sql")), "text/x-sql");
+    }
+
+    #[test]
+    fn detect_mime_type_images() {
+        assert_eq!(detect_mime_type(Path::new("f.jpg")), "image/jpeg");
+        assert_eq!(detect_mime_type(Path::new("f.jpeg")), "image/jpeg");
+        assert_eq!(detect_mime_type(Path::new("f.gif")), "image/gif");
+        assert_eq!(detect_mime_type(Path::new("f.svg")), "image/svg+xml");
+        assert_eq!(detect_mime_type(Path::new("f.webp")), "image/webp");
+        assert_eq!(detect_mime_type(Path::new("f.ico")), "image/x-icon");
+        assert_eq!(detect_mime_type(Path::new("f.bmp")), "image/bmp");
+    }
+
+    #[test]
+    fn detect_mime_type_binary() {
+        assert_eq!(detect_mime_type(Path::new("f.pdf")), "application/pdf");
+        assert_eq!(detect_mime_type(Path::new("f.zip")), "application/zip");
+        assert_eq!(detect_mime_type(Path::new("f.gz")), "application/gzip");
+        assert_eq!(detect_mime_type(Path::new("f.gzip")), "application/gzip");
+        assert_eq!(detect_mime_type(Path::new("f.tar")), "application/x-tar");
+        assert_eq!(detect_mime_type(Path::new("f.wasm")), "application/wasm");
+        assert_eq!(
+            detect_mime_type(Path::new("f.exe")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            detect_mime_type(Path::new("f.dll")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            detect_mime_type(Path::new("f.so")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            detect_mime_type(Path::new("f.bin")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn detect_mime_type_no_extension() {
+        assert_eq!(
+            detect_mime_type(Path::new("Makefile")),
+            "application/octet-stream"
+        );
+    }
+
+    // ── is_binary_mime_type extended ───────────────────────────────
+
+    #[test]
+    fn is_binary_mime_type_audio_video() {
+        assert!(is_binary_mime_type("audio/mpeg"));
+        assert!(is_binary_mime_type("video/mp4"));
+    }
+
+    #[test]
+    fn is_binary_mime_type_archives() {
+        assert!(is_binary_mime_type("application/zip"));
+        assert!(is_binary_mime_type("application/gzip"));
+        assert!(is_binary_mime_type("application/x-tar"));
+        assert!(is_binary_mime_type("application/wasm"));
+        assert!(is_binary_mime_type("application/octet-stream"));
+    }
+
+    #[test]
+    fn is_binary_mime_type_text_types_false() {
+        assert!(!is_binary_mime_type("text/html"));
+        assert!(!is_binary_mime_type("text/markdown"));
+        assert!(!is_binary_mime_type("application/yaml"));
+        assert!(!is_binary_mime_type("application/toml"));
+    }
+
+    // ── base64_encode extended ────────────────────────────────────
+
+    #[test]
+    fn base64_encode_hello_world() {
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    #[test]
+    fn base64_encode_binary_sequence() {
+        // Known value: bytes [0, 1, 2] → AAEC
+        assert_eq!(base64_encode(&[0, 1, 2]), "AAEC");
+    }
+
+    // ── glob_match edge cases ─────────────────────────────────────
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(glob_match("readme.md", "readme.md"));
+        assert!(!glob_match("readme.md", "other.md"));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_empty_path() {
+        assert!(glob_match("", ""));
+    }
+
+    #[test]
+    fn glob_match_star_empty() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn glob_match_double_star_alone() {
+        assert!(glob_match("**", ""));
+        assert!(glob_match("**", "a/b/c"));
+    }
+
+    #[test]
+    fn glob_match_mixed_pattern() {
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(!glob_match("src/*.rs", "src/sub/main.rs"));
+        assert!(glob_match("src/**/*.rs", "src/sub/main.rs"));
+    }
+
+    // ── FilesystemResourceHandler ─────────────────────────────────
+
+    #[test]
+    fn handler_debug() {
+        let root = TestDir::new("handler-debug");
+        write_text(&root.join("a.txt"), "hello");
+        let handler = FilesystemProvider::new(root.path()).build();
+        let debug = format!("{:?}", handler);
+        assert!(debug.contains("FilesystemResourceHandler"));
+        assert!(debug.contains("provider"));
+    }
+
+    #[test]
+    fn handler_definition_without_prefix() {
+        let root = TestDir::new("handler-no-prefix");
+        let handler = FilesystemProvider::new(root.path()).build();
+        let def = handler.definition();
+        assert_eq!(def.name, "files");
+        assert_eq!(def.uri, "file://{path}");
+        assert!(def.description.is_none());
+    }
+
+    #[test]
+    fn handler_template_without_prefix() {
+        let root = TestDir::new("handler-tmpl-no-prefix");
+        let handler = FilesystemProvider::new(root.path()).build();
+        let tmpl = handler.template().unwrap();
+        assert_eq!(tmpl.uri_template, "file://{path}");
+        assert_eq!(tmpl.name, "files");
+    }
+
+    #[test]
+    fn handler_cached_resources_populated() {
+        let root = TestDir::new("handler-cached");
+        write_text(&root.join("one.txt"), "1");
+        write_text(&root.join("two.md"), "2");
+        let handler = FilesystemProvider::new(root.path())
+            .with_exclude(&[])
+            .build();
+        // cached_resources should have entries for the files
+        assert!(handler.cached_resources.len() >= 2);
+    }
+
+    #[test]
+    fn handler_read_with_uri_missing_path_param() {
+        let root = TestDir::new("handler-missing-param");
+        let handler = FilesystemProvider::new(root.path())
+            .with_prefix("p")
+            .build();
+        let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
+        let empty_params = HashMap::new();
+        // URI doesn't match prefix either
+        let result = handler.read_with_uri(&ctx, "file://wrong/x", &empty_params);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handler_read_binary_file_returns_blob() {
+        let root = TestDir::new("handler-binary");
+        write_bytes(&root.join("data.bin"), &[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let handler = FilesystemProvider::new(root.path())
+            .with_exclude(&[])
+            .build();
+        let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), "data.bin".to_string());
+        let result = handler
+            .read_with_uri(&ctx, "file://data.bin", &params)
+            .unwrap();
+        assert!(result[0].text.is_none());
+        assert!(result[0].blob.is_some());
+    }
+
+    // ── list_files with exclude ───────────────────────────────────
+
+    #[test]
+    fn list_files_excludes_hidden_by_default() {
+        let root = TestDir::new("list-hidden");
+        write_text(&root.join("visible.txt"), "v");
+        write_text(&root.join(".hidden"), "h");
+
+        let provider = FilesystemProvider::new(root.path());
+        let files = provider.list_files().unwrap();
+        let paths: Vec<&str> = files.iter().map(|e| e.relative_path.as_str()).collect();
+        assert!(paths.contains(&"visible.txt"));
+        assert!(!paths.contains(&".hidden"));
+    }
+
+    #[test]
+    fn list_files_no_patterns_includes_all() {
+        let root = TestDir::new("list-all");
+        write_text(&root.join("a.txt"), "a");
+        write_text(&root.join("b.rs"), "b");
+
+        let provider = FilesystemProvider::new(root.path()).with_exclude(&[]);
+        let files = provider.list_files().unwrap();
+        assert!(files.len() >= 2);
+    }
+
+    // ── DEFAULT_MAX_SIZE ──────────────────────────────────────────
+
+    #[test]
+    fn default_max_size_is_10mb() {
+        assert_eq!(DEFAULT_MAX_SIZE, 10 * 1024 * 1024);
+    }
+
+    // ── FileEntry ─────────────────────────────────────────────────
+
+    #[test]
+    fn file_entry_debug() {
+        let entry = FileEntry {
+            path: PathBuf::from("/tmp/test.txt"),
+            relative_path: "test.txt".to_string(),
+            size: Some(42),
+            mime_type: "text/plain".to_string(),
+        };
+        let debug = format!("{:?}", entry);
+        assert!(debug.contains("test.txt"));
+        assert!(debug.contains("42"));
+    }
+
+    // ── Provider builder chaining ─────────────────────────────────
+
+    #[test]
+    fn provider_builder_chaining() {
+        let root = TestDir::new("builder-chain");
+        let provider = FilesystemProvider::new(root.path())
+            .with_prefix("chain")
+            .with_patterns(&["*.md"])
+            .with_exclude(&["*.bak"])
+            .with_recursive(true)
+            .with_max_size(2048)
+            .with_follow_symlinks(true)
+            .with_description("Chain test");
+
+        assert_eq!(provider.prefix, Some("chain".to_string()));
+        assert_eq!(provider.include_patterns, vec!["*.md"]);
+        assert_eq!(provider.exclude_patterns, vec!["*.bak"]);
+        assert!(provider.recursive);
+        assert_eq!(provider.max_file_size, 2048);
+        assert!(provider.follow_symlinks);
+        assert_eq!(provider.description, Some("Chain test".to_string()));
+    }
 }
