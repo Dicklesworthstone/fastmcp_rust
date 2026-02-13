@@ -22,8 +22,8 @@
 #![allow(dead_code)]
 
 use fastmcp_rust::{
-    Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceHandler,
-    Role, ToolHandler, prompt, resource, tool,
+    Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceContent,
+    ResourceHandler, Role, ToolHandler, prompt, resource, tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2379,4 +2379,110 @@ fn json_schema_mixed_attributes() {
     // Original names should not be present
     assert!(!props.contains_key("to_rename"));
     assert!(!props.contains_key("also_renamed"));
+}
+
+// ============================================================================
+// Resource macro: Vec<ResourceContent> return type support (bd-24s9)
+// ============================================================================
+
+/// Resource returning Vec<ResourceContent> directly for multi-part content.
+#[resource(uri = "data://multi-part", description = "Multi-part resource")]
+fn multi_part_vec(_ctx: &McpContext) -> Vec<ResourceContent> {
+    vec![
+        ResourceContent {
+            uri: "data://multi-part/a".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("Part A".to_string()),
+            blob: None,
+        },
+        ResourceContent {
+            uri: "data://multi-part/b".to_string(),
+            mime_type: Some("application/json".to_string()),
+            text: Some(r#"{"key":"value"}"#.to_string()),
+            blob: None,
+        },
+    ]
+}
+
+#[test]
+fn resource_vec_resource_content_return() {
+    let handler = MultiPartVecResource;
+    let def = handler.definition();
+    assert_eq!(def.uri, "data://multi-part");
+    assert_eq!(def.description.as_deref(), Some("Multi-part resource"));
+
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+    let contents = handler.read(&ctx).unwrap();
+    assert_eq!(contents.len(), 2);
+    assert_eq!(contents[0].uri, "data://multi-part/a");
+    assert_eq!(contents[0].text.as_deref(), Some("Part A"));
+    assert_eq!(contents[1].uri, "data://multi-part/b");
+    assert_eq!(contents[1].mime_type.as_deref(), Some("application/json"));
+}
+
+/// Resource returning McpResult<Vec<ResourceContent>> for error handling.
+#[resource(
+    uri = "data://fallible-multi",
+    description = "Fallible multi-part resource"
+)]
+fn fallible_multi(_ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+    Ok(vec![ResourceContent {
+        uri: "data://fallible-multi".to_string(),
+        mime_type: Some("text/plain".to_string()),
+        text: Some("OK".to_string()),
+        blob: None,
+    }])
+}
+
+#[test]
+fn resource_mcp_result_vec_resource_content_return() {
+    let handler = FallibleMultiResource;
+    let def = handler.definition();
+    assert_eq!(def.uri, "data://fallible-multi");
+
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+    let contents = handler.read(&ctx).unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].text.as_deref(), Some("OK"));
+}
+
+/// Resource returning McpResult<Vec<ResourceContent>> that errors.
+#[resource(uri = "data://error-rc", description = "Always-error resource")]
+fn error_rc(_ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+    Err(fastmcp_rust::McpError::resource_not_found("not available"))
+}
+
+#[test]
+fn resource_mcp_result_vec_resource_content_error() {
+    let handler = ErrorRcResource;
+    let def = handler.definition();
+    assert_eq!(def.uri, "data://error-rc");
+
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+    let result = handler.read(&ctx);
+    assert!(result.is_err());
+}
+
+/// Resource returning binary content via Vec<ResourceContent>.
+#[resource(uri = "binary://test", description = "Binary resource")]
+fn binary_blob(_ctx: &McpContext) -> Vec<ResourceContent> {
+    vec![ResourceContent {
+        uri: "binary://test".to_string(),
+        mime_type: Some("application/octet-stream".to_string()),
+        text: None,
+        blob: Some("AQID".to_string()), // base64 for [1, 2, 3]
+    }]
+}
+
+#[test]
+fn resource_vec_resource_content_binary() {
+    let handler = BinaryBlobResource;
+    let def = handler.definition();
+    assert_eq!(def.uri, "binary://test");
+
+    let ctx = McpContext::new(Cx::for_testing(), 1);
+    let contents = handler.read(&ctx).unwrap();
+    assert_eq!(contents.len(), 1);
+    assert!(contents[0].text.is_none());
+    assert_eq!(contents[0].blob.as_deref(), Some("AQID"));
 }

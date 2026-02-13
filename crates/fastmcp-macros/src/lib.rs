@@ -496,10 +496,16 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
 enum ResourceReturnTypeKind {
     /// Returns String directly
     String,
+    /// Returns Vec<ResourceContent> directly
+    VecResourceContent,
     /// Returns Result<String, E>
     ResultString,
     /// Returns McpResult<String>
     McpResultString,
+    /// Returns Result<Vec<ResourceContent>, E>
+    ResultVecResourceContent,
+    /// Returns McpResult<Vec<ResourceContent>>
+    McpResultVecResourceContent,
     /// Unknown type - use ToString
     Other,
 }
@@ -520,6 +526,23 @@ fn analyze_resource_type(ty: &Type) -> ResourceReturnTypeKind {
 
             match type_name.as_str() {
                 "String" => return ResourceReturnTypeKind::String,
+                "Vec" => {
+                    // Check if it's Vec<ResourceContent>
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(Type::Path(inner_path))) =
+                            args.args.first()
+                        {
+                            if inner_path
+                                .path
+                                .segments
+                                .last()
+                                .is_some_and(|s| s.ident == "ResourceContent")
+                            {
+                                return ResourceReturnTypeKind::VecResourceContent;
+                            }
+                        }
+                    }
+                }
                 "Result" | "McpResult" => {
                     // Check the Ok type
                     if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
@@ -531,6 +554,13 @@ fn analyze_resource_type(ty: &Type) -> ResourceReturnTypeKind {
                                         ResourceReturnTypeKind::McpResultString
                                     } else {
                                         ResourceReturnTypeKind::ResultString
+                                    }
+                                }
+                                ResourceReturnTypeKind::VecResourceContent => {
+                                    if type_name == "McpResult" {
+                                        ResourceReturnTypeKind::McpResultVecResourceContent
+                                    } else {
+                                        ResourceReturnTypeKind::ResultVecResourceContent
                                     }
                                 }
                                 _ => ResourceReturnTypeKind::Other,
@@ -567,6 +597,9 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
                 blob: None,
             }])
         },
+        ResourceReturnTypeKind::VecResourceContent => quote! {
+            Ok(result)
+        },
         ResourceReturnTypeKind::ResultString | ResourceReturnTypeKind::McpResultString => quote! {
             let text = result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))?;
             Ok(vec![fastmcp_protocol::ResourceContent {
@@ -575,6 +608,12 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
                 text: Some(text),
                 blob: None,
             }])
+        },
+        ResourceReturnTypeKind::ResultVecResourceContent => quote! {
+            result.map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
+        },
+        ResourceReturnTypeKind::McpResultVecResourceContent => quote! {
+            result
         },
         ResourceReturnTypeKind::Other => quote! {
             // Fallback: use ToString trait
