@@ -695,3 +695,393 @@ impl PromptHandler for MountedPromptHandler {
         self.inner.get_async(ctx, arguments)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::Cx;
+    use fastmcp_core::McpError;
+    use std::sync::Mutex;
+
+    // ── ProgressNotificationSender ───────────────────────────────────
+
+    #[test]
+    fn progress_sender_sends_notification_without_total() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-1"), move |req| {
+            sent_clone.lock().unwrap().push(req)
+        });
+
+        sender.send_progress(0.5, None, None);
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].method, "notifications/progress");
+        let params = messages[0].params.as_ref().unwrap();
+        assert_eq!(params["progress"], 0.5);
+        assert!(params.get("total").is_none() || params["total"].is_null());
+    }
+
+    #[test]
+    fn progress_sender_sends_notification_with_total() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-2"), move |req| {
+            sent_clone.lock().unwrap().push(req)
+        });
+
+        sender.send_progress(3.0, Some(10.0), None);
+
+        let messages = sent.lock().unwrap();
+        let params = messages[0].params.as_ref().unwrap();
+        assert_eq!(params["progress"], 3.0);
+        assert_eq!(params["total"], 10.0);
+    }
+
+    #[test]
+    fn progress_sender_sends_notification_with_message() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-3"), move |req| {
+            sent_clone.lock().unwrap().push(req)
+        });
+
+        sender.send_progress(1.0, Some(5.0), Some("loading"));
+
+        let messages = sent.lock().unwrap();
+        let params = messages[0].params.as_ref().unwrap();
+        assert_eq!(params["message"], "loading");
+    }
+
+    #[test]
+    fn progress_sender_debug_format() {
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-dbg"), |_| {});
+        let debug = format!("{:?}", sender);
+        assert!(debug.contains("ProgressNotificationSender"));
+    }
+
+    #[test]
+    fn progress_sender_into_reporter() {
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-rpt"), |_| {});
+        let _reporter = sender.into_reporter();
+    }
+
+    // ── BidirectionalSenders ─────────────────────────────────────────
+
+    #[test]
+    fn bidirectional_senders_default_is_empty() {
+        let senders = BidirectionalSenders::new();
+        assert!(senders.sampling.is_none());
+        assert!(senders.elicitation.is_none());
+    }
+
+    #[test]
+    fn bidirectional_senders_debug_shows_presence() {
+        let senders = BidirectionalSenders::new();
+        let debug = format!("{:?}", senders);
+        assert!(debug.contains("sampling: false"));
+        assert!(debug.contains("elicitation: false"));
+    }
+
+    // ── create_context_with_progress ─────────────────────────────────
+
+    #[test]
+    fn create_context_no_progress_no_state() {
+        let cx = Cx::for_testing();
+        let ctx = create_context_with_progress(cx, 42, None, None, |_| {});
+        assert_eq!(ctx.request_id(), 42);
+    }
+
+    #[test]
+    fn create_context_with_progress_marker() {
+        let cx = Cx::for_testing();
+        let marker = ProgressMarker::from("ctx-pm");
+        let ctx = create_context_with_progress(cx, 7, Some(marker), None, |_| {});
+        assert_eq!(ctx.request_id(), 7);
+    }
+
+    #[test]
+    fn create_context_with_state_only() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        state.set("k", &"v");
+        let ctx = create_context_with_progress(cx, 10, None, Some(state), |_| {});
+        let val: Option<String> = ctx.get_state("k");
+        assert_eq!(val.as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn create_context_with_progress_and_state() {
+        let cx = Cx::for_testing();
+        let marker = ProgressMarker::from("both");
+        let state = SessionState::new();
+        let ctx = create_context_with_progress(cx, 99, Some(marker), Some(state), |_| {});
+        assert_eq!(ctx.request_id(), 99);
+    }
+
+    // ── Minimal ToolHandler impl for testing ─────────────────────────
+
+    struct StubTool;
+
+    impl ToolHandler for StubTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "stub".to_string(),
+                description: Some("a stub tool".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(format!("echo: {args}"))])
+        }
+    }
+
+    #[test]
+    fn tool_handler_defaults_return_none() {
+        let tool = StubTool;
+        assert!(tool.icon().is_none());
+        assert!(tool.version().is_none());
+        assert!(tool.tags().is_empty());
+        assert!(tool.annotations().is_none());
+        assert!(tool.output_schema().is_none());
+        assert!(tool.timeout().is_none());
+    }
+
+    #[test]
+    fn tool_handler_call_sync() {
+        let tool = StubTool;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = tool.call(&ctx, serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn tool_handler_call_sync_error() {
+        struct FailTool;
+        impl ToolHandler for FailTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "fail".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Err(McpError::internal_error("boom"))
+            }
+        }
+
+        let tool = FailTool;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let err = tool.call(&ctx, serde_json::json!({})).unwrap_err();
+        assert!(err.message.contains("boom"));
+    }
+
+    // ── Minimal ResourceHandler impl for testing ─────────────────────
+
+    struct StubResource;
+
+    impl ResourceHandler for StubResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///stub".to_string(),
+                name: "stub".to_string(),
+                description: None,
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "file:///stub".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("hello".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn resource_handler_defaults_return_none() {
+        let res = StubResource;
+        assert!(res.template().is_none());
+        assert!(res.icon().is_none());
+        assert!(res.version().is_none());
+        assert!(res.tags().is_empty());
+        assert!(res.timeout().is_none());
+    }
+
+    #[test]
+    fn resource_handler_read_with_uri_delegates_to_read() {
+        let res = StubResource;
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let params = UriParams::new();
+        let result = res.read_with_uri(&ctx, "file:///stub", &params).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── Minimal PromptHandler impl for testing ───────────────────────
+
+    struct StubPrompt;
+
+    impl PromptHandler for StubPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "stub".to_string(),
+                description: Some("a stub prompt".to_string()),
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _arguments: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn prompt_handler_defaults_return_none() {
+        let prompt = StubPrompt;
+        assert!(prompt.icon().is_none());
+        assert!(prompt.version().is_none());
+        assert!(prompt.tags().is_empty());
+        assert!(prompt.timeout().is_none());
+    }
+
+    // ── MountedToolHandler ───────────────────────────────────────────
+
+    #[test]
+    fn mounted_tool_handler_overrides_name() {
+        let inner = Box::new(StubTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "prefix_stub".to_string());
+        let def = mounted.definition();
+        assert_eq!(def.name, "prefix_stub");
+        assert_eq!(def.description.as_deref(), Some("a stub tool"));
+    }
+
+    #[test]
+    fn mounted_tool_handler_delegates_defaults() {
+        let inner = Box::new(StubTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_stub".to_string());
+        assert!(mounted.tags().is_empty());
+        assert!(mounted.annotations().is_none());
+        assert!(mounted.output_schema().is_none());
+        assert!(mounted.timeout().is_none());
+    }
+
+    #[test]
+    fn mounted_tool_handler_delegates_call() {
+        let inner = Box::new(StubTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_stub".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = mounted.call(&ctx, serde_json::json!({})).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    // ── MountedResourceHandler ───────────────────────────────────────
+
+    #[test]
+    fn mounted_resource_handler_overrides_uri() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///mounted".to_string());
+        let def = mounted.definition();
+        assert_eq!(def.uri, "file:///mounted");
+        assert_eq!(def.name, "stub");
+    }
+
+    #[test]
+    fn mounted_resource_handler_template_none_by_default() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        assert!(mounted.template().is_none());
+    }
+
+    #[test]
+    fn mounted_resource_handler_with_template() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let tmpl = ResourceTemplate {
+            uri_template: "file:///items/{id}".to_string(),
+            name: "items".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let mounted =
+            MountedResourceHandler::with_template(inner, "file:///items/{id}".to_string(), tmpl);
+        let t = mounted.template().expect("template set");
+        assert_eq!(t.uri_template, "file:///items/{id}");
+    }
+
+    #[test]
+    fn mounted_resource_handler_delegates_read() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = mounted.read(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn mounted_resource_handler_delegates_tags() {
+        let inner = Box::new(StubResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        assert!(mounted.tags().is_empty());
+    }
+
+    // ── MountedPromptHandler ─────────────────────────────────────────
+
+    #[test]
+    fn mounted_prompt_handler_overrides_name() {
+        let inner = Box::new(StubPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns_stub".to_string());
+        let def = mounted.definition();
+        assert_eq!(def.name, "ns_stub");
+        assert_eq!(def.description.as_deref(), Some("a stub prompt"));
+    }
+
+    #[test]
+    fn mounted_prompt_handler_delegates_defaults() {
+        let inner = Box::new(StubPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns_stub".to_string());
+        assert!(mounted.tags().is_empty());
+        assert!(mounted.timeout().is_none());
+    }
+
+    #[test]
+    fn mounted_prompt_handler_delegates_get() {
+        let inner = Box::new(StubPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns_stub".to_string());
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = mounted.get(&ctx, HashMap::new()).unwrap();
+        assert!(result.is_empty());
+    }
+}
