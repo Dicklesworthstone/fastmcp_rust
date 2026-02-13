@@ -1271,4 +1271,349 @@ mod tests {
         assert!(server.has_resources());
         assert!(server.has_prompts());
     }
+
+    // ── Console configuration extended ─────────────────────────────
+
+    #[test]
+    fn builder_with_console_config() {
+        let config = ConsoleConfig::new().with_banner(BannerStyle::None);
+        let builder = ServerBuilder::new("srv", "1.0").with_console_config(config);
+        assert_eq!(builder.console_config().banner_style, BannerStyle::None);
+    }
+
+    #[test]
+    fn builder_with_traffic_logging() {
+        let builder = ServerBuilder::new("srv", "1.0").with_traffic_logging(TrafficVerbosity::Full);
+        let config = builder.console_config();
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
+    }
+
+    #[test]
+    fn builder_with_periodic_stats() {
+        let builder = ServerBuilder::new("srv", "1.0").with_periodic_stats(30);
+        let config = builder.console_config();
+        assert_eq!(config.stats_interval_secs, 30);
+    }
+
+    #[test]
+    fn builder_force_color() {
+        let builder = ServerBuilder::new("srv", "1.0").force_color();
+        let _config = builder.console_config();
+        // Just verify the chain completes without panic
+    }
+
+    // ── Logging config ─────────────────────────────────────────────
+
+    #[test]
+    fn builder_logging_full_config() {
+        let config = LoggingConfig {
+            level: Level::Trace,
+            timestamps: false,
+            targets: false,
+            file_line: true,
+        };
+        let _builder = ServerBuilder::new("srv", "1.0").logging(config);
+    }
+
+    // ── List page size ─────────────────────────────────────────────
+
+    #[test]
+    fn builder_list_page_size() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .list_page_size(50)
+            .tool(TestTool)
+            .build();
+        assert!(server.has_tools());
+    }
+
+    // ── Resource template ──────────────────────────────────────────
+
+    #[test]
+    fn builder_resource_template_enables_capability() {
+        let template = ResourceTemplate {
+            uri_template: "file://{path}".to_string(),
+            name: "Template".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let server = ServerBuilder::new("srv", "1.0")
+            .resource_template(template)
+            .build();
+        assert!(server.capabilities().resources.is_some());
+    }
+
+    // ── Middleware ──────────────────────────────────────────────────
+
+    struct NoopMiddleware;
+    impl crate::Middleware for NoopMiddleware {}
+
+    #[test]
+    fn builder_middleware() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .middleware(NoopMiddleware)
+            .build();
+        let _ = server;
+    }
+
+    #[test]
+    fn builder_multiple_middleware() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .middleware(NoopMiddleware)
+            .middleware(NoopMiddleware)
+            .build();
+        let _ = server;
+    }
+
+    // ── Auth provider ──────────────────────────────────────────────
+
+    struct TestAuthProvider;
+    impl crate::AuthProvider for TestAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            _request: crate::auth::AuthRequest<'_>,
+        ) -> McpResult<fastmcp_core::AuthContext> {
+            Ok(fastmcp_core::AuthContext::with_subject("test-user"))
+        }
+    }
+
+    #[test]
+    fn builder_auth_provider() {
+        let server = ServerBuilder::new("srv", "1.0")
+            .auth_provider(TestAuthProvider)
+            .build();
+        let _ = server;
+    }
+
+    // ── auto_mask_errors ───────────────────────────────────────────
+
+    #[test]
+    fn builder_auto_mask_errors() {
+        // In debug builds (test mode), auto_mask_errors defaults to false
+        let builder = ServerBuilder::new("srv", "1.0").auto_mask_errors();
+        // In debug_assertions mode, masking should be disabled
+        assert!(!builder.is_error_masking_enabled());
+    }
+
+    // ── Duplicate behavior error ───────────────────────────────────
+
+    struct DupTool(&'static str);
+    impl crate::ToolHandler for DupTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.0.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("ok")])
+        }
+    }
+
+    #[test]
+    fn builder_on_duplicate_error_logs_but_continues() {
+        // With DuplicateBehavior::Error, duplicate registration logs error
+        // but builder doesn't panic
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Error)
+            .tool(DupTool("dup"))
+            .tool(DupTool("dup")) // duplicate - will log error
+            .build();
+        assert!(server.has_tools());
+    }
+
+    // ── Mount ──────────────────────────────────────────────────────
+
+    #[test]
+    fn builder_mount_with_prefix() {
+        let source = ServerBuilder::new("sub", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount(source, Some("sub"))
+            .build();
+
+        assert!(main.has_tools());
+        assert!(main.has_resources());
+        assert!(main.has_prompts());
+    }
+
+    #[test]
+    fn builder_mount_without_prefix() {
+        let source = ServerBuilder::new("sub", "1.0").tool(TestTool).build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount(source, None)
+            .build();
+
+        assert!(main.has_tools());
+    }
+
+    #[test]
+    fn builder_mount_tools_only() {
+        let source = ServerBuilder::new("sub", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount_tools(source, Some("sub"))
+            .build();
+
+        assert!(main.has_tools());
+        // Resources and prompts should NOT be mounted
+        assert!(!main.has_resources());
+        assert!(!main.has_prompts());
+    }
+
+    #[test]
+    fn builder_mount_resources_only() {
+        let source = ServerBuilder::new("sub", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount_resources(source, Some("data"))
+            .build();
+
+        assert!(!main.has_tools());
+        assert!(main.has_resources());
+        assert!(!main.has_prompts());
+    }
+
+    #[test]
+    fn builder_mount_prompts_only() {
+        let source = ServerBuilder::new("sub", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount_prompts(source, Some("tmpl"))
+            .build();
+
+        assert!(!main.has_tools());
+        assert!(!main.has_resources());
+        assert!(main.has_prompts());
+    }
+
+    #[test]
+    fn builder_mount_empty_server() {
+        let source = ServerBuilder::new("empty", "1.0").build();
+
+        let main = ServerBuilder::new("main", "1.0")
+            .mount(source, Some("empty"))
+            .build();
+
+        assert!(!main.has_tools());
+        assert!(!main.has_resources());
+        assert!(!main.has_prompts());
+    }
+
+    // ── Proxy registration ─────────────────────────────────────────
+
+    #[test]
+    fn builder_proxy_with_catalog() {
+        use crate::proxy::{ProxyCatalog, ProxyClient};
+
+        struct DummyBackend;
+        impl crate::proxy::ProxyBackend for DummyBackend {
+            fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+                Ok(vec![])
+            }
+            fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+                Ok(vec![])
+            }
+            fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+                Ok(vec![])
+            }
+            fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+                Ok(vec![])
+            }
+            fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn call_tool_with_progress(
+                &mut self,
+                _: &str,
+                _: serde_json::Value,
+                _: crate::proxy::ProgressCallback<'_>,
+            ) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+            fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+            fn get_prompt(
+                &mut self,
+                _: &str,
+                _: std::collections::HashMap<String, String>,
+            ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                Ok(vec![])
+            }
+        }
+
+        let client = ProxyClient::from_backend(DummyBackend);
+        let catalog = ProxyCatalog {
+            tools: vec![Tool {
+                name: "proxy-tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }],
+            ..ProxyCatalog::default()
+        };
+
+        let server = ServerBuilder::new("srv", "1.0")
+            .proxy(client, catalog)
+            .build();
+        assert!(server.has_tools());
+    }
+
+    // ── DEFAULT_REQUEST_TIMEOUT_SECS constant ──────────────────────
+
+    #[test]
+    fn default_request_timeout_constant() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    // ── mask_error_details toggling ────────────────────────────────
+
+    #[test]
+    fn builder_mask_error_details_toggle() {
+        let builder = ServerBuilder::new("srv", "1.0")
+            .mask_error_details(true)
+            .mask_error_details(false);
+        assert!(!builder.is_error_masking_enabled());
+    }
+
+    // ── strict_input_validation toggling ────────────────────────────
+
+    #[test]
+    fn builder_strict_validation_toggle() {
+        let builder = ServerBuilder::new("srv", "1.0")
+            .strict_input_validation(true)
+            .strict_input_validation(false);
+        assert!(!builder.is_strict_input_validation_enabled());
+    }
 }
