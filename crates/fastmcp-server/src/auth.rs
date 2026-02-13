@@ -1082,6 +1082,160 @@ mod tests {
         assert_eq!(token.scheme, "Bearer");
         assert_eq!(token.token, "abc");
     }
+
+    // ── _meta / headers non-object fallthrough ──────────────────────
+
+    #[test]
+    fn access_token_meta_non_object_falls_through_to_headers() {
+        let params = serde_json::json!({
+            "_meta": 42,
+            "headers": {"authorization": "Bearer hdr"}
+        });
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req.access_token().expect("should skip non-object _meta");
+        assert_eq!(token.token, "hdr");
+    }
+
+    #[test]
+    fn access_token_headers_non_object_returns_none() {
+        let params = serde_json::json!({
+            "_meta": {"other": true},
+            "headers": "not-an-object"
+        });
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    // ── Non-string, non-object values in map fields ─────────────────
+
+    #[test]
+    fn access_token_map_field_with_numeric_value_returns_none() {
+        let params = serde_json::json!({"authorization": 12345});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn access_token_map_field_with_bool_value_returns_none() {
+        let params = serde_json::json!({"token": true});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    #[test]
+    fn access_token_map_field_with_array_value_returns_none() {
+        let params = serde_json::json!({"authorization": ["Bearer", "tok"]});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        assert!(req.access_token().is_none());
+    }
+
+    // ── extract_from_value nested accessToken key ───────────────────
+
+    #[test]
+    fn access_token_nested_object_with_access_token_key() {
+        let params = serde_json::json!({
+            "auth": {
+                "accessToken": "Bearer nested-at"
+            }
+        });
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let token = req
+            .access_token()
+            .expect("should extract from nested accessToken");
+        assert_eq!(token.token, "nested-at");
+    }
+
+    // ── StaticTokenVerifier with empty allowed_schemes ──────────────
+
+    #[test]
+    fn static_verifier_empty_allowed_schemes_rejects_all() {
+        let verifier = StaticTokenVerifier::new([("tok", AuthContext::anonymous())])
+            .with_allowed_schemes(Vec::<String>::new());
+        let req = AuthRequest {
+            method: "test",
+            params: None,
+            request_id: 1,
+        };
+        let err = verifier
+            .verify(
+                &ctx(),
+                req,
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: "tok".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.message.contains("Unsupported auth scheme"));
+    }
+
+    // ── TokenAuthProvider with scheme restriction in verifier ────────
+
+    #[test]
+    fn token_auth_provider_with_scheme_restriction() {
+        let verifier = StaticTokenVerifier::new([("secret", AuthContext::with_subject("user"))])
+            .with_allowed_schemes(["Bearer"]);
+        let provider = TokenAuthProvider::new(verifier);
+
+        // Basic scheme rejected by verifier
+        let params = serde_json::json!({"authorization": "Basic secret"});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let err = provider.authenticate(&ctx(), req).unwrap_err();
+        assert!(err.message.contains("Unsupported"));
+
+        // Bearer scheme accepted
+        let params = serde_json::json!({"authorization": "Bearer secret"});
+        let req = AuthRequest {
+            method: "test",
+            params: Some(&params),
+            request_id: 1,
+        };
+        let auth = provider.authenticate(&ctx(), req).unwrap();
+        assert_eq!(auth.subject, Some("user".to_string()));
+    }
+
+    // ── AuthRequest with all fields populated ───────────────────────
+
+    #[test]
+    fn auth_request_exposes_all_fields() {
+        let params = serde_json::json!({"key": "val"});
+        let req = AuthRequest {
+            method: "prompts/get",
+            params: Some(&params),
+            request_id: 99,
+        };
+        assert_eq!(req.method, "prompts/get");
+        assert_eq!(req.request_id, 99);
+        assert!(req.params.is_some());
+    }
 }
 
 #[cfg(all(test, feature = "jwt"))]
