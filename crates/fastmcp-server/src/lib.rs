@@ -2186,4 +2186,68 @@ mod lib_unit_tests {
         // After drop, the entry should be removed
         assert_eq!(map.lock().unwrap().len(), 0);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-cd79)
+    // =========================================================================
+
+    #[test]
+    fn logging_config_debug_and_clone() {
+        let config = LoggingConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("LoggingConfig"));
+        assert!(debug.contains("Info"));
+
+        let cloned = config.clone();
+        assert_eq!(cloned.level, Level::Info);
+        assert_eq!(cloned.timestamps, config.timestamps);
+    }
+
+    #[test]
+    fn transport_lock_error_is_io() {
+        let err = transport_lock_error();
+        match err {
+            TransportError::Io(io) => {
+                assert!(io.to_string().contains("poisoned"));
+            }
+            other => panic!("expected Io variant, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifespan_hooks_default_matches_new() {
+        let default_hooks = LifespanHooks::default();
+        let new_hooks = LifespanHooks::new();
+        assert!(default_hooks.on_startup.is_none());
+        assert!(default_hooks.on_shutdown.is_none());
+        assert!(new_hooks.on_startup.is_none());
+        assert!(new_hooks.on_shutdown.is_none());
+    }
+
+    #[test]
+    fn request_completion_wait_resolves_on_concurrent_done() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let rc = Arc::new(RequestCompletion::new());
+        let rc_clone = rc.clone();
+
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            rc_clone.mark_done();
+        });
+
+        // Should resolve within the timeout because the other thread marks done
+        assert!(rc.wait_timeout(Duration::from_secs(2)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn active_request_stores_region_id() {
+        let cx = Cx::for_testing();
+        let expected_region = cx.region_id();
+        let completion = Arc::new(RequestCompletion::new());
+        let ar = ActiveRequest::new(cx, completion);
+        assert_eq!(ar.region_id, expected_region);
+    }
 }
