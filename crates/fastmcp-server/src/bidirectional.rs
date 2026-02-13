@@ -896,6 +896,300 @@ mod tests {
         let _cloned = roots.clone();
     }
 
+    // ── lock_pending with poisoned mutex ─────────────────────────────
+
+    #[test]
+    fn pending_requests_lock_pending_recovers_from_poison() {
+        let pr = Arc::new(PendingRequests::new());
+        let id = pr.next_request_id();
+        let _rx = pr.register(id.clone());
+
+        // Poison the mutex by panicking while holding the lock
+        let pr2 = Arc::clone(&pr);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pr2.pending.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // lock_pending should recover from poison (into_inner)
+        // Routing should still work
+        let response = JsonRpcResponse::success(id, serde_json::json!("recovered"));
+        assert!(pr.route_response(&response));
+        let result = _rx.recv().unwrap().unwrap();
+        assert_eq!(result, serde_json::json!("recovered"));
+    }
+
+    // ── TransportSamplingSender — create_message ─────────────────────
+
+    fn make_sender_with_responder(
+        responder: impl Fn(&JsonRpcRequest) -> serde_json::Value + Send + Sync + 'static,
+    ) -> RequestSender {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_clone = Arc::clone(&pending);
+        let send_fn: TransportSendFn = Arc::new(move |msg| {
+            if let JsonRpcMessage::Request(req) = msg {
+                let id = req.id.clone().unwrap();
+                let result = responder(req);
+                let response = JsonRpcResponse::success(id, result);
+                pending_clone.route_response(&response);
+            }
+            Ok(())
+        });
+        RequestSender::new(pending, send_fn)
+    }
+
+    #[test]
+    fn transport_sampling_sender_create_message_text() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "content": {"type": "text", "text": "Hello world"},
+                "role": "assistant",
+                "model": "test-model",
+                "stopReason": "endTurn"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![fastmcp_core::SamplingRequestMessage {
+                role: SamplingRole::User,
+                text: "Hi".to_string(),
+            }],
+            max_tokens: 100,
+            system_prompt: Some("Be helpful".to_string()),
+            temperature: Some(0.7),
+            stop_sequences: vec!["STOP".to_string()],
+            model_hints: vec![],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.model, "test-model");
+        assert!(matches!(result.stop_reason, SamplingStopReason::EndTurn));
+    }
+
+    #[test]
+    fn transport_sampling_sender_create_message_image() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "content": {"type": "image", "data": "aW1hZ2VkYXRh", "mimeType": "image/png"},
+                "role": "assistant",
+                "model": "vision-model",
+                "stopReason": "maxTokens"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![fastmcp_core::SamplingRequestMessage {
+                role: SamplingRole::User,
+                text: "Describe image".to_string(),
+            }],
+            max_tokens: 50,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: vec![],
+            model_hints: vec![],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        // Image content is formatted as "[image: N bytes, type: ...]"
+        assert!(result.text.contains("image"));
+        assert!(result.text.contains("image/png"));
+        assert_eq!(result.model, "vision-model");
+        assert!(matches!(result.stop_reason, SamplingStopReason::MaxTokens));
+    }
+
+    #[test]
+    fn transport_sampling_sender_create_message_with_model_hints() {
+        let sender = make_sender_with_responder(|req| {
+            // Verify model_preferences was sent
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            assert!(params["modelPreferences"]["hints"].is_array());
+            serde_json::json!({
+                "content": {"type": "text", "text": "ok"},
+                "role": "assistant",
+                "model": "preferred",
+                "stopReason": "stopSequence"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![fastmcp_core::SamplingRequestMessage {
+                role: SamplingRole::User,
+                text: "Hi".to_string(),
+            }],
+            max_tokens: 10,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: vec![],
+            model_hints: vec!["claude-3".to_string()],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert!(matches!(
+            result.stop_reason,
+            SamplingStopReason::StopSequence
+        ));
+    }
+
+    #[test]
+    fn transport_sampling_sender_create_message_assistant_role() {
+        let sender = make_sender_with_responder(|req| {
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            assert_eq!(params["messages"][0]["role"], "assistant");
+            serde_json::json!({
+                "content": {"type": "text", "text": "continued"},
+                "role": "assistant",
+                "model": "m",
+                "stopReason": "endTurn"
+            })
+        });
+        let sampling = TransportSamplingSender::new(sender);
+
+        let request = SamplingRequest {
+            messages: vec![fastmcp_core::SamplingRequestMessage {
+                role: SamplingRole::Assistant,
+                text: "Previous response".to_string(),
+            }],
+            max_tokens: 10,
+            system_prompt: None,
+            temperature: None,
+            stop_sequences: vec![],
+            model_hints: vec![],
+        };
+
+        let future = SamplingSender::create_message(&sampling, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert_eq!(result.text, "continued");
+    }
+
+    // ── TransportElicitationSender — elicit ──────────────────────────
+
+    #[test]
+    fn transport_elicitation_sender_form_accept_with_content() {
+        let sender = make_sender_with_responder(|req| {
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            assert_eq!(params["mode"], "form");
+            serde_json::json!({
+                "action": "accept",
+                "content": {
+                    "name": "Alice",
+                    "age": 30,
+                    "active": true,
+                    "score": 9.5,
+                    "tags": ["a", "b"],
+                    "empty": null
+                }
+            })
+        });
+        let elicitation = TransportElicitationSender::new(sender);
+
+        let request = ElicitationRequest {
+            message: "Fill the form".to_string(),
+            mode: ElicitationMode::Form,
+            schema: Some(serde_json::json!({"type": "object"})),
+            url: None,
+            elicitation_id: None,
+        };
+
+        let future = ElicitationSender::elicit(&elicitation, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert!(matches!(result.action, ElicitationAction::Accept));
+        let content = result.content.unwrap();
+        assert_eq!(content["name"], serde_json::json!("Alice"));
+        assert_eq!(content["age"], serde_json::json!(30));
+        assert_eq!(content["active"], serde_json::json!(true));
+        assert_eq!(content["score"], serde_json::json!(9.5));
+        assert_eq!(content["tags"], serde_json::json!(["a", "b"]));
+        assert_eq!(content["empty"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn transport_elicitation_sender_form_decline() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "action": "decline"
+            })
+        });
+        let elicitation = TransportElicitationSender::new(sender);
+
+        let request = ElicitationRequest {
+            message: "Confirm?".to_string(),
+            mode: ElicitationMode::Form,
+            schema: None,
+            url: None,
+            elicitation_id: None,
+        };
+
+        let future = ElicitationSender::elicit(&elicitation, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert!(matches!(result.action, ElicitationAction::Decline));
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn transport_elicitation_sender_url_mode() {
+        let sender = make_sender_with_responder(|req| {
+            let params: serde_json::Value =
+                serde_json::from_value(req.params.clone().unwrap()).unwrap();
+            assert_eq!(params["mode"], "url");
+            assert_eq!(params["url"], "https://example.com/auth");
+            serde_json::json!({
+                "action": "cancel"
+            })
+        });
+        let elicitation = TransportElicitationSender::new(sender);
+
+        let request = ElicitationRequest {
+            message: "Please authenticate".to_string(),
+            mode: ElicitationMode::Url,
+            schema: None,
+            url: Some("https://example.com/auth".to_string()),
+            elicitation_id: Some("eid-123".to_string()),
+        };
+
+        let future = ElicitationSender::elicit(&elicitation, request);
+        let result = fastmcp_core::block_on(future).unwrap();
+        assert!(matches!(result.action, ElicitationAction::Cancel));
+    }
+
+    // ── TransportRootsProvider — list_roots ──────────────────────────
+
+    #[test]
+    fn transport_roots_provider_list_roots() {
+        let sender = make_sender_with_responder(|_| {
+            serde_json::json!({
+                "roots": [
+                    {"uri": "file:///home/user/project", "name": "Project"},
+                    {"uri": "file:///tmp"}
+                ]
+            })
+        });
+        let roots = TransportRootsProvider::new(sender);
+        let result = roots.list_roots().unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].uri, "file:///home/user/project");
+        assert_eq!(result[0].name, Some("Project".to_string()));
+        assert_eq!(result[1].uri, "file:///tmp");
+        assert!(result[1].name.is_none());
+    }
+
+    #[test]
+    fn transport_roots_provider_empty_roots() {
+        let sender = make_sender_with_responder(|_| serde_json::json!({ "roots": [] }));
+        let roots = TransportRootsProvider::new(sender);
+        let result = roots.list_roots().unwrap();
+        assert!(result.is_empty());
+    }
+
     // ── RequestSender ID cleanup after success ───────────────────────
 
     #[test]
