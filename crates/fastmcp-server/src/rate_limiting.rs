@@ -675,4 +675,377 @@ mod tests {
         assert_eq!(i32::from(err.code), RATE_LIMIT_ERROR_CODE);
         assert_eq!(err.message, "test");
     }
+
+    // ========================================
+    // rate_limit_error / RATE_LIMIT_ERROR_CODE
+    // ========================================
+
+    #[test]
+    fn rate_limit_error_code_value() {
+        assert_eq!(RATE_LIMIT_ERROR_CODE, -32005);
+    }
+
+    #[test]
+    fn rate_limit_error_from_string() {
+        let err = rate_limit_error(String::from("custom message"));
+        assert_eq!(err.message, "custom message");
+        assert_eq!(i32::from(err.code), RATE_LIMIT_ERROR_CODE);
+    }
+
+    // ========================================
+    // TokenBucketRateLimiter — additional
+    // ========================================
+
+    #[test]
+    fn token_bucket_debug() {
+        let limiter = TokenBucketRateLimiter::new(10, 5.0);
+        let debug = format!("{:?}", limiter);
+        assert!(debug.contains("TokenBucketRateLimiter"));
+        assert!(debug.contains("10"));
+    }
+
+    #[test]
+    fn token_bucket_consume_multiple_at_once() {
+        let limiter = TokenBucketRateLimiter::new(10, 1.0);
+        // Consume 5 at once — should succeed
+        assert!(limiter.try_consume(5));
+        // Consume another 5 — should succeed (exactly 10 tokens)
+        assert!(limiter.try_consume(5));
+        // No tokens left
+        assert!(!limiter.try_consume(1));
+    }
+
+    #[test]
+    fn token_bucket_consume_more_than_capacity() {
+        let limiter = TokenBucketRateLimiter::new(5, 1.0);
+        // Request more than capacity — should fail immediately
+        assert!(!limiter.try_consume(6));
+        // Bucket still has tokens (nothing was consumed on failure)
+        assert!(limiter.try_consume(5));
+    }
+
+    #[test]
+    fn token_bucket_available_tokens_caps_at_capacity() {
+        let limiter = TokenBucketRateLimiter::new(5, 1000.0); // Very high refill
+        // Even with high refill rate, wait a bit — should not exceed capacity
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(limiter.available_tokens() <= 5.0 + 0.1);
+    }
+
+    #[test]
+    fn token_bucket_available_tokens_after_full_drain() {
+        let limiter = TokenBucketRateLimiter::new(3, 1.0);
+        limiter.try_consume(3);
+        assert!(limiter.available_tokens() < 1.0);
+    }
+
+    // ========================================
+    // SlidingWindowRateLimiter — additional
+    // ========================================
+
+    #[test]
+    fn sliding_window_debug() {
+        let limiter = SlidingWindowRateLimiter::new(100, 60);
+        let debug = format!("{:?}", limiter);
+        assert!(debug.contains("SlidingWindowRateLimiter"));
+        assert!(debug.contains("100"));
+    }
+
+    #[test]
+    fn sliding_window_current_requests_starts_at_zero() {
+        let limiter = SlidingWindowRateLimiter::new(10, 60);
+        assert_eq!(limiter.current_requests(), 0);
+    }
+
+    #[test]
+    fn sliding_window_denied_request_not_counted() {
+        let limiter = SlidingWindowRateLimiter::new(2, 60);
+        assert!(limiter.is_allowed());
+        assert!(limiter.is_allowed());
+        assert!(!limiter.is_allowed()); // denied
+        // Only 2 requests counted (not the denied one)
+        assert_eq!(limiter.current_requests(), 2);
+    }
+
+    // ========================================
+    // RateLimitingMiddleware — construction/Debug
+    // ========================================
+
+    #[test]
+    fn rate_limiting_middleware_default_burst_capacity() {
+        let m = RateLimitingMiddleware::new(10.0);
+        // Default burst capacity is 2x rate = 20
+        assert_eq!(m.burst_capacity, 20);
+        assert!(!m.global_limit);
+        assert!(m.global_limiter.is_none());
+        assert!(m.get_client_id.is_none());
+    }
+
+    #[test]
+    fn rate_limiting_middleware_debug() {
+        let m = RateLimitingMiddleware::new(10.0)
+            .burst_capacity(30)
+            .global();
+        let debug = format!("{:?}", m);
+        assert!(debug.contains("RateLimitingMiddleware"));
+        assert!(debug.contains("30"));
+        assert!(debug.contains("true")); // global_limit
+    }
+
+    #[test]
+    fn rate_limiting_middleware_global_creates_limiter() {
+        let m = RateLimitingMiddleware::new(5.0).global();
+        assert!(m.global_limit);
+        assert!(m.global_limiter.is_some());
+    }
+
+    #[test]
+    fn rate_limiting_middleware_burst_capacity_without_global() {
+        let m = RateLimitingMiddleware::new(10.0).burst_capacity(50);
+        // No global limiter created when not in global mode
+        assert!(m.global_limiter.is_none());
+        assert_eq!(m.burst_capacity, 50);
+    }
+
+    #[test]
+    fn rate_limiting_middleware_burst_capacity_with_global_recreates_limiter() {
+        let m = RateLimitingMiddleware::new(10.0).global().burst_capacity(3);
+        assert_eq!(m.burst_capacity, 3);
+        // Global limiter should exist with new capacity
+        assert!(m.global_limiter.is_some());
+
+        let ctx = test_context();
+        let req = test_request("test");
+        // Should allow exactly 3 requests (burst capacity)
+        assert!(m.on_request(&ctx, &req).is_ok());
+        assert!(m.on_request(&ctx, &req).is_ok());
+        assert!(m.on_request(&ctx, &req).is_ok());
+        assert!(m.on_request(&ctx, &req).is_err());
+    }
+
+    // ========================================
+    // RateLimitingMiddleware — client ID extraction
+    // ========================================
+
+    #[test]
+    fn rate_limiting_middleware_no_extractor_uses_global_key() {
+        let m = RateLimitingMiddleware::new(10.0);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "global");
+    }
+
+    #[test]
+    fn rate_limiting_middleware_extractor_returning_none_uses_global() {
+        let m = RateLimitingMiddleware::new(10.0).client_id_extractor(|_ctx, _req| None);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "global");
+    }
+
+    #[test]
+    fn rate_limiting_middleware_extractor_returning_some() {
+        let m = RateLimitingMiddleware::new(10.0)
+            .client_id_extractor(|_ctx, _req| Some("user-42".to_string()));
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "user-42");
+    }
+
+    // ========================================
+    // RateLimitingMiddleware — per-client without extractor
+    // ========================================
+
+    #[test]
+    fn rate_limiting_middleware_per_client_no_extractor_all_share_global_key() {
+        // Without an extractor, per-client mode defaults all to "global"
+        let m = RateLimitingMiddleware::new(10.0).burst_capacity(2);
+        let ctx = test_context();
+        let req_a = test_request("method_a");
+        let req_b = test_request("method_b");
+
+        // Both methods share the same "global" bucket
+        assert!(m.on_request(&ctx, &req_a).is_ok());
+        assert!(m.on_request(&ctx, &req_b).is_ok());
+        // Bucket exhausted for both
+        assert!(m.on_request(&ctx, &req_a).is_err());
+    }
+
+    #[test]
+    fn rate_limiting_middleware_error_msg_per_client() {
+        let m = RateLimitingMiddleware::new(10.0)
+            .burst_capacity(1)
+            .client_id_extractor(|_ctx, _req| Some("alice".to_string()));
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(
+            err.message
+                .contains("Rate limit exceeded for client: alice")
+        );
+    }
+
+    #[test]
+    fn rate_limiting_middleware_error_msg_global() {
+        let m = RateLimitingMiddleware::new(10.0).burst_capacity(1).global();
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(err.message.contains("Global rate limit exceeded"));
+    }
+
+    // ========================================
+    // SlidingWindowRateLimitingMiddleware — construction/Debug
+    // ========================================
+
+    #[test]
+    fn sliding_window_middleware_new_fields() {
+        let m = SlidingWindowRateLimitingMiddleware::new(50, 120);
+        assert_eq!(m.max_requests, 50);
+        assert_eq!(m.window_seconds, 120);
+        assert!(m.get_client_id.is_none());
+    }
+
+    #[test]
+    fn sliding_window_middleware_per_minute_converts() {
+        let m = SlidingWindowRateLimitingMiddleware::per_minute(100, 5);
+        assert_eq!(m.max_requests, 100);
+        assert_eq!(m.window_seconds, 300); // 5 * 60
+    }
+
+    #[test]
+    fn sliding_window_middleware_debug() {
+        let m = SlidingWindowRateLimitingMiddleware::new(50, 120);
+        let debug = format!("{:?}", m);
+        assert!(debug.contains("SlidingWindowRateLimitingMiddleware"));
+        assert!(debug.contains("50"));
+        assert!(debug.contains("120"));
+    }
+
+    // ========================================
+    // SlidingWindowRateLimitingMiddleware — client ID
+    // ========================================
+
+    #[test]
+    fn sliding_window_middleware_no_extractor_uses_global() {
+        let m = SlidingWindowRateLimitingMiddleware::new(10, 60);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "global");
+    }
+
+    #[test]
+    fn sliding_window_middleware_extractor_returning_none_uses_global() {
+        let m =
+            SlidingWindowRateLimitingMiddleware::new(10, 60).client_id_extractor(|_ctx, _req| None);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "global");
+    }
+
+    #[test]
+    fn sliding_window_middleware_extractor_returning_some() {
+        let m = SlidingWindowRateLimitingMiddleware::new(10, 60)
+            .client_id_extractor(|_ctx, _req| Some("bob".to_string()));
+        let ctx = test_context();
+        let req = test_request("tools/call");
+        let id = m.get_client_identifier(&ctx, &req);
+        assert_eq!(id, "bob");
+    }
+
+    // ========================================
+    // SlidingWindowRateLimitingMiddleware — per-client
+    // ========================================
+
+    #[test]
+    fn sliding_window_middleware_per_client() {
+        let m = SlidingWindowRateLimitingMiddleware::new(1, 60)
+            .client_id_extractor(|_ctx, req| Some(req.method.clone()));
+        let ctx = test_context();
+        let req_a = test_request("method_a");
+        let req_b = test_request("method_b");
+
+        // Each client gets their own window
+        assert!(m.on_request(&ctx, &req_a).is_ok());
+        assert!(m.on_request(&ctx, &req_b).is_ok());
+
+        // Both exhausted
+        assert!(m.on_request(&ctx, &req_a).is_err());
+        assert!(m.on_request(&ctx, &req_b).is_err());
+    }
+
+    // ========================================
+    // SlidingWindowRateLimitingMiddleware — error messages
+    // ========================================
+
+    #[test]
+    fn sliding_window_middleware_error_msg_seconds() {
+        let m = SlidingWindowRateLimitingMiddleware::new(1, 30);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(err.message.contains("30 second(s)"));
+        assert!(err.message.contains("client: global"));
+    }
+
+    #[test]
+    fn sliding_window_middleware_error_msg_minutes() {
+        let m = SlidingWindowRateLimitingMiddleware::new(1, 120);
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(err.message.contains("2 minute(s)"));
+    }
+
+    #[test]
+    fn sliding_window_middleware_error_msg_with_client_id() {
+        let m = SlidingWindowRateLimitingMiddleware::new(1, 60)
+            .client_id_extractor(|_ctx, _req| Some("alice".to_string()));
+        let ctx = test_context();
+        let req = test_request("tools/call");
+
+        m.on_request(&ctx, &req).unwrap();
+        let err = m.on_request(&ctx, &req).unwrap_err();
+        assert!(err.message.contains("client: alice"));
+        assert_eq!(i32::from(err.code), RATE_LIMIT_ERROR_CODE);
+    }
+
+    // ========================================
+    // Edge cases
+    // ========================================
+
+    #[test]
+    fn rate_limiting_middleware_get_or_create_limiter_creates_new() {
+        let m = RateLimitingMiddleware::new(10.0).burst_capacity(2);
+        // First call for a new client creates a limiter
+        assert!(m.get_or_create_limiter("new-client"));
+        // Second call reuses the same limiter
+        assert!(m.get_or_create_limiter("new-client"));
+        // Third call exhausts it
+        assert!(!m.get_or_create_limiter("new-client"));
+    }
+
+    #[test]
+    fn sliding_window_middleware_is_request_allowed_creates_new() {
+        let m = SlidingWindowRateLimitingMiddleware::new(2, 60);
+        assert!(m.is_request_allowed("c1"));
+        assert!(m.is_request_allowed("c1"));
+        assert!(!m.is_request_allowed("c1"));
+
+        // Different client gets its own limiter
+        assert!(m.is_request_allowed("c2"));
+    }
 }
