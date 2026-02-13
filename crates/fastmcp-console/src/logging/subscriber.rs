@@ -402,6 +402,80 @@ mod tests {
         assert!(debug.contains("level_filter"));
     }
 
+    #[test]
+    fn field_collector_record_typed_values() {
+        use tracing::field::FieldSet;
+
+        let mut collector = FieldCollector::default();
+        let fields = FieldSet::new(
+            &["flag", "count_i", "count_u", "ratio"],
+            tracing::callsite::Identifier(&NOP_CALLSITE),
+        );
+
+        let flag = fields.field("flag").unwrap();
+        collector.record_bool(&flag, true);
+
+        let count_i = fields.field("count_i").unwrap();
+        collector.record_i64(&count_i, -42);
+
+        let count_u = fields.field("count_u").unwrap();
+        collector.record_u64(&count_u, 100);
+
+        let ratio = fields.field("ratio").unwrap();
+        collector.record_f64(&ratio, 3.14);
+
+        assert_eq!(collector.fields.len(), 4);
+        assert_eq!(
+            collector.fields[0],
+            ("flag".to_string(), "true".to_string())
+        );
+        assert_eq!(
+            collector.fields[1],
+            ("count_i".to_string(), "-42".to_string())
+        );
+        assert_eq!(
+            collector.fields[2],
+            ("count_u".to_string(), "100".to_string())
+        );
+        assert_eq!(
+            collector.fields[3],
+            ("ratio".to_string(), "3.14".to_string())
+        );
+    }
+
+    #[test]
+    fn field_collector_record_debug_format() {
+        use tracing::field::FieldSet;
+
+        let mut collector = FieldCollector::default();
+        let fields = FieldSet::new(&["data"], tracing::callsite::Identifier(&NOP_CALLSITE));
+        let field = fields.field("data").unwrap();
+        collector.record_debug(&field, &vec![1, 2, 3]);
+
+        assert_eq!(collector.fields.len(), 1);
+        assert_eq!(collector.fields[0].0, "data");
+        assert_eq!(collector.fields[0].1, "[1, 2, 3]");
+    }
+
+    #[test]
+    fn builder_default_matches_new() {
+        let def = RichSubscriberBuilder::default();
+        let new = RichSubscriberBuilder::new();
+        assert_eq!(def.show_timestamps, new.show_timestamps);
+        assert_eq!(def.show_targets, new.show_targets);
+        assert_eq!(def.show_file_line, new.show_file_line);
+        assert_eq!(def.max_width, new.max_width);
+        assert_eq!(def.level_filter, new.level_filter);
+    }
+
+    #[test]
+    fn builder_with_max_width_none_clears() {
+        let builder = RichSubscriberBuilder::new()
+            .with_max_width(Some(80))
+            .with_max_width(None);
+        assert_eq!(builder.max_width, None);
+    }
+
     // Minimal callsite for field tests.
     static NOP_CALLSITE: NopCallsite = NopCallsite;
 
