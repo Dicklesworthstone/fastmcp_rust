@@ -13,6 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::{Budget, CancelKind, Cx};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{info, targets};
 use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
 use fastmcp_derive::tool;
@@ -6290,5 +6292,33 @@ mod builder_tests {
             )
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn tools_list_handles_extreme_cursor_offset_without_overflow() {
+        let router = ServerBuilder::new("s", "0.1")
+            .list_page_size(2)
+            .tool(BuilderT1Tool)
+            .build()
+            .into_router();
+
+        let payload = serde_json::json!({ "offset": usize::MAX });
+        let cursor = BASE64_STANDARD
+            .encode(serde_json::to_vec(&payload).expect("extreme cursor payload should serialize"));
+
+        let cx = Cx::for_testing();
+        let page = router
+            .handle_tools_list(
+                &cx,
+                fastmcp_protocol::ListToolsParams {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("tools/list should not overflow on extreme cursor offset");
+
+        assert!(page.tools.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 }

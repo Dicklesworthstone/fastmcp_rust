@@ -747,7 +747,7 @@ impl Router {
         };
 
         let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = (offset + page_size).min(tools.len());
+        let end = offset.saturating_add(page_size).min(tools.len());
         let next_cursor = if end < tools.len() {
             Some(encode_cursor_offset(end))
         } else {
@@ -932,7 +932,7 @@ impl Router {
         };
 
         let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = (offset + page_size).min(resources.len());
+        let end = offset.saturating_add(page_size).min(resources.len());
         let next_cursor = if end < resources.len() {
             Some(encode_cursor_offset(end))
         } else {
@@ -970,7 +970,7 @@ impl Router {
         };
 
         let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = (offset + page_size).min(templates.len());
+        let end = offset.saturating_add(page_size).min(templates.len());
         let next_cursor = if end < templates.len() {
             Some(encode_cursor_offset(end))
         } else {
@@ -1109,7 +1109,7 @@ impl Router {
         };
 
         let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = (offset + page_size).min(prompts.len());
+        let end = offset.saturating_add(page_size).min(prompts.len());
         let next_cursor = if end < prompts.len() {
             Some(encode_cursor_offset(end))
         } else {
@@ -1259,7 +1259,7 @@ impl Router {
 
         let limit = params.limit.unwrap_or(50).max(1) as usize;
         let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = (offset + limit).min(tasks.len());
+        let end = offset.saturating_add(limit).min(tasks.len());
         let next_cursor = if end < tasks.len() {
             Some(encode_cursor_offset(end))
         } else {
