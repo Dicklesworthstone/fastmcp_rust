@@ -604,4 +604,218 @@ mod tests {
         assert_eq!(transform.required, Some(true));
         assert!(!transform.hide);
     }
+
+    // ── ArgTransform type helpers ─────────────────────────────────────
+
+    #[test]
+    fn arg_transform_default_int() {
+        let t = ArgTransform::new().default_int(42);
+        assert_eq!(t.default, Some(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn arg_transform_default_bool() {
+        let t = ArgTransform::new().default_bool(true);
+        assert_eq!(t.default, Some(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn arg_transform_type_schema() {
+        let schema = serde_json::json!({"type": "number", "minimum": 0});
+        let t = ArgTransform::new().type_schema(schema.clone());
+        assert_eq!(t.type_schema, Some(schema));
+    }
+
+    #[test]
+    fn arg_transform_drop_with_default() {
+        let t = ArgTransform::drop_with_default("auto");
+        assert!(t.hide);
+        assert_eq!(t.default, Some(serde_json::json!("auto")));
+    }
+
+    #[test]
+    fn arg_transform_hide_sets_flag() {
+        let t = ArgTransform::new().hide();
+        assert!(t.hide);
+    }
+
+    #[test]
+    fn arg_transform_debug() {
+        let t = ArgTransform::new().name("x");
+        let debug = format!("{:?}", t);
+        assert!(debug.contains("ArgTransform"));
+    }
+
+    #[test]
+    fn arg_transform_clone() {
+        let t = ArgTransform::new().name("x").default_int(5);
+        let c = t.clone();
+        assert_eq!(c.name, Some("x".to_string()));
+        assert_eq!(c.default, Some(serde_json::json!(5)));
+    }
+
+    // ── TransformedTool accessors ─────────────────────────────────────
+
+    #[test]
+    fn transformed_tool_parent_definition() {
+        let tool = SearchToolFixture::new("original");
+        let transformed = TransformedTool::from_tool(tool).name("renamed").build();
+        let parent_def = transformed.parent_definition();
+        assert_eq!(parent_def.name, "original");
+    }
+
+    #[test]
+    fn transformed_tool_arg_transforms_accessor() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .build();
+        let transforms = transformed.arg_transforms();
+        assert!(transforms.contains_key("q"));
+    }
+
+    #[test]
+    fn transformed_tool_debug_format() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool).name("dbg_tool").build();
+        let debug = format!("{:?}", transformed);
+        assert!(debug.contains("TransformedTool"));
+        assert!(debug.contains("dbg_tool"));
+    }
+
+    #[test]
+    fn transformed_tool_from_boxed() {
+        let tool = Box::new(SearchToolFixture::new("boxed")) as BoxedToolHandler;
+        let transformed = TransformedTool::from_boxed(tool).name("unboxed").build();
+        assert_eq!(transformed.definition().name, "unboxed");
+    }
+
+    // ── transform_arguments edge cases ───────────────────────────────
+
+    #[test]
+    fn transform_arguments_null_treated_as_empty() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool).hide_arg("n", 10).build();
+
+        let result = transformed
+            .transform_arguments(serde_json::Value::Null)
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("n").unwrap(), 10);
+    }
+
+    #[test]
+    fn transform_arguments_non_object_returns_error() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool).build();
+
+        let result = transformed.transform_arguments(serde_json::json!("bad"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Arguments must be an object"));
+    }
+
+    #[test]
+    fn transform_arguments_passthrough_unknown_args() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .build();
+
+        let input = serde_json::json!({
+            "query": "test",
+            "extra": "value"
+        });
+        let result = transformed.transform_arguments(input).unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("q").unwrap(), "test");
+        assert_eq!(obj.get("extra").unwrap(), "value");
+    }
+
+    #[test]
+    fn transform_arguments_hidden_without_default_errors() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new().hide())
+            .build();
+
+        let result = transformed.transform_arguments(serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Hidden argument 'q' requires a default value")
+        );
+    }
+
+    // ── ToolHandler impl ─────────────────────────────────────────────
+
+    #[test]
+    fn transformed_tool_call_delegates_with_mapped_args() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = transformed
+            .call(&ctx, serde_json::json!({"query": "hello"}))
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn transformed_tool_call_with_invalid_args_returns_error() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool).build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = transformed.call(&ctx, serde_json::json!("string_not_object"));
+        assert!(result.is_err());
+    }
+
+    // ── Builder keeps parent properties ──────────────────────────────
+
+    #[test]
+    fn builder_no_name_keeps_parent_name() {
+        let tool = SearchToolFixture::new("original_name");
+        let transformed = TransformedTool::from_tool(tool).build();
+        assert_eq!(transformed.definition().name, "original_name");
+    }
+
+    #[test]
+    fn builder_no_description_keeps_parent_description() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool).build();
+        assert_eq!(
+            transformed.definition().description,
+            Some("Search tool".to_string())
+        );
+    }
+
+    // ── Schema transform: description override ───────────────────────
+
+    #[test]
+    fn transform_schema_applies_description_override() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new().description("Full search query"))
+            .build();
+
+        let def = transformed.definition();
+        let q_schema = &def.input_schema["properties"]["q"];
+        assert_eq!(q_schema["description"], "Full search query");
+    }
+
+    // ── NotSet sentinel ──────────────────────────────────────────────
+
+    #[test]
+    fn not_set_debug() {
+        let n = NotSet;
+        let debug = format!("{:?}", n);
+        assert!(debug.contains("NotSet"));
+    }
 }
