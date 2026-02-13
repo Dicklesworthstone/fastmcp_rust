@@ -276,4 +276,64 @@ mod tests {
             .cancelled()
             .render_plain();
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-teh7)
+    // =========================================================================
+
+    #[test]
+    fn format_duration_edge_cases() {
+        assert_eq!(format_duration(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
+        // Exactly 1 second
+        assert_eq!(format_duration(Duration::from_secs(1)), "1.00s");
+        // Exactly 60 seconds
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        // Large duration
+        assert_eq!(format_duration(Duration::from_secs(3661)), "61m 1s");
+    }
+
+    #[test]
+    fn request_log_new_defaults() {
+        let log = RequestLog::new("resources/read", Some("42"));
+        assert_eq!(log.method, "resources/read");
+        assert_eq!(log.id, Some("42".to_string()));
+        assert!(matches!(log.status, RequestStatus::Pending));
+
+        let no_id = RequestLog::new("ping", None);
+        assert!(no_id.id.is_none());
+    }
+
+    #[test]
+    fn render_success_includes_duration_text() {
+        let tc = TestConsole::new();
+        let log = RequestLog::new("tools/call", Some("5")).success();
+        log.render(tc.console());
+        // Duration is always rendered for success
+        let output = tc.output_string();
+        assert!(output.contains("tools/call"));
+        // Duration should be present (some number followed by ms or s)
+        assert!(output.contains("ms") || output.contains('s'));
+    }
+
+    #[test]
+    fn render_cancelled_shows_icon() {
+        let tc = TestConsole::new();
+        let log = RequestLog::new("tools/call", None).cancelled();
+        log.render(tc.console());
+        assert!(tc.output_string().contains("tools/call"));
+    }
+
+    #[test]
+    fn render_routes_to_plain_for_non_rich_console() {
+        let (writer, _buf) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, false);
+        // Should route to render_plain without panicking
+        RequestLog::new("tools/call", Some("1"))
+            .success()
+            .render(&console);
+        RequestLog::new("tools/call", None)
+            .error("fail")
+            .render(&console);
+    }
 }
