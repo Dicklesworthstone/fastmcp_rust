@@ -327,3 +327,293 @@ pub trait TwoPhaseTransport: Transport {
     /// Returns `TransportError::Cancelled` if the request has been cancelled.
     fn reserve_send(&mut self, cx: &Cx) -> Result<SendPermit<'_, Self::Writer>, TransportError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Codec, CodecError, SendPermit, Transport, TransportError, TwoPhaseTransport};
+    use asupersync::Cx;
+    use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+    use std::error::Error;
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        sent: Vec<JsonRpcMessage>,
+        closed: bool,
+    }
+
+    impl Transport for RecordingTransport {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent.push(message.clone());
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            Err(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed = true;
+            Ok(())
+        }
+    }
+
+    struct TwoPhaseFixture {
+        writer: Vec<u8>,
+        codec: Codec,
+    }
+
+    impl Default for TwoPhaseFixture {
+        fn default() -> Self {
+            Self {
+                writer: Vec::new(),
+                codec: Codec::new(),
+            }
+        }
+    }
+
+    impl Transport for TwoPhaseFixture {
+        fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            let permit = self.reserve_send(cx)?;
+            permit.send(message)
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            Err(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    impl TwoPhaseTransport for TwoPhaseFixture {
+        type Writer = Vec<u8>;
+
+        fn reserve_send(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<SendPermit<'_, Self::Writer>, TransportError> {
+            if cx.is_cancel_requested() {
+                return Err(TransportError::Cancelled);
+            }
+
+            Ok(SendPermit::new(&mut self.writer, &self.codec))
+        }
+    }
+
+    fn test_error(message: &str) -> Box<dyn Error> {
+        std::io::Error::other(message).into()
+    }
+
+    fn require(condition: bool, message: &str) -> Result<(), Box<dyn Error>> {
+        if condition {
+            Ok(())
+        } else {
+            Err(test_error(message))
+        }
+    }
+
+    #[test]
+    fn transport_error_predicates_match_variants() -> Result<(), Box<dyn Error>> {
+        require(
+            TransportError::Cancelled.is_cancelled(),
+            "cancelled flag mismatch",
+        )?;
+        require(
+            !TransportError::Timeout.is_cancelled(),
+            "timeout should not be cancelled",
+        )?;
+        require(TransportError::Closed.is_closed(), "closed flag mismatch")?;
+        require(
+            !TransportError::Timeout.is_closed(),
+            "timeout should not be closed",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn transport_error_display_and_source_are_exposed() -> Result<(), Box<dyn Error>> {
+        let io_error = std::io::Error::other("write failed");
+        let io_transport_error = TransportError::Io(io_error);
+        require(
+            io_transport_error.to_string() == "I/O error: write failed",
+            "io display mismatch",
+        )?;
+        require(
+            io_transport_error.source().is_some(),
+            "io source should exist",
+        )?;
+
+        let json_error = match serde_json::from_str::<serde_json::Value>("not json") {
+            Err(err) => err,
+            Ok(_) => return Err(test_error("invalid json unexpectedly parsed")),
+        };
+        let codec_error = CodecError::from(json_error);
+        let codec_transport_error = TransportError::Codec(codec_error);
+        require(
+            codec_transport_error
+                .to_string()
+                .starts_with("Codec error: JSON error:"),
+            "codec display mismatch",
+        )?;
+        require(
+            codec_transport_error.source().is_some(),
+            "codec source should exist",
+        )?;
+
+        require(
+            TransportError::Timeout.source().is_none(),
+            "timeout should not have source",
+        )?;
+        require(
+            TransportError::Closed.source().is_none(),
+            "closed should not have source",
+        )?;
+        require(
+            TransportError::Cancelled.source().is_none(),
+            "cancelled should not have source",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn transport_error_from_conversions_wrap_underlying_types() -> Result<(), Box<dyn Error>> {
+        let io_transport_error = TransportError::from(std::io::Error::other("socket closed"));
+        require(
+            matches!(io_transport_error, TransportError::Io(_)),
+            "io conversion mismatch",
+        )?;
+
+        let json_error = match serde_json::from_str::<serde_json::Value>("bad json") {
+            Err(err) => err,
+            Ok(_) => return Err(test_error("invalid json unexpectedly parsed")),
+        };
+        let codec_transport_error = TransportError::from(CodecError::from(json_error));
+        require(
+            matches!(codec_transport_error, TransportError::Codec(_)),
+            "codec conversion mismatch",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn send_request_wraps_request_message() -> Result<(), Box<dyn Error>> {
+        let mut transport = RecordingTransport::default();
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::new("tools/list", None, 7i64);
+
+        transport.send_request(&cx, &request)?;
+
+        require(transport.sent.len() == 1, "expected one sent message")?;
+        match &transport.sent[0] {
+            JsonRpcMessage::Request(req) => {
+                require(req.method == "tools/list", "request method mismatch")?;
+                require(
+                    req.id == Some(RequestId::Number(7)),
+                    "request id mismatch for wrapped message",
+                )?;
+            }
+            JsonRpcMessage::Response(_) => {
+                return Err(test_error("expected request message"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_response_wraps_response_message() -> Result<(), Box<dyn Error>> {
+        let mut transport = RecordingTransport::default();
+        let cx = Cx::for_testing();
+        let response = JsonRpcResponse::success(
+            RequestId::Number(9),
+            serde_json::json!({"server": "fastmcp"}),
+        );
+
+        transport.send_response(&cx, &response)?;
+
+        require(transport.sent.len() == 1, "expected one sent message")?;
+        match &transport.sent[0] {
+            JsonRpcMessage::Response(resp) => {
+                require(
+                    resp.id == Some(RequestId::Number(9)),
+                    "response id mismatch for wrapped message",
+                )?;
+            }
+            JsonRpcMessage::Request(_) => {
+                return Err(test_error("expected response message"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_permit_writes_request_bytes() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let request = JsonRpcRequest::new("resources/list", None, 11i64);
+
+        let permit = fixture.reserve_send(&cx)?;
+        permit.send_request(&request)?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        match &messages[0] {
+            JsonRpcMessage::Request(req) => {
+                require(
+                    req.method == "resources/list",
+                    "decoded request method mismatch",
+                )?;
+                require(
+                    req.id == Some(RequestId::Number(11)),
+                    "decoded request id mismatch",
+                )?;
+            }
+            JsonRpcMessage::Response(_) => {
+                return Err(test_error("expected request message"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_permit_writes_response_bytes() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        let mut fixture = TwoPhaseFixture::default();
+        let response =
+            JsonRpcResponse::success(RequestId::Number(22), serde_json::json!({"status": "ok"}));
+
+        let permit = fixture.reserve_send(&cx)?;
+        permit.send_response(&response)?;
+
+        let mut decode_codec = Codec::new();
+        let messages = decode_codec.decode(&fixture.writer)?;
+        require(messages.len() == 1, "expected one decoded message")?;
+        match &messages[0] {
+            JsonRpcMessage::Response(resp) => {
+                require(
+                    resp.id == Some(RequestId::Number(22)),
+                    "decoded response id mismatch",
+                )?;
+            }
+            JsonRpcMessage::Request(_) => {
+                return Err(test_error("expected response message"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_send_returns_cancelled_when_context_is_cancelled() -> Result<(), Box<dyn Error>> {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let mut fixture = TwoPhaseFixture::default();
+
+        let result = fixture.reserve_send(&cx);
+
+        match result {
+            Err(TransportError::Cancelled) => Ok(()),
+            _ => Err(test_error("reserve_send should return cancelled")),
+        }
+    }
+}
