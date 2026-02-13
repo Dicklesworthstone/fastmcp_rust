@@ -1696,4 +1696,150 @@ mod tests {
             other => panic!("expected Ok, got {:?}", other),
         }
     }
+
+    // ── Additional coverage ─────────────────────────────────────────
+
+    #[test]
+    fn progress_sender_with_message_but_no_total() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-msg"), move |req| {
+            sent_clone.lock().unwrap().push(req);
+        });
+
+        sender.send_progress(2.0, None, Some("processing"));
+
+        let messages = sent.lock().unwrap();
+        let params = messages[0].params.as_ref().unwrap();
+        assert_eq!(params["progress"], 2.0);
+        assert_eq!(params["message"], "processing");
+        assert!(params.get("total").is_none() || params["total"].is_null());
+    }
+
+    #[test]
+    fn progress_notification_includes_progress_token() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender =
+            ProgressNotificationSender::new(ProgressMarker::from("my-token"), move |req| {
+                sent_clone.lock().unwrap().push(req);
+            });
+
+        sender.send_progress(1.0, None, None);
+
+        let messages = sent.lock().unwrap();
+        let params = messages[0].params.as_ref().unwrap();
+        assert_eq!(params["progressToken"], "my-token");
+    }
+
+    #[test]
+    fn resource_read_async_propagates_error() {
+        struct ErrResource;
+        impl ResourceHandler for ErrResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "file:///err".to_string(),
+                    name: "err".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Err(McpError::internal_error("read-fail"))
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(ErrResource.read_async(&ctx));
+        match outcome {
+            Outcome::Err(e) => assert!(e.message.contains("read-fail")),
+            other => panic!("expected Err, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prompt_get_async_propagates_error() {
+        struct ErrPrompt;
+        impl PromptHandler for ErrPrompt {
+            fn definition(&self) -> Prompt {
+                Prompt {
+                    name: "err".to_string(),
+                    description: None,
+                    arguments: vec![],
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                _args: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
+                Err(McpError::internal_error("get-fail"))
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let outcome = fastmcp_core::block_on(ErrPrompt.get_async(&ctx, HashMap::new()));
+        match outcome {
+            Outcome::Err(e) => assert!(e.message.contains("get-fail")),
+            other => panic!("expected Err, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_read_async_with_uri_nonempty_params_propagates_error() {
+        struct ErrWithUri;
+        impl ResourceHandler for ErrWithUri {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "file:///err".to_string(),
+                    name: "err".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![])
+            }
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                _uri: &str,
+                _params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Err(McpError::internal_error("uri-fail"))
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mut params = UriParams::new();
+        params.insert("id".to_string(), "1".to_string());
+        let outcome =
+            fastmcp_core::block_on(ErrWithUri.read_async_with_uri(&ctx, "file:///err", &params));
+        match outcome {
+            Outcome::Err(e) => assert!(e.message.contains("uri-fail")),
+            other => panic!("expected Err, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mounted_tool_definition_preserves_inner_fields() {
+        let inner = Box::new(StubTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "renamed".to_string());
+        let def = mounted.definition();
+        assert_eq!(def.name, "renamed");
+        assert_eq!(def.description.as_deref(), Some("a stub tool"));
+        assert_eq!(def.input_schema, serde_json::json!({"type": "object"}));
+    }
 }
