@@ -1987,3 +1987,203 @@ fn create_notification_sender() -> NotificationSender {
         }
     })
 }
+
+#[cfg(test)]
+mod lib_unit_tests {
+    use super::*;
+
+    // ── parse_params ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_params_none_returns_error() {
+        let result = parse_params::<serde_json::Value>(None);
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Missing required parameters"));
+    }
+
+    #[test]
+    fn parse_params_invalid_json_returns_error() {
+        // Pass a string where a struct is expected
+        let result = parse_params::<ListToolsParams>(Some(serde_json::json!("not_an_object")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_params_valid_json_succeeds() {
+        let result = parse_params::<ReadResourceParams>(Some(serde_json::json!({"uri": "x://y"})));
+        let params = result.unwrap();
+        assert_eq!(params.uri, "x://y");
+    }
+
+    // ── parse_params_or_default ─────────────────────────────────────
+
+    #[test]
+    fn parse_params_or_default_none_returns_default() {
+        let result = parse_params_or_default::<ListToolsParams>(None);
+        let params = result.unwrap();
+        assert!(params.cursor.is_none());
+    }
+
+    #[test]
+    fn parse_params_or_default_invalid_json_returns_error() {
+        let result =
+            parse_params_or_default::<ListToolsParams>(Some(serde_json::json!("bad_input")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_params_or_default_valid_json_succeeds() {
+        let result =
+            parse_params_or_default::<ListToolsParams>(Some(serde_json::json!({"cursor": "abc"})));
+        let params = result.unwrap();
+        assert_eq!(params.cursor.as_deref(), Some("abc"));
+    }
+
+    // ── request_id_to_u64 ───────────────────────────────────────────
+
+    #[test]
+    fn request_id_to_u64_number() {
+        let id = RequestId::Number(42);
+        assert_eq!(request_id_to_u64(Some(&id)), 42);
+    }
+
+    #[test]
+    fn request_id_to_u64_string() {
+        let id = RequestId::String("req-123".to_string());
+        let result = request_id_to_u64(Some(&id));
+        assert_ne!(result, 0);
+    }
+
+    #[test]
+    fn request_id_to_u64_none() {
+        assert_eq!(request_id_to_u64(None), 0);
+    }
+
+    // ── stable_hash_request_id ──────────────────────────────────────
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        let h1 = stable_hash_request_id("test");
+        let h2 = stable_hash_request_id("test");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn stable_hash_never_returns_zero() {
+        // Empty string and various inputs should never produce 0
+        assert_ne!(stable_hash_request_id(""), 0);
+        assert_ne!(stable_hash_request_id("a"), 0);
+    }
+
+    #[test]
+    fn stable_hash_different_inputs_differ() {
+        let h1 = stable_hash_request_id("alpha");
+        let h2 = stable_hash_request_id("beta");
+        assert_ne!(h1, h2);
+    }
+
+    // ── RequestCompletion ───────────────────────────────────────────
+
+    #[test]
+    fn request_completion_new_is_not_done() {
+        let rc = RequestCompletion::new();
+        assert!(!rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_mark_done_sets_done() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        assert!(rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_mark_done_idempotent() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        rc.mark_done(); // should not panic
+        assert!(rc.is_done());
+    }
+
+    #[test]
+    fn request_completion_wait_timeout_returns_true_if_done() {
+        let rc = RequestCompletion::new();
+        rc.mark_done();
+        assert!(rc.wait_timeout(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn request_completion_wait_timeout_returns_false_if_not_done() {
+        let rc = RequestCompletion::new();
+        assert!(!rc.wait_timeout(Duration::from_millis(10)));
+    }
+
+    // ── DuplicateBehavior ───────────────────────────────────────────
+
+    #[test]
+    fn duplicate_behavior_default_is_warn() {
+        assert_eq!(DuplicateBehavior::default(), DuplicateBehavior::Warn);
+    }
+
+    #[test]
+    fn duplicate_behavior_debug_and_clone() {
+        let b = DuplicateBehavior::Error;
+        let debug = format!("{:?}", b);
+        assert!(debug.contains("Error"));
+        let cloned = b;
+        assert_eq!(cloned, DuplicateBehavior::Error);
+    }
+
+    #[test]
+    fn duplicate_behavior_all_variants_are_distinct() {
+        assert_ne!(DuplicateBehavior::Error, DuplicateBehavior::Warn);
+        assert_ne!(DuplicateBehavior::Warn, DuplicateBehavior::Replace);
+        assert_ne!(DuplicateBehavior::Replace, DuplicateBehavior::Ignore);
+    }
+
+    // ── LoggingConfig ───────────────────────────────────────────────
+
+    #[test]
+    fn logging_config_default_values() {
+        let config = LoggingConfig::default();
+        assert_eq!(config.level, Level::Info);
+        assert!(config.timestamps);
+        assert!(config.targets);
+        assert!(!config.file_line);
+    }
+
+    // ── LifespanHooks ───────────────────────────────────────────────
+
+    #[test]
+    fn lifespan_hooks_new_has_no_hooks() {
+        let hooks = LifespanHooks::new();
+        assert!(hooks.on_startup.is_none());
+        assert!(hooks.on_shutdown.is_none());
+    }
+
+    // ── log_level_rank ──────────────────────────────────────────────
+
+    #[test]
+    fn log_level_rank_ordering() {
+        assert!(Server::log_level_rank(LogLevel::Debug) < Server::log_level_rank(LogLevel::Info));
+        assert!(Server::log_level_rank(LogLevel::Info) < Server::log_level_rank(LogLevel::Warning));
+        assert!(
+            Server::log_level_rank(LogLevel::Warning) < Server::log_level_rank(LogLevel::Error)
+        );
+    }
+
+    // ── ActiveRequestGuard ──────────────────────────────────────────
+
+    #[test]
+    fn active_request_guard_removes_on_drop() {
+        let map = Mutex::new(HashMap::new());
+        let cx = Cx::for_testing();
+        let id = RequestId::Number(1);
+        {
+            let _guard = ActiveRequestGuard::new(&map, id.clone(), cx);
+            assert_eq!(map.lock().unwrap().len(), 1);
+        }
+        // After drop, the entry should be removed
+        assert_eq!(map.lock().unwrap().len(), 0);
+    }
+}
