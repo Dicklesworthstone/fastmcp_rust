@@ -3207,6 +3207,171 @@ mod tests {
         assert!(types.contains(&"z".to_string()));
     }
 
+    // ========================================
+    // Worker — process_one with cancelled cx
+    // ========================================
+
+    #[test]
+    fn worker_process_one_cancelled_cx_returns_error() {
+        use fastmcp_core::block_on;
+
+        let docket = Docket::memory();
+        docket.submit("cancel_test", serde_json::json!({})).unwrap();
+
+        let worker = docket
+            .worker()
+            .subscribe("cancel_test", |_| async { Ok(serde_json::json!({})) })
+            .build();
+
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let result = block_on(worker.process_one(&cx));
+        assert!(result.is_err());
+    }
+
+    // ========================================
+    // Cancel with None reason sets error to None
+    // ========================================
+
+    #[test]
+    fn cancel_with_none_reason_sets_no_error() {
+        let docket = Docket::memory();
+        let id = docket.submit("t", serde_json::json!({})).unwrap();
+        docket.cancel(&id, None).unwrap();
+
+        let task = docket.get_task(&id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(task.error.is_none());
+    }
+
+    // ========================================
+    // to_task_info for Failed status
+    // ========================================
+
+    #[test]
+    fn docket_task_to_task_info_failed_has_completed_at() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t"),
+            "type".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Failed;
+        task.error = Some("crash".to_string());
+
+        let info = task.to_task_info();
+        assert_eq!(info.status, TaskStatus::Failed);
+        assert!(info.completed_at.is_some()); // Failed is terminal
+        assert_eq!(info.error, Some("crash".to_string()));
+    }
+
+    // ========================================
+    // Memory backend cancel nonexistent
+    // ========================================
+
+    #[test]
+    fn memory_backend_cancel_nonexistent_returns_error() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let result = backend.cancel(&TaskId::from_string("no-such"), None);
+        assert!(result.is_err());
+    }
+
+    // ========================================
+    // submit_with_options uses default max_retries
+    // ========================================
+
+    #[test]
+    fn submit_with_options_uses_default_max_retries() {
+        let settings = DocketSettings::memory().with_max_retries(7);
+        let docket = Docket::new(settings).unwrap();
+
+        // Submit without overriding max_retries
+        let id = docket
+            .submit_with_options("t", serde_json::json!({}), SubmitOptions::default())
+            .unwrap();
+
+        let task = docket.get_task(&id).unwrap().unwrap();
+        assert_eq!(task.max_retries, 7); // inherited from settings
+    }
+
+    // ========================================
+    // Same-priority FIFO ordering
+    // ========================================
+
+    #[test]
+    fn memory_backend_same_priority_fifo() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+
+        for i in 0..3 {
+            let task = DocketTask::new(
+                TaskId::from_string(format!("t-{i}")),
+                "fifo".into(),
+                serde_json::json!({}),
+                0, // same priority
+                3,
+            );
+            backend.enqueue(task).unwrap();
+        }
+
+        let first = backend.dequeue(&["fifo".to_string()]).unwrap().unwrap();
+        assert_eq!(first.id.to_string(), "t-0");
+        let second = backend.dequeue(&["fifo".to_string()]).unwrap().unwrap();
+        assert_eq!(second.id.to_string(), "t-1");
+        let third = backend.dequeue(&["fifo".to_string()]).unwrap().unwrap();
+        assert_eq!(third.id.to_string(), "t-2");
+    }
+
+    // ========================================
+    // requeue_stale skips invalid claimed_at
+    // ========================================
+
+    #[test]
+    fn memory_backend_requeue_stale_skips_invalid_claimed_at() {
+        let settings = DocketSettings::memory().with_visibility_timeout(Duration::from_millis(0));
+        let backend = MemoryDocketBackend::new(settings);
+
+        let task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Set as running with an invalid claimed_at
+        {
+            let mut tasks = backend.tasks.write().unwrap();
+            let t = tasks.get_mut(&TaskId::from_string("t1")).unwrap();
+            t.status = TaskStatus::Running;
+            t.claimed_at = Some("not-a-valid-timestamp".to_string());
+        }
+
+        // Should not requeue (can't parse claimed_at)
+        let requeued = backend.requeue_stale().unwrap();
+        assert_eq!(requeued, 0);
+
+        // Task should still be Running
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+    }
+
+    // ========================================
+    // DocketError::Cancelled into McpError
+    // ========================================
+
+    #[test]
+    fn docket_error_cancelled_into_mcp_error() {
+        let err = DocketError::Cancelled;
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("cancelled"));
+    }
+
     #[cfg(feature = "redis")]
     #[test]
     fn test_redis_requeue_stale_marks_failed_at_retry_limit() {
