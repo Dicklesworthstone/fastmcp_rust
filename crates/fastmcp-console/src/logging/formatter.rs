@@ -634,4 +634,165 @@ mod tests {
         // Should work without panicking
         let _ = formatter.format_level_badge(LogLevel::Info);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-m32k)
+    // =========================================================================
+
+    #[test]
+    fn truncate_text_exact_max_no_truncation() {
+        let formatter = test_formatter_agent().with_max_width(Some(5));
+        let event = LogEvent::new(LogLevel::Info, "Hello");
+        let formatted = formatter.format_event(&event);
+        // Exactly at max → no truncation
+        assert_eq!(formatted.message, "Hello");
+    }
+
+    #[test]
+    fn truncate_text_no_max_returns_full() {
+        let formatter = test_formatter_agent().with_max_width(None);
+        let event = LogEvent::new(
+            LogLevel::Info,
+            "A long message that should not be truncated at all",
+        );
+        let formatted = formatter.format_event(&event);
+        assert_eq!(
+            formatted.message,
+            "A long message that should not be truncated at all"
+        );
+    }
+
+    #[test]
+    fn truncate_text_width_one_and_two() {
+        // max <= 3 takes first max chars (no ellipsis)
+        let f1 = test_formatter_agent().with_max_width(Some(1));
+        let e = LogEvent::new(LogLevel::Info, "Hello");
+        assert_eq!(f1.format_event(&e).message, "H");
+
+        let f2 = test_formatter_agent().with_max_width(Some(2));
+        assert_eq!(f2.format_event(&e).message, "He");
+    }
+
+    #[test]
+    fn should_use_rich_agent_vs_human() {
+        let agent = test_formatter_agent();
+        assert!(!agent.should_use_rich());
+
+        let human = test_formatter_human();
+        assert!(human.should_use_rich());
+    }
+
+    #[test]
+    fn style_for_level_all_levels() {
+        let formatter = test_formatter_agent();
+        // Just verify each level returns a style without panicking
+        let _ = formatter.style_for_level(LogLevel::Error);
+        let _ = formatter.style_for_level(LogLevel::Warn);
+        let _ = formatter.style_for_level(LogLevel::Info);
+        let _ = formatter.style_for_level(LogLevel::Debug);
+        let _ = formatter.style_for_level(LogLevel::Trace);
+        // Debug and Trace should return the same muted style
+        assert!(std::ptr::eq(
+            formatter.style_for_level(LogLevel::Debug),
+            formatter.style_for_level(LogLevel::Trace)
+        ));
+    }
+
+    #[test]
+    fn formatted_log_to_line_minimal() {
+        // No timestamp, no target, no fields → just "badge message"
+        let log = FormattedLog {
+            level_badge: "[INFO ]".to_string(),
+            timestamp: None,
+            target: None,
+            message: "hello".to_string(),
+            fields: String::new(),
+        };
+        assert_eq!(log.to_line(), "[INFO ] hello");
+    }
+
+    #[test]
+    fn formatted_log_debug_and_clone() {
+        let log = FormattedLog {
+            level_badge: "[INFO ]".to_string(),
+            timestamp: Some("12:00:00".to_string()),
+            target: Some("server".to_string()),
+            message: "msg".to_string(),
+            fields: "k=v".to_string(),
+        };
+        let debug = format!("{log:?}");
+        assert!(debug.contains("FormattedLog"));
+
+        let cloned = log.clone();
+        assert_eq!(cloned.message, "msg");
+        assert_eq!(cloned.to_line(), log.to_line());
+    }
+
+    #[test]
+    fn log_level_as_str_and_traits() {
+        // as_str
+        assert_eq!(LogLevel::Error.as_str(), "ERROR");
+        assert_eq!(LogLevel::Warn.as_str(), "WARN");
+        assert_eq!(LogLevel::Info.as_str(), "INFO");
+        assert_eq!(LogLevel::Debug.as_str(), "DEBUG");
+        assert_eq!(LogLevel::Trace.as_str(), "TRACE");
+
+        // Debug
+        let debug = format!("{:?}", LogLevel::Error);
+        assert!(debug.contains("Error"));
+
+        // Clone + Copy
+        let level = LogLevel::Warn;
+        let copied = level;
+        assert_eq!(level, copied);
+    }
+
+    #[test]
+    fn log_event_debug_and_clone() {
+        let event = LogEvent::new(LogLevel::Info, "test")
+            .with_target("t")
+            .with_field("k", "v");
+
+        let debug = format!("{event:?}");
+        assert!(debug.contains("LogEvent"));
+        assert!(debug.contains("test"));
+
+        let cloned = event.clone();
+        assert_eq!(cloned.message, "test");
+        assert_eq!(cloned.target, Some("t".to_string()));
+        assert_eq!(cloned.fields.len(), 1);
+    }
+
+    #[test]
+    fn format_event_with_all_options_enabled() {
+        let formatter = test_formatter_agent()
+            .with_file_line(true)
+            .with_max_width(Some(50));
+
+        let event = LogEvent::new(LogLevel::Error, "Connection failed")
+            .with_target("fastmcp_rust::transport::http")
+            .with_timestamp("2026-01-01T00:00:00Z")
+            .with_file("src/transport/http.rs")
+            .with_line(42)
+            .with_field("peer", "127.0.0.1");
+
+        let formatted = formatter.format_event(&event);
+        assert_eq!(formatted.level_badge, "[ERROR]");
+        assert!(formatted.timestamp.is_some());
+        assert!(formatted.target.is_some());
+        // file:line should be in fields
+        assert!(formatted.fields.contains("file=src/transport/http.rs:42"));
+        assert!(formatted.fields.contains("peer=127.0.0.1"));
+    }
+
+    #[test]
+    fn format_target_rich_with_truncation() {
+        let formatter = test_formatter_human().with_max_width(Some(10));
+        let target = formatter
+            .format_target("fastmcp_rust::server::router::handler")
+            .unwrap();
+        // Should contain markup and be truncated
+        assert!(target.contains("[/]"));
+        assert!(target.contains("..."));
+    }
 }

@@ -1457,4 +1457,250 @@ mod tests {
         assert_ne!(id2, id3);
         assert!(id1.starts_with("trace-"));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-m32k)
+    // =========================================================================
+
+    #[test]
+    fn epoch_to_datetime_unix_epoch() {
+        let (year, month, day, hour, min, sec) = epoch_to_datetime(0);
+        assert_eq!((year, month, day, hour, min, sec), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn epoch_to_datetime_leap_year_feb29() {
+        // 2000-02-29 00:00:00 UTC = 951782400
+        let (year, month, day, hour, min, sec) = epoch_to_datetime(951_782_400);
+        assert_eq!(year, 2000);
+        assert_eq!(month, 2);
+        assert_eq!(day, 29);
+        assert_eq!((hour, min, sec), (0, 0, 0));
+    }
+
+    #[test]
+    fn epoch_to_datetime_year_end() {
+        // 2023-12-31 23:59:59 UTC = 1704067199
+        let (year, month, day, hour, min, sec) = epoch_to_datetime(1_704_067_199);
+        assert_eq!(year, 2023);
+        assert_eq!(month, 12);
+        assert_eq!(day, 31);
+        assert_eq!((hour, min, sec), (23, 59, 59));
+    }
+
+    #[test]
+    fn epoch_to_datetime_mid_year() {
+        // 2024-06-15 12:30:45 UTC = 1718451045
+        let (year, month, day, hour, min, sec) = epoch_to_datetime(1_718_451_045);
+        assert_eq!(year, 2024);
+        assert_eq!(month, 6);
+        assert_eq!(day, 15);
+        assert_eq!((hour, min, sec), (11, 30, 45));
+    }
+
+    #[test]
+    fn trace_entry_serde_roundtrip() {
+        let entries = vec![
+            TraceEntry::Request {
+                correlation_id: "c1".into(),
+                timestamp: "ts".into(),
+                method: "tools/list".into(),
+                params: Some(serde_json::json!({"x": 1})),
+                span_id: Some("s1".into()),
+            },
+            TraceEntry::Response {
+                correlation_id: "c1".into(),
+                timestamp: "ts".into(),
+                method: "tools/list".into(),
+                duration_ms: 42.5,
+                result: Some(serde_json::json!([])),
+                error: None,
+                span_id: None,
+            },
+            TraceEntry::SpanStart {
+                span_id: "s1".into(),
+                parent_span_id: None,
+                name: "test-span".into(),
+                timestamp: "ts".into(),
+            },
+            TraceEntry::SpanEnd {
+                span_id: "s1".into(),
+                timestamp: "ts".into(),
+                duration_ms: 10.0,
+                error: Some("failed".into()),
+            },
+            TraceEntry::Log {
+                timestamp: "ts".into(),
+                level: TraceLevel::Warn,
+                message: "warning".into(),
+                span_id: None,
+                data: None,
+            },
+            TraceEntry::Metric {
+                timestamp: "ts".into(),
+                name: "latency".into(),
+                value: 99.9,
+                unit: Some("ms".into()),
+                span_id: None,
+            },
+        ];
+
+        for entry in &entries {
+            let json = serde_json::to_string(entry).expect("serialize");
+            let back: TraceEntry = serde_json::from_str(&json).expect("deserialize");
+            let json2 = serde_json::to_string(&back).expect("re-serialize");
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn trace_summary_default_is_zeroed() {
+        let s = TraceSummary::default();
+        assert_eq!(s.request_count, 0);
+        assert_eq!(s.response_count, 0);
+        assert_eq!(s.success_count, 0);
+        assert_eq!(s.error_count, 0);
+        assert_eq!(s.span_count, 0);
+        assert!(s.method_counts.is_empty());
+        assert!(s.method_timings.is_empty());
+    }
+
+    #[test]
+    fn method_timing_default_values() {
+        let t = MethodTiming::default();
+        assert_eq!(t.count, 0);
+        assert_eq!(t.total_ms, 0.0);
+        assert!(t.min_ms.is_none());
+        assert!(t.max_ms.is_none());
+        assert!(t.mean_ms.is_none());
+    }
+
+    #[test]
+    fn request_within_span_gets_span_id() {
+        let mut trace = TestTrace::builder("span-req")
+            .with_console_output(false)
+            .build();
+
+        let span_id = trace.start_span("my-span");
+        let corr = trace.log_request("tools/call", Some(&serde_json::json!({})));
+        trace.log_response(&corr, Some(&serde_json::json!({})), None::<&()>);
+        trace.end_span(None);
+
+        // Request and response should have span_id set
+        match &trace.entries()[1] {
+            TraceEntry::Request {
+                span_id: sid,
+                method,
+                ..
+            } => {
+                assert_eq!(method, "tools/call");
+                assert_eq!(sid.as_deref(), Some(span_id.as_str()));
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+        match &trace.entries()[2] {
+            TraceEntry::Response {
+                span_id: sid,
+                method,
+                ..
+            } => {
+                assert_eq!(method, "tools/call");
+                assert_eq!(sid.as_deref(), Some(span_id.as_str()));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metric_within_span_gets_span_id() {
+        let mut trace = TestTrace::builder("span-metric")
+            .with_console_output(false)
+            .build();
+
+        let span_id = trace.start_span("measurement");
+        trace.metric("latency", 42.0, Some("ms"));
+        trace.end_span(None);
+
+        match &trace.entries()[1] {
+            TraceEntry::Metric {
+                span_id: sid,
+                name,
+                value,
+                unit,
+                ..
+            } => {
+                assert_eq!(name, "latency");
+                assert!((value - 42.0).abs() < f64::EPSILON);
+                assert_eq!(unit.as_deref(), Some("ms"));
+                assert_eq!(sid.as_deref(), Some(span_id.as_str()));
+            }
+            other => panic!("expected Metric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_output_empty_trace() {
+        let trace = TestTrace::builder("empty")
+            .with_console_output(false)
+            .build();
+
+        let output = trace.build_output();
+        assert_eq!(output.name, "empty");
+        assert!(output.entries.is_empty());
+        assert_eq!(output.summary.request_count, 0);
+        assert!(output.ended_at.is_some());
+        assert!(output.duration_ms.is_some());
+    }
+
+    #[test]
+    fn sanitize_filename_various_chars() {
+        let trace = TestTrace::builder("test")
+            .with_console_output(false)
+            .build();
+
+        assert_eq!(trace.sanitize_filename("hello world"), "hello_world");
+        assert_eq!(trace.sanitize_filename("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(trace.sanitize_filename("dots.and.more"), "dots_and_more");
+        assert_eq!(
+            trace.sanitize_filename("keep-dash_underscore"),
+            "keep-dash_underscore"
+        );
+        assert_eq!(trace.sanitize_filename("UPPER123"), "UPPER123");
+    }
+
+    #[test]
+    fn test_trace_output_serde_roundtrip() {
+        let mut trace = TestTrace::builder("roundtrip")
+            .with_console_output(false)
+            .with_metadata("ver", "1.0")
+            .build();
+
+        trace.info("hello");
+        let id = trace.log_request("tools/list", None::<&()>);
+        trace.log_response(&id, Some(&serde_json::json!([])), None::<&()>);
+
+        let output = trace.build_output();
+        let json = serde_json::to_string(&output).expect("serialize");
+        let back: TestTraceOutput = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.name, "roundtrip");
+        assert_eq!(back.entries.len(), output.entries.len());
+        assert_eq!(back.summary.request_count, 1);
+        assert_eq!(back.summary.response_count, 1);
+        assert_eq!(back.metadata["ver"], "1.0");
+    }
+
+    #[test]
+    fn trace_level_serde_roundtrip() {
+        for level in [
+            TraceLevel::Debug,
+            TraceLevel::Info,
+            TraceLevel::Warn,
+            TraceLevel::Error,
+        ] {
+            let json = serde_json::to_string(&level).expect("serialize");
+            let back: TraceLevel = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(level, back);
+        }
+    }
 }

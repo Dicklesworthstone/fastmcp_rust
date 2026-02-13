@@ -507,6 +507,55 @@ mod tests {
         assert!(output.contains("render_or rich"));
     }
 
+    // =========================================================================
+    // Additional coverage tests (bd-m32k)
+    // =========================================================================
+
+    #[test]
+    fn strip_markup_trailing_backslash() {
+        // Backslash at end of string with no following char
+        assert_eq!(strip_markup("path\\"), "path\\");
+    }
+
+    #[test]
+    fn strip_markup_backslash_non_special() {
+        // Backslash followed by a char that is NOT [ ] or \
+        assert_eq!(strip_markup("line\\n break"), "line\\n break");
+    }
+
+    #[test]
+    fn strip_markup_backslash_backslash_escape() {
+        // Double backslash → single backslash
+        assert_eq!(strip_markup("a\\\\b"), "a\\b");
+    }
+
+    #[test]
+    fn strip_markup_unclosed_tag() {
+        // Opening bracket with no closing bracket — consumes rest of string
+        assert_eq!(strip_markup("hello [bold no close"), "hello ");
+    }
+
+    #[test]
+    fn with_writer_plain_mode() {
+        let (writer, captured) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, false);
+
+        assert!(!console.is_rich());
+        console.print_plain("plain text");
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap_or_default();
+        assert!(output.contains("plain text"));
+    }
+
+    #[test]
+    fn console_default_impl() {
+        // Default should not panic and should produce a valid console
+        let console = FastMcpConsole::default();
+        // Width/height should return sensible values
+        assert!(console.width() > 0);
+        assert!(console.height() > 0);
+    }
+
     #[test]
     fn test_disabled_mode_branches_execute() {
         let console = FastMcpConsole::with_enabled(false);
