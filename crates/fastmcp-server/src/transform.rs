@@ -818,4 +818,274 @@ mod tests {
         let debug = format!("{:?}", n);
         assert!(debug.contains("NotSet"));
     }
+
+    #[test]
+    fn not_set_clone_copy() {
+        let n = NotSet;
+        let cloned = n.clone();
+        let copied = n; // Copy
+        let _ = (cloned, copied);
+    }
+
+    #[test]
+    fn not_set_default() {
+        let _n = NotSet::default();
+    }
+
+    // ── ArgTransform defaults ────────────────────────────────────────
+
+    #[test]
+    fn arg_transform_new_is_all_none() {
+        let t = ArgTransform::new();
+        assert!(t.name.is_none());
+        assert!(t.description.is_none());
+        assert!(t.default.is_none());
+        assert!(!t.hide);
+        assert!(t.required.is_none());
+        assert!(t.type_schema.is_none());
+    }
+
+    #[test]
+    fn arg_transform_default_trait() {
+        let t = <ArgTransform as Default>::default();
+        assert!(t.name.is_none());
+        assert!(!t.hide);
+    }
+
+    // ── Schema transform: type override ──────────────────────────────
+
+    #[test]
+    fn transform_schema_applies_type_override() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg(
+                "q",
+                ArgTransform::new().type_schema(serde_json::json!({"type": "number"})),
+            )
+            .build();
+
+        let def = transformed.definition();
+        let q_schema = &def.input_schema["properties"]["q"];
+        assert_eq!(q_schema["type"], "number");
+    }
+
+    // ── Schema transform: default value ──────────────────────────────
+
+    #[test]
+    fn transform_schema_applies_default_value() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new().default_int(25))
+            .build();
+
+        let def = transformed.definition();
+        let n_schema = &def.input_schema["properties"]["n"];
+        assert_eq!(n_schema["default"], 25);
+    }
+
+    // ── Schema rename updates required array ─────────────────────────
+
+    #[test]
+    fn transform_schema_rename_updates_required() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "query"));
+        assert!(!required.iter().any(|v| v == "q"));
+    }
+
+    // ── Schema hide removes from required ────────────────────────────
+
+    #[test]
+    fn transform_schema_hide_removes_from_required() {
+        // Make a tool where "q" is required, then hide it
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .hide_arg("q", "default-query")
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "q"));
+    }
+
+    // ── Combined transforms ──────────────────────────────────────────
+
+    #[test]
+    fn combined_rename_description_default() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg(
+                "n",
+                ArgTransform::new()
+                    .name("limit")
+                    .description("Max results")
+                    .default_int(10),
+            )
+            .build();
+
+        let def = transformed.definition();
+        let props = def.input_schema["properties"].as_object().unwrap();
+        assert!(!props.contains_key("n"));
+        let limit = props.get("limit").unwrap();
+        assert_eq!(limit["description"], "Max results");
+        assert_eq!(limit["default"], 10);
+    }
+
+    // ── build_definition preserves parent metadata ───────────────────
+
+    #[test]
+    fn build_definition_preserves_parent_output_schema() {
+        struct ToolWithOutputSchema;
+        impl ToolHandler for ToolWithOutputSchema {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "parent".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: Some(serde_json::json!({"type": "string"})),
+                    icon: None,
+                    version: Some("2.0".to_string()),
+                    tags: vec!["tag1".to_string()],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(ToolWithOutputSchema)
+            .name("child")
+            .build();
+        let def = transformed.definition();
+        assert_eq!(
+            def.output_schema,
+            Some(serde_json::json!({"type": "string"}))
+        );
+        assert_eq!(def.version, Some("2.0".to_string()));
+        assert_eq!(def.tags, vec!["tag1".to_string()]);
+    }
+
+    // ── transform_schema with non-object schema ──────────────────────
+
+    #[test]
+    fn transform_schema_non_object_returned_as_is() {
+        struct ArraySchemaTool;
+        impl ToolHandler for ArraySchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "arr".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!("not an object"),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(ArraySchemaTool)
+            .rename_arg("x", "y")
+            .build();
+        let def = transformed.definition();
+        // Schema is returned as-is since it's not an object
+        assert_eq!(def.input_schema, serde_json::json!("not an object"));
+    }
+
+    // ── Schema without properties or required ────────────────────────
+
+    #[test]
+    fn transform_schema_adds_properties_and_required_if_missing() {
+        struct MinimalSchemaTool;
+        impl ToolHandler for MinimalSchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "min".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(MinimalSchemaTool).build();
+        let def = transformed.definition();
+        assert!(def.input_schema["properties"].is_object());
+        assert!(def.input_schema["required"].is_array());
+    }
+
+    // ── TransformedTool call with hidden defaults ─────────────────────
+
+    #[test]
+    fn transformed_tool_call_injects_hidden_defaults() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .hide_arg("n", 5)
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = transformed
+            .call(&ctx, serde_json::json!({"query": "test"}))
+            .unwrap();
+        // The result should contain the search output with mapped args
+        assert_eq!(result.len(), 1);
+        if let Content::Text { text } = &result[0] {
+            assert!(text.contains("\"n\":5"));
+            assert!(text.contains("\"q\":\"test\""));
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    // ── transform_arg with no-op transform ───────────────────────────
+
+    #[test]
+    fn transform_arg_with_noop_keeps_original() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new())
+            .build();
+
+        let def = transformed.definition();
+        let props = def.input_schema["properties"].as_object().unwrap();
+        // q should still exist unchanged
+        assert!(props.contains_key("q"));
+    }
+
+    // ── transform_arg for non-existent arg ───────────────────────────
+
+    #[test]
+    fn transform_arg_for_nonexistent_arg_is_ignored() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("nonexistent", "renamed")
+            .build();
+
+        let def = transformed.definition();
+        let props = def.input_schema["properties"].as_object().unwrap();
+        // Original args should be untouched
+        assert!(props.contains_key("q"));
+        assert!(props.contains_key("n"));
+        // Renamed nonexistent shouldn't appear
+        assert!(!props.contains_key("renamed"));
+    }
 }
