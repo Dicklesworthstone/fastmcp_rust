@@ -556,4 +556,119 @@ mod tests {
         let result = block_on(first_ok(&cx, futures));
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1msb)
+    // =========================================================================
+
+    #[test]
+    fn join_all_results_collects_ok_and_err() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![
+            Box::pin(async { Ok(1) }),
+            Box::pin(async { Err(McpError::internal_error("oops")) }),
+            Box::pin(async { Ok(3) }),
+        ];
+        let results = block_on(join_all_results(&cx, futures));
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), &1);
+        assert!(results[1].is_err());
+        assert_eq!(results[2].as_ref().unwrap(), &3);
+    }
+
+    #[test]
+    fn race_multiple_returns_first() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, i32>> = vec![
+            Box::pin(async { 10 }),
+            Box::pin(async { 20 }),
+            Box::pin(async { 30 }),
+        ];
+        let result = block_on(race(&cx, futures));
+        // Phase 0 sequential: first future wins
+        assert_eq!(result.unwrap(), 10);
+    }
+
+    #[test]
+    fn race_timeout_delegates_to_race() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(async { 42 })];
+        let result = block_on(race_timeout(&cx, Duration::from_secs(5), futures));
+        assert_eq!(result.unwrap(), 42);
+
+        // Empty vec still errors
+        let empty: Vec<BoxFuture<'_, i32>> = vec![];
+        let err = block_on(race_timeout(&cx, Duration::from_secs(5), empty));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn quorum_timeout_delegates_to_quorum() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+            vec![Box::pin(async { Ok(1) }), Box::pin(async { Ok(2) })];
+        let result = block_on(quorum_timeout(&cx, 2, Duration::from_secs(5), futures));
+        let qr = result.unwrap();
+        assert!(qr.quorum_met);
+        assert_eq!(qr.successes.len(), 2);
+    }
+
+    #[test]
+    fn quorum_result_is_success_and_into_results() {
+        let met = QuorumResult {
+            successes: vec![1, 2],
+            quorum_met: true,
+            failure_count: 1,
+        };
+        assert!(met.is_success());
+        let values = met.into_results().unwrap();
+        assert_eq!(values, vec![1, 2]);
+
+        let not_met = QuorumResult {
+            successes: vec![1],
+            quorum_met: false,
+            failure_count: 2,
+        };
+        assert!(!not_met.is_success());
+        assert!(not_met.into_results().is_none());
+    }
+
+    #[test]
+    fn quorum_result_debug() {
+        let qr = QuorumResult {
+            successes: vec![42],
+            quorum_met: true,
+            failure_count: 0,
+        };
+        let debug = format!("{qr:?}");
+        assert!(debug.contains("QuorumResult"));
+        assert!(debug.contains("42"));
+        assert!(debug.contains("quorum_met: true"));
+    }
+
+    #[test]
+    fn quorum_all_failures() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![
+            Box::pin(async { Err(McpError::internal_error("fail 1")) }),
+            Box::pin(async { Err(McpError::internal_error("fail 2")) }),
+            Box::pin(async { Err(McpError::internal_error("fail 3")) }),
+        ];
+        let result = block_on(quorum(&cx, 2, futures));
+        let qr = result.unwrap();
+        assert!(!qr.quorum_met);
+        assert!(qr.successes.is_empty());
+        assert!(qr.failure_count >= 2);
+    }
+
+    #[test]
+    fn first_ok_all_fail_returns_last_error_message() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![
+            Box::pin(async { Err(McpError::internal_error("first")) }),
+            Box::pin(async { Err(McpError::internal_error("last")) }),
+        ];
+        let err = block_on(first_ok(&cx, futures)).unwrap_err();
+        assert!(err.message.contains("last"));
+    }
 }
