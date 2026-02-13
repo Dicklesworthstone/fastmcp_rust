@@ -1115,4 +1115,336 @@ mod tests {
         assert_eq!(recorded[2].progress, Some(0.5));
         assert_eq!(recorded.last().expect("last").status, TaskStatus::Completed);
     }
+
+    // ── can_transition ─────────────────────────────────────────────────
+
+    #[test]
+    fn can_transition_valid_pairs() {
+        assert!(can_transition(TaskStatus::Pending, TaskStatus::Running));
+        assert!(can_transition(TaskStatus::Pending, TaskStatus::Cancelled));
+        assert!(can_transition(TaskStatus::Running, TaskStatus::Completed));
+        assert!(can_transition(TaskStatus::Running, TaskStatus::Failed));
+        assert!(can_transition(TaskStatus::Running, TaskStatus::Cancelled));
+    }
+
+    #[test]
+    fn can_transition_invalid_pairs() {
+        assert!(!can_transition(TaskStatus::Pending, TaskStatus::Completed));
+        assert!(!can_transition(TaskStatus::Pending, TaskStatus::Failed));
+        assert!(!can_transition(TaskStatus::Completed, TaskStatus::Running));
+        assert!(!can_transition(TaskStatus::Completed, TaskStatus::Pending));
+        assert!(!can_transition(
+            TaskStatus::Completed,
+            TaskStatus::Cancelled
+        ));
+        assert!(!can_transition(TaskStatus::Failed, TaskStatus::Running));
+        assert!(!can_transition(TaskStatus::Cancelled, TaskStatus::Running));
+    }
+
+    // ── Default / Debug / into_shared ──────────────────────────────────
+
+    #[test]
+    fn default_creates_empty_manager() {
+        let manager = TaskManager::default();
+        assert_eq!(manager.total_count(), 0);
+        assert!(!manager.has_list_changed_notifications());
+    }
+
+    #[test]
+    fn new_for_testing_disables_auto_execute() {
+        let manager = TaskManager::new_for_testing();
+        assert!(!manager.auto_execute);
+    }
+
+    #[test]
+    fn into_shared_returns_arc() {
+        let manager = TaskManager::new_for_testing();
+        let shared: SharedTaskManager = manager.into_shared();
+        assert_eq!(shared.total_count(), 0);
+    }
+
+    #[test]
+    fn debug_output_contains_fields() {
+        let manager = TaskManager::new_for_testing();
+        let debug = format!("{:?}", manager);
+        assert!(debug.contains("TaskManager"));
+        assert!(debug.contains("task_count"));
+        assert!(debug.contains("handler_count"));
+        assert!(debug.contains("task_counter"));
+        assert!(debug.contains("list_changed_notifications"));
+        assert!(debug.contains("auto_execute"));
+    }
+
+    // ── get_info / get_result for nonexistent tasks ────────────────────
+
+    #[test]
+    fn get_info_nonexistent_returns_none() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        assert!(manager.get_info(&fake_id).is_none());
+    }
+
+    #[test]
+    fn get_result_nonexistent_returns_none() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        assert!(manager.get_result(&fake_id).is_none());
+    }
+
+    #[test]
+    fn get_result_pending_task_returns_none() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        assert!(manager.get_result(&id).is_none());
+    }
+
+    // ── is_cancel_requested edge cases ─────────────────────────────────
+
+    #[test]
+    fn is_cancel_requested_nonexistent_returns_false() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        assert!(!manager.is_cancel_requested(&fake_id));
+    }
+
+    #[test]
+    fn is_cancel_requested_before_cancel_returns_false() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        assert!(!manager.is_cancel_requested(&id));
+    }
+
+    // ── update_progress edge cases ─────────────────────────────────────
+
+    #[test]
+    fn update_progress_on_pending_task_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        // Task is pending, progress update should be ignored
+        manager.update_progress(&id, 0.5, Some("test".to_string()));
+        let info = manager.get_info(&id).unwrap();
+        assert!(info.progress.is_none());
+    }
+
+    #[test]
+    fn update_progress_on_completed_task_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+        // Task is completed, progress update should be ignored
+        manager.update_progress(&id, 0.1, None);
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.progress, Some(1.0)); // unchanged from completion
+    }
+
+    // ── complete_task / fail_task on nonexistent ────────────────────────
+
+    #[test]
+    fn complete_task_nonexistent_does_not_panic() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        manager.complete_task(&fake_id, serde_json::json!({})); // should not panic
+    }
+
+    #[test]
+    fn fail_task_nonexistent_does_not_panic() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        manager.fail_task(&fake_id, "error"); // should not panic
+    }
+
+    // ── cancel edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn cancel_nonexistent_task_returns_error() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        let err = manager.cancel(&fake_id, None).unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn cancel_pending_task_directly() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        // Cancel from Pending (valid: Pending -> Cancelled)
+        let info = manager.cancel(&id, None).unwrap();
+        assert_eq!(info.status, TaskStatus::Cancelled);
+        assert!(manager.is_cancel_requested(&id));
+    }
+
+    #[test]
+    fn cancel_with_default_reason() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        let info = manager.cancel(&id, None).unwrap();
+        assert_eq!(info.error, Some("Cancelled by request".to_string()));
+    }
+
+    // ── task ID sequencing ─────────────────────────────────────────────
+
+    #[test]
+    fn task_ids_are_sequential() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id1 = manager.submit(&cx, "t", None).unwrap();
+        let id2 = manager.submit(&cx, "t", None).unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1.0.starts_with("task-"));
+        assert!(id2.0.starts_with("task-"));
+    }
+
+    // ── start_task edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn start_task_nonexistent_returns_error() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        let err = manager.start_task(&fake_id).unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn start_task_already_running_returns_error() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        let err = manager.start_task(&id).unwrap_err();
+        assert!(err.message.contains("not pending"));
+    }
+
+    // ── cleanup_completed ──────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_completed_removes_old_terminal_tasks() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+        assert_eq!(manager.total_count(), 1);
+
+        // Cleanup with 0 duration removes all completed tasks
+        manager.cleanup_completed(std::time::Duration::from_secs(0));
+        assert_eq!(manager.total_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_completed_keeps_active_tasks() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id1 = manager.submit(&cx, "t", None).unwrap();
+        let id2 = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id1).unwrap();
+        manager.complete_task(&id1, serde_json::json!({}));
+        // id2 is still pending (active)
+
+        manager.cleanup_completed(std::time::Duration::from_secs(0));
+        assert_eq!(manager.total_count(), 1); // only id2 remains
+        assert!(manager.get_info(&id2).is_some());
+    }
+
+    #[test]
+    fn cleanup_completed_keeps_recent_tasks() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({}));
+
+        // Cleanup with large duration keeps recently completed
+        manager.cleanup_completed(std::time::Duration::from_secs(3600));
+        assert_eq!(manager.total_count(), 1);
+    }
+
+    // ── identity transition ────────────────────────────────────────────
+
+    #[test]
+    fn transition_same_state_returns_true() {
+        // Create a minimal TaskState to test transition_state
+        let task_id = TaskId::from_string("test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Running,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: None,
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        // Same state transition returns true
+        assert!(transition_state(&mut state, TaskStatus::Running));
+    }
+
+    // ── submit with params ─────────────────────────────────────────────
+
+    #[test]
+    fn submit_with_none_params_creates_task() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.task_type, "t");
+        assert_eq!(info.status, TaskStatus::Pending);
+        assert!(info.started_at.is_none());
+        assert!(info.completed_at.is_none());
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn submit_with_some_params_creates_task() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager
+            .submit(&cx, "t", Some(serde_json::json!({"key": "value"})))
+            .unwrap();
+        assert!(manager.get_info(&id).is_some());
+    }
+
+    // ── fail_task sets result ──────────────────────────────────────────
+
+    #[test]
+    fn fail_task_sets_error_result() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.fail_task(&id, "boom");
+        let result = manager.get_result(&id).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.error, Some("boom".to_string()));
+        assert!(result.data.is_none());
+    }
 }
