@@ -90,3 +90,160 @@ where
         (**self).on_error(ctx, request, error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::Cx;
+
+    fn make_ctx() -> McpContext {
+        McpContext::new(Cx::for_testing(), 1)
+    }
+
+    fn make_request() -> JsonRpcRequest {
+        JsonRpcRequest::new("tools/call", None, 1i64)
+    }
+
+    // ── MiddlewareDecision ───────────────────────────────────────────
+
+    #[test]
+    fn middleware_decision_continue_debug() {
+        let d = MiddlewareDecision::Continue;
+        let debug = format!("{:?}", d);
+        assert!(debug.contains("Continue"));
+    }
+
+    #[test]
+    fn middleware_decision_respond_debug() {
+        let d = MiddlewareDecision::Respond(serde_json::json!({"ok": true}));
+        let debug = format!("{:?}", d);
+        assert!(debug.contains("Respond"));
+    }
+
+    #[test]
+    fn middleware_decision_clone() {
+        let d = MiddlewareDecision::Respond(serde_json::json!(42));
+        let cloned = d.clone();
+        match cloned {
+            MiddlewareDecision::Respond(v) => assert_eq!(v, 42),
+            _ => panic!("expected Respond"),
+        }
+    }
+
+    // ── Default trait methods ────────────────────────────────────────
+
+    struct NoopMiddleware;
+    impl Middleware for NoopMiddleware {}
+
+    #[test]
+    fn default_on_request_returns_continue() {
+        let mw = NoopMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let decision = mw.on_request(&ctx, &req).unwrap();
+        matches!(decision, MiddlewareDecision::Continue);
+    }
+
+    #[test]
+    fn default_on_response_passes_through() {
+        let mw = NoopMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let input = serde_json::json!({"data": "hello"});
+        let output = mw.on_response(&ctx, &req, input.clone()).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn default_on_error_passes_through() {
+        let mw = NoopMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let err = McpError::internal_error("test error");
+        let result = mw.on_error(&ctx, &req, err);
+        assert!(result.message.contains("test error"));
+    }
+
+    // ── Custom middleware ─────────────────────────────────────────────
+
+    struct BlockingMiddleware;
+    impl Middleware for BlockingMiddleware {
+        fn on_request(
+            &self,
+            _ctx: &McpContext,
+            _request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            Ok(MiddlewareDecision::Respond(
+                serde_json::json!({"blocked": true}),
+            ))
+        }
+    }
+
+    #[test]
+    fn custom_on_request_can_short_circuit() {
+        let mw = BlockingMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let decision = mw.on_request(&ctx, &req).unwrap();
+        match decision {
+            MiddlewareDecision::Respond(v) => assert_eq!(v["blocked"], true),
+            _ => panic!("expected Respond"),
+        }
+    }
+
+    struct ErrorRewritingMiddleware;
+    impl Middleware for ErrorRewritingMiddleware {
+        fn on_error(
+            &self,
+            _ctx: &McpContext,
+            _request: &JsonRpcRequest,
+            _error: McpError,
+        ) -> McpError {
+            McpError::internal_error("rewritten")
+        }
+    }
+
+    #[test]
+    fn custom_on_error_can_rewrite() {
+        let mw = ErrorRewritingMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let original = McpError::internal_error("original");
+        let rewritten = mw.on_error(&ctx, &req, original);
+        assert!(rewritten.message.contains("rewritten"));
+    }
+
+    // ── Arc delegation ───────────────────────────────────────────────
+
+    #[test]
+    fn arc_middleware_delegates_on_request() {
+        let mw: Arc<dyn Middleware> = Arc::new(BlockingMiddleware);
+        let ctx = make_ctx();
+        let req = make_request();
+        let decision = mw.on_request(&ctx, &req).unwrap();
+        match decision {
+            MiddlewareDecision::Respond(v) => assert_eq!(v["blocked"], true),
+            _ => panic!("expected Respond"),
+        }
+    }
+
+    #[test]
+    fn arc_middleware_delegates_on_response() {
+        let mw: Arc<dyn Middleware> = Arc::new(NoopMiddleware);
+        let ctx = make_ctx();
+        let req = make_request();
+        let input = serde_json::json!("hello");
+        let output = mw.on_response(&ctx, &req, input.clone()).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn arc_middleware_delegates_on_error() {
+        let mw: Arc<dyn Middleware> = Arc::new(ErrorRewritingMiddleware);
+        let ctx = make_ctx();
+        let req = make_request();
+        let err = McpError::internal_error("x");
+        let result = mw.on_error(&ctx, &req, err);
+        assert!(result.message.contains("rewritten"));
+    }
+}
