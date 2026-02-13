@@ -471,4 +471,85 @@ mod tests {
         assert_eq!(hex.len(), 7);
         assert!(hex.starts_with('#'));
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-2xpx)
+    // =========================================================================
+
+    #[test]
+    fn stats_renderer_debug_and_clone() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        let debug = format!("{renderer:?}");
+        assert!(debug.contains("StatsRenderer"));
+
+        let cloned = renderer.clone();
+        assert!(!cloned.should_use_rich(&FastMcpConsole::with_enabled(true)));
+    }
+
+    #[test]
+    fn format_duration_boundary_exactly_60s() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(renderer.format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(renderer.format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(
+            renderer.format_duration(Duration::from_secs(3599)),
+            "59m 59s"
+        );
+    }
+
+    #[test]
+    fn format_latency_boundary_values() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_latency(Duration::from_micros(0)), "0us");
+        assert_eq!(renderer.format_latency(Duration::from_micros(999)), "999us");
+        assert_eq!(
+            renderer.format_latency(Duration::from_micros(1000)),
+            "1.0ms"
+        );
+        assert_eq!(
+            renderer.format_latency(Duration::from_micros(999_999)),
+            "1000.0ms"
+        );
+    }
+
+    #[test]
+    fn format_bytes_boundary_values() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_bytes(0), "0 B");
+        assert_eq!(renderer.format_bytes(1023), "1023 B");
+        assert_eq!(renderer.format_bytes(1024), "1.0 KB");
+        assert_eq!(renderer.format_bytes(1024 * 1024 - 1), "1024.0 KB");
+        assert_eq!(renderer.format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(renderer.format_bytes(1024 * 1024 * 1024 - 1), "1024.0 MB");
+    }
+
+    #[test]
+    fn format_percentage_full_coverage() {
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        assert_eq!(renderer.format_percentage(100, 100), "100.0%");
+        assert_eq!(renderer.format_percentage(50, 200), "25.0%");
+    }
+
+    #[test]
+    fn render_oneline_with_zero_requests() {
+        let tc = TestConsole::new();
+        let renderer = StatsRenderer::new(DisplayContext::new_agent());
+        let mut stats = sample_snapshot();
+        stats.total_requests = 0;
+        stats.successful_requests = 0;
+        renderer.render_oneline(&stats, tc.console());
+        // success_rate returns 1.0 when total_requests is 0
+        tc.assert_contains("Uptime");
+        tc.assert_contains("Requests");
+        tc.assert_contains("100.0");
+    }
+
+    #[test]
+    fn build_panel_text_has_16_rows() {
+        let renderer = StatsRenderer::new(DisplayContext::new_human());
+        let content = renderer.build_panel_text(&sample_snapshot());
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 16);
+    }
 }

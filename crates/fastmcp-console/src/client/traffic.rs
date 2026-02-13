@@ -676,4 +676,118 @@ mod tests {
         console.assert_contains("Error -32001: boom");
         console.assert_contains("Data:");
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-cqqa)
+    // =========================================================================
+
+    #[test]
+    fn renderer_debug_and_clone() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let debug = format!("{renderer:?}");
+        assert!(debug.contains("RequestResponseRenderer"));
+        assert!(debug.contains("show_params"));
+        assert!(debug.contains("truncate_at"));
+
+        let cloned = renderer.clone();
+        assert_eq!(cloned.show_params, true);
+        assert_eq!(cloned.truncate_at, 200);
+    }
+
+    #[test]
+    fn detect_constructor() {
+        let renderer = RequestResponseRenderer::detect();
+        assert_eq!(renderer.truncate_at, 200);
+        assert!(renderer.show_params);
+        assert!(renderer.show_result);
+        assert!(renderer.show_timing);
+    }
+
+    #[test]
+    fn render_response_rich_success() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let response = JsonRpcResponse::success(RequestId::Number(7), json!({"items": [1, 2, 3]}));
+
+        renderer.render_response(&response, Some(Duration::from_millis(5)), console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("OK"));
+        assert!(output.contains("id=7"));
+        assert!(output.contains("Result"));
+    }
+
+    #[test]
+    fn render_response_rich_no_duration() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let response = JsonRpcResponse::success(RequestId::Number(8), json!({"ok": true}));
+
+        renderer.render_response(&response, None, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("OK"));
+        assert!(output.contains("id=8"));
+    }
+
+    #[test]
+    fn render_request_rich_no_params() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        let console = TestConsole::new_rich();
+        let request = JsonRpcRequest::new("tools/list", None, 3i64);
+
+        renderer.render_request(&request, console.console());
+
+        let output = console.output_string();
+        assert!(output.contains("tools/list"));
+        assert!(output.contains("id=3"));
+        assert!(!output.contains("Params"));
+    }
+
+    #[test]
+    fn method_color_shutdown_prefix() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let init_color = renderer.method_color("initialize");
+        let shut_color = renderer.method_color("shutdown");
+        // Both initialize and shutdown use the same warning color
+        assert_eq!(init_color, shut_color);
+    }
+
+    #[test]
+    fn render_response_rich_show_timing_disabled() {
+        let mut renderer = RequestResponseRenderer::new(DisplayContext::new_human());
+        renderer.show_timing = false;
+        let console = TestConsole::new_rich();
+        let response = JsonRpcResponse::success(RequestId::Number(9), json!(null));
+
+        renderer.render_response(
+            &response,
+            Some(Duration::from_millis(50)),
+            console.console(),
+        );
+
+        let output = console.output_string();
+        assert!(output.contains("OK"));
+        // Timing should NOT appear
+        assert!(!output.contains("50"));
+    }
+
+    #[test]
+    fn render_error_preview_plain_without_data() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+
+        renderer.render_error_preview_plain(
+            &JsonRpcError {
+                code: -32600,
+                message: "Invalid Request".to_string(),
+                data: None,
+            },
+            console.console(),
+        );
+
+        console.assert_contains("Error -32600");
+        console.assert_contains("Invalid Request");
+        console.assert_not_contains("Data:");
+    }
 }
