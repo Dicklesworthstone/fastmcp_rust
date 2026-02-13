@@ -2168,6 +2168,728 @@ mod tests {
         assert_eq!(reclaimed.retry_count, 1);
     }
 
+    // ========================================
+    // DocketSettings — additional
+    // ========================================
+
+    #[test]
+    fn docket_settings_memory_equals_default() {
+        let mem = DocketSettings::memory();
+        let def = DocketSettings::default();
+        assert_eq!(mem.queue_prefix, def.queue_prefix);
+        assert_eq!(mem.max_retries, def.max_retries);
+        assert_eq!(mem.visibility_timeout, def.visibility_timeout);
+        assert_eq!(mem.default_task_timeout, def.default_task_timeout);
+        assert_eq!(mem.retry_delay, def.retry_delay);
+        assert_eq!(mem.poll_interval, def.poll_interval);
+    }
+
+    #[test]
+    fn docket_settings_with_visibility_timeout() {
+        let s = DocketSettings::memory().with_visibility_timeout(Duration::from_secs(120));
+        assert_eq!(s.visibility_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn docket_settings_debug() {
+        let s = DocketSettings::memory();
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("DocketSettings"));
+        assert!(debug.contains("fastmcp:docket"));
+    }
+
+    #[test]
+    fn docket_settings_clone() {
+        let s = DocketSettings::memory().with_max_retries(7);
+        let c = s.clone();
+        assert_eq!(c.max_retries, 7);
+    }
+
+    #[test]
+    fn docket_settings_redis_pool_size() {
+        let s = DocketSettings::redis("redis://localhost:6379");
+        match s.backend {
+            DocketBackendType::Redis(ref r) => {
+                assert_eq!(r.pool_size, 10);
+                assert_eq!(r.connect_timeout, Duration::from_secs(5));
+                assert_eq!(r.url, "redis://localhost:6379");
+            }
+            _ => panic!("expected Redis backend"),
+        }
+    }
+
+    // ========================================
+    // DocketBackendType / RedisSettings
+    // ========================================
+
+    #[test]
+    fn docket_backend_type_debug() {
+        let mem = DocketBackendType::Memory;
+        let debug = format!("{:?}", mem);
+        assert!(debug.contains("Memory"));
+
+        let redis = DocketBackendType::Redis(RedisSettings {
+            url: "redis://test".to_string(),
+            pool_size: 5,
+            connect_timeout: Duration::from_secs(3),
+        });
+        let debug = format!("{:?}", redis);
+        assert!(debug.contains("Redis"));
+    }
+
+    #[test]
+    fn redis_settings_clone() {
+        let r = RedisSettings {
+            url: "redis://host".to_string(),
+            pool_size: 3,
+            connect_timeout: Duration::from_secs(2),
+        };
+        let c = r.clone();
+        assert_eq!(c.url, "redis://host");
+        assert_eq!(c.pool_size, 3);
+    }
+
+    // ========================================
+    // DocketTask
+    // ========================================
+
+    #[test]
+    fn docket_task_new_fields() {
+        let task = DocketTask::new(
+            TaskId::from_string("t-1"),
+            "my_type".to_string(),
+            serde_json::json!({"key": "val"}),
+            5,
+            3,
+        );
+        assert_eq!(task.task_type, "my_type");
+        assert_eq!(task.priority, 5);
+        assert_eq!(task.max_retries, 3);
+        assert_eq!(task.retry_count, 0);
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.claimed_at.is_none());
+        assert!(task.error.is_none());
+        assert!(task.result.is_none());
+        assert!(!task.created_at.is_empty());
+    }
+
+    #[test]
+    fn docket_task_debug_and_clone() {
+        let task = DocketTask::new(
+            TaskId::from_string("t-dbg"),
+            "dbg_type".to_string(),
+            serde_json::json!(null),
+            0,
+            1,
+        );
+        let debug = format!("{:?}", task);
+        assert!(debug.contains("DocketTask"));
+        assert!(debug.contains("dbg_type"));
+
+        let cloned = task.clone();
+        assert_eq!(cloned.task_type, "dbg_type");
+    }
+
+    #[test]
+    fn docket_task_serialize_deserialize_roundtrip() {
+        let task = DocketTask::new(
+            TaskId::from_string("t-ser"),
+            "ser_type".to_string(),
+            serde_json::json!({"a": 1}),
+            2,
+            4,
+        );
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: DocketTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.task_type, "ser_type");
+        assert_eq!(deserialized.priority, 2);
+        assert_eq!(deserialized.max_retries, 4);
+    }
+
+    #[test]
+    fn docket_task_to_task_info_pending() {
+        let task = DocketTask::new(
+            TaskId::from_string("t-info"),
+            "info_type".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        let info = task.to_task_info();
+        assert_eq!(info.status, TaskStatus::Pending);
+        assert!(info.started_at.is_none());
+        assert!(info.completed_at.is_none()); // Pending is not terminal
+    }
+
+    #[test]
+    fn docket_task_to_task_info_completed() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t-comp"),
+            "comp_type".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Completed;
+        task.claimed_at = Some("2025-01-01T00:00:00Z".to_string());
+        let info = task.to_task_info();
+        assert_eq!(info.status, TaskStatus::Completed);
+        assert!(info.started_at.is_some());
+        assert!(info.completed_at.is_some()); // Completed is terminal
+    }
+
+    #[test]
+    fn docket_task_to_task_result_non_terminal() {
+        let task = DocketTask::new(
+            TaskId::from_string("t-res"),
+            "res_type".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        assert!(task.to_task_result().is_none());
+    }
+
+    #[test]
+    fn docket_task_to_task_result_completed() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t-res2"),
+            "res_type".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Completed;
+        task.result = Some(serde_json::json!({"data": 42}));
+        let result = task.to_task_result().unwrap();
+        assert!(result.success);
+        assert_eq!(result.data, Some(serde_json::json!({"data": 42})));
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn docket_task_to_task_result_failed() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t-fail"),
+            "fail_type".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Failed;
+        task.error = Some("something broke".to_string());
+        let result = task.to_task_result().unwrap();
+        assert!(!result.success);
+        assert_eq!(result.error, Some("something broke".to_string()));
+    }
+
+    // ========================================
+    // SubmitOptions — additional
+    // ========================================
+
+    #[test]
+    fn submit_options_default() {
+        let opts = SubmitOptions::default();
+        assert_eq!(opts.priority, 0);
+        assert!(opts.max_retries.is_none());
+        assert!(opts.delay.is_none());
+    }
+
+    #[test]
+    fn submit_options_debug() {
+        let opts = SubmitOptions::new().with_priority(3);
+        let debug = format!("{:?}", opts);
+        assert!(debug.contains("SubmitOptions"));
+        assert!(debug.contains('3'));
+    }
+
+    // ========================================
+    // DocketError — additional
+    // ========================================
+
+    #[test]
+    fn docket_error_serialization_display() {
+        let err = DocketError::Serialization("bad json".to_string());
+        assert_eq!(err.to_string(), "Serialization error: bad json");
+    }
+
+    #[test]
+    fn docket_error_backend_display() {
+        let err = DocketError::Backend("lock poisoned".to_string());
+        assert_eq!(err.to_string(), "Backend error: lock poisoned");
+    }
+
+    #[test]
+    fn docket_error_is_std_error() {
+        let err = DocketError::NotFound("x".to_string());
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn docket_error_into_mcp_error() {
+        let err = DocketError::Handler("timeout".to_string());
+        let mcp: McpError = err.into();
+        assert!(mcp.message.contains("Handler error: timeout"));
+    }
+
+    #[test]
+    fn docket_error_debug() {
+        let err = DocketError::Cancelled;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("Cancelled"));
+    }
+
+    // ========================================
+    // QueueStats
+    // ========================================
+
+    #[test]
+    fn queue_stats_default() {
+        let stats = QueueStats::default();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.in_progress, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.cancelled, 0);
+    }
+
+    #[test]
+    fn queue_stats_debug_and_clone() {
+        let stats = QueueStats {
+            pending: 1,
+            in_progress: 2,
+            completed: 3,
+            failed: 4,
+            cancelled: 5,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("QueueStats"));
+
+        let c = stats.clone();
+        assert_eq!(c.pending, 1);
+        assert_eq!(c.completed, 3);
+    }
+
+    // ========================================
+    // MemoryDocketBackend — additional
+    // ========================================
+
+    #[test]
+    fn memory_backend_dequeue_empty() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let result = backend.dequeue(&["any".to_string()]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn memory_backend_dequeue_wrong_type() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-1"),
+            "type_a".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Request wrong type — should return None
+        let result = backend.dequeue(&["type_b".to_string()]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn memory_backend_dequeue_sets_running() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-run"),
+            "work".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        let dequeued = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
+        assert_eq!(dequeued.status, TaskStatus::Running);
+        assert!(dequeued.claimed_at.is_some());
+    }
+
+    #[test]
+    fn memory_backend_ack_nonexistent() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let result = backend.ack(&TaskId::from_string("nonexistent"), serde_json::json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_backend_nack_nonexistent() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let result = backend.nack(&TaskId::from_string("nonexistent"), "err");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_backend_get_task_nonexistent() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let result = backend.get_task(&TaskId::from_string("missing")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn memory_backend_cancel_terminal_task_fails() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-can"),
+            "cancel_test".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        let id = TaskId::from_string("t-can");
+        backend.cancel(&id, None).unwrap();
+
+        // Cancelling again should fail (already in terminal state)
+        let result = backend.cancel(&id, Some("again"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_backend_cancel_removes_from_pending() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-crp"),
+            "cancel_pend".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        let id = TaskId::from_string("t-crp");
+        backend.cancel(&id, Some("bye")).unwrap();
+
+        // Should not be dequeued
+        let result = backend.dequeue(&["cancel_pend".to_string()]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn memory_backend_list_tasks_with_limit() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        for i in 0..5 {
+            let task = DocketTask::new(
+                TaskId::from_string(format!("t-{i}")),
+                "limit_test".to_string(),
+                serde_json::json!({}),
+                0,
+                3,
+            );
+            backend.enqueue(task).unwrap();
+        }
+
+        let tasks = backend.list_tasks(None, 3).unwrap();
+        assert_eq!(tasks.len(), 3);
+    }
+
+    #[test]
+    fn memory_backend_list_tasks_filter_by_status() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        for i in 0..3 {
+            let task = DocketTask::new(
+                TaskId::from_string(format!("t-{i}")),
+                "filter_test".to_string(),
+                serde_json::json!({}),
+                0,
+                3,
+            );
+            backend.enqueue(task).unwrap();
+        }
+        // Cancel one
+        backend.cancel(&TaskId::from_string("t-1"), None).unwrap();
+
+        let pending = backend.list_tasks(Some(TaskStatus::Pending), 100).unwrap();
+        assert_eq!(pending.len(), 2);
+
+        let cancelled = backend
+            .list_tasks(Some(TaskStatus::Cancelled), 100)
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+    }
+
+    #[test]
+    fn memory_backend_stats_all_statuses() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+
+        // Create pending
+        for i in 0..2 {
+            let task = DocketTask::new(
+                TaskId::from_string(format!("p-{i}")),
+                "stat_test".to_string(),
+                serde_json::json!({}),
+                0,
+                3,
+            );
+            backend.enqueue(task).unwrap();
+        }
+
+        // Dequeue one → Running
+        let _running = backend.dequeue(&["stat_test".to_string()]).unwrap();
+
+        // Ack → Completed (re-create and dequeue another)
+        let task = DocketTask::new(
+            TaskId::from_string("c-0"),
+            "stat_test".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+        let deq = backend
+            .dequeue(&["stat_test".to_string()])
+            .unwrap()
+            .unwrap();
+        backend.ack(&deq.id, serde_json::json!({})).unwrap();
+
+        let stats = backend.stats().unwrap();
+        assert!(stats.pending >= 1);
+        assert!(stats.in_progress >= 1 || stats.completed >= 1);
+    }
+
+    #[test]
+    fn memory_backend_requeue_stale_no_stale() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-fresh"),
+            "stale_test".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Dequeue but with a long visibility timeout — should not be stale
+        let _deq = backend
+            .dequeue(&["stale_test".to_string()])
+            .unwrap()
+            .unwrap();
+        let requeued = backend.requeue_stale().unwrap();
+        assert_eq!(requeued, 0);
+    }
+
+    #[test]
+    fn memory_backend_ack_marks_completed() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t-ack"),
+            "ack_test".to_string(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        let deq = backend.dequeue(&["ack_test".to_string()]).unwrap().unwrap();
+        backend
+            .ack(&deq.id, serde_json::json!({"done": true}))
+            .unwrap();
+
+        let task = backend
+            .get_task(&TaskId::from_string("t-ack"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.result, Some(serde_json::json!({"done": true})));
+    }
+
+    #[test]
+    fn memory_backend_priority_ordering() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+
+        // Enqueue low priority first, then high
+        let low = DocketTask::new(
+            TaskId::from_string("low"),
+            "prio".to_string(),
+            serde_json::json!({}),
+            1,
+            3,
+        );
+        let high = DocketTask::new(
+            TaskId::from_string("high"),
+            "prio".to_string(),
+            serde_json::json!({}),
+            10,
+            3,
+        );
+        backend.enqueue(low).unwrap();
+        backend.enqueue(high).unwrap();
+
+        // High priority dequeued first
+        let first = backend.dequeue(&["prio".to_string()]).unwrap().unwrap();
+        assert_eq!(first.id.to_string(), "high");
+    }
+
+    // ========================================
+    // Docket — additional
+    // ========================================
+
+    #[test]
+    fn docket_debug() {
+        let docket = Docket::memory();
+        let debug = format!("{:?}", docket);
+        assert!(debug.contains("Docket"));
+        assert!(debug.contains("settings"));
+    }
+
+    #[test]
+    fn docket_settings_accessor() {
+        let docket = Docket::memory();
+        let settings = docket.settings();
+        assert!(matches!(settings.backend, DocketBackendType::Memory));
+    }
+
+    #[test]
+    fn docket_into_shared() {
+        let docket = Docket::memory();
+        let shared: SharedDocket = docket.into_shared();
+        // Can be cloned (Arc)
+        let _clone = Arc::clone(&shared);
+        assert!(matches!(
+            shared.settings().backend,
+            DocketBackendType::Memory
+        ));
+    }
+
+    #[test]
+    fn docket_get_task_nonexistent() {
+        let docket = Docket::memory();
+        let result = docket
+            .get_task(&TaskId::from_string("no-such-task"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn docket_cancel_nonexistent_is_error() {
+        let docket = Docket::memory();
+        let result = docket.cancel(&TaskId::from_string("no-such"), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn docket_task_ids_are_sequential() {
+        let docket = Docket::memory();
+        let id1 = docket.submit("seq", serde_json::json!({})).unwrap();
+        let id2 = docket.submit("seq", serde_json::json!({})).unwrap();
+        // IDs should be different (sequential counter)
+        assert_ne!(id1.to_string(), id2.to_string());
+        assert!(id1.to_string().starts_with("docket-"));
+        assert!(id2.to_string().starts_with("docket-"));
+    }
+
+    #[test]
+    fn docket_submit_with_max_retries_override() {
+        let docket = Docket::memory();
+        let id = docket
+            .submit_with_options(
+                "retry_over",
+                serde_json::json!({}),
+                SubmitOptions::new().with_max_retries(10),
+            )
+            .unwrap();
+
+        let task = docket.get_task(&id).unwrap().unwrap();
+        assert_eq!(task.max_retries, 10);
+    }
+
+    #[cfg(not(feature = "redis"))]
+    #[test]
+    fn docket_new_redis_without_feature_fails() {
+        let settings = DocketSettings::redis("redis://localhost:6379");
+        let result = Docket::new(settings);
+        assert!(result.is_err());
+    }
+
+    // ========================================
+    // Worker — additional
+    // ========================================
+
+    #[test]
+    fn worker_is_running_initially_false() {
+        let docket = Docket::memory();
+        let worker = docket
+            .worker()
+            .subscribe("test", |_| async { Ok(serde_json::json!({})) })
+            .build();
+        assert!(!worker.is_running());
+    }
+
+    #[test]
+    fn worker_stop() {
+        let docket = Docket::memory();
+        let worker = docket
+            .worker()
+            .subscribe("test", |_| async { Ok(serde_json::json!({})) })
+            .build();
+
+        // Manually set running
+        worker.running.store(true, Ordering::SeqCst);
+        assert!(worker.is_running());
+
+        worker.stop();
+        assert!(!worker.is_running());
+    }
+
+    #[test]
+    fn worker_debug() {
+        let docket = Docket::memory();
+        let worker = docket
+            .worker()
+            .subscribe("type_x", |_| async { Ok(serde_json::json!({})) })
+            .build();
+        let debug = format!("{:?}", worker);
+        assert!(debug.contains("Worker"));
+        assert!(debug.contains("type_x"));
+    }
+
+    #[test]
+    fn worker_process_one_handler_error_nacks() {
+        use fastmcp_core::block_on;
+
+        let settings = DocketSettings::memory().with_max_retries(2);
+        let docket = Docket::new(settings).unwrap();
+
+        let id = docket.submit("fail_type", serde_json::json!({})).unwrap();
+
+        let worker = docket
+            .worker()
+            .subscribe("fail_type", |_| async {
+                Err(DocketError::Handler("boom".to_string()))
+            })
+            .build();
+
+        let cx = Cx::for_testing();
+        // First failure — nack, requeue
+        let processed = block_on(worker.process_one(&cx)).unwrap();
+        assert!(processed);
+
+        // Task should be requeued (retry_count=1, still < max_retries=2)
+        let task = docket.get_task(&id).unwrap().unwrap();
+        assert_eq!(task.retry_count, 1);
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.error.as_deref().unwrap().contains("boom"));
+
+        // Second failure — should exceed max retries
+        let processed = block_on(worker.process_one(&cx)).unwrap();
+        assert!(processed);
+
+        let task = docket.get_task(&id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.retry_count, 2);
+    }
+
     #[cfg(feature = "redis")]
     #[test]
     fn test_redis_requeue_stale_marks_failed_at_retry_limit() {
