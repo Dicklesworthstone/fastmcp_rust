@@ -392,4 +392,71 @@ mod tests {
 
         assert_eq!(prompt.tags.len(), 2);
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1u39)
+    // =========================================================================
+
+    #[test]
+    fn summarize_prompt_fields() {
+        let prompt = summarize_prompt();
+        assert_eq!(prompt.name, "summarize");
+        assert_eq!(prompt.arguments.len(), 3);
+        assert!(prompt.arguments[0].required); // text
+        assert!(!prompt.arguments[1].required); // max_length
+        assert!(!prompt.arguments[2].required); // style
+        assert!(prompt.tags.contains(&"summarize".to_string()));
+    }
+
+    #[test]
+    fn translate_prompt_fields() {
+        let prompt = translate_prompt();
+        assert_eq!(prompt.name, "translate");
+        assert_eq!(prompt.arguments.len(), 3);
+
+        let required: Vec<_> = prompt
+            .arguments
+            .iter()
+            .filter(|a| a.required)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(required.contains(&"text"));
+        assert!(required.contains(&"target_language"));
+        assert_eq!(required.len(), 2);
+    }
+
+    #[test]
+    fn sql_prompt_fields() {
+        let prompt = sql_prompt();
+        assert_eq!(prompt.name, "sql_query");
+        assert_eq!(prompt.arguments.len(), 3);
+        assert!(prompt.tags.contains(&"sql".to_string()));
+        assert!(prompt.tags.contains(&"database".to_string()));
+    }
+
+    #[test]
+    fn prompt_builder_version_setter() {
+        let prompt = PromptBuilder::new("versioned").version("5.0.0").build();
+        assert_eq!(prompt.version, Some("5.0.0".to_string()));
+    }
+
+    #[test]
+    fn prompt_builder_debug_and_clone() {
+        let builder = PromptBuilder::new("dbg")
+            .description("desc")
+            .required_arg("x", "x desc");
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("PromptBuilder"));
+        assert!(debug.contains("dbg"));
+
+        let cloned = builder.clone();
+        let prompt = cloned.build();
+        assert_eq!(prompt.name, "dbg");
+        assert_eq!(prompt.arguments.len(), 1);
+    }
+
+    #[test]
+    fn all_sample_prompts_exact_count() {
+        assert_eq!(all_sample_prompts().len(), 7);
+    }
 }
