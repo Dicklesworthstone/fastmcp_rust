@@ -743,4 +743,92 @@ mod tests {
         let config = config.no_ttl();
         assert!(config.ttl.is_none());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-3dn2)
+    // =========================================================================
+
+    #[test]
+    fn event_store_config_default_values() {
+        let config = EventStoreConfig::default();
+        assert_eq!(config.max_events_per_stream, DEFAULT_MAX_EVENTS_PER_STREAM);
+        assert_eq!(config.ttl, Some(Duration::from_secs(DEFAULT_TTL_SECS)));
+    }
+
+    #[test]
+    fn event_store_default_trait() {
+        let store = EventStore::default();
+        assert_eq!(store.stream_count(), 0);
+        assert_eq!(store.event_count(), 0);
+        assert_eq!(
+            store.config().max_events_per_stream,
+            DEFAULT_MAX_EVENTS_PER_STREAM
+        );
+    }
+
+    #[test]
+    fn event_store_config_accessor() {
+        let config = EventStoreConfig::no_expiry().max_events(42);
+        let store = EventStore::with_config(config);
+        assert_eq!(store.config().max_events_per_stream, 42);
+        assert!(store.config().ttl.is_none());
+    }
+
+    #[test]
+    fn get_events_after_nonexistent_stream_returns_empty() {
+        let store = EventStore::new();
+        store.store_event("stream1", Some(serde_json::json!({})));
+        let events = store.get_events_after("no-such-stream", None);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn get_events_after_unknown_id_returns_empty() {
+        let store = EventStore::new();
+        store.store_event("stream1", Some(serde_json::json!({})));
+        // An unknown after_id returns empty per SSE spec (client should reconnect fresh)
+        let events = store.get_events_after("stream1", Some("bogus-id"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn create_shared_event_store_with_config_works() {
+        let config = EventStoreConfig::no_expiry().max_events(5);
+        let store = create_shared_event_store_with_config(config);
+        assert_eq!(store.config().max_events_per_stream, 5);
+        assert!(store.config().ttl.is_none());
+    }
+
+    #[test]
+    fn cleanup_expired_removes_empty_streams() {
+        let config = EventStoreConfig {
+            max_events_per_stream: 100,
+            ttl: Some(Duration::from_millis(10)),
+        };
+        let store = EventStore::with_config(config);
+
+        store.store_event("stream1", Some(serde_json::json!({})));
+        store.store_event("stream2", Some(serde_json::json!({})));
+        assert_eq!(store.stream_count(), 2);
+
+        std::thread::sleep(Duration::from_millis(20));
+        store.cleanup_expired();
+
+        // Streams whose events all expired should be removed entirely
+        assert_eq!(store.stream_count(), 0);
+        assert_eq!(store.event_count(), 0);
+    }
+
+    #[test]
+    fn event_store_stats_includes_config_fields() {
+        let config = EventStoreConfig::no_expiry().max_events(77);
+        let store = EventStore::with_config(config);
+        store.store_event("s1", None);
+
+        let stats = store.stats();
+        assert_eq!(stats.stream_count, 1);
+        assert_eq!(stats.total_events, 1);
+        assert_eq!(stats.max_events_per_stream, 77);
+        assert!(stats.ttl.is_none());
+    }
 }
