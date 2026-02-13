@@ -1559,4 +1559,43 @@ mod tests {
         drop(client);
         // If we get here without panicking, the test passes
     }
+
+    #[test]
+    fn client_progress_params_debug() {
+        let params = ClientProgressParams {
+            marker: ProgressMarker::Number(1),
+            progress: 0.5,
+            total: Some(1.0),
+            message: Some("half".into()),
+        };
+        let debug = format!("{:?}", params);
+        assert!(debug.contains("progress"));
+    }
+
+    #[test]
+    fn transport_error_to_mcp_preserves_io_details() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "socket vanished");
+        let mcp_err = transport_error_to_mcp(TransportError::Io(io_err));
+        assert!(mcp_err.message.contains("socket vanished"));
+    }
+
+    #[test]
+    fn method_not_found_response_error_message_includes_method() {
+        let request = JsonRpcRequest::new("totally/custom/method", None, 1i64);
+        let response = method_not_found_response(&request).unwrap();
+        if let JsonRpcMessage::Response(resp) = response {
+            let error = resp.error.unwrap();
+            assert!(error.message.contains("totally/custom/method"));
+        }
+    }
+
+    #[test]
+    fn client_server_capabilities_default_is_empty() {
+        let client = make_closed_client(true);
+        let caps = client.server_capabilities();
+        // Default capabilities should have no features enabled
+        assert!(caps.tools.is_none());
+        assert!(caps.resources.is_none());
+        assert!(caps.prompts.is_none());
+    }
 }
