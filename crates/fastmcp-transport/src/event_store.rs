@@ -831,4 +831,85 @@ mod tests {
         assert_eq!(stats.max_events_per_stream, 77);
         assert!(stats.ttl.is_none());
     }
+
+    // =========================================================================
+    // Additional coverage tests (bd-1w9n)
+    // =========================================================================
+
+    #[test]
+    fn event_entry_debug_and_clone() {
+        let entry = EventEntry::new("ev1".into(), "s1".into(), Some(serde_json::json!(42)));
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("ev1"));
+        assert!(debug.contains("s1"));
+
+        let cloned = entry.clone();
+        assert_eq!(cloned.id, "ev1");
+        assert_eq!(cloned.stream_id, "s1");
+    }
+
+    #[test]
+    fn event_entry_is_expired_not_expired() {
+        let entry = EventEntry::new("ev1".into(), "s1".into(), None);
+        // Just created → not expired with 1h TTL
+        assert!(!entry.is_expired(Some(Duration::from_secs(3600))));
+        // Never expires with None TTL
+        assert!(!entry.is_expired(None));
+    }
+
+    #[test]
+    fn event_store_config_debug_and_clone() {
+        let config = EventStoreConfig::default().max_events(10);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("10"));
+
+        let cloned = config.clone();
+        assert_eq!(cloned.max_events_per_stream, 10);
+    }
+
+    #[test]
+    fn event_store_stats_debug_and_clone() {
+        let store = EventStore::new();
+        store.store_event("s1", None);
+        let stats = store.stats();
+        let debug = format!("{stats:?}");
+        assert!(debug.contains("EventStoreStats"));
+
+        let cloned = stats.clone();
+        assert_eq!(cloned.stream_count, 1);
+    }
+
+    #[test]
+    fn event_store_debug() {
+        let store = EventStore::new();
+        let debug = format!("{store:?}");
+        assert!(debug.contains("EventStore"));
+    }
+
+    #[test]
+    fn cleanup_expired_noop_with_no_ttl() {
+        let config = EventStoreConfig::no_expiry();
+        let store = EventStore::with_config(config);
+        store.store_event("s1", Some(serde_json::json!(1)));
+        store.store_event("s2", Some(serde_json::json!(2)));
+        store.cleanup_expired();
+        // Nothing should be removed
+        assert_eq!(store.event_count(), 2);
+        assert_eq!(store.stream_count(), 2);
+    }
+
+    #[test]
+    fn clear_stream_nonexistent_is_noop() {
+        let store = EventStore::new();
+        store.store_event("s1", None);
+        store.clear_stream("no-such-stream");
+        assert_eq!(store.stream_count(), 1);
+    }
+
+    #[test]
+    fn event_id_format_contains_dash() {
+        let store = EventStore::new();
+        let id = store.store_event("s1", None);
+        assert!(id.contains('-'), "event ID should contain a dash: {id}");
+    }
 }
