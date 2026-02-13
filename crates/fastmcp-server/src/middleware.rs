@@ -246,4 +246,91 @@ mod tests {
         let result = mw.on_error(&ctx, &req, err);
         assert!(result.message.contains("rewritten"));
     }
+
+    // ── Additional coverage ─────────────────────────────────────────
+
+    struct TransformResponseMiddleware;
+    impl Middleware for TransformResponseMiddleware {
+        fn on_response(
+            &self,
+            _ctx: &McpContext,
+            _request: &JsonRpcRequest,
+            mut response: serde_json::Value,
+        ) -> McpResult<serde_json::Value> {
+            response["transformed"] = serde_json::json!(true);
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn custom_on_response_can_transform() {
+        let mw = TransformResponseMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let input = serde_json::json!({"data": 1});
+        let output = mw.on_response(&ctx, &req, input).unwrap();
+        assert_eq!(output["data"], 1);
+        assert_eq!(output["transformed"], true);
+    }
+
+    #[test]
+    fn on_request_can_return_error() {
+        struct RejectMiddleware;
+        impl Middleware for RejectMiddleware {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                Err(McpError::internal_error("rejected"))
+            }
+        }
+
+        let mw = RejectMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let err = mw.on_request(&ctx, &req).unwrap_err();
+        assert!(err.message.contains("rejected"));
+    }
+
+    #[test]
+    fn on_response_can_return_error() {
+        struct FailResponseMiddleware;
+        impl Middleware for FailResponseMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                _response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                Err(McpError::internal_error("response-fail"))
+            }
+        }
+
+        let mw = FailResponseMiddleware;
+        let ctx = make_ctx();
+        let req = make_request();
+        let err = mw
+            .on_response(&ctx, &req, serde_json::json!({}))
+            .unwrap_err();
+        assert!(err.message.contains("response-fail"));
+    }
+
+    #[test]
+    fn middleware_decision_continue_clone() {
+        let d = MiddlewareDecision::Continue;
+        let cloned = d.clone();
+        assert!(matches!(cloned, MiddlewareDecision::Continue));
+    }
+
+    #[test]
+    fn arc_middleware_delegates_transforming_on_response() {
+        let mw: Arc<dyn Middleware> = Arc::new(TransformResponseMiddleware);
+        let ctx = make_ctx();
+        let req = make_request();
+        let input = serde_json::json!({"x": 2});
+        let output = mw.on_response(&ctx, &req, input).unwrap();
+        assert_eq!(output["x"], 2);
+        assert_eq!(output["transformed"], true);
+    }
 }
