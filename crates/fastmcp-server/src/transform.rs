@@ -1088,4 +1088,154 @@ mod tests {
         // Renamed nonexistent shouldn't appear
         assert!(!props.contains_key("renamed"));
     }
+
+    #[test]
+    fn call_async_delegates_with_mapped_args() {
+        use fastmcp_core::block_on;
+
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .hide_arg("n", 7)
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = block_on(transformed.call_async(&ctx, serde_json::json!({"query": "async"})));
+        let content = result.unwrap();
+        assert_eq!(content.len(), 1);
+        if let Content::Text { text } = &content[0] {
+            assert!(text.contains("\"q\":\"async\""));
+            assert!(text.contains("\"n\":7"));
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn transform_arguments_no_value_no_default_not_hidden_skipped() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new().description("ignored desc"))
+            .build();
+
+        // Don't supply "n" at all - should skip it (no default, not hidden)
+        let result = transformed
+            .transform_arguments(serde_json::json!({"q": "hello"}))
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("q").unwrap(), "hello");
+        assert!(
+            obj.get("n").is_none(),
+            "missing arg without default should be skipped"
+        );
+    }
+
+    #[test]
+    fn transform_arguments_default_used_without_hide() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new().default_int(99))
+            .build();
+
+        // Don't supply "n" - default should kick in even though not hidden
+        let result = transformed
+            .transform_arguments(serde_json::json!({"q": "test"}))
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("n").unwrap(), 99);
+    }
+
+    #[test]
+    fn build_definition_parent_no_description_returns_none() {
+        struct NoDescTool;
+        impl ToolHandler for NoDescTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "nodesc".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(NoDescTool).build();
+        assert!(transformed.definition().description.is_none());
+    }
+
+    #[test]
+    fn transform_schema_preserves_unrenamed_in_required() {
+        // Create a tool with two required args; rename only one
+        struct TwoReqTool;
+        impl ToolHandler for TwoReqTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "two".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "string"},
+                            "b": {"type": "string"}
+                        },
+                        "required": ["a", "b"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(TwoReqTool)
+            .rename_arg("a", "alpha")
+            .build();
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "alpha"),
+            "renamed arg in required"
+        );
+        assert!(
+            required.iter().any(|v| v == "b"),
+            "unrenamed arg still in required"
+        );
+        assert!(
+            !required.iter().any(|v| v == "a"),
+            "old name removed from required"
+        );
+    }
+
+    #[test]
+    fn type_schema_replaces_entire_property() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg(
+                "q",
+                ArgTransform::new()
+                    .type_schema(serde_json::json!({"type": "array", "items": {"type": "string"}})),
+            )
+            .build();
+
+        let def = transformed.definition();
+        let q_schema = &def.input_schema["properties"]["q"];
+        // Should have the new type, not the old "string"
+        assert_eq!(q_schema["type"], "array");
+        assert!(q_schema["items"].is_object());
+        // The old description should NOT be present (type_schema replaces entirely)
+        assert!(q_schema.get("description").is_none());
+    }
 }
