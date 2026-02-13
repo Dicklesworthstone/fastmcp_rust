@@ -2890,6 +2890,327 @@ mod tests {
         assert_eq!(task.retry_count, 2);
     }
 
+    // ========================================
+    // DocketSettings — additional
+    // ========================================
+
+    #[test]
+    fn docket_settings_with_poll_interval() {
+        let s = DocketSettings::memory().with_poll_interval(Duration::from_millis(500));
+        assert_eq!(s.poll_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn docket_settings_with_max_retries() {
+        let s = DocketSettings::memory().with_max_retries(10);
+        assert_eq!(s.max_retries, 10);
+    }
+
+    // ========================================
+    // SubmitOptions — clone
+    // ========================================
+
+    #[test]
+    fn submit_options_clone() {
+        let opts = SubmitOptions::new().with_priority(5).with_max_retries(3);
+        let cloned = opts.clone();
+        assert_eq!(cloned.priority, 5);
+        assert_eq!(cloned.max_retries, Some(3));
+    }
+
+    // ========================================
+    // DocketTask::to_task_info — additional statuses
+    // ========================================
+
+    #[test]
+    fn docket_task_to_task_info_running_has_started_at() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t"),
+            "type".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Running;
+        task.claimed_at = Some("2026-01-01T00:00:00Z".to_string());
+
+        let info = task.to_task_info();
+        assert_eq!(info.status, TaskStatus::Running);
+        assert_eq!(info.started_at, Some("2026-01-01T00:00:00Z".to_string()));
+        // Not terminal, so completed_at should be None
+        assert!(info.completed_at.is_none());
+    }
+
+    #[test]
+    fn docket_task_to_task_info_cancelled_has_completed_at() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t"),
+            "type".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Cancelled;
+        task.error = Some("user cancelled".to_string());
+
+        let info = task.to_task_info();
+        assert_eq!(info.status, TaskStatus::Cancelled);
+        assert!(info.completed_at.is_some()); // terminal
+        assert_eq!(info.error, Some("user cancelled".to_string()));
+    }
+
+    #[test]
+    fn docket_task_to_task_result_cancelled() {
+        let mut task = DocketTask::new(
+            TaskId::from_string("t"),
+            "type".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Cancelled;
+        task.error = Some("cancelled by user".to_string());
+
+        let result = task.to_task_result().expect("terminal");
+        assert!(!result.success);
+        assert_eq!(result.error, Some("cancelled by user".to_string()));
+    }
+
+    // ========================================
+    // Memory backend — cancel running
+    // ========================================
+
+    #[test]
+    fn memory_backend_cancel_running_task() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+        let task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Dequeue to set running
+        let _claimed = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
+
+        // Cancel while running
+        backend
+            .cancel(&TaskId::from_string("t1"), Some("force cancel"))
+            .unwrap();
+
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error, Some("force cancel".to_string()));
+    }
+
+    // ========================================
+    // Memory backend — requeue stale
+    // ========================================
+
+    #[test]
+    fn memory_backend_requeue_stale_with_stale_task() {
+        let settings = DocketSettings::memory().with_visibility_timeout(Duration::from_millis(0));
+        let backend = MemoryDocketBackend::new(settings);
+
+        let mut task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        task.status = TaskStatus::Running;
+        task.claimed_at = Some("2000-01-01T00:00:00Z".to_string()); // long ago
+        backend.enqueue(task).unwrap();
+
+        // Manually set status to Running (enqueue sets Pending, we need to update)
+        {
+            let mut tasks = backend.tasks.write().unwrap();
+            let t = tasks.get_mut(&TaskId::from_string("t1")).unwrap();
+            t.status = TaskStatus::Running;
+            t.claimed_at = Some("2000-01-01T00:00:00Z".to_string());
+        }
+
+        let requeued = backend.requeue_stale().unwrap();
+        assert_eq!(requeued, 1);
+
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.claimed_at.is_none());
+        assert_eq!(task.retry_count, 1);
+    }
+
+    #[test]
+    fn memory_backend_requeue_stale_at_retry_limit_marks_failed() {
+        let settings = DocketSettings::memory()
+            .with_visibility_timeout(Duration::from_millis(0))
+            .with_max_retries(1);
+        let backend = MemoryDocketBackend::new(settings);
+
+        let task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            1, // max_retries = 1
+        );
+        backend.enqueue(task).unwrap();
+
+        // Manually set as running and stale
+        {
+            let mut tasks = backend.tasks.write().unwrap();
+            let t = tasks.get_mut(&TaskId::from_string("t1")).unwrap();
+            t.status = TaskStatus::Running;
+            t.claimed_at = Some("2000-01-01T00:00:00Z".to_string());
+        }
+
+        let requeued = backend.requeue_stale().unwrap();
+        assert_eq!(requeued, 0); // Failed, not requeued
+
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_deref(), Some("Exceeded visibility timeout"));
+    }
+
+    // ========================================
+    // Memory backend — nack retry vs fail
+    // ========================================
+
+    #[test]
+    fn memory_backend_nack_under_limit_requeues() {
+        let settings = DocketSettings::memory().with_max_retries(3);
+        let backend = MemoryDocketBackend::new(settings);
+
+        let task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Dequeue to set running
+        let _claimed = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
+
+        // First nack — requeued
+        backend
+            .nack(&TaskId::from_string("t1"), "fail1")
+            .unwrap();
+
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.retry_count, 1);
+    }
+
+    #[test]
+    fn memory_backend_nack_at_limit_marks_failed() {
+        let settings = DocketSettings::memory().with_max_retries(1);
+        let backend = MemoryDocketBackend::new(settings);
+
+        let task = DocketTask::new(
+            TaskId::from_string("t1"),
+            "work".into(),
+            serde_json::json!({}),
+            0,
+            1,
+        );
+        backend.enqueue(task).unwrap();
+
+        // Dequeue to set running
+        let _claimed = backend.dequeue(&["work".to_string()]).unwrap().unwrap();
+
+        // First nack at max_retries=1 — fails
+        backend
+            .nack(&TaskId::from_string("t1"), "fatal")
+            .unwrap();
+
+        let task = backend
+            .get_task(&TaskId::from_string("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.retry_count, 1);
+    }
+
+    // ========================================
+    // Memory backend — dequeue multi-type
+    // ========================================
+
+    #[test]
+    fn memory_backend_dequeue_multiple_types() {
+        let backend = MemoryDocketBackend::new(DocketSettings::memory());
+
+        let task_a = DocketTask::new(
+            TaskId::from_string("a"),
+            "type_a".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        let task_b = DocketTask::new(
+            TaskId::from_string("b"),
+            "type_b".into(),
+            serde_json::json!({}),
+            0,
+            3,
+        );
+        backend.enqueue(task_a).unwrap();
+        backend.enqueue(task_b).unwrap();
+
+        // Dequeue accepting both types — should get first enqueued
+        let claimed = backend
+            .dequeue(&["type_a".to_string(), "type_b".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.task_type, "type_a");
+    }
+
+    // ========================================
+    // Docket::memory constructor
+    // ========================================
+
+    #[test]
+    fn docket_memory_constructor() {
+        let d = Docket::memory();
+        assert!(matches!(d.settings().backend, DocketBackendType::Memory));
+    }
+
+    // ========================================
+    // Worker — subscribed_types order
+    // ========================================
+
+    #[test]
+    fn worker_subscribed_types_contains_all() {
+        let docket = Docket::memory();
+        let worker = docket
+            .worker()
+            .subscribe("x", |_| async { Ok(serde_json::json!(1)) })
+            .subscribe("y", |_| async { Ok(serde_json::json!(2)) })
+            .subscribe("z", |_| async { Ok(serde_json::json!(3)) })
+            .build();
+
+        let types = worker.subscribed_types();
+        assert_eq!(types.len(), 3);
+        assert!(types.contains(&"x".to_string()));
+        assert!(types.contains(&"y".to_string()));
+        assert!(types.contains(&"z".to_string()));
+    }
+
     #[cfg(feature = "redis")]
     #[test]
     fn test_redis_requeue_stale_marks_failed_at_retry_limit() {
