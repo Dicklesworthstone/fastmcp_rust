@@ -1899,4 +1899,189 @@ mod tests {
     fn protocol_version_value() {
         assert_eq!(PROTOCOL_VERSION, "2024-11-05");
     }
+
+    // ========================================================================
+    // ToolAnnotations Tests
+    // ========================================================================
+
+    #[test]
+    fn tool_annotations_default_is_empty() {
+        let ann = ToolAnnotations::new();
+        assert!(ann.is_empty());
+    }
+
+    #[test]
+    fn tool_annotations_builder_chain() {
+        let ann = ToolAnnotations::new()
+            .read_only(true)
+            .idempotent(true)
+            .destructive(false)
+            .open_world_hint("none");
+
+        assert_eq!(ann.read_only, Some(true));
+        assert_eq!(ann.idempotent, Some(true));
+        assert_eq!(ann.destructive, Some(false));
+        assert_eq!(ann.open_world_hint.as_deref(), Some("none"));
+        assert!(!ann.is_empty());
+    }
+
+    #[test]
+    fn tool_annotations_single_field_not_empty() {
+        assert!(!ToolAnnotations::new().destructive(true).is_empty());
+        assert!(!ToolAnnotations::new().idempotent(false).is_empty());
+        assert!(!ToolAnnotations::new().read_only(true).is_empty());
+        assert!(!ToolAnnotations::new().open_world_hint("x").is_empty());
+    }
+
+    #[test]
+    fn tool_annotations_serialization_skips_none() {
+        let ann = ToolAnnotations::new().read_only(true);
+        let value = serde_json::to_value(&ann).expect("serialize");
+        assert_eq!(value["readOnly"], true);
+        assert!(value.get("destructive").is_none());
+        assert!(value.get("idempotent").is_none());
+        assert!(value.get("openWorldHint").is_none());
+    }
+
+    #[test]
+    fn tool_annotations_round_trip() {
+        let ann = ToolAnnotations::new()
+            .destructive(true)
+            .idempotent(false)
+            .open_world_hint("strict");
+        let json_str = serde_json::to_string(&ann).expect("serialize");
+        let deserialized: ToolAnnotations = serde_json::from_str(&json_str).expect("deserialize");
+        assert_eq!(ann, deserialized);
+    }
+
+    // ========================================================================
+    // Icon Tests
+    // ========================================================================
+
+    #[test]
+    fn icon_is_data_uri_with_data_prefix() {
+        let icon = Icon {
+            src: Some("data:image/png;base64,iVBOR".to_string()),
+            mime_type: None,
+            sizes: None,
+        };
+        assert!(icon.is_data_uri());
+    }
+
+    #[test]
+    fn icon_is_data_uri_without_data_prefix() {
+        let icon = Icon {
+            src: Some("https://example.com/icon.png".to_string()),
+            mime_type: None,
+            sizes: None,
+        };
+        assert!(!icon.is_data_uri());
+    }
+
+    #[test]
+    fn icon_is_data_uri_no_src() {
+        let icon = Icon {
+            src: None,
+            mime_type: None,
+            sizes: None,
+        };
+        assert!(!icon.is_data_uri());
+    }
+
+    #[test]
+    fn icon_is_data_uri_empty_string() {
+        let icon = Icon {
+            src: Some(String::new()),
+            mime_type: None,
+            sizes: None,
+        };
+        assert!(!icon.is_data_uri());
+    }
+
+    // ========================================================================
+    // Content Binary Factory Tests
+    // ========================================================================
+
+    #[test]
+    fn content_image_bytes_encodes_base64() {
+        let bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47]; // PNG header
+        let content = Content::image_bytes(bytes, "image/png");
+        match &content {
+            Content::Image { data, mime_type } => {
+                assert_eq!(mime_type, "image/png");
+                // Verify it's valid base64 that decodes back
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("valid base64");
+                assert_eq!(decoded, bytes);
+            }
+            _ => panic!("expected Image content"),
+        }
+    }
+
+    #[test]
+    fn content_image_bytes_empty() {
+        let content = Content::image_bytes(&[] as &[u8], "image/png");
+        match &content {
+            Content::Image { data, .. } => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("valid base64");
+                assert!(decoded.is_empty());
+            }
+            _ => panic!("expected Image content"),
+        }
+    }
+
+    #[test]
+    fn content_audio_bytes_encodes_base64() {
+        let bytes: &[u8] = &[0x52, 0x49, 0x46, 0x46]; // RIFF header
+        let content = Content::audio_bytes(bytes, "audio/wav");
+        match &content {
+            Content::Audio { data, mime_type } => {
+                assert_eq!(mime_type, "audio/wav");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("valid base64");
+                assert_eq!(decoded, bytes);
+            }
+            _ => panic!("expected Audio content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_blob_bytes_encodes_base64() {
+        let bytes: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let content = Content::resource_blob_bytes(
+            "blob://test",
+            Some("application/octet-stream".into()),
+            bytes,
+        );
+        match &content {
+            Content::Resource {
+                resource: ResourceContent { uri, blob, .. },
+            } => {
+                assert_eq!(uri, "blob://test");
+                let blob_data = blob.as_ref().expect("should have blob");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(blob_data)
+                    .expect("valid base64");
+                assert_eq!(decoded, bytes);
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
+
+    #[test]
+    fn content_resource_blob_bytes_none_mime() {
+        let content = Content::resource_blob_bytes("blob://test", None, &[1, 2, 3]);
+        match &content {
+            Content::Resource {
+                resource: ResourceContent { mime_type, .. },
+            } => {
+                assert!(mime_type.is_none());
+            }
+            _ => panic!("expected Resource content"),
+        }
+    }
 }
