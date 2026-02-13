@@ -1447,4 +1447,403 @@ mod tests {
         assert_eq!(result.error, Some("boom".to_string()));
         assert!(result.data.is_none());
     }
+
+    // ── update_progress on nonexistent task ──────────────────────────────
+
+    #[test]
+    fn update_progress_nonexistent_does_not_panic() {
+        let manager = TaskManager::new_for_testing();
+        let fake_id = TaskId::from_string("nonexistent".to_string());
+        manager.update_progress(&fake_id, 0.5, None); // should not panic
+    }
+
+    // ── fail_task on already-terminal task ───────────────────────────────
+
+    #[test]
+    fn fail_task_on_completed_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.complete_task(&id, serde_json::json!({"done": true}));
+        // Attempt to fail a completed task - should be ignored
+        manager.fail_task(&id, "too late");
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.status, TaskStatus::Completed);
+        let result = manager.get_result(&id).unwrap();
+        assert!(result.success);
+    }
+
+    // ── complete_task on already-terminal task ───────────────────────────
+
+    #[test]
+    fn complete_task_on_failed_is_ignored() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.fail_task(&id, "something broke");
+        // Attempt to complete a failed task - should be ignored
+        manager.complete_task(&id, serde_json::json!({"late": true}));
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.status, TaskStatus::Failed);
+        let result = manager.get_result(&id).unwrap();
+        assert!(!result.success);
+    }
+
+    // ── register_handler replaces existing handler ──────────────────────
+
+    #[test]
+    fn register_handler_replaces_existing() {
+        let manager = TaskManager::new_for_testing();
+        manager.register_handler("t", |_cx, _params| async {
+            Ok(serde_json::json!({"v": 1}))
+        });
+        manager.register_handler("t", |_cx, _params| async {
+            Ok(serde_json::json!({"v": 2}))
+        });
+        // Should succeed with the new handler
+        let cx = Cx::for_testing();
+        let id = manager.submit(&cx, "t", None).unwrap();
+        assert!(manager.get_info(&id).is_some());
+    }
+
+    // ── transition_state timestamps ─────────────────────────────────────
+
+    #[test]
+    fn transition_to_running_sets_started_at() {
+        let task_id = TaskId::from_string("ts-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Pending,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: None,
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        assert!(state.info.started_at.is_none());
+        assert!(transition_state(&mut state, TaskStatus::Running));
+        assert!(state.info.started_at.is_some());
+    }
+
+    #[test]
+    fn transition_to_completed_sets_completed_at() {
+        let task_id = TaskId::from_string("ts-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Running,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: Some("earlier".to_string()),
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        assert!(state.info.completed_at.is_none());
+        assert!(transition_state(&mut state, TaskStatus::Completed));
+        assert!(state.info.completed_at.is_some());
+    }
+
+    #[test]
+    fn transition_to_failed_sets_completed_at() {
+        let task_id = TaskId::from_string("ts-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Running,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: Some("earlier".to_string()),
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        assert!(transition_state(&mut state, TaskStatus::Failed));
+        assert!(state.info.completed_at.is_some());
+    }
+
+    #[test]
+    fn transition_to_cancelled_sets_completed_at() {
+        let task_id = TaskId::from_string("ts-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Running,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: Some("earlier".to_string()),
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        assert!(transition_state(&mut state, TaskStatus::Cancelled));
+        assert!(state.info.completed_at.is_some());
+    }
+
+    #[test]
+    fn transition_invalid_returns_false() {
+        let task_id = TaskId::from_string("ts-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Pending,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: None,
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        // Pending -> Completed is invalid
+        assert!(!transition_state(&mut state, TaskStatus::Completed));
+        // State should remain Pending
+        assert_eq!(state.info.status, TaskStatus::Pending);
+    }
+
+    // ── TaskStatusSnapshot ──────────────────────────────────────────────
+
+    #[test]
+    fn task_status_snapshot_debug_and_clone() {
+        let task_id = TaskId::from_string("snap-test".to_string());
+        let state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Running,
+                progress: Some(0.5),
+                message: Some("testing".to_string()),
+                created_at: "now".to_string(),
+                started_at: Some("now".to_string()),
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        let snapshot = TaskStatusSnapshot::from(&state);
+        let debug = format!("{:?}", snapshot);
+        assert!(debug.contains("TaskStatusSnapshot"));
+        let cloned = snapshot.clone();
+        assert_eq!(cloned.info.status, TaskStatus::Running);
+        assert!(cloned.result.is_none());
+    }
+
+    // ── cleanup with failed/cancelled tasks ─────────────────────────────
+
+    #[test]
+    fn cleanup_completed_removes_failed_and_cancelled() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let id1 = manager.submit(&cx, "t", None).unwrap();
+        let id2 = manager.submit(&cx, "t", None).unwrap();
+        let id3 = manager.submit(&cx, "t", None).unwrap();
+
+        // Complete one
+        manager.start_task(&id1).unwrap();
+        manager.complete_task(&id1, serde_json::json!({}));
+
+        // Fail one
+        manager.start_task(&id2).unwrap();
+        manager.fail_task(&id2, "error");
+
+        // Cancel one
+        manager.cancel(&id3, None).unwrap();
+
+        assert_eq!(manager.total_count(), 3);
+
+        // Cleanup with 0 duration should remove all terminal tasks
+        manager.cleanup_completed(std::time::Duration::from_secs(0));
+        assert_eq!(manager.total_count(), 0);
+    }
+
+    // ── set_notification_sender replaces sender ─────────────────────────
+
+    #[test]
+    fn set_notification_sender_replaces_existing() {
+        let manager = TaskManager::new_for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let c1 = Arc::clone(&count1);
+        let sender1: TaskNotificationSender = Arc::new(move |_| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        manager.set_notification_sender(sender1);
+
+        let cx = Cx::for_testing();
+        let _id1 = manager.submit(&cx, "t", None).unwrap();
+        assert!(count1.load(std::sync::atomic::Ordering::SeqCst) > 0);
+
+        // Replace sender
+        let c2 = Arc::clone(&count2);
+        let sender2: TaskNotificationSender = Arc::new(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        manager.set_notification_sender(sender2);
+
+        let _id2 = manager.submit(&cx, "t", None).unwrap();
+        assert!(count2.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    // ── cancel with custom reason ───────────────────────────────────────
+
+    #[test]
+    fn cancel_with_custom_reason() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        let info = manager.cancel(&id, Some("Timeout".to_string())).unwrap();
+        assert_eq!(info.error, Some("Timeout".to_string()));
+        let result = manager.get_result(&id).unwrap();
+        assert_eq!(result.error, Some("Timeout".to_string()));
+    }
+
+    // ── can_transition self-transitions ──────────────────────────────────
+
+    #[test]
+    fn can_transition_self_is_false() {
+        // Self-transitions are not in the match arms, so can_transition returns false,
+        // but transition_state handles identity specially (returns true without changing state).
+        assert!(!can_transition(TaskStatus::Pending, TaskStatus::Pending));
+        assert!(!can_transition(TaskStatus::Running, TaskStatus::Running));
+        assert!(!can_transition(
+            TaskStatus::Completed,
+            TaskStatus::Completed
+        ));
+        assert!(!can_transition(TaskStatus::Failed, TaskStatus::Failed));
+        assert!(!can_transition(
+            TaskStatus::Cancelled,
+            TaskStatus::Cancelled
+        ));
+    }
+
+    // ── transition_state with Pending -> Pending (identity) ─────────────
+
+    #[test]
+    fn transition_state_identity_pending_returns_true() {
+        let task_id = TaskId::from_string("identity-test".to_string());
+        let mut state = TaskState {
+            info: TaskInfo {
+                id: task_id,
+                task_type: "t".to_string(),
+                status: TaskStatus::Pending,
+                progress: None,
+                message: None,
+                created_at: String::new(),
+                started_at: None,
+                completed_at: None,
+                error: None,
+            },
+            cancel_requested: false,
+            result: None,
+            cx: Cx::for_testing(),
+        };
+        assert!(transition_state(&mut state, TaskStatus::Pending));
+        assert_eq!(state.info.status, TaskStatus::Pending);
+    }
+
+    // ── list_tasks with no filter ───────────────────────────────────────
+
+    #[test]
+    fn list_tasks_no_filter_returns_all() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id1 = manager.submit(&cx, "t", None).unwrap();
+        let _id2 = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id1).unwrap();
+        manager.complete_task(&id1, serde_json::json!({}));
+        // id1 is Completed, id2 is Pending
+        let all = manager.list_tasks(None);
+        assert_eq!(all.len(), 2);
+    }
+
+    // ── notification sender status content ──────────────────────────────
+
+    #[test]
+    fn cancel_notification_includes_error_and_result() {
+        let manager = TaskManager::new_for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+
+        let events: Arc<std::sync::Mutex<Vec<TaskStatusNotificationParams>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender_events = Arc::clone(&events);
+        let sender: TaskNotificationSender = Arc::new(move |request| {
+            if request.method == "notifications/tasks/status" {
+                let params: TaskStatusNotificationParams = request
+                    .params
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap();
+                sender_events.lock().unwrap().push(params);
+            }
+        });
+        manager.set_notification_sender(sender);
+
+        let cx = Cx::for_testing();
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.cancel(&id, Some("user abort".to_string())).unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        // Last notification should be the cancellation
+        let last = recorded.last().unwrap();
+        assert_eq!(last.status, TaskStatus::Cancelled);
+        assert_eq!(last.error, Some("user abort".to_string()));
+        assert!(last.result.is_some());
+        let result = last.result.as_ref().unwrap();
+        assert!(!result.success);
+    }
+
+    // ── complete sets progress to 1.0 ───────────────────────────────────
+
+    #[test]
+    fn complete_task_sets_progress_to_one() {
+        let manager = TaskManager::new_for_testing();
+        let cx = Cx::for_testing();
+        manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
+        let id = manager.submit(&cx, "t", None).unwrap();
+        manager.start_task(&id).unwrap();
+        manager.update_progress(&id, 0.5, None);
+        manager.complete_task(&id, serde_json::json!({}));
+        let info = manager.get_info(&id).unwrap();
+        assert_eq!(info.progress, Some(1.0));
+    }
 }
