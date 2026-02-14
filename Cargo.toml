@@ -24,7 +24,7 @@ readme = "README.md"
 [workspace.dependencies]
 # Runtime (our own)
 asupersync = "0.1.1"
-rich_rust = { version = "0.1.1", path = "../rich_rust" }
+rich_rust = "0.1.1"
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }
