@@ -5,17 +5,27 @@
 //! server-side authentication providers.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Session state key used to store authentication context.
 pub const AUTH_STATE_KEY: &str = "fastmcp.auth";
 
 /// Parsed access token (scheme + token value).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessToken {
     /// Token scheme (e.g., "Bearer").
     pub scheme: String,
     /// Raw token value.
     pub token: String,
+}
+
+impl fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("scheme", &self.scheme)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AccessToken {
@@ -222,10 +232,30 @@ mod tests {
         };
         let debug = format!("{token:?}");
         assert!(debug.contains("AccessToken"));
-        assert!(debug.contains("abc"));
+        assert!(debug.contains("Bearer"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("abc"));
 
         let cloned = token.clone();
         assert_eq!(token, cloned);
+    }
+
+    #[test]
+    fn auth_context_debug_redacts_nested_token() {
+        let ctx = AuthContext {
+            subject: Some("user42".to_string()),
+            scopes: vec!["read".to_string()],
+            token: Some(AccessToken {
+                scheme: "Bearer".to_string(),
+                token: "super-secret-token".to_string(),
+            }),
+            claims: None,
+        };
+
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains("AuthContext"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret-token"));
     }
 
     #[test]
