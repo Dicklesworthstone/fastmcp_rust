@@ -1,10 +1,10 @@
 # AGENTS.md — FastMCP Rust
 
-> Guidelines for AI coding agents working on the FastMCP Rust port.
+> Guidelines for AI coding agents working in this Rust codebase.
 
 ---
 
-## RULE 0 - THE FUNDAMENTAL OVERRIDE PEROGATIVE
+## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
 
@@ -12,37 +12,36 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## RULE NUMBER 1: NO FILE DELETION
 
-**YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.**
+**YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
 
 **YOU MUST ALWAYS ASK AND RECEIVE CLEAR, WRITTEN PERMISSION BEFORE EVER DELETING A FILE OR FOLDER OF ANY KIND.**
 
 ---
 
-## Irreversible Git & Filesystem Actions — FORBIDDEN
+## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
-1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command.
-2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval.
-3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options first.
+1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
+2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
+3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
+4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
+5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
 
 ---
 
-## Porting Methodology
+## Git Branch: ONLY Use `main`, NEVER `master`
 
-**THE RULE:** *Extract spec from legacy → implement from spec → never translate line-by-line.*
+**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
 
-### The Three Documents
+- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
+- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
+- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
+  ```bash
+  git push origin main:master
+  ```
 
-1. **PLAN_TO_PORT_FASTMCP_TO_RUST.md** - Strategy, scope, exclusions
-2. **EXISTING_FASTMCP_STRUCTURE.md** - THE SPEC DOC (consult this, not legacy)
-3. **PROPOSED_RUST_ARCHITECTURE.md** - Rust design from references
-
-### During Implementation
-
-- **Consult ONLY the spec doc, not legacy code**
-- Copy patterns from reference projects (`/data/projects/fastapi_rust`)
-- Use asupersync for async runtime (NOT tokio directly)
-- Use `serde` for serialization
-- Minimal dependencies philosophy
+**If you see `master` referenced anywhere:**
+1. Update it to `main`
+2. Ensure `master` is synchronized: `git push origin main:master`
 
 ---
 
@@ -52,54 +51,88 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
-- **Configuration:** Cargo.toml only
+- **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+
+### Async Runtime: asupersync (MANDATORY — NO TOKIO)
+
+**This project uses [asupersync](/dp/asupersync) exclusively for all async/concurrent operations. Tokio and the entire tokio ecosystem are FORBIDDEN.**
+
+- **Structured concurrency**: `Cx`, `Scope`, `region()` — no orphan tasks
+- **Cancel-correct channels**: Two-phase `reserve()/send()` — no data loss on cancellation
+- **Sync primitives**: `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, `Pool` — cancel-aware
+- **Deterministic testing**: `LabRuntime` with virtual time, DPOR, oracles
+- **Native HTTP**: `asupersync::http::h1` for HTTP transport (replaces reqwest)
+
+**Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
+
+**Pattern**: All async functions take `&Cx` as first parameter (wrapped in `McpContext`). The `Cx` flows down from the consumer's runtime — FastMCP does NOT create its own runtime.
 
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Cancel-correct async runtime (our own) |
+| `asupersync` | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `rich_rust` | Rich console output and formatting |
 | `serde` + `serde_json` | JSON serialization |
-| `proc-macro2`, `quote`, `syn` | Procedural macros only |
+| `serde_yaml` | YAML configuration parsing |
+| `chrono` | Date/time handling |
+| `clap` | CLI argument parsing |
+| `notify` + `glob` | File watching for dev mode |
+| `getrandom` | Cryptographic RNG (WebSocket masking) |
+| `sha2` + `hmac` | Cryptography (OAuth PKCE, OIDC signing) |
+| `regex` | JSON Schema `pattern` validation |
+| `base64` | Opaque cursor encoding for pagination |
+| `semver` + `ureq` | Update checking (CLI) |
+| `redis` | Optional distributed backend (Docket) |
+| `jsonwebtoken` | Optional JWT authentication |
+| `log` | Logging facade (zero-cost when disabled) |
+| `proc-macro2` + `quote` + `syn` | Procedural macros (`#[tool]`, `#[resource]`, `#[prompt]`) |
 
-### Crate Structure
+### Release Profile
 
-```
-fastmcp_rust/
-├── AGENTS.md                           # This file
-├── PLAN_TO_PORT_FASTMCP_TO_RUST.md    # Porting strategy
-├── EXISTING_FASTMCP_STRUCTURE.md      # THE SPEC (create this)
-├── PROPOSED_RUST_ARCHITECTURE.md      # Rust design (create this)
-├── legacy_fastmcp/                    # Python reference (read-only)
-├── Cargo.toml                         # Workspace config
-├── rust-toolchain.toml                # Nightly
-└── crates/
-    ├── fastmcp/                       # Facade crate (published as fastmcp-rust)
-    ├── fastmcp-core/                  # Core types, McpContext, errors
-    ├── fastmcp-protocol/              # MCP types, JSON-RPC
-    ├── fastmcp-transport/             # Stdio, SSE transports
-    ├── fastmcp-server/                # Server implementation
-    ├── fastmcp-client/                # Client implementation
-    └── fastmcp-derive/                # #[tool], #[resource], #[prompt]
+The release build optimizes for performance:
+
+```toml
+[profile.release]
+opt-level = 3       # Maximum performance optimization
+lto = true          # Link-time optimization
+codegen-units = 1   # Single codegen unit for better optimization
+strip = true        # Remove debug symbols
 ```
 
 ---
 
-## Asupersync Integration
+## Code Editing Discipline
 
-FastMCP uses asupersync (`/data/projects/asupersync`) for:
+### No Script-Based Changes
 
-- **Cx**: Capability context for all operations
-- **Outcome**: 4-valued result (Ok, Err, Cancelled, Panicked)
-- **Budget**: Request timeouts and resource limits
-- **LabRuntime**: Deterministic testing
-- **Structured concurrency**: All tasks in regions
+**NEVER** run a script that processes/changes code files in this repo. Brittle regex-based transformations create far more problems than they solve.
 
-Key patterns:
-- Every handler receives `&McpContext` (wraps Cx)
-- Use `ctx.checkpoint()` for cancellation points
-- Use `ctx.masked(|| ...)` for critical sections
+- **Always make code changes manually**, even when there are many instances
+- For many simple changes: use parallel subagents
+- For subtle/complex changes: do them methodically yourself
+
+### No File Proliferation
+
+If you want to change something or add a feature, **revise existing code files in place**.
+
+**NEVER** create variations like:
+- `mainV2.rs`
+- `main_improved.rs`
+- `main_enhanced.rs`
+
+New files are reserved for **genuinely new functionality** that makes zero sense to include in any existing file. The bar for creating new files is **incredibly high**.
+
+---
+
+## Backwards Compatibility
+
+We do not care about backwards compatibility—we're in early development with no users. We want to do things the **RIGHT** way with **NO TECH DEBT**.
+
+- Never create "compatibility shims"
+- Never create wrapper functions for deprecated APIs
+- Just fix the code directly
 
 ---
 
@@ -108,11 +141,11 @@ Key patterns:
 **After any substantive code changes, you MUST verify no errors were introduced:**
 
 ```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
+# Check for compiler errors and warnings (workspace-wide)
+cargo check --workspace --all-targets
 
-# Check for clippy lints (pedantic enabled)
-cargo clippy --all-targets -- -D warnings
+# Check for clippy lints (pedantic + nursery are enabled)
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
 cargo fmt --check
@@ -122,32 +155,239 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
-## Code Editing Discipline
+## Testing
 
-### No Script-Based Changes
+### Testing Policy
 
-**NEVER** run a script that processes/changes code files in this repo.
+Every component crate includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
 
-- **Always make code changes manually**, even when there are many instances
-- For many simple changes: use parallel subagents
+The `fastmcp-server` crate contains extensive integration tests in `tests.rs`.
 
-### No File Proliferation
+### Unit Tests
 
-If you want to change something or add a feature, **revise existing code files in place**.
+```bash
+# Run all tests across the workspace
+cargo test --workspace
 
-**NEVER** create variations like `mainV2.rs`, `main_improved.rs`
+# Run with output
+cargo test --workspace -- --nocapture
 
----
+# Run tests for a specific crate
+cargo test -p fastmcp-core
+cargo test -p fastmcp-protocol
+cargo test -p fastmcp-transport
+cargo test -p fastmcp-server
+cargo test -p fastmcp-client
+cargo test -p fastmcp-derive
+cargo test -p fastmcp-console
+cargo test -p fastmcp-cli
+cargo test -p fastmcp-rust
 
-## Backwards Compatibility
+# Run tests with all features enabled
+cargo test --workspace --all-features
+```
 
-We do not care about backwards compatibility—we're in early development. We want to do things the **RIGHT** way with **NO TECH DEBT**.
+### Test Categories
+
+| Crate | Focus Areas |
+|-------|-------------|
+| `fastmcp-core` | McpContext lifecycle, error types, budget/cancellation semantics, auth context, combinators, duration parsing, session state |
+| `fastmcp-protocol` | JSON-RPC message parsing/serialization, MCP types round-trip, JSON Schema generation/validation, protocol version negotiation |
+| `fastmcp-transport` | Stdio framing, SSE event streaming, WebSocket frame encode/decode, HTTP request/response, memory transport, codec correctness, event store persistence |
+| `fastmcp-server` | Handler dispatch, router registration, tool/resource/prompt lifecycle, builder API, middleware chains, caching, rate limiting, OAuth/OIDC flows, JWT auth, proxy client, session management, Docket distributed backend, bidirectional communication, task management |
+| `fastmcp-client` | Client connection lifecycle, session management, tool calling, resource reading, MCP config file parsing |
+| `fastmcp-derive` | `#[tool]` macro expansion, `#[resource]` macro expansion, `#[prompt]` macro expansion, JsonSchema derive |
+| `fastmcp-console` | Rich console output formatting, log level filtering |
+| `fastmcp-cli` | CLI argument parsing, server run/dev/install commands |
+| `fastmcp-rust` (facade) | Re-export correctness, prelude completeness, compile tests |
 
 ---
 
 ## Third-Party Library Usage
 
-If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation.
+If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
+
+---
+
+## FastMCP Rust — This Project
+
+**This is the project you're working on.** FastMCP Rust is a Rust port of the Python FastMCP framework, providing a fast, cancel-correct implementation of the Model Context Protocol (MCP) for building AI tool servers and clients.
+
+### What It Does
+
+Provides a complete MCP framework with server and client APIs, procedural macros for ergonomic handler definitions (`#[tool]`, `#[resource]`, `#[prompt]`), multiple transports (stdio, SSE, WebSocket, HTTP, memory), middleware (caching, rate limiting, transforms), authentication (OAuth 2.1, OIDC, JWT, static tokens), a proxy/gateway system, and a rich CLI for running, inspecting, and installing MCP servers.
+
+### Architecture
+
+```
+User Code → #[tool] / #[resource] / #[prompt] macros
+                │
+                ▼
+         ServerBuilder → Router (handler dispatch)
+                │
+                ├─ Middleware: Caching, Rate Limiting, Transform
+                ├─ Auth: OAuth 2.1, OIDC, JWT, Static Token
+                ├─ Proxy: ProxyClient → remote MCP servers
+                │
+                ▼
+         Transport Layer
+                ├─ StdioTransport (stdin/stdout JSON-RPC)
+                ├─ SSE (Server-Sent Events over HTTP)
+                ├─ WebSocket (full-duplex framing)
+                ├─ HTTP (Streamable HTTP transport)
+                └─ Memory (in-process, for testing)
+                │
+                ▼
+         Protocol Layer (JSON-RPC 2.0 + MCP messages)
+                │
+                ▼
+         Core (McpContext wrapping asupersync Cx)
+```
+
+### Workspace Structure
+
+```
+fastmcp_rust/
+├── Cargo.toml                         # Workspace root
+├── crates/
+│   ├── fastmcp/                       # Facade crate (published as fastmcp-rust, re-exports everything)
+│   ├── fastmcp-core/                  # Core types: McpContext, errors, budget, auth, combinators
+│   ├── fastmcp-protocol/             # MCP protocol types, JSON-RPC, JSON Schema
+│   ├── fastmcp-transport/            # Transports: stdio, SSE, WebSocket, HTTP, memory
+│   ├── fastmcp-server/               # Server: router, handlers, middleware, auth, proxy, Docket
+│   ├── fastmcp-client/               # Client: connection, session, MCP config parsing
+│   ├── fastmcp-macros/               # Proc macros: #[tool], #[resource], #[prompt], JsonSchema
+│   ├── fastmcp-console/              # Rich console output (rich_rust integration)
+│   └── fastmcp-cli/                  # CLI binary: run, dev, install, inspect commands
+├── legacy_fastmcp/                    # Python reference (read-only)
+├── PLAN_TO_PORT_FASTMCP_TO_RUST.md   # Porting strategy
+├── EXISTING_FASTMCP_STRUCTURE.md     # THE SPEC DOC (consult this, not legacy)
+└── PROPOSED_RUST_ARCHITECTURE.md     # Rust design from references
+```
+
+### Key Files by Crate
+
+| Crate | Key Files | Purpose |
+|-------|-----------|---------|
+| `fastmcp-core` | `src/context.rs` | `McpContext` wrapping asupersync `Cx`, cancellation, budget, progress reporting, sampling, elicitation |
+| `fastmcp-core` | `src/error.rs` | `McpError`, `McpErrorCode`, `McpResult`, `McpOutcome`, 4-valued result bridging |
+| `fastmcp-core` | `src/auth.rs` | `AuthContext`, `AccessToken`, auth state management |
+| `fastmcp-core` | `src/combinator.rs` | Functional combinators for async operations |
+| `fastmcp-core` | `src/state.rs` | `SessionState`, disabled tools/resources/prompts tracking |
+| `fastmcp-protocol` | `src/jsonrpc.rs` | JSON-RPC 2.0 message types (Request, Response, Error) |
+| `fastmcp-protocol` | `src/messages.rs` | MCP message types (Initialize, CallTool, ReadResource, GetPrompt, etc.) |
+| `fastmcp-protocol` | `src/types.rs` | MCP domain types (Tool, Resource, Prompt, Content, etc.) |
+| `fastmcp-protocol` | `src/schema.rs` | JSON Schema generation and validation |
+| `fastmcp-transport` | `src/stdio.rs` | Stdin/stdout newline-delimited JSON-RPC transport |
+| `fastmcp-transport` | `src/sse.rs` | Server-Sent Events HTTP transport |
+| `fastmcp-transport` | `src/websocket.rs` | WebSocket frame encode/decode, full-duplex transport |
+| `fastmcp-transport` | `src/http.rs` | Streamable HTTP transport |
+| `fastmcp-transport` | `src/memory.rs` | In-process transport for testing |
+| `fastmcp-transport` | `src/event_store.rs` | Persistent event store for SSE replay |
+| `fastmcp-server` | `src/lib.rs` | `Server` struct, core server lifecycle |
+| `fastmcp-server` | `src/builder.rs` | `ServerBuilder` fluent API for server configuration |
+| `fastmcp-server` | `src/router.rs` | Request routing, handler dispatch, tool/resource/prompt registration |
+| `fastmcp-server` | `src/handler.rs` | `ToolHandler`, `ResourceHandler`, `PromptHandler` traits and implementations |
+| `fastmcp-server` | `src/middleware.rs` | Middleware chain for request/response transformation |
+| `fastmcp-server` | `src/caching.rs` | Response caching layer |
+| `fastmcp-server` | `src/rate_limiting.rs` | Rate limiting middleware |
+| `fastmcp-server` | `src/transform.rs` | Request/response transformation middleware |
+| `fastmcp-server` | `src/auth.rs` | Auth providers (static token, JWT, token verifier) |
+| `fastmcp-server` | `src/oauth.rs` | OAuth 2.1 authorization server implementation |
+| `fastmcp-server` | `src/oidc.rs` | OpenID Connect provider integration |
+| `fastmcp-server` | `src/proxy.rs` | `ProxyClient` for forwarding to remote MCP servers |
+| `fastmcp-server` | `src/bidirectional.rs` | Bidirectional server-to-client communication (sampling, elicitation) |
+| `fastmcp-server` | `src/session.rs` | Per-client session management |
+| `fastmcp-server` | `src/docket.rs` | Distributed backend via Redis |
+| `fastmcp-server` | `src/tasks.rs` | Background task management |
+| `fastmcp-server` | `src/providers/filesystem.rs` | Filesystem resource provider |
+| `fastmcp-client` | `src/lib.rs` | `Client`, `ClientBuilder`, `ClientSession`, MCP config loading |
+| `fastmcp-macros` | `src/lib.rs` | `#[tool]`, `#[resource]`, `#[prompt]`, `JsonSchema` derive macros |
+| `fastmcp-console` | `src/lib.rs` | Rich stderr console output with rich_rust |
+| `fastmcp-cli` | `src/main.rs` | CLI binary: `fastmcp run`, `fastmcp dev`, `fastmcp install`, `fastmcp inspect` |
+
+### Feature Flags
+
+```toml
+[features]
+# fastmcp-rust (facade crate)
+jwt = ["fastmcp-server/jwt"]         # JWT authentication support
+
+# fastmcp-server
+jwt = ["dep:jsonwebtoken"]           # JWT token verification
+redis = ["dep:redis"]                # Docket distributed backend via Redis
+
+# fastmcp-console
+full = ["rich_rust/full"]            # Full rich_rust features
+syntax = ["rich_rust/syntax"]        # Syntax highlighting
+markdown = ["rich_rust/markdown"]    # Markdown rendering
+json = ["rich_rust/json"]            # JSON pretty-printing
+```
+
+### Core Types Quick Reference
+
+| Type | Purpose |
+|------|---------|
+| `McpContext` | Capability-carrying handle wrapping asupersync `Cx` — passed to all handlers |
+| `McpError` | Unified error type with `McpErrorCode` variants |
+| `McpResult<T>` | `Result<T, McpError>` convenience alias |
+| `McpOutcome<T>` | `Outcome<T, McpError>` — 4-valued: Ok, Err, Cancelled, Panicked |
+| `Server` | MCP server — registers tools, resources, prompts and runs on a transport |
+| `ServerBuilder` | Fluent API for constructing and configuring a `Server` |
+| `Router` | Request dispatcher — maps JSON-RPC methods to handlers |
+| `ToolHandler` | Trait for tool implementations (auto-derived by `#[tool]`) |
+| `ResourceHandler` | Trait for resource implementations (auto-derived by `#[resource]`) |
+| `PromptHandler` | Trait for prompt implementations (auto-derived by `#[prompt]`) |
+| `Client` | MCP client — connects to servers, calls tools, reads resources |
+| `ClientSession` | Active client connection with message correlation |
+| `ProxyClient` | Forwards requests to a remote MCP server |
+| `Session` | Per-client server session with state |
+| `SessionState` | Key-value state bag per client session |
+| `Transport` | Trait for message transport (stdio, SSE, WebSocket, HTTP, memory) |
+| `Codec` | JSON-RPC message framing and parsing |
+| `AuthProvider` | Trait for pluggable authentication |
+| `TokenVerifier` | Trait for token validation (static, JWT) |
+| `TaskManager` | Background task lifecycle management |
+| `Cx` | asupersync capability context — passed to all async operations |
+| `Outcome<T, E>` | Four-valued result: Ok, Err, Cancelled, Panicked |
+| `Budget` | Request timeouts and resource limits |
+
+### Porting Methodology
+
+**THE RULE:** *Extract spec from legacy -> implement from spec -> never translate line-by-line.*
+
+#### The Three Documents
+
+1. **PLAN_TO_PORT_FASTMCP_TO_RUST.md** - Strategy, scope, exclusions
+2. **EXISTING_FASTMCP_STRUCTURE.md** - THE SPEC DOC (consult this, not legacy)
+3. **PROPOSED_RUST_ARCHITECTURE.md** - Rust design from references
+
+#### During Implementation
+
+- **Consult ONLY the spec doc, not legacy code**
+- Copy patterns from reference projects (`/data/projects/fastapi_rust`)
+- Use asupersync for async runtime (NOT tokio directly)
+- Use `serde` for serialization
+- Minimal dependencies philosophy
+
+### Key Design Decisions
+
+- **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
+- **`McpContext` wraps `Cx`** — every handler receives `&McpContext` which wraps asupersync's capability context
+- **Cancel-correct lifecycle** — handlers use checkpoints for graceful cancellation, `masked()` for critical sections
+- **4-valued `Outcome`** — Ok, Err, Cancelled, Panicked propagated throughout the stack
+- **Proc macros for ergonomics** — `#[tool]`, `#[resource]`, `#[prompt]` generate schema and handler boilerplate at compile time
+- **Facade crate pattern** — `fastmcp-rust` re-exports everything; most users depend on a single crate
+- **Middleware pipeline** — caching, rate limiting, transforms compose as chainable middleware
+- **Multiple auth strategies** — OAuth 2.1, OIDC, JWT, static tokens; `AuthProvider` trait for custom schemes
+- **Proxy gateway** — `ProxyClient` + `ProxyCatalog` for aggregating multiple remote MCP servers
+- **Docket distributed backend** — optional Redis-backed distributed task queue
+- **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
+- **Structured tracing** via `log` facade — zero-cost when disabled
+- **`#![forbid(unsafe_code)]`** throughout all crates
 
 ---
 
@@ -202,9 +442,9 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 ## Beads (br) — Dependency-Aware Issue Tracking
 
-Beads provides a lightweight, dependency-aware issue database and CLI (`br` / beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
+Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
-**Note:** br (beads_rust) is non-invasive and never executes git commands. You must manually stage and commit `.beads/` changes after using br commands.
+**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
 ### Conventions
 
@@ -233,7 +473,8 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` / be
 
 5. **Complete and release:**
    ```bash
-   br close br-123 --reason "Completed"
+   br close 123 --reason "Completed"
+   br sync --flush-only  # Export to JSONL (no git operations)
    ```
    ```
    release_file_reservations(project_key, agent_name, paths=["src/**"])
@@ -382,6 +623,33 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ---
 
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+
+---
+
 ## ast-grep vs ripgrep
 
 **Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
@@ -431,9 +699,9 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| "How is pattern matching implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the quick reject filter?" | `warp_grep` | Need to understand architecture |
-| "Find all uses of `Regex::new`" | `ripgrep` | Targeted literal search |
+| "How does the proxy client forward requests?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is OAuth 2.1 token exchange implemented?" | `warp_grep` | Need to understand architecture |
+| "Find all uses of `McpContext::checkpoint`" | `ripgrep` | Targeted literal search |
 | "Find files with `println!`" | `ripgrep` | Simple pattern |
 | "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
 
@@ -441,8 +709,8 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/dcg",
-  query: "How does the safe pattern whitelist work?"
+  repoPath: "/dp/fastmcp_rust",
+  query: "How does the server builder register tool handlers?"
 )
 ```
 
@@ -454,81 +722,15 @@ Returns structured results with file paths, line ranges, and extracted code snip
 - **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
 - **Don't** use `ripgrep` for codemods → risks collateral edits
 
----
-
-## cass — Cross-Agent Session Search
-
-`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, Aider, etc.) into a unified, searchable index so you can reuse solved problems.
-
-**NEVER run bare `cass`** — it launches an interactive TUI. Always use `--robot` or `--json`.
-
-### Quick Start
-
-```bash
-# Check if index is healthy (exit 0=ok, 1=run index first)
-cass health
-
-# Search across all agent histories
-cass search "authentication error" --robot --limit 5
-
-# View a specific result (from search output)
-cass view /path/to/session.jsonl -n 42 --json
-
-# Expand context around a line
-cass expand /path/to/session.jsonl -n 42 -C 3 --json
-
-# Learn the full API
-cass capabilities --json      # Feature discovery
-cass robot-docs guide         # LLM-optimized docs
-```
-
-### Key Flags
-
-| Flag | Purpose |
-|------|---------|
-| `--robot` / `--json` | Machine-readable JSON output (required!) |
-| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent` only |
-| `--limit N` | Cap result count |
-| `--agent NAME` | Filter to specific agent (claude, codex, cursor, etc.) |
-| `--days N` | Limit to recent N days |
-
-**stdout = data only, stderr = diagnostics. Exit 0 = success.**
-
-### Robot Mode Etiquette
-
-- Prefer `cass --robot-help` and `cass robot-docs <topic>` for machine-first docs
-- The CLI is forgiving: globals placed before/after subcommand are auto-normalized
-- If parsing fails, follow the actionable errors with examples
-- Use `--color=never` in non-TTY automation for ANSI-free output
-
-### Pre-Flight Health Check
-
-```bash
-cass health --json
-```
-
-Returns in <50ms:
-- **Exit 0:** Healthy—proceed with queries
-- **Exit 1:** Unhealthy—run `cass index --full` first
-
-### Exit Codes
-
-| Code | Meaning | Retryable |
-|------|---------|-----------|
-| 0 | Success | N/A |
-| 1 | Health check failed | Yes—run `cass index --full` |
-| 2 | Usage/parsing error | No—fix syntax |
-| 3 | Index/DB missing | Yes—run `cass index --full` |
-
-Treat cass as a way to avoid re-solving problems other agents already handled.
-
 <!-- bv-agent-instructions-v1 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
 
 ### Essential Commands
 
@@ -542,9 +744,9 @@ br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies
 br create --title="..." --type=task --priority=2
 br update <id> --status=in_progress
-br close <id> --reason="Completed"
+br close <id> --reason "Completed"
 br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Flush changes to .beads/ (does NOT run git)
+br sync --flush-only  # Export to JSONL (NO git operations)
 ```
 
 ### Workflow Pattern
@@ -553,7 +755,7 @@ br sync --flush-only  # Flush changes to .beads/ (does NOT run git)
 2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only` then manually commit `.beads/`
+5. **Sync**: Run `br sync --flush-only` then manually commit
 
 ### Key Concepts
 
@@ -569,9 +771,9 @@ br sync --flush-only  # Flush changes to .beads/ (does NOT run git)
 ```bash
 git status              # Check what changed
 git add <files>         # Stage code changes
-br sync --flush-only    # Flush beads changes to .beads/
+br sync --flush-only    # Export beads to JSONL
 git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit code and beads together
+git commit -m "..."     # Commit everything together
 git push                # Push to remote
 ```
 
@@ -581,37 +783,21 @@ git push                # Push to remote
 - Update status as you work (in_progress → closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only` then `git add .beads/ && git commit` before ending session
+- Always `br sync --flush-only && git add .beads/` before ending session
 
 <!-- end-bv-agent-instructions -->
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only
-   git add .beads/
-   git commit -m "Update beads"
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
 
 
 ---
@@ -632,7 +818,7 @@ Next steps (pick one)
 3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into think YOU made the changes and simply don't recall it for some reason.
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
 
 ---
 
