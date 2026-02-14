@@ -73,7 +73,7 @@ fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
         (from, to),
         (
             TaskStatus::Pending,
-            TaskStatus::Running | TaskStatus::Cancelled
+            TaskStatus::Running | TaskStatus::Failed | TaskStatus::Cancelled
         ) | (
             TaskStatus::Running,
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
@@ -120,6 +120,60 @@ fn transition_state(state: &mut TaskState, to: TaskStatus) -> bool {
     true
 }
 
+fn mark_task_failed_snapshot(
+    tasks: &Arc<RwLock<HashMap<TaskId, TaskState>>>,
+    task_id: &TaskId,
+    error_msg: String,
+    lock_context: &'static str,
+) -> Option<TaskStatusSnapshot> {
+    let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
+        warn!(
+            target: targets::SERVER,
+            "tasks lock poisoned in {}, recovering",
+            lock_context
+        );
+        poisoned.into_inner()
+    });
+
+    let state = tasks_guard.get_mut(task_id)?;
+    if state.cancel_requested || !transition_state(state, TaskStatus::Failed) {
+        return None;
+    }
+
+    state.info.error = Some(error_msg.clone());
+    state.result = Some(TaskResult {
+        id: task_id.clone(),
+        success: false,
+        data: None,
+        error: Some(error_msg),
+    });
+    Some(TaskStatusSnapshot::from(state))
+}
+
+fn build_runtime_handle() -> Option<RuntimeHandle> {
+    match RuntimeBuilder::multi_thread().build() {
+        Ok(runtime) => Some(runtime.handle()),
+        Err(multi_err) => {
+            warn!(
+                target: targets::SERVER,
+                "failed to initialize multi-thread runtime for tasks: {}; attempting current-thread fallback",
+                multi_err
+            );
+            match RuntimeBuilder::current_thread().build() {
+                Ok(runtime) => Some(runtime.handle()),
+                Err(single_err) => {
+                    warn!(
+                        target: targets::SERVER,
+                        "failed to initialize current-thread runtime fallback for tasks: {}",
+                        single_err
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Background task manager.
 ///
 /// Manages the lifecycle of background tasks including submission, status
@@ -134,7 +188,7 @@ pub struct TaskManager {
     /// Whether task list changes should trigger notifications.
     list_changed_notifications: bool,
     /// Background runtime handle for executing tasks.
-    runtime: RuntimeHandle,
+    runtime: Option<RuntimeHandle>,
     /// Whether submitted tasks should execute immediately.
     auto_execute: bool,
     /// Optional notification sender for task status updates.
@@ -145,10 +199,13 @@ impl TaskManager {
     /// Creates a new task manager.
     #[must_use]
     pub fn new() -> Self {
-        let runtime = RuntimeBuilder::multi_thread()
-            .build()
-            .expect("failed to build background task runtime")
-            .handle();
+        let runtime = build_runtime_handle();
+        if runtime.is_none() {
+            warn!(
+                target: targets::SERVER,
+                "TaskManager runtime unavailable; auto-executed tasks will fail until runtime becomes available"
+            );
+        }
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             handlers: Arc::new(RwLock::new(HashMap::new())),
@@ -298,11 +355,22 @@ impl TaskManager {
         task_cx: Cx,
         params: serde_json::Value,
     ) {
+        let Some(runtime) = self.runtime.clone() else {
+            let failure_snapshot = mark_task_failed_snapshot(
+                &self.tasks,
+                &task_id,
+                "Task runtime unavailable".to_string(),
+                "spawn_task runtime unavailable",
+            );
+            self.notify_snapshot(failure_snapshot);
+            return;
+        };
+
         let tasks = Arc::clone(&self.tasks);
         let handlers = Arc::clone(&self.handlers);
         let notification_sender = Arc::clone(&self.notification_sender);
-
-        self.runtime.spawn(async move {
+        let scheduled_task_id = task_id.clone();
+        let scheduling = runtime.try_spawn(async move {
             let running_snapshot = {
                 let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
                     warn!(target: targets::SERVER, "tasks lock poisoned in spawn_task, recovering");
@@ -328,32 +396,12 @@ impl TaskManager {
                     poisoned.into_inner()
                 });
                 let Some(handler) = handlers_guard.get(&task_type) else {
-                    let failure_snapshot = {
-                        let mut tasks_guard = tasks.write().unwrap_or_else(|poisoned| {
-                            warn!(target: targets::SERVER, "tasks lock poisoned in spawn_task failure, recovering");
-                            poisoned.into_inner()
-                        });
-                        match tasks_guard.get_mut(&task_id) {
-                            Some(state) => {
-                                if !state.cancel_requested {
-                                    let error_msg = format!("Unknown task type: {task_type}");
-                                    state.info.status = TaskStatus::Failed;
-                                    state.info.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                                    state.info.error = Some(error_msg.clone());
-                                    state.result = Some(TaskResult {
-                                        id: task_id.clone(),
-                                        success: false,
-                                        data: None,
-                                        error: Some(error_msg),
-                                    });
-                                    Some(TaskStatusSnapshot::from(state))
-                                } else {
-                                    None
-                                }
-                            }
-                            None => None,
-                        }
-                    };
+                    let failure_snapshot = mark_task_failed_snapshot(
+                        &tasks,
+                        &task_id,
+                        format!("Unknown task type: {task_type}"),
+                        "spawn_task failure",
+                    );
                     notify_snapshot(&notification_sender, failure_snapshot);
                     return;
                 };
@@ -409,6 +457,22 @@ impl TaskManager {
 
             notify_snapshot(&notification_sender, completion_snapshot);
         });
+
+        if let Err(err) = scheduling {
+            warn!(
+                target: targets::SERVER,
+                "failed to schedule task {}: {}",
+                scheduled_task_id,
+                err
+            );
+            let failure_snapshot = mark_task_failed_snapshot(
+                &self.tasks,
+                &scheduled_task_id,
+                format!("Failed to schedule task: {err}"),
+                "spawn_task scheduling",
+            );
+            self.notify_snapshot(failure_snapshot);
+        }
     }
 
     /// Starts execution of a pending task.
@@ -843,6 +907,28 @@ mod tests {
         let cx = Cx::for_testing();
         let result = manager.submit(&cx, "test_task", None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_submit_auto_execute_fails_when_runtime_unavailable() {
+        let mut manager = TaskManager::new_for_testing();
+        manager.auto_execute = true;
+        manager.runtime = None;
+
+        manager.register_handler("test_task", |_cx, _params| async {
+            Ok(serde_json::json!({}))
+        });
+
+        let cx = Cx::for_testing();
+        let task_id = manager.submit(&cx, "test_task", None).unwrap();
+
+        let info = manager.get_info(&task_id).unwrap();
+        assert_eq!(info.status, TaskStatus::Failed);
+        assert_eq!(info.error.as_deref(), Some("Task runtime unavailable"));
+
+        let result = manager.get_result(&task_id).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Task runtime unavailable"));
     }
 
     #[test]
