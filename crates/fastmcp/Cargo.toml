@@ -25,7 +25,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true
-jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
 [lints]
 workspace = true

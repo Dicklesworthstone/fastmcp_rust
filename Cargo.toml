@@ -23,8 +23,8 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Runtime (our own)
-asupersync = "0.2.0"
-rich_rust = "0.2.0"
+asupersync = "0.2"
+rich_rust = "0.2"
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }
@@ -36,8 +36,8 @@ log = "0.4"
 
 # Opaque cursor encoding for pagination
 base64 = "0.22"
-semver = "1.0.27"
-ureq = "3.2.0"
+semver = "1"
+ureq = "3"
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -47,24 +47,24 @@ notify = "8"
 glob = "0.3"
 
 # Console output
-console = "0.15"
+console = "0.16"
 
 # Redis (optional, for Docket distributed backend)
-redis = "1.0.3"
+redis = "1"
 
 # Configuration file parsing
-toml = "0.8"
+toml = "1.0"
 dirs = "6"
 
 # Cryptographic RNG (for WebSocket masking)
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Cryptography (OAuth PKCE, OIDC signing)
-sha2 = "0.10.8"
-hmac = "0.12.1"
+sha2 = "0.10"
+hmac = "0.12"
 
 # Regex (JSON Schema `pattern` validation)
-regex = "1.11.1"
+regex = "1"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
