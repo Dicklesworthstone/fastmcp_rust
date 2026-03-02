@@ -119,7 +119,7 @@ jobs:
 
       - name: Upload test trace artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-traces-${{ matrix.os }}
           path: |
@@ -216,7 +216,7 @@ jobs:
             --no-run --no-clean
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-reports
           path: |
@@ -321,7 +321,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fastmcp-${{ matrix.target }}
           path: |
