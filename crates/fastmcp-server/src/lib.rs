@@ -91,9 +91,15 @@ pub use bidirectional::{
 };
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::TcpListener;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use fastmcp_transport::http::{
+    HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse, HttpStatus,
+    HttpTransport,
+};
 
 use asupersync::time::wall_now;
 use asupersync::{Budget, CancelKind, Cx, RegionId};
@@ -257,6 +263,82 @@ pub enum DuplicateBehavior {
     ///
     /// Use this when duplicates are expected and should be ignored.
     Ignore,
+}
+
+/// Configuration for the turnkey HTTP server started by [`Server::run_http`].
+///
+/// All fields have sensible defaults. Use the builder methods to customise.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastmcp_server::HttpServerConfig;
+///
+/// let config = HttpServerConfig::new()
+///     .mcp_path("/api/mcp")
+///     .health_path("/healthz")
+///     .max_connections(128);
+/// ```
+#[derive(Debug, Clone)]
+pub struct HttpServerConfig {
+    /// Path where MCP JSON-RPC requests are accepted (default: `"/mcp"`).
+    pub mcp_path: String,
+    /// Path for the health-check endpoint (default: `"/health"`).
+    pub health_path: String,
+    /// Maximum number of concurrent connections (default: 64).
+    pub max_connections: usize,
+    /// Inner HTTP handler configuration (CORS, body size, timeouts).
+    pub handler_config: HttpHandlerConfig,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            mcp_path: "/mcp".to_string(),
+            health_path: "/health".to_string(),
+            max_connections: 64,
+            handler_config: HttpHandlerConfig {
+                base_path: "/mcp".to_string(),
+                ..HttpHandlerConfig::default()
+            },
+        }
+    }
+}
+
+impl HttpServerConfig {
+    /// Creates a new configuration with default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the MCP endpoint path.
+    #[must_use]
+    pub fn mcp_path(mut self, path: impl Into<String>) -> Self {
+        self.mcp_path = path.into();
+        self
+    }
+
+    /// Sets the health-check endpoint path.
+    #[must_use]
+    pub fn health_path(mut self, path: impl Into<String>) -> Self {
+        self.health_path = path.into();
+        self
+    }
+
+    /// Sets the maximum number of concurrent connections.
+    #[must_use]
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// Sets the inner HTTP handler configuration.
+    #[must_use]
+    pub fn handler_config(mut self, config: HttpHandlerConfig) -> Self {
+        self.handler_config = config;
+        self
+    }
 }
 
 /// An MCP server instance.
@@ -610,6 +692,350 @@ impl Server {
     {
         let transport = WsTransport::new(reader, writer);
         self.run_transport_with_cx(cx, transport)
+    }
+
+    // =========================================================================
+    // HTTP Server — turnkey Streamable HTTP transport
+    // =========================================================================
+
+    /// Runs the server on HTTP transport, listening on the given address.
+    ///
+    /// This is the HTTP equivalent of [`run_stdio`](Self::run_stdio). It binds a
+    /// TCP listener, accepts connections, and dispatches MCP JSON-RPC requests
+    /// over HTTP.
+    ///
+    /// # Routes
+    ///
+    /// | Method  | Path       | Description                              |
+    /// |---------|------------|------------------------------------------|
+    /// | POST    | `/mcp`     | MCP JSON-RPC handler                     |
+    /// | GET     | `/health`  | Health check (`{"status": "ok"}`)        |
+    /// | OPTIONS | `/mcp`     | CORS preflight (via `HttpRequestHandler`) |
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// Server::new("my-server", "1.0.0")
+    ///     .tool(my_tool)
+    ///     .build()
+    ///     .run_http("0.0.0.0:3000");
+    /// ```
+    pub fn run_http(self, addr: impl Into<String>) -> ! {
+        let cx = Cx::for_request();
+        self.run_http_with_cx(&cx, addr)
+    }
+
+    /// Runs the server on HTTP with a provided [`Cx`].
+    ///
+    /// This allows integration with a real asupersync runtime.
+    pub fn run_http_with_cx(self, cx: &Cx, addr: impl Into<String>) -> ! {
+        self.run_http_accept_loop(cx, addr.into(), false);
+        // run_http_accept_loop only returns when `returning` is true.
+        unreachable!()
+    }
+
+    /// Runs the server on HTTP and returns when the listener closes or the [`Cx`]
+    /// is cancelled.
+    ///
+    /// Unlike [`run_http`](Self::run_http), this does **not** call
+    /// `std::process::exit` on shutdown. This is useful for tests and embedding.
+    pub fn run_http_returning(self, addr: impl Into<String>) {
+        let cx = Cx::for_request();
+        self.run_http_returning_with_cx(&cx, addr);
+    }
+
+    /// Full control: custom [`Cx`] + returns on shutdown.
+    pub fn run_http_returning_with_cx(self, cx: &Cx, addr: impl Into<String>) {
+        self.run_http_accept_loop(cx, addr.into(), true);
+    }
+
+    /// Core HTTP accept loop shared by all `run_http*` variants.
+    ///
+    /// When `returning` is `false` the method calls `std::process::exit` on
+    /// shutdown (matching the behaviour of the stdio/transport family).
+    #[allow(clippy::too_many_lines)]
+    fn run_http_accept_loop(self, cx: &Cx, addr: String, returning: bool) {
+        self.init_rich_logging();
+
+        // Bind the TCP listener.
+        let listener = match TcpListener::bind(&addr) {
+            Ok(l) => l,
+            Err(e) => {
+                error!(target: targets::TRANSPORT, "Failed to bind HTTP listener on {}: {}", addr, e);
+                if returning {
+                    return;
+                }
+                std::process::exit(1);
+            }
+        };
+
+        // Set a short accept timeout so we can periodically check for cancellation.
+        let _ = listener.set_nonblocking(false);
+
+        info!(target: targets::SERVER, "HTTP server listening on {}", addr);
+
+        // Set up per-server state shared across connections.
+        let session = Arc::new(Mutex::new(Session::new(
+            self.info.clone(),
+            self.capabilities.clone(),
+        )));
+
+        // Notification sender — for HTTP we log notifications since there is no
+        // persistent outbound channel per connection.
+        let notification_sender: NotificationSender = Arc::new(|request: JsonRpcRequest| {
+            log::debug!(
+                target: targets::SERVER,
+                "HTTP notification (not deliverable to client): {}",
+                request.method
+            );
+        });
+
+        // Request sender for bidirectional communication.
+        let request_sender = {
+            let send_fn: bidirectional::TransportSendFn = Arc::new(|_message| {
+                // HTTP is request/response — server-to-client requests are not
+                // deliverable.  Log and drop.
+                Err("HTTP transport does not support server-to-client requests".into())
+            });
+            bidirectional::RequestSender::new(self.pending_requests.clone(), send_fn)
+        };
+
+        // Track connection opened.
+        if let Some(ref stats) = self.stats {
+            stats.connection_opened();
+        }
+
+        // Render startup banner (with HTTP transport name).
+        if self.console_config.show_banner && !banner_suppressed() {
+            self.render_http_startup_banner(&addr);
+        }
+
+        // Run startup hook.
+        if !self.run_startup_hook() {
+            error!(target: targets::SERVER, "Startup hook failed");
+            if returning {
+                self.graceful_shutdown_returning();
+                return;
+            }
+            self.graceful_shutdown(1);
+        }
+
+        // Build the HTTP request handler with the server's config (or default).
+        let http_handler = HttpRequestHandler::new();
+
+        // Traffic renderer.
+        let traffic_renderer = if self.console_config.show_request_traffic {
+            let mut renderer = RequestResponseRenderer::new(self.console_config.resolve_context());
+            renderer.truncate_at = self.console_config.truncate_at;
+            match self.console_config.traffic_verbosity {
+                TrafficVerbosity::None => {}
+                TrafficVerbosity::Summary | TrafficVerbosity::Headers => {
+                    renderer.show_params = false;
+                    renderer.show_result = false;
+                }
+                TrafficVerbosity::Full => {
+                    renderer.show_params = true;
+                    renderer.show_result = true;
+                }
+            }
+            Some(renderer)
+        } else {
+            None
+        };
+
+        // Default HTTP server config — paths for routing.
+        let mcp_path = "/mcp".to_string();
+        let health_path = "/health".to_string();
+
+        // Accept loop.
+        loop {
+            if cx.is_cancel_requested() {
+                info!(target: targets::SERVER, "Cancellation requested, shutting down HTTP server");
+                if returning {
+                    self.graceful_shutdown_returning();
+                    return;
+                }
+                self.graceful_shutdown(0);
+            }
+
+            let (stream, peer_addr) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Non-blocking timeout — check cancellation and retry.
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => {
+                    error!(target: targets::TRANSPORT, "Failed to accept connection: {}", e);
+                    continue;
+                }
+            };
+
+            debug!(
+                target: targets::TRANSPORT,
+                "Accepted HTTP connection from {}",
+                peer_addr
+            );
+
+            // Read the HTTP request from the connection.
+            let reader = BufReader::new(match stream.try_clone() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(target: targets::TRANSPORT, "Failed to clone TCP stream: {}", e);
+                    continue;
+                }
+            });
+            let writer = BufWriter::new(stream);
+            let mut http_transport: HttpTransport<BufReader<std::net::TcpStream>, BufWriter<std::net::TcpStream>> =
+                HttpTransport::new(reader, writer);
+
+            let http_request = match http_transport.read_request() {
+                Ok(req) => req,
+                Err(e) => {
+                    debug!(target: targets::TRANSPORT, "Failed to read HTTP request: {}", e);
+                    continue;
+                }
+            };
+
+            // Route by path and method.
+            let response = if http_request.path == health_path && http_request.method == HttpMethod::Get {
+                // Health-check endpoint.
+                HttpResponse::ok()
+                    .with_json(&serde_json::json!({"status": "ok"}))
+            } else if http_request.path == mcp_path && http_request.method == HttpMethod::Options {
+                // CORS preflight.
+                http_handler.handle_options(&http_request)
+            } else if http_request.path == mcp_path && http_request.method == HttpMethod::Post {
+                // MCP JSON-RPC handler.
+                self.handle_http_mcp_request(
+                    cx,
+                    &session,
+                    &http_handler,
+                    &http_request,
+                    &notification_sender,
+                    &request_sender,
+                    &traffic_renderer,
+                )
+            } else {
+                // 404 for anything else.
+                HttpResponse::new(HttpStatus::NOT_FOUND)
+                    .with_json(&serde_json::json!({"error": "not found"}))
+            };
+
+            // Write the response.
+            if let Err(e) = http_transport.write_response(&response) {
+                debug!(target: targets::TRANSPORT, "Failed to write HTTP response: {}", e);
+            }
+        }
+    }
+
+    /// Processes a single MCP JSON-RPC request received over HTTP.
+    fn handle_http_mcp_request(
+        &self,
+        cx: &Cx,
+        session: &Arc<Mutex<Session>>,
+        http_handler: &HttpRequestHandler,
+        http_request: &HttpRequest,
+        notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
+        traffic_renderer: &Option<RequestResponseRenderer>,
+    ) -> HttpResponse {
+        // Parse the JSON-RPC request from the HTTP body.
+        let json_rpc = match http_handler.parse_request(http_request) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(target: targets::TRANSPORT, "Invalid MCP request: {}", e);
+                return http_handler.error_response(
+                    HttpStatus::BAD_REQUEST,
+                    &format!("Invalid request: {e}"),
+                );
+            }
+        };
+
+        // Log request traffic.
+        if let Some(renderer) = traffic_renderer {
+            renderer.render_request(&json_rpc, console());
+        }
+
+        // Track bytes received.
+        if let Some(ref stats) = self.stats {
+            if let Ok(json) = serde_json::to_string(&json_rpc) {
+                stats.add_bytes_received(json.len() as u64 + 1);
+            }
+        }
+
+        let start_time = Instant::now();
+
+        // Dispatch through the server's handler.
+        let response_opt = {
+            let mut session_guard = match session.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    error!(target: targets::SERVER, "Session lock poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            self.handle_request(
+                cx,
+                &mut session_guard,
+                json_rpc,
+                notification_sender,
+                request_sender,
+            )
+        };
+
+        let duration = start_time.elapsed();
+
+        match response_opt {
+            Some(json_rpc_response) => {
+                // Log response traffic.
+                if let Some(renderer) = traffic_renderer {
+                    renderer.render_response(&json_rpc_response, Some(duration), console());
+                }
+
+                // Track bytes sent.
+                if let Some(ref stats) = self.stats {
+                    if let Ok(json) = serde_json::to_string(&json_rpc_response) {
+                        stats.add_bytes_sent(json.len() as u64 + 1);
+                    }
+                }
+
+                let origin = http_request.header("origin");
+                http_handler.create_response(&json_rpc_response, origin)
+            }
+            None => {
+                // Notification (no response expected) — return 202 Accepted.
+                HttpResponse::new(HttpStatus::ACCEPTED)
+            }
+        }
+    }
+
+    /// Renders the HTTP-specific startup banner.
+    fn render_http_startup_banner(&self, addr: &str) {
+        let render = || {
+            let transport_label = format!("http://{addr}");
+            let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
+                .tools(self.router.tools_count())
+                .resources(self.router.resources_count())
+                .prompts(self.router.prompts_count())
+                .transport(&transport_label);
+
+            if let Some(desc) = self.instructions.as_deref().filter(|d| !d.is_empty()) {
+                banner = banner.description(desc);
+            }
+
+            match self.console_config.banner_style {
+                BannerStyle::Full => banner.render(console()),
+                BannerStyle::Compact | BannerStyle::Minimal => {
+                    banner.no_logo().render(console());
+                }
+                BannerStyle::None => {}
+            }
+        };
+
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
+            eprintln!("Warning: banner rendering failed: {err:?}");
+        }
     }
 
     /// Runs the startup lifecycle hook, if configured.
