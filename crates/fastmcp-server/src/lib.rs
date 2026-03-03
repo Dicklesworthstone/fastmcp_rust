@@ -886,8 +886,10 @@ impl Server {
                 }
             });
             let writer = BufWriter::new(stream);
-            let mut http_transport: HttpTransport<BufReader<std::net::TcpStream>, BufWriter<std::net::TcpStream>> =
-                HttpTransport::new(reader, writer);
+            let mut http_transport: HttpTransport<
+                BufReader<std::net::TcpStream>,
+                BufWriter<std::net::TcpStream>,
+            > = HttpTransport::new(reader, writer);
 
             let http_request = match http_transport.read_request() {
                 Ok(req) => req,
@@ -898,10 +900,11 @@ impl Server {
             };
 
             // Route by path and method.
-            let response = if http_request.path == health_path && http_request.method == HttpMethod::Get {
+            let response = if http_request.path == health_path
+                && http_request.method == HttpMethod::Get
+            {
                 // Health-check endpoint.
-                HttpResponse::ok()
-                    .with_json(&serde_json::json!({"status": "ok"}))
+                HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
             } else if http_request.path == mcp_path && http_request.method == HttpMethod::Options {
                 // CORS preflight.
                 http_handler.handle_options(&http_request)
@@ -945,10 +948,8 @@ impl Server {
             Ok(r) => r,
             Err(e) => {
                 debug!(target: targets::TRANSPORT, "Invalid MCP request: {}", e);
-                return http_handler.error_response(
-                    HttpStatus::BAD_REQUEST,
-                    &format!("Invalid request: {e}"),
-                );
+                return http_handler
+                    .error_response(HttpStatus::BAD_REQUEST, &format!("Invalid request: {e}"));
             }
         };
 
