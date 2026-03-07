@@ -388,9 +388,10 @@ impl TaskManager {
                 }
             };
 
+            let should_start = running_snapshot.is_some();
             notify_snapshot(&notification_sender, running_snapshot);
 
-            if running_snapshot.is_none() {
+            if !should_start {
                 return;
             }
 

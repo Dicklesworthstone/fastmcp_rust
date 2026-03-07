@@ -1668,7 +1668,8 @@ mod router_tests {
         let cx = Cx::for_testing();
 
         let guard =
-            ActiveRequestGuard::new(&server.active_requests, request_id.clone(), cx.clone());
+            ActiveRequestGuard::try_new(&server.active_requests, request_id.clone(), cx.clone())
+                .expect("active request should register");
         {
             let guard_map = server
                 .active_requests
@@ -1709,7 +1710,8 @@ mod router_tests {
             let ready = Arc::clone(&ready);
             let handle = thread::spawn(move || {
                 let _guard =
-                    ActiveRequestGuard::new(&server.active_requests, request_id, cx.clone());
+                    ActiveRequestGuard::try_new(&server.active_requests, request_id, cx.clone())
+                        .expect("active request should register");
                 ready.wait();
                 let _ = release_rx.recv();
             });
@@ -1757,11 +1759,12 @@ mod router_tests {
         let server_for_worker = Arc::clone(&server);
         let cx_for_worker = cx.clone();
         let worker = thread::spawn(move || {
-            let _guard = ActiveRequestGuard::new(
+            let _guard = ActiveRequestGuard::try_new(
                 &server_for_worker.active_requests,
                 request_id,
                 cx_for_worker,
-            );
+            )
+            .expect("active request should register");
             ready_tx.send(()).expect("ready send failed");
             let _ = release_rx.recv();
         });

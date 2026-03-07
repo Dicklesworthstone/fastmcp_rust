@@ -2944,6 +2944,7 @@ mod lib_unit_tests {
 
     static HTTP_OVERLAP_METRICS: OnceLock<HttpOverlapMetrics> = OnceLock::new();
     static HTTP_OVERLAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static AUTH_BARRIER: OnceLock<Mutex<Option<Arc<std::sync::Barrier>>>> = OnceLock::new();
 
     fn http_overlap_metrics() -> &'static HttpOverlapMetrics {
         HTTP_OVERLAP_METRICS.get_or_init(HttpOverlapMetrics::default)
@@ -2951,6 +2952,10 @@ mod lib_unit_tests {
 
     fn http_overlap_lock() -> &'static Mutex<()> {
         HTTP_OVERLAP_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn auth_barrier_slot() -> &'static Mutex<Option<Arc<std::sync::Barrier>>> {
+        AUTH_BARRIER.get_or_init(|| Mutex::new(None))
     }
 
     fn reset_http_overlap_metrics() {
@@ -2984,6 +2989,23 @@ mod lib_unit_tests {
         thread::sleep(Duration::from_millis(100));
         metrics.current.fetch_sub(1, Ordering::SeqCst);
         "overlap-ok".to_string()
+    }
+
+    #[tool(
+        name = "http_auth_echo_tool_runtime",
+        description = "Returns the request-scoped auth subject after overlapping requests synchronize"
+    )]
+    fn http_auth_echo_tool_runtime(ctx: &McpContext) -> String {
+        if let Some(barrier) = auth_barrier_slot()
+            .lock()
+            .expect("auth barrier lock poisoned")
+            .clone()
+        {
+            barrier.wait();
+        }
+        ctx.auth()
+            .and_then(|auth| auth.subject)
+            .unwrap_or_else(|| "anonymous".to_string())
     }
 
     // ── parse_params ────────────────────────────────────────────────
@@ -3373,8 +3395,6 @@ mod lib_unit_tests {
 
     #[test]
     fn http_read_only_snapshot_keeps_request_auth_isolated() {
-        use std::sync::Barrier;
-
         #[derive(Debug)]
         struct EchoAuthProvider;
 
@@ -3395,41 +3415,18 @@ mod lib_unit_tests {
             }
         }
 
-        static AUTH_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
-
-        fn auth_barrier_slot() -> &'static Mutex<Option<Arc<Barrier>>> {
-            AUTH_BARRIER.get_or_init(|| Mutex::new(None))
-        }
-
-        #[tool(
-            name = "http_auth_echo_tool_runtime",
-            description = "Returns the request-scoped auth subject after overlapping requests synchronize"
-        )]
-        fn http_auth_echo_tool_runtime(ctx: &McpContext) -> String {
-            if let Some(barrier) = auth_barrier_slot()
-                .lock()
-                .expect("auth barrier lock poisoned")
-                .clone()
-            {
-                barrier.wait();
-            }
-            ctx.auth()
-                .and_then(|auth| auth.subject)
-                .unwrap_or_else(|| "anonymous".to_string())
-        }
-
         let _guard = http_overlap_lock()
             .lock()
             .expect("http overlap test lock poisoned");
 
         *auth_barrier_slot()
             .lock()
-            .expect("auth barrier slot lock poisoned") = Some(Arc::new(Barrier::new(3)));
+            .expect("auth barrier slot lock poisoned") = Some(Arc::new(std::sync::Barrier::new(2)));
 
         let server = Arc::new(
             Server::new("http-auth-test-server", "1.0.0")
                 .auth_provider(EchoAuthProvider)
-                .tool(http_auth_echo_tool_runtime)
+                .tool(HttpAuthEchoToolRuntime)
                 .build(),
         );
         let session = Arc::new(Mutex::new(Session::new(
@@ -3448,7 +3445,7 @@ mod lib_unit_tests {
         let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
         let request_sender = test_request_sender();
-        let start = Arc::new(Barrier::new(3));
+        let start = Arc::new(std::sync::Barrier::new(3));
 
         let run_request = |id, token: &'static str| {
             let server = Arc::clone(&server);
