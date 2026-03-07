@@ -108,7 +108,7 @@ use fastmcp_console::client::RequestResponseRenderer;
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_console::{banner::StartupBanner, console};
 use fastmcp_core::logging::{debug, error, info, targets};
-use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult};
+use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelledParams, GetPromptParams, GetTaskParams,
     InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
@@ -290,6 +290,42 @@ pub struct HttpServerConfig {
     pub max_connections: usize,
     /// Inner HTTP handler configuration (CORS, body size, timeouts).
     pub handler_config: HttpHandlerConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRequestExecutionMode {
+    ConcurrentReadOnly,
+    ExclusiveSession,
+}
+
+impl HttpRequestExecutionMode {
+    fn for_method(method: &str) -> Self {
+        match method {
+            "tools/call" | "resources/read" | "prompts/get" => Self::ConcurrentReadOnly,
+            _ => Self::ExclusiveSession,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionSnapshot {
+    initialized: bool,
+    state: SessionState,
+    supports_sampling: bool,
+    supports_elicitation: bool,
+    log_level: Option<LogLevel>,
+}
+
+impl SessionSnapshot {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            initialized: session.is_initialized(),
+            state: session.state().clone(),
+            supports_sampling: session.supports_sampling(),
+            supports_elicitation: session.supports_elicitation(),
+            log_level: session.log_level(),
+        }
+    }
 }
 
 impl Default for HttpServerConfig {
@@ -1031,22 +1067,47 @@ impl Server {
 
         let start_time = Instant::now();
 
-        // Dispatch through the server's handler.
-        let response_opt = {
-            let mut session_guard = match session.lock() {
-                Ok(g) => g,
-                Err(poisoned) => {
-                    error!(target: targets::SERVER, "Session lock poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            };
-            self.handle_request(
-                cx,
-                &mut session_guard,
-                json_rpc,
-                notification_sender,
-                request_sender,
-            )
+        let execution_mode = HttpRequestExecutionMode::for_method(&json_rpc.method);
+
+        // Dispatch through the server's handler. Read-only HTTP methods take a
+        // lightweight snapshot so handler execution is not serialized on the
+        // session mutex.
+        let response_opt = match execution_mode {
+            HttpRequestExecutionMode::ConcurrentReadOnly => {
+                let snapshot = {
+                    let session_guard = match session.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            error!(target: targets::SERVER, "Session lock poisoned, recovering");
+                            poisoned.into_inner()
+                        }
+                    };
+                    SessionSnapshot::from_session(&session_guard)
+                };
+                self.handle_request_with_snapshot(
+                    cx,
+                    &snapshot,
+                    json_rpc,
+                    notification_sender,
+                    request_sender,
+                )
+            }
+            HttpRequestExecutionMode::ExclusiveSession => {
+                let mut session_guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        error!(target: targets::SERVER, "Session lock poisoned, recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                self.handle_request(
+                    cx,
+                    &mut session_guard,
+                    json_rpc,
+                    notification_sender,
+                    request_sender,
+                )
+            }
         };
 
         let duration = start_time.elapsed();
@@ -1631,6 +1692,107 @@ impl Server {
         }
     }
 
+    fn handle_request_with_snapshot(
+        &self,
+        cx: &Cx,
+        session: &SessionSnapshot,
+        request: JsonRpcRequest,
+        notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<JsonRpcResponse> {
+        let id = request.id.clone();
+        let method = request.method.clone();
+        let is_notification = id.is_none();
+
+        let start_time = Instant::now();
+        let request_id = request_id_to_u64(id.as_ref());
+        let budget = self.create_request_budget();
+
+        if budget.is_exhausted() {
+            if let Some(ref stats) = self.stats {
+                stats.record_request(&method, start_time.elapsed(), false);
+            }
+            let response_id = id.clone()?;
+            return Some(JsonRpcResponse::error(
+                Some(response_id),
+                JsonRpcError {
+                    code: McpErrorCode::RequestCancelled.into(),
+                    message: "Request budget exhausted".to_string(),
+                    data: None,
+                },
+            ));
+        }
+
+        let request_cx = if is_notification {
+            cx.clone()
+        } else {
+            Cx::for_request_with_budget(budget)
+        };
+
+        let _active_guard = id.clone().map(|request_id| {
+            ActiveRequestGuard::new(&self.active_requests, request_id, request_cx.clone())
+        });
+
+        let result = self.dispatch_read_only_http_method(
+            &request_cx,
+            session,
+            request,
+            request_id,
+            &budget,
+            notification_sender,
+            request_sender,
+        );
+
+        let latency = start_time.elapsed();
+        if let Some(ref stats) = self.stats {
+            match &result {
+                Ok(_) => stats.record_request(&method, latency, true),
+                Err(e) if e.code == fastmcp_core::McpErrorCode::RequestCancelled => {
+                    stats.record_cancelled(&method, latency);
+                }
+                Err(_) => stats.record_request(&method, latency, false),
+            }
+        }
+
+        if is_notification {
+            if let Err(e) = result {
+                fastmcp_core::logging::error!(
+                    target: targets::HANDLER,
+                    "Notification '{}' failed: {}",
+                    method,
+                    e
+                );
+            }
+            return None;
+        }
+
+        let response_id = id.clone()?;
+
+        match result {
+            Ok(value) => Some(JsonRpcResponse::success(response_id, value)),
+            Err(e) => {
+                if self.mask_error_details && e.is_internal() {
+                    fastmcp_core::logging::error!(
+                        target: targets::HANDLER,
+                        "Request '{}' failed (masked in response): {}",
+                        method,
+                        e
+                    );
+                }
+
+                let masked = e.masked(self.mask_error_details);
+                Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcError {
+                        code: masked.code.into(),
+                        message: masked.message,
+                        data: masked.data,
+                    },
+                ))
+            }
+        }
+    }
+
     /// Creates a budget for a new request based on server configuration.
     fn create_request_budget(&self) -> Budget {
         if self.request_timeout_secs == 0 {
@@ -1897,6 +2059,152 @@ impl Server {
         final_result
     }
 
+    fn dispatch_read_only_http_method(
+        &self,
+        cx: &Cx,
+        session: &SessionSnapshot,
+        request: JsonRpcRequest,
+        request_id: u64,
+        budget: &Budget,
+        notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Result<serde_json::Value, McpError> {
+        if cx.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+
+        if budget.is_exhausted() {
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request budget exhausted",
+            ));
+        }
+
+        if budget.is_past_deadline(wall_now()) {
+            cx.cancel_fast(CancelKind::Deadline);
+            return Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "Request timeout exceeded",
+            ));
+        }
+
+        if !session.initialized && request.method != "initialize" && request.method != "ping" {
+            return Err(McpError::invalid_request(
+                "Server not initialized. Client must send 'initialize' first.",
+            ));
+        }
+
+        if let Some(task_manager) = &self.task_manager {
+            task_manager.set_notification_sender(Arc::clone(notification_sender));
+        }
+
+        let mw_ctx = McpContext::with_state(cx.clone(), request_id, session.state.clone());
+        let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
+
+        for m in self.middleware.iter() {
+            entered_middleware.push(m.as_ref());
+            match m.on_request(&mw_ctx, &request) {
+                Ok(crate::MiddlewareDecision::Continue) => {}
+                Ok(crate::MiddlewareDecision::Respond(v)) => {
+                    let result =
+                        self.apply_middleware_response(&entered_middleware, &mw_ctx, &request, v);
+                    self.maybe_emit_log_notification_for_level(
+                        session.log_level,
+                        notification_sender,
+                        &request.method,
+                        &result,
+                    );
+                    return result;
+                }
+                Err(e) => {
+                    let err =
+                        self.apply_middleware_error(&entered_middleware, &mw_ctx, &request, e);
+                    let result = Err(err);
+                    self.maybe_emit_log_notification_for_level(
+                        session.log_level,
+                        notification_sender,
+                        &request.method,
+                        &result,
+                    );
+                    return result;
+                }
+            }
+        }
+
+        let result: Result<serde_json::Value, McpError> = (|| {
+            if self.should_authenticate(&request.method) {
+                let auth_request = AuthRequest {
+                    method: &request.method,
+                    params: request.params.as_ref(),
+                    request_id,
+                };
+                self.authenticate_request_with_state(cx, request_id, &session.state, auth_request)?;
+            }
+
+            let method = &request.method;
+            let params = request.params.clone();
+            let bidirectional_senders =
+                self.create_bidirectional_senders_from_snapshot(session, request_sender);
+
+            match method.as_str() {
+                "tools/call" => {
+                    let params: CallToolParams = parse_params(params)?;
+                    let result = self.router.handle_tools_call(
+                        cx,
+                        request_id,
+                        params,
+                        budget,
+                        session.state.clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "resources/read" => {
+                    let params: ReadResourceParams = parse_params(params)?;
+                    let result = self.router.handle_resources_read(
+                        cx,
+                        request_id,
+                        &params,
+                        budget,
+                        session.state.clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                "prompts/get" => {
+                    let params: GetPromptParams = parse_params(params)?;
+                    let result = self.router.handle_prompts_get(
+                        cx,
+                        request_id,
+                        params,
+                        budget,
+                        session.state.clone(),
+                        Some(notification_sender),
+                        bidirectional_senders.as_ref(),
+                    )?;
+                    Ok(serde_json::to_value(result).map_err(McpError::from)?)
+                }
+                _ => Err(McpError::method_not_found(method)),
+            }
+        })();
+
+        let final_result = match result {
+            Ok(v) => self.apply_middleware_response(&entered_middleware, &mw_ctx, &request, v),
+            Err(e) => Err(self.apply_middleware_error(&entered_middleware, &mw_ctx, &request, e)),
+        };
+
+        self.maybe_emit_log_notification_for_level(
+            session.log_level,
+            notification_sender,
+            &request.method,
+            &final_result,
+        );
+
+        final_result
+    }
+
     fn apply_middleware_response(
         &self,
         stack: &[&dyn crate::Middleware],
@@ -1940,9 +2248,31 @@ impl Server {
         session: &Session,
         request_sender: &bidirectional::RequestSender,
     ) -> Option<handler::BidirectionalSenders> {
-        let supports_sampling = session.supports_sampling();
-        let supports_elicitation = session.supports_elicitation();
+        self.create_bidirectional_senders_from_capabilities(
+            session.supports_sampling(),
+            session.supports_elicitation(),
+            request_sender,
+        )
+    }
 
+    fn create_bidirectional_senders_from_snapshot(
+        &self,
+        session: &SessionSnapshot,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<handler::BidirectionalSenders> {
+        self.create_bidirectional_senders_from_capabilities(
+            session.supports_sampling,
+            session.supports_elicitation,
+            request_sender,
+        )
+    }
+
+    fn create_bidirectional_senders_from_capabilities(
+        &self,
+        supports_sampling: bool,
+        supports_elicitation: bool,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<handler::BidirectionalSenders> {
         if !supports_sampling && !supports_elicitation {
             return None;
         }
@@ -1985,6 +2315,28 @@ impl Server {
         };
 
         let ctx = McpContext::with_state(cx.clone(), request_id, session.state().clone());
+        let auth = provider.authenticate(&ctx, request)?;
+        if !ctx.set_auth(auth.clone()) {
+            debug!(
+                target: targets::SESSION,
+                "Auth context not stored (session state unavailable)"
+            );
+        }
+        Ok(auth)
+    }
+
+    fn authenticate_request_with_state(
+        &self,
+        cx: &Cx,
+        request_id: u64,
+        session_state: &SessionState,
+        request: AuthRequest<'_>,
+    ) -> Result<AuthContext, McpError> {
+        let Some(provider) = &self.auth_provider else {
+            return Ok(AuthContext::anonymous());
+        };
+
+        let ctx = McpContext::with_state(cx.clone(), request_id, session_state.clone());
         let auth = provider.authenticate(&ctx, request)?;
         if !ctx.set_auth(auth.clone()) {
             debug!(
@@ -2134,14 +2486,14 @@ impl Server {
         }
     }
 
-    fn emit_log_notification(
+    fn emit_log_notification_for_level(
         &self,
-        session: &Session,
+        min_level: Option<LogLevel>,
         sender: &NotificationSender,
         level: LogLevel,
         message: impl Into<String>,
     ) {
-        let Some(min_level) = session.log_level() else {
+        let Some(min_level) = min_level else {
             return;
         };
         if Self::log_level_rank(level) < Self::log_level_rank(min_level) {
@@ -2170,6 +2522,39 @@ impl Server {
             "notifications/message",
             Some(payload),
         ));
+    }
+
+    fn emit_log_notification(
+        &self,
+        session: &Session,
+        sender: &NotificationSender,
+        level: LogLevel,
+        message: impl Into<String>,
+    ) {
+        self.emit_log_notification_for_level(session.log_level(), sender, level, message);
+    }
+
+    fn maybe_emit_log_notification_for_level(
+        &self,
+        min_level: Option<LogLevel>,
+        sender: &NotificationSender,
+        method: &str,
+        result: &McpResult<serde_json::Value>,
+    ) {
+        if method.starts_with("notifications/") || method == "logging/setLevel" {
+            return;
+        }
+        let level = if result.is_ok() {
+            LogLevel::Info
+        } else {
+            LogLevel::Error
+        };
+        let message = if result.is_ok() {
+            format!("Handled {}", method)
+        } else {
+            format!("Error handling {}", method)
+        };
+        self.emit_log_notification_for_level(min_level, sender, level, message);
     }
 
     fn maybe_emit_log_notification(
@@ -2482,6 +2867,58 @@ fn create_notification_sender() -> NotificationSender {
 #[cfg(test)]
 mod lib_unit_tests {
     use super::*;
+    use fastmcp_derive::tool;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct HttpOverlapMetrics {
+        current: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    static HTTP_OVERLAP_METRICS: OnceLock<HttpOverlapMetrics> = OnceLock::new();
+    static HTTP_OVERLAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn http_overlap_metrics() -> &'static HttpOverlapMetrics {
+        HTTP_OVERLAP_METRICS.get_or_init(HttpOverlapMetrics::default)
+    }
+
+    fn http_overlap_lock() -> &'static Mutex<()> {
+        HTTP_OVERLAP_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn reset_http_overlap_metrics() {
+        let metrics = http_overlap_metrics();
+        metrics.current.store(0, Ordering::SeqCst);
+        metrics.max.store(0, Ordering::SeqCst);
+    }
+
+    fn test_request_sender() -> RequestSender {
+        let pending = Arc::new(PendingRequests::new());
+        let send_fn: bidirectional::TransportSendFn =
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}")));
+        RequestSender::new(pending, send_fn)
+    }
+
+    fn http_json_request(method: &str, params: serde_json::Value, id: i64) -> HttpRequest {
+        let request = JsonRpcRequest::new(method, Some(params), id);
+        HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&request).expect("serialize JSON-RPC request"))
+    }
+
+    #[tool(name = "http_overlap_tool", description = "Records concurrent overlap for HTTP tests")]
+    fn http_overlap_tool(_ctx: &McpContext) -> String {
+        let metrics = http_overlap_metrics();
+        let current = metrics.current.fetch_add(1, Ordering::SeqCst) + 1;
+        metrics.max.fetch_max(current, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        metrics.current.fetch_sub(1, Ordering::SeqCst);
+        "overlap-ok".to_string()
+    }
 
     // ── parse_params ────────────────────────────────────────────────
 
@@ -2740,5 +3177,116 @@ mod lib_unit_tests {
         let completion = Arc::new(RequestCompletion::new());
         let ar = ActiveRequest::new(cx, completion);
         assert_eq!(ar.region_id, expected_region);
+    }
+
+    #[test]
+    fn http_request_execution_mode_classifies_methods() {
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("tools/call"),
+            HttpRequestExecutionMode::ConcurrentReadOnly
+        );
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("resources/read"),
+            HttpRequestExecutionMode::ConcurrentReadOnly
+        );
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("prompts/get"),
+            HttpRequestExecutionMode::ConcurrentReadOnly
+        );
+
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("initialize"),
+            HttpRequestExecutionMode::ExclusiveSession
+        );
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("logging/setLevel"),
+            HttpRequestExecutionMode::ExclusiveSession
+        );
+        assert_eq!(
+            HttpRequestExecutionMode::for_method("resources/subscribe"),
+            HttpRequestExecutionMode::ExclusiveSession
+        );
+    }
+
+    #[test]
+    fn http_read_only_requests_can_overlap_without_session_mutex_serialization() {
+        let _guard = http_overlap_lock()
+            .lock()
+            .expect("http overlap test lock poisoned");
+        reset_http_overlap_metrics();
+
+        let server = Arc::new(
+            Server::new("http-test-server", "1.0.0")
+                .tool(HttpOverlapTool)
+                .build(),
+        );
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session
+            .lock()
+            .expect("session lock poisoned")
+            .initialize(
+                fastmcp_protocol::ClientInfo {
+                    name: "http-test-client".to_string(),
+                    version: "1.0.0".to_string(),
+                },
+                fastmcp_protocol::ClientCapabilities::default(),
+                "2024-11-05".to_string(),
+            );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let run_request = |id| {
+            let server = Arc::clone(&server);
+            let session = Arc::clone(&session);
+            let http_handler = Arc::clone(&http_handler);
+            let notification_sender = Arc::clone(&notification_sender);
+            let request_sender = request_sender.clone();
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                let cx = Cx::for_testing();
+                let request = http_json_request(
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "http_overlap_tool",
+                        "arguments": {}
+                    }),
+                    id,
+                );
+                let traffic_renderer: Option<RequestResponseRenderer> = None;
+                let response = server.handle_http_mcp_request(
+                    &cx,
+                    &session,
+                    &http_handler,
+                    &request,
+                    &notification_sender,
+                    &request_sender,
+                    &traffic_renderer,
+                );
+                assert_eq!(response.status, HttpStatus::OK);
+                let json: JsonRpcResponse =
+                    serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+                assert!(json.error.is_none(), "unexpected error response: {:?}", json.error);
+            })
+        };
+
+        let first = run_request(1);
+        let second = run_request(2);
+        start.wait();
+
+        first.join().expect("first HTTP request thread panicked");
+        second.join().expect("second HTTP request thread panicked");
+
+        let overlap = http_overlap_metrics().max.load(Ordering::SeqCst);
+        assert!(
+            overlap >= 2,
+            "expected concurrent HTTP tools/call overlap, observed max overlap {overlap}"
+        );
     }
 }
