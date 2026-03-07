@@ -2910,7 +2910,10 @@ mod lib_unit_tests {
             .with_body(serde_json::to_vec(&request).expect("serialize JSON-RPC request"))
     }
 
-    #[tool(name = "http_overlap_tool", description = "Records concurrent overlap for HTTP tests")]
+    #[tool(
+        name = "http_overlap_tool",
+        description = "Records concurrent overlap for HTTP tests"
+    )]
     fn http_overlap_tool(_ctx: &McpContext) -> String {
         let metrics = http_overlap_metrics();
         let current = metrics.current.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3224,17 +3227,14 @@ mod lib_unit_tests {
             server.info.clone(),
             server.capabilities.clone(),
         )));
-        session
-            .lock()
-            .expect("session lock poisoned")
-            .initialize(
-                fastmcp_protocol::ClientInfo {
-                    name: "http-test-client".to_string(),
-                    version: "1.0.0".to_string(),
-                },
-                fastmcp_protocol::ClientCapabilities::default(),
-                "2024-11-05".to_string(),
-            );
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
 
         let http_handler = Arc::new(HttpRequestHandler::new());
         let notification_sender: NotificationSender = Arc::new(|_| {});
@@ -3272,7 +3272,11 @@ mod lib_unit_tests {
                 assert_eq!(response.status, HttpStatus::OK);
                 let json: JsonRpcResponse =
                     serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
-                assert!(json.error.is_none(), "unexpected error response: {:?}", json.error);
+                assert!(
+                    json.error.is_none(),
+                    "unexpected error response: {:?}",
+                    json.error
+                );
             })
         };
 

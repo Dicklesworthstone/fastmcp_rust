@@ -1207,6 +1207,7 @@ mod tests {
     #[test]
     fn can_transition_valid_pairs() {
         assert!(can_transition(TaskStatus::Pending, TaskStatus::Running));
+        assert!(can_transition(TaskStatus::Pending, TaskStatus::Failed));
         assert!(can_transition(TaskStatus::Pending, TaskStatus::Cancelled));
         assert!(can_transition(TaskStatus::Running, TaskStatus::Completed));
         assert!(can_transition(TaskStatus::Running, TaskStatus::Failed));
@@ -1216,7 +1217,6 @@ mod tests {
     #[test]
     fn can_transition_invalid_pairs() {
         assert!(!can_transition(TaskStatus::Pending, TaskStatus::Completed));
-        assert!(!can_transition(TaskStatus::Pending, TaskStatus::Failed));
         assert!(!can_transition(TaskStatus::Completed, TaskStatus::Running));
         assert!(!can_transition(TaskStatus::Completed, TaskStatus::Pending));
         assert!(!can_transition(
@@ -2164,16 +2164,22 @@ mod tests {
     }
 
     #[test]
-    fn fail_task_on_pending_is_ignored() {
+    fn fail_task_on_pending_records_failure() {
         let manager = TaskManager::new_for_testing();
         let cx = Cx::for_testing();
         manager.register_handler("t", |_cx, _params| async { Ok(serde_json::json!({})) });
         let id = manager.submit(&cx, "t", None).unwrap();
-        // Pending -> Failed is not a valid transition
         manager.fail_task(&id, "too early");
         let info = manager.get_info(&id).unwrap();
-        assert_eq!(info.status, TaskStatus::Pending);
-        assert!(manager.get_result(&id).is_none());
+        assert_eq!(info.status, TaskStatus::Failed);
+        assert_eq!(info.error.as_deref(), Some("too early"));
+        assert!(info.completed_at.is_some());
+
+        let result = manager
+            .get_result(&id)
+            .expect("failed task should record a result");
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("too early"));
     }
 
     #[test]
