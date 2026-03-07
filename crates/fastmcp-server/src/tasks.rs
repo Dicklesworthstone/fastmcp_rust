@@ -390,6 +390,10 @@ impl TaskManager {
 
             notify_snapshot(&notification_sender, running_snapshot);
 
+            if running_snapshot.is_none() {
+                return;
+            }
+
             let task_future = {
                 let handlers_guard = handlers.read().unwrap_or_else(|poisoned| {
                     warn!(target: targets::SERVER, "handlers lock poisoned in spawn_task, recovering");
@@ -880,6 +884,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_task_manager_creation() {
@@ -2180,6 +2185,80 @@ mod tests {
             .expect("failed task should record a result");
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("too early"));
+    }
+
+    #[test]
+    fn spawn_task_skips_handler_for_pre_failed_pending_task() {
+        let manager = TaskManager::new();
+        let task_runs = Arc::new(AtomicU64::new(0));
+        let task_type = "never-run".to_string();
+        let task_id = TaskId::from_string("task-prefailed");
+        let task_cx = Cx::for_request_with_budget(Budget::INFINITE);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        manager.register_handler(task_type.clone(), {
+            let task_runs = Arc::clone(&task_runs);
+            move |_cx, _params| {
+                let task_runs = Arc::clone(&task_runs);
+                async move {
+                    task_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"unexpected": true}))
+                }
+            }
+        });
+
+        {
+            let mut tasks = manager.tasks.write().unwrap_or_else(|poisoned| {
+                warn!(target: targets::SERVER, "tasks lock poisoned in test, recovering");
+                poisoned.into_inner()
+            });
+            tasks.insert(
+                task_id.clone(),
+                TaskState {
+                    info: TaskInfo {
+                        id: task_id.clone(),
+                        task_type: task_type.clone(),
+                        status: TaskStatus::Failed,
+                        progress: None,
+                        message: None,
+                        created_at: now,
+                        started_at: None,
+                        completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                        error: Some("prefailed".to_string()),
+                    },
+                    cancel_requested: false,
+                    result: Some(TaskResult {
+                        id: task_id.clone(),
+                        success: false,
+                        data: None,
+                        error: Some("prefailed".to_string()),
+                    }),
+                    cx: task_cx.clone(),
+                },
+            );
+        }
+
+        manager.spawn_task(task_id.clone(), task_type, task_cx, serde_json::json!({}));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if task_runs.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            task_runs.load(Ordering::SeqCst),
+            0,
+            "pre-failed pending task must not execute its handler"
+        );
+
+        let info = manager
+            .get_info(&task_id)
+            .expect("prefailed task should remain present");
+        assert_eq!(info.status, TaskStatus::Failed);
+        assert_eq!(info.error.as_deref(), Some("prefailed"));
     }
 
     #[test]

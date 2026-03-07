@@ -33,6 +33,23 @@ impl SessionState {
         Self::default()
     }
 
+    /// Creates an isolated snapshot of the current session state.
+    ///
+    /// Unlike [`Clone`], which shares the same underlying storage, this copies
+    /// the current key-value map into a fresh container so later writes do not
+    /// bleed across requests.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        let snapshot = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Self {
+            inner: Arc::new(Mutex::new(snapshot)),
+        }
+    }
+
     /// Gets a value from session state by key.
     ///
     /// Returns `None` if the key doesn't exist or if deserialization fails.
@@ -306,6 +323,26 @@ mod tests {
         cloned.set("key2", "value2");
 
         assert!(state.contains("key2"));
+    }
+
+    #[test]
+    fn test_session_state_snapshot_is_isolated() {
+        let state = SessionState::new();
+        state.set("counter", 1);
+
+        let snapshot = state.snapshot();
+        state.set("counter", 2);
+        snapshot.set("only_in_snapshot", true);
+
+        let live_counter: Option<i32> = state.get("counter");
+        let snap_counter: Option<i32> = snapshot.get("counter");
+        let live_only: Option<bool> = state.get("only_in_snapshot");
+        let snap_only: Option<bool> = snapshot.get("only_in_snapshot");
+
+        assert_eq!(live_counter, Some(2));
+        assert_eq!(snap_counter, Some(1));
+        assert_eq!(live_only, None);
+        assert_eq!(snap_only, Some(true));
     }
 
     // ========================================================================

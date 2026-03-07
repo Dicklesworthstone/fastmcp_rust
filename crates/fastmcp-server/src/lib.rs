@@ -320,7 +320,7 @@ impl SessionSnapshot {
     fn from_session(session: &Session) -> Self {
         Self {
             initialized: session.is_initialized(),
-            state: session.state().clone(),
+            state: session.state().snapshot(),
             supports_sampling: session.supports_sampling(),
             supports_elicitation: session.supports_elicitation(),
             log_level: session.log_level(),
@@ -812,8 +812,9 @@ impl Server {
             }
         };
 
-        // Set a short accept timeout so we can periodically check for cancellation.
-        let _ = listener.set_nonblocking(false);
+        // Poll accept in nonblocking mode so cancellation/shutdown can be
+        // observed promptly even when no clients are connecting.
+        let _ = listener.set_nonblocking(true);
 
         info!(target: targets::SERVER, "HTTP server listening on {}", addr);
 
@@ -948,6 +949,11 @@ impl Server {
                 peer_addr
             );
 
+            // The listener is nonblocking so the accepted socket may inherit
+            // that mode on some platforms; force blocking reads for
+            // HttpTransport's request/response flow.
+            let _ = stream.set_nonblocking(false);
+
             // Clone shared state for the connection handler thread.
             let server = Arc::clone(&server);
             let session = Arc::clone(&session);
@@ -1069,9 +1075,10 @@ impl Server {
 
         let execution_mode = HttpRequestExecutionMode::for_method(&json_rpc.method);
 
-        // Dispatch through the server's handler. Read-only HTTP methods take a
-        // lightweight snapshot so handler execution is not serialized on the
-        // session mutex.
+        // Dispatch through the server's handler. Snapshot-eligible HTTP methods
+        // take an isolated copy of session metadata/state so handler execution
+        // is not serialized on the session mutex and request-local auth/state
+        // updates cannot race across overlapping requests.
         let response_opt = match execution_mode {
             HttpRequestExecutionMode::ConcurrentReadOnly => {
                 let snapshot = {
@@ -1621,9 +1628,34 @@ impl Server {
             Cx::for_request_with_budget(budget)
         };
 
-        let _active_guard = id.clone().map(|request_id| {
-            ActiveRequestGuard::new(&self.active_requests, request_id, request_cx.clone())
-        });
+        let _active_guard = match id.clone() {
+            Some(request_id) => {
+                match ActiveRequestGuard::try_new(
+                    &self.active_requests,
+                    request_id.clone(),
+                    request_cx.clone(),
+                ) {
+                    Ok(guard) => Some(guard),
+                    Err(duplicate_id) => {
+                        if let Some(ref stats) = self.stats {
+                            stats.record_request(&method, start_time.elapsed(), false);
+                        }
+                        let message = format!(
+                            "Request id {duplicate_id} is already active; wait for the earlier request to finish before reusing it"
+                        );
+                        return Some(JsonRpcResponse::error(
+                            Some(request_id),
+                            JsonRpcError {
+                                code: McpErrorCode::InvalidRequest.into(),
+                                message,
+                                data: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
 
         // Dispatch based on method, passing the budget, notification sender, and request sender
         let result = self.dispatch_method(
@@ -1729,9 +1761,34 @@ impl Server {
             Cx::for_request_with_budget(budget)
         };
 
-        let _active_guard = id.clone().map(|request_id| {
-            ActiveRequestGuard::new(&self.active_requests, request_id, request_cx.clone())
-        });
+        let _active_guard = match id.clone() {
+            Some(request_id) => {
+                match ActiveRequestGuard::try_new(
+                    &self.active_requests,
+                    request_id.clone(),
+                    request_cx.clone(),
+                ) {
+                    Ok(guard) => Some(guard),
+                    Err(duplicate_id) => {
+                        if let Some(ref stats) = self.stats {
+                            stats.record_request(&method, start_time.elapsed(), false);
+                        }
+                        let message = format!(
+                            "Request id {duplicate_id} is already active; wait for the earlier request to finish before reusing it"
+                        );
+                        return Some(JsonRpcResponse::error(
+                            Some(request_id),
+                            JsonRpcError {
+                                code: McpErrorCode::InvalidRequest.into(),
+                                message,
+                                data: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
 
         let result = self.dispatch_read_only_http_method(
             &request_cx,
@@ -2670,24 +2727,30 @@ struct ActiveRequestGuard<'a> {
 }
 
 impl<'a> ActiveRequestGuard<'a> {
-    fn new(map: &'a Mutex<HashMap<RequestId, ActiveRequest>>, id: RequestId, cx: Cx) -> Self {
+    fn try_new(
+        map: &'a Mutex<HashMap<RequestId, ActiveRequest>>,
+        id: RequestId,
+        cx: Cx,
+    ) -> Result<Self, RequestId> {
         let completion = Arc::new(RequestCompletion::new());
         let entry = ActiveRequest::new(cx, completion.clone());
         let mut guard = map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.insert(id.clone(), entry).is_some() {
+        if guard.contains_key(&id) {
             fastmcp_core::logging::warn!(
                 target: targets::SESSION,
-                "Active request replaced for requestId={}",
+                "Duplicate active requestId={} rejected while an earlier request is still running",
                 id
             );
+            return Err(id);
         }
-        Self {
+        guard.insert(id.clone(), entry);
+        Ok(Self {
             map,
             id,
             completion,
-        }
+        })
     }
 }
 
@@ -3111,11 +3174,25 @@ mod lib_unit_tests {
         let cx = Cx::for_testing();
         let id = RequestId::Number(1);
         {
-            let _guard = ActiveRequestGuard::new(&map, id.clone(), cx);
+            let _guard = ActiveRequestGuard::try_new(&map, id.clone(), cx).expect("insert guard");
             assert_eq!(map.lock().unwrap().len(), 1);
         }
         // After drop, the entry should be removed
         assert_eq!(map.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn active_request_guard_rejects_duplicate_request_id() {
+        let map = Mutex::new(HashMap::new());
+        let first = ActiveRequestGuard::try_new(&map, RequestId::Number(7), Cx::for_testing())
+            .expect("first request should register");
+        let duplicate = ActiveRequestGuard::try_new(&map, RequestId::Number(7), Cx::for_testing());
+        assert!(
+            duplicate.is_err(),
+            "duplicate active request id must be rejected"
+        );
+        drop(first);
+        assert!(map.lock().unwrap().is_empty());
     }
 
     // =========================================================================
@@ -3291,6 +3368,179 @@ mod lib_unit_tests {
         assert!(
             overlap >= 2,
             "expected concurrent HTTP tools/call overlap, observed max overlap {overlap}"
+        );
+    }
+
+    #[test]
+    fn http_read_only_snapshot_keeps_request_auth_isolated() {
+        use std::sync::Barrier;
+
+        #[derive(Debug)]
+        struct EchoAuthProvider;
+
+        impl AuthProvider for EchoAuthProvider {
+            fn authenticate(
+                &self,
+                _ctx: &McpContext,
+                request: AuthRequest<'_>,
+            ) -> McpResult<AuthContext> {
+                let access = request
+                    .access_token()
+                    .ok_or_else(|| McpError::invalid_request("missing auth token"))?;
+                Ok(AuthContext {
+                    subject: Some(access.token.clone()),
+                    token: Some(access),
+                    ..AuthContext::default()
+                })
+            }
+        }
+
+        static AUTH_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+
+        fn auth_barrier_slot() -> &'static Mutex<Option<Arc<Barrier>>> {
+            AUTH_BARRIER.get_or_init(|| Mutex::new(None))
+        }
+
+        #[tool(
+            name = "http_auth_echo_tool_runtime",
+            description = "Returns the request-scoped auth subject after overlapping requests synchronize"
+        )]
+        fn http_auth_echo_tool_runtime(ctx: &McpContext) -> String {
+            if let Some(barrier) = auth_barrier_slot()
+                .lock()
+                .expect("auth barrier lock poisoned")
+                .clone()
+            {
+                barrier.wait();
+            }
+            ctx.auth()
+                .and_then(|auth| auth.subject)
+                .unwrap_or_else(|| "anonymous".to_string())
+        }
+
+        let _guard = http_overlap_lock()
+            .lock()
+            .expect("http overlap test lock poisoned");
+
+        *auth_barrier_slot()
+            .lock()
+            .expect("auth barrier slot lock poisoned") = Some(Arc::new(Barrier::new(3)));
+
+        let server = Arc::new(
+            Server::new("http-auth-test-server", "1.0.0")
+                .auth_provider(EchoAuthProvider)
+                .tool(http_auth_echo_tool_runtime)
+                .build(),
+        );
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-auth-test-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let start = Arc::new(Barrier::new(3));
+
+        let run_request = |id, token: &'static str| {
+            let server = Arc::clone(&server);
+            let session = Arc::clone(&session);
+            let http_handler = Arc::clone(&http_handler);
+            let notification_sender = Arc::clone(&notification_sender);
+            let request_sender = request_sender.clone();
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                let cx = Cx::for_testing();
+                let request = http_json_request(
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "http_auth_echo_tool_runtime",
+                        "arguments": {},
+                        "auth": format!("Bearer {token}")
+                    }),
+                    id,
+                );
+                let traffic_renderer: Option<RequestResponseRenderer> = None;
+                let response = server.handle_http_mcp_request(
+                    &cx,
+                    &session,
+                    &http_handler,
+                    &request,
+                    &notification_sender,
+                    &request_sender,
+                    &traffic_renderer,
+                );
+                assert_eq!(response.status, HttpStatus::OK);
+                let json: JsonRpcResponse =
+                    serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+                let result = json.result.expect("authenticated request should succeed");
+                result
+                    .as_str()
+                    .expect("auth echo tool should return a string")
+                    .to_string()
+            })
+        };
+
+        let first = run_request(1, "alpha");
+        let second = run_request(2, "beta");
+        start.wait();
+
+        let first_subject = first.join().expect("first auth request thread panicked");
+        let second_subject = second.join().expect("second auth request thread panicked");
+
+        *auth_barrier_slot()
+            .lock()
+            .expect("auth barrier slot lock poisoned") = None;
+
+        assert_eq!(first_subject, "alpha");
+        assert_eq!(second_subject, "beta");
+    }
+
+    #[test]
+    fn http_returning_server_honors_cancellation_without_needing_accept_wakeup() {
+        let port_probe =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port probe");
+        let addr = port_probe
+            .local_addr()
+            .expect("discover ephemeral port probe address");
+        drop(port_probe);
+
+        let cx = Cx::for_testing();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = thread::spawn({
+            let server = Server::new("http-cancel-test", "1.0.0").build();
+            let cx = cx.clone();
+            let addr = addr.to_string();
+            move || {
+                server.run_http_returning_with_cx(&cx, addr);
+                let _ = done_tx.send(());
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        cx.cancel_with(CancelKind::User, None);
+
+        let returned_before_wakeup = done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        if !returned_before_wakeup {
+            let _ = std::net::TcpStream::connect(addr);
+            let _ = done_rx.recv_timeout(Duration::from_secs(1));
+        }
+
+        server_thread
+            .join()
+            .expect("HTTP returning server thread should not panic");
+        assert!(
+            returned_before_wakeup,
+            "run_http_returning_with_cx should stop promptly after cancellation without requiring an extra connection to wake accept()"
         );
     }
 }
