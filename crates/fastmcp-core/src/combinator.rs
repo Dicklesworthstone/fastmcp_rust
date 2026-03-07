@@ -579,8 +579,8 @@ impl<T> QuorumTimeoutState<'_, T> {
         if !still_pending {
             let successes = std::mem::take(&mut self.successes);
             return Poll::Ready(Ok(QuorumResult {
+                quorum_met: successes.len() >= self.required,
                 successes,
-                quorum_met: false,
                 failure_count: self.failures,
             }));
         }
