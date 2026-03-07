@@ -5,13 +5,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use asupersync::time::wall_now;
 use asupersync::types::CancelReason;
 use asupersync::{Budget, CancelKind, Cx, Outcome, RegionId, TaskId};
 
-use crate::{AUTH_STATE_KEY, AuthContext, SessionState};
+use crate::{AuthContext, SessionState};
 
 // ============================================================================
 // Notification Sender
@@ -922,6 +922,8 @@ pub struct McpContext {
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
     state: Option<SessionState>,
+    /// Request-scoped authentication context.
+    auth: Arc<Mutex<Option<AuthContext>>>,
     /// Optional sampling sender for LLM completions.
     sampling_sender: Option<Arc<dyn SamplingSender>>,
     /// Optional elicitation sender for user input requests.
@@ -947,6 +949,14 @@ impl std::fmt::Debug for McpContext {
             .field("request_id", &self.request_id)
             .field("progress_reporter", &self.progress_reporter)
             .field("state", &self.state.is_some())
+            .field(
+                "auth",
+                &self
+                    .auth
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            )
             .field("sampling_sender", &self.sampling_sender.is_some())
             .field("elicitation_sender", &self.elicitation_sender.is_some())
             .field("resource_reader", &self.resource_reader.is_some())
@@ -971,6 +981,7 @@ impl McpContext {
             request_id,
             progress_reporter: None,
             state: None,
+            auth: Arc::new(Mutex::new(None)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -992,6 +1003,7 @@ impl McpContext {
             request_id,
             progress_reporter: None,
             state: Some(state),
+            auth: Arc::new(Mutex::new(None)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1014,6 +1026,7 @@ impl McpContext {
             request_id,
             progress_reporter: Some(reporter),
             state: None,
+            auth: Arc::new(Mutex::new(None)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1038,6 +1051,7 @@ impl McpContext {
             request_id,
             progress_reporter: Some(reporter),
             state: Some(state),
+            auth: Arc::new(Mutex::new(None)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1343,17 +1357,28 @@ impl McpContext {
     /// Returns the authentication context for this request, if available.
     #[must_use]
     pub fn auth(&self) -> Option<AuthContext> {
-        self.state.as_ref()?.get(AUTH_STATE_KEY)
+        self.auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    /// Stores authentication context into session state.
+    /// Stores authentication context for this request.
     ///
-    /// Returns `false` if session state is unavailable or serialization fails.
+    /// Returns `true` once the request-scoped auth context has been recorded.
     pub fn set_auth(&self, auth: AuthContext) -> bool {
-        let Some(state) = self.state.as_ref() else {
-            return false;
-        };
-        state.set(AUTH_STATE_KEY, auth)
+        *self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth);
+        true
+    }
+
+    /// Returns a cloned context with request-local auth attached.
+    #[must_use]
+    pub fn with_auth(self, auth: AuthContext) -> Self {
+        let _ = self.set_auth(auth);
+        self
     }
 
     /// Sets a value in session state.
@@ -2511,6 +2536,81 @@ mod tests {
 
         assert!(ctx.has_session_state());
         assert!(ctx.has_progress_reporter());
+    }
+
+    #[test]
+    fn test_mcp_context_auth_is_request_local() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(cx, 1, state.clone());
+
+        assert!(ctx.set_auth(AuthContext::with_subject("alice")));
+
+        assert_eq!(
+            ctx.auth().and_then(|auth| auth.subject),
+            Some("alice".to_string())
+        );
+        let stored: Option<AuthContext> = state.get(crate::AUTH_STATE_KEY);
+        assert!(
+            stored.is_none(),
+            "request auth must not be persisted into session state"
+        );
+    }
+
+    #[test]
+    fn test_mcp_context_clones_share_request_auth() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let cloned = ctx.clone();
+
+        assert!(cloned.set_auth(AuthContext::with_subject("bob")));
+
+        assert_eq!(
+            ctx.auth().and_then(|auth| auth.subject),
+            Some("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn test_new_mcp_contexts_do_not_share_request_auth_even_with_same_cx() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let first = McpContext::with_state(cx.clone(), 7, state.clone());
+        let second = McpContext::with_state(cx, 7, state);
+
+        assert!(first.set_auth(AuthContext::with_subject("carol")));
+
+        assert!(second.auth().is_none());
+    }
+
+    #[test]
+    fn test_new_mcp_contexts_do_not_share_request_auth_across_requests() {
+        let state = SessionState::new();
+        let first = McpContext::with_state(Cx::for_testing(), 7, state.clone());
+        let second = McpContext::with_state(Cx::for_testing(), 8, state);
+
+        assert!(first.set_auth(AuthContext::with_subject("dave")));
+
+        assert_eq!(
+            first.auth().and_then(|auth| auth.subject),
+            Some("dave".to_string())
+        );
+        assert!(second.auth().is_none());
+    }
+
+    #[test]
+    fn test_mcp_context_drop_does_not_leak_request_auth() {
+        let cx = Cx::for_testing();
+
+        {
+            let ctx = McpContext::new(cx.clone(), 9);
+            assert!(ctx.set_auth(AuthContext::with_subject("erin")));
+        }
+
+        assert!(
+            McpContext::new(cx, 9).auth().is_none(),
+            "fresh contexts must start without inherited request auth"
+        );
     }
 
     // ========================================================================

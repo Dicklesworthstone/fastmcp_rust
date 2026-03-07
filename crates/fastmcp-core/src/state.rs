@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     inner: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    local: Option<Arc<Mutex<HashMap<String, serde_json::Value>>>>,
 }
 
 impl SessionState {
@@ -33,6 +34,23 @@ impl SessionState {
         Self::default()
     }
 
+    /// Returns a view with request-local overrides layered on top of the
+    /// shared session state.
+    ///
+    /// Cloning the returned value preserves the same local override map,
+    /// while ordinary writes continue to target the shared session state.
+    #[must_use]
+    pub fn with_local_overrides(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            local: Some(
+                self.local
+                    .as_ref()
+                    .map_or_else(|| Arc::new(Mutex::new(HashMap::new())), Arc::clone),
+            ),
+        }
+    }
+
     /// Creates an isolated snapshot of the current session state.
     ///
     /// Unlike [`Clone`], which shares the same underlying storage, this copies
@@ -40,13 +58,22 @@ impl SessionState {
     /// bleed across requests.
     #[must_use]
     pub fn snapshot(&self) -> Self {
-        let snapshot = self
+        let mut snapshot = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if let Some(local) = &self.local {
+            snapshot.extend(
+                local
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            );
+        }
         Self {
             inner: Arc::new(Mutex::new(snapshot)),
+            local: None,
         }
     }
 
@@ -59,9 +86,8 @@ impl SessionState {
     /// * `T` - The expected type of the value (must implement Deserialize)
     #[must_use]
     pub fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        let guard = self.inner.lock().ok()?;
-        let value = guard.get(key)?;
-        serde_json::from_value(value.clone()).ok()
+        let value = self.get_raw(key)?;
+        serde_json::from_value(value).ok()
     }
 
     /// Gets a raw JSON value from session state by key.
@@ -69,6 +95,12 @@ impl SessionState {
     /// Returns `None` if the key doesn't exist.
     #[must_use]
     pub fn get_raw(&self, key: &str) -> Option<serde_json::Value> {
+        if let Some(local) = &self.local {
+            let guard = local.lock().ok()?;
+            if let Some(value) = guard.get(key) {
+                return Some(value.clone());
+            }
+        }
         let guard = self.inner.lock().ok()?;
         guard.get(key).cloned()
     }
@@ -103,10 +135,40 @@ impl SessionState {
         true
     }
 
+    /// Sets a request-local raw JSON value layered over the shared session state.
+    ///
+    /// Returns `false` if this state does not have local overrides enabled.
+    pub fn set_local_raw(&self, key: impl Into<String>, value: serde_json::Value) -> bool {
+        let Some(local) = &self.local else {
+            return false;
+        };
+        let Ok(mut guard) = local.lock() else {
+            return false;
+        };
+        guard.insert(key.into(), value);
+        true
+    }
+
+    /// Sets a request-local value layered over the shared session state.
+    ///
+    /// Returns `false` if serialization fails or local overrides are unavailable.
+    pub fn set_local<T: serde::Serialize>(&self, key: impl Into<String>, value: T) -> bool {
+        let Ok(json_value) = serde_json::to_value(value) else {
+            return false;
+        };
+        self.set_local_raw(key, json_value)
+    }
+
     /// Removes a value from session state.
     ///
     /// Returns the previous value if it existed.
     pub fn remove(&self, key: &str) -> Option<serde_json::Value> {
+        if let Some(local) = &self.local {
+            let mut guard = local.lock().ok()?;
+            if let Some(value) = guard.remove(key) {
+                return Some(value);
+            }
+        }
         let mut guard = self.inner.lock().ok()?;
         guard.remove(key)
     }
@@ -114,16 +176,26 @@ impl SessionState {
     /// Checks if a key exists in session state.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.contains_key(key))
-            .unwrap_or(false)
+        self.get_raw(key).is_some()
     }
 
     /// Returns the number of entries in session state.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+        let shared_keys = self
+            .inner
+            .lock()
+            .map(|g| g.keys().cloned().collect::<std::collections::HashSet<_>>())
+            .unwrap_or_default();
+        if let Some(local) = &self.local {
+            let local_keys = local
+                .lock()
+                .map(|g| g.keys().cloned().collect::<std::collections::HashSet<_>>())
+                .unwrap_or_default();
+            shared_keys.union(&local_keys).count()
+        } else {
+            shared_keys.len()
+        }
     }
 
     /// Returns true if session state is empty.
@@ -135,6 +207,11 @@ impl SessionState {
     /// Clears all session state.
     pub fn clear(&self) {
         if let Ok(mut guard) = self.inner.lock() {
+            guard.clear();
+        }
+        if let Some(local) = &self.local
+            && let Ok(mut guard) = local.lock()
+        {
             guard.clear();
         }
     }

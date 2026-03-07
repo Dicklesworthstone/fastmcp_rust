@@ -2285,8 +2285,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2312,8 +2320,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2332,8 +2348,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -2355,8 +2379,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -2374,8 +2406,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Request should fail due to exhausted budget
         assert!(result.is_err());
@@ -2394,8 +2434,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -2417,8 +2465,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2439,8 +2495,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2461,8 +2525,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2486,8 +2558,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2513,8 +2593,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2547,8 +2635,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_err());
     }
@@ -2565,8 +2661,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let result = router.handle_resources_read(
+            &cx,
+            1,
+            &params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Should be cancelled
         assert!(result.is_err());
@@ -2588,8 +2692,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_prompts_get(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -2617,8 +2729,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_prompts_get(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_err());
     }
@@ -2636,8 +2756,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2657,8 +2785,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2678,8 +2814,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2700,8 +2844,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Should pass in lenient mode
         assert!(result.is_ok());
@@ -2724,8 +2876,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Should fail in strict mode due to extra property
         assert!(result.is_err());
@@ -2748,8 +2908,16 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let result = router.handle_tools_call(
+            &cx,
+            1,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        );
 
         // Should pass in strict mode with valid input
         assert!(result.is_ok());
@@ -3142,6 +3310,7 @@ mod multi_handler_tests {
             SessionState::new(),
             None,
             None,
+            None,
         );
         assert!(result1.is_ok());
 
@@ -3155,6 +3324,7 @@ mod multi_handler_tests {
             },
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         );
@@ -3198,6 +3368,7 @@ mod multi_handler_tests {
             SessionState::new(),
             None,
             None,
+            None,
         );
         let result_b = router.handle_resources_read(
             &cx,
@@ -3208,6 +3379,7 @@ mod multi_handler_tests {
             },
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         );
@@ -3247,23 +3419,40 @@ mod session_state_tests {
             arguments: None,
             meta: None,
         };
-        let result1 =
-            router.handle_tools_call(&cx, 1, params.clone(), &budget, state.clone(), None, None);
+        let result1 = router.handle_tools_call(
+            &cx,
+            1,
+            params.clone(),
+            &budget,
+            state.clone(),
+            None,
+            None,
+            None,
+        );
         assert!(result1.is_ok());
         if let Content::Text { text } = &result1.unwrap().content[0] {
             assert_eq!(text, "Counter: 1");
         }
 
         // Second call with same state - counter should be 2
-        let result2 =
-            router.handle_tools_call(&cx, 2, params.clone(), &budget, state.clone(), None, None);
+        let result2 = router.handle_tools_call(
+            &cx,
+            2,
+            params.clone(),
+            &budget,
+            state.clone(),
+            None,
+            None,
+            None,
+        );
         assert!(result2.is_ok());
         if let Content::Text { text } = &result2.unwrap().content[0] {
             assert_eq!(text, "Counter: 2");
         }
 
         // Third call - counter should be 3
-        let result3 = router.handle_tools_call(&cx, 3, params, &budget, state.clone(), None, None);
+        let result3 =
+            router.handle_tools_call(&cx, 3, params, &budget, state.clone(), None, None, None);
         assert!(result3.is_ok());
         if let Content::Text { text } = &result3.unwrap().content[0] {
             assert_eq!(text, "Counter: 3");
@@ -3290,15 +3479,33 @@ mod session_state_tests {
 
         // Call with state1 twice
         router
-            .handle_tools_call(&cx, 1, params.clone(), &budget, state1.clone(), None, None)
+            .handle_tools_call(
+                &cx,
+                1,
+                params.clone(),
+                &budget,
+                state1.clone(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let result1 = router
-            .handle_tools_call(&cx, 2, params.clone(), &budget, state1.clone(), None, None)
+            .handle_tools_call(
+                &cx,
+                2,
+                params.clone(),
+                &budget,
+                state1.clone(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         // Call with state2 once
         let result2 = router
-            .handle_tools_call(&cx, 3, params, &budget, state2.clone(), None, None)
+            .handle_tools_call(&cx, 3, params, &budget, state2.clone(), None, None, None)
             .unwrap();
 
         // state1 should have counter=2, state2 should have counter=1
@@ -3558,6 +3765,7 @@ mod lab_runtime_tests {
                     SessionState::new(),
                     None,
                     None,
+                    None,
                 );
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
@@ -3605,6 +3813,7 @@ mod lab_runtime_tests {
                     &params,
                     &budget,
                     SessionState::new(),
+                    None,
                     None,
                     None,
                 );

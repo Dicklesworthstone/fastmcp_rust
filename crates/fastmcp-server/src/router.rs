@@ -9,7 +9,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{debug, targets, trace};
 use fastmcp_core::{
-    McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
+    AuthContext, McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
 };
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, Content, GetPromptParams,
@@ -776,6 +776,7 @@ impl Router {
         params: CallToolParams,
         budget: &Budget,
         session_state: SessionState,
+        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
@@ -843,7 +844,7 @@ impl Router {
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_marker, notification_sender) {
+        let mut ctx = match (progress_marker, notification_sender) {
             (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
@@ -871,6 +872,9 @@ impl Router {
                 ctx
             }
         };
+        if let Some(auth) = auth {
+            ctx = ctx.with_auth(auth);
+        }
 
         // Call the handler asynchronously - returns McpOutcome (4-valued)
         let outcome = block_on(handler.call_async(&ctx, arguments));
@@ -999,6 +1003,7 @@ impl Router {
         params: &ReadResourceParams,
         budget: &Budget,
         session_state: SessionState,
+        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ReadResourceResult> {
@@ -1040,7 +1045,7 @@ impl Router {
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_marker, notification_sender) {
+        let mut ctx = match (progress_marker, notification_sender) {
             (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
@@ -1068,6 +1073,9 @@ impl Router {
                 ctx
             }
         };
+        if let Some(auth) = auth {
+            ctx = ctx.with_auth(auth);
+        }
 
         // Read the resource asynchronously - returns McpOutcome (4-valued)
         let outcome = block_on(resolved.handler.read_async_with_uri(
@@ -1138,6 +1146,7 @@ impl Router {
         params: GetPromptParams,
         budget: &Budget,
         session_state: SessionState,
+        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<GetPromptResult> {
@@ -1184,7 +1193,7 @@ impl Router {
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
         // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let ctx = match (progress_marker, notification_sender) {
+        let mut ctx = match (progress_marker, notification_sender) {
             (Some(marker), Some(sender)) => {
                 let sender = sender.clone();
                 create_context_with_progress_and_senders(
@@ -1212,6 +1221,9 @@ impl Router {
                 ctx
             }
         };
+        if let Some(auth) = auth {
+            ctx = ctx.with_auth(auth);
+        }
 
         // Get the prompt asynchronously - returns McpOutcome (4-valued)
         let arguments = params.arguments.unwrap_or_default();
@@ -4255,7 +4267,7 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_tools_call(&cx, 1, params, &budget, state, None, None)
+            .handle_tools_call(&cx, 1, params, &budget, state, None, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4274,7 +4286,16 @@ mod router_tests {
             meta: None,
         };
         let result = r
-            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_tools_call(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(!result.is_error);
         assert!(!result.content.is_empty());
@@ -4293,7 +4314,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_tools_call(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(err.message.contains("missing"));
     }
@@ -4312,7 +4342,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_tools_call(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(
             err.message.contains("budget") || err.message.contains("exhausted"),
@@ -4338,7 +4377,7 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_resources_read(&cx, 1, &params, &budget, state, None, None)
+            .handle_resources_read(&cx, 1, &params, &budget, state, None, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4356,7 +4395,16 @@ mod router_tests {
             meta: None,
         };
         let result = r
-            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(result.contents.len(), 1);
         assert_eq!(result.contents[0].uri, "file:///a");
@@ -4374,7 +4422,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(err.message.contains("nonexistent") || err.message.contains("not found"));
     }
@@ -4392,7 +4449,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(
             err.message.contains("budget") || err.message.contains("exhausted"),
@@ -4419,7 +4485,7 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_prompts_get(&cx, 1, params, &budget, state, None, None)
+            .handle_prompts_get(&cx, 1, params, &budget, state, None, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4438,7 +4504,16 @@ mod router_tests {
             meta: None,
         };
         let result = r
-            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_prompts_get(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.description.is_some());
     }
@@ -4456,7 +4531,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_prompts_get(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(err.message.contains("missing") || err.message.contains("not found"));
     }
@@ -4475,7 +4559,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_prompts_get(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(
             err.message.contains("budget") || err.message.contains("exhausted"),
@@ -4692,7 +4785,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_tools_call(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -4709,7 +4811,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -4727,7 +4838,16 @@ mod router_tests {
             meta: None,
         };
         let err = r
-            .handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None)
+            .handle_prompts_get(
+                &cx,
+                1,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
