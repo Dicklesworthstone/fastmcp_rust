@@ -40,7 +40,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 
@@ -54,6 +55,23 @@ use crate::error::{McpError, McpErrorCode, McpResult};
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ============================================================================
+// Internal: poll a BoxFuture stored in an Option slot
+// ============================================================================
+
+/// Attempt to poll `slot`. If the future resolves, `slot` is set to `None`
+/// and `Some(output)` is returned. Otherwise returns `None`.
+fn poll_slot<T>(slot: &mut Option<BoxFuture<'_, T>>, cx: &mut Context<'_>) -> Option<T> {
+    let fut = slot.as_mut()?;
+    match fut.as_mut().poll(cx) {
+        Poll::Ready(val) => {
+            *slot = None; // drop the completed future
+            Some(val)
+        }
+        Poll::Pending => None,
+    }
+}
+
+// ============================================================================
 // Join Combinator
 // ============================================================================
 
@@ -62,13 +80,13 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// This is the N-of-N combinator: all futures must complete before
 /// returning. Results are returned in the same order as input futures.
 ///
+/// Futures are polled concurrently — each poll cycle round-robins
+/// through all incomplete futures, ensuring fair progress.
+///
 /// # Cancel-Correctness
 ///
-/// In Phase 1+, if any future is cancelled or panics, the combinator
-/// will still await all remaining futures to completion before returning.
-///
-/// **Phase 0 note:** Currently uses sequential execution, so futures run
-/// one at a time and panics propagate immediately.
+/// If any future is cancelled or panics, the combinator will still
+/// await all remaining futures to completion before returning.
 ///
 /// # Example
 ///
@@ -81,13 +99,51 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// let users = join_all(ctx.cx(), futures).await;
 /// ```
 pub async fn join_all<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -> Vec<T> {
-    // Phase 0: Sequential execution (single-threaded runtime)
-    // Phase 1+: Will use proper concurrent polling
-    let mut results = Vec::with_capacity(futures.len());
-    for fut in futures {
-        results.push(fut.await);
+    let len = futures.len();
+    if len == 0 {
+        return Vec::new();
     }
-    results
+    // Single future: no concurrency overhead needed.
+    if len == 1 {
+        let mut futs = futures;
+        return vec![futs.remove(0).await];
+    }
+    let mut state = JoinAllState {
+        futures: futures.into_iter().map(Some).collect(),
+        results: (0..len).map(|_| None).collect(),
+        remaining: len,
+    };
+    // Use std::future::poll_fn for safe self-referential polling.
+    std::future::poll_fn(move |cx| state.poll(cx)).await
+}
+
+/// Internal state for join_all concurrent polling.
+struct JoinAllState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, T>>>,
+    results: Vec<Option<T>>,
+    remaining: usize,
+}
+
+impl<T> JoinAllState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Vec<T>> {
+        for i in 0..self.futures.len() {
+            if let Some(val) = poll_slot(&mut self.futures[i], cx) {
+                self.results[i] = Some(val);
+                self.remaining -= 1;
+            }
+        }
+
+        if self.remaining == 0 {
+            let results: Vec<T> = self
+                .results
+                .iter_mut()
+                .map(|slot| slot.take().expect("all futures completed"))
+                .collect();
+            Poll::Ready(results)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 /// Waits for all futures to complete, returning Results.
@@ -120,15 +176,11 @@ pub async fn join_all_results<T: Send + 'static>(
 /// Races multiple futures, returning the first to complete.
 ///
 /// This is the 1-of-N combinator: the first future to complete wins,
-/// and all others are cancelled and drained.
+/// and all others are cancelled (dropped).
 ///
-/// # Cancel-Correctness
-///
-/// In Phase 1+, losing futures are properly cancelled and awaited to
-/// ensure no orphan tasks remain.
-///
-/// **Phase 0 note:** Currently uses sequential execution, so only the
-/// first future runs and there are no losers to cancel.
+/// Futures are polled concurrently — each poll cycle round-robins
+/// through all futures. The first to resolve wins; remaining futures
+/// are dropped immediately, triggering cancellation.
 ///
 /// # Errors
 ///
@@ -150,15 +202,38 @@ pub async fn join_all_results<T: Send + 'static>(
 /// let result = race(ctx.cx(), futures).await?;
 /// ```
 pub async fn race<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -> McpResult<T> {
-    // Phase 0: Sequential execution - first future wins
-    // Phase 1+: Will use proper concurrent polling with cancellation
-    let mut iter = futures.into_iter();
-    match iter.next() {
-        Some(fut) => Ok(fut.await),
-        None => Err(McpError::new(
+    if futures.is_empty() {
+        return Err(McpError::new(
             McpErrorCode::InvalidParams,
             "race requires at least one future",
-        )),
+        ));
+    }
+    // Single future: no concurrency overhead needed.
+    if futures.len() == 1 {
+        let mut futs = futures;
+        return Ok(futs.remove(0).await);
+    }
+    let mut state = RaceAllState {
+        futures: futures.into_iter().map(Some).collect(),
+    };
+    Ok(std::future::poll_fn(move |cx| state.poll(cx)).await)
+}
+
+/// Internal state for race_all concurrent polling.
+struct RaceAllState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, T>>>,
+}
+
+impl<T> RaceAllState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
+        for i in 0..self.futures.len() {
+            if let Some(val) = poll_slot(&mut self.futures[i], cx) {
+                // Drop all remaining futures (cancellation).
+                self.futures.clear();
+                return Poll::Ready(val);
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -177,13 +252,52 @@ pub async fn race<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -
 /// let result = race_timeout(ctx.cx(), Duration::from_secs(5), futures).await?;
 /// ```
 pub async fn race_timeout<T: Send + 'static>(
-    cx: &Cx,
-    _timeout: Duration, // Phase 0: timeout not enforced
+    _cx: &Cx,
+    timeout: Duration,
     futures: Vec<BoxFuture<'_, T>>,
 ) -> McpResult<T> {
-    // Phase 0: Delegate to race without timeout enforcement
-    // Phase 1+: Will use proper timeout wrapping
-    race(cx, futures).await
+    if futures.is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "race requires at least one future",
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    let mut state = RaceTimeoutState {
+        futures: futures.into_iter().map(Some).collect(),
+        deadline,
+    };
+    std::future::poll_fn(move |cx| state.poll(cx)).await
+}
+
+/// Internal state for race with timeout enforcement.
+struct RaceTimeoutState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, T>>>,
+    deadline: Instant,
+}
+
+impl<T> RaceTimeoutState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
+        // Check timeout first.
+        if Instant::now() >= self.deadline {
+            self.futures.clear();
+            return Poll::Ready(Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "operation timed out",
+            )));
+        }
+
+        for i in 0..self.futures.len() {
+            if let Some(val) = poll_slot(&mut self.futures[i], cx) {
+                self.futures.clear();
+                return Poll::Ready(Ok(val));
+            }
+        }
+
+        // Schedule a wakeup so we can re-check the deadline.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 // ============================================================================
@@ -222,7 +336,11 @@ impl<T> QuorumResult<T> {
 /// Waits for M of N futures to complete successfully.
 ///
 /// This is the M-of-N combinator: returns when `required` futures
-/// have completed successfully. Remaining futures are cancelled.
+/// have completed successfully. Remaining futures are cancelled (dropped).
+///
+/// Futures are polled concurrently — each poll cycle round-robins
+/// through all incomplete futures. Once quorum is reached or becomes
+/// impossible, remaining futures are dropped.
 ///
 /// # Arguments
 ///
@@ -232,11 +350,8 @@ impl<T> QuorumResult<T> {
 ///
 /// # Cancel-Correctness
 ///
-/// In Phase 1+, once quorum is reached (or impossible), remaining futures
-/// are cancelled and drained. No orphan tasks.
-///
-/// **Phase 0 note:** Currently uses sequential execution, so remaining
-/// futures simply aren't started rather than being cancelled.
+/// Once quorum is reached (or impossible), remaining futures are
+/// dropped immediately, triggering cancellation. No orphan tasks.
 ///
 /// # Special Cases
 ///
@@ -283,47 +398,81 @@ pub async fn quorum<T: Send + 'static>(
         });
     }
 
-    // Phase 0: Sequential execution with early exit
-    // Phase 1+: Will use proper concurrent polling with cancellation
-    let mut successes = Vec::with_capacity(required);
-    let mut failures = 0;
-    let max_allowed_failures = total - required;
+    let mut state = QuorumState {
+        futures: futures.into_iter().map(Some).collect(),
+        successes: Vec::with_capacity(required),
+        failures: 0,
+        required,
+        total,
+    };
+    std::future::poll_fn(move |cx| state.poll(cx)).await
+}
 
-    for fut in futures {
-        // Check if quorum is already met
-        if successes.len() >= required {
-            break;
+/// Internal state for quorum concurrent polling.
+struct QuorumState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, McpResult<T>>>>,
+    successes: Vec<T>,
+    failures: usize,
+    required: usize,
+    total: usize,
+}
+
+impl<T> QuorumState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
+        for i in 0..self.futures.len() {
+            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
+                match result {
+                    Ok(val) => self.successes.push(val),
+                    Err(_) => self.failures += 1,
+                }
+            }
         }
 
-        // Check if quorum is still possible
-        if failures > max_allowed_failures {
-            break;
+        let max_allowed_failures = self.total - self.required;
+
+        // Quorum met: early exit, drop remaining futures.
+        if self.successes.len() >= self.required {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met: true,
+                failure_count: self.failures,
+            }));
         }
 
-        match fut.await {
-            Ok(value) => successes.push(value),
-            Err(_) => failures += 1,
+        // Quorum impossible: too many failures.
+        if self.failures > max_allowed_failures {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met: false,
+                failure_count: self.failures,
+            }));
         }
+
+        // All futures done but quorum not met.
+        let still_pending = self.futures.iter().any(Option::is_some);
+        if !still_pending {
+            let successes = std::mem::take(&mut self.successes);
+            let quorum_met = successes.len() >= self.required;
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met,
+                failure_count: self.failures,
+            }));
+        }
+
+        Poll::Pending
     }
-
-    let quorum_met = successes.len() >= required;
-
-    Ok(QuorumResult {
-        successes,
-        quorum_met,
-        failure_count: failures,
-    })
 }
 
 /// Waits for M of N futures with a timeout.
 ///
-/// Like `quorum`, but fails if the quorum isn't reached within
-/// the specified duration.
-///
-/// # Note
-///
-/// In Phase 0, this delegates to `quorum` without actual timeout enforcement.
-/// In Phase 1+, proper timeout handling will be implemented.
+/// Like `quorum`, but if the timeout fires before quorum is reached,
+/// the result reflects whatever successes have accumulated so far
+/// (with `quorum_met` likely `false`).
 ///
 /// # Example
 ///
@@ -336,14 +485,110 @@ pub async fn quorum<T: Send + 'static>(
 /// ).await?;
 /// ```
 pub async fn quorum_timeout<T: Send + 'static>(
-    cx: &Cx,
+    _cx: &Cx,
     required: usize,
-    _timeout: Duration, // Phase 0: timeout not enforced
+    timeout: Duration,
     futures: Vec<BoxFuture<'_, McpResult<T>>>,
 ) -> McpResult<QuorumResult<T>> {
-    // Phase 0: Delegate to quorum without timeout
-    // Phase 1+: Will use proper timeout wrapping
-    quorum(cx, required, futures).await
+    let total = futures.len();
+
+    // Validate quorum parameters
+    if required > total {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("quorum requires {required} successes but only {total} futures provided"),
+        ));
+    }
+
+    if required == 0 {
+        return Ok(QuorumResult {
+            successes: Vec::new(),
+            quorum_met: true,
+            failure_count: 0,
+        });
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut state = QuorumTimeoutState {
+        futures: futures.into_iter().map(Some).collect(),
+        successes: Vec::with_capacity(required),
+        failures: 0,
+        required,
+        total,
+        deadline,
+    };
+    std::future::poll_fn(move |cx| state.poll(cx)).await
+}
+
+/// Internal state for quorum with timeout enforcement.
+struct QuorumTimeoutState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, McpResult<T>>>>,
+    successes: Vec<T>,
+    failures: usize,
+    required: usize,
+    total: usize,
+    deadline: Instant,
+}
+
+impl<T> QuorumTimeoutState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
+        // Check timeout first.
+        if Instant::now() >= self.deadline {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            let quorum_met = successes.len() >= self.required;
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met,
+                failure_count: self.failures,
+            }));
+        }
+
+        for i in 0..self.futures.len() {
+            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
+                match result {
+                    Ok(val) => self.successes.push(val),
+                    Err(_) => self.failures += 1,
+                }
+            }
+        }
+
+        let max_allowed_failures = self.total - self.required;
+
+        if self.successes.len() >= self.required {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met: true,
+                failure_count: self.failures,
+            }));
+        }
+
+        if self.failures > max_allowed_failures {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met: false,
+                failure_count: self.failures,
+            }));
+        }
+
+        let still_pending = self.futures.iter().any(Option::is_some);
+        if !still_pending {
+            let successes = std::mem::take(&mut self.successes);
+            return Poll::Ready(Ok(QuorumResult {
+                successes,
+                quorum_met: false,
+                failure_count: self.failures,
+            }));
+        }
+
+        // Schedule wakeup for timeout checking.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 // ============================================================================
@@ -352,9 +597,9 @@ pub async fn quorum_timeout<T: Send + 'static>(
 
 /// Races futures and returns the first successful result.
 ///
-/// This function takes futures that return `McpResult<T>` and tries them
-/// in sequence (Phase 0) or concurrently (Phase 1+), returning the first
-/// `Ok` value. If all futures return `Err`, the last error is returned.
+/// This function takes futures that return `McpResult<T>` and polls them
+/// concurrently, returning the first `Ok` value. If all futures return
+/// `Err`, the last error is returned.
 ///
 /// Use this for fallback patterns where you want to try multiple sources
 /// and take the first success.
@@ -380,19 +625,46 @@ pub async fn first_ok<T: Send + 'static>(
         ));
     }
 
-    // Phase 0: Sequential fallback execution
-    // Phase 1+: Will use concurrent polling with first-success semantics
-    let mut last_error = None;
+    let mut state = FirstOkState {
+        futures: futures.into_iter().map(Some).collect(),
+        last_error: None,
+    };
+    std::future::poll_fn(move |cx| state.poll(cx)).await
+}
 
-    for fut in futures {
-        match fut.await {
-            Ok(value) => return Ok(value),
-            Err(e) => last_error = Some(e),
+/// Internal state for first-success concurrent polling.
+struct FirstOkState<'a, T> {
+    futures: Vec<Option<BoxFuture<'a, McpResult<T>>>>,
+    last_error: Option<McpError>,
+}
+
+impl<T> FirstOkState<'_, T> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
+        for i in 0..self.futures.len() {
+            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
+                match result {
+                    Ok(val) => {
+                        // Found a success — drop all remaining futures.
+                        self.futures.clear();
+                        return Poll::Ready(Ok(val));
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                    }
+                }
+            }
         }
-    }
 
-    Err(last_error
-        .unwrap_or_else(|| McpError::new(McpErrorCode::InternalError, "all futures failed")))
+        let still_pending = self.futures.iter().any(Option::is_some);
+        if !still_pending {
+            let err = self.last_error.take().unwrap_or_else(|| {
+                McpError::new(McpErrorCode::InternalError, "all futures failed")
+            });
+            return Poll::Ready(Err(err));
+        }
+
+        Poll::Pending
+    }
 }
 
 // ============================================================================
@@ -577,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn race_multiple_returns_first() {
+    fn race_multiple_returns_first_ready() {
         let cx = make_cx();
         let futures: Vec<BoxFuture<'_, i32>> = vec![
             Box::pin(async { 10 }),
@@ -585,12 +857,12 @@ mod tests {
             Box::pin(async { 30 }),
         ];
         let result = block_on(race(&cx, futures));
-        // Phase 0 sequential: first future wins
+        // With concurrent polling, the first immediately-ready future wins.
         assert_eq!(result.unwrap(), 10);
     }
 
     #[test]
-    fn race_timeout_delegates_to_race() {
+    fn race_timeout_succeeds_within_deadline() {
         let cx = make_cx();
         let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(async { 42 })];
         let result = block_on(race_timeout(&cx, Duration::from_secs(5), futures));
@@ -603,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn quorum_timeout_delegates_to_quorum() {
+    fn quorum_timeout_succeeds_within_deadline() {
         let cx = make_cx();
         let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
             vec![Box::pin(async { Ok(1) }), Box::pin(async { Ok(2) })];

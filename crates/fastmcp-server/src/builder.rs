@@ -14,8 +14,8 @@ use log::{Level, LevelFilter};
 use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
 use crate::tasks::SharedTaskManager;
 use crate::{
-    AuthProvider, DuplicateBehavior, LifespanHooks, LoggingConfig, PromptHandler, ProxyCatalog,
-    ProxyClient, ResourceHandler, Router, Server, ToolHandler,
+    AuthProvider, DuplicateBehavior, HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler,
+    ProxyCatalog, ProxyClient, ResourceHandler, Router, Server, ToolHandler,
 };
 
 /// Default request timeout in seconds.
@@ -49,6 +49,8 @@ pub struct ServerBuilder {
     on_duplicate: DuplicateBehavior,
     /// Whether to use strict input validation (reject extra properties).
     strict_input_validation: bool,
+    /// HTTP server configuration (paths, max_connections, CORS).
+    http_config: HttpServerConfig,
 }
 
 impl ServerBuilder {
@@ -83,6 +85,7 @@ impl ServerBuilder {
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
             strict_input_validation: false,
+            http_config: HttpServerConfig::default(),
         }
     }
 
@@ -255,6 +258,26 @@ impl ServerBuilder {
     #[must_use]
     pub fn is_strict_input_validation_enabled(&self) -> bool {
         self.strict_input_validation
+    }
+
+    /// Sets the HTTP server configuration (paths, max connections, CORS).
+    ///
+    /// This configuration is used by [`Server::run_http`](crate::Server::run_http)
+    /// and related HTTP methods.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastmcp_server::HttpServerConfig;
+    ///
+    /// Server::new("demo", "1.0")
+    ///     .http_config(HttpServerConfig::new().mcp_path("/api/mcp").max_connections(128))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn http_config(mut self, config: HttpServerConfig) -> Self {
+        self.http_config = config;
+        self
     }
 
     /// Registers a middleware.
@@ -949,6 +972,7 @@ impl ServerBuilder {
             active_requests: Mutex::new(HashMap::new()),
             task_manager: self.task_manager,
             pending_requests: std::sync::Arc::new(crate::bidirectional::PendingRequests::new()),
+            http_config: self.http_config,
         }
     }
 }

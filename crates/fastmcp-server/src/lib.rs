@@ -93,6 +93,7 @@ pub use bidirectional::{
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -372,6 +373,8 @@ pub struct Server {
     task_manager: Option<SharedTaskManager>,
     /// Pending server-to-client requests (for bidirectional communication).
     pending_requests: Arc<bidirectional::PendingRequests>,
+    /// HTTP server configuration (paths, max_connections, CORS).
+    http_config: HttpServerConfig,
 }
 
 impl Server {
@@ -753,6 +756,10 @@ impl Server {
     ///
     /// When `returning` is `false` the method calls `std::process::exit` on
     /// shutdown (matching the behaviour of the stdio/transport family).
+    ///
+    /// Each accepted connection is handled in its own thread, enabling
+    /// concurrent tool dispatch across HTTP connections. The number of
+    /// concurrent connections is bounded by `HttpServerConfig::max_connections`.
     #[allow(clippy::too_many_lines)]
     fn run_http_accept_loop(self, cx: &Cx, addr: String, returning: bool) {
         self.init_rich_logging();
@@ -774,6 +781,11 @@ impl Server {
 
         info!(target: targets::SERVER, "HTTP server listening on {}", addr);
 
+        // Extract http_config paths before wrapping self in Arc.
+        let mcp_path = self.http_config.mcp_path.clone();
+        let health_path = self.http_config.health_path.clone();
+        let max_connections = self.http_config.max_connections;
+
         // Set up per-server state shared across connections.
         let session = Arc::new(Mutex::new(Session::new(
             self.info.clone(),
@@ -791,14 +803,14 @@ impl Server {
         });
 
         // Request sender for bidirectional communication.
-        let request_sender = {
+        let request_sender = Arc::new({
             let send_fn: bidirectional::TransportSendFn = Arc::new(|_message| {
                 // HTTP is request/response — server-to-client requests are not
                 // deliverable.  Log and drop.
                 Err("HTTP transport does not support server-to-client requests".into())
             });
             bidirectional::RequestSender::new(self.pending_requests.clone(), send_fn)
-        };
+        });
 
         // Track connection opened.
         if let Some(ref stats) = self.stats {
@@ -821,10 +833,10 @@ impl Server {
         }
 
         // Build the HTTP request handler with the server's config (or default).
-        let http_handler = HttpRequestHandler::new();
+        let http_handler = Arc::new(HttpRequestHandler::new());
 
         // Traffic renderer.
-        let traffic_renderer = if self.console_config.show_request_traffic {
+        let traffic_renderer = Arc::new(if self.console_config.show_request_traffic {
             let mut renderer = RequestResponseRenderer::new(self.console_config.resolve_context());
             renderer.truncate_at = self.console_config.truncate_at;
             match self.console_config.traffic_verbosity {
@@ -841,21 +853,23 @@ impl Server {
             Some(renderer)
         } else {
             None
-        };
+        });
 
-        // Default HTTP server config — paths for routing.
-        let mcp_path = "/mcp".to_string();
-        let health_path = "/health".to_string();
+        // Wrap self in Arc for sharing across connection handler threads.
+        let server = Arc::new(self);
 
-        // Accept loop.
+        // Active connection counter for max_connections enforcement.
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        // Accept loop — each connection is handled in its own thread.
         loop {
             if cx.is_cancel_requested() {
                 info!(target: targets::SERVER, "Cancellation requested, shutting down HTTP server");
                 if returning {
-                    self.graceful_shutdown_returning();
+                    server.graceful_shutdown_returning();
                     return;
                 }
-                self.graceful_shutdown(0);
+                server.graceful_shutdown(0);
             }
 
             let (stream, peer_addr) = match listener.accept() {
@@ -871,64 +885,114 @@ impl Server {
                 }
             };
 
+            // Enforce max_connections.
+            let current = active_connections.load(Ordering::Relaxed);
+            if current >= max_connections {
+                debug!(
+                    target: targets::TRANSPORT,
+                    "Rejecting connection from {} (max_connections {} reached)",
+                    peer_addr,
+                    max_connections
+                );
+                // Write a 503 Service Unavailable and close.
+                if let Ok(reader_stream) = stream.try_clone() {
+                    let mut http_transport =
+                        HttpTransport::new(BufReader::new(reader_stream), BufWriter::new(stream));
+                    let _ = http_transport.write_response(
+                        &HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                            .with_json(&serde_json::json!({"error": "too many connections"})),
+                    );
+                }
+                continue;
+            }
+
             debug!(
                 target: targets::TRANSPORT,
                 "Accepted HTTP connection from {}",
                 peer_addr
             );
 
-            // Read the HTTP request from the connection.
-            let reader = BufReader::new(match stream.try_clone() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(target: targets::TRANSPORT, "Failed to clone TCP stream: {}", e);
-                    continue;
+            // Clone shared state for the connection handler thread.
+            let server = Arc::clone(&server);
+            let session = Arc::clone(&session);
+            let notification_sender = Arc::clone(&notification_sender);
+            let request_sender = Arc::clone(&request_sender);
+            let http_handler = Arc::clone(&http_handler);
+            let traffic_renderer = Arc::clone(&traffic_renderer);
+            let active_connections = Arc::clone(&active_connections);
+            let mcp_path = mcp_path.clone();
+            let health_path = health_path.clone();
+            let conn_cx = cx.clone();
+
+            // Increment active connection count.
+            active_connections.fetch_add(1, Ordering::Relaxed);
+
+            // Spawn a thread to handle this connection concurrently.
+            std::thread::spawn(move || {
+                // Ensure connection count is decremented when this thread exits.
+                struct ConnectionGuard(Arc<AtomicUsize>);
+                impl Drop for ConnectionGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let _guard = ConnectionGuard(active_connections);
+
+                // Read the HTTP request from the connection.
+                let reader = BufReader::new(match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(target: targets::TRANSPORT, "Failed to clone TCP stream: {}", e);
+                        return;
+                    }
+                });
+                let writer = BufWriter::new(stream);
+                let mut http_transport: HttpTransport<
+                    BufReader<std::net::TcpStream>,
+                    BufWriter<std::net::TcpStream>,
+                > = HttpTransport::new(reader, writer);
+
+                let http_request = match http_transport.read_request() {
+                    Ok(req) => req,
+                    Err(e) => {
+                        debug!(target: targets::TRANSPORT, "Failed to read HTTP request: {}", e);
+                        return;
+                    }
+                };
+
+                // Route by path and method.
+                let response = if http_request.path == health_path
+                    && http_request.method == HttpMethod::Get
+                {
+                    // Health-check endpoint.
+                    HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
+                } else if http_request.path == mcp_path
+                    && http_request.method == HttpMethod::Options
+                {
+                    // CORS preflight.
+                    http_handler.handle_options(&http_request)
+                } else if http_request.path == mcp_path && http_request.method == HttpMethod::Post {
+                    // MCP JSON-RPC handler.
+                    server.handle_http_mcp_request(
+                        &conn_cx,
+                        &session,
+                        &http_handler,
+                        &http_request,
+                        &notification_sender,
+                        &request_sender,
+                        &traffic_renderer,
+                    )
+                } else {
+                    // 404 for anything else.
+                    HttpResponse::new(HttpStatus::NOT_FOUND)
+                        .with_json(&serde_json::json!({"error": "not found"}))
+                };
+
+                // Write the response.
+                if let Err(e) = http_transport.write_response(&response) {
+                    debug!(target: targets::TRANSPORT, "Failed to write HTTP response: {}", e);
                 }
             });
-            let writer = BufWriter::new(stream);
-            let mut http_transport: HttpTransport<
-                BufReader<std::net::TcpStream>,
-                BufWriter<std::net::TcpStream>,
-            > = HttpTransport::new(reader, writer);
-
-            let http_request = match http_transport.read_request() {
-                Ok(req) => req,
-                Err(e) => {
-                    debug!(target: targets::TRANSPORT, "Failed to read HTTP request: {}", e);
-                    continue;
-                }
-            };
-
-            // Route by path and method.
-            let response = if http_request.path == health_path
-                && http_request.method == HttpMethod::Get
-            {
-                // Health-check endpoint.
-                HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
-            } else if http_request.path == mcp_path && http_request.method == HttpMethod::Options {
-                // CORS preflight.
-                http_handler.handle_options(&http_request)
-            } else if http_request.path == mcp_path && http_request.method == HttpMethod::Post {
-                // MCP JSON-RPC handler.
-                self.handle_http_mcp_request(
-                    cx,
-                    &session,
-                    &http_handler,
-                    &http_request,
-                    &notification_sender,
-                    &request_sender,
-                    &traffic_renderer,
-                )
-            } else {
-                // 404 for anything else.
-                HttpResponse::new(HttpStatus::NOT_FOUND)
-                    .with_json(&serde_json::json!({"error": "not found"}))
-            };
-
-            // Write the response.
-            if let Err(e) = http_transport.write_response(&response) {
-                debug!(target: targets::TRANSPORT, "Failed to write HTTP response: {}", e);
-            }
         }
     }
 
