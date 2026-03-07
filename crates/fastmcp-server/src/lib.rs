@@ -2931,6 +2931,7 @@ fn create_notification_sender() -> NotificationSender {
 mod lib_unit_tests {
     use super::*;
     use fastmcp_derive::tool;
+    use fastmcp_protocol::{CallToolResult, Content};
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -2944,7 +2945,7 @@ mod lib_unit_tests {
 
     static HTTP_OVERLAP_METRICS: OnceLock<HttpOverlapMetrics> = OnceLock::new();
     static HTTP_OVERLAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    static AUTH_BARRIER: OnceLock<Mutex<Option<Arc<std::sync::Barrier>>>> = OnceLock::new();
+    static AUTH_READY_COUNT: OnceLock<AtomicUsize> = OnceLock::new();
 
     fn http_overlap_metrics() -> &'static HttpOverlapMetrics {
         HTTP_OVERLAP_METRICS.get_or_init(HttpOverlapMetrics::default)
@@ -2954,8 +2955,8 @@ mod lib_unit_tests {
         HTTP_OVERLAP_LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn auth_barrier_slot() -> &'static Mutex<Option<Arc<std::sync::Barrier>>> {
-        AUTH_BARRIER.get_or_init(|| Mutex::new(None))
+    fn auth_ready_count() -> &'static AtomicUsize {
+        AUTH_READY_COUNT.get_or_init(|| AtomicUsize::new(0))
     }
 
     fn reset_http_overlap_metrics() {
@@ -2996,12 +2997,15 @@ mod lib_unit_tests {
         description = "Returns the request-scoped auth subject after overlapping requests synchronize"
     )]
     fn http_auth_echo_tool_runtime(ctx: &McpContext) -> String {
-        if let Some(barrier) = auth_barrier_slot()
-            .lock()
-            .expect("auth barrier lock poisoned")
-            .clone()
-        {
-            barrier.wait();
+        let ready = auth_ready_count();
+        ready.fetch_add(1, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while ready.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "concurrent auth requests never overlapped"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
         ctx.auth()
             .and_then(|auth| auth.subject)
@@ -3418,10 +3422,7 @@ mod lib_unit_tests {
         let _guard = http_overlap_lock()
             .lock()
             .expect("http overlap test lock poisoned");
-
-        *auth_barrier_slot()
-            .lock()
-            .expect("auth barrier slot lock poisoned") = Some(Arc::new(std::sync::Barrier::new(2)));
+        auth_ready_count().store(0, Ordering::SeqCst);
 
         let server = Arc::new(
             Server::new("http-auth-test-server", "1.0.0")
@@ -3480,10 +3481,16 @@ mod lib_unit_tests {
                 let json: JsonRpcResponse =
                     serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
                 let result = json.result.expect("authenticated request should succeed");
-                result
-                    .as_str()
-                    .expect("auth echo tool should return a string")
-                    .to_string()
+                let tool_result: CallToolResult =
+                    serde_json::from_value(result).expect("parse tool result payload");
+                assert!(
+                    !tool_result.is_error,
+                    "auth echo tool unexpectedly returned an error payload"
+                );
+                match tool_result.content.as_slice() {
+                    [Content::Text { text }] => text.clone(),
+                    other => panic!("expected single text tool result, got {other:?}"),
+                }
             })
         };
 
@@ -3493,10 +3500,7 @@ mod lib_unit_tests {
 
         let first_subject = first.join().expect("first auth request thread panicked");
         let second_subject = second.join().expect("second auth request thread panicked");
-
-        *auth_barrier_slot()
-            .lock()
-            .expect("auth barrier slot lock poisoned") = None;
+        auth_ready_count().store(0, Ordering::SeqCst);
 
         assert_eq!(first_subject, "alpha");
         assert_eq!(second_subject, "beta");
