@@ -301,8 +301,21 @@ enum HttpRequestExecutionMode {
 impl HttpRequestExecutionMode {
     fn for_method(method: &str) -> Self {
         match method {
-            "tools/call" | "resources/read" | "prompts/get" => Self::ConcurrentReadOnly,
+            "resources/read" | "prompts/get" => Self::ConcurrentReadOnly,
             _ => Self::ExclusiveSession,
+        }
+    }
+
+    fn for_request(router: &Router, request: &JsonRpcRequest) -> Self {
+        match request.method.as_str() {
+            "tools/call" => request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| router.tool_is_read_only(name))
+                .map_or(Self::ExclusiveSession, |_| Self::ConcurrentReadOnly),
+            _ => Self::for_method(&request.method),
         }
     }
 }
@@ -1073,7 +1086,7 @@ impl Server {
 
         let start_time = Instant::now();
 
-        let execution_mode = HttpRequestExecutionMode::for_method(&json_rpc.method);
+        let execution_mode = HttpRequestExecutionMode::for_request(self.router.as_ref(), &json_rpc);
 
         // Dispatch through the server's handler. Concurrent HTTP methods take
         // a lock-free view of session metadata while sharing live session
@@ -1916,7 +1929,20 @@ impl Server {
                 params: request.params.as_ref(),
                 request_id,
             };
-            Some(self.authenticate_request(cx, request_id, session, auth_request)?)
+            match self.authenticate_request(cx, request_id, session, auth_request) {
+                Ok(auth) => Some(auth),
+                Err(err) => {
+                    let err = self.apply_global_middleware_error(&mw_ctx, &request, err);
+                    let result = Err(err);
+                    self.maybe_emit_log_notification(
+                        session,
+                        notification_sender,
+                        &request.method,
+                        &result,
+                    );
+                    return result;
+                }
+            }
         } else {
             None
         };
@@ -1949,9 +1975,11 @@ impl Server {
             }
         }
 
+        let dispatch_auth = mw_ctx.auth();
+
         // Everything after middleware entry must flow through `result` so that:
         // - `on_response` runs for successes in reverse middleware order
-        // - `on_error` runs for *all* errors (including parsing/auth) in reverse middleware order
+        // - `on_error` runs for handler/middleware errors in reverse middleware order
         //
         // Without this, `?` would early-return from `dispatch_method` and bypass middleware error
         // rewriting, contradicting the ordering semantics documented in `middleware.rs`.
@@ -2002,7 +2030,7 @@ impl Server {
                         params,
                         budget,
                         session.state().clone(),
-                        request_auth.clone(),
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2032,7 +2060,7 @@ impl Server {
                         &params,
                         budget,
                         session.state().clone(),
-                        request_auth.clone(),
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2066,7 +2094,7 @@ impl Server {
                         params,
                         budget,
                         session.state().clone(),
-                        request_auth,
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2170,12 +2198,21 @@ impl Server {
                 params: request.params.as_ref(),
                 request_id,
             };
-            Some(self.authenticate_request_with_state(
-                cx,
-                request_id,
-                &session.state,
-                auth_request,
-            )?)
+            match self.authenticate_request_with_state(cx, request_id, &session.state, auth_request)
+            {
+                Ok(auth) => Some(auth),
+                Err(err) => {
+                    let err = self.apply_global_middleware_error(&mw_ctx, &request, err);
+                    let result = Err(err);
+                    self.maybe_emit_log_notification_for_level(
+                        session.log_level,
+                        notification_sender,
+                        &request.method,
+                        &result,
+                    );
+                    return result;
+                }
+            }
         } else {
             None
         };
@@ -2215,6 +2252,8 @@ impl Server {
             }
         }
 
+        let dispatch_auth = mw_ctx.auth();
+
         let result: Result<serde_json::Value, McpError> = (|| {
             let method = &request.method;
             let params = request.params.clone();
@@ -2230,7 +2269,7 @@ impl Server {
                         params,
                         budget,
                         session.state.clone(),
-                        request_auth.clone(),
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2244,7 +2283,7 @@ impl Server {
                         &params,
                         budget,
                         session.state.clone(),
-                        request_auth.clone(),
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2258,7 +2297,7 @@ impl Server {
                         params,
                         budget,
                         session.state.clone(),
-                        request_auth,
+                        dispatch_auth.clone(),
                         Some(notification_sender),
                         bidirectional_senders.as_ref(),
                     )?;
@@ -2312,6 +2351,19 @@ impl Server {
     ) -> McpError {
         let mut err = error;
         for m in stack.iter().rev() {
+            err = m.on_error(ctx, request, err);
+        }
+        err
+    }
+
+    fn apply_global_middleware_error(
+        &self,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+        error: McpError,
+    ) -> McpError {
+        let mut err = error;
+        for m in self.middleware.iter().rev() {
             err = m.on_error(ctx, request, err);
         }
         err
@@ -2997,7 +3049,8 @@ mod lib_unit_tests {
 
     #[tool(
         name = "http_overlap_tool",
-        description = "Records concurrent overlap for HTTP tests"
+        description = "Records concurrent overlap for HTTP tests",
+        annotations(read_only)
     )]
     fn http_overlap_tool(_ctx: &McpContext) -> String {
         let metrics = http_overlap_metrics();
@@ -3010,7 +3063,8 @@ mod lib_unit_tests {
 
     #[tool(
         name = "http_auth_echo_tool_runtime",
-        description = "Returns the request-scoped auth subject while recording overlap"
+        description = "Returns the request-scoped auth subject while recording overlap",
+        annotations(read_only)
     )]
     fn http_auth_echo_tool_runtime(ctx: &McpContext) -> String {
         let metrics = http_overlap_metrics();
@@ -3036,9 +3090,20 @@ mod lib_unit_tests {
 
     #[tool(
         name = "http_current_auth_subject_tool",
-        description = "Returns the current request auth subject"
+        description = "Returns the current request auth subject",
+        annotations(read_only)
     )]
     fn http_current_auth_subject_tool(ctx: &McpContext) -> String {
+        ctx.auth()
+            .and_then(|auth| auth.subject)
+            .unwrap_or_else(|| "anonymous".to_string())
+    }
+
+    #[tool(
+        name = "http_current_auth_subject_exclusive_tool",
+        description = "Returns the current request auth subject from the exclusive path"
+    )]
+    fn http_current_auth_subject_exclusive_tool(ctx: &McpContext) -> String {
         ctx.auth()
             .and_then(|auth| auth.subject)
             .unwrap_or_else(|| "anonymous".to_string())
@@ -3063,6 +3128,49 @@ mod lib_unit_tests {
                     ctx.auth().and_then(|auth| auth.subject),
                 ));
             Ok(MiddlewareDecision::Continue)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct OverridingAuthMiddleware {
+        subject: &'static str,
+    }
+
+    impl Middleware for OverridingAuthMiddleware {
+        fn on_request(
+            &self,
+            ctx: &McpContext,
+            _request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            ctx.set_auth(AuthContext::with_subject(self.subject));
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailAuthProvider;
+
+    impl AuthProvider for AlwaysFailAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            _request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            Err(McpError::invalid_request("auth failed"))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RewritingErrorMiddleware;
+
+    impl Middleware for RewritingErrorMiddleware {
+        fn on_error(
+            &self,
+            _ctx: &McpContext,
+            _request: &JsonRpcRequest,
+            error: McpError,
+        ) -> McpError {
+            McpError::new(error.code, format!("rewritten: {}", error.message))
         }
     }
 
@@ -3341,29 +3449,72 @@ mod lib_unit_tests {
 
     #[test]
     fn http_request_execution_mode_classifies_methods() {
+        let mut router = Router::new();
+        router.add_tool(HttpOverlapTool);
+        router.add_tool(HttpStatefulIncrementTool);
+
         assert_eq!(
-            HttpRequestExecutionMode::for_method("tools/call"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "http_overlap_tool",
+                        "arguments": {}
+                    })),
+                    1,
+                ),
+            ),
             HttpRequestExecutionMode::ConcurrentReadOnly
         );
         assert_eq!(
-            HttpRequestExecutionMode::for_method("resources/read"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "http_stateful_increment_tool",
+                        "arguments": {}
+                    })),
+                    2,
+                ),
+            ),
+            HttpRequestExecutionMode::ExclusiveSession
+        );
+        assert_eq!(
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new("resources/read", None, 3),
+            ),
             HttpRequestExecutionMode::ConcurrentReadOnly
         );
         assert_eq!(
-            HttpRequestExecutionMode::for_method("prompts/get"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new("prompts/get", None, 4)
+            ),
             HttpRequestExecutionMode::ConcurrentReadOnly
         );
 
         assert_eq!(
-            HttpRequestExecutionMode::for_method("initialize"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new("initialize", None, 5)
+            ),
             HttpRequestExecutionMode::ExclusiveSession
         );
         assert_eq!(
-            HttpRequestExecutionMode::for_method("logging/setLevel"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new("logging/setLevel", None, 6),
+            ),
             HttpRequestExecutionMode::ExclusiveSession
         );
         assert_eq!(
-            HttpRequestExecutionMode::for_method("resources/subscribe"),
+            HttpRequestExecutionMode::for_request(
+                &router,
+                &JsonRpcRequest::new("resources/subscribe", None, 7),
+            ),
             HttpRequestExecutionMode::ExclusiveSession
         );
     }
@@ -3569,7 +3720,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn http_read_only_requests_preserve_session_state_updates() {
+    fn http_stateful_tool_calls_preserve_session_state_updates() {
         let server = Arc::new(
             Server::new("http-state-test-server", "1.0.0")
                 .tool(HttpStatefulIncrementTool)
@@ -3790,6 +3941,221 @@ mod lib_unit_tests {
             observed,
             vec![("tools/call".to_string(), Some("beta".to_string()))]
         );
+    }
+
+    #[test]
+    fn http_exclusive_middleware_auth_mutation_reaches_handler_dispatch() {
+        let server = Server::new("http-exclusive-auth-override-test-server", "1.0.0")
+            .middleware(OverridingAuthMiddleware {
+                subject: "exclusive-override",
+            })
+            .tool(HttpCurrentAuthSubjectExclusiveTool)
+            .build();
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-exclusive-auth-override-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let request = http_json_request(
+            "tools/call",
+            serde_json::json!({
+                "name": "http_current_auth_subject_exclusive_tool",
+                "arguments": {}
+            }),
+            1,
+        );
+        let traffic_renderer: Option<RequestResponseRenderer> = None;
+        let response = server.handle_http_mcp_request(
+            &Cx::for_testing(),
+            &session,
+            &http_handler,
+            &request,
+            &notification_sender,
+            &request_sender,
+            &traffic_renderer,
+        );
+        assert_eq!(response.status, HttpStatus::OK);
+
+        let json: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        let result = json
+            .result
+            .expect("exclusive auth override request should succeed");
+        let tool_result: CallToolResult =
+            serde_json::from_value(result).expect("parse tool result payload");
+        match tool_result.content.as_slice() {
+            [Content::Text { text }] => assert_eq!(text, "exclusive-override"),
+            other => panic!("expected single text tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_read_only_middleware_auth_mutation_reaches_handler_dispatch() {
+        let server = Server::new("http-read-only-auth-override-test-server", "1.0.0")
+            .middleware(OverridingAuthMiddleware {
+                subject: "read-only-override",
+            })
+            .tool(HttpCurrentAuthSubjectTool)
+            .build();
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-read-only-auth-override-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let request = http_json_request(
+            "tools/call",
+            serde_json::json!({
+                "name": "http_current_auth_subject_tool",
+                "arguments": {}
+            }),
+            1,
+        );
+        let traffic_renderer: Option<RequestResponseRenderer> = None;
+        let response = server.handle_http_mcp_request(
+            &Cx::for_testing(),
+            &session,
+            &http_handler,
+            &request,
+            &notification_sender,
+            &request_sender,
+            &traffic_renderer,
+        );
+        assert_eq!(response.status, HttpStatus::OK);
+
+        let json: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        let result = json
+            .result
+            .expect("read-only auth override request should succeed");
+        let tool_result: CallToolResult =
+            serde_json::from_value(result).expect("parse tool result payload");
+        match tool_result.content.as_slice() {
+            [Content::Text { text }] => assert_eq!(text, "read-only-override"),
+            other => panic!("expected single text tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_exclusive_auth_failures_flow_through_middleware_error_rewriting() {
+        let server = Server::new("http-exclusive-auth-error-test-server", "1.0.0")
+            .auth_provider(AlwaysFailAuthProvider)
+            .middleware(RewritingErrorMiddleware)
+            .build();
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-exclusive-auth-error-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let request = http_json_request(
+            "tools/list",
+            serde_json::json!({
+                "auth": "Bearer nope"
+            }),
+            1,
+        );
+        let traffic_renderer: Option<RequestResponseRenderer> = None;
+        let response = server.handle_http_mcp_request(
+            &Cx::for_testing(),
+            &session,
+            &http_handler,
+            &request,
+            &notification_sender,
+            &request_sender,
+            &traffic_renderer,
+        );
+        assert_eq!(response.status, HttpStatus::OK);
+
+        let json: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        let error = json
+            .error
+            .expect("auth failure should return JSON-RPC error");
+        assert_eq!(error.message, "rewritten: auth failed");
+    }
+
+    #[test]
+    fn http_read_only_auth_failures_flow_through_middleware_error_rewriting() {
+        let server = Server::new("http-read-only-auth-error-test-server", "1.0.0")
+            .auth_provider(AlwaysFailAuthProvider)
+            .middleware(RewritingErrorMiddleware)
+            .tool(HttpCurrentAuthSubjectTool)
+            .build();
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info.clone(),
+            server.capabilities.clone(),
+        )));
+        session.lock().expect("session lock poisoned").initialize(
+            fastmcp_protocol::ClientInfo {
+                name: "http-read-only-auth-error-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fastmcp_protocol::ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let http_handler = Arc::new(HttpRequestHandler::new());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = test_request_sender();
+        let request = http_json_request(
+            "tools/call",
+            serde_json::json!({
+                "name": "http_current_auth_subject_tool",
+                "arguments": {},
+                "auth": "Bearer nope"
+            }),
+            1,
+        );
+        let traffic_renderer: Option<RequestResponseRenderer> = None;
+        let response = server.handle_http_mcp_request(
+            &Cx::for_testing(),
+            &session,
+            &http_handler,
+            &request,
+            &notification_sender,
+            &request_sender,
+            &traffic_renderer,
+        );
+        assert_eq!(response.status, HttpStatus::OK);
+
+        let json: JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("parse HTTP JSON-RPC response");
+        let error = json
+            .error
+            .expect("auth failure should return JSON-RPC error");
+        assert_eq!(error.message, "rewritten: auth failed");
     }
 
     #[test]

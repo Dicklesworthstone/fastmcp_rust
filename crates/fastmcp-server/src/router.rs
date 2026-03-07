@@ -165,6 +165,14 @@ impl Router {
         self.list_page_size = page_size.filter(|n| *n > 0);
     }
 
+    pub(crate) fn tool_is_read_only(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .and_then(|handler| handler.definition().annotations)
+            .and_then(|annotations| annotations.read_only)
+            .unwrap_or(false)
+    }
+
     /// Sets whether to use strict input validation.
     ///
     /// When enabled, tool input validation will reject any properties not
@@ -2166,6 +2174,7 @@ impl ResourceReader for RouterResourceReader {
         &self,
         cx: &Cx,
         uri: &str,
+        auth: Option<AuthContext>,
         depth: u32,
     ) -> Pin<
         Box<
@@ -2208,12 +2217,19 @@ impl ResourceReader for RouterResourceReader {
             // Clone router again for the nested reader (the original is borrowed by resolved)
             let nested_router = router.clone();
             let nested_state = session_state.clone();
-            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
+            let mut child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
                 .with_resource_read_depth(depth)
+                .with_tool_caller(Arc::new(RouterToolCaller::new(
+                    nested_router.clone(),
+                    nested_state.clone(),
+                )))
                 .with_resource_reader(Arc::new(RouterResourceReader::new(
                     nested_router,
                     nested_state,
                 )));
+            if let Some(auth) = auth {
+                child_ctx = child_ctx.with_auth(auth);
+            }
 
             // Read the resource
             let outcome = block_on(resolved.handler.read_async_with_uri(
@@ -2275,6 +2291,7 @@ impl ToolCaller for RouterToolCaller {
         cx: &Cx,
         name: &str,
         args: serde_json::Value,
+        auth: Option<AuthContext>,
         depth: u32,
     ) -> Pin<
         Box<dyn std::future::Future<Output = fastmcp_core::McpResult<ToolCallResult>> + Send + '_>,
@@ -2329,7 +2346,7 @@ impl ToolCaller for RouterToolCaller {
             // Clone router again for nested calls
             let nested_router = router.clone();
             let nested_state = session_state.clone();
-            let child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
+            let mut child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
                 .with_tool_call_depth(depth)
                 .with_tool_caller(Arc::new(RouterToolCaller::new(
                     nested_router.clone(),
@@ -2339,6 +2356,9 @@ impl ToolCaller for RouterToolCaller {
                     nested_router,
                     nested_state,
                 )));
+            if let Some(auth) = auth {
+                child_ctx = child_ctx.with_auth(auth);
+            }
 
             // Call the tool
             let outcome = block_on(handler.call_async(&child_ctx, args));

@@ -8,6 +8,8 @@
 //! - `on_request` runs **in registration order** (first registered, first called).
 //! - `on_response` runs **in reverse order** for middleware whose `on_request` ran.
 //! - `on_error` runs **in reverse order** for middleware whose `on_request` ran.
+//! - Server-generated failures before `on_request` entry (for example auth errors)
+//!   may still be passed through `on_error` for the registered middleware stack.
 //!
 //! If a middleware returns `Respond` from `on_request`, the response is still
 //! passed through `on_response` for the already-entered middleware stack.

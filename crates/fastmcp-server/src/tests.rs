@@ -4442,7 +4442,7 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://app", 0));
+        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://app", None, 0));
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -4456,7 +4456,7 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://missing", 0));
+        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://missing", None, 0));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4474,6 +4474,7 @@ mod ctx_read_resource_tests {
         let result = fastmcp_core::block_on(reader.read_resource(
             &cx,
             "any://uri",
+            None,
             MAX_RESOURCE_READ_DEPTH + 1,
         ));
 
@@ -4682,6 +4683,92 @@ mod ctx_read_resource_tests {
             text
         );
     }
+
+    struct AuthEchoResource;
+
+    impl ResourceHandler for AuthEchoResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "auth://subject".to_string(),
+                name: "auth_subject".to_string(),
+                description: Some("Returns the current auth subject".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "auth://subject".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(
+                    ctx.auth()
+                        .and_then(|auth| auth.subject)
+                        .unwrap_or_else(|| "anonymous".to_string()),
+                ),
+                blob: None,
+            }])
+        }
+    }
+
+    struct NestedAuthResource;
+
+    impl ResourceHandler for NestedAuthResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "nested://auth".to_string(),
+                name: "nested_auth".to_string(),
+                description: Some(
+                    "Reads another resource and expects auth to propagate".to_string(),
+                ),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            let inner = fastmcp_core::block_on(ctx.read_resource("auth://subject"))?;
+            Ok(vec![ResourceContent {
+                uri: "nested://auth".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(inner.first_text().unwrap_or("missing").to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn test_request_auth_propagates_through_nested_reads() {
+        let mut router = Router::new();
+        router.add_resource(AuthEchoResource);
+        router.add_resource(NestedAuthResource);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state)
+            .with_resource_reader(reader)
+            .with_auth(AuthContext::with_subject("reader-auth"));
+
+        let result = fastmcp_core::block_on(ctx.read_resource("nested://auth"))
+            .expect("nested resource read should succeed");
+        assert_eq!(result.first_text(), Some("reader-auth"));
+    }
 }
 
 // ============================================================================
@@ -4744,6 +4831,7 @@ mod ctx_call_tool_tests {
             &cx,
             "add",
             serde_json::json!({"a": 5, "b": 3}),
+            None,
             0,
         ));
 
@@ -4760,8 +4848,13 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result =
-            fastmcp_core::block_on(caller.call_tool(&cx, "nonexistent", serde_json::json!({}), 0));
+        let result = fastmcp_core::block_on(caller.call_tool(
+            &cx,
+            "nonexistent",
+            serde_json::json!({}),
+            None,
+            0,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4780,6 +4873,7 @@ mod ctx_call_tool_tests {
             &cx,
             "any_tool",
             serde_json::json!({}),
+            None,
             MAX_TOOL_CALL_DEPTH + 1,
         ));
 
@@ -4918,6 +5012,7 @@ mod ctx_call_tool_tests {
             &cx,
             "add",
             serde_json::json!({}), // Missing a and b
+            None,
             0,
         ));
 
@@ -4960,6 +5055,93 @@ mod ctx_call_tool_tests {
             "Expected session state to propagate through tool calls, got: {}",
             text
         );
+    }
+
+    struct CurrentAuthTool;
+
+    impl ToolHandler for CurrentAuthTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "current_auth".to_string(),
+                description: Some("Returns the current auth subject".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: ctx
+                    .auth()
+                    .and_then(|auth| auth.subject)
+                    .unwrap_or_else(|| "anonymous".to_string()),
+            }])
+        }
+    }
+
+    struct NestedAuthTool;
+
+    impl ToolHandler for NestedAuthTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested_auth".to_string(),
+                description: Some("Calls another tool and expects auth to propagate".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let inner =
+                fastmcp_core::block_on(ctx.call_tool("current_auth", serde_json::json!({})))?;
+            Ok(vec![Content::Text {
+                text: inner.first_text().unwrap_or("missing").to_string(),
+            }])
+        }
+    }
+
+    #[test]
+    fn test_request_auth_propagates_through_nested_tool_calls() {
+        use crate::RouterResourceReader;
+
+        let mut router = Router::new();
+        router.add_tool(CurrentAuthTool);
+        router.add_tool(NestedAuthTool);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let caller: Arc<dyn ToolCaller> = Arc::new(RouterToolCaller::new(
+            router_arc.clone(),
+            session_state.clone(),
+        ));
+        let reader: Arc<dyn fastmcp_core::ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state)
+            .with_tool_caller(caller)
+            .with_resource_reader(reader)
+            .with_auth(AuthContext::with_subject("tool-auth"));
+
+        let result = fastmcp_core::block_on(ctx.call_tool("nested_auth", serde_json::json!({})))
+            .expect("nested tool call should succeed");
+        assert_eq!(result.first_text(), Some("tool-auth"));
     }
 }
 

@@ -565,6 +565,7 @@ pub trait ResourceReader: Send + Sync {
         &self,
         cx: &Cx,
         uri: &str,
+        auth: Option<AuthContext>,
         depth: u32,
     ) -> Pin<Box<dyn Future<Output = crate::McpResult<ResourceReadResult>> + Send + '_>>;
 }
@@ -708,6 +709,7 @@ pub trait ToolCaller: Send + Sync {
         cx: &Cx,
         name: &str,
         args: serde_json::Value,
+        auth: Option<AuthContext>,
         depth: u32,
     ) -> Pin<Box<dyn Future<Output = crate::McpResult<ToolCallResult>> + Send + '_>>;
 }
@@ -1936,7 +1938,7 @@ impl McpContext {
 
         // Read the resource with incremented depth
         reader
-            .read_resource(&self.cx, uri, self.resource_read_depth + 1)
+            .read_resource(&self.cx, uri, self.auth(), self.resource_read_depth + 1)
             .await
     }
 
@@ -2077,7 +2079,7 @@ impl McpContext {
 
         // Call the tool with incremented depth
         caller
-            .call_tool(&self.cx, name, args, self.tool_call_depth + 1)
+            .call_tool(&self.cx, name, args, self.auth(), self.tool_call_depth + 1)
             .await
     }
 
