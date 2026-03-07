@@ -589,6 +589,66 @@ impl Server {
         }
     }
 
+    /// Processes a single JSON-RPC request through the full server dispatch
+    /// pipeline (initialization checks, middleware, routing, tool/resource/prompt
+    /// execution, error masking, and statistics recording).
+    ///
+    /// This is the public equivalent of the internal `handle_request` method that
+    /// the built-in transports (`run_stdio`, `run_http`, etc.) use. It allows
+    /// external code to drive the server from a custom transport or embedding
+    /// without going through a `Transport` abstraction.
+    ///
+    /// # Parameters
+    ///
+    /// - `cx` — The cancellation / budget context for this request.
+    /// - `session` — Mutable reference to the session for this connection.
+    ///   The caller is responsible for session lifecycle (creation, sharing,
+    ///   locking if shared across threads).
+    /// - `request` — The incoming JSON-RPC request (or notification).
+    /// - `notification_sender` — Callback used to push server-initiated
+    ///   notifications (e.g. progress) back to the client.
+    /// - `request_sender` — Sender for server-to-client requests
+    ///   (sampling, elicitation, roots).
+    ///
+    /// # Returns
+    ///
+    /// `Some(JsonRpcResponse)` for normal requests, or `None` for
+    /// notifications (JSON-RPC messages without an `id`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use fastmcp_rust::{
+    ///     Server, Session, JsonRpcRequest, NotificationSender,
+    ///     bidirectional::RequestSender,
+    /// };
+    /// use fastmcp_core::Cx;
+    ///
+    /// let server = Arc::new(
+    ///     Server::new("my-server", "1.0.0").build(),
+    /// );
+    /// let mut session = Session::new();
+    /// let cx = Cx::for_request();
+    /// let notify: NotificationSender = Arc::new(|_| {});
+    /// let req_sender = RequestSender::noop();
+    ///
+    /// let request: JsonRpcRequest = /* ... */;
+    /// let response = server.dispatch_request(
+    ///     &cx, &mut session, request, &notify, &req_sender,
+    /// );
+    /// ```
+    pub fn dispatch_request(
+        &self,
+        cx: &Cx,
+        session: &mut Session,
+        request: JsonRpcRequest,
+        notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<JsonRpcResponse> {
+        self.handle_request(cx, session, request, notification_sender, request_sender)
+    }
+
     /// Runs the server on stdio transport.
     ///
     /// This is the primary way to run MCP servers as subprocesses.
@@ -1086,7 +1146,7 @@ impl Server {
 
         let start_time = Instant::now();
 
-        let execution_mode = HttpRequestExecutionMode::for_request(self.router.as_ref(), &json_rpc);
+        let execution_mode = HttpRequestExecutionMode::for_request(&self.router, &json_rpc);
 
         // Dispatch through the server's handler. Concurrent HTTP methods take
         // a lock-free view of session metadata while sharing live session

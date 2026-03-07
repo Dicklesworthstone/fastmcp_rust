@@ -108,11 +108,15 @@ pub use fastmcp_transport::{event_store, http, memory};
 #[cfg(feature = "jwt")]
 pub use fastmcp_server::JwtTokenVerifier;
 pub use fastmcp_server::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, PromptHandler, ProxyBackend,
-    ProxyCatalog, ProxyClient, ResourceHandler, Router, Server, ServerBuilder, Session,
-    SharedTaskManager, StaticTokenVerifier, TaskManager, TokenAuthProvider, TokenVerifier,
-    ToolHandler,
+    AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, NotificationSender,
+    PendingRequests, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient, RequestSender,
+    ResourceHandler, Router, Server, ServerBuilder, Session, SharedTaskManager,
+    StaticTokenVerifier, TaskManager, TokenAuthProvider, TokenVerifier, ToolHandler,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
 };
+
+// Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
+pub use fastmcp_server::bidirectional;
 
 // Re-export server middleware modules
 pub use fastmcp_server::{caching, docket, oauth, oidc, rate_limiting, transform};
