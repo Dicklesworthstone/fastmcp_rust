@@ -722,7 +722,13 @@ impl Server {
         match execution_mode {
             HttpRequestExecutionMode::ConcurrentReadOnly => {
                 let session_view = {
-                    let session_guard = session.lock().unwrap_or_else(|p| p.into_inner());
+                    let session_guard = match session.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            error!(target: targets::SERVER, "Session lock poisoned, recovering");
+                            poisoned.into_inner()
+                        }
+                    };
                     SessionView::from_session(&session_guard)
                 };
                 self.handle_request_with_view(
@@ -734,7 +740,13 @@ impl Server {
                 )
             }
             HttpRequestExecutionMode::ExclusiveSession => {
-                let mut session_guard = session.lock().unwrap_or_else(|p| p.into_inner());
+                let mut session_guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        error!(target: targets::SERVER, "Session lock poisoned, recovering");
+                        poisoned.into_inner()
+                    }
+                };
                 self.handle_request(
                     cx,
                     &mut session_guard,
