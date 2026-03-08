@@ -658,12 +658,11 @@ impl Server {
     /// `Arc<Mutex<Session>>` (e.g. in HTTP or WebSocket transports where
     /// multiple requests may arrive simultaneously).
     ///
-    /// Internally, each request is classified via
-    /// [`HttpRequestExecutionMode::for_request`]:
+    /// Internally, each request is classified into one of two execution modes:
     ///
     /// - **`ConcurrentReadOnly`** (`resources/read`, `prompts/get`, and
-    ///   `tools/call` on read-only tools): a lightweight [`SessionView`]
-    ///   snapshot is taken and the mutex is released immediately, so other
+    ///   `tools/call` on read-only tools): a lightweight session snapshot
+    ///   is taken and the mutex is released immediately, so other
     ///   requests can proceed in parallel.
     /// - **`ExclusiveSession`** (everything else): the mutex is held for the
     ///   full duration of the handler, guaranteeing exclusive access to
@@ -723,9 +722,7 @@ impl Server {
         match execution_mode {
             HttpRequestExecutionMode::ConcurrentReadOnly => {
                 let session_view = {
-                    let session_guard = session
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let session_guard = session.lock().unwrap_or_else(|p| p.into_inner());
                     SessionView::from_session(&session_guard)
                 };
                 self.handle_request_with_view(
@@ -737,9 +734,7 @@ impl Server {
                 )
             }
             HttpRequestExecutionMode::ExclusiveSession => {
-                let mut session_guard = session
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let mut session_guard = session.lock().unwrap_or_else(|p| p.into_inner());
                 self.handle_request(
                     cx,
                     &mut session_guard,
