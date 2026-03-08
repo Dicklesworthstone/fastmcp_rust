@@ -649,6 +649,108 @@ impl Server {
         self.handle_request(cx, session, request, notification_sender, request_sender)
     }
 
+    /// Processes a single JSON-RPC request with automatic concurrency
+    /// classification, allowing read-only requests to execute without holding
+    /// the session mutex for the duration of the handler.
+    ///
+    /// This is the concurrent counterpart of [`dispatch_request`](Self::dispatch_request).
+    /// Use it when the session is shared across threads behind an
+    /// `Arc<Mutex<Session>>` (e.g. in HTTP or WebSocket transports where
+    /// multiple requests may arrive simultaneously).
+    ///
+    /// Internally, each request is classified via
+    /// [`HttpRequestExecutionMode::for_request`]:
+    ///
+    /// - **`ConcurrentReadOnly`** (`resources/read`, `prompts/get`, and
+    ///   `tools/call` on read-only tools): a lightweight [`SessionView`]
+    ///   snapshot is taken and the mutex is released immediately, so other
+    ///   requests can proceed in parallel.
+    /// - **`ExclusiveSession`** (everything else): the mutex is held for the
+    ///   full duration of the handler, guaranteeing exclusive access to
+    ///   session state.
+    ///
+    /// Mutex poisoning is recovered from automatically (the poisoned inner
+    /// value is used), matching the behaviour of the internal HTTP handler.
+    ///
+    /// # Parameters
+    ///
+    /// - `cx` — The cancellation / budget context for this request.
+    /// - `session` — Shared, mutex-protected session for this connection.
+    /// - `request` — The incoming JSON-RPC request (or notification).
+    /// - `notification_sender` — Callback used to push server-initiated
+    ///   notifications (e.g. progress) back to the client.
+    /// - `request_sender` — Sender for server-to-client requests
+    ///   (sampling, elicitation, roots).
+    ///
+    /// # Returns
+    ///
+    /// `Some(JsonRpcResponse)` for normal requests, or `None` for
+    /// notifications (JSON-RPC messages without an `id`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::{Arc, Mutex};
+    /// use fastmcp_rust::{
+    ///     Server, Session, JsonRpcRequest, NotificationSender,
+    ///     bidirectional::RequestSender,
+    /// };
+    /// use fastmcp_core::Cx;
+    ///
+    /// let server = Arc::new(
+    ///     Server::new("my-server", "1.0.0").build(),
+    /// );
+    /// let session = Arc::new(Mutex::new(Session::new()));
+    /// let cx = Cx::for_request();
+    /// let notify: NotificationSender = Arc::new(|_| {});
+    /// let req_sender = RequestSender::noop();
+    ///
+    /// let request: JsonRpcRequest = /* ... */;
+    /// let response = server.dispatch_request_concurrent(
+    ///     &cx, &session, request, &notify, &req_sender,
+    /// );
+    /// ```
+    pub fn dispatch_request_concurrent(
+        &self,
+        cx: &Cx,
+        session: &Arc<Mutex<Session>>,
+        request: JsonRpcRequest,
+        notification_sender: &NotificationSender,
+        request_sender: &bidirectional::RequestSender,
+    ) -> Option<JsonRpcResponse> {
+        let execution_mode = HttpRequestExecutionMode::for_request(&self.router, &request);
+
+        match execution_mode {
+            HttpRequestExecutionMode::ConcurrentReadOnly => {
+                let session_view = {
+                    let session_guard = session
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    SessionView::from_session(&session_guard)
+                };
+                self.handle_request_with_view(
+                    cx,
+                    &session_view,
+                    request,
+                    notification_sender,
+                    request_sender,
+                )
+            }
+            HttpRequestExecutionMode::ExclusiveSession => {
+                let mut session_guard = session
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                self.handle_request(
+                    cx,
+                    &mut session_guard,
+                    request,
+                    notification_sender,
+                    request_sender,
+                )
+            }
+        }
+    }
+
     /// Runs the server on stdio transport.
     ///
     /// This is the primary way to run MCP servers as subprocesses.
