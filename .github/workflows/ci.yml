@@ -24,16 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -69,16 +69,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -119,7 +119,7 @@ jobs:
 
       - name: Upload test trace artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-traces-${{ matrix.os }}
           path: |
@@ -132,16 +132,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -168,16 +168,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -216,7 +216,7 @@ jobs:
             --no-run --no-clean
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-reports
           path: |
@@ -228,16 +228,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -273,16 +273,16 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -321,7 +321,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fastmcp-${{ matrix.target }}
           path: |
@@ -334,16 +334,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
@@ -372,16 +372,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout asupersync
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/asupersync
           path: deps/asupersync
 
       - name: Checkout rich_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Dicklesworthstone/rich_rust
           path: deps/rich_rust
