@@ -47,10 +47,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             .build()
             .expect("failed to build asupersync runtime");
 
-        RuntimeWithIo {
-            runtime,
-            io_driver,
-        }
+        RuntimeWithIo { runtime, io_driver }
     });
 
     // Install a Cx on the current thread so that futures polled inside
@@ -60,9 +57,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         RegionId::new_for_test(0, 0),
         TaskId::new_for_test(0, 0),
         Budget::INFINITE,
-        None,            // observability
+        None, // observability
         Some(rt.io_driver.clone()),
-        None,            // entropy
+        None, // entropy
     );
     let _cx_guard = Cx::set_current(Some(cx));
 
