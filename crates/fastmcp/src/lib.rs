@@ -95,7 +95,7 @@ pub use fastmcp_protocol::{
     ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel, PROTOCOL_VERSION, Prompt,
     PromptArgument, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
     ResourceContent, ResourceTemplate, ResourcesCapability, Role, ServerCapabilities, ServerInfo,
-    SubscribeResourceParams, Tool, ToolsCapability, UnsubscribeResourceParams,
+    SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability, UnsubscribeResourceParams,
 };
 
 // Re-export transport types
