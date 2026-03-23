@@ -13,7 +13,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dicklesworthstone/fastmcp_rust/actions/workflows/ci.yml"><img src="https://github.com/Dicklesworthstone/fastmcp_rust/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B_(nightly)-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
