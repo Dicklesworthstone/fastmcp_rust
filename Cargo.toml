@@ -60,7 +60,7 @@ dirs = "6"
 getrandom = "0.4"
 
 # Cryptography (OAuth PKCE, OIDC signing)
-sha2 = "0.10"
+sha2 = "0.11"
 hmac = "0.12"
 
 # Regex (JSON Schema `pattern` validation)
