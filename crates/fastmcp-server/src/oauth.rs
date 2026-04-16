@@ -1195,7 +1195,7 @@ impl OAuthServer {
     // MCP Integration
     // -------------------------------------------------------------------------
 
-    /// Creates a token verifier for use with MCP [`TokenAuthProvider`].
+    /// Creates a token verifier for use with MCP [`crate::auth::TokenAuthProvider`].
     #[must_use]
     pub fn token_verifier(self: &Arc<Self>) -> OAuthTokenVerifier {
         OAuthTokenVerifier {
@@ -1265,7 +1265,7 @@ pub struct OAuthServerStats {
 /// OAuth token verifier for MCP integration.
 ///
 /// This implements [`TokenVerifier`] to allow the OAuth server to be used
-/// with the MCP server's [`TokenAuthProvider`].
+/// with the MCP server's [`crate::auth::TokenAuthProvider`].
 pub struct OAuthTokenVerifier {
     server: Arc<OAuthServer>,
 }

@@ -26,33 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -71,45 +49,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - name: Setup sibling path dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          if (!(Test-Path ..\\asupersync)) {
-            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
-          }
-          if (!(Test-Path ..\\rich_rust)) {
-            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
-          }
-
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --verbose
@@ -134,31 +78,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check all targets
         run: cargo check --all-targets --all-features
@@ -170,33 +92,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
@@ -230,23 +130,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Install cargo-audit
@@ -275,36 +158,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - name: Setup sibling path dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          if (!(Test-Path ..\\asupersync)) {
-            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
-          }
-          if (!(Test-Path ..\\rich_rust)) {
-            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
-          }
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
@@ -312,10 +165,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -336,31 +185,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features
@@ -374,32 +201,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v6
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
       # Using nightly since edition 2024 requires it
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Check MSRV
         run: cargo check --all-targets

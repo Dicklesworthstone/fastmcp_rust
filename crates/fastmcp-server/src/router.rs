@@ -223,7 +223,7 @@ impl Router {
 
     /// Adds a tool handler with specified duplicate behavior.
     ///
-    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// Returns `Err` if behavior is [`crate::DuplicateBehavior::Error`] and the
     /// tool name already exists.
     pub fn add_tool_with_behavior<H: ToolHandler + 'static>(
         &mut self,
@@ -297,7 +297,7 @@ impl Router {
 
     /// Adds a resource handler with specified duplicate behavior.
     ///
-    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// Returns `Err` if behavior is [`crate::DuplicateBehavior::Error`] and the
     /// resource URI already exists.
     pub fn add_resource_with_behavior<H: ResourceHandler + 'static>(
         &mut self,
@@ -410,7 +410,7 @@ impl Router {
 
     /// Adds a prompt handler with specified duplicate behavior.
     ///
-    /// Returns `Err` if behavior is [`DuplicateBehavior::Error`] and the
+    /// Returns `Err` if behavior is [`crate::DuplicateBehavior::Error`] and the
     /// prompt name already exists.
     pub fn add_prompt_with_behavior<H: PromptHandler + 'static>(
         &mut self,
