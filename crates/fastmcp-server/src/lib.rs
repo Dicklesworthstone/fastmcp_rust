@@ -4396,13 +4396,13 @@ mod lib_unit_tests {
         // is the documented path there.  As long as the server *does*
         // shut down within the fallback window (verified by
         // `server_thread.join()` returning above), the cancellation
-        // contract is honored on Windows too.
+        // contract is honored on Windows too.  No matching `#[cfg(windows)]`
+        // arm is needed: `returned_before_wakeup` is already consumed by
+        // the `if !returned_before_wakeup` branch above on every platform.
         #[cfg(not(windows))]
         assert!(
             returned_before_wakeup,
             "run_http_returning_with_cx should stop promptly after cancellation without requiring an extra connection to wake accept()"
         );
-        #[cfg(windows)]
-        let _ = returned_before_wakeup;
     }
 }
