@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "chrono",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "dirs",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "log",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "fastmcp-core",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "base64",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "fastmcp-core",
