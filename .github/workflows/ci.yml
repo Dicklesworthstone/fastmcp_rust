@@ -55,8 +55,25 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      - name: Run tests
+      # The `redis` feature's tests spawn a real `redis-server` subprocess
+      # (see crates/fastmcp-server/src/docket.rs).  Install it where the
+      # package manager makes it trivial; on Windows we skip those tests
+      # below since redis-for-Windows isn't shipped on the GH runners.
+      - name: Install redis-server (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - name: Install redis-server (macOS)
+        if: runner.os == 'macOS'
+        run: brew install redis
+
+      - name: Run tests (Linux/macOS)
+        if: runner.os != 'Windows'
         run: cargo test --workspace --all-targets --all-features --verbose
+
+      - name: Run tests (Windows, skip redis)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --all-targets --all-features --verbose -- --skip test_redis_
 
       - name: Run doc tests
         run: cargo test --workspace --doc --all-features
@@ -102,6 +119,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+
+      # Coverage runs the same redis-feature tests as the Test job above,
+      # so it needs the same redis-server binary available on PATH.
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
 
       - name: Run coverage
         run: |
