@@ -132,10 +132,13 @@ jobs:
             --fail-under-lines 80
 
       - name: Generate coverage summary JSON
+        # `cargo llvm-cov report` reuses the profraw data already on disk
+        # from the previous step, so we don't re-run the test suite.  The
+        # old `--no-run --no-clean` combo is no longer accepted (cargo-llvm-cov
+        # rejects both flags together as of recent releases).
         run: |
-          cargo llvm-cov --all-features --workspace \
-            --json --summary-only --output-path coverage-summary.json \
-            --no-run --no-clean
+          cargo llvm-cov report --json --summary-only \
+            --output-path coverage-summary.json
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7

@@ -36,12 +36,15 @@ fn get_test_server_binary() -> PathBuf {
                 String::from_utf8_lossy(&output.stderr)
             );
 
-            // Find the binary in target directory
+            // Find the binary in target directory.
+            // Note: examples carry the platform EXE_SUFFIX (`.exe` on Windows,
+            // empty elsewhere); without it the assert below fires on Windows.
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let target_dir = std::env::var("CARGO_TARGET_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| manifest_dir.join("../../target"));
-            let binary_path = target_dir.join("debug/examples/test_server");
+            let binary_name = format!("test_server{}", std::env::consts::EXE_SUFFIX);
+            let binary_path = target_dir.join("debug/examples").join(&binary_name);
 
             assert!(
                 binary_path.exists(),
