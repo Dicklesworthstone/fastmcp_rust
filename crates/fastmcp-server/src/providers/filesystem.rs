@@ -1078,7 +1078,16 @@ mod tests {
 
         let provider = FilesystemProvider::new(root.path());
 
-        let absolute = provider.validate_path("/tmp/absolute.txt");
+        // Use a platform-appropriate absolute path: on Windows
+        // `/tmp/absolute.txt` is *not* absolute (no drive letter), so the
+        // hard-coded Unix string fails to exercise the absolute-path
+        // rejection branch and the assertion below misfires.
+        let absolute_input = if cfg!(windows) {
+            r"C:\Windows\System32\absolute.txt"
+        } else {
+            "/tmp/absolute.txt"
+        };
+        let absolute = provider.validate_path(absolute_input);
         assert!(matches!(
             absolute,
             Err(FilesystemProviderError::PathTraversal { .. })
