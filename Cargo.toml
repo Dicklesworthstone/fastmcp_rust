@@ -23,7 +23,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Runtime (our own)
-asupersync = "0.2"
+asupersync = "0.3"
 rich_rust = "0.2"
 
 # Serialization (only these)
