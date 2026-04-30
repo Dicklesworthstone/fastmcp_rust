@@ -580,9 +580,13 @@ pub fn default_config_paths() -> Vec<PathBuf> {
             paths.push(home.join(".mcp/config.json"));
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
-            // XDG config directory
+            // XDG config directory — applies to Linux and every other
+            // non-macOS Unix (FreeBSD, NetBSD, OpenBSD, Illumos, etc.).
+            // Mirrors the same broadening done in
+            // `claude_desktop_config_path` so callers iterating both
+            // surfaces don't see a Linux/BSD asymmetry.
             if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
                 let xdg_path = PathBuf::from(xdg_config);
                 paths.push(xdg_path.join("mcp/config.json"));
