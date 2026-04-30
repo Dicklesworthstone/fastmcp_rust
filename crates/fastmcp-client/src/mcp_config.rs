@@ -611,13 +611,18 @@ pub fn claude_desktop_config_path() -> Option<PathBuf> {
         dirs::data_dir().map(|d| d.join("Claude/claude_desktop_config.json"))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
             Some(PathBuf::from(xdg_config).join("claude/config.json"))
         } else {
             dirs::home_dir().map(|h| h.join(".config/claude/config.json"))
         }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        None
     }
 }
 
