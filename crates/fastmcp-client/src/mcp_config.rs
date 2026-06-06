@@ -593,10 +593,7 @@ pub fn default_config_paths() -> Vec<PathBuf> {
             // empty value, so check `is_empty` explicitly to avoid
             // emitting relative `mcp/config.json` / `claude/config.json`
             // paths against the caller's CWD).
-            if let Some(xdg_config) = env::var("XDG_CONFIG_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-            {
+            if let Some(xdg_config) = env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()) {
                 let xdg_path = PathBuf::from(xdg_config);
                 paths.push(xdg_path.join("mcp/config.json"));
                 paths.push(xdg_path.join("claude/config.json"));
@@ -631,10 +628,7 @@ pub fn claude_desktop_config_path() -> Option<PathBuf> {
         // should be used." `env::var` returns Ok("") for an empty value,
         // so check `is_empty` explicitly to avoid emitting a relative
         // `claude/config.json` path.
-        if let Some(xdg_config) = env::var("XDG_CONFIG_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(xdg_config) = env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()) {
             Some(PathBuf::from(xdg_config).join("claude/config.json"))
         } else {
             dirs::home_dir().map(|h| h.join(".config/claude/config.json"))
