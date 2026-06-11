@@ -12,7 +12,7 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use asupersync::{Budget, CancelKind, Cx};
+use asupersync::{Budget, CancelKind, Cx, time::wall_now};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{info, targets};
@@ -3053,7 +3053,7 @@ mod budget_tests {
     #[test]
     fn test_deadline_budget() {
         // A budget with a deadline far in the future
-        let budget = Budget::with_deadline_secs(3600);
+        let budget = Budget::new().with_timeout(wall_now(), Duration::from_secs(3600));
         assert!(!budget.is_exhausted());
     }
 }
@@ -3840,7 +3840,7 @@ mod lab_runtime_tests {
     #[test]
     fn test_lab_runtime_deadline_progression() {
         with_lab_runtime(|runtime| {
-            let budget = Budget::with_deadline_secs(1);
+            let budget = Budget::with_deadline_at_secs(1);
             let start = runtime.now();
             assert!(!budget.is_past_deadline(start));
 

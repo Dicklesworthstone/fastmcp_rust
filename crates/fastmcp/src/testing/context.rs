@@ -3,7 +3,9 @@
 //! Provides a convenient wrapper around `Cx::for_testing()` with
 //! helper methods for common test scenarios.
 
-use asupersync::{Budget, Cx};
+use std::time::Duration;
+
+use asupersync::{Budget, Cx, time::wall_now};
 use fastmcp_core::{McpContext, SessionState};
 
 /// Test context wrapper providing convenient testing utilities.
@@ -77,7 +79,7 @@ impl TestContext {
     /// ```
     #[must_use]
     pub fn with_budget_secs(mut self, secs: u64) -> Self {
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::new().with_timeout(wall_now(), Duration::from_secs(secs)));
         self
     }
 
@@ -88,9 +90,7 @@ impl TestContext {
     /// * `ms` - Timeout in milliseconds
     #[must_use]
     pub fn with_budget_ms(mut self, ms: u64) -> Self {
-        // Convert ms to secs (rounded up)
-        let secs = (ms + 999) / 1000;
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::new().with_timeout(wall_now(), Duration::from_millis(ms)));
         self
     }
 
