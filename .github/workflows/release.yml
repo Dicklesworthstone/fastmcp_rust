@@ -23,6 +23,7 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}  # binary artifacts only on tag releases
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -98,6 +99,7 @@ jobs:
 
   release:
     name: Create Release
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}  # GH release + binaries only on tag pushes
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -137,9 +139,15 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: release
-    runs-on: ubuntu-latest
-    if: "!contains(needs.release.outputs.version, '-')"  # Skip prereleases
+    # Decoupled from the binary-build matrix: crates are platform-independent and must not wait
+    # on throttled GitHub-hosted x86_64-linux/Windows runners (this is what stranded the
+    # asupersync 0.3.4 -> fastmcp 0.3.2 -> beads_rust#353 chain). Runs on ubuntu-24.04-arm
+    # (consistently serviceable) with no `needs:`, so on tag pushes it runs in parallel with
+    # `build`/`release`, and it can be invoked standalone via workflow_dispatch to publish the
+    # version currently in Cargo.toml. `cargo publish --locked` verify-builds each crate, so
+    # compilation is still gated before any upload.
+    if: ${{ !contains(github.ref, '-') }}  # skip prereleases (tag like v1.2.3-rc1); main has no '-'
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
     env:
