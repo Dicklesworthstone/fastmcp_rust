@@ -2650,8 +2650,8 @@ mod tests {
         let json = serde_json::to_value(&tool).expect("serialize");
         let output_schema = json.get("outputSchema").expect("outputSchema field");
         assert_eq!(output_schema["type"], "object");
-        assert!(output_schema["properties"]["result"]["type"] == "number");
-        assert!(output_schema["properties"]["success"]["type"] == "boolean");
+        assert_eq!(output_schema["properties"]["result"]["type"], "number");
+        assert_eq!(output_schema["properties"]["success"]["type"], "boolean");
     }
 
     #[test]

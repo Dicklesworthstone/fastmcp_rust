@@ -378,7 +378,7 @@ mod tests {
         let _value2 = generate_test_value("test", 16);
 
         assert!(value1.starts_with("test-"));
-        assert!(value1.len() == "test-".len() + 16);
+        assert_eq!(value1.len(), "test-".len() + 16);
         // Tokens should be different (though not guaranteed with this simple generator)
         // Just verify they're generated correctly
         assert!(

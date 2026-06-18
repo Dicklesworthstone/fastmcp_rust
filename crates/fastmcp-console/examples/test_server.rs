@@ -185,7 +185,7 @@ fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
         "ping" => Ok(serde_json::json!({})),
         _ => Err(JsonRpcError {
             code: -32601,
-            message: format!("Method not found: {}", &request.method),
+            message: format!("Method not found: {}", request.method),
         }),
     };
 

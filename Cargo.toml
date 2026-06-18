@@ -23,7 +23,27 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Runtime (our own)
-asupersync = "0.3.4"
+#
+# `test-internals` STOPGAP (tracked follow-up): asupersync 0.3.4 moved the
+# standalone capability-context constructors (`Cx::for_request`,
+# `Cx::for_request_with_budget`, `Cx::for_testing*`) and the `Cx::set_current`
+# /`RegionId::new_for_test`/`TaskId::new_for_test` helpers behind
+# `#[cfg(any(test, feature = "test-internals"))]` to stop production code from
+# minting fully-capable contexts out of band (asupersync br-asupersync-2x6hbi /
+# -ovztin). FastMCP's current synchronous, thread-per-connection design mints
+# such root/request contexts directly in its `run_*` entry points, request
+# dispatch, the synchronous `Transport::close` path, the client config helpers,
+# and the shipped `fastmcp_rust::testing` helpers — none of which run inside a
+# `Runtime::block_on`, so `Cx::current()` is unavailable there. asupersync
+# exposes NO public production replacement that synchronously yields a
+# standalone, capability-bearing `Cx` (the blessed path,
+# `Runtime::request_cx_with_budget`, is `pub(crate)`). The genuine fix is an
+# architectural migration to runtime-managed contexts (wrap entry points in a
+# runtime, derive request scopes via `cx.scope_with_budget`, plumb `&Cx` into
+# `Transport::close`); until then we opt into `test-internals` to keep the
+# constructors visible. NOTE: `fastmcp-core::block_on` does NOT rely on this —
+# it was fixed to use `Runtime::block_on`'s own ambient `Cx`.
+asupersync = { version = "0.3.4", features = ["test-internals"] }
 rich_rust = "0.2"
 
 # Serialization (only these)
