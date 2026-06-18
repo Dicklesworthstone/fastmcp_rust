@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -93,15 +93,15 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 trybuild = { version = "1", default-features = false }
 
 # Internal crates
-fastmcp-rust = { version = "0.3.1", path = "crates/fastmcp" }
-fastmcp-core = { version = "0.3.1", path = "crates/fastmcp-core" }
-fastmcp-transport = { version = "0.3.1", path = "crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.3.1", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.3.1", path = "crates/fastmcp-server" }
-fastmcp-client = { version = "0.3.1", path = "crates/fastmcp-client" }
-fastmcp-derive = { version = "0.3.1", path = "crates/fastmcp-macros" }
-fastmcp-console = { version = "0.3.1", path = "crates/fastmcp-console" }
-fastmcp-cli = { version = "0.3.1", path = "crates/fastmcp-cli" }
+fastmcp-rust = { version = "0.3.2", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.3.2", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.3.2", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.3.2", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.3.2", path = "crates/fastmcp-server" }
+fastmcp-client = { version = "0.3.2", path = "crates/fastmcp-client" }
+fastmcp-derive = { version = "0.3.2", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.3.2", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.3.2", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
