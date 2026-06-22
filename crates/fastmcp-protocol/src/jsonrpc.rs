@@ -109,6 +109,12 @@ impl JsonRpcRequest {
         }
     }
 
+    /// Creates the MCP lifecycle initialized notification.
+    #[must_use]
+    pub fn initialized_notification() -> Self {
+        Self::notification(crate::methods::NOTIFICATIONS_INITIALIZED, None)
+    }
+
     /// Returns true if this is a notification (no ID).
     #[must_use]
     pub fn is_notification(&self) -> bool {
@@ -337,6 +343,18 @@ mod tests {
         assert!(notif.is_notification());
         let value = serde_json::to_value(&notif).expect("serialize");
         assert_eq!(value["params"]["uri"], "file://changed.txt");
+    }
+
+    #[test]
+    fn initialized_notification_uses_spec_method_name() {
+        // Spec: https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle
+        let notif = JsonRpcRequest::initialized_notification();
+        let value = serde_json::to_value(&notif).expect("serialize");
+
+        assert!(notif.is_notification());
+        assert_eq!(value["method"], crate::methods::NOTIFICATIONS_INITIALIZED);
+        assert!(value.get("id").is_none());
+        assert!(value.get("params").is_none());
     }
 
     #[test]

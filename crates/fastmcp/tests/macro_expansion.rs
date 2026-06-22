@@ -816,12 +816,7 @@ fn tool_annotations_destructive_only() {
 }
 
 /// Tool with all annotations set.
-#[tool(annotations(
-    read_only,
-    idempotent,
-    destructive,
-    open_world_hint = "accepts extra fields"
-))]
+#[tool(annotations(read_only, idempotent, destructive, open_world_hint = true))]
 fn fully_annotated(_ctx: &McpContext) -> String {
     "full".to_string()
 }
@@ -834,7 +829,30 @@ fn tool_annotations_all_fields() {
     assert_eq!(ann.read_only, Some(true));
     assert_eq!(ann.idempotent, Some(true));
     assert_eq!(ann.destructive, Some(true));
-    assert_eq!(ann.open_world_hint.as_deref(), Some("accepts extra fields"));
+    assert_eq!(ann.open_world_hint, Some(true));
+}
+
+/// Tool with explicit boolean annotation values.
+#[tool(annotations(
+    read_only = false,
+    idempotent = true,
+    destructive = false,
+    open_world_hint = false
+))]
+fn explicitly_annotated(_ctx: &McpContext) -> String {
+    "explicit".to_string()
+}
+
+#[test]
+fn tool_annotations_accept_explicit_boolean_values() {
+    // Spec: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+    let handler = ExplicitlyAnnotated;
+    let def = handler.definition();
+    let ann = def.annotations.expect("annotations should be Some");
+    assert_eq!(ann.read_only, Some(false));
+    assert_eq!(ann.idempotent, Some(true));
+    assert_eq!(ann.destructive, Some(false));
+    assert_eq!(ann.open_world_hint, Some(false));
 }
 
 /// Tool with version only, no annotations.

@@ -302,20 +302,20 @@ impl Icon {
 pub struct ToolAnnotations {
     /// Whether the tool may cause destructive side effects.
     /// True means the tool modifies external state (e.g., deleting files).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
     pub destructive: Option<bool>,
     /// Whether the tool is idempotent (safe to retry without side effects).
     /// True means calling the tool multiple times has the same effect as calling it once.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "idempotentHint", skip_serializing_if = "Option::is_none")]
     pub idempotent: Option<bool>,
     /// Whether the tool is read-only (has no side effects).
     /// True means the tool only reads data without modifying anything.
-    #[serde(rename = "readOnly", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
     /// Hint about the tool's behavior with unknown inputs.
     /// Can be used to indicate how the tool handles inputs not explicitly defined.
     #[serde(rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
-    pub open_world_hint: Option<String>,
+    pub open_world_hint: Option<bool>,
 }
 
 impl ToolAnnotations {
@@ -348,8 +348,8 @@ impl ToolAnnotations {
 
     /// Sets the open_world_hint annotation.
     #[must_use]
-    pub fn open_world_hint(mut self, hint: impl Into<String>) -> Self {
-        self.open_world_hint = Some(hint.into());
+    pub fn open_world_hint(mut self, value: bool) -> Self {
+        self.open_world_hint = Some(value);
         self
     }
 
@@ -1438,8 +1438,8 @@ mod tests {
         assert_eq!(value["icon"]["src"], "https://example.com/icon.png");
         assert_eq!(value["version"], "2.1.0");
         assert_eq!(value["tags"], json!(["math", "compute"]));
-        assert_eq!(value["annotations"]["readOnly"], true);
-        assert_eq!(value["annotations"]["idempotent"], true);
+        assert_eq!(value["annotations"]["readOnlyHint"], true);
+        assert_eq!(value["annotations"]["idempotentHint"], true);
     }
 
     #[test]
@@ -1451,7 +1451,7 @@ mod tests {
             "outputSchema": {"type": "string"},
             "version": "1.0.0",
             "tags": ["greeting"],
-            "annotations": {"readOnly": true}
+            "annotations": {"readOnlyHint": true}
         });
         let tool: Tool = serde_json::from_value(json.clone()).expect("deserialize");
         assert_eq!(tool.name, "greet");
@@ -1911,47 +1911,47 @@ mod tests {
     }
 
     #[test]
-    fn tool_annotations_builder_chain() {
-        let ann = ToolAnnotations::new()
-            .read_only(true)
-            .idempotent(true)
-            .destructive(false)
-            .open_world_hint("none");
+    fn tool_descriptor_serializes_spec_annotation_wire_shape() {
+        // Spec: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+        let tool = Tool {
+            name: "sync_local_index".to_string(),
+            description: Some("Synchronizes a local index".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some("1.0.0".to_string()),
+            tags: vec!["local".to_string()],
+            annotations: Some(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(false)
+                    .idempotent(true)
+                    .open_world_hint(false),
+            ),
+        };
 
-        assert_eq!(ann.read_only, Some(true));
-        assert_eq!(ann.idempotent, Some(true));
-        assert_eq!(ann.destructive, Some(false));
-        assert_eq!(ann.open_world_hint.as_deref(), Some("none"));
-        assert!(!ann.is_empty());
-    }
-
-    #[test]
-    fn tool_annotations_single_field_not_empty() {
-        assert!(!ToolAnnotations::new().destructive(true).is_empty());
-        assert!(!ToolAnnotations::new().idempotent(false).is_empty());
-        assert!(!ToolAnnotations::new().read_only(true).is_empty());
-        assert!(!ToolAnnotations::new().open_world_hint("x").is_empty());
-    }
-
-    #[test]
-    fn tool_annotations_serialization_skips_none() {
-        let ann = ToolAnnotations::new().read_only(true);
-        let value = serde_json::to_value(&ann).expect("serialize");
-        assert_eq!(value["readOnly"], true);
-        assert!(value.get("destructive").is_none());
-        assert!(value.get("idempotent").is_none());
-        assert!(value.get("openWorldHint").is_none());
-    }
-
-    #[test]
-    fn tool_annotations_round_trip() {
-        let ann = ToolAnnotations::new()
-            .destructive(true)
-            .idempotent(false)
-            .open_world_hint("strict");
-        let json_str = serde_json::to_string(&ann).expect("serialize");
-        let deserialized: ToolAnnotations = serde_json::from_str(&json_str).expect("deserialize");
-        assert_eq!(ann, deserialized);
+        assert_eq!(
+            serde_json::to_value(&tool).expect("serialize"),
+            json!({
+                "name": "sync_local_index",
+                "description": "Synchronizes a local index",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false
+                },
+                "version": "1.0.0",
+                "tags": ["local"],
+                "annotations": {
+                    "readOnlyHint": false,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": false
+                }
+            })
+        );
     }
 
     // ========================================================================

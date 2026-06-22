@@ -381,7 +381,7 @@ impl ClientBuilder {
         };
 
         let init_request = JsonRpcRequest::new(
-            "initialize",
+            fastmcp_protocol::methods::INITIALIZE,
             Some(serde_json::to_value(&init_params).map_err(|e| {
                 McpError::internal_error(format!("Failed to serialize params: {e}"))
             })?),
@@ -424,12 +424,7 @@ impl ClientBuilder {
         })?;
 
         // Send initialized notification
-        let initialized_request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: "initialized".to_string(),
-            params: Some(serde_json::json!({})),
-            id: None,
-        };
+        let initialized_request = JsonRpcRequest::initialized_notification();
 
         transport
             .send(cx, &JsonRpcMessage::Request(initialized_request))

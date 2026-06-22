@@ -187,7 +187,7 @@ impl Client {
         );
 
         // Send initialized notification
-        client.send_notification("initialized", serde_json::json!({}))?;
+        client.send_notification_request(JsonRpcRequest::initialized_notification())?;
 
         // Mark as initialized
         client.initialized.store(true, Ordering::SeqCst);
@@ -277,7 +277,7 @@ impl Client {
         );
 
         // Send initialized notification
-        self.send_notification("initialized", serde_json::json!({}))?;
+        self.send_notification_request(JsonRpcRequest::initialized_notification())?;
 
         // Mark as initialized
         self.initialized.store(true, Ordering::SeqCst);
@@ -363,18 +363,18 @@ impl Client {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
-        // Create a notification (request without id)
-        let request = JsonRpcRequest {
+        self.send_notification_request(JsonRpcRequest {
             jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
             method: method.to_string(),
             params: Some(params_value),
             id: None,
-        };
+        })
+    }
 
+    fn send_notification_request(&mut self, request: JsonRpcRequest) -> McpResult<()> {
         self.transport
             .send(&self.cx, &JsonRpcMessage::Request(request))
             .map_err(transport_error_to_mcp)?;
-
         Ok(())
     }
 
@@ -397,7 +397,7 @@ impl Client {
             reason,
             await_cleanup: if await_cleanup { Some(true) } else { None },
         };
-        self.send_notification("notifications/cancelled", params)
+        self.send_notification(fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED, params)
     }
 
     /// Receives a response from the transport, validating the response ID.
@@ -471,7 +471,7 @@ impl Client {
             client_info,
         };
 
-        self.send_request("initialize", params)
+        self.send_request(fastmcp_protocol::methods::INITIALIZE, params)
     }
 
     /// Lists available tools.
@@ -502,7 +502,8 @@ impl Client {
             }
             let mut params = ListToolsParams::default();
             params.cursor = cursor.clone();
-            let result: ListToolsResult = self.send_request("tools/list", params)?;
+            let result: ListToolsResult =
+                self.send_request(fastmcp_protocol::methods::TOOLS_LIST, params)?;
             all.extend(result.tools);
             cursor = result.next_cursor;
             if cursor.is_none() {
@@ -529,7 +530,8 @@ impl Client {
             arguments: Some(arguments),
             meta: None,
         };
-        let result: CallToolResult = self.send_request("tools/call", params)?;
+        let result: CallToolResult =
+            self.send_request(fastmcp_protocol::methods::TOOLS_CALL, params)?;
 
         if result.is_error {
             // Extract error message from content if available
@@ -582,7 +584,7 @@ impl Client {
         };
 
         let result: CallToolResult = self.send_request_with_progress(
-            "tools/call",
+            fastmcp_protocol::methods::TOOLS_CALL,
             params,
             request_id,
             &progress_marker,

@@ -394,7 +394,7 @@ fn create_and_initialize_client(
     let params_value = serde_json::to_value(&params)
         .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
-    let request = JsonRpcRequest::new("initialize", Some(params_value), 1);
+    let request = JsonRpcRequest::new(fastmcp_protocol::methods::INITIALIZE, Some(params_value), 1);
 
     transport
         .send(&cx, &JsonRpcMessage::Request(request))
@@ -425,12 +425,7 @@ fn create_and_initialize_client(
         .map_err(|e| McpError::internal_error(format!("Failed to parse initialize result: {e}")))?;
 
     // Send initialized notification
-    let notification = JsonRpcRequest {
-        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-        method: "initialized".to_string(),
-        params: Some(serde_json::json!({})),
-        id: None,
-    };
+    let notification = JsonRpcRequest::initialized_notification();
 
     transport
         .send(&cx, &JsonRpcMessage::Request(notification))

@@ -115,7 +115,7 @@ use fastmcp_protocol::{
     ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListTasksParams,
     ListToolsParams, LogLevel, LogMessageParams, Prompt, ReadResourceParams, RequestId, Resource,
     ResourceTemplate, ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams,
-    SubscribeResourceParams, Tool, UnsubscribeResourceParams,
+    SubscribeResourceParams, Tool, UnsubscribeResourceParams, methods,
 };
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
@@ -308,7 +308,7 @@ impl HttpRequestExecutionMode {
 
     fn for_request(router: &Router, request: &JsonRpcRequest) -> Self {
         match request.method.as_str() {
-            "tools/call" => request
+            methods::TOOLS_CALL => request
                 .params
                 .as_ref()
                 .and_then(|params| params.get("name"))
@@ -2081,7 +2081,10 @@ impl Server {
         }
 
         // Check initialization state
-        if !session.is_initialized() && request.method != "initialize" && request.method != "ping" {
+        if !session.is_initialized()
+            && request.method != methods::INITIALIZE
+            && request.method != methods::PING
+        {
             return Err(McpError::invalid_request(
                 "Server not initialized. Client must send 'initialize' first.",
             ));
@@ -2160,7 +2163,7 @@ impl Server {
             let bidirectional_senders = self.create_bidirectional_senders(session, request_sender);
 
             match method.as_str() {
-                "initialize" => {
+                methods::INITIALIZE => {
                     let params: InitializeParams = parse_params(params)?;
                     let result = self.router.handle_initialize(
                         cx,
@@ -2170,11 +2173,11 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "initialized" => {
+                methods::LEGACY_INITIALIZED | methods::NOTIFICATIONS_INITIALIZED => {
                     // Notification, no response needed (but we send empty ok)
                     Ok(serde_json::Value::Null)
                 }
-                "notifications/cancelled" => {
+                methods::NOTIFICATIONS_CANCELLED => {
                     let params: CancelledParams = parse_params(params)?;
                     self.handle_cancelled_notification(params);
                     Ok(serde_json::Value::Null)
@@ -2184,14 +2187,14 @@ impl Server {
                     self.handle_set_log_level(session, params);
                     Ok(serde_json::Value::Null)
                 }
-                "tools/list" => {
+                methods::TOOLS_LIST => {
                     let params: ListToolsParams = parse_params_or_default(params)?;
                     let result =
                         self.router
                             .handle_tools_list(cx, params, Some(session.state()))?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "tools/call" => {
+                methods::TOOLS_CALL => {
                     let params: CallToolParams = parse_params(params)?;
                     let result = self.router.handle_tools_call(
                         cx,
@@ -2269,7 +2272,7 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "ping" => {
+                methods::PING => {
                     // Simple ping-pong for health checks
                     Ok(serde_json::json!({}))
                 }
@@ -2350,7 +2353,10 @@ impl Server {
             ));
         }
 
-        if !session.initialized && request.method != "initialize" && request.method != "ping" {
+        if !session.initialized
+            && request.method != methods::INITIALIZE
+            && request.method != methods::PING
+        {
             return Err(McpError::invalid_request(
                 "Server not initialized. Client must send 'initialize' first.",
             ));
@@ -2430,7 +2436,7 @@ impl Server {
                 self.create_bidirectional_senders_from_view(session, request_sender);
 
             match method.as_str() {
-                "tools/call" => {
+                methods::TOOLS_CALL => {
                     let params: CallToolParams = parse_params(params)?;
                     let result = self.router.handle_tools_call(
                         cx,
@@ -2598,7 +2604,11 @@ impl Server {
     fn should_authenticate(&self, method: &str) -> bool {
         !matches!(
             method,
-            "initialize" | "initialized" | "notifications/cancelled" | "ping"
+            methods::INITIALIZE
+                | methods::LEGACY_INITIALIZED
+                | methods::NOTIFICATIONS_INITIALIZED
+                | methods::NOTIFICATIONS_CANCELLED
+                | methods::PING
         )
     }
 

@@ -5281,7 +5281,7 @@ mod handler_direct_tests {
                     destructive: Some(false),
                     idempotent: Some(true),
                     read_only: Some(true),
-                    open_world_hint: Some("none".to_string()),
+                    open_world_hint: Some(true),
                 },
                 output_schema: serde_json::json!({
                     "type": "object",
@@ -6918,5 +6918,14 @@ mod helper_function_tests {
         assert!(d < i);
         assert!(i < w);
         assert!(w < e);
+    }
+
+    #[test]
+    fn initialized_notifications_do_not_require_authentication() {
+        let server = Server::new("test", "1.0.0").build();
+
+        assert!(!server.should_authenticate("initialized"));
+        assert!(!server.should_authenticate("notifications/initialized"));
+        assert!(server.should_authenticate("tools/list"));
     }
 }

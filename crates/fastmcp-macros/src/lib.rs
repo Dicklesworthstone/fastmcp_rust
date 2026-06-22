@@ -902,11 +902,11 @@ struct ToolAttrs {
     output_schema: Option<syn::Expr>,
     /// Tool version string (e.g., "1.0.0").
     version: Option<String>,
-    /// Annotation flags: `read_only`, `idempotent`, `destructive`.
+    /// Annotation flags: `read_only`, `idempotent`, `destructive`, `open_world_hint`.
     annotations_read_only: Option<bool>,
     annotations_idempotent: Option<bool>,
     annotations_destructive: Option<bool>,
-    annotations_open_world_hint: Option<String>,
+    annotations_open_world_hint: Option<bool>,
 }
 
 impl Parse for ToolAttrs {
@@ -989,13 +989,17 @@ impl Parse for ToolAttrs {
                     while !content.is_empty() {
                         let ann_ident: Ident = content.parse()?;
                         match ann_ident.to_string().as_str() {
-                            "read_only" => annotations_read_only = Some(true),
-                            "idempotent" => annotations_idempotent = Some(true),
-                            "destructive" => annotations_destructive = Some(true),
+                            "read_only" => {
+                                annotations_read_only = Some(parse_annotation_bool(&content)?)
+                            }
+                            "idempotent" => {
+                                annotations_idempotent = Some(parse_annotation_bool(&content)?)
+                            }
+                            "destructive" => {
+                                annotations_destructive = Some(parse_annotation_bool(&content)?)
+                            }
                             "open_world_hint" => {
-                                content.parse::<Token![=]>()?;
-                                let lit: LitStr = content.parse()?;
-                                annotations_open_world_hint = Some(lit.value());
+                                annotations_open_world_hint = Some(parse_annotation_bool(&content)?)
                             }
                             other => {
                                 return Err(syn::Error::new(
@@ -1034,6 +1038,16 @@ impl Parse for ToolAttrs {
             annotations_destructive,
             annotations_open_world_hint,
         })
+    }
+}
+
+fn parse_annotation_bool(input: ParseStream<'_>) -> syn::Result<bool> {
+    if input.peek(Token![=]) {
+        input.parse::<Token![=]>()?;
+        let lit: syn::LitBool = input.parse()?;
+        Ok(lit.value)
+    } else {
+        Ok(true)
     }
 }
 
@@ -1155,8 +1169,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
             .map_or_else(|| quote! { None }, |v| quote! { Some(#v) });
         let owh = attrs
             .annotations_open_world_hint
-            .as_ref()
-            .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+            .map_or_else(|| quote! { None }, |v| quote! { Some(#v) });
         quote! {
             Some(fastmcp_protocol::ToolAnnotations {
                 read_only: #ro,
