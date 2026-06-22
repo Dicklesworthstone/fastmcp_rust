@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{McpContext, McpError, McpResult};
-use fastmcp_protocol::JsonRpcRequest;
+use fastmcp_protocol::{JsonRpcRequest, methods};
 
 use crate::{Middleware, MiddlewareDecision};
 
@@ -575,12 +575,12 @@ impl ResponseCachingMiddleware {
     /// Checks if a method should be cached.
     fn should_cache_method(&self, method: &str, params: Option<&serde_json::Value>) -> bool {
         match method {
-            "tools/list" => self.tools_list_config.enabled,
-            "resources/list" => self.resources_list_config.enabled,
-            "prompts/list" => self.prompts_list_config.enabled,
-            "resources/read" => self.resources_read_config.enabled,
-            "prompts/get" => self.prompts_get_config.enabled,
-            "tools/call" => {
+            methods::TOOLS_LIST => self.tools_list_config.enabled,
+            methods::RESOURCES_LIST => self.resources_list_config.enabled,
+            methods::PROMPTS_LIST => self.prompts_list_config.enabled,
+            methods::RESOURCES_READ => self.resources_read_config.enabled,
+            methods::PROMPTS_GET => self.prompts_get_config.enabled,
+            methods::TOOLS_CALL => {
                 if !self.tools_call_config.base.enabled {
                     return false;
                 }
@@ -599,12 +599,12 @@ impl ResponseCachingMiddleware {
     /// Gets the TTL for a specific method.
     fn get_ttl(&self, method: &str) -> Duration {
         match method {
-            "tools/list" => Duration::from_secs(self.tools_list_config.ttl_secs),
-            "resources/list" => Duration::from_secs(self.resources_list_config.ttl_secs),
-            "prompts/list" => Duration::from_secs(self.prompts_list_config.ttl_secs),
-            "tools/call" => Duration::from_secs(self.tools_call_config.base.ttl_secs),
-            "resources/read" => Duration::from_secs(self.resources_read_config.ttl_secs),
-            "prompts/get" => Duration::from_secs(self.prompts_get_config.ttl_secs),
+            methods::TOOLS_LIST => Duration::from_secs(self.tools_list_config.ttl_secs),
+            methods::RESOURCES_LIST => Duration::from_secs(self.resources_list_config.ttl_secs),
+            methods::PROMPTS_LIST => Duration::from_secs(self.prompts_list_config.ttl_secs),
+            methods::TOOLS_CALL => Duration::from_secs(self.tools_call_config.base.ttl_secs),
+            methods::RESOURCES_READ => Duration::from_secs(self.resources_read_config.ttl_secs),
+            methods::PROMPTS_GET => Duration::from_secs(self.prompts_get_config.ttl_secs),
             _ => self.call_ttl,
         }
     }

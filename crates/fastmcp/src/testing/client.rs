@@ -15,7 +15,7 @@ use fastmcp_protocol::{
     ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListToolsParams,
     ListToolsResult, PROTOCOL_VERSION, Prompt, PromptMessage, ReadResourceParams,
     ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerInfo, Tool, methods,
 };
 use fastmcp_transport::Transport;
 use fastmcp_transport::memory::MemoryTransport;
@@ -142,7 +142,7 @@ impl TestClient {
             client_info: self.client_info.clone(),
         };
 
-        let result: InitializeResult = self.send_request("initialize", params)?;
+        let result: InitializeResult = self.send_request(methods::INITIALIZE, params)?;
 
         // Store server info
         self.server_info = Some(result.server_info.clone());
@@ -150,7 +150,7 @@ impl TestClient {
         self.protocol_version = Some(result.protocol_version.clone());
 
         // Send initialized notification
-        self.send_notification("initialized", serde_json::json!({}))?;
+        self.send_notification(JsonRpcRequest::initialized_notification())?;
 
         self.initialized = true;
         Ok(result)
@@ -188,7 +188,7 @@ impl TestClient {
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
         let params = ListToolsParams::default();
-        let result: ListToolsResult = self.send_request("tools/list", params)?;
+        let result: ListToolsResult = self.send_request(methods::TOOLS_LIST, params)?;
         Ok(result.tools)
     }
 
@@ -208,7 +208,7 @@ impl TestClient {
             arguments: Some(arguments),
             meta: None,
         };
-        let result: CallToolResult = self.send_request("tools/call", params)?;
+        let result: CallToolResult = self.send_request(methods::TOOLS_CALL, params)?;
 
         if result.is_error {
             let error_msg = result
@@ -233,7 +233,7 @@ impl TestClient {
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
         let params = ListResourcesParams::default();
-        let result: ListResourcesResult = self.send_request("resources/list", params)?;
+        let result: ListResourcesResult = self.send_request(methods::RESOURCES_LIST, params)?;
         Ok(result.resources)
     }
 
@@ -246,7 +246,7 @@ impl TestClient {
         self.ensure_initialized()?;
         let params = ListResourceTemplatesParams::default();
         let result: ListResourceTemplatesResult =
-            self.send_request("resources/templates/list", params)?;
+            self.send_request(methods::RESOURCES_TEMPLATES_LIST, params)?;
         Ok(result.resource_templates)
     }
 
@@ -261,7 +261,7 @@ impl TestClient {
             uri: uri.to_string(),
             meta: None,
         };
-        let result: ReadResourceResult = self.send_request("resources/read", params)?;
+        let result: ReadResourceResult = self.send_request(methods::RESOURCES_READ, params)?;
         Ok(result.contents)
     }
 
@@ -273,7 +273,7 @@ impl TestClient {
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
         let params = ListPromptsParams::default();
-        let result: ListPromptsResult = self.send_request("prompts/list", params)?;
+        let result: ListPromptsResult = self.send_request(methods::PROMPTS_LIST, params)?;
         Ok(result.prompts)
     }
 
@@ -297,7 +297,7 @@ impl TestClient {
             },
             meta: None,
         };
-        let result: GetPromptResult = self.send_request("prompts/get", params)?;
+        let result: GetPromptResult = self.send_request(methods::PROMPTS_GET, params)?;
         Ok(result.messages)
     }
 
@@ -441,17 +441,7 @@ impl TestClient {
             .map_err(|e| McpError::internal_error(format!("Failed to deserialize response: {e}")))
     }
 
-    fn send_notification<P: serde::Serialize>(&mut self, method: &str, params: P) -> McpResult<()> {
-        let params_value = serde_json::to_value(params)
-            .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-
-        let request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: method.to_string(),
-            params: Some(params_value),
-            id: None,
-        };
-
+    fn send_notification(&mut self, request: JsonRpcRequest) -> McpResult<()> {
         self.transport
             .send(&self.cx, &JsonRpcMessage::Request(request))
             .map_err(|e| McpError::internal_error(format!("Transport error: {e:?}")))?;

@@ -301,7 +301,7 @@ enum HttpRequestExecutionMode {
 impl HttpRequestExecutionMode {
     fn for_method(method: &str) -> Self {
         match method {
-            "resources/read" | "prompts/get" => Self::ConcurrentReadOnly,
+            methods::RESOURCES_READ | methods::PROMPTS_GET => Self::ConcurrentReadOnly,
             _ => Self::ExclusiveSession,
         }
     }
@@ -2182,7 +2182,7 @@ impl Server {
                     self.handle_cancelled_notification(params);
                     Ok(serde_json::Value::Null)
                 }
-                "logging/setLevel" => {
+                methods::LOGGING_SET_LEVEL => {
                     let params: SetLogLevelParams = parse_params(params)?;
                     self.handle_set_log_level(session, params);
                     Ok(serde_json::Value::Null)
@@ -2208,14 +2208,14 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "resources/list" => {
+                methods::RESOURCES_LIST => {
                     let params: ListResourcesParams = parse_params_or_default(params)?;
                     let result =
                         self.router
                             .handle_resources_list(cx, params, Some(session.state()))?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "resources/templates/list" => {
+                methods::RESOURCES_TEMPLATES_LIST => {
                     let params: ListResourceTemplatesParams = parse_params_or_default(params)?;
                     let result = self.router.handle_resource_templates_list(
                         cx,
@@ -2224,7 +2224,7 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "resources/read" => {
+                methods::RESOURCES_READ => {
                     let params: ReadResourceParams = parse_params(params)?;
                     let result = self.router.handle_resources_read(
                         cx,
@@ -2251,14 +2251,14 @@ impl Server {
                     session.unsubscribe_resource(&params.uri);
                     Ok(serde_json::json!({}))
                 }
-                "prompts/list" => {
+                methods::PROMPTS_LIST => {
                     let params: ListPromptsParams = parse_params_or_default(params)?;
                     let result =
                         self.router
                             .handle_prompts_list(cx, params, Some(session.state()))?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "prompts/get" => {
+                methods::PROMPTS_GET => {
                     let params: GetPromptParams = parse_params(params)?;
                     let result = self.router.handle_prompts_get(
                         cx,
@@ -2450,7 +2450,7 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "resources/read" => {
+                methods::RESOURCES_READ => {
                     let params: ReadResourceParams = parse_params(params)?;
                     let result = self.router.handle_resources_read(
                         cx,
@@ -2464,7 +2464,7 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "prompts/get" => {
+                methods::PROMPTS_GET => {
                     let params: GetPromptParams = parse_params(params)?;
                     let result = self.router.handle_prompts_get(
                         cx,
@@ -2828,7 +2828,7 @@ impl Server {
             }
         };
         sender(JsonRpcRequest::notification(
-            "notifications/message",
+            methods::NOTIFICATIONS_MESSAGE,
             Some(payload),
         ));
     }
@@ -2850,7 +2850,7 @@ impl Server {
         method: &str,
         result: &McpResult<serde_json::Value>,
     ) {
-        if method.starts_with("notifications/") || method == "logging/setLevel" {
+        if method.starts_with("notifications/") || method == methods::LOGGING_SET_LEVEL {
             return;
         }
         let level = if result.is_ok() {
@@ -2873,7 +2873,7 @@ impl Server {
         method: &str,
         result: &McpResult<serde_json::Value>,
     ) {
-        if method.starts_with("notifications/") || method == "logging/setLevel" {
+        if method.starts_with("notifications/") || method == methods::LOGGING_SET_LEVEL {
             return;
         }
         let level = if result.is_ok() {

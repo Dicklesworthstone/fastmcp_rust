@@ -439,7 +439,7 @@ impl Client {
                 }
                 JsonRpcMessage::Request(request) => {
                     // Server sending a request to client (e.g., notification)
-                    if request.method == "notifications/message" {
+                    if request.method == fastmcp_protocol::methods::NOTIFICATIONS_MESSAGE {
                         if let Some(params) = request.params.as_ref() {
                             if let Ok(message) =
                                 serde_json::from_value::<LogMessageParams>(params.clone())
@@ -692,7 +692,7 @@ impl Client {
                                 }
                             }
                         }
-                    } else if request.method == "notifications/message" {
+                    } else if request.method == fastmcp_protocol::methods::NOTIFICATIONS_MESSAGE {
                         if let Some(params) = request.params.as_ref() {
                             if let Ok(message) =
                                 serde_json::from_value::<LogMessageParams>(params.clone())
@@ -758,7 +758,8 @@ impl Client {
             }
             let mut params = ListResourcesParams::default();
             params.cursor = cursor.clone();
-            let result: ListResourcesResult = self.send_request("resources/list", params)?;
+            let result: ListResourcesResult =
+                self.send_request(fastmcp_protocol::methods::RESOURCES_LIST, params)?;
             all.extend(result.resources);
             cursor = result.next_cursor;
             if cursor.is_none() {
@@ -798,7 +799,7 @@ impl Client {
             let mut params = ListResourceTemplatesParams::default();
             params.cursor = cursor.clone();
             let result: ListResourceTemplatesResult =
-                self.send_request("resources/templates/list", params)?;
+                self.send_request(fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST, params)?;
             all.extend(result.resource_templates);
             cursor = result.next_cursor;
             if cursor.is_none() {
@@ -817,7 +818,8 @@ impl Client {
     pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()> {
         self.ensure_initialized()?;
         let params = SetLogLevelParams { level };
-        let _: serde_json::Value = self.send_request("logging/setLevel", params)?;
+        let _: serde_json::Value =
+            self.send_request(fastmcp_protocol::methods::LOGGING_SET_LEVEL, params)?;
         Ok(())
     }
 
@@ -832,7 +834,8 @@ impl Client {
             uri: uri.to_string(),
             meta: None,
         };
-        let result: ReadResourceResult = self.send_request("resources/read", params)?;
+        let result: ReadResourceResult =
+            self.send_request(fastmcp_protocol::methods::RESOURCES_READ, params)?;
         Ok(result.contents)
     }
 
@@ -864,7 +867,8 @@ impl Client {
             }
             let mut params = ListPromptsParams::default();
             params.cursor = cursor.clone();
-            let result: ListPromptsResult = self.send_request("prompts/list", params)?;
+            let result: ListPromptsResult =
+                self.send_request(fastmcp_protocol::methods::PROMPTS_LIST, params)?;
             all.extend(result.prompts);
             cursor = result.next_cursor;
             if cursor.is_none() {
@@ -895,7 +899,8 @@ impl Client {
             },
             meta: None,
         };
-        let result: GetPromptResult = self.send_request("prompts/get", params)?;
+        let result: GetPromptResult =
+            self.send_request(fastmcp_protocol::methods::PROMPTS_GET, params)?;
         Ok(result.messages)
     }
 
