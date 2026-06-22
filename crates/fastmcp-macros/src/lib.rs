@@ -988,28 +988,23 @@ impl Parse for ToolAttrs {
                     syn::parenthesized!(content in input);
                     while !content.is_empty() {
                         let ann_ident: Ident = content.parse()?;
-                        match ann_ident.to_string().as_str() {
-                            "read_only" => {
-                                annotations_read_only = Some(parse_annotation_bool(&content)?)
+                        let slot = match ann_ident {
+                            ref ident if ident == "read_only" => &mut annotations_read_only,
+                            ref ident if ident == "idempotent" => &mut annotations_idempotent,
+                            ref ident if ident == "destructive" => &mut annotations_destructive,
+                            ref ident if ident == "open_world_hint" => {
+                                &mut annotations_open_world_hint
                             }
-                            "idempotent" => {
-                                annotations_idempotent = Some(parse_annotation_bool(&content)?)
-                            }
-                            "destructive" => {
-                                annotations_destructive = Some(parse_annotation_bool(&content)?)
-                            }
-                            "open_world_hint" => {
-                                annotations_open_world_hint = Some(parse_annotation_bool(&content)?)
-                            }
-                            other => {
+                            _ => {
                                 return Err(syn::Error::new(
                                     ann_ident.span(),
-                                    format!(
-                                        "unknown annotation: {other}; expected read_only, idempotent, destructive, or open_world_hint"
+                                    format_args!(
+                                        "unknown annotation: {ann_ident}; expected read_only, idempotent, destructive, or open_world_hint"
                                     ),
                                 ));
                             }
-                        }
+                        };
+                        *slot = Some(parse_annotation_bool(&content)?);
                         if !content.is_empty() {
                             content.parse::<Token![,]>()?;
                         }
