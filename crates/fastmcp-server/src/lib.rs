@@ -2170,7 +2170,9 @@ impl Server {
                     )?;
                     Ok(serde_json::to_value(result).map_err(McpError::from)?)
                 }
-                "initialized" => {
+                // Accept both the spec-correct `notifications/initialized` and the
+                // legacy bare `initialized` spelling for backwards compatibility.
+                "notifications/initialized" | "initialized" => {
                     // Notification, no response needed (but we send empty ok)
                     Ok(serde_json::Value::Null)
                 }
@@ -2598,7 +2600,11 @@ impl Server {
     fn should_authenticate(&self, method: &str) -> bool {
         !matches!(
             method,
-            "initialize" | "initialized" | "notifications/cancelled" | "ping"
+            "initialize"
+                | "initialized"
+                | "notifications/initialized"
+                | "notifications/cancelled"
+                | "ping"
         )
     }
 

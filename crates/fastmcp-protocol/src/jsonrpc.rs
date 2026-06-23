@@ -109,6 +109,16 @@ impl JsonRpcRequest {
         }
     }
 
+    /// Creates the MCP lifecycle `notifications/initialized` notification.
+    ///
+    /// Uses the spec-correct method name (`notifications/initialized`), avoiding
+    /// the bare `initialized` spelling that compliant servers do not route as the
+    /// lifecycle ack.
+    #[must_use]
+    pub fn initialized_notification() -> Self {
+        Self::notification(crate::methods::NOTIFICATIONS_INITIALIZED, None)
+    }
+
     /// Returns true if this is a notification (no ID).
     #[must_use]
     pub fn is_notification(&self) -> bool {

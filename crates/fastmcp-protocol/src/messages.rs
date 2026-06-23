@@ -2525,9 +2525,12 @@ mod tests {
         };
         let json = serde_json::to_value(&tool).expect("serialize");
         let annotations = json.get("annotations").expect("annotations field");
-        assert_eq!(annotations["destructive"], true);
-        assert_eq!(annotations["idempotent"], false);
-        assert_eq!(annotations["readOnly"], false);
+        // MCP-spec wire names are the `*Hint` forms.
+        assert_eq!(annotations["destructiveHint"], true);
+        assert_eq!(annotations["idempotentHint"], false);
+        assert_eq!(annotations["readOnlyHint"], false);
+        assert!(annotations.get("destructive").is_none());
+        assert!(annotations.get("readOnly").is_none());
         assert!(annotations.get("openWorldHint").is_none());
 
         // Tool with read_only annotation
@@ -2543,8 +2546,8 @@ mod tests {
         };
         let json = serde_json::to_value(&tool).expect("serialize");
         let annotations = json.get("annotations").expect("annotations field");
-        assert_eq!(annotations["readOnly"], true);
-        assert!(annotations.get("destructive").is_none());
+        assert_eq!(annotations["readOnlyHint"], true);
+        assert!(annotations.get("destructiveHint").is_none());
     }
 
     #[test]
@@ -2564,10 +2567,10 @@ mod tests {
             "name": "delete_tool",
             "inputSchema": {"type": "object"},
             "annotations": {
-                "destructive": true,
-                "idempotent": false,
-                "readOnly": false,
-                "openWorldHint": "May delete any file"
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "readOnlyHint": false,
+                "openWorldHint": true
             }
         });
         let tool: Tool = serde_json::from_value(json).expect("deserialize");
@@ -2575,10 +2578,7 @@ mod tests {
         assert_eq!(annotations.destructive, Some(true));
         assert_eq!(annotations.idempotent, Some(false));
         assert_eq!(annotations.read_only, Some(false));
-        assert_eq!(
-            annotations.open_world_hint,
-            Some("May delete any file".to_string())
-        );
+        assert_eq!(annotations.open_world_hint, Some(true));
     }
 
     #[test]
@@ -2589,15 +2589,12 @@ mod tests {
             .destructive(true)
             .idempotent(true)
             .read_only(false)
-            .open_world_hint("Handles unknown inputs gracefully");
+            .open_world_hint(true);
 
         assert_eq!(annotations.destructive, Some(true));
         assert_eq!(annotations.idempotent, Some(true));
         assert_eq!(annotations.read_only, Some(false));
-        assert_eq!(
-            annotations.open_world_hint,
-            Some("Handles unknown inputs gracefully".to_string())
-        );
+        assert_eq!(annotations.open_world_hint, Some(true));
         assert!(!annotations.is_empty());
 
         // Empty annotations

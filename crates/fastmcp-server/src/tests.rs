@@ -5281,7 +5281,7 @@ mod handler_direct_tests {
                     destructive: Some(false),
                     idempotent: Some(true),
                     read_only: Some(true),
-                    open_world_hint: Some("none".to_string()),
+                    open_world_hint: Some(false),
                 },
                 output_schema: serde_json::json!({
                     "type": "object",

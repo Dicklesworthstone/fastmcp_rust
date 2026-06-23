@@ -186,8 +186,11 @@ impl Client {
             init_result.protocol_version,
         );
 
-        // Send initialized notification
-        client.send_notification("initialized", serde_json::json!({}))?;
+        // Send the spec-correct `notifications/initialized` lifecycle notification.
+        client.send_notification(
+            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+            serde_json::json!({}),
+        )?;
 
         // Mark as initialized
         client.initialized.store(true, Ordering::SeqCst);
@@ -276,8 +279,11 @@ impl Client {
             init_result.protocol_version,
         );
 
-        // Send initialized notification
-        self.send_notification("initialized", serde_json::json!({}))?;
+        // Send the spec-correct `notifications/initialized` lifecycle notification.
+        self.send_notification(
+            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+            serde_json::json!({}),
+        )?;
 
         // Mark as initialized
         self.initialized.store(true, Ordering::SeqCst);

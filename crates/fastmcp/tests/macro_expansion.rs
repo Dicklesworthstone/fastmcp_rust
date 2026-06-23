@@ -820,7 +820,7 @@ fn tool_annotations_destructive_only() {
     read_only,
     idempotent,
     destructive,
-    open_world_hint = "accepts extra fields"
+    open_world_hint = true
 ))]
 fn fully_annotated(_ctx: &McpContext) -> String {
     "full".to_string()
@@ -834,7 +834,7 @@ fn tool_annotations_all_fields() {
     assert_eq!(ann.read_only, Some(true));
     assert_eq!(ann.idempotent, Some(true));
     assert_eq!(ann.destructive, Some(true));
-    assert_eq!(ann.open_world_hint.as_deref(), Some("accepts extra fields"));
+    assert_eq!(ann.open_world_hint, Some(true));
 }
 
 /// Tool with version only, no annotations.

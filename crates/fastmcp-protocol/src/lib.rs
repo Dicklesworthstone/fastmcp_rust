@@ -35,6 +35,7 @@
 
 mod jsonrpc;
 mod messages;
+pub mod methods;
 pub mod schema;
 mod types;
 

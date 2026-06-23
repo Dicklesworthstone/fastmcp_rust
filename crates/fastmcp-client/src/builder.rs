@@ -423,13 +423,8 @@ impl ClientBuilder {
             McpError::internal_error(format!("Failed to parse initialize result: {e}"))
         })?;
 
-        // Send initialized notification
-        let initialized_request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: "initialized".to_string(),
-            params: Some(serde_json::json!({})),
-            id: None,
-        };
+        // Send the spec-correct `notifications/initialized` lifecycle notification.
+        let initialized_request = JsonRpcRequest::initialized_notification();
 
         transport
             .send(cx, &JsonRpcMessage::Request(initialized_request))

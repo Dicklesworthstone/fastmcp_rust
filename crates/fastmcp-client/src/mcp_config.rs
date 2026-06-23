@@ -424,13 +424,8 @@ fn create_and_initialize_client(
     let init_result: InitializeResult = serde_json::from_value(result_value)
         .map_err(|e| McpError::internal_error(format!("Failed to parse initialize result: {e}")))?;
 
-    // Send initialized notification
-    let notification = JsonRpcRequest {
-        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-        method: "initialized".to_string(),
-        params: Some(serde_json::json!({})),
-        id: None,
-    };
+    // Send the spec-correct `notifications/initialized` lifecycle notification.
+    let notification = JsonRpcRequest::initialized_notification();
 
     transport
         .send(&cx, &JsonRpcMessage::Request(notification))
