@@ -1,14 +1,14 @@
 //! Test context wrapper for asupersync integration.
 //!
-//! Provides a convenient wrapper around `Cx::for_testing()` with
+//! Provides a convenient wrapper around a FastMCP runtime-provided `Cx` with
 //! helper methods for common test scenarios.
 
 use asupersync::{Budget, Cx};
-use fastmcp_core::{McpContext, SessionState};
+use fastmcp_core::{McpContext, SessionState, block_on};
 
 /// Test context wrapper providing convenient testing utilities.
 ///
-/// Wraps `Cx::for_testing()` and provides helper methods for:
+/// Wraps a runtime-provided `Cx` and provides helper methods for:
 /// - Budget/timeout configuration
 /// - Creating `McpContext` instances
 /// - Running async operations with cleanup
@@ -48,7 +48,7 @@ impl Default for TestContext {
 }
 
 impl TestContext {
-    /// Creates a new test context using `Cx::for_testing()`.
+    /// Creates a new test context using a FastMCP runtime context.
     ///
     /// # Example
     ///
@@ -57,8 +57,11 @@ impl TestContext {
     /// ```
     #[must_use]
     pub fn new() -> Self {
+        let cx =
+            block_on(async { Cx::current().expect("fastmcp runtime should install a current Cx") });
+
         Self {
-            cx: Cx::for_testing(),
+            cx,
             budget: None,
             session_state: None,
         }
@@ -77,7 +80,7 @@ impl TestContext {
     /// ```
     #[must_use]
     pub fn with_budget_secs(mut self, secs: u64) -> Self {
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::with_deadline_at_secs(secs));
         self
     }
 
@@ -90,7 +93,7 @@ impl TestContext {
     pub fn with_budget_ms(mut self, ms: u64) -> Self {
         // Convert ms to secs (rounded up)
         let secs = (ms + 999) / 1000;
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::with_deadline_at_secs(secs));
         self
     }
 

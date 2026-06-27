@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, Content, GetPromptParams,
     GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
@@ -76,9 +76,12 @@ impl TestClient {
     /// ```
     #[must_use]
     pub fn new(transport: MemoryTransport) -> Self {
+        let cx =
+            block_on(async { Cx::current().expect("fastmcp runtime should install a current Cx") });
+
         Self {
             transport,
-            cx: Cx::for_testing(),
+            cx,
             client_info: ClientInfo {
                 name: "test-client".to_owned(),
                 version: "1.0.0".to_owned(),
