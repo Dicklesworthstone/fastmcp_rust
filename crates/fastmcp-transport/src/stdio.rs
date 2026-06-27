@@ -40,7 +40,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 
-use asupersync::{Budget, Cx};
+use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
 use crate::async_io::{AsyncLineReader, AsyncStdout};
@@ -349,10 +349,11 @@ impl Transport for AsyncStdioTransport {
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
-        // Use an infinite budget context for close - ensures flush completes
-        // without cancellation (close should always complete)
-        let cx = Cx::for_request_with_budget(Budget::INFINITE);
-        self.writer.flush_sync(&cx)?;
+        if let Some(cx) = Cx::current() {
+            self.writer.flush_sync(&cx)?;
+        } else {
+            self.writer.flush_unchecked()?;
+        }
         Ok(())
     }
 }

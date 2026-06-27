@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, CancelledParams,
     ClientCapabilities, ClientInfo, Content, GetPromptParams, GetPromptResult, GetTaskParams,
@@ -119,7 +119,10 @@ impl Client {
     ///
     /// Returns an error if the subprocess fails to start or initialization fails.
     pub fn stdio(command: &str, args: &[&str]) -> McpResult<Self> {
-        Self::stdio_with_cx(command, args, Cx::for_request())
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            Self::stdio_with_cx(command, args, cx)
+        })
     }
 
     /// Creates a client with a provided Cx for cancellation support.

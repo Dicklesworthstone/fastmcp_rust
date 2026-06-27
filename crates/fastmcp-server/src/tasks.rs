@@ -35,8 +35,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+#[cfg(test)]
+use asupersync::Budget;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
-use asupersync::{Budget, CancelKind, Cx};
+use asupersync::{CancelKind, Cx};
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
@@ -281,7 +283,7 @@ impl TaskManager {
     /// background region.
     pub fn submit(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         task_type: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<TaskId> {
@@ -306,7 +308,7 @@ impl TaskManager {
 
         // Create task info
         let now = chrono::Utc::now().to_rfc3339();
-        let task_cx = Cx::for_request_with_budget(Budget::INFINITE);
+        let task_cx = cx.clone();
         let info = TaskInfo {
             id: task_id.clone(),
             task_type: task_type.clone(),
