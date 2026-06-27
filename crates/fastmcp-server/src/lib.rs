@@ -108,7 +108,9 @@ use fastmcp_console::client::RequestResponseRenderer;
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_console::{banner::StartupBanner, console};
 use fastmcp_core::logging::{debug, error, info, targets};
-use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
+use fastmcp_core::{
+    AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState, block_on,
+};
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelledParams, GetPromptParams, GetTaskParams,
     InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
@@ -763,9 +765,10 @@ impl Server {
     /// This is the primary way to run MCP servers as subprocesses.
     /// Creates a request-scoped Cx and runs the server loop.
     pub fn run_stdio(self) -> ! {
-        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
-        let cx = Cx::for_request();
-        self.run_stdio_with_cx(&cx)
+        block_on(async move {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.run_stdio_with_cx(&cx)
+        })
     }
 
     /// Runs the server on stdio with a provided Cx.
@@ -801,9 +804,10 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
-        let cx = Cx::for_request();
-        self.run_transport_with_cx(&cx, transport)
+        block_on(async move {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.run_transport_with_cx(&cx, transport)
+        })
     }
 
     /// Runs the server on a custom transport with a provided Cx.
@@ -816,7 +820,7 @@ impl Server {
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
-        let notification_sender = create_transport_notification_sender(shared.clone());
+        let notification_sender = create_transport_notification_sender(shared.clone(), cx.clone());
 
         let shared_recv = shared.clone();
         let shared_send = shared;
@@ -840,7 +844,7 @@ impl Server {
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
-        let notification_sender = create_transport_notification_sender(shared.clone());
+        let notification_sender = create_transport_notification_sender(shared.clone(), cx.clone());
 
         let shared_recv = shared.clone();
         let shared_send = shared;
@@ -860,9 +864,10 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
-        // Top-level server loop Cx (non-test). Per-request budgets are applied in `handle_request`.
-        let cx = Cx::for_request();
-        self.run_transport_returning_with_cx(&cx, transport);
+        block_on(async move {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.run_transport_returning_with_cx(&cx, transport);
+        });
     }
 
     /// Runs the server using SSE transport with a testing Cx.
@@ -942,8 +947,11 @@ impl Server {
     ///     .run_http("0.0.0.0:3000");
     /// ```
     pub fn run_http(self, addr: impl Into<String>) -> ! {
-        let cx = Cx::for_request();
-        self.run_http_with_cx(&cx, addr)
+        let addr = addr.into();
+        block_on(async move {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.run_http_with_cx(&cx, addr)
+        })
     }
 
     /// Runs the server on HTTP with a provided [`Cx`].
@@ -961,8 +969,11 @@ impl Server {
     /// Unlike [`run_http`](Self::run_http), this does **not** call
     /// `std::process::exit` on shutdown. This is useful for tests and embedding.
     pub fn run_http_returning(self, addr: impl Into<String>) {
-        let cx = Cx::for_request();
-        self.run_http_returning_with_cx(&cx, addr);
+        let addr = addr.into();
+        block_on(async move {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.run_http_returning_with_cx(&cx, addr);
+        });
     }
 
     /// Full control: custom [`Cx`] + returns on shutdown.
@@ -1804,11 +1815,7 @@ impl Server {
             ));
         }
 
-        let request_cx = if is_notification {
-            cx.clone()
-        } else {
-            Cx::for_request_with_budget(budget)
-        };
+        let request_cx = cx.clone();
 
         let _active_guard = match id.clone() {
             Some(request_id) => {
@@ -1937,11 +1944,7 @@ impl Server {
             ));
         }
 
-        let request_cx = if is_notification {
-            cx.clone()
-        } else {
-            Cx::for_request_with_budget(budget)
-        };
+        let request_cx = cx.clone();
 
         let _active_guard = match id.clone() {
             Some(request_id) => {
@@ -3119,12 +3122,13 @@ fn transport_lock_error() -> TransportError {
     TransportError::Io(std::io::Error::other("transport lock poisoned"))
 }
 
-fn create_transport_notification_sender<T>(transport: SharedTransport<T>) -> NotificationSender
+fn create_transport_notification_sender<T>(
+    transport: SharedTransport<T>,
+    cx: Cx,
+) -> NotificationSender
 where
     T: Transport + Send + 'static,
 {
-    let cx = Cx::for_request();
-
     Arc::new(move |request: JsonRpcRequest| {
         let message = JsonRpcMessage::Request(request);
         if let Err(e) = transport.send(&cx, &message) {

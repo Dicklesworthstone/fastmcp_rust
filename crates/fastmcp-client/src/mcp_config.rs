@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Serialize};
 
@@ -289,7 +289,10 @@ impl McpConfig {
     ///
     /// Returns an error if the server is not found, disabled, or fails to start.
     pub fn client(&self, name: &str) -> Result<Client, ConfigError> {
-        self.client_with_cx(name, Cx::for_request())
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.client_with_cx(name, cx)
+        })
     }
 
     /// Creates a client with a provided Cx for cancellation support.

@@ -42,7 +42,7 @@ use asupersync::Cx;
 use fastmcp_core::{
     ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
     McpError, McpErrorCode, McpResult, SamplingRequest, SamplingResponse, SamplingRole,
-    SamplingSender, SamplingStopReason,
+    SamplingSender, SamplingStopReason, block_on,
 };
 use fastmcp_protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
@@ -308,8 +308,9 @@ impl SamplingSender for TransportSamplingSender {
             let params_value = serde_json::to_value(&params)
                 .map_err(|e| McpError::internal_error(format!("Failed to serialize: {}", e)))?;
 
-            // Create a request-scoped Cx for this server-initiated request.
-            let cx = Cx::for_request();
+            let cx = Cx::current().ok_or_else(|| {
+                McpError::internal_error("No current asupersync Cx for sampling request")
+            })?;
 
             let result: fastmcp_protocol::CreateMessageResult =
                 self.sender
@@ -382,8 +383,9 @@ impl ElicitationSender for TransportElicitationSender {
                 }
             };
 
-            // Create a request-scoped Cx for this server-initiated request.
-            let cx = Cx::for_request();
+            let cx = Cx::current().ok_or_else(|| {
+                McpError::internal_error("No current asupersync Cx for elicitation request")
+            })?;
 
             let result: fastmcp_protocol::ElicitResult =
                 self.sender
@@ -448,11 +450,15 @@ impl TransportRootsProvider {
 
     /// Lists the filesystem roots from the client.
     pub fn list_roots(&self) -> McpResult<Vec<fastmcp_protocol::Root>> {
-        let cx = Cx::for_request();
-        let result: fastmcp_protocol::ListRootsResult =
-            self.sender
-                .send_request(&cx, "roots/list", serde_json::json!({}))?;
-        Ok(result.roots)
+        block_on(async {
+            let cx = Cx::current().ok_or_else(|| {
+                McpError::internal_error("No current asupersync Cx for roots request")
+            })?;
+            let result: fastmcp_protocol::ListRootsResult =
+                self.sender
+                    .send_request(&cx, "roots/list", serde_json::json!({}))?;
+            Ok(result.roots)
+        })
     }
 }
 

@@ -49,7 +49,7 @@ impl Drop for ChildGuard {
 }
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, JsonRpcMessage,
     JsonRpcRequest, PROTOCOL_VERSION,
@@ -246,7 +246,10 @@ impl ClientBuilder {
     /// - The initialization handshake fails
     /// - All retry attempts are exhausted
     pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-        self.connect_stdio_with_cx(command, args, &Cx::for_request())
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.connect_stdio_with_cx(command, args, &cx)
+        })
     }
 
     /// Connects to a server via stdio subprocess with a provided Cx.
