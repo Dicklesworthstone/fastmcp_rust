@@ -3840,7 +3840,7 @@ mod lab_runtime_tests {
     #[test]
     fn test_lab_runtime_deadline_progression() {
         with_lab_runtime(|runtime| {
-            let budget = Budget::with_deadline_secs(1);
+            let budget = Budget::with_deadline_at_secs(1);
             let start = runtime.now();
             assert!(!budget.is_past_deadline(start));
 
