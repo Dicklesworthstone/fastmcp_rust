@@ -43,7 +43,7 @@ readme = "README.md"
 # `Transport::close`); until then we opt into `test-internals` to keep the
 # constructors visible. NOTE: `fastmcp-core::block_on` does NOT rely on this —
 # it was fixed to use `Runtime::block_on`'s own ambient `Cx`.
-asupersync = { version = "0.3.4", features = ["test-internals"] }
+asupersync = { version = "0.3.9", features = ["test-internals"] }
 rich_rust = "0.2"
 
 # Serialization (only these)
