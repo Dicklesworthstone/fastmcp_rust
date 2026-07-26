@@ -816,12 +816,7 @@ fn tool_annotations_destructive_only() {
 }
 
 /// Tool with all annotations set.
-#[tool(annotations(
-    read_only,
-    idempotent,
-    destructive,
-    open_world_hint = true
-))]
+#[tool(annotations(read_only, idempotent, destructive, open_world_hint = true))]
 fn fully_annotated(_ctx: &McpContext) -> String {
     "full".to_string()
 }
