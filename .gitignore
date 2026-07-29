@@ -55,3 +55,5 @@ storage.sqlite3*
 proptest-regressions/
 test_meminfo
 perf.data
+# br doctor per-run artifacts
+.doctor/
