@@ -54,9 +54,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use fastmcp_core::{AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult};
+use fastmcp_core::{
+    AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult, SecurityIdentifier,
+    draw_security_identifier, sha256_bounded,
+};
 
 use crate::auth::{AuthRequest, TokenVerifier};
+
+const PKCE_CODE_VERIFIER_MIN_BYTES: usize = 43;
+const PKCE_CODE_VERIFIER_MAX_BYTES: usize = 128;
 
 // =============================================================================
 // Configuration
@@ -79,8 +85,6 @@ pub struct OAuthServerConfig {
     pub min_code_verifier_length: usize,
     /// Maximum PKCE code verifier length.
     pub max_code_verifier_length: usize,
-    /// Token entropy bytes (default: 32 = 256 bits).
-    pub token_entropy_bytes: usize,
 }
 
 impl Default for OAuthServerConfig {
@@ -91,9 +95,8 @@ impl Default for OAuthServerConfig {
             refresh_token_lifetime: Duration::from_secs(86400 * 30), // 30 days
             authorization_code_lifetime: Duration::from_secs(600), // 10 minutes
             allow_public_clients: true,
-            min_code_verifier_length: 43,
-            max_code_verifier_length: 128,
-            token_entropy_bytes: 32,
+            min_code_verifier_length: PKCE_CODE_VERIFIER_MIN_BYTES,
+            max_code_verifier_length: PKCE_CODE_VERIFIER_MAX_BYTES,
         }
     }
 }
@@ -367,12 +370,14 @@ impl AuthorizationCode {
     /// Validates the PKCE code verifier against the stored challenge.
     #[must_use]
     pub fn validate_code_verifier(&self, verifier: &str) -> bool {
+        if validate_pkce_code_verifier(verifier).is_err() {
+            return false;
+        }
+
         match self.code_challenge_method {
             CodeChallengeMethod::Plain => constant_time_eq(&self.code_challenge, verifier),
-            CodeChallengeMethod::S256 => {
-                let computed = compute_s256_challenge(verifier);
-                constant_time_eq(&self.code_challenge, &computed)
-            }
+            CodeChallengeMethod::S256 => compute_s256_challenge(verifier)
+                .is_ok_and(|computed| constant_time_eq(&self.code_challenge, &computed)),
         }
     }
 }
@@ -771,6 +776,19 @@ impl OAuthServer {
         request: &AuthorizationRequest,
         subject: Option<String>,
     ) -> Result<(String, String), OAuthError> {
+        self.authorize_with_token_draw(request, subject, draw_security_identifier)
+    }
+
+    fn authorize_with_token_draw<F, E>(
+        &self,
+        request: &AuthorizationRequest,
+        subject: Option<String>,
+        draw: F,
+    ) -> Result<(String, String), OAuthError>
+    where
+        F: FnOnce() -> Result<SecurityIdentifier, E>,
+        E: std::fmt::Display,
+    {
         // Validate response_type
         if request.response_type != "code" {
             return Err(OAuthError::UnsupportedResponseType(
@@ -805,7 +823,7 @@ impl OAuthServer {
         }
 
         // Generate authorization code
-        let code_value = generate_token(self.config.token_entropy_bytes)?;
+        let code_value = generate_token_with_draw(draw)?;
         let now = Instant::now();
         let code = AuthorizationCode {
             code: code_value.clone(),
@@ -876,12 +894,14 @@ impl OAuthServer {
             OAuthError::InvalidRequest("code_verifier is required (PKCE)".to_string())
         })?;
 
-        // Validate code verifier length
+        // Enforce the fixed RFC 7636 syntax and hard bounds before consuming
+        // the one-use authorization code or performing SHA-256.
+        validate_pkce_code_verifier(code_verifier)?;
         if code_verifier.len() < self.config.min_code_verifier_length
             || code_verifier.len() > self.config.max_code_verifier_length
         {
             return Err(OAuthError::InvalidRequest(format!(
-                "code_verifier must be between {} and {} characters",
+                "code_verifier must be between {} and {} bytes",
                 self.config.min_code_verifier_length, self.config.max_code_verifier_length
             )));
         }
@@ -948,6 +968,18 @@ impl OAuthServer {
     }
 
     fn token_refresh_token(&self, request: &TokenRequest) -> Result<TokenResponse, OAuthError> {
+        self.token_refresh_token_with_draw(request, draw_security_identifier)
+    }
+
+    fn token_refresh_token_with_draw<F, E>(
+        &self,
+        request: &TokenRequest,
+        draw: F,
+    ) -> Result<TokenResponse, OAuthError>
+    where
+        F: FnOnce() -> Result<SecurityIdentifier, E>,
+        E: std::fmt::Display,
+    {
         let refresh_value = request
             .refresh_token
             .as_ref()
@@ -1014,7 +1046,7 @@ impl OAuthServer {
 
         // Issue new access token (keep same refresh token)
         let now = Instant::now();
-        let access_value = generate_token(self.config.token_entropy_bytes)?;
+        let access_value = generate_token_with_draw(draw)?;
         let issued_access = OAuthToken {
             token: access_value.clone(),
             token_type: TokenType::Bearer,
@@ -1056,10 +1088,24 @@ impl OAuthServer {
         scopes: &[String],
         subject: Option<&str>,
     ) -> Result<TokenResponse, OAuthError> {
+        self.issue_tokens_with_draw(client_id, scopes, subject, draw_security_identifier)
+    }
+
+    fn issue_tokens_with_draw<F, E>(
+        &self,
+        client_id: &str,
+        scopes: &[String],
+        subject: Option<&str>,
+        mut draw: F,
+    ) -> Result<TokenResponse, OAuthError>
+    where
+        F: FnMut() -> Result<SecurityIdentifier, E>,
+        E: std::fmt::Display,
+    {
         let now = Instant::now();
 
         // Generate access token
-        let access_value = generate_token(self.config.token_entropy_bytes)?;
+        let access_value = generate_token_with_draw(&mut draw)?;
         let access_cred = OAuthToken {
             token: access_value.clone(),
             token_type: TokenType::Bearer,
@@ -1072,7 +1118,7 @@ impl OAuthServer {
         };
 
         // Generate refresh token
-        let refresh_value = generate_token(self.config.token_entropy_bytes)?;
+        let refresh_value = generate_token_with_draw(&mut draw)?;
         let refresh_cred = OAuthToken {
             token: refresh_value.clone(),
             token_type: TokenType::Bearer,
@@ -1311,13 +1357,18 @@ impl TokenVerifier for OAuthTokenVerifier {
 // =============================================================================
 
 /// Generates a cryptographically secure random token.
-fn generate_token(bytes: usize) -> Result<String, OAuthError> {
-    let mut buf = vec![0u8; bytes];
-    getrandom::fill(&mut buf)
-        .map_err(|e| OAuthError::ServerError(format!("secure random generation failed: {e}")))?;
+fn generate_token() -> Result<String, OAuthError> {
+    generate_token_with_draw(draw_security_identifier)
+}
 
+fn generate_token_with_draw<F, E>(draw: F) -> Result<String, OAuthError>
+where
+    F: FnOnce() -> Result<SecurityIdentifier, E>,
+    E: std::fmt::Display,
+{
+    let identifier = draw().map_err(|error| OAuthError::ServerError(error.to_string()))?;
     // Base64url encode (URL-safe, no padding).
-    Ok(base64url_encode(&buf))
+    Ok(base64url_encode(identifier.as_bytes()))
 }
 
 /// Base64url encodes bytes (URL-safe, no padding).
@@ -1327,11 +1378,37 @@ fn base64url_encode(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Computes S256 code challenge from a verifier.
-fn compute_s256_challenge(verifier: &str) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(verifier.as_bytes());
-    base64url_encode(&hash)
+/// Validates the fixed RFC 7636 verifier grammar and byte bounds.
+fn validate_pkce_code_verifier(verifier: &str) -> Result<(), OAuthError> {
+    let verifier_bytes = verifier.as_bytes();
+    if !(PKCE_CODE_VERIFIER_MIN_BYTES..=PKCE_CODE_VERIFIER_MAX_BYTES)
+        .contains(&verifier_bytes.len())
+    {
+        return Err(OAuthError::InvalidRequest(format!(
+            "code_verifier must be {PKCE_CODE_VERIFIER_MIN_BYTES} to \
+             {PKCE_CODE_VERIFIER_MAX_BYTES} bytes of RFC 7636 unreserved ASCII"
+        )));
+    }
+    if !verifier_bytes
+        .iter()
+        .copied()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(OAuthError::InvalidRequest(format!(
+            "code_verifier must be {PKCE_CODE_VERIFIER_MIN_BYTES} to \
+             {PKCE_CODE_VERIFIER_MAX_BYTES} bytes of RFC 7636 unreserved ASCII"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Computes the exact RFC 7636 S256 challenge from an admitted verifier.
+fn compute_s256_challenge(verifier: &str) -> Result<String, OAuthError> {
+    validate_pkce_code_verifier(verifier)?;
+    let digest = sha256_bounded(verifier.as_bytes(), PKCE_CODE_VERIFIER_MAX_BYTES)
+        .map_err(|error| OAuthError::InvalidRequest(error.to_string()))?;
+    Ok(base64url_encode(digest.as_bytes()))
 }
 
 /// URL-encodes a string.
@@ -1592,17 +1669,135 @@ mod tests {
 
     #[test]
     fn test_token_generation() {
-        let value1 = generate_token(32).unwrap();
-        let value2 = generate_token(32).unwrap();
+        let value = generate_token().unwrap();
 
-        // Tokens should be unique
-        assert_ne!(value1, value2);
-        // Tokens should be URL-safe
+        assert_eq!(value.len(), 43);
+        assert!(!value.contains('='));
         assert!(
-            value1
+            value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    #[test]
+    fn pkce_s256_matches_rfc_7636_and_enforces_fixed_input() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            compute_s256_challenge(verifier).unwrap(),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+
+        assert!(compute_s256_challenge(&"A".repeat(43)).is_ok());
+        assert!(compute_s256_challenge(&"~".repeat(128)).is_ok());
+        assert!(compute_s256_challenge(&"A".repeat(42)).is_err());
+        assert!(compute_s256_challenge(&"A".repeat(129)).is_err());
+        assert!(compute_s256_challenge(&format!("{}%", "A".repeat(42))).is_err());
+        assert!(compute_s256_challenge(&"é".repeat(43)).is_err());
+    }
+
+    #[test]
+    fn authorization_draw_failure_precedes_code_storage() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("test-client")
+            .redirect_uri("http://localhost:3000/callback")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+
+        let request = AuthorizationRequest {
+            response_type: "code".to_string(),
+            client_id: "test-client".to_string(),
+            redirect_uri: "http://localhost:3000/callback".to_string(),
+            scopes: vec![],
+            state: None,
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+            code_challenge_method: CodeChallengeMethod::S256,
+        };
+        let draw_calls = std::cell::Cell::new(0);
+
+        let result = server.authorize_with_token_draw(&request, None, || {
+            draw_calls.set(draw_calls.get() + 1);
+            Err::<SecurityIdentifier, _>("forced security-identifier draw failure")
+        });
+
+        assert!(matches!(result, Err(OAuthError::ServerError(_))));
+        assert_eq!(draw_calls.get(), 1);
+        assert!(server.state.read().unwrap().authorization_codes.is_empty());
+    }
+
+    #[test]
+    fn second_token_draw_failure_commits_neither_token() {
+        let server = OAuthServer::with_defaults();
+        let draw_calls = std::cell::Cell::new(0);
+
+        let result = server.issue_tokens_with_draw("client", &[], None, || {
+            let call = draw_calls.get() + 1;
+            draw_calls.set(call);
+            if call == 1 {
+                draw_security_identifier().map_err(|_| "unexpected operating-system RNG failure")
+            } else {
+                Err("forced second security-identifier draw failure")
+            }
+        });
+
+        assert!(matches!(result, Err(OAuthError::ServerError(_))));
+        assert_eq!(draw_calls.get(), 2);
+        let state = server.state.read().unwrap();
+        assert!(state.access_tokens.is_empty());
+        assert!(state.refresh_tokens.is_empty());
+    }
+
+    #[test]
+    fn token_pair_consumes_two_fresh_security_identifier_draws() {
+        let server = OAuthServer::with_defaults();
+        let draw_calls = std::cell::Cell::new(0);
+
+        let response = server
+            .issue_tokens_with_draw("client", &[], None, || {
+                draw_calls.set(draw_calls.get() + 1);
+                draw_security_identifier().map_err(|_| "unexpected operating-system RNG failure")
+            })
+            .unwrap();
+
+        assert_eq!(draw_calls.get(), 2);
+        assert_eq!(response.access_token.len(), 43);
+        assert_eq!(response.refresh_token.as_deref().unwrap().len(), 43);
+    }
+
+    #[test]
+    fn refresh_access_draw_failure_preserves_existing_token_state() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("client")
+            .redirect_uri("http://localhost/callback")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+        let issued = server.issue_tokens("client", &[], Some("subject")).unwrap();
+        let refresh_token = issued.refresh_token.unwrap();
+        let request = TokenRequest {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: "client".to_string(),
+            client_secret: None,
+            code_verifier: None,
+            refresh_token: Some(refresh_token.clone()),
+            scopes: None,
+        };
+        let draw_calls = std::cell::Cell::new(0);
+
+        let result = server.token_refresh_token_with_draw(&request, || {
+            draw_calls.set(draw_calls.get() + 1);
+            Err::<SecurityIdentifier, _>("forced refresh access-token draw failure")
+        });
+
+        assert!(matches!(result, Err(OAuthError::ServerError(_))));
+        assert_eq!(draw_calls.get(), 1);
+        let state = server.state.read().unwrap();
+        assert_eq!(state.access_tokens.len(), 1);
+        assert_eq!(state.refresh_tokens.len(), 1);
+        assert!(state.refresh_tokens.contains_key(&refresh_token));
     }
 
     #[test]
@@ -1818,7 +2013,6 @@ mod tests {
         assert!(c.allow_public_clients);
         assert_eq!(c.min_code_verifier_length, 43);
         assert_eq!(c.max_code_verifier_length, 128);
-        assert_eq!(c.token_entropy_bytes, 32);
     }
 
     #[test]
@@ -2030,26 +2224,27 @@ mod tests {
 
     #[test]
     fn authorization_code_validate_plain() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let code = AuthorizationCode {
             code: "test".to_string(),
             client_id: "c".to_string(),
             redirect_uri: "http://localhost/cb".to_string(),
             scopes: vec![],
-            code_challenge: "my-verifier".to_string(),
+            code_challenge: verifier.to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
             issued_at: Instant::now(),
             expires_at: Instant::now() + Duration::from_secs(600),
             subject: None,
             state: None,
         };
-        assert!(code.validate_code_verifier("my-verifier"));
+        assert!(code.validate_code_verifier(verifier));
         assert!(!code.validate_code_verifier("wrong"));
     }
 
     #[test]
     fn authorization_code_validate_s256() {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = compute_s256_challenge(verifier);
+        let challenge = compute_s256_challenge(verifier).unwrap();
         let code = AuthorizationCode {
             code: "test".to_string(),
             client_id: "c".to_string(),
@@ -2502,7 +2697,9 @@ mod tests {
 
     #[test]
     fn server_token_auth_code_verifier_too_short() {
-        let server = OAuthServer::with_defaults();
+        let mut config = OAuthServerConfig::default();
+        config.min_code_verifier_length = 0;
+        let server = OAuthServer::new(config);
         let client = OAuthClient::builder("c")
             .redirect_uri("http://localhost/cb")
             .build()
@@ -2510,7 +2707,7 @@ mod tests {
         server.register_client(client).unwrap();
 
         // Authorize first
-        let verifier = "short"; // < 43 chars
+        let verifier = "short"; // The fixed 43-byte minimum still applies.
         let req = AuthorizationRequest {
             response_type: "code".to_string(),
             client_id: "c".to_string(),
@@ -2521,6 +2718,7 @@ mod tests {
             code_challenge_method: CodeChallengeMethod::Plain,
         };
         let (code, _) = server.authorize(&req, None).unwrap();
+        let stored_code = code.clone();
 
         let token_req = TokenRequest {
             grant_type: "authorization_code".to_string(),
@@ -2534,6 +2732,14 @@ mod tests {
         };
         let result = server.token(&token_req);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&stored_code)
+        );
     }
 
     #[test]
@@ -2547,7 +2753,7 @@ mod tests {
         server.register_client(client).unwrap();
 
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = compute_s256_challenge(verifier);
+        let challenge = compute_s256_challenge(verifier).unwrap();
 
         let auth_req = AuthorizationRequest {
             response_type: "code".to_string(),
@@ -2724,9 +2930,9 @@ mod tests {
 
     #[test]
     fn compute_s256_challenge_deterministic() {
-        let v = "test-verifier";
-        let c1 = compute_s256_challenge(v);
-        let c2 = compute_s256_challenge(v);
+        let v = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let c1 = compute_s256_challenge(v).unwrap();
+        let c2 = compute_s256_challenge(v).unwrap();
         assert_eq!(c1, c2);
         assert!(!c1.is_empty());
     }
@@ -3156,7 +3362,9 @@ mod tests {
 
     #[test]
     fn server_token_auth_code_verifier_too_long() {
-        let server = OAuthServer::with_defaults();
+        let mut config = OAuthServerConfig::default();
+        config.max_code_verifier_length = usize::MAX;
+        let server = OAuthServer::new(config);
         let client = OAuthClient::builder("c1")
             .redirect_uri("http://localhost/cb")
             .scope("read")
@@ -3180,12 +3388,12 @@ mod tests {
             )
             .unwrap();
 
-        // Verifier exceeds max length (128 by default)
+        // The fixed RFC bound cannot be weakened by caller configuration.
         let long_verifier = "a".repeat(129);
         let err = server
             .token(&TokenRequest {
                 grant_type: "authorization_code".to_string(),
-                code: Some(code),
+                code: Some(code.clone()),
                 redirect_uri: Some("http://localhost/cb".to_string()),
                 client_id: "c1".to_string(),
                 client_secret: None,
@@ -3197,6 +3405,14 @@ mod tests {
 
         assert_eq!(err.error_code(), "invalid_request");
         assert!(err.description().contains("code_verifier"));
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&code)
+        );
     }
 
     // ========================================
@@ -3791,5 +4007,43 @@ mod tests {
             "http://localhost/callback",
             "http://localhost/callback"
         ));
+    }
+
+    #[test]
+    fn oauth_crypto_ownership_and_fallbacks_are_denied() {
+        let source = include_str!("oauth.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+
+        assert!(!production.contains("getrandom::"));
+        assert!(!production.contains("sha2::"));
+        assert!(!production.contains("hmac::"));
+        assert!(!production.contains("generate_token(bytes"));
+        assert!(production.contains("draw_security_identifier"));
+        assert!(production.contains("sha256_bounded"));
+
+        let token_helper_start = production
+            .find("fn generate_token()")
+            .expect("token helper marker");
+        let token_helper_end = production[token_helper_start..]
+            .find("/// Base64url encodes bytes")
+            .map(|offset| token_helper_start + offset)
+            .expect("token helper end marker");
+        let token_helper = &production[token_helper_start..token_helper_end];
+        for fallback in [
+            "SystemTime",
+            "Instant",
+            "process::",
+            "thread::",
+            "Atomic",
+            "rand::",
+            "usize::MAX",
+        ] {
+            assert!(
+                !token_helper.contains(fallback),
+                "security-token fallback found: {fallback}"
+            );
+        }
     }
 }
