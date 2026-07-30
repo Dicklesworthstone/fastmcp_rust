@@ -41,6 +41,7 @@
 use std::io::{BufReader, Read, Write};
 
 use asupersync::Cx;
+use fastmcp_core::{WebSocketMask, draw_websocket_mask};
 
 use crate::{Codec, Transport, TransportError};
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
@@ -613,6 +614,13 @@ pub struct WsClientWriter<W> {
     writer: W,
 }
 
+fn map_mask_draw_error<E>(error: E) -> TransportError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    TransportError::Io(std::io::Error::other(error))
+}
+
 impl<W: Write> WsClientWriter<W> {
     /// Creates a new client WebSocket writer.
     pub fn new(writer: W) -> Self {
@@ -623,15 +631,9 @@ impl<W: Write> WsClientWriter<W> {
     ///
     /// RFC 6455 Section 5.3: The masking key MUST be unpredictable.
     fn generate_mask() -> Result<[u8; 4], TransportError> {
-        let mut mask = [0u8; 4];
-        // Use CSPRNG for unpredictable mask keys per RFC 6455
-        getrandom::fill(&mut mask).map_err(|e| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("getrandom failed: {e}"),
-            ))
-        })?;
-        Ok(mask)
+        draw_websocket_mask()
+            .map(WebSocketMask::into_bytes)
+            .map_err(map_mask_draw_error)
     }
 
     /// Writes a WebSocket frame with client masking.
@@ -640,6 +642,21 @@ impl<W: Write> WsClientWriter<W> {
     ///
     /// Returns an error if I/O fails.
     pub fn write_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
+        self.write_frame_with_mask_draw(frame, Self::generate_mask)
+    }
+
+    fn write_frame_with_mask_draw<F>(
+        &mut self,
+        frame: &WsFrame,
+        draw_mask: F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnOnce() -> Result<[u8; 4], TransportError>,
+    {
+        // Draw before emitting any header bytes. RNG failure is terminal and
+        // cannot leave a partial frame on the stream.
+        let mask = draw_mask()?;
+
         // First byte: FIN + opcode
         let byte1 = if frame.fin { 0x80 } else { 0x00 } | frame.frame_type.opcode();
 
@@ -659,7 +676,6 @@ impl<W: Write> WsClientWriter<W> {
         }
 
         // Write mask key (cryptographically random per RFC 6455)
-        let mask = Self::generate_mask()?;
         self.writer.write_all(&mask)?;
 
         // Write masked payload
@@ -1012,9 +1028,99 @@ mod tests {
             writer.write_frame(&frame).unwrap();
         }
 
-        // Check that mask bit is set (second byte has 0x80 bit)
-        assert!(buffer.len() >= 2);
+        assert_eq!(buffer.len(), 8);
+        assert_eq!(buffer[0], 0x81);
         assert_ne!(buffer[1] & 0x80, 0, "Mask bit should be set for client");
+        assert_eq!(buffer[6], b'h' ^ buffer[2]);
+        assert_eq!(buffer[7], b'i' ^ buffer[3]);
+
+        let mut reader = WsReader::new(Cursor::new(buffer));
+        assert_eq!(reader.read_frame().unwrap().as_text().unwrap(), "hi");
+    }
+
+    #[test]
+    fn client_writer_applies_injected_mask_exactly_once() {
+        let mut buffer = Vec::new();
+        let draw_calls = std::cell::Cell::new(0);
+
+        {
+            let mut writer = WsClientWriter::new(&mut buffer);
+            writer
+                .write_frame_with_mask_draw(&WsFrame::text("hi"), || {
+                    draw_calls.set(draw_calls.get() + 1);
+                    Ok([0x12, 0x34, 0x56, 0x78])
+                })
+                .unwrap();
+        }
+
+        assert_eq!(draw_calls.get(), 1);
+        assert_eq!(buffer, vec![0x81, 0x82, 0x12, 0x34, 0x56, 0x78, 0x7a, 0x5d]);
+    }
+
+    #[test]
+    fn client_writer_mask_failure_precedes_all_output() {
+        #[derive(Debug)]
+        struct ForcedMaskDrawError;
+
+        impl std::fmt::Display for ForcedMaskDrawError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("forced WebSocket mask draw failure")
+            }
+        }
+
+        impl std::error::Error for ForcedMaskDrawError {}
+
+        let mut buffer = Vec::new();
+        let draw_calls = std::cell::Cell::new(0);
+        let result = {
+            let mut writer = WsClientWriter::new(&mut buffer);
+            writer.write_frame_with_mask_draw(&WsFrame::text("hi"), || {
+                draw_calls.set(draw_calls.get() + 1);
+                Err(map_mask_draw_error(ForcedMaskDrawError))
+            })
+        };
+
+        let error = match result {
+            Err(TransportError::Io(error)) => error,
+            other => panic!("expected mask-draw I/O error, got {other:?}"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ForcedMaskDrawError>())
+                .is_some()
+        );
+        assert_eq!(draw_calls.get(), 1);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn client_writer_draws_fresh_mask_for_every_frame_including_empty() {
+        let mut buffer = Vec::new();
+        let draw_calls = std::cell::Cell::new(0);
+
+        {
+            let mut writer = WsClientWriter::new(&mut buffer);
+            writer
+                .write_frame_with_mask_draw(&WsFrame::text("x"), || {
+                    draw_calls.set(draw_calls.get() + 1);
+                    Ok([0x01, 0x02, 0x03, 0x04])
+                })
+                .unwrap();
+            writer
+                .write_frame_with_mask_draw(&WsFrame::close(), || {
+                    draw_calls.set(draw_calls.get() + 1);
+                    Ok([0x05, 0x06, 0x07, 0x08])
+                })
+                .unwrap();
+        }
+
+        assert_eq!(draw_calls.get(), 2);
+        assert_eq!(&buffer[..6], &[0x81, 0x81, 0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(buffer[6], b'x' ^ 0x01);
+        assert_eq!(&buffer[7..], &[0x88, 0x80, 0x05, 0x06, 0x07, 0x08]);
     }
 
     #[test]
@@ -1701,5 +1807,62 @@ mod tests {
             panic!("expected request");
         };
         assert_eq!(req.method, "after_pong");
+    }
+
+    #[test]
+    fn websocket_mask_ownership_and_fallbacks_are_denied() {
+        let source = include_str!("websocket.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+
+        assert_eq!(production.matches("draw_websocket_mask()").count(), 1);
+        assert_eq!(
+            production.matches(".map_err(map_mask_draw_error)").count(),
+            1
+        );
+        assert!(!production.contains("getrandom::"));
+        assert!(!production.contains("draw_security_identifier"));
+
+        let writer_impl_start = production
+            .find("impl<W: Write> WsClientWriter<W> {")
+            .expect("client writer implementation marker");
+        let writer_impl_end = production[writer_impl_start..]
+            .find("/// Client-side WebSocket transport.")
+            .map(|offset| writer_impl_start + offset)
+            .expect("client writer implementation end marker");
+        let writer_impl = &production[writer_impl_start..writer_impl_end];
+        let mask_decl = writer_impl
+            .lines()
+            .find(|line| line.contains("fn generate_mask()"))
+            .expect("mask helper declaration")
+            .trim_start();
+        let injected_decl = writer_impl
+            .lines()
+            .find(|line| line.contains("fn write_frame_with_mask_draw"))
+            .expect("injected mask helper declaration")
+            .trim_start();
+        assert!(mask_decl.starts_with("fn generate_mask()"));
+        assert!(injected_decl.starts_with("fn write_frame_with_mask_draw"));
+        assert_eq!(
+            writer_impl
+                .matches("self.write_frame_with_mask_draw(frame, Self::generate_mask)")
+                .count(),
+            1
+        );
+
+        for fallback in [
+            "SystemTime",
+            "Instant",
+            "process::",
+            "thread::",
+            "Atomic",
+            "rand::",
+        ] {
+            assert!(
+                !writer_impl.contains(fallback),
+                "WebSocket mask fallback found: {fallback}"
+            );
+        }
     }
 }
