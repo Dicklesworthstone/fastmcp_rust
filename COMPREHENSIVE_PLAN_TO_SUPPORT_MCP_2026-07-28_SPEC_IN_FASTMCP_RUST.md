@@ -4032,15 +4032,19 @@ RESP, topology, scripts, durability, ACLs, and destructive fault
 evidence. AUTHX-01 and AUTHX-03 each cross protocol, provider, trust,
 store, and integration surfaces. The remaining aggregates likewise
 combine unusually broad implementation, test, state, or security
-surfaces. Their parent closes only after their implementation children
-and a named integration child close. Enforce that order in Beads, not
-only in prose: the aggregate formally `blocks`-depends on its
-integration child, the integration child formally `blocks`-depends on
-every implementation child, and each child additionally carries its
-real external prerequisites. Parent-child hierarchy alone is not
-closure enforcement. The preclaim and close checker rejects an
-aggregate without that chain or an integration child that omits an
-implementation child.
+surfaces. Their parent closes only after their implementation children,
+a named integration child, and any declared independent final
+verification child close. Enforce that order in Beads, not only in
+prose: the integration child formally `blocks`-depends on every
+implementation child; an optional verification child formally
+`blocks`-depends on the integration child; and the aggregate formally
+`blocks`-depends on exactly one terminal child—the verification child
+when present, otherwise the integration child. Each child additionally
+carries its real external prerequisites. Parent-child hierarchy alone
+is not closure enforcement. The preclaim and close checker rejects an
+aggregate without that chain, an integration child that omits an
+implementation child, or simultaneous aggregate dependency edges to
+both the integration and verification children.
 
 Every mandatory or voluntary decomposition uses the same schema:
 
@@ -4048,24 +4052,41 @@ Every mandatory or voluntary decomposition uses the same schema:
   `work-package`, domain, profile, and canonical `wp-<package>` labels;
 - every child has issue type `task`, has the formal package as its
   Beads parent, inherits all domain and `profile-*` labels, and adds
-  `work-package-child`, exactly one of `implementation-child` or
-  `integration-child`, and `wp-parent-<lowercase-package-id>`;
+  `work-package-child`, exactly one of `implementation-child`,
+  `integration-child`, or `verification-child`, and
+  `wp-parent-<lowercase-package-id>`;
 - child identity is stable as `<PACKAGE>/<role>-<ascii-slug>` in its
   external reference and Agent Mail thread suffix; renaming a title
   does not change that identity;
-- there is exactly one integration child, it formally
-  `blocks`-depends on every implementation child, and the formal
-  aggregate formally `blocks`-depends on that integration child;
+- there is exactly one integration child and zero or one verification
+  child; the integration child formally `blocks`-depends on every
+  implementation child; when a verification child exists, it formally
+  `blocks`-depends on the integration child and the aggregate formally
+  `blocks`-depends only on the verification child; otherwise the
+  aggregate formally `blocks`-depends on the integration child;
 - an implementation child carries every external prerequisite needed
   for its own work, and the integration child carries any remaining
-  package-level prerequisite needed to verify the assembled result;
-  hierarchy never substitutes for those dependency edges.
+  package-level prerequisite needed to assemble the result;
+- a verification child is an independent post-integration
+  attestation/review role. It may own its exact attestation output and
+  read declared immutable inputs, but it must not author, mutate,
+  repair, or share ownership of implementation outputs or integration
+  receipts; its attester identity must differ from the integration
+  producer identity, and it carries any remaining prerequisite needed
+  to validate the assembled result;
+- hierarchy never substitutes for those dependency edges.
 
 The tracker checker rejects a decomposed package with a missing,
 duplicate, wrongly parented, wrongly labelled, or dependency-bypassing
 child. A voluntarily decomposed package is no longer directly
-claimable and follows the same aggregate-to-integration-to-
-implementation closure chain as the twelve mandatory aggregates.
+claimable and follows the same implementation-to-integration-to-
+optional-verification-to-aggregate closure chain as the twelve
+mandatory aggregates. The checker also rejects more than one
+verification child, a verification child without an integration child,
+a missing integration-to-verification edge, or an aggregate that
+targets both children instead of its one terminal child. It also
+rejects a verification child that writes an input/receipt or reuses
+the integration producer identity.
 
 More than twelve implementation bullets, more than eight test groups,
 or ownership across three or more crates is a mandatory decomposition
@@ -4104,10 +4125,10 @@ They are never reservation paths and do not satisfy an ownership card.
 No reservation may use `crates/**`, a whole crate `/**`, or another
 broad surface.
 Mandatory planning aggregates intentionally have no time estimate;
-every implementation child, integration child, and directly claimed
-formal package must receive an estimate before claim. Each estimate
-must satisfy the 1-through-480-minute rule above; work that cannot must
-be split again before it is claimable.
+every implementation child, integration child, verification child,
+and directly claimed formal package must receive an estimate before
+claim. Each estimate must satisfy the 1-through-480-minute rule above;
+work that cannot must be split again before it is claimable.
 
 The default ownership map is:
 
@@ -32403,6 +32424,56 @@ Round 10 — freeze-candidate fresh-eyes audit:
   intentionally non-current until its one post-freeze Beads
   rematerialization below.
 
+Round 11 — FND-01 execution-schema correction:
+
+- implementation exposed that a sole integration producer cannot also
+  provide independent final attestation without a self-review gap;
+  Section 11 now permits zero or one verification child after the
+  single integration child, requires a distinct read-only attester,
+  and gives the aggregate exactly one terminal child dependency;
+- child-produced evidence, integration receipts, and final attestation
+  are phase-aware: source-input tree hashes exclude only the exact
+  predeclared derived-output paths, which are instead bound by
+  exact-set, producer, parent-chain, byte-length, and content hashes;
+  no attestation recursively hashes itself;
+- this procedural amendment is outside the canonical package region
+  and changes no formal package block or prerequisite. The formal plan
+  therefore remains 122 packages and 606 edges with the graph and
+  corpus fingerprints recorded in Section 36.3;
+- pinned `br 0.2.16` misclassifies required retained child
+  dependencies as dead and can simultaneously report a child as fully
+  unblocked without surfacing it through `br ready` because it treats
+  parent hierarchy as readiness. Section 36.4 permits only those two
+  exact independently reconciled dependency-detector false positives;
+  stale locks, stale merge anchors, unexpected edge/readiness drift,
+  and every other doctor finding remain hard failures.
+
+Round 12 — FND-01 qualification/production sequencing clarification:
+
+- FND-01's ring language defines the exact eventual stable
+  public-verification profile, but the materialized FND-01 child
+  projection owns qualification evidence rather than the public
+  protocol API: `.1.11` pins `ring =0.17.14`, removes legacy production
+  JWT/local-signing reachability, and produces public-verification
+  vectors; `.1.1` may consume ring only through the exact facade-dev
+  qualification surface;
+- FND-01 must not add `fastmcp-protocol/src/jose.rs`, a production ring
+  dependency, a public JOSE export, or a JWT/OIDC support claim.
+  PRT-01 owns that later production module/edge and its protocol-only
+  `jose` build, consumes the independently attested FND-01 evidence,
+  and must reproduce every applicable FND-01 ring gate before
+  promotion. FND-09 separately owns external signer/provider custody;
+- `.1.14` owns the strict offline policy/verifier source but no
+  manifest. It therefore closes only after independent static/schema
+  review; `.1.1` first adds the exact verifier dev dependencies and
+  executes the ordinary verifier through serialized RCH. Any compile,
+  parse, oracle, mutation, handoff, or diagnostic defect reopens
+  `.1.14`; no external harness or unsupported result may substitute;
+- this clarification is outside the canonical package region. It
+  allocates already-planned FND-01 and PRT-01 responsibilities without
+  changing a formal package block, package ID, prerequisite edge, or
+  the Section 36.3 graph/corpus fingerprints.
+
 Canonical fingerprint rules:
 
 - normalize CRLF to LF;
@@ -32483,8 +32554,8 @@ The twelve mandatory planning aggregates are `FND-04`, `FND-08`,
 `FND-09`, `AUTH-00`, `LIMIT-01`, `HTTP-02`, `TASK-02`, `TASKP-01`,
 `TASKR-01`, `AUTHX-01`, `AUTHX-03`, and `PXY-02`. They remain
 unestimated and unclaimable until their enforced
-implementation-child -> integration-child -> aggregate closure chain
-exists.
+implementation-child -> integration-child -> optional
+verification-child -> aggregate closure chain exists.
 
 `profile-core` is the exact 77-package core release closure. Optional
 profile labels are additive affinity deltas, not claims that the
@@ -32779,6 +32850,16 @@ An independent database/document reconciliation then proved:
   77-package core release closure, and every optional closure count in
   Section 36.1.
 
+Implementation, integration, and optional verification children and
+their hierarchy/closure edges are decomposition projections rather
+than formal package nodes or formal prerequisite edges. They never
+alter the 122-package/606-edge graph or canonical package-corpus
+fingerprints above. Their parent, role, labels, ownership cards,
+estimates, reservations, and exact closure edges are validated
+separately under Section 11. The historical absence of decomposition
+children in this snapshot is not a rule forbidding a later
+checker-valid child projection.
+
 `br sync --flush-only --error-policy strict --orphans strict --json`
 exported 401 JSONL records, 923 total project dependency records, 1,171
 labels, and eight comments with a 100% success rate and no error. The
@@ -32854,6 +32935,50 @@ Consequently `bv` is ranking and analysis only.
 dependency-readiness authority and returns exactly FND-01 in this
 snapshot. `br dep cycles --json` returns zero cycles.
 
+#### 36.3.1 Post-FND-01-decomposition operational snapshot
+
+The preceding materialization facts remain timestamped historical
+evidence. After the FND-01 decomposition and the Round 11 procedural
+correction, a fresh read-only reconciliation at
+`2026-07-30T01:00:17Z` found:
+
+- the formal region still contains exactly 122 packages and 606
+  prerequisite edges; its graph remains 14,125 bytes with SHA-256
+  `dd957db1d3c554b9cfbdfc11057f86a32f17f17f85a23e2d2e906466f51bbaab`,
+  and its corpus remains 1,378,269 bytes with SHA-256
+  `2dd228ede2ee00ad6d8ff9f0be4154e8b3b263015ab9a8980c5a6836f27facd4`;
+- the exported tracker contains 416 issue records, 968 dependency
+  records—719 `blocks` plus 249 `parent-child`—1,276 labels, and eight
+  comments;
+- FND-01 has exactly 15 direct children: 13 implementation children,
+  one integration child, and one verification child. The integration
+  child depends on all 13 implementation children, the verification
+  child depends on the integration child, and the aggregate depends
+  only on the verification child;
+- every FND-01 child has one parseable actual-newline ownership card,
+  the 54 literal `Owned` paths are unique, all paths are relative and
+  non-recursive, every empty shared set uses the exact Section 11
+  representation, and `br dep cycles --json` reports zero cycles;
+- `.beads/issues.jsonl` is 2,622,635 bytes with SHA-256
+  `319f01c9390e937c73b8baf7d639b078197538e1c2317f0f531b3b6454a1978e`;
+  all `bv v0.16.0` robot views share data hash
+  `e0ae49d692ba6e22`, and its cycle result is empty.
+- pinned `br 0.2.16` returns an empty `br ready` set because it treats
+  the open parent hierarchy edge as a child blocker, while an
+  independent exact projection proves `.1.14` is the sole
+  dependency-ready FND-01 child: all 12 of its real `blocks`
+  prerequisites are closed. During the pre-FND-02 manual bootstrap,
+  only this exact checker-style child projection may supplement
+  `br ready`; it grants no formal-package readiness.
+
+This supersedes only the earlier operational tracker counts and current
+`bv` hash, not the historical audit record or formal graph/corpus
+identities. The same live audit still reports stale merge-anchor and
+write-lock findings, so the lineage is not claim-ready. The additional
+dependency-detector findings are handled only by the exact versioned
+reconciliation rule in Section 36.4; they do not authorize removing
+required closure/provenance edges or inventing readiness.
+
 ### 36.4 Execution protocol
 
 Use the following fail-closed sequence for every implementation turn.
@@ -32861,7 +32986,23 @@ Use the following fail-closed sequence for every implementation turn.
 1. Run `br doctor --json` and
    `br sync --status --json`. Require doctor `ok: true`, healthy
    workspace state, zero dirty issues, neither DB nor JSONL newer, and
-   no reliability anomaly. Resolve a failure without `--force`.
+   no reliability anomaly. Under pinned `br 0.2.16`, the sole permitted
+   exceptions are findings
+   `fm-dependencies-dead-closed-blocking-edges` and
+   `fm-dependencies-fully-unblocked-open-issues` when an exact
+   independent reconciliation proves every referenced issue exists,
+   its status is exact, every retained child dependency has the
+   Section 11 direction and exact set, and the independently
+   reconstructed formal and child ready sets match the applicable
+   `br ready`, checker, or frozen manual-bootstrap projection below.
+   These detectors can misclassify required retained dependencies and
+   hierarchy-obscured child readiness; neither detector can itself
+   grant readiness, and deleting those edges would destroy the
+   required closure proof. Their exact allowlisted occurrences may
+   make top-level `ok` false without blocking. Any other finding, any
+   change in the independently reconstructed edge/ready sets, or any
+   failure of that reconciliation remains blocking. Resolve a failure
+   without `--force`.
    A sole stale `.beads/.write.lock` warning is still a failed
    precondition: do not infer permission from a zero-byte file or the
    absence of a live process, and do not delete, move, overwrite, or
@@ -32871,9 +33012,14 @@ Use the following fail-closed sequence for every implementation turn.
    36.3 is currently paused at this gate.
 2. Run
    `br ready --epic bd-mcp-2026-07-28-support-ahet --json`.
-   This is the sole dependency-readiness authority. Exclude the epic
-   itself from a formal-package projection and distinguish
-   dependency-ready from claim-ready.
+   This is the sole formal-package dependency-readiness authority.
+   Exclude the epic itself from a formal-package projection and
+   distinguish dependency-ready from claim-ready. For a decomposed
+   child, parent-child hierarchy is ownership only, not a real
+   prerequisite: after FND-02 exists its checker computes the exact
+   contracted child projection. Before then, only the frozen manually
+   reconciled FND-01 and FND-02 child projections described in this
+   section may supplement `br ready`.
 3. After FND-02 has installed it, run
    `cargo xtask plan-tracker-check all`. Before that point, the frozen
    Section 36.3 snapshot permits only the manually validated FND-01
@@ -32883,20 +33029,30 @@ Use the following fail-closed sequence for every implementation turn.
    and parallel-track context. Ignore its epic connector and never use
    `--robot-plan`, `--robot-triage`, or `--robot-next` as readiness
    authority under pinned `bv v0.16.0`.
-5. Select only a formal package or validated child returned ready by
-   Beads and allowed by the checker/bootstrap rule. A formal package's
-   ready state means all formal prerequisites closed; it does not prove
-   estimate, card, reservation, or decomposition compliance.
+5. Select only a formal package returned ready by Beads or a child
+   returned ready by the checker/frozen manual-bootstrap projection.
+   A formal package's ready state means all formal prerequisites
+   closed; it does not prove estimate, card, reservation, or
+   decomposition compliance. A child is ready only when every real
+   non-hierarchy `blocks` prerequisite in its exact Section 11
+   projection is closed; its open parent never substitutes for or
+   blocks those prerequisites.
 6. Never claim a mandatory planning aggregate. Create estimated
    implementation children plus exactly one named integration child
-   under that formal parent, copy all domain/profile labels plus the
-   required child-role and stable-parent labels, retain every child's
-   real external prerequisite, make the integration child
-   `blocks`-depend on every implementation child, and make the formal
-   aggregate `blocks`-depend on the integration child. Voluntary
-   decomposition uses the same chain. Once decomposed, the aggregate
-   is intentionally no longer directly ready; the checker validates
-   readiness through the contracted child projection.
+   and, only when independent post-integration attestation is required,
+   at most one verification child under that formal parent. Copy all
+   domain/profile labels plus the required child-role and stable-parent
+   labels, retain every child's real external prerequisite, and make
+   the integration child `blocks`-depend on every implementation
+   child. If a verification child exists, make it `blocks`-depend on
+   the integration child and make the aggregate `blocks`-depend only
+   on the verification child. Otherwise make the aggregate
+   `blocks`-depend on the integration child. Voluntary decomposition
+   uses the same chain. The verification attester identity must differ
+   from the integration producer identity and may not write any
+   implementation output or integration receipt. Once decomposed, the
+   aggregate is intentionally no longer directly ready; the checker
+   validates readiness through the contracted child projection.
 7. For a directly executable issue, record a positive integer
    1-through-480-minute estimate, the decomposition-review rationale,
    and exact `Owned`, `Shared`, `Reservation`, and `Integrator` values.
@@ -32980,9 +33136,10 @@ failure with a bypass.
 The regression suite must compare Beads' formal ready set with the
 canonical DAG after contracting only checker-valid decomposition
 chains. It must explicitly exclude the hierarchy epic and distinguish
-formal aggregates, implementation children, and integration children.
-A future `bv` version may become a readiness source only after a pinned
-regression proves all three audited hierarchy defects absent.
+formal aggregates, implementation children, integration children, and
+verification children. A future `bv` version may become a readiness
+source only after a pinned regression proves all three audited
+hierarchy defects absent.
 
 The epic contains every one of the 122 formal packages, including
 optional profiles. Therefore `br epic close-eligible --json` may close
