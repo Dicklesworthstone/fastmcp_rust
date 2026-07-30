@@ -1,0 +1,215 @@
+{
+  "_provenance": {
+    "archive_sha256": "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe",
+    "archive_url": "https://static.crates.io/crates/asupersync/asupersync-0.3.9.crate",
+    "canonicalization": "SHA-256 is over UTF-8 JSON of the `features` object only, with keys sorted and separators ',' and ':'.",
+    "feature_count": 56,
+    "feature_object_canonical_json_sha256": "f93df5ae9369da6cd081822797e613ce66a959006edb98d32e0350c27d1f269d",
+    "normalized_manifest_sha256": "8fe507ee87b55e7a1512a072f6857e47484a3107afd5cdf6584129da4e605b79",
+    "version": "0.3.9"
+  },
+  "features": {
+    "atp-cli": [
+      "dep:clap",
+      "tls",
+      "dep:rustls-native-certs"
+    ],
+    "atpd-daemon": [
+      "cli",
+      "dep:tracing-subscriber"
+    ],
+    "benchmark-adapters": [
+      "dep:async-trait",
+      "dep:tokio",
+      "dep:tracing",
+      "tokio/macros",
+      "tokio/sync",
+      "tokio/time",
+      "dep:num_cpus",
+      "dep:whoami",
+      "dep:chrono"
+    ],
+    "browser-io": [],
+    "browser-trace": [],
+    "cancel-correctness-oracle": [],
+    "channel-mpsc-select-e2e": [],
+    "ci-cross-platform": [
+      "messaging-fabric",
+      "waker-profiling",
+      "wasm-browser-preview",
+      "wasm-runtime",
+      "browser-io",
+      "browser-trace",
+      "deterministic-mode",
+      "native-runtime",
+      "wasm-browser-dev",
+      "wasm-browser-prod",
+      "wasm-browser-deterministic",
+      "wasm-browser-minimal",
+      "test-internals",
+      "legacy-internal-test-harnesses",
+      "serialization-golden-harnesses",
+      "real-service-e2e",
+      "h3-websocket-e2e",
+      "raptorq-roundtrip-e2e",
+      "obligation-cleanup-e2e",
+      "metrics",
+      "tracing-integration",
+      "proc-macros",
+      "tower",
+      "trace-compression",
+      "debug-server",
+      "config-file",
+      "lock-metrics",
+      "obligation-leak-detection",
+      "tls",
+      "tls-native-roots",
+      "tls-webpki-roots",
+      "cli",
+      "sqlite",
+      "postgres",
+      "mysql",
+      "quic",
+      "http3",
+      "tailscale-path-provider",
+      "tokio-compat",
+      "compression",
+      "simd-intrinsics",
+      "loom-tests",
+      "cancel-correctness-oracle",
+      "lab-stack-traces",
+      "criterion-benches",
+      "atpd-daemon",
+      "fuzz"
+    ],
+    "cli": [
+      "dep:clap",
+      "dep:time",
+      "trace-compression",
+      "dep:serde_yaml",
+      "dep:chrono",
+      "dep:env_logger",
+      "config-file",
+      "tracing-integration"
+    ],
+    "compression": [
+      "dep:flate2",
+      "dep:brotli"
+    ],
+    "config-file": [
+      "dep:toml"
+    ],
+    "criterion-benches": [],
+    "debug-server": [],
+    "default": [
+      "proc-macros",
+      "nightly-outcome-try"
+    ],
+    "deterministic-mode": [],
+    "fuzz": [
+      "dep:arbitrary",
+      "dep:opentelemetry-proto"
+    ],
+    "h3-websocket-e2e": [],
+    "http3": [
+      "quic"
+    ],
+    "io-uring": [
+      "dep:io-uring"
+    ],
+    "kafka": [
+      "dep:rdkafka"
+    ],
+    "lab-stack-traces": [
+      "dep:backtrace",
+      "dep:rustc-demangle"
+    ],
+    "legacy-internal-test-harnesses": [],
+    "lock-metrics": [],
+    "loom-tests": [
+      "dep:loom"
+    ],
+    "messaging-fabric": [],
+    "metrics": [
+      "dep:opentelemetry",
+      "dep:opentelemetry_sdk",
+      "dep:regex"
+    ],
+    "mysql": [],
+    "native-runtime": [],
+    "nightly-outcome-try": [],
+    "obligation-cleanup-e2e": [],
+    "obligation-leak-detection": [],
+    "postgres": [],
+    "proc-macros": [
+      "dep:asupersync-macros"
+    ],
+    "quic": [],
+    "raptorq-roundtrip-e2e": [],
+    "real-service-e2e": [
+      "channel-mpsc-select-e2e",
+      "h3-websocket-e2e",
+      "obligation-cleanup-e2e",
+      "raptorq-roundtrip-e2e"
+    ],
+    "runtime-metrics": [],
+    "serialization-golden-harnesses": [],
+    "simd-intrinsics": [],
+    "sqlite": [
+      "dep:rusqlite",
+      "dep:sqlparser"
+    ],
+    "tailscale-path-provider": [],
+    "test-internals": [
+      "dep:tracing",
+      "dep:tracing-subscriber",
+      "dep:visibility"
+    ],
+    "tls": [
+      "dep:rustls",
+      "dep:rustls-pki-types",
+      "rustls/ring",
+      "dep:rustls-pemfile",
+      "dep:x509-parser"
+    ],
+    "tls-native-roots": [
+      "tls",
+      "dep:rustls-native-certs"
+    ],
+    "tls-webpki-roots": [
+      "tls",
+      "dep:webpki-roots"
+    ],
+    "tokio-compat": [],
+    "tower": [
+      "dep:tower"
+    ],
+    "trace-compression": [
+      "dep:lz4_flex"
+    ],
+    "tracing-integration": [
+      "dep:tracing"
+    ],
+    "waker-profiling": [],
+    "wasm-browser-deterministic": [
+      "wasm-runtime",
+      "deterministic-mode",
+      "browser-trace"
+    ],
+    "wasm-browser-dev": [
+      "wasm-runtime",
+      "browser-io"
+    ],
+    "wasm-browser-minimal": [
+      "wasm-runtime"
+    ],
+    "wasm-browser-preview": [],
+    "wasm-browser-prod": [
+      "wasm-runtime",
+      "browser-io"
+    ],
+    "wasm-runtime": [
+      "wasm-browser-preview"
+    ]
+  }
+}

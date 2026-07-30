@@ -1,0 +1,127 @@
+{
+  "format": "fastmcp-fnd01-nuget-assets-closure-v1",
+  "libraries": [
+    {
+      "id_version": "Microsoft.Extensions.AI.Abstractions/10.8.3",
+      "path": "microsoft.extensions.ai.abstractions/10.8.3",
+      "sha512": "K0B05oApxmviWalNHPMBBcRC7erKiDATz3ENNR/jqTR9JwIwLRefgDhj2jCRwL1aca99pXUe0qyQC73/xIuZig==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Caching.Abstractions/10.0.10",
+      "path": "microsoft.extensions.caching.abstractions/10.0.10",
+      "sha512": "4ZFBNE+jzR+CrWWlhOesnmywCW7pYKT0dxyAQRdL11yJwxe4jvcAu31eorFtEkoFeCDcUTeNssgPv2yaRRptaQ==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Configuration.Abstractions/10.0.10",
+      "path": "microsoft.extensions.configuration.abstractions/10.0.10",
+      "sha512": "5Vnd2I75DmZCVEjSynIdJ/0EGafgnLQwgR3t2C2/fkjx/nRG+cLwxLLdInoHeCEpkD5K4Ov/g9ZCRYrl4TRsaA==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.DependencyInjection.Abstractions/10.0.10",
+      "path": "microsoft.extensions.dependencyinjection.abstractions/10.0.10",
+      "sha512": "z/2xXlFw2aLGjHyEm6E0tQ+In6VfzQzTrtArbQ2c0TQE16ZbyDCMGPvaUT9I0s8rgy9sRWlU2P9waW37qV04qA==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Diagnostics.Abstractions/10.0.10",
+      "path": "microsoft.extensions.diagnostics.abstractions/10.0.10",
+      "sha512": "9uWiKpeOVac355STyChWR/pliFX/5CeLqChW9kKsaxyDH4EUTZxMkT4Jwp/J/peLm0GBFmSX5c0WCse3yCnq1Q==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.FileProviders.Abstractions/10.0.10",
+      "path": "microsoft.extensions.fileproviders.abstractions/10.0.10",
+      "sha512": "c5zqFCY9DiIpMovLd7/d/CTiEtrMOuQ639dhv3PABtKQIKNQikSHwQt8+N679uii9q+B55lgK28Uv64FOwEu8w==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Hosting.Abstractions/10.0.10",
+      "path": "microsoft.extensions.hosting.abstractions/10.0.10",
+      "sha512": "5LugpYGHk+mkn0a8IZgcyfBca8PCTAU9RQFoMrTdtOOidq88M2SI5f3px6ugnzgxC+eTkvYYJi8pzlUnG5xdAQ==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Logging.Abstractions/10.0.10",
+      "path": "microsoft.extensions.logging.abstractions/10.0.10",
+      "sha512": "zkFxGYUvdxAvIKTyXHrmW+Sux53D4SezD9dMyZ6hrwwzPQJNuwCRy1f5W7AvYTqacEGhWF2XderRQG1OvbV8og==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Options/10.0.10",
+      "path": "microsoft.extensions.options/10.0.10",
+      "sha512": "srnhnk7nE8krBiIXp71LvBmKBtraBONWSRzdjJgRv1Ko9Mp8IVNqv4vIS9hGeVteBig8aQkva9ZG+sC+o5sVcA==",
+      "type": "package"
+    },
+    {
+      "id_version": "Microsoft.Extensions.Primitives/10.0.10",
+      "path": "microsoft.extensions.primitives/10.0.10",
+      "sha512": "5wu/GrYVd8mG2DVUw3vFJzF+O336TyTGg/Kmcgw9bfwYhCoFiV5lR5QeEmKecJyrW4W54nMfD3p3589E8a7czQ==",
+      "type": "package"
+    },
+    {
+      "id_version": "ModelContextProtocol.Core/2.0.0",
+      "path": "modelcontextprotocol.core/2.0.0",
+      "sha512": "piFR0HtA/2Oc1tgk96EE5Tye6qA2sg3WGRAXBhUqo/BWikdEYEs2UuqtmwLrQZJUge1nUOPgGHYsb15VIBK8iw==",
+      "type": "package"
+    },
+    {
+      "id_version": "ModelContextProtocol/2.0.0",
+      "path": "modelcontextprotocol/2.0.0",
+      "sha512": "X/KDNZDP9Zgs7YXXxxpKiDMWWPXYrs764lVgc6vEM4pCg87bYz4VaceeiKW91XDTGgUvIbmRYXgWqyNpV32xRg==",
+      "type": "package"
+    },
+    {
+      "id_version": "System.Diagnostics.DiagnosticSource/10.0.10",
+      "path": "system.diagnostics.diagnosticsource/10.0.10",
+      "sha512": "cjtKi6ERMYWp6b9UTVPcwDT29PjKDtlM3W9OwnWL5abRsI8ku42Q2wqZoLIIXJnT/XF2s2CjuK8Nl4a3mmTxQQ==",
+      "type": "package"
+    },
+    {
+      "id_version": "System.IO.Pipelines/10.0.10",
+      "path": "system.io.pipelines/10.0.10",
+      "sha512": "7WX0W96y3dpQdYG4sEGdh38g3/0lOD4/dKbn2rRVOVzKhzoZUn2gKNIKaFeKWs8RCbpFfmmEWsRhSy95hMpvqA==",
+      "type": "package"
+    },
+    {
+      "id_version": "System.Net.ServerSentEvents/10.0.10",
+      "path": "system.net.serversentevents/10.0.10",
+      "sha512": "1m3dGOl5YI9VhOE+MPCSII+WXZcyYVr5D/UbBifOUxkrx2npczhWjdl0PYZ1tMGygVce1mIfUDhdM1LBiEQFNw==",
+      "type": "package"
+    },
+    {
+      "id_version": "System.Text.Encodings.Web/10.0.10",
+      "path": "system.text.encodings.web/10.0.10",
+      "sha512": "o16m2YpDN/pjHsnxf9pTGwkpcuvjW8v1/wGUwJtM1c3QZUKm7ZEO/eYRJg7iIx6GxS2Zv9lAMHpiQwHDdgqauA==",
+      "type": "package"
+    },
+    {
+      "id_version": "System.Text.Json/10.0.10",
+      "path": "system.text.json/10.0.10",
+      "sha512": "bmsO6UdYtBdtn32zYXfsh7KlyTIzV/3V9hdT9RIb4pXKgYOsNxXR+VbWigNwBtNFVGYGm6Hwmqw5a+/IWFd36Q==",
+      "type": "package"
+    }
+  ],
+  "target": "net8.0",
+  "target_packages": [
+    "Microsoft.Extensions.AI.Abstractions/10.8.3",
+    "Microsoft.Extensions.Caching.Abstractions/10.0.10",
+    "Microsoft.Extensions.Configuration.Abstractions/10.0.10",
+    "Microsoft.Extensions.DependencyInjection.Abstractions/10.0.10",
+    "Microsoft.Extensions.Diagnostics.Abstractions/10.0.10",
+    "Microsoft.Extensions.FileProviders.Abstractions/10.0.10",
+    "Microsoft.Extensions.Hosting.Abstractions/10.0.10",
+    "Microsoft.Extensions.Logging.Abstractions/10.0.10",
+    "Microsoft.Extensions.Options/10.0.10",
+    "Microsoft.Extensions.Primitives/10.0.10",
+    "ModelContextProtocol.Core/2.0.0",
+    "ModelContextProtocol/2.0.0",
+    "System.Diagnostics.DiagnosticSource/10.0.10",
+    "System.IO.Pipelines/10.0.10",
+    "System.Net.ServerSentEvents/10.0.10",
+    "System.Text.Encodings.Web/10.0.10",
+    "System.Text.Json/10.0.10"
+  ]
+}

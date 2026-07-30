@@ -1,0 +1,934 @@
+manifest_format = "fastmcp-fnd-01-core-conformance-v1"
+work_package = "FND-01"
+bead = "bd-mcp-2026-07-28-support-ahet.1.2"
+scope = "Final MCP 2026-07-28 core and pinned launch-day conformance inputs"
+retrieval_date = "2026-07-29"
+artifact_count = 6
+artifact_bytes_are_unmodified = true
+source_rewriting_generator_used = false
+
+[authority_domains.wire_contract]
+applies_to = [
+  "wire structures",
+  "required fields",
+  "unions",
+  "constants",
+  "message directionality",
+]
+precedence = [
+  "final tagged schema.ts as source of truth",
+  "final generated JSON Schema as derivative validation material",
+  "dated changelog as explanation of intended deltas",
+]
+
+[authority_domains.behavioral_contract]
+applies_to = [
+  "behavior",
+  "transports",
+  "authorization",
+  "security",
+  "caching",
+  "lifecycle",
+]
+precedence = [
+  "final dated normative prose",
+  "final accepted SEPs and conformance traceability as clarification of intent",
+  "official extension specifications for their own negotiated surfaces",
+]
+
+[authority_domains.migration_and_context]
+applies_to = [
+  "migration",
+  "implementation context",
+]
+precedence = [
+  "official conformance scenarios as observable examples",
+  "official SDK migration guides as non-normative implementation patterns",
+  "release and product announcements as context only",
+]
+
+[authority_domains.cross_domain_conflict]
+schema_prose_conflict = "blocking_upstream_ambiguity"
+rule = "Any conflict between the final tagged schema and final normative prose blocks implementation; neither source globally outranks the other across domains."
+
+[core]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+protocol_version = "2026-07-28"
+tag = "2026-07-28"
+tag_target_type = "commit"
+tag_commit = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+commit_tree = "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"
+commit_author_date = "2026-07-28T16:44:35Z"
+dated_spec_tree = "db87fd4f40e51d80325f21c0d99bcdaf6f52b1b1"
+dated_schema_tree = "8b5e263be073848f9531151cb363ccb764eb2da6"
+specification_url = "https://modelcontextprotocol.io/specification/2026-07-28"
+changelog_url = "https://modelcontextprotocol.io/specification/2026-07-28/changelog"
+commit_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/commit/5f5440bb26a62e2cf3440b92da5a667efa03b267"
+compare_to_prior_version_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/compare/2025-11-25...2026-07-28"
+authority = "The immutable 2026-07-28 tag is authoritative; later default-branch edits are not silently incorporated."
+
+[core.post_release_drift]
+inspected_revision = "aa7306efa4dcc03a2a9f2f223e3b2d7a0c5f3ded"
+inspected_on = "2026-07-29"
+dated_spec_tree = "973d19bffc162f84656bb91cf87cc818a49a30d2"
+dated_schema_tree = "8b5e263be073848f9531151cb363ccb764eb2da6"
+classification = "Within the dated 2026-07-28 specification subtree, only link-target repairs were observed; no wire shape, normative requirement, or behavioral prose change in that subtree supersedes the final tag. This statement makes no claim about changes elsewhere in the compared repository commit."
+authority_changed = false
+
+[conformance]
+repository = "https://github.com/modelcontextprotocol/conformance"
+revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+commit_tree = "699705222f144a15fb7fdcc1b4f0b0a62825aef0"
+commit_author_date = "2026-07-28T09:56:25Z"
+auth_scenario_tree = "84d79c0194b649917a7143022e6c920e686bff8e"
+package_name = "@modelcontextprotocol/conformance"
+package_version = "0.2.0-alpha.10"
+package_version_source = "artifact:conformance-package"
+scenario_inventory = [
+  "auth/enterprise-managed-authorization",
+  "auth/client-credentials-jwt",
+  "auth/client-credentials-basic",
+]
+scenario_inventory_count = 3
+authority = "reproducible_audit_baseline"
+permanent_release_oracle = false
+final_schema_alignment_established = false
+default_suite_completeness_established = false
+source_label_at_freeze = "internal draft terminology"
+policy = "Run every applicable scenario explicitly; zero reported failures with omitted, filtered, or silently skipped scenarios is not success."
+policy_rejection_rule = "An expected FastMCP policy rejection is a raw negative and must never be reported as a passing upstream conformance scenario."
+
+[conformance.drift]
+current_ci_mode = "warning"
+blocking_transition = "CONF-02"
+reason = "The launch-day revision is reproducible but is not the permanent final-schema release oracle."
+blocking_requirements = [
+  "Pin a reviewed conformance revision whose vendored schema matches the final tagged schema.",
+  "Prove the scenario manifest contains every traceability-backed 2026-07-28 check.",
+  "Extend the frozen scenario-local declared check IDs below to a complete helper-expanded runtime inventory, including all skips, filters, and xfails.",
+]
+
+[conformance.check_inventory_scope]
+scenario_local_declared_ids_frozen = true
+scenario_local_status_roles_frozen = true
+exact_transitive_helper_closure_inspected = false
+complete_transitive_helper_inventory_established = false
+followup_owner = "CONF-02"
+known_direct_check_producers = [
+  "src/scenarios/client/auth/helpers/createAuthServer.ts",
+  "src/scenarios/client/auth/helpers/createServer.ts",
+  "src/scenarios/client/auth/helpers/mockTokenVerifier.ts",
+]
+known_non_exhaustive_transitive_check_examples = [
+  "authorization-server-metadata",
+  "token-request",
+  "prm-pathbased-requested",
+  "valid-bearer-token",
+  "invalid-bearer-token",
+]
+scope = "Only check IDs declared directly in the two vendored scenario source files are frozen here. Direct helpers and their imports can append checks at runtime."
+incompleteness = "The exact pinned helper closure has not been exhaustively inspected, so the examples above are not a complete transitive inventory and this manifest makes no complete harness check-inventory claim."
+
+[[artifacts]]
+id = "core-schema-ts"
+kind = "final_core_typescript_schema"
+authority = "final_tagged_schema"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+git_tree = "8b5e263be073848f9531151cb363ccb764eb2da6"
+git_blob_sha1 = "9b55feeb412bc3ae877f2eac10b5c01ba29a2eed"
+upstream_path = "schema/2026-07-28/schema.ts"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts"
+media_type = "text/typescript; charset=utf-8"
+byte_length = 98426
+sha256 = "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"
+
+[[artifacts]]
+id = "core-schema-json"
+kind = "final_core_generated_json_schema"
+authority = "final_tagged_schema"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+git_tree = "8b5e263be073848f9531151cb363ccb764eb2da6"
+git_blob_sha1 = "213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8"
+upstream_path = "schema/2026-07-28/schema.json"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json"
+media_type = "application/schema+json"
+byte_length = 181474
+sha256 = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203"
+
+[[artifacts]]
+id = "core-changelog"
+kind = "final_dated_changelog"
+authority = "final_tagged_release_record"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+git_tree = "db87fd4f40e51d80325f21c0d99bcdaf6f52b1b1"
+git_blob_sha1 = "dc5c9a9cf3e6895504534cf3f300514394d8c6ae"
+upstream_path = "docs/specification/2026-07-28/changelog.mdx"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx"
+media_type = "text/mdx; charset=utf-8"
+byte_length = 11714
+sha256 = "ba4d0ba299ff0b45d26c52111d41dc0c862dd04ef973f63f93570c2b020f3974"
+
+[[artifacts]]
+id = "conformance-package"
+kind = "conformance_package_manifest"
+authority = "pinned_verification_input"
+repository = "https://github.com/modelcontextprotocol/conformance"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+git_tree = "699705222f144a15fb7fdcc1b4f0b0a62825aef0"
+git_blob_sha1 = "e59d9f0411a9f7e9e11f2b57f45bdbcab65e1137"
+upstream_path = "package.json"
+source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/package.json"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/package.json"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/conformance-package-49103de6.json"
+media_type = "application/json"
+byte_length = 1972
+sha256 = "2fd65cda83b8af49452198944e1924a9dc1a52ed4f56aba18e1d814922150149"
+
+[[artifacts]]
+id = "conformance-enterprise-auth"
+kind = "conformance_auth_scenario_source"
+authority = "pinned_verification_input"
+repository = "https://github.com/modelcontextprotocol/conformance"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+git_tree = "84d79c0194b649917a7143022e6c920e686bff8e"
+git_blob_sha1 = "eff5e255fac86344d2d212c5942454fa4664c731"
+upstream_path = "src/scenarios/client/auth/enterprise-managed-authorization.ts"
+source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/enterprise-managed-authorization.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/enterprise-managed-authorization.ts"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/conformance-enterprise-managed-authorization-49103de6.ts"
+media_type = "text/typescript; charset=utf-8"
+byte_length = 18666
+sha256 = "caec7e9a28f6de14678612682115cb5b6f3125d3e233f6a52250435f6a0383c2"
+
+[[artifacts]]
+id = "conformance-client-credentials"
+kind = "conformance_auth_scenario_source"
+authority = "pinned_verification_input"
+repository = "https://github.com/modelcontextprotocol/conformance"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+git_tree = "84d79c0194b649917a7143022e6c920e686bff8e"
+git_blob_sha1 = "d633f7a57fe3da3a3e9eaff28af213c3669beac9"
+upstream_path = "src/scenarios/client/auth/client-credentials.ts"
+source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/client-credentials.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/client-credentials.ts"
+retrieval_date = "2026-07-29"
+vendored_path = "evidence/fnd-01/vendor/core/conformance-client-credentials-49103de6.ts"
+media_type = "text/typescript; charset=utf-8"
+byte_length = 13961
+sha256 = "fe9b9e2a0f62962d2eeecc772b3ed1ee8be9941a7bc792c19a9a29a8b452c3c4"
+
+[[final_error_codes]]
+name = "HeaderMismatchError"
+typescript_constant = "HEADER_MISMATCH"
+code = -32020
+http_status = 400
+typescript_artifact = "core-schema-ts"
+json_schema_artifact = "core-schema-json"
+json_pointer = "#/$defs/HeaderMismatchError/properties/error/allOf/1/properties/code/const"
+
+[[final_error_codes]]
+name = "MissingRequiredClientCapabilityError"
+typescript_constant = "MISSING_REQUIRED_CLIENT_CAPABILITY"
+code = -32021
+http_status = 400
+typescript_artifact = "core-schema-ts"
+json_schema_artifact = "core-schema-json"
+json_pointer = "#/$defs/MissingRequiredClientCapabilityError/properties/error/allOf/1/properties/code/const"
+
+[[final_error_codes]]
+name = "UnsupportedProtocolVersionError"
+typescript_constant = "UNSUPPORTED_PROTOCOL_VERSION"
+code = -32022
+http_status = 400
+typescript_artifact = "core-schema-ts"
+json_schema_artifact = "core-schema-json"
+json_pointer = "#/$defs/UnsupportedProtocolVersionError/properties/error/allOf/1/properties/code/const"
+
+[[conformance_scenarios]]
+id = "auth/enterprise-managed-authorization"
+source_artifact = "conformance-enterprise-auth"
+source_symbol = "EnterpriseManagedAuthorizationScenario"
+source_name_line = 59
+extension_id = "io.modelcontextprotocol/enterprise-managed-authorization"
+profile = "extension"
+raw_role = "multi-cause policy negative"
+source_audit_finding_count = 29
+forced_input_incompatibility_count = 12
+missing_or_overpermissive_oracle_count = 8
+missing_production_evidence_count = 9
+scenario_local_declared_check_id_count = 2
+scenario_local_declared_check_ids = [
+  "complete-flow-token-exchange",
+  "complete-flow-jwt-bearer",
+]
+scenario_local_expected_success_path_check_ids = [
+  "complete-flow-token-exchange",
+  "complete-flow-jwt-bearer",
+]
+scenario_local_conditional_failure_check_ids = [
+  "complete-flow-token-exchange",
+  "complete-flow-jwt-bearer",
+]
+observed_result = "not_run_in_source_freeze"
+upstream_pass_claimed = false
+production_positive_claimed = false
+
+[[conformance_scenarios]]
+id = "auth/client-credentials-jwt"
+source_artifact = "conformance-client-credentials"
+source_symbol = "ClientCredentialsJwtScenario"
+source_name_line = 35
+extension_id = "io.modelcontextprotocol/oauth-client-credentials"
+profile = "extension"
+raw_role = "multi-cause policy negative"
+source_audit_finding_count = 9
+forced_input_incompatibility_count = 4
+missing_or_overpermissive_oracle_count = 3
+missing_production_evidence_count = 2
+scenario_local_declared_check_id_count = 5
+scenario_local_declared_check_ids = [
+  "client-credentials-grant-type",
+  "client-credentials-assertion-type",
+  "client-credentials-jwt-iss",
+  "client-credentials-jwt-sub",
+  "client-credentials-jwt-verified",
+]
+scenario_local_expected_success_path_check_ids = [
+  "client-credentials-jwt-verified",
+]
+scenario_local_conditional_failure_check_ids = [
+  "client-credentials-grant-type",
+  "client-credentials-assertion-type",
+  "client-credentials-jwt-iss",
+  "client-credentials-jwt-sub",
+  "client-credentials-jwt-verified",
+]
+observed_result = "not_run_in_source_freeze"
+upstream_pass_claimed = false
+production_positive_claimed = false
+
+[[conformance_scenarios]]
+id = "auth/client-credentials-basic"
+source_artifact = "conformance-client-credentials"
+source_symbol = "ClientCredentialsBasicScenario"
+source_name_line = 257
+extension_id = "io.modelcontextprotocol/oauth-client-credentials"
+profile = "extension"
+raw_role = "applicable raw Basic wire evidence"
+source_audit_finding_count = 3
+forced_input_incompatibility_count = 0
+missing_or_overpermissive_oracle_count = 0
+missing_production_evidence_count = 3
+scenario_local_declared_check_id_count = 2
+scenario_local_declared_check_ids = [
+  "client-credentials-grant-type",
+  "client-credentials-basic-auth",
+]
+scenario_local_expected_success_path_check_ids = [
+  "client-credentials-basic-auth",
+]
+scenario_local_conditional_failure_check_ids = [
+  "client-credentials-grant-type",
+  "client-credentials-basic-auth",
+]
+observed_result = "not_run_in_source_freeze"
+upstream_pass_claimed = false
+production_positive_claimed = false
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/enterprise-managed-authorization"
+check_id = "complete-flow-token-exchange"
+source_artifact = "conformance-enterprise-auth"
+expected_success_path = true
+conditional_failure = true
+success_declaration_lines = [249]
+failure_declaration_lines = [188, 220, 292, 528]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/enterprise-managed-authorization"
+check_id = "complete-flow-jwt-bearer"
+source_artifact = "conformance-enterprise-auth"
+expected_success_path = true
+conditional_failure = true
+success_declaration_lines = [479]
+failure_declaration_lines = [319, 344, 368, 386, 404, 439, 461, 498, 542]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-jwt"
+check_id = "client-credentials-grant-type"
+source_artifact = "conformance-client-credentials"
+expected_success_path = false
+conditional_failure = true
+success_declaration_lines = []
+failure_declaration_lines = [59]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-jwt"
+check_id = "client-credentials-assertion-type"
+source_artifact = "conformance-client-credentials"
+expected_success_path = false
+conditional_failure = true
+success_declaration_lines = []
+failure_declaration_lines = [84]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-jwt"
+check_id = "client-credentials-jwt-iss"
+source_artifact = "conformance-client-credentials"
+expected_success_path = false
+conditional_failure = true
+success_declaration_lines = []
+failure_declaration_lines = [116]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-jwt"
+check_id = "client-credentials-jwt-sub"
+source_artifact = "conformance-client-credentials"
+expected_success_path = false
+conditional_failure = true
+success_declaration_lines = []
+failure_declaration_lines = [138]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-jwt"
+check_id = "client-credentials-jwt-verified"
+source_artifact = "conformance-client-credentials"
+expected_success_path = true
+conditional_failure = true
+success_declaration_lines = [159]
+failure_declaration_lines = [185, 235]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-basic"
+check_id = "client-credentials-grant-type"
+source_artifact = "conformance-client-credentials"
+expected_success_path = false
+conditional_failure = true
+success_declaration_lines = []
+failure_declaration_lines = [282]
+
+[[scenario_local_check_declarations]]
+scenario_id = "auth/client-credentials-basic"
+check_id = "client-credentials-basic-auth"
+source_artifact = "conformance-client-credentials"
+expected_success_path = true
+conditional_failure = true
+success_declaration_lines = [345]
+failure_declaration_lines = [302, 328, 398]
+
+[[scenario_observations]]
+scenario_id = "auth/enterprise-managed-authorization"
+first_observed_pre_dispatch_rejection_required = true
+status = "pending_runtime_observation"
+first_observed_pre_dispatch_rejection = "not_observed_in_FND-01_byte_freeze"
+followup_owner = "CONF-02"
+rule = "Record the first rejection actually emitted by the unmodified raw scenario; do not attribute the result to ES256 alone."
+
+[[scenario_observations]]
+scenario_id = "auth/client-credentials-jwt"
+first_observed_pre_dispatch_rejection_required = true
+status = "pending_runtime_observation"
+first_observed_pre_dispatch_rejection = "not_observed_in_FND-01_byte_freeze"
+followup_owner = "CONF-02"
+rule = "Record the first rejection actually emitted by the unmodified raw scenario; preserve every ordered incompatibility."
+
+[[scenario_observations]]
+scenario_id = "auth/client-credentials-basic"
+first_observed_pre_dispatch_rejection_required = false
+independent_runtime_result_required = true
+status = "pending_runtime_observation"
+first_observed_pre_dispatch_rejection = "not_applicable"
+followup_owner = "CONF-02"
+rule = "Record the raw Basic result independently; never promote it to production-positive evidence."
+
+# Ordered source audit for auth/enterprise-managed-authorization.
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 1
+category = "forced_input_incompatibility"
+finding = "The IdP ID Token is generated with ES256 rather than the admitted stable RS256 profile."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 2
+category = "forced_input_incompatibility"
+finding = "The ID-JAG is generated with ES256 rather than the admitted stable RS256 profile."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 3
+category = "forced_input_incompatibility"
+finding = "Resource authorization-server metadata omits authorization_grant_profiles_supported."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 4
+category = "forced_input_incompatibility"
+finding = "IdP metadata omits identity_chaining_requested_token_types_supported."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 5
+category = "forced_input_incompatibility"
+finding = "The first-stage confidential-client authentication contract is absent."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 6
+category = "forced_input_incompatibility"
+finding = "IdP metadata omits id_token_signing_alg_values_supported."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 7
+category = "forced_input_incompatibility"
+finding = "The injected ID Token has no kid."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 8
+category = "forced_input_incompatibility"
+finding = "The injected ID Token has no nonce."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 9
+category = "forced_input_incompatibility"
+finding = "The advertised IdP JWKS URI has no route."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 10
+category = "missing_or_overpermissive_oracle"
+finding = "The first token endpoint omits the complete Cache-Control: no-store plus Pragma: no-cache response pair. Missing either field is a bounded peer-nonconformance diagnostic and does not alone invalidate an otherwise admitted response."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 11
+category = "missing_or_overpermissive_oracle"
+finding = "The second token endpoint omits the complete Cache-Control: no-store plus Pragma: no-cache response pair. Missing either field is a bounded peer-nonconformance diagnostic and does not alone invalidate an otherwise admitted response."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 12
+category = "forced_input_incompatibility"
+finding = "The ID-JAG has no kid."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 13
+category = "missing_or_overpermissive_oracle"
+finding = "The pinned scenario uses the default empty requested scope set, so omitting signed ID-JAG scope is correct for that run. It leaves nonempty signed-scope binding unexercised while stage two trusts request-body scope."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 14
+category = "forced_input_incompatibility"
+finding = "The stage-two response cannot satisfy the EnterpriseAccessTokenResponse resource overlay."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 15
+category = "missing_or_overpermissive_oracle"
+finding = "The redeemer treats trailing-slash variants of the ID-JAG audience as equivalent."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 16
+category = "missing_or_overpermissive_oracle"
+finding = "The redeemer supplies no expected issuer to JWT verification."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 17
+category = "missing_or_overpermissive_oracle"
+finding = "The redeemer decodes attacker-controlled sub before verification to select an in-memory key."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 18
+category = "missing_or_overpermissive_oracle"
+finding = "The redeemer has no trusted issuer/JWKS admission policy."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 19
+category = "missing_or_overpermissive_oracle"
+finding = "Stage two derives scopes from the request body instead of enforcing the signed ID-JAG scope."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 20
+category = "missing_production_evidence"
+finding = "Raw idp_id_token context injection supplies no identity-backend session or provider proof."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 21
+category = "missing_production_evidence"
+finding = "Raw ID-token injection supplies no durable one-use evidence."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 22
+category = "missing_production_evidence"
+finding = "Raw ID-token injection supplies no distinct-assertion recovery contract."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 23
+category = "missing_production_evidence"
+finding = "The confidential client secret is injected without an issuer-bound credential-provider artifact."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 24
+category = "missing_production_evidence"
+finding = "Client registration evidence does not bind the enterprise profile and both required grant types."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 25
+category = "forced_input_incompatibility"
+finding = "The scenario supplies only a fresh mock-memory ID-JAG key and lacks the required exact-issuer-bound IdJagIssuerCryptoPolicy and JWKS generation; the profile rejects this configuration before assertion acquisition or exchange dispatch."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 26
+category = "missing_production_evidence"
+finding = "There is no deployment-assigned issuer/redeemer trust domain or isolated-boundary evidence."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 27
+category = "missing_production_evidence"
+finding = "The redeemer has no durable ID-JAG replay and one-use authority."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 28
+category = "missing_production_evidence"
+finding = "The fixture supplies no independent Resource-AS to IdP relying-party registration."
+
+[[conformance_findings]]
+scenario_id = "auth/enterprise-managed-authorization"
+ordinal = 29
+category = "missing_production_evidence"
+finding = "The fixture supplies no pairwise-subject continuity evidence."
+
+# Ordered source audit for auth/client-credentials-jwt.
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 1
+category = "forced_input_incompatibility"
+finding = "The scenario generates and advertises ES256 instead of the admitted stable RS256 profile."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 2
+category = "forced_input_incompatibility"
+finding = "The scenario gives the client a raw private-key PEM."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 3
+category = "forced_input_incompatibility"
+finding = "The scenario provides no FND-09 external-signer registration receipt."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 4
+category = "forced_input_incompatibility"
+finding = "The scenario provides no admitted RSA kid binding."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 5
+category = "missing_or_overpermissive_oracle"
+finding = "The verifier treats ClientAssertionAudience values that differ only by one or more trailing slashes as equivalent."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 6
+category = "missing_or_overpermissive_oracle"
+finding = "The verifier does not require the bounded exp claim selected by the RFC 7523 profile."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 7
+category = "missing_or_overpermissive_oracle"
+finding = "The verifier does not require the unique jti claim selected by the RFC 7523 profile."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 8
+category = "missing_production_evidence"
+finding = "The in-process loopback mock is not an external authorization-server process."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-jwt"
+ordinal = 9
+category = "missing_production_evidence"
+finding = "The fixture supplies no production TLS identity, external custody boundary, immutable peer configuration, or wire-capture evidence."
+
+# Ordered source audit for auth/client-credentials-basic.
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-basic"
+ordinal = 1
+category = "missing_production_evidence"
+finding = "The target is loopback cleartext HTTP rather than production HTTPS Streamable HTTP."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-basic"
+ordinal = 2
+category = "missing_production_evidence"
+finding = "The client secret is injected through scenario context rather than a named attested secret provider."
+
+[[conformance_findings]]
+scenario_id = "auth/client-credentials-basic"
+ordinal = 3
+category = "missing_production_evidence"
+finding = "The raw scenario cannot establish transport permission, secret custody, or a production external-peer boundary."
+
+[derived_negative_policy]
+algorithm_negative_requirement = "Derive one separately hashed, one-variable algorithm negative from a conforming RS256 baseline and preserve its exact provenance and diff."
+raw_fixture_rule = "No raw negative, local derivative, or source-adjusted fixture may be labeled passing upstream conformance."
+positive_requirement = "Stable or experimental auth claims require independent, nonempty RS256 real-peer positives."
+real_peer_exclusions = [
+  "in-process mock",
+  "FastMCP issuer path",
+  "source-adjusted conformance fixture",
+  "loopback-cleartext waiver",
+  "self-test against the same implementation",
+  "test-only adapter",
+]
+
+[fixture_provenance]
+adjacent_manifest = "evidence/fnd-01/core-conformance.toml"
+vendored_root = "evidence/fnd-01/vendor/core"
+policy = "Each vendored fixture is an unmodified upstream response body. Its adjacent artifact table records repository, immutable revision, upstream path, URLs, retrieval date, byte length, Git blob SHA-1, and SHA-256."
+headers_added_to_vendored_bytes = false
+reason_no_inline_header = "Adding a header would alter the authoritative upstream bytes and invalidate their checksums."
+
+[manual_update]
+review_required = true
+floating_revision_allowed = false
+source_rewriting_generator_allowed = false
+steps = [
+  "Open a reviewed evidence change that names the proposed immutable core and conformance revisions; never start from a default branch, rendered page, floating package range, or latest draft URL.",
+  "Resolve the core tag with git ls-remote and resolve each repository commit and tree through the upstream Git object API.",
+  "Fetch every artifact from its raw immutable commit URL without content transformation; retain the exact response body.",
+  "Compute and record the byte length, SHA-256, upstream Git blob SHA-1, retrieval URL, source page URL, and UTC retrieval date before changing this manifest.",
+  "Review semantic diffs for both schema.ts and schema.json against the currently frozen bytes. A generated-schema-only or TypeScript-only change is insufficient.",
+  "Review the dated normative prose and changelog diff against the schema diff. Any final prose/schema conflict is a blocking upstream ambiguity.",
+  "Review both auth source files and package.json at the proposed conformance revision. Re-enumerate exact scenario IDs and every check, skip, filter, xfail, forced incompatibility, weak oracle, and missing production-evidence category.",
+  "Do not promote the conformance revision unless its vendored schema matches the final tagged schema and its traceability-backed 2026-07-28 scenario inventory is complete.",
+  "Review the complete Section 5 ambiguity register and add, remove, or resolve entries only through a semantic evidence review.",
+  "Add new immutable vendored paths rather than silently replacing prior evidence. Make repository changes only through apply_patch and never run a source-rewriting generator.",
+  "Run TOML parsing, local byte/hash verification, Git blob verification, source-revision checks, exact error-code checks, exact scenario-inventory checks, provenance checks, and all drift negatives.",
+  "Require maintainer review of schema, prose, conformance, ambiguity, and provenance diffs before changing the baseline or switching CI drift from warning to blocking.",
+]
+
+[verification]
+local_sha256_command = "shasum -a 256 <vendored_path>"
+local_byte_length_command = "wc -c < <vendored_path>"
+remote_sha256_command = "curl --fail --silent --show-error --location <retrieval_url> | shasum -a 256"
+remote_byte_length_command = "curl --fail --silent --show-error --location <retrieval_url> | wc -c"
+git_blob_command = "curl --fail --silent --show-error --location <retrieval_url> | git hash-object --stdin"
+core_tag_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2026-07-28"
+toml_parse_command = "python3 -c 'import pathlib,tomllib; tomllib.loads(pathlib.Path(\"evidence/fnd-01/core-conformance.toml\").read_text())'"
+required_negative_cases = [
+  "missing artifact",
+  "swapped artifact paths",
+  "truncated artifact",
+  "wrong byte length",
+  "wrong SHA-256",
+  "wrong Git blob",
+  "changed retrieval URL",
+  "floating revision or latest URL",
+  "missing provenance field",
+  "duplicate or missing scenario ID",
+  "missing, duplicate, or changed scenario-local declared check ID",
+  "expected-success versus conditional-failure check-role mismatch",
+  "incomplete transitive helper inventory mislabeled complete",
+  "file-level auth scenario classification",
+  "nonfatal missing cache header mislabeled as forced input",
+  "empty-scope omission mislabeled as a forced signed-scope failure",
+  "missing exact-issuer ID-JAG policy mislabeled as production-only evidence",
+  "expected policy rejection mislabeled as upstream pass",
+  "wrong final error code",
+  "missing or duplicate Section 5 ambiguity entry",
+]
+
+# This register freezes the complete known ambiguity inventory. The full
+# adopted resolution remains in the cited plan section and must be reviewed
+# semantically rather than abbreviated into a new source of truth here.
+[[ambiguities]]
+id = "5.1"
+title = "Tasks extension lag"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.1"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.2"
+title = "Subscription teardown wording"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.2"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.3"
+title = "Apps lifecycle wording"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.3"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.4"
+title = "Release examples"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.4"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.5"
+title = "Deprecated HTTP+SSE disposition"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.5"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.6"
+title = "Authorization-profile wire-negotiation ambiguity"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.6"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.7"
+title = "Broken Streamable HTTP response semantics"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.7"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.8"
+title = "Generated JSON Schema numeric narrowing"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.8"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.9"
+title = "HTTP dual-era fallback status wording"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.9"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.10"
+title = "Stdio any-other-error fallback boundary"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.10"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.11"
+title = "Landing-page extension-negotiation drift"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.11"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.12"
+title = "Icon source prose conflict"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.12"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.13"
+title = "Malformed trace-context receiver behavior"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.13"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.14"
+title = "Legacy versions inside modern negotiation results"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.14"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.15"
+title = "resultType backward-compatibility scope"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.15"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.16"
+title = "JSON-RPC errors when no request ID is readable"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.16"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.17"
+title = "SSE UTF-8 decoding is replacement-mode, not strict validation"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.17"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.18"
+title = "Tool output schemas and error results"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.18"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.19"
+title = "MRTR input requests are embedded descriptors"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.19"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.20"
+title = "Missing-resource error example versus conformance"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.20"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.21"
+title = "Stdio log notifications have no standard request correlator"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.21"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.22"
+title = "Deprecation dates are eligibility boundaries, not removals"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.22"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.23"
+title = "Tasks timestamps have prose semantics but only string schemas"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.23"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.24"
+title = "ID-JAG requires response grants that its examples omit"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.24"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.25"
+title = "Enterprise CIMD link differs from final core"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.25"
+status = "recognized_with_frozen_resolution"
+
+[[ambiguities]]
+id = "5.26"
+title = "OIDC code-token invalid_client has conflicting status mandates"
+source_section = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md Section 5.26"
+status = "recognized_with_frozen_resolution"

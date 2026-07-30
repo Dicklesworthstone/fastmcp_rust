@@ -1,0 +1,1001 @@
+# FND-01 immutable cross-SDK interoperability evidence.
+#
+# This manifest is the adjacent provenance record for every native lock and
+# locally authored consumer input under sdk-locks/. The SDKs are executable
+# interoperability peers only; they do not override the final tagged schema or
+# normative prose.
+
+manifest_format = "fastmcp-fnd-01-sdk-matrix-v1"
+manifest_revision = 3
+work_package = "FND-01"
+bead = "bd-mcp-2026-07-28-support-ahet.1.5"
+protocol_version = "2026-07-28"
+retrieved_at_utc = "2026-07-29T21:16:40Z"
+corrected_after_independent_review_at_utc = "2026-07-29T21:43:19Z"
+truthfulness_revalidated_at_utc = "2026-07-29T21:59:09Z"
+retrieval_agent = "GoldenMink"
+plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+artifact_count = 13
+artifact_count_scope = "Every regular file under evidence/fnd-01/sdk-locks/."
+artifact_total_bytes = 35759
+source_rewriting_generator_used = false
+native_package_manager_locks_used = true
+cargo_invoked = false
+
+authority_order = [
+  "final tagged MCP schema and final normative prose",
+  "immutable dated SDK-tier catalog for peer inclusion only",
+  "pinned SDK source revisions and registry artifacts as interoperability evidence only",
+]
+
+[policy]
+sdk_authority = "interoperability_peer_only"
+normative_authority = false
+floating_versions_allowed = false
+floating_default_branches_allowed = false
+unreviewed_catalog_drift_allowed = false
+duplicate_peers_allowed = false
+lower_tier_substitution_allowed = false
+offline_resolution_required = true
+lock_scope = "isolated consumer/project per ecosystem; no FastMCP workspace dependency graph is reused"
+source_binding_rule = "A source tag/commit and a registry artifact are separately frozen. An embedded VCS revision is recorded where the registry format supplies one; otherwise no cryptographic source-to-artifact binding is claimed."
+
+[proof_environment]
+host_os = "macOS 26.5 (Build 25F71)"
+host_arch = "arm64"
+shell = "zsh"
+network_denial_tool = "/usr/bin/sandbox-exec"
+network_denial_profile = "(version 1) (allow default) (deny network*)"
+network_denial_probe = "Run curl for the ecosystem registry inside the same sandbox; exit 0 is a proof failure."
+network_denial_observed_exit = 6
+network_denial_observed_class = "DNS/network unavailable inside deny-network sandbox"
+temporary_directory_policy = "Every proof uses new mktemp staging/cache directories and retains them for audit; it never writes generated output into the repository."
+
+[catalog]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+upstream_path = "docs/docs/2026-07-28/sdk.mdx"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/docs/2026-07-28/sdk.mdx"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/docs/2026-07-28/sdk.mdx"
+retrieval_url_is_commit_addressed = true
+vendored_path = "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx"
+media_type = "text/mdx; charset=utf-8"
+byte_length = 4330
+sha256 = "c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77"
+bytes_unmodified = true
+selection_rule = "Include every and only SDK whose row in these exact bytes says Tier 1."
+tier1_ids_in_catalog_order = ["typescript", "python", "csharp", "go"]
+tier1_ids_canonical = ["csharp", "go", "python", "typescript"]
+tier1_count = 4
+tier1_canonical_serialization = "csharp\ngo\npython\ntypescript\n"
+tier1_canonical_sha256 = "680f79529bb5eb72242ee02c37681fbded270d698c26b9e75658a962639ab7cb"
+tier2_ids_canonical = ["java", "rust"]
+tier2_canonical_sha256 = "b902db0634b174d8d5ef2960cd83fdb6df9c3114a8e44456b7f8d7dc792d0408"
+tier3_ids_canonical = ["kotlin", "php", "ruby", "swift"]
+tier3_canonical_sha256 = "05b58d91909e904d9305f0911dc391e8985f05353044f7a9a4767106e720ab12"
+matrix_peer_ids = ["typescript", "python", "csharp", "go"]
+matrix_peer_count = 4
+matrix_exact_set_equal = true
+matrix_order_significant = false
+duplicate_check_precedes_set_comparison = true
+canonicalization = "Reject duplicate IDs; require known ASCII-lowercase IDs; sort bytewise; join with LF; retain one final LF; SHA-256 the resulting bytes."
+
+[catalog.live_drift_observation]
+inspected_on = "2026-07-29"
+repository_default_branch = "main"
+inspected_revision = "aa7306efa4dcc03a2a9f2f223e3b2d7a0c5f3ded"
+upstream_path = "docs/docs/2026-07-28/sdk.mdx"
+byte_length = 4330
+sha256 = "c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77"
+byte_drift_from_frozen_catalog = false
+tier_assignment_drift_from_frozen_catalog = false
+authority_changed = false
+rule = "A later live difference is reported and fails the drift check; it never edits this baseline or silently changes the matrix."
+
+[[catalog.entries]]
+id = "typescript"
+display_name = "TypeScript"
+tier = 1
+repository = "https://github.com/modelcontextprotocol/typescript-sdk"
+included = true
+
+[[catalog.entries]]
+id = "python"
+display_name = "Python"
+tier = 1
+repository = "https://github.com/modelcontextprotocol/python-sdk"
+included = true
+
+[[catalog.entries]]
+id = "csharp"
+display_name = "C#"
+tier = 1
+repository = "https://github.com/modelcontextprotocol/csharp-sdk"
+included = true
+
+[[catalog.entries]]
+id = "go"
+display_name = "Go"
+tier = 1
+repository = "https://github.com/modelcontextprotocol/go-sdk"
+included = true
+
+[[catalog.entries]]
+id = "java"
+display_name = "Java"
+tier = 2
+repository = "https://github.com/modelcontextprotocol/java-sdk"
+included = false
+exclusion_reason = "Tier 2 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog.entries]]
+id = "rust"
+display_name = "Rust"
+tier = 2
+repository = "https://github.com/modelcontextprotocol/rust-sdk"
+included = false
+exclusion_reason = "Tier 2 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog.entries]]
+id = "swift"
+display_name = "Swift"
+tier = 3
+repository = "https://github.com/modelcontextprotocol/swift-sdk"
+included = false
+exclusion_reason = "Tier 3 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog.entries]]
+id = "ruby"
+display_name = "Ruby"
+tier = 3
+repository = "https://github.com/modelcontextprotocol/ruby-sdk"
+included = false
+exclusion_reason = "Tier 3 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog.entries]]
+id = "php"
+display_name = "PHP"
+tier = 3
+repository = "https://github.com/modelcontextprotocol/php-sdk"
+included = false
+exclusion_reason = "Tier 3 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog.entries]]
+id = "kotlin"
+display_name = "Kotlin"
+tier = 3
+repository = "https://github.com/modelcontextprotocol/kotlin-sdk"
+included = false
+exclusion_reason = "Tier 3 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog_negative_cases]]
+id = "missing-tier1-typescript"
+candidate_peer_ids = ["python", "csharp", "go"]
+mutation = "Omit one frozen Tier-1 row."
+expected_error = "missing_tier1_peer"
+expected_details = ["typescript"]
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[catalog_negative_cases]]
+id = "extra-lower-tier-java"
+candidate_peer_ids = ["typescript", "python", "csharp", "go", "java"]
+mutation = "Add one frozen Tier-2 row to the Tier-1 matrix."
+expected_error = "extra_non_tier1_peer"
+expected_details = ["java"]
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[catalog_negative_cases]]
+id = "duplicate-go"
+candidate_peer_ids = ["typescript", "python", "csharp", "go", "go"]
+mutation = "Duplicate one otherwise valid Tier-1 peer."
+expected_error = "duplicate_peer"
+expected_details = ["go"]
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[catalog_negative_cases]]
+id = "catalog-byte-drift"
+candidate_peer_ids = ["typescript", "python", "csharp", "go"]
+mutation = "Append one LF byte to the frozen catalog."
+candidate_catalog_byte_length = 4331
+expected_error = "catalog_byte_drift"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[catalog_negative_cases]]
+id = "catalog-tier-drift"
+candidate_peer_ids = ["typescript", "python", "csharp", "go"]
+mutation = "Relabel Java from Tier 2 to Tier 1 while retaining a stale four-peer matrix."
+expected_error = "catalog_tier_assignment_drift"
+expected_details = ["java"]
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[catalog_negative_cases]]
+id = "floating-catalog-substitution"
+candidate_peer_ids = ["typescript", "python", "csharp", "go"]
+mutation = "Replace the commit-addressed retrieval URL with a default-branch URL."
+expected_error = "floating_catalog_source"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peers]]
+id = "typescript"
+display_name = "TypeScript"
+ecosystem = "npm"
+tier_at_freeze = 1
+repository = "https://github.com/modelcontextprotocol/typescript-sdk"
+version = "2.0.0"
+source_commit = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+source_commit_url = "https://github.com/modelcontextprotocol/typescript-sdk/commit/cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+tag_kind = "annotated"
+tagger_date_utc = "2026-07-27T23:55:22Z"
+registry = "https://registry.npmjs.org/"
+registry_metadata_url = "https://registry.npmjs.org/@modelcontextprotocol/core/2.0.0"
+source_artifact_binding = "All three annotated tags peel to the frozen commit. The tarballs expose version and repository URL but no gitHead, so source and package bytes are independently frozen and no stronger binding is claimed."
+
+[[peers.validation_sources]]
+role = "server_tool_output_validation"
+upstream_path = "packages/server/src/server/mcp.ts"
+source_page_url = "https://github.com/modelcontextprotocol/typescript-sdk/blob/cc4b41617ce3601b1290d67216ea0b194a3cd9ac/packages/server/src/server/mcp.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/typescript-sdk/cc4b41617ce3601b1290d67216ea0b194a3cd9ac/packages/server/src/server/mcp.ts"
+repository_revision = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+git_blob_sha1 = "d2e40181e4da2231edef676305f82393d13391aa"
+byte_length = 60172
+sha256 = "dfb62d3152ce9e9613be434973202b243c7651cc50315f7ef0af71705cc63f39"
+vendored = false
+
+[[peers.validation_sources]]
+role = "client_tool_output_validation"
+upstream_path = "packages/client/src/client/client.ts"
+source_page_url = "https://github.com/modelcontextprotocol/typescript-sdk/blob/cc4b41617ce3601b1290d67216ea0b194a3cd9ac/packages/client/src/client/client.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/typescript-sdk/cc4b41617ce3601b1290d67216ea0b194a3cd9ac/packages/client/src/client/client.ts"
+repository_revision = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+git_blob_sha1 = "0b386a63e8904817196d0c65ab5a0ad6ac441049"
+byte_length = 131812
+sha256 = "694be3b5010bf4e2a21c00fe21ccc45835a55cb29a429561fc45b4cd55005efb"
+vendored = false
+
+[[peers.tags]]
+name = "@modelcontextprotocol/client@2.0.0"
+tag_object_sha1 = "ba0cd9ba0c5d56d1cf5635adece92349dff5af38"
+peeled_commit = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+
+[[peers.tags]]
+name = "@modelcontextprotocol/core@2.0.0"
+tag_object_sha1 = "fcde8af047310f73059367b3a28f63af77a51538"
+peeled_commit = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+
+[[peers.tags]]
+name = "@modelcontextprotocol/server@2.0.0"
+tag_object_sha1 = "a6616555882fcfb9be1b2df238e5a54ca4d03d46"
+peeled_commit = "cc4b41617ce3601b1290d67216ea0b194a3cd9ac"
+
+[[peers.registry_artifacts]]
+package = "@modelcontextprotocol/core"
+version = "2.0.0"
+url = "https://registry.npmjs.org/@modelcontextprotocol/core/-/core-2.0.0.tgz"
+published_at_utc = "2026-07-27T23:55:21.808Z"
+byte_length = 154096
+sha1 = "c918a4c6aef22a7c59dfb0aabc2a82c187cce157"
+sha256 = "e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6"
+integrity = "sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA=="
+
+[[peers.registry_artifacts]]
+package = "@modelcontextprotocol/client"
+version = "2.0.0"
+url = "https://registry.npmjs.org/@modelcontextprotocol/client/-/client-2.0.0.tgz"
+published_at_utc = "2026-07-27T23:55:22.113Z"
+byte_length = 1552450
+sha1 = "4dc18c983c7acb40040f08442123e3c5b88d6074"
+sha256 = "cb470b0249b4a06e262145ab2281ea25344e77608f312a5a52ab4dcc26bfa732"
+integrity = "sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw=="
+
+[[peers.registry_artifacts]]
+package = "@modelcontextprotocol/server"
+version = "2.0.0"
+url = "https://registry.npmjs.org/@modelcontextprotocol/server/-/server-2.0.0.tgz"
+published_at_utc = "2026-07-27T23:55:22.239Z"
+byte_length = 1485528
+sha1 = "4fae5ccb8f7925ed9a6bf6595bb3b58617063ffd"
+sha256 = "b4f0dfda3b73b322f1091b86fabe568994eb2fedef873b12db2c54adc3cfe198"
+integrity = "sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw=="
+
+[peers.lock]
+consumer_manifest_path = "evidence/fnd-01/sdk-locks/typescript-package.json"
+consumer_manifest_byte_length = 193
+consumer_manifest_sha256 = "042241e616629b524bb259fe0b4ffb75c055b8564cfdd5a2b78ac3ef0d4d83b5"
+lock_path = "evidence/fnd-01/sdk-locks/typescript-package-lock.json"
+lock_format = "npm package-lock v3"
+lock_byte_length = 6011
+lock_sha256 = "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"
+direct_package_count = 3
+installed_package_count = 14
+exact_direct_requirements = [
+  "@modelcontextprotocol/client=2.0.0",
+  "@modelcontextprotocol/core=2.0.0",
+  "@modelcontextprotocol/server=2.0.0",
+]
+resolver_node_version = "v24.12.0"
+resolver_npm_version = "11.14.0"
+online_command = 'cd "$ts_online" && npm_config_update_notifier=false npm ci --ignore-scripts --no-audit --no-fund --cache "$ts_cache"'
+offline_command = 'cd "$ts_offline" && sandbox-exec -p "(version 1) (allow default) (deny network*)" /usr/bin/env npm_config_update_notifier=false npm ci --ignore-scripts --offline --no-audit --no-fund --cache "$ts_cache"'
+closure_canonicalization = "npm ls --all --json, select .dependencies, jq -S"
+online_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+offline_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+online_offline_equal = true
+offline_resolution_verified = true
+portable_directory_name_verified = true
+install_scripts_disabled = true
+run_from = "repository root"
+required_tools = ["node v24.12.0", "npm 11.14.0", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+reproduction_script = '''
+set -eu
+set -o pipefail
+repo_root=$(pwd -P)
+test "$(node --version)" = "v24.12.0"
+test "$(npm --version)" = "11.14.0"
+ts_cache=$(mktemp -d /tmp/fastmcp-fnd01-ts-proof-cache.XXXXXX)
+ts_online=$(mktemp -d /tmp/fastmcp-fnd01-ts-proof-online.XXXXXX)
+ts_offline=$(mktemp -d /tmp/fastmcp-fnd01-ts-proof-offline.XXXXXX)
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/typescript-package.json" "$ts_online/package.json"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/typescript-package-lock.json" "$ts_online/package-lock.json"
+(
+  cd "$ts_online"
+  npm_config_update_notifier=false npm ci --ignore-scripts --no-audit --no-fund --cache "$ts_cache"
+  npm ls --all --json | jq -S '.dependencies' > closure.json
+)
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/typescript-package.json" "$ts_offline/package.json"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/typescript-package-lock.json" "$ts_offline/package-lock.json"
+(
+  cd "$ts_offline"
+  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env npm_config_update_notifier=false npm ci --ignore-scripts --offline --no-audit --no-fund --cache "$ts_cache"
+  npm ls --all --json | jq -S '.dependencies' > closure.json
+)
+cmp "$ts_online/closure.json" "$ts_offline/closure.json"
+test "$(shasum -a 256 "$ts_offline/closure.json" | awk '{print $1}')" = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+test "$(shasum -a 256 "$ts_offline/package-lock.json" | awk '{print $1}')" = "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"
+if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl --silent --show-error --max-time 2 https://registry.npmjs.org/ >/dev/null; then
+  exit 97
+fi
+'''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:42:53Z"
+online_exit = 0
+offline_exit = 0
+closure_compare_exit = 0
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: registry.npmjs.org"
+online_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+offline_closure_sha256 = "4d98599cb296425e2ae6cfeca26396d1d7d4f858f96b2c78b30c52d7852ee9a6"
+checked_in_lock_sha256 = "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9"
+script_exit = 0
+native_package_filenames_staged = true
+online_offline_closure_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
+[[peers]]
+id = "python"
+display_name = "Python"
+ecosystem = "PyPI"
+tier_at_freeze = 1
+repository = "https://github.com/modelcontextprotocol/python-sdk"
+version = "2.0.0"
+source_tag = "v2.0.0"
+source_tag_kind = "lightweight"
+source_commit = "6f69a3758ebf2ee55ce050f58b470ce11af71133"
+source_commit_url = "https://github.com/modelcontextprotocol/python-sdk/commit/6f69a3758ebf2ee55ce050f58b470ce11af71133"
+registry = "https://pypi.org/"
+registry_metadata_url = "https://pypi.org/pypi/mcp/2.0.0/json"
+source_artifact_binding = "The lightweight source tag and both PyPI artifacts are independently frozen; neither artifact embeds a verified VCS commit binding."
+
+[[peers.registry_artifacts]]
+package = "mcp"
+version = "2.0.0"
+kind = "wheel"
+filename = "mcp-2.0.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/67/72/7d7897418912c1d12e87556630dfb7bf0eac71160e9bef8b447960804ee3/mcp-2.0.0-py3-none-any.whl"
+uploaded_at_utc = "2026-07-28T13:45:28.853348Z"
+byte_length = 349980
+sha256 = "1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6"
+
+[[peers.registry_artifacts]]
+package = "mcp"
+version = "2.0.0"
+kind = "sdist"
+filename = "mcp-2.0.0.tar.gz"
+url = "https://files.pythonhosted.org/packages/74/33/32d4dff2c95bb5d897c3ef4c83649a08996b17b58f0a326d2495d4c81179/mcp-2.0.0.tar.gz"
+uploaded_at_utc = "2026-07-28T13:45:32.346253Z"
+byte_length = 1662284
+sha256 = "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728"
+
+[peers.lock]
+lock_path = "evidence/fnd-01/sdk-locks/python-requirements.lock"
+lock_format = "pip requirements with exact versions and one SHA-256 wheel hash per line"
+lock_byte_length = 2727
+lock_sha256 = "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"
+direct_requirement = "mcp==2.0.0"
+resolved_wheel_count = 28
+target_python = "CPython 3.12"
+target_implementation = "cp"
+target_abi = "cp312"
+target_platform = "manylinux2014_x86_64"
+binary_policy = "wheels only"
+extras = []
+resolver_host_python = "Python 3.14.4"
+resolver_pip_version = "26.1"
+online_command = 'python3 -m pip download --disable-pip-version-check --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_online" --requirement "$py_stage/requirements.lock"'
+offline_command = 'sandbox-exec -p "(version 1) (allow default) (deny network*)" python3 -m pip download --disable-pip-version-check --no-index --find-links "$py_online" --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_offline" --requirement "$py_stage/requirements.lock"'
+closure_filename_canonicalization = "Sort exact wheel basenames bytewise, one LF-terminated name per line."
+online_closure_filename_sha256 = "d6b1a3536284fd4dfe932d13e8531f7b9d6f62cf7c484ef522d27301544b1c8c"
+offline_closure_filename_sha256 = "d6b1a3536284fd4dfe932d13e8531f7b9d6f62cf7c484ef522d27301544b1c8c"
+closure_content_canonicalization = "For every wheel, write lowercase SHA-256, two spaces, basename, LF; sort complete lines bytewise."
+online_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+offline_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+online_offline_equal = true
+offline_resolution_verified = true
+run_from = "repository root"
+required_tools = ["Python 3.14.4", "pip 26.1", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+reproduction_script = '''
+set -eu
+set -o pipefail
+repo_root=$(pwd -P)
+test "$(python3 --version)" = "Python 3.14.4"
+test "$(python3 -m pip --version | awk '{print $2}')" = "26.1"
+py_stage=$(mktemp -d /tmp/fastmcp-fnd01-python-proof-stage.XXXXXX)
+py_online=$(mktemp -d /tmp/fastmcp-fnd01-python-proof-online.XXXXXX)
+py_offline=$(mktemp -d /tmp/fastmcp-fnd01-python-proof-offline.XXXXXX)
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/python-requirements.lock" "$py_stage/requirements.lock"
+python3 -m pip download --disable-pip-version-check --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_online" --requirement "$py_stage/requirements.lock"
+sandbox-exec -p '(version 1) (allow default) (deny network*)' python3 -m pip download --disable-pip-version-check --no-index --find-links "$py_online" --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_offline" --requirement "$py_stage/requirements.lock"
+for wheel_dir in "$py_online" "$py_offline"; do
+  find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -exec basename {} \; | LC_ALL=C sort > "$wheel_dir/closure-filenames.txt"
+  find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -exec shasum -a 256 {} + | sed 's#  .*/#  #' | LC_ALL=C sort > "$wheel_dir/closure.sha256"
+done
+cmp "$py_online/closure-filenames.txt" "$py_offline/closure-filenames.txt"
+cmp "$py_online/closure.sha256" "$py_offline/closure.sha256"
+test "$(shasum -a 256 "$py_offline/closure-filenames.txt" | awk '{print $1}')" = "d6b1a3536284fd4dfe932d13e8531f7b9d6f62cf7c484ef522d27301544b1c8c"
+test "$(shasum -a 256 "$py_offline/closure.sha256" | awk '{print $1}')" = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+test "$(shasum -a 256 "$py_stage/requirements.lock" | awk '{print $1}')" = "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"
+if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl --silent --show-error --max-time 2 https://pypi.org/ >/dev/null; then
+  exit 97
+fi
+'''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:43:08Z"
+online_exit = 0
+offline_exit = 0
+closure_compare_exit = 0
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: pypi.org"
+online_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+offline_closure_content_sha256 = "45241e22188c095d3c71e3d05c425a2ae91dc7a0655a1d0fa21ffefbd9669678"
+checked_in_lock_sha256 = "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "9c733d9399c77ab8411662ab39f12bf5755a306817250fb8523f10b56057291d"
+script_exit = 0
+filename_closure_equal = true
+content_closure_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
+[[peers]]
+id = "csharp"
+display_name = "C#"
+ecosystem = "NuGet"
+tier_at_freeze = 1
+repository = "https://github.com/modelcontextprotocol/csharp-sdk"
+version = "2.0.0"
+source_tag = "v2.0.0"
+source_tag_kind = "lightweight"
+source_commit = "15f8b2da110b574a1c20a35a8c629cea4095c7be"
+source_commit_url = "https://github.com/modelcontextprotocol/csharp-sdk/commit/15f8b2da110b574a1c20a35a8c629cea4095c7be"
+registry = "https://api.nuget.org/v3/index.json"
+registry_metadata_url = "https://api.nuget.org/v3/registration5-gz-semver2/modelcontextprotocol/2.0.0.json"
+source_artifact_binding = "The nupkg nuspec repository element embeds the exact frozen source commit."
+
+[[peers.registry_artifacts]]
+package = "ModelContextProtocol"
+version = "2.0.0"
+kind = "nupkg"
+url = "https://api.nuget.org/v3-flatcontainer/modelcontextprotocol/2.0.0/modelcontextprotocol.2.0.0.nupkg"
+published_at_utc = "2026-07-28T21:38:31.737Z"
+byte_length = 224338
+raw_nupkg_sha256 = "20c858661ef286c0e32ef06a18408b761f71821d2999a8b38cb0dad46f45358d"
+raw_nupkg_sha512 = "B/dXT4cUZ3G4s90nNwcReh5tfxUW22ZrC9BMpsVuYeBe7lfM0pfY2IvX+IHQu7UPgar8lweccZ7I6GEcWmvX8A=="
+nuget_lock_content_hash = "X/KDNZDP9Zgs7YXXxxpKiDMWWPXYrs764lVgc6vEM4pCg87bYz4VaceeiKW91XDTGgUvIbmRYXgWqyNpV32xRg=="
+embedded_repository_commit = "15f8b2da110b574a1c20a35a8c629cea4095c7be"
+hash_semantics = "raw_nupkg_sha512 hashes the downloaded nupkg bytes; nuget_lock_content_hash is NuGet's native lock contentHash. They are distinct values and are not conflated."
+
+[peers.lock]
+consumer_project_path = "evidence/fnd-01/sdk-locks/csharp-consumer.csproj"
+consumer_project_byte_length = 299
+consumer_project_sha256 = "42bb711ecc3bfae27c203a664b32b44f049861e729cd78bfd2034691d1fc6f73"
+lock_path = "evidence/fnd-01/sdk-locks/csharp-packages.lock.json"
+lock_format = "NuGet packages.lock.json v1"
+lock_byte_length = 5928
+lock_sha256 = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+native_generated_byte_length = 5927
+native_generated_sha256 = "933cc7902d4f04ebc62a4c0eeecc1e2dcfd8cdae0360dbc02c23e8aac941f87e"
+canonical_json_sha256 = "e9b34e079a5f227deb162c0cf4f7e6b74240b7f92c958596593ccd291b4f3869"
+vendoring_normalization = "One final LF was added to the native JSON for repository text-file hygiene; parsed JSON and NuGet semantics are identical."
+target_framework = "net8.0"
+direct_package_count = 1
+resolved_package_count = 17
+direct_requirement = "ModelContextProtocol [2.0.0] (exact NuGet range)"
+resolver_dotnet_sdk = "10.0.100"
+resolver_sdk_archive_url = "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.100/dotnet-sdk-10.0.100-osx-arm64.tar.gz"
+resolver_sdk_archive_byte_length = 229936839
+resolver_sdk_archive_sha256 = "71b3815ef8d83a6bbebf8627a56639600193f22d4ea6a6de2f71855c4b3e63fd"
+online_command = 'cd "$cs_online" && DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --use-lock-file -p:NuGetAudit=false'
+offline_command = 'cd "$cs_offline" && sandbox-exec -p "(version 1) (allow default) (deny network*)" /usr/bin/env DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --locked-mode --no-cache --ignore-failed-sources --source "$cs_empty_feed" -p:NuGetAudit=false'
+online_lock_matches_vendored_canonical_json = true
+offline_lock_sha256_before = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+offline_lock_sha256_after = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+project_assets_projection_path = "evidence/fnd-01/sdk-locks/csharp-project-assets-closure.json"
+project_assets_projection_format = "fastmcp-fnd01-nuget-assets-closure-v1"
+project_assets_projection_byte_length = 5565
+project_assets_projection_sha256 = "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"
+project_assets_projection_rule = "From obj/project.assets.json, select target net8.0 package keys and every library id/version, type, sha512, and lowercase cache path; sort keys and libraries; omit machine-local restore paths."
+online_offline_equal = true
+offline_resolution_verified = true
+run_from = "repository root"
+required_environment = [
+  "DOTNET_ARCHIVE points to dotnet-sdk-10.0.100-osx-arm64.tar.gz",
+  "DOTNET_SDK points to that archive extracted without modification",
+]
+required_tools = [".NET SDK 10.0.100", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+reproduction_script = '''
+set -eu
+set -o pipefail
+repo_root=$(pwd -P)
+test "$(shasum -a 256 "$DOTNET_ARCHIVE" | awk '{print $1}')" = "71b3815ef8d83a6bbebf8627a56639600193f22d4ea6a6de2f71855c4b3e63fd"
+test "$("$DOTNET_SDK/dotnet" --version)" = "10.0.100"
+cs_cache=$(mktemp -d /tmp/fastmcp-fnd01-csharp-proof-cache.XXXXXX)
+cs_online=$(mktemp -d /tmp/fastmcp-fnd01-csharp-proof-online.XXXXXX)
+cs_offline=$(mktemp -d /tmp/fastmcp-fnd01-csharp-proof-offline.XXXXXX)
+cs_empty_feed=$(mktemp -d /tmp/fastmcp-fnd01-csharp-proof-empty.XXXXXX)
+cs_cli_home=$(mktemp -d /tmp/fastmcp-fnd01-csharp-proof-home.XXXXXX)
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/csharp-consumer.csproj" "$cs_online/csharp-consumer.csproj"
+(
+  cd "$cs_online"
+  DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --use-lock-file -p:NuGetAudit=false
+  jq -S . packages.lock.json > generated-lock.canonical.json
+  jq -S '{format: "fastmcp-fnd01-nuget-assets-closure-v1", target: "net8.0", target_packages: (.targets["net8.0"] | keys | sort), libraries: (.libraries | to_entries | map({id_version: .key, type: .value.type, sha512: .value.sha512, path: .value.path}) | sort_by(.id_version))}' obj/project.assets.json > project-assets-closure.json
+)
+jq -S . "$repo_root/evidence/fnd-01/sdk-locks/csharp-packages.lock.json" > "$cs_online/expected-lock.canonical.json"
+cmp "$cs_online/generated-lock.canonical.json" "$cs_online/expected-lock.canonical.json"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/csharp-consumer.csproj" "$cs_offline/csharp-consumer.csproj"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/csharp-packages.lock.json" "$cs_offline/packages.lock.json"
+(
+  cd "$cs_offline"
+  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --locked-mode --no-cache --ignore-failed-sources --source "$cs_empty_feed" -p:NuGetAudit=false
+  jq -S '{format: "fastmcp-fnd01-nuget-assets-closure-v1", target: "net8.0", target_packages: (.targets["net8.0"] | keys | sort), libraries: (.libraries | to_entries | map({id_version: .key, type: .value.type, sha512: .value.sha512, path: .value.path}) | sort_by(.id_version))}' obj/project.assets.json > project-assets-closure.json
+)
+cmp "$cs_online/project-assets-closure.json" "$cs_offline/project-assets-closure.json"
+cmp "$cs_offline/project-assets-closure.json" "$repo_root/evidence/fnd-01/sdk-locks/csharp-project-assets-closure.json"
+test "$(shasum -a 256 "$cs_offline/project-assets-closure.json" | awk '{print $1}')" = "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"
+test "$(shasum -a 256 "$cs_offline/packages.lock.json" | awk '{print $1}')" = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl --silent --show-error --max-time 2 https://api.nuget.org/v3/index.json >/dev/null; then
+  exit 97
+fi
+'''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:40:50Z"
+offline_restore_exit = 0
+offline_restore_stdout_summary = "Determining projects to restore; restored csharp-consumer.csproj in 103 ms."
+offline_restore_stdout_raw_sha256 = "a1e468cea40937ec5808c75f2579e069e50197d8afd2841a91f3f26220d1dd88"
+offline_restore_stdout_raw_digest_scope = "Exact path-bearing stdout bytes captured during the recorded execution; the human-readable summary is intentionally not claimed to hash to this value."
+offline_restore_stderr_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+offline_project_assets_raw_byte_length = 46188
+offline_project_assets_raw_sha256 = "6b5184c088ea27c7beb2611b2a490c88f0ccb6693eacdf46022486aa83d879a7"
+raw_assets_digest_is_path_specific = true
+offline_project_assets_projection_sha256 = "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"
+offline_project_assets_package_count = 17
+checked_in_lock_sha256_after_restore = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: api.nuget.org"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "a5b3c164dde83de2edb27027eb413d7979f71bfd95b99517bfc38cf76af4f19c"
+script_exit = 0
+online_offline_project_assets_equal = true
+vendored_project_assets_projection_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
+[[peers]]
+id = "go"
+display_name = "Go"
+ecosystem = "Go modules"
+tier_at_freeze = 1
+repository = "https://github.com/modelcontextprotocol/go-sdk"
+version = "v1.7.0"
+module = "github.com/modelcontextprotocol/go-sdk"
+source_tag = "v1.7.0"
+source_tag_kind = "annotated"
+source_tag_object_sha1 = "25cb00203c6b693780f602ab4041c06f7f4b9570"
+source_commit = "bc72835f62eb94d0fb484439f886b6885b075f36"
+source_commit_url = "https://github.com/modelcontextprotocol/go-sdk/commit/bc72835f62eb94d0fb484439f886b6885b075f36"
+registry = "https://proxy.golang.org/"
+sum_database = "https://sum.golang.org/"
+source_artifact_binding = "The module proxy .info Origin records the exact VCS URL, tag ref, and frozen source commit."
+
+[[peers.registry_artifacts]]
+package = "github.com/modelcontextprotocol/go-sdk"
+version = "v1.7.0"
+kind = "module-info"
+url = "https://proxy.golang.org/github.com/modelcontextprotocol/go-sdk/@v/v1.7.0.info"
+published_at_utc = "2026-07-27T15:20:53Z"
+byte_length = 203
+sha256 = "8a5347c2c7af752bf873c9cb3be2042d83d581681b524ec8171a21646d33d49e"
+embedded_origin_commit = "bc72835f62eb94d0fb484439f886b6885b075f36"
+embedded_origin_ref = "refs/tags/v1.7.0"
+
+[[peers.registry_artifacts]]
+package = "github.com/modelcontextprotocol/go-sdk"
+version = "v1.7.0"
+kind = "go.mod"
+url = "https://proxy.golang.org/github.com/modelcontextprotocol/go-sdk/@v/v1.7.0.mod"
+byte_length = 480
+sha256 = "8679c6a4a8447d6d2d7e3ac99e922161ba1a0eaa881d7666d503cc473cdbc8a3"
+sumdb_h1 = "h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts="
+
+[[peers.registry_artifacts]]
+package = "github.com/modelcontextprotocol/go-sdk"
+version = "v1.7.0"
+kind = "module-zip"
+url = "https://proxy.golang.org/github.com/modelcontextprotocol/go-sdk/@v/v1.7.0.zip"
+byte_length = 643641
+sha256 = "324a2a6956be6b4aa8a92057cf2ac71ad91bdbbf4dd3d9a00a192e789843a320"
+sumdb_h1 = "h1:yqjY2dsbKAC0LSuWZVBMrHgiG8ukXv6NRo0JiALay44="
+
+[peers.sumdb]
+lookup_url = "https://sum.golang.org/lookup/github.com/modelcontextprotocol/go-sdk@v1.7.0"
+record_id = 58242397
+module_sum = "h1:yqjY2dsbKAC0LSuWZVBMrHgiG8ukXv6NRo0JiALay44="
+go_mod_sum = "h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts="
+
+[peers.lock]
+consumer_module_path = "evidence/fnd-01/sdk-locks/go-consumer.mod"
+consumer_module_byte_length = 108
+consumer_module_sha256 = "c64b1f4d3915d52422d4b37a174458f37faa922faa3bcb910a68d9fe64165fd8"
+consumer_module_identity = "fastmcp.invalid/fnd01/sdk-consumer"
+consumer_exact_requirement = "github.com/modelcontextprotocol/go-sdk v1.7.0"
+consumer_sum_path = "evidence/fnd-01/sdk-locks/go-consumer.sum"
+consumer_sum_byte_length = 2028
+consumer_sum_sha256 = "3217ba72b22c5fffe92b8c0d35c6925a2564d8100a9b4b9fa5080a4fae91a4e4"
+consumer_resolved_module_lock_path = "evidence/fnd-01/sdk-locks/go-consumer-modules.lock.json"
+consumer_resolved_module_lock_byte_length = 2679
+consumer_resolved_module_lock_sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+resolved_dependency_module_count = 12
+resolved_module_count_including_consumer_root = 13
+root_sdk_module_in_resolved_lock = true
+root_sdk_module_path = "github.com/modelcontextprotocol/go-sdk"
+root_sdk_module_version = "v1.7.0"
+root_sdk_module_sum = "h1:yqjY2dsbKAC0LSuWZVBMrHgiG8ukXv6NRo0JiALay44="
+root_sdk_go_mod_sum = "h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts="
+publisher_module_path = "evidence/fnd-01/sdk-locks/go-sdk.mod"
+publisher_module_byte_length = 480
+publisher_module_sha256 = "8679c6a4a8447d6d2d7e3ac99e922161ba1a0eaa881d7666d503cc473cdbc8a3"
+publisher_sum_path = "evidence/fnd-01/sdk-locks/go-sdk.sum"
+publisher_sum_byte_length = 1833
+publisher_sum_sha256 = "1c855ba6f1dbddbe295ac0027add07877cd022198bc32e7bec3731dcb8df3142"
+publisher_context_projection_path = "evidence/fnd-01/sdk-locks/go-modules.lock.json"
+publisher_context_projection_byte_length = 3578
+publisher_context_projection_sha256 = "e3539049baab393d2cdeb585c3762e39f179f65dca1e32d44abcece05f419285"
+publisher_context_is_interop_consumer_lock = false
+publisher_context_note = "Preserved upstream/publisher context only. It makes go-sdk the main module and therefore cannot satisfy the external-consumer interoperability proof."
+resolver_go_version = "go1.25.0 darwin/arm64"
+stable_projection_command = "jq -s 'map({GoModSum, Origin: (.Origin // null), Path, Sum, Version}) | sort_by(.Path)'"
+offline_environment = [
+  "GOENV=off",
+  "GOTOOLCHAIN=local",
+  "GOPROXY=off",
+  "GOSUMDB=off",
+  "GOVCS=*:off",
+  "fresh task-specific GOCACHE",
+  "online-seeded task-specific GOMODCACHE",
+  "sandbox-exec deny network*",
+]
+online_resolved_module_lock_sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+offline_resolved_module_lock_sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+online_closure_sha256 = "5636d9bd1a83b90257b366339f1b31f58bf17f57926f4a4e9bba899bbd074465"
+offline_closure_sha256 = "5636d9bd1a83b90257b366339f1b31f58bf17f57926f4a4e9bba899bbd074465"
+online_offline_equal = true
+offline_resolution_verified = true
+network_denial_verified = true
+run_from = "repository root"
+required_environment = ["GO_1_25 points to an extracted local go1.25.0 toolchain root"]
+required_tools = ["go1.25.0 darwin/arm64", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+reproduction_script = '''
+set -eu
+set -o pipefail
+repo_root=$(pwd -P)
+go_tool="$GO_1_25/bin/go"
+test "$("$go_tool" version)" = "go version go1.25.0 darwin/arm64"
+go_cache=$(mktemp -d /tmp/fastmcp-fnd01-go-proof-mod-cache.XXXXXX)
+go_build_cache=$(mktemp -d /tmp/fastmcp-fnd01-go-proof-build-cache.XXXXXX)
+go_online=$(mktemp -d /tmp/fastmcp-fnd01-go-proof-online.XXXXXX)
+go_offline=$(mktemp -d /tmp/fastmcp-fnd01-go-proof-offline.XXXXXX)
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/go-consumer.mod" "$go_online/go.mod"
+(
+  cd "$go_online"
+  GOENV=off GOTOOLCHAIN=local GOCACHE="$go_build_cache" GOMODCACHE="$go_cache" GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOVCS='*:all' "$go_tool" mod download -json all > download.jsonl
+  jq -s 'map({GoModSum, Origin: (.Origin // null), Path, Sum, Version}) | sort_by(.Path)' download.jsonl > modules.lock.json
+  GOENV=off GOTOOLCHAIN=local GOCACHE="$go_build_cache" GOMODCACHE="$go_cache" GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOVCS='*:all' "$go_tool" list -mod=readonly -m all | LC_ALL=C sort > modules.sorted.txt
+)
+cmp "$go_online/go.sum" "$repo_root/evidence/fnd-01/sdk-locks/go-consumer.sum"
+cmp "$go_online/modules.lock.json" "$repo_root/evidence/fnd-01/sdk-locks/go-consumer-modules.lock.json"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/go-consumer.mod" "$go_offline/go.mod"
+install -m 0644 "$repo_root/evidence/fnd-01/sdk-locks/go-consumer.sum" "$go_offline/go.sum"
+(
+  cd "$go_offline"
+  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env GOENV=off GOTOOLCHAIN=local GOCACHE="$go_build_cache" GOMODCACHE="$go_cache" GOPROXY=off GOSUMDB=off GOVCS='*:off' "$go_tool" mod download -json all > download.jsonl
+  jq -s 'map({GoModSum, Origin: (.Origin // null), Path, Sum, Version}) | sort_by(.Path)' download.jsonl > modules.lock.json
+  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env GOENV=off GOTOOLCHAIN=local GOCACHE="$go_build_cache" GOMODCACHE="$go_cache" GOPROXY=off GOSUMDB=off GOVCS='*:off' "$go_tool" list -mod=readonly -m all | LC_ALL=C sort > modules.sorted.txt
+)
+cmp "$go_online/modules.lock.json" "$go_offline/modules.lock.json"
+cmp "$go_online/modules.sorted.txt" "$go_offline/modules.sorted.txt"
+test "$(shasum -a 256 "$go_offline/modules.lock.json" | awk '{print $1}')" = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+test "$(shasum -a 256 "$go_offline/modules.sorted.txt" | awk '{print $1}')" = "5636d9bd1a83b90257b366339f1b31f58bf17f57926f4a4e9bba899bbd074465"
+jq -e '.[] | select(.Path == "github.com/modelcontextprotocol/go-sdk" and .Version == "v1.7.0" and .Sum == "h1:yqjY2dsbKAC0LSuWZVBMrHgiG8ukXv6NRo0JiALay44=")' "$go_offline/modules.lock.json" >/dev/null
+if sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/curl --silent --show-error --max-time 2 https://proxy.golang.org/ >/dev/null; then
+  exit 97
+fi
+'''
+
+[peers.lock.last_execution]
+executed_at_utc = "2026-07-29T21:43:36Z"
+online_exit = 0
+offline_download_exit = 0
+offline_list_exit = 0
+online_offline_lock_compare_exit = 0
+root_sdk_module_entry_verified = true
+network_denial_probe_exit = 6
+network_denial_probe_stderr = "curl: (6) Could not resolve host: proxy.golang.org"
+offline_environment_goproxy = "off"
+offline_environment_gosumdb = "off"
+offline_environment_govcs = "*:off"
+offline_sandbox_profile = "(version 1) (allow default) (deny network*)"
+offline_resolved_module_lock_sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+offline_closure_sha256 = "5636d9bd1a83b90257b366339f1b31f58bf17f57926f4a4e9bba899bbd074465"
+checked_in_consumer_sum_sha256 = "3217ba72b22c5fffe92b8c0d35c6925a2564d8100a9b4b9fa5080a4fae91a4e4"
+result = "pass"
+
+[peers.lock.last_revalidation]
+executed_at_utc = "2026-07-29T21:59:09Z"
+reproduction_script_sha256 = "f493691b8fce43938bcfa4fd27ec834fac970a3e863f86bcfbf0948e48dddebf"
+script_exit = 0
+external_consumer_root_sdk_entry_verified = true
+online_offline_lock_and_module_list_equal = true
+network_denial_probe_observed = true
+result = "pass"
+
+[[vendored_artifacts]]
+id = "sdk-tier-catalog"
+path = "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx"
+kind = "immutable_upstream_catalog_bytes"
+byte_length = 4330
+sha256 = "c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77"
+provenance = "Exact bytes from catalog.retrieval_url."
+transformation = "none"
+
+[[vendored_artifacts]]
+id = "typescript-consumer-manifest"
+path = "evidence/fnd-01/sdk-locks/typescript-package.json"
+kind = "isolated_consumer_input"
+byte_length = 193
+sha256 = "042241e616629b524bb259fe0b4ffb75c055b8564cfdd5a2b78ac3ef0d4d83b5"
+provenance = "Locally authored minimal npm consumer with an explicit stable project name and exact Tier-1 package versions."
+transformation = "not_applicable"
+
+[[vendored_artifacts]]
+id = "typescript-package-lock"
+path = "evidence/fnd-01/sdk-locks/typescript-package-lock.json"
+kind = "native_ecosystem_lock"
+byte_length = 6011
+sha256 = "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"
+provenance = "Generated by npm 11.14.0 from typescript-package.json; package-lock v3 integrity covers every resolved tarball."
+transformation = "none after native package-lock regeneration"
+
+[[vendored_artifacts]]
+id = "python-requirements-lock"
+path = "evidence/fnd-01/sdk-locks/python-requirements.lock"
+kind = "target_qualified_hash_lock"
+byte_length = 2727
+sha256 = "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"
+provenance = "Exact manylinux2014_x86_64 CPython-3.12 wheel closure selected by pip 26.1; one exact version and wheel SHA-256 per line."
+transformation = "deterministic requirements-with-hashes projection of the resolved wheelhouse"
+
+[[vendored_artifacts]]
+id = "csharp-consumer-project"
+path = "evidence/fnd-01/sdk-locks/csharp-consumer.csproj"
+kind = "isolated_consumer_input"
+byte_length = 299
+sha256 = "42bb711ecc3bfae27c203a664b32b44f049861e729cd78bfd2034691d1fc6f73"
+provenance = "Locally authored minimal net8.0 NuGet consumer with one exact ModelContextProtocol reference."
+transformation = "not_applicable"
+
+[[vendored_artifacts]]
+id = "csharp-packages-lock"
+path = "evidence/fnd-01/sdk-locks/csharp-packages.lock.json"
+kind = "native_ecosystem_lock"
+byte_length = 5928
+sha256 = "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"
+provenance = "Generated by .NET SDK 10.0.100 for net8.0; every NuGet dependency has an exact version and native contentHash."
+transformation = "single final LF added; canonical parsed JSON matches the native 5927-byte output"
+
+[[vendored_artifacts]]
+id = "csharp-project-assets-closure"
+path = "evidence/fnd-01/sdk-locks/csharp-project-assets-closure.json"
+kind = "stable_offline_restore_projection"
+byte_length = 5565
+sha256 = "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"
+provenance = "Stable path-independent projection of the project.assets.json emitted by the recorded network-denied locked restore."
+transformation = "jq selects the net8.0 target package keys and every library id/version, type, sha512, and lowercase cache path; machine-local restore paths are omitted"
+
+[[vendored_artifacts]]
+id = "go-consumer-module"
+path = "evidence/fnd-01/sdk-locks/go-consumer.mod"
+kind = "isolated_external_consumer_input"
+byte_length = 108
+sha256 = "c64b1f4d3915d52422d4b37a174458f37faa922faa3bcb910a68d9fe64165fd8"
+provenance = "Locally authored external Go module requiring github.com/modelcontextprotocol/go-sdk v1.7.0 exactly."
+transformation = "not_applicable"
+
+[[vendored_artifacts]]
+id = "go-consumer-sum"
+path = "evidence/fnd-01/sdk-locks/go-consumer.sum"
+kind = "external_consumer_checksum_lock"
+byte_length = 2028
+sha256 = "3217ba72b22c5fffe92b8c0d35c6925a2564d8100a9b4b9fa5080a4fae91a4e4"
+provenance = "Generated by go1.25.0 from go-consumer.mod through the public module proxy and checksum database; includes the root SDK zip and go.mod sums."
+transformation = "none after native Go resolution"
+
+[[vendored_artifacts]]
+id = "go-consumer-resolved-modules-lock"
+path = "evidence/fnd-01/sdk-locks/go-consumer-modules.lock.json"
+kind = "external_consumer_stable_resolver_projection"
+byte_length = 2679
+sha256 = "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"
+provenance = "External consumer go1.25.0 go mod download -json all projection; contains the root go-sdk v1.7.0 artifact plus all eleven selected transitive modules."
+transformation = "jq stable-field projection removes machine-local cache paths"
+
+[[vendored_artifacts]]
+id = "go-module-file"
+path = "evidence/fnd-01/sdk-locks/go-sdk.mod"
+kind = "immutable_upstream_module_manifest"
+byte_length = 480
+sha256 = "8679c6a4a8447d6d2d7e3ac99e922161ba1a0eaa881d7666d503cc473cdbc8a3"
+provenance = "Exact Go module-proxy v1.7.0 .mod bytes."
+transformation = "none"
+
+[[vendored_artifacts]]
+id = "go-sum-file"
+path = "evidence/fnd-01/sdk-locks/go-sdk.sum"
+kind = "immutable_upstream_checksum_lock"
+byte_length = 1833
+sha256 = "1c855ba6f1dbddbe295ac0027add07877cd022198bc32e7bec3731dcb8df3142"
+provenance = "Exact go.sum at the frozen v1.7.0 source commit."
+transformation = "none"
+
+[[vendored_artifacts]]
+id = "go-publisher-context-modules"
+path = "evidence/fnd-01/sdk-locks/go-modules.lock.json"
+kind = "publisher_context_stable_resolver_projection"
+byte_length = 3578
+sha256 = "e3539049baab393d2cdeb585c3762e39f179f65dca1e32d44abcece05f419285"
+provenance = "Preserved go1.25.0 publisher-module projection. It is diagnostic upstream context only and is not the external interoperability consumer lock."
+transformation = "jq stable-field projection removes machine-local cache paths"
+
+[[peer_negative_cases]]
+id = "floating-version"
+mutation = "Replace any exact direct version with latest, a range, branch, or unpeeled mutable ref."
+expected_error = "floating_peer_version"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peer_negative_cases]]
+id = "source-commit-drift"
+mutation = "Change a recorded tag target or peeled commit while keeping the old registry artifact."
+expected_error = "peer_source_commit_drift"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peer_negative_cases]]
+id = "registry-byte-drift"
+mutation = "Change, truncate, or substitute a registry artifact while retaining its recorded integrity."
+expected_error = "peer_registry_integrity_mismatch"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peer_negative_cases]]
+id = "swapped-ecosystem-artifact"
+mutation = "Associate one peer with another ecosystem's artifact or lock."
+expected_error = "peer_artifact_identity_mismatch"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peer_negative_cases]]
+id = "lock-byte-drift"
+mutation = "Change a checked-in lock without reviewing and updating its digest and closure evidence."
+expected_error = "peer_lock_digest_mismatch"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[[peer_negative_cases]]
+id = "closure-drift"
+mutation = "Resolve a missing, extra, differently versioned, or differently hashed transitive package."
+expected_error = "peer_resolution_closure_mismatch"
+verified = false
+result = "pending"
+evidence = "Failure oracle is frozen here; executable mutation-gate evidence is owned by bd-mcp-2026-07-28-support-ahet.1.14."
+
+[update_procedure]
+baseline_is_append_only = true
+steps = [
+  "Fetch the commit-addressed catalog URL and reject redirects to an unpinned source.",
+  "Verify exact catalog byte length and SHA-256 before parsing any row.",
+  "Parse all SDK rows, reject duplicate or unknown IDs, and compare exact Tier sets and tier assignments.",
+  "Fetch the live main-branch catalog only as a drift observation and produce a reviewed semantic diff.",
+  "For each frozen Tier-1 peer, re-resolve tag objects/commits and registry artifact bytes independently.",
+  "Regenerate each isolated native lock using its recorded resolver and target.",
+  "Stage the checked-in inputs under each ecosystem's native filenames in fresh online and offline directories.",
+  "Run the online resolution into an empty cache, then run the recorded offline resolution in a fresh consumer directory using only that populated cache or wheelhouse and an OS-level deny-network sandbox.",
+  "For Go, resolve from the external consumer module and require the go-sdk v1.7.0 root artifact itself to appear in go.sum and the stable download projection.",
+  "For C#, compare both the exact packages.lock.json and the stable path-independent projection of the offline project.assets.json closure.",
+  "Compare lock bytes or the explicitly recorded canonical representation and compare complete closure digests.",
+  "Run the declared negative mutations through bd-mcp-2026-07-28-support-ahet.1.14 before changing the overall result from pending to pass.",
+  "On any reviewed release or catalog change, mint a new evidence baseline; never silently mutate the 2026-07-28 freeze.",
+]
+
+[acceptance]
+immutable_catalog_bytes_verified = true
+catalog_tier_inventory_complete = true
+tier1_peer_set_exact = true
+lower_tier_exclusions_explicit = true
+missing_peer_negative_verified = false
+extra_peer_negative_verified = false
+duplicate_peer_negative_verified = false
+catalog_drift_negative_verified = false
+live_catalog_drift_reported = true
+every_peer_version_exact = true
+every_peer_source_commit_exact = true
+every_peer_registry_integrity_exact = true
+every_peer_has_isolated_transitive_lock = true
+every_peer_resolves_offline = true
+online_offline_closures_equal = true
+floating_sources_rejected = false
+sdk_normative_authority_claimed = false
+positive_freeze_and_resolution_result = "pass"
+negative_gate = "pending bd-mcp-2026-07-28-support-ahet.1.14 executable mutation evidence"
+all_required_acceptance_complete = false
+result = "pending_negative_gate"

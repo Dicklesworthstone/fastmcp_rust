@@ -1,0 +1,567 @@
+# FND-01 immutable dependency evidence for:
+#   bd-mcp-2026-07-28-support-ahet.1.7
+#
+# This file records registry bytes, upstream source identity, declared
+# normal/build/dev dependency surfaces, the selected feature policy, and a
+# locked consumer-resolution snapshot. It intentionally distinguishes a
+# package's published dev graph from the graph propagated to a FastMCP
+# consumer.
+
+format_version = 1
+evidence_id = "FND-01/serialization-uri-dependencies"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.7"
+retrieved_at_utc = "2026-07-29T20:53:31Z"
+retrieval_agent = "BlueTern"
+plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+registry_index = "https://index.crates.io/"
+registry_api = "https://crates.io/api/v1/crates"
+registry_archive = "https://static.crates.io/crates"
+
+[toolchain]
+rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
+cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
+host = "aarch64-apple-darwin"
+resolver = "2"
+
+[advisory_snapshot]
+repository = "https://github.com/RustSec/advisory-db"
+commit = "7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
+commit_time_utc = "2026-07-29T15:17:10Z"
+advisory_count = 1173
+audit_tool = "cargo-audit-audit 0.22.0"
+consumer_lock_dependency_count = 129
+audit_output_bytes = 314
+audit_output_sha256 = "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
+audit_output_json = '''{"database":{"advisory-count":1173,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":129},"settings":{"target_arch":[],"target_os":[],"severity":null,"ignore":[],"informational_warnings":["unmaintained","unsound","notice"]},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}
+'''
+vulnerabilities = []
+warnings = []
+direct_package_advisories = []
+result = "clean at the pinned advisory database commit; no ignore list used"
+
+[policy]
+supported_targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+prohibited_active_packages = [
+  "tokio",
+  "reqwest",
+  "hyper",
+  "axum",
+  "tower",
+  "async-std",
+  "smol",
+  "rustls",
+  "aws-lc-rs",
+  "rand",
+]
+prohibited_active_packages_found = []
+network_schema_resolution = "disabled"
+schema_draft = "Draft 2020-12"
+json_number_policy = "arbitrary precision before bounded protocol admission"
+absolute_uri_policy = "separate byte-preserving RFC 3986 URI-with-required-scheme parser; never implemented with url"
+url_policy = "core-owned implementation detail for canonical HTTP/security identifiers only"
+secret_policy = "zeroize is used only through framework-owned secret containers"
+argon2_policy = "optional built-in-issuer capability only; no hand-rolled password KDF"
+
+[[crate]]
+name = "serde_json"
+version = "1.0.151"
+requirement = "=1.0.151"
+default_features = true
+requested_features = ["arbitrary_precision"]
+resolved_features = ["arbitrary_precision", "default", "float_roundtrip", "std"]
+allowed_features = ["arbitrary_precision", "default", "float_roundtrip", "std"]
+prohibited_features = ["preserve_order", "raw_value", "unbounded_depth"]
+checksum_sha256 = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+archive_bytes = 156556
+archive_url = "https://static.crates.io/crates/serde_json/serde_json-1.0.151.crate"
+index_url = "https://index.crates.io/se/rd/serde_json"
+api_url = "https://crates.io/api/v1/crates/serde_json/1.0.151"
+published_at_utc = "2026-07-20T05:54:44.078083Z"
+yanked = false
+license = "MIT OR Apache-2.0"
+rust_version = "1.71"
+repository = "https://github.com/serde-rs/json"
+vcs_revision = "de8500740cdcabffb9734f503e4889def823cf10"
+vcs_path = ""
+tag = "v1.0.151"
+tag_peeled_revision = "de8500740cdcabffb9734f503e4889def823cf10"
+publisher_lock_bytes = 10546
+publisher_lock_sha256 = "3dc87740936e57d7be685ad20618aaa3ec8d931085e54381d196a2ec8faa919f"
+normal_dependencies = [
+  "indexmap ^2.2.3 optional default-features=true",
+  "itoa ^1.0 default-features=true",
+  "memchr ^2 default-features=false",
+  "serde_core ^1.0.220 default-features=false",
+  "zmij ^1.0 default-features=true",
+  "serde ^1.0.220 target=cfg(any()) default-features=false",
+]
+build_dependencies = []
+dev_dependencies = [
+  "automod ^1.0.11",
+  "indoc ^2.0.2",
+  "ref-cast ^1.0.18",
+  "rustversion ^1.0.13",
+  "serde ^1.0.194 features=derive",
+  "serde_bytes ^0.11.10",
+  "serde_derive ^1.0.166",
+  "serde_stacker ^0.1.8",
+  "trybuild ^1.0.108 features=diff",
+]
+notes = [
+  "jsonschema 0.49.2 activates float_roundtrip in addition to FastMCP's direct arbitrary_precision request",
+  "no preserve_order or unbounded_depth feature is admitted",
+]
+
+[[crate]]
+name = "jsonschema"
+version = "0.49.2"
+requirement = "=0.49.2"
+default_features = false
+requested_features = ["arbitrary-precision"]
+resolved_features = ["arbitrary-precision"]
+allowed_features = ["arbitrary-precision"]
+prohibited_features = [
+  "default",
+  "resolve-http",
+  "resolve-file",
+  "resolve-async",
+  "tls-aws-lc-rs",
+  "tls-ring",
+  "macros",
+  "conformance",
+  "magnus",
+  "pyo3",
+]
+checksum_sha256 = "f8a77951c56b6a0af03c22af6953d6ffcfba9403c765578921f3f1089b999db6"
+archive_bytes = 440692
+archive_url = "https://static.crates.io/crates/jsonschema/jsonschema-0.49.2.crate"
+index_url = "https://index.crates.io/js/on/jsonschema"
+api_url = "https://crates.io/api/v1/crates/jsonschema/0.49.2"
+published_at_utc = "2026-07-27T22:05:26.190903Z"
+yanked = false
+license = "MIT"
+rust_version = "1.85.0"
+repository = "https://github.com/Stranger6667/jsonschema"
+vcs_revision = "d85e5f2cb537167fc1fce71c0eca759ba79319ea"
+vcs_path = "crates/jsonschema"
+tag = "rust-v0.49.2"
+tag_peeled_revision = "d85e5f2cb537167fc1fce71c0eca759ba79319ea"
+publisher_lock_bytes = 73205
+publisher_lock_sha256 = "a06ea29796cdd3e5410d48bc5d6ff9157f53b9734214a08c49fcd0714ebfcd34"
+normal_dependencies = [
+  "ahash ^0.8 features=serde default-features=true",
+  "bytecount ^0.6 features=runtime-dispatch-simd",
+  "data-encoding ^2.9",
+  "email_address ^0.2.9",
+  "fancy-regex ^0.18",
+  "fraction ^0.15 default-features=false features=with-bigint",
+  "idna ^1.0.2",
+  "itoa ^1",
+  "jsonschema-regex ^0.49.2",
+  "jsonschema-value ^0.49.2",
+  "num-bigint ^0.4 optional; enabled by arbitrary-precision",
+  "num-cmp ^0.1",
+  "num-traits ^0.2.19",
+  "percent-encoding ^2.3",
+  "referencing ^0.49.2",
+  "regex ^1.11.1",
+  "serde ^1.0 features=derive",
+  "serde_json ^1 features=float_roundtrip",
+  "strum ^0.28.0 features=derive",
+  "unicode-general-category ^1.1",
+  "uuid-simd ^0.8 default-features=false features=std,detect",
+  "getrandom ^0.3.4 target=cfg(target_arch=\"wasm32\") features=wasm_js",
+]
+optional_normal_dependencies_disabled = [
+  "async-trait ^0.1.86 optional",
+  "jsonschema-macros ^0.49.2 optional",
+  "tokio ^1 optional default-features=false features=rt",
+  "reqwest ^0.13 target=cfg(all(target_arch=\"wasm32\",any(target_os=\"unknown\",target_os=\"none\"))) optional default-features=false features=json",
+  "reqwest ^0.13 target=cfg(not(target_arch=\"wasm32\")) optional default-features=false features=blocking,json,http2,rustls-no-provider",
+  "rustls ^0.23 target=cfg(not(target_arch=\"wasm32\")) optional default-features=false features=std,tls12",
+]
+build_dependencies = []
+dev_dependencies = [
+  "test-case ^3 target=all",
+  "futures ^0.3 default-features=false features=std",
+  "wasm-bindgen-test ^0.3.55 target=cfg(all(target_arch=\"wasm32\",target_os=\"unknown\"))",
+  "codspeed-criterion-compat ^5.0 target=cfg(not(target_arch=\"wasm32\")) default-features=false",
+  "criterion ^0.8 target=cfg(not(target_arch=\"wasm32\")) default-features=false",
+  "hegeltest ^0.28 target=cfg(not(target_arch=\"wasm32\")) features=serde_json",
+  "tempfile ^3.13.0 target=cfg(not(target_arch=\"wasm32\"))",
+  "test-case ^3 target=cfg(not(target_arch=\"wasm32\"))",
+  "tokio ^1 target=cfg(not(target_arch=\"wasm32\")) dev-only default-features=true features=macros,rt",
+]
+dev_dependency_authority = "normalized Cargo.toml in the published jsonschema-0.49.2 crate archive"
+source_workspace_only_dev_dependencies_excluded_during_packaging = [
+  "jsonschema-testsuite path=../jsonschema-testsuite package=jsonschema-testsuite target=all",
+  "benchmark path=../benchmark target=cfg(not(target_arch=\"wasm32\"))",
+]
+packaging_normalization = "Cargo excludes the two workspace path-only dev edges from the normalized published Cargo.toml. They are recorded here as source-workspace context, not as resolvable packaged-consumer edges."
+notes = [
+  "the publisher's dev graph contains Tokio, but transitive dev dependencies do not propagate into the FastMCP consumer graph",
+  "the selected consumer normal/build graph contains no Tokio, Reqwest, Rustls, or network resolver feature",
+  "ahash 0.8.12 defaults activate runtime-rng and getrandom 0.3.4 on every supported target; this is hash-table seeding, not a FastMCP security-token draw",
+]
+
+[[crate]]
+name = "url"
+version = "2.5.8"
+requirement = "=2.5.8"
+default_features = false
+requested_features = ["std"]
+resolved_features = ["std"]
+allowed_features = ["std"]
+prohibited_features = ["default", "serde", "debugger_visualizer", "expose_internals"]
+checksum_sha256 = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+archive_bytes = 86512
+archive_url = "https://static.crates.io/crates/url/url-2.5.8.crate"
+index_url = "https://index.crates.io/3/u/url"
+api_url = "https://crates.io/api/v1/crates/url/2.5.8"
+published_at_utc = "2026-01-05T22:14:31.414927Z"
+yanked = false
+license = "MIT OR Apache-2.0"
+rust_version = "1.63"
+repository = "https://github.com/servo/rust-url"
+vcs_revision = "d6ea13c5f8e7e6e627f6390161b3e185bda5e5ce"
+vcs_path = "url"
+tag = "v2.5.8"
+tag_peeled_revision = "d6ea13c5f8e7e6e627f6390161b3e185bda5e5ce"
+publisher_lock_bytes = 10787
+publisher_lock_sha256 = "f219c87b25034c1046eeffa7e75288646b719131dd49cf27e1efe64141c65ba7"
+normal_dependencies = [
+  "form_urlencoded ^1.2.2 default-features=false features=alloc",
+  "idna ^1.1.0 default-features=false features=alloc,compiled_data",
+  "percent-encoding ^2.3.2 default-features=false features=alloc",
+  "serde ^1.0 optional default-features=false",
+  "serde_derive ^1.0 optional default-features=false",
+]
+build_dependencies = []
+dev_dependencies = [
+  "bencher ^0.1",
+  "serde ^1.0",
+  "serde_derive ^1.0",
+  "serde_json ^1.0",
+  "wasm-bindgen-test ^0.3 target=cfg(all(target_arch=\"wasm32\",target_os=\"unknown\"))",
+]
+notes = [
+  "the selected std-only consumer edge does not activate url's optional serde dependencies",
+  "url is prohibited from parsing or representing byte-preserving generic MCP resource URIs",
+]
+
+[[crate]]
+name = "zeroize"
+version = "1.9.0"
+requirement = "=1.9.0"
+default_features = false
+requested_features = ["alloc", "derive"]
+resolved_features = ["alloc", "derive", "zeroize_derive"]
+allowed_features = ["alloc", "derive", "zeroize_derive"]
+prohibited_features = ["default", "std", "serde", "aarch64", "simd"]
+checksum_sha256 = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+archive_bytes = 24480
+archive_url = "https://static.crates.io/crates/zeroize/zeroize-1.9.0.crate"
+index_url = "https://index.crates.io/ze/ro/zeroize"
+api_url = "https://crates.io/api/v1/crates/zeroize/1.9.0"
+published_at_utc = "2026-06-12T18:42:35.275395Z"
+yanked = false
+license = "Apache-2.0 OR MIT"
+rust_version = "1.85"
+repository = "https://github.com/RustCrypto/utils"
+vcs_revision = "0b715735a660a8566ccd240bf42489fe2ed98efb"
+vcs_path = "zeroize"
+tag = "zeroize-v1.9.0"
+tag_peeled_revision = "0b715735a660a8566ccd240bf42489fe2ed98efb"
+publisher_lock_bytes = 2067
+publisher_lock_sha256 = "d20e85bfdcc029e5d83ff3ef3141bc681b154ab6fe8dc603e7389eed7c10a391"
+normal_dependencies = [
+  "serde ^1 optional default-features=false",
+  "zeroize_derive ^1.5 optional; enabled by derive",
+]
+build_dependencies = []
+dev_dependencies = []
+notes = [
+  "alloc is required for Zeroizing<Vec<_>>",
+  "derive is admitted only for framework-owned secret wrapper types",
+  "std and serde are not activated",
+]
+
+[[crate]]
+name = "argon2"
+version = "0.5.3"
+requirement = "=0.5.3"
+default_features = false
+requested_features = ["alloc", "password-hash", "zeroize"]
+resolved_features = ["alloc", "password-hash", "zeroize"]
+allowed_features = ["alloc", "password-hash", "zeroize"]
+prohibited_features = ["default", "rand", "simple", "std"]
+checksum_sha256 = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+archive_bytes = 28795
+archive_url = "https://static.crates.io/crates/argon2/argon2-0.5.3.crate"
+index_url = "https://index.crates.io/ar/go/argon2"
+api_url = "https://crates.io/api/v1/crates/argon2/0.5.3"
+published_at_utc = "2024-01-20T19:21:51.661198Z"
+yanked = false
+license = "MIT OR Apache-2.0"
+rust_version = "1.65"
+vcs_repository = "https://github.com/RustCrypto/password-hashes"
+published_repository_subdirectory = "argon2"
+published_repository_literal_sha256 = "1f8bc939e9ef2ff03ec0794db0f20b5db776e1fde37ff208657cdfb7a7eb40d4"
+published_repository_policy_note = "The archive metadata uses a legacy default-branch subdirectory URL. Repository policy forbids reproducing that branch token; the exact literal remains provable by this SHA-256 and the content-addressed archive, while VCS checkout uses the root URL plus immutable revision and path."
+vcs_revision = "5b6a74e0799955b21c9d3854de1674a78a472648"
+vcs_tree = "b2d5de435d18ca645cab6f91aad3d416caf0fcd4"
+vcs_path = "argon2"
+tag = "argon2-v0.5.3"
+tag_revision = "2b6f9688625db3db798b35c8a209e4799bb60e11"
+tag_tree = "b2d5de435d18ca645cab6f91aad3d416caf0fcd4"
+publisher_workspace_lock_url = "https://raw.githubusercontent.com/RustCrypto/password-hashes/5b6a74e0799955b21c9d3854de1674a78a472648/Cargo.lock"
+publisher_workspace_lock_bytes = 13848
+publisher_workspace_lock_sha256 = "1456b7ba0b2a8f35dc1d2180377258757443edda150897aadab308bd3e1a8f7f"
+normal_dependencies = [
+  "base64ct ^1 default-features=true",
+  "blake2 ^0.10.6 default-features=false",
+  "password-hash ^0.5 optional default-features=true",
+  "zeroize ^1 optional default-features=false",
+  "cpufeatures ^0.2.12 target=x86-or-x86_64",
+]
+build_dependencies = []
+dev_dependencies = [
+  "hex-literal ^0.4",
+  "password-hash ^0.5 features=rand_core",
+]
+notes = [
+  "the archive VCS revision and release tag are sibling commits with the identical recorded tree",
+  "argon2's optional password-hash dependency has default-features=true; the selected alloc/password-hash feature path therefore activates password-hash 0.5.0 default and rand_core 0.6.4",
+  "rand_core 0.6.4 has no getrandom feature in this graph, so Argon2 does not obtain an OS RNG through that edge",
+  "the built-in issuer must supply admitted salt and parameters through framework policy; Argon2 is not a general ambient-randomness API",
+]
+
+[consumer_probe]
+name = "fastmcp_fnd01_dep_probe"
+version = "0.1.0"
+manifest_bytes = 578
+manifest_sha256 = "1131b5d2403f5ce9bce00014c0fc70ecdf3a0c595180b32e5f9daeca214d32d0"
+source_bytes = 24
+source_lines = 1
+source_sha256 = "31d7843263bb4b61502b7ae9d92ac7b121b8d70e4f1421afd719bffc5e898f55"
+lock_bytes = 30726
+lock_lines = 1215
+lock_sha256 = "c13836da46ef5637de3a16a025fbd51e00ae063f24434d121d60b6f73b7b15ef"
+lock_artifact_path = "evidence/fnd-01/serialization-uri-consumer.lock"
+lock_artifact_checked_in = true
+lock_artifact_byte_identical_to_probe = true
+lock_package_count = 129
+lock_package_projection_bytes = 10689
+lock_package_projection_lines = 129
+lock_package_projection_sha256 = "6562581f032a865cb86beb2a59d80f787371f718486d801d3cfec2ea028092d1"
+cargo_audit_result = "0 vulnerabilities, 0 warnings"
+rch_check_status = "blocked: the canonical-root clone retained a local-only origin, so RCH rejected preflight before compilation; compile proof remains an FND-01 integration gate"
+manifest = '''
+[package]
+name = "fastmcp_fnd01_dep_probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+resolver = "2"
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
+jsonschema = { version = "=0.49.2", default-features = false, features = ["arbitrary-precision"] }
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
+url = { version = "=2.5.8", default-features = false, features = ["std"] }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+'''
+source = '''#![forbid(unsafe_code)]
+'''
+
+[[consumer_probe.key_resolved_package]]
+name = "ahash"
+version = "0.8.12"
+checksum_sha256 = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+features = ["default", "getrandom", "runtime-rng", "serde", "std"]
+
+[[consumer_probe.key_resolved_package]]
+name = "getrandom"
+version = "0.3.4"
+checksum_sha256 = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+features = ["default through ahash on supported targets"]
+
+[[consumer_probe.key_resolved_package]]
+name = "password-hash"
+version = "0.5.0"
+checksum_sha256 = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+features = ["alloc", "default", "rand_core"]
+
+[[consumer_probe.key_resolved_package]]
+name = "rand_core"
+version = "0.6.4"
+checksum_sha256 = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+features = []
+
+[[consumer_probe.key_resolved_package]]
+name = "jsonschema-value"
+version = "0.49.2"
+checksum_sha256 = "94e097778f3e9c6a33862077dbf07aca0360d0b18d2a7abc323da132df49ee83"
+features = ["arbitrary-precision", "default", "serde_json"]
+
+[[consumer_probe.key_resolved_package]]
+name = "jsonschema-regex"
+version = "0.49.2"
+checksum_sha256 = "a4c2e64f341a1d6a15d2daa3c967e48921cf15b9c7f23a9899e8b63c7f7c4199"
+features = []
+
+[[consumer_probe.key_resolved_package]]
+name = "referencing"
+version = "0.49.2"
+checksum_sha256 = "b772e96f8eb6badd4eb10fbc08b8a98244c09b4af37e72e8fa612c854604b870"
+features = ["default"]
+
+[[consumer_probe.key_resolved_package]]
+name = "num-bigint"
+version = "0.4.8"
+checksum_sha256 = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+features = ["default", "std"]
+
+[[consumer_probe.key_resolved_package]]
+name = "zeroize_derive"
+version = "1.5.0"
+checksum_sha256 = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+features = []
+
+[consumer_probe.dev_graph]
+root_dev_dependencies = []
+transitive_dependency_dev_edges_propagate = false
+lines = 1
+bytes = 32
+sha256 = "4d55fd31c3e24603833218c57849161831d6fffe72016f23885cc18deb04ad44"
+canonical_output = "0fastmcp_fnd01_dep_probe v0.1.0\n"
+note = "The isolated consumer declares no dev dependencies, and dependency dev edges do not propagate. Published normal/build/dev declarations for each direct crate are separately recorded above."
+
+[[target_graph]]
+target = "x86_64-unknown-linux-gnu"
+normal_build_lines = 211
+normal_build_bytes = 4461
+normal_build_sha256 = "9b802aeff758416ab30d423baf958e67f7f9c780c755514b6e46cc4960da8ff6"
+feature_lines = 713
+feature_bytes = 38330
+feature_sha256 = "b86235c2b14bb7bdb912d1279644d3dfe03680e8c9b0093e777fc7c6056823ff"
+active_special_packages = ["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"]
+
+[[target_graph]]
+target = "aarch64-unknown-linux-gnu"
+normal_build_lines = 210
+normal_build_bytes = 4440
+normal_build_sha256 = "7aec3d8196b21e77c1c3f53a4482eec871c9e654fb962b675be3774ff0ee4afe"
+feature_lines = 711
+feature_bytes = 38278
+feature_sha256 = "06e56bb8eb215c35134c766afbe1442f7753244587f30acc99d3b02e28d6ab86"
+active_special_packages = ["getrandom 0.3.4", "rand_core 0.6.4"]
+
+[[target_graph]]
+target = "x86_64-apple-darwin"
+normal_build_lines = 211
+normal_build_bytes = 4461
+normal_build_sha256 = "9b802aeff758416ab30d423baf958e67f7f9c780c755514b6e46cc4960da8ff6"
+feature_lines = 713
+feature_bytes = 38330
+feature_sha256 = "b86235c2b14bb7bdb912d1279644d3dfe03680e8c9b0093e777fc7c6056823ff"
+active_special_packages = ["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"]
+
+[[target_graph]]
+target = "aarch64-apple-darwin"
+normal_build_lines = 210
+normal_build_bytes = 4440
+normal_build_sha256 = "7aec3d8196b21e77c1c3f53a4482eec871c9e654fb962b675be3774ff0ee4afe"
+feature_lines = 711
+feature_bytes = 38278
+feature_sha256 = "06e56bb8eb215c35134c766afbe1442f7753244587f30acc99d3b02e28d6ab86"
+active_special_packages = ["getrandom 0.3.4", "rand_core 0.6.4"]
+
+[[target_graph]]
+target = "x86_64-pc-windows-msvc"
+normal_build_lines = 210
+normal_build_bytes = 4452
+normal_build_sha256 = "c62ce8288cdfc40e2b3785ed6f8554119897414fbeb429f93879771f910b374d"
+feature_lines = 710
+feature_bytes = 38256
+feature_sha256 = "60463587f417c18f0e8f6e76190728dad95bf9a533cfa2c990672d64429e99dc"
+active_special_packages = ["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"]
+
+[reproduction]
+materialization_precondition = "FASTMCP_FND01_PROBE_DIR names a new nonexistent path outside every source checkout; never point it at a workspace or user-home directory."
+materialization_recipe = '''
+export FASTMCP_FND01_PROBE_DIR=/absolute/new/fastmcp-fnd01-dependency-probe
+test ! -e "$FASTMCP_FND01_PROBE_DIR"
+mkdir -p "$FASTMCP_FND01_PROBE_DIR/src"
+yq -p toml -o json '.consumer_probe.manifest' evidence/fnd-01/serialization-uri-dependencies.toml | jq -j -r '.' > "$FASTMCP_FND01_PROBE_DIR/Cargo.toml"
+yq -p toml -o json '.consumer_probe.source' evidence/fnd-01/serialization-uri-dependencies.toml | jq -j -r '.' > "$FASTMCP_FND01_PROBE_DIR/src/lib.rs"
+install -m 0644 evidence/fnd-01/serialization-uri-consumer.lock "$FASTMCP_FND01_PROBE_DIR/Cargo.lock"
+test "$(wc -c < "$FASTMCP_FND01_PROBE_DIR/Cargo.toml" | tr -d ' ')" = 578
+test "$(shasum -a 256 "$FASTMCP_FND01_PROBE_DIR/Cargo.toml" | cut -d ' ' -f 1)" = 1131b5d2403f5ce9bce00014c0fc70ecdf3a0c595180b32e5f9daeca214d32d0
+test "$(shasum -a 256 "$FASTMCP_FND01_PROBE_DIR/src/lib.rs" | cut -d ' ' -f 1)" = 31d7843263bb4b61502b7ae9d92ac7b121b8d70e4f1421afd719bffc5e898f55
+test "$(shasum -a 256 "$FASTMCP_FND01_PROBE_DIR/Cargo.lock" | cut -d ' ' -f 1)" = c13836da46ef5637de3a16a025fbd51e00ae063f24434d121d60b6f73b7b15ef
+'''
+archive_hash = "curl -fsSL <archive_url> | shasum -a 256"
+archive_length = "curl -fsSL <archive_url> | wc -c"
+vcs_info = "curl -fsSL <archive_url> | tar -xzOf - <crate-version>/.cargo_vcs_info.json"
+publisher_manifest_normalized = "curl -fsSL <archive_url> | tar -xzOf - <crate-version>/Cargo.toml"
+publisher_manifest_original = "curl -fsSL <archive_url> | tar -xzOf - <crate-version>/Cargo.toml.orig"
+registry_record = "curl -fsSL <index_url> | jq -c 'select(.vers == \"<version>\")'"
+lock_projection = "yq -p=toml -o=json '.' Cargo.lock | jq -r '.package | sort_by(.name,.version)[] | [.name,.version,(.checksum // \"path\")] | @tsv'"
+normal_build_graph = "cargo tree --locked --target <target> --edges normal,build --prefix depth --format '{p}' | sed -E 's#fastmcp_fnd01_dep_probe v0.1.0 \\([^)]*\\)#fastmcp_fnd01_dep_probe v0.1.0#; s/[[:space:]]+$//'"
+feature_graph = "cargo tree --locked --target <target> --edges features --prefix depth --format '{p} {f}' | sed -E 's#fastmcp_fnd01_dep_probe v0.1.0 \\([^)]*\\)#fastmcp_fnd01_dep_probe v0.1.0#; s/[[:space:]]+$//'"
+dev_graph = "cargo tree --locked --edges dev --prefix depth --format '{p}' | sed -E 's#fastmcp_fnd01_dep_probe v0.1.0 \\([^)]*\\)#fastmcp_fnd01_dep_probe v0.1.0#; s/[[:space:]]+$//'"
+target_graph_prerequisites = "Run from FASTMCP_FND01_PROBE_DIR with the exact dated Cargo, checked-in lock, and registry archives whose checksums Cargo verifies against that lock. The recorded hashes are not claimed reproducible from the lock bytes alone."
+advisory_database_verify = "test \"$(git -C \"$FASTMCP_RUSTSEC_DB\" rev-parse HEAD)\" = 7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2 && test -z \"$(git -C \"$FASTMCP_RUSTSEC_DB\" status --porcelain)\""
+advisory_check = "cargo audit --db \"$FASTMCP_RUSTSEC_DB\" --file \"$FASTMCP_FND01_PROBE_DIR/Cargo.lock\" --no-fetch --json"
+
+[current_workspace_gap]
+serde_json_lock = "1.0.151 is present, but the workspace declaration is floating and does not request arbitrary_precision"
+url_lock = "2.5.8 is present transitively, but fastmcp-core is not its sole direct owner"
+zeroize_lock = "1.9.0 is present transitively, but there is no common core-owned secret-container edge"
+jsonschema_lock = "absent"
+argon2_lock = "absent"
+shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+required_integration = [
+  "pin the exact declarations and ownership in shared Cargo manifests",
+  "converge Cargo.lock against this evidence",
+  "run the isolated and workspace package-consumer checks through RCH",
+  "verify every target graph and prohibited-package assertion",
+]
+
+[gate]
+registry_bytes_verified = true
+upstream_source_identity_verified = true
+declared_normal_build_dev_graphs_recorded = true
+consumer_resolution_locked = true
+consumer_lock_checked_in = true
+consumer_target_graph_hashes_recorded = true
+consumer_target_graph_bytes_checked_in = false
+consumer_target_graphs_reproducible_under_recorded_prerequisites = true
+advisory_snapshot_clean = true
+workspace_manifests_integrated = false
+workspace_lock_integrated = false
+rch_compile_verified = false
+claim = "registry bytes, the exact isolated consumer lock, declared graphs, and reproducible target-graph hashes are frozen; canonical target-graph output bytes and workspace integration/RCH proof remain downstream gates, so the aggregate stays fail-closed"
+
+[handoff]
+evidence_child_complete_when = "Every direct registry/source/declaration record, the checked-in resolver-2 consumer lock, materialization recipe, dev-edge proof, target-graph hash, advisory binding, and negative assertion in this artifact independently validates."
+integration_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+verification_owner = "bd-mcp-2026-07-28-support-ahet.1.14"
+integration_owned_pending = [
+  "apply the exact dependencies to shared workspace manifests",
+  "converge the shared Cargo.lock",
+  "run all compilation through RCH",
+]
+verification_owned_pending = [
+  "capture and compare canonical target-graph output bytes from a clean materialized consumer",
+  "run packaged-consumer compilation and prohibited-package checks",
+  "turn the three workspace/RCH gate fields above true only after observed success",
+]
+closure_boundary = "This evidence child may close before integration only after independent review of its owned records. Its closure is not a workspace dependency-support claim and cannot make any aggregate FND-01 gate pass."

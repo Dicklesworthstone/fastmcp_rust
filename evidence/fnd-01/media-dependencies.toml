@@ -1,0 +1,979 @@
+# FND-01 immutable dependency evidence for:
+#   bd-mcp-2026-07-28-support-ahet.1.12
+#
+# This evidence child freezes exact root artifacts, declarative feature
+# surfaces, compatible graph projections, security-policy vectors, and
+# fail-closed handoffs. It does not claim workspace integration, target
+# compilation, advisory execution, HTML authoring conformance, or safe media
+# rendering.
+
+format_version = 1
+evidence_id = "FND-01/media-dependencies"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.12"
+owner = "IndigoHeron"
+recorded_on = "2026-07-29"
+plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+plan_byte_length = 1734578
+plan_sha256 = "24917c625694304177a717c380044bd3da57c824409035fce411065ff2f6454d"
+root_crate_count = 3
+vector_manifest_count = 2
+owned_artifact_count = 9
+substitution_negative_count = 34
+hash_algorithm = "sha256"
+registry_index = "https://index.crates.io/"
+registry_archive = "https://static.crates.io/crates"
+crates_io_api_403_is_evidence = false
+
+[scope]
+classification = "fnd_01_evidence_child_only"
+aggregate_fnd_01_support = false
+apps_support = false
+safe_icon_rendering_support = false
+runtime_results = "pending"
+owned_paths = [
+  "evidence/fnd-01/media-dependencies.toml",
+  "evidence/fnd-01/vectors/media/*",
+]
+shared_files_modified = false
+
+[toolchain]
+rust_version = "1.99"
+channel = "nightly-2026-07-11"
+rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
+cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
+resolver = "2"
+supported_targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+target_authority = "evidence/fnd-01/toolchain-asupersync.toml"
+target_authority_byte_length = 39202
+target_authority_sha256 = "c18236b79c98dcaaa7c61170d3251148213bb960130b179ff436da6c2ed838f8"
+
+[source_policy]
+direct_root_archive_bytes_checked_in = false
+transitive_reserved_archives_checked_in = true
+transitive_reserved_archives_content_addressed = true
+offline_source = "already-present local Cargo registry archives/source plus local sparse-index records"
+archive_hash_scope = "Exact .crate bytes"
+manifest_hash_scope = "Exact packaged file bytes; no newline or whitespace normalization"
+upstream_ref_rule = "Record symbolic tag separately from tag object, peeled commit, tree, and archive VCS revision. Never invent an absent tag."
+publisher_lock_is_consumer_authority = false
+api_observation = "Three crates.io version-API requests returned HTTP 403; no fact in this manifest is derived from those responses."
+
+[source_provenance_evidence]
+index_entry_rule = "Sparse-index bytes are immutable release metadata; each path is bound by exact byte length and SHA-256."
+html5ever_index_path = "ht/ml/html5ever"
+html5ever_index_bytes = 727
+html5ever_index_sha256 = "f3c00431225ef2701c3bc515fee5f928527e4855180f0d90b54a31e0bd25a454"
+image_index_path = "im/ag/image"
+image_index_bytes = 3698
+image_index_sha256 = "91daf7f9c360ac8c0ebf47a5f718a14549d3ebd6add52299cfc1446e84084ca0"
+resvg_index_path = "re/sv/resvg"
+resvg_index_bytes = 1740
+resvg_index_sha256 = "ee0878368a2c99e21b6c9f85c828689df4a1a1daa1203cb212904be3364d7d13"
+tag_object_bytes_checked_in = false
+tag_signature_verification_claimed = false
+tag_tree_external_receipts_required = false
+source_ref_closure_status = "immutable archive VCS and exact source-ref receipts are bound below; no signature-validity claim is made"
+source_ref_receipts_complete = true
+compatible_lock_path_hash_rule = "Every compatible projection path is bound by package/version/source/checksum; canonical FastMCP lock remains owned by .1.1."
+
+[[source_ref_receipt]]
+package = "html5ever"
+repository = "https://github.com/servo/html5ever"
+ref_kind = "commit"
+ref = "ce64836c685025a5fef0860fa2e9c80b2683e8d0"
+tree = "acfb6468afc848144a88f8a9e66473d79e6296a1"
+tag = ""
+tag_object = ""
+tag_peeled_commit = "ce64836c685025a5fef0860fa2e9c80b2683e8d0"
+receipt_url = "https://github.com/servo/html5ever/commit/ce64836c685025a5fef0860fa2e9c80b2683e8d0"
+
+[[source_ref_receipt]]
+package = "image"
+repository = "https://github.com/image-rs/image"
+ref_kind = "annotated_tag"
+ref = "v0.25.10"
+tag_object = "cf06bc9f66bb9423b1d5231af29cb5dd02bb4fa1"
+tag_peeled_commit = "76e57184f22772dad1138e96954e57945406b15e"
+tree = "e239f84eef64d93701fc5762f23ee04f12178d9d"
+receipt_url = "https://api.github.com/repos/image-rs/image/git/tags/cf06bc9f66bb9423b1d5231af29cb5dd02bb4fa1"
+
+[[source_ref_receipt]]
+package = "resvg"
+repository = "https://github.com/linebender/resvg"
+ref_kind = "annotated_tag"
+ref = "v0.47.0"
+tag_object = "898b377cb4f1b55f6f7b1dde4d0448277179812f"
+tag_peeled_commit = "3a0fdba53ccf2d346b54cc53ba7adf0ee60d0707"
+tree = "34b3792e054be9a4ac6790eeb399722ec7fec856"
+receipt_url = "https://api.github.com/repos/linebender/resvg/git/tags/898b377cb4f1b55f6f7b1dde4d0448277179812f"
+
+[[source_ref_receipt]]
+package = "tiny-skia / tiny-skia-path"
+repository = "https://github.com/linebender/tiny-skia"
+ref_kind = "lightweight_tag"
+ref = "v0.12.0"
+tag_object = ""
+tag_peeled_commit = "e48b9027762d33731e60e40eb17eaa4f583b0185"
+tree = "c65bf6145b324fe1d00174aabe6349a736072591"
+path_in_vcs = ["", "path"]
+receipt_url = "https://api.github.com/repos/linebender/tiny-skia/commits/e48b9027762d33731e60e40eb17eaa4f583b0185"
+receipt_authority = "official GitHub commit API; lightweight tag has no tag object or signature claim"
+
+[owned_artifacts]
+paths = [
+  "evidence/fnd-01/vectors/media/graph-snapshot.toml",
+  "evidence/fnd-01/vectors/media/security-vectors.toml",
+  "evidence/fnd-01/vectors/media/png-valid-upstream.png",
+  "evidence/fnd-01/vectors/media/jpeg-metadata-valid-upstream.jpg",
+  "evidence/fnd-01/vectors/media/webp-static-valid-upstream.webp",
+  "evidence/fnd-01/vectors/media/webp-animated-upstream.webp",
+  "evidence/fnd-01/vectors/media/tiny-skia-0.12.0.crate",
+  "evidence/fnd-01/vectors/media/tiny-skia-path-0.12.0.crate",
+  "evidence/fnd-01/vectors/media/usvg-0.47.0.crate",
+]
+sha256 = [
+  "3d26fc603329af4f89d7ec3f41cd4286086beb8ce777ccbf516a1ce7388318df",
+  "93c3126fd46f413fa412eb90a7097d112c3908337ce95547edc094c9f9fd3e6d",
+  "b95534c515880250a4d87a2dede9d39f086249c6d0b61d1d448da28ea43a444c",
+  "5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751",
+  "284ddab37b3cf76424a5a9a32351a84e815a0972f4bffd68571f6f67874c38d3",
+  "459d0f8601844487cebd09dd11d0f50346fa45820bb7a7d817140dcc811496b4",
+  "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea",
+  "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9",
+  "d46cf96c5f498d36b7a9693bc6a7075c0bb9303189d61b2249b0dc3d309c07de",
+]
+
+[[crate]]
+name = "html5ever"
+version = "0.39.0"
+requirement = "=0.39.0"
+edition = "2021"
+rust_version = "1.71.0"
+license = "MIT OR Apache-2.0"
+default_features = false
+requested_features = []
+allowed_root_features = []
+prohibited_root_features = ["serde", "trace_tokenizer"]
+checksum_sha256 = "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8"
+archive_bytes = 81764
+archive_url = "https://static.crates.io/crates/html5ever/html5ever-0.39.0.crate"
+index_url = "https://index.crates.io/ht/ml/html5ever"
+published_at_utc = "2026-03-13T16:22:15Z"
+yanked = false
+normalized_manifest_bytes = 1813
+normalized_manifest_sha256 = "fdd4c475861e3761a4a73e7ef08f310950032579628fd0b488000a47b9d8b834"
+original_manifest_bytes = 701
+original_manifest_sha256 = "512759192eb48ad87acc334ec5284db60cc9e5d461e551a1aa7c7fbe53b140f1"
+vcs_info_bytes = 103
+vcs_info_sha256 = "a03b7c5471f16270b26a7701138fa249adc598c862eaf34b6504387f03d9ff64"
+license_apache_bytes = 10847
+license_apache_sha256 = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+license_mit_bytes = 1076
+license_mit_sha256 = "86dd7f026f916daf7511e39951ad8ea8cf55a8db67ae64060dacf829761c18f3"
+repository = "https://github.com/servo/html5ever"
+vcs_path = "html5ever"
+vcs_revision = "ce64836c685025a5fef0860fa2e9c80b2683e8d0"
+vcs_tree = "acfb6468afc848144a88f8a9e66473d79e6296a1"
+tag_present = false
+tag = ""
+source_ref_kind = "commit"
+source_commit_url = "https://github.com/servo/html5ever/commit/ce64836c685025a5fef0860fa2e9c80b2683e8d0"
+source_tree_url = "https://github.com/servo/html5ever/tree/ce64836c685025a5fef0860fa2e9c80b2683e8d0/html5ever"
+source_identity = "Archive VCS revision exactly equals the immutable release commit whose workspace manifest bumps version to 0.39.0; upstream advertises no 0.39.0 tag."
+normal_dependencies = ["log ^0.4", "markup5ever ^0.39"]
+build_dependencies = []
+dev_dependencies = ["criterion ^0.8", "typed-arena ^2.0.2"]
+supported_surface = "HTML tokenizer/tree builder only"
+disabled_surface = "serde and trace_tokenizer features"
+authority_limit = "Parser success is never WHATWG authoring-conformance evidence."
+
+[[crate]]
+name = "image"
+version = "0.25.10"
+requirement = "=0.25.10"
+edition = "2021"
+rust_version = "1.88.0"
+license = "MIT OR Apache-2.0"
+default_features = false
+requested_features = ["jpeg", "png", "webp"]
+allowed_root_features = ["jpeg", "png", "webp"]
+prohibited_root_features = [
+  "default",
+  "default-formats",
+  "avif",
+  "avif-native",
+  "bmp",
+  "color_quant",
+  "dds",
+  "exr",
+  "ff",
+  "gif",
+  "hdr",
+  "ico",
+  "nasm",
+  "pnm",
+  "qoi",
+  "rayon",
+  "benchmarks",
+  "serde",
+  "tga",
+  "tiff",
+]
+checksum_sha256 = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+archive_bytes = 303647
+archive_url = "https://static.crates.io/crates/image/image-0.25.10.crate"
+index_url = "https://index.crates.io/im/ag/image"
+published_at_utc = "2026-03-10T16:29:18Z"
+yanked = false
+normalized_manifest_bytes = 4189
+normalized_manifest_sha256 = "b45592b42e4f065d5258379bac78e2a00ab6e50bbeec265fcceeea9cf5829c26"
+original_manifest_bytes = 3657
+original_manifest_sha256 = "72ca0bc1d327e6ac95b697d74e65235138441b9d639f43f620cd3389517cf61d"
+vcs_info_bytes = 94
+vcs_info_sha256 = "f231a3e6ec6fd66ebd2522b6a118982bf468ba1b07c96a1778edfa135936a693"
+license_apache_bytes = 10174
+license_apache_sha256 = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+license_mit_bytes = 1036
+license_mit_sha256 = "c77a4cf9da729987d0fe7ccd811e3bd27393914ddf3d23467c18cc22954513b3"
+changes_bytes = 36876
+changes_sha256 = "b0f0a1dd668c5073e3df9203144641f9c3b4652be9b7183df5447ec2afff491f"
+repository = "https://github.com/image-rs/image"
+vcs_path = ""
+vcs_revision = "76e57184f22772dad1138e96954e57945406b15e"
+vcs_tree = "e239f84eef64d93701fc5762f23ee04f12178d9d"
+tag_present = true
+tag = "v0.25.10"
+tag_object = "cf06bc9f66bb9423b1d5231af29cb5dd02bb4fa1"
+tag_peeled_revision = "76e57184f22772dad1138e96954e57945406b15e"
+tag_verification = "PGP signature present; GitHub reports verified=false reason=bad_email"
+tag_object_bytes_checked_in = false
+tag_claim_verified = false
+tag_object_url = "https://api.github.com/repos/image-rs/image/git/tags/cf06bc9f66bb9423b1d5231af29cb5dd02bb4fa1"
+source_commit_url = "https://github.com/image-rs/image/commit/76e57184f22772dad1138e96954e57945406b15e"
+source_identity = "Archive VCS revision exactly equals the annotated tag peeled commit."
+normal_dependencies = [
+  "bytemuck ^1.8.0 features=extern_crate_alloc",
+  "byteorder-lite ^0.1.0",
+  "moxcms ^0.8.0",
+  "num-traits ^0.2.0",
+  "image-webp ^0.2.0 optional; webp only",
+  "png ^0.18.0 optional; png only",
+  "zune-core ^0.5.0 optional default-features=false; jpeg only",
+  "zune-jpeg ^0.5.5 optional; jpeg only",
+]
+build_dependencies = []
+dev_dependencies = ["crc32fast ^1.2.0", "criterion ^0.5.0", "glob ^0.3", "num-complex ^0.4", "quickcheck ^1"]
+supported_surface = "Exact PNG, JPEG, and static WebP decoder selection only; image/jpg is a MIME alias for JPEG, not a Cargo feature."
+disabled_surface = "Every other format, Rayon/parallelism, AVIF native code, NASM, Serde, auto-guessing, external decoder hooks, and encoder APIs"
+compiled_forbidden_surface = [
+  "image::open and image::guess_format: compiled convenience/auto-detection paths, forbidden to FastMCP",
+  "image::write_buffer_with_format and ImageEncoder implementations: compiled encoder APIs, forbidden to FastMCP",
+  "PNG/JPEG/WebP encoder modules and registration hooks: compiled but deny-listed; no encoder or external decoder hook is admitted",
+]
+compiled_forbidden_surface_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+
+[[crate]]
+name = "resvg"
+version = "0.47.0"
+requirement = "=0.47.0"
+edition = "2024"
+rust_version = "1.87.0"
+license = "Apache-2.0 OR MIT"
+default_features = false
+requested_features = []
+allowed_root_features = []
+prohibited_root_features = ["default", "memmap-fonts", "raster-images", "system-fonts", "text"]
+checksum_sha256 = "9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81"
+archive_bytes = 78312
+archive_url = "https://static.crates.io/crates/resvg/resvg-0.47.0.crate"
+index_url = "https://index.crates.io/re/sv/resvg"
+published_at_utc = "2026-02-09T18:54:34Z"
+yanked = false
+normalized_manifest_bytes = 2091
+normalized_manifest_sha256 = "63e6a7cbae29a44c45a13332cad24d1e58c67b06f530cb6ebfad017487e150b8"
+original_manifest_bytes = 1360
+original_manifest_sha256 = "9e86922990cea8223a0a400ee77b5a202ddbc9ab577d92d0a89e41cee3d13705"
+vcs_info_bytes = 106
+vcs_info_sha256 = "df4c482b8f7f872a4693d76eeb39cf2362b1b97e3d3264340be62d8fdaa377fd"
+license_apache_bytes = 10173
+license_apache_sha256 = "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+license_mit_bytes = 1057
+license_mit_sha256 = "f5d934dc281b44e0003ee461ac740b18b6629a454decd872c774d34e4ee0b21d"
+repository = "https://github.com/linebender/resvg"
+vcs_path = "crates/resvg"
+vcs_revision = "3a0fdba53ccf2d346b54cc53ba7adf0ee60d0707"
+vcs_tree = "34b3792e054be9a4ac6790eeb399722ec7fec856"
+tag_present = true
+tag = "v0.47.0"
+tag_object = "898b377cb4f1b55f6f7b1dde4d0448277179812f"
+tag_peeled_revision = "3a0fdba53ccf2d346b54cc53ba7adf0ee60d0707"
+tag_verification = "annotated tag is unsigned"
+tag_object_bytes_checked_in = false
+tag_claim_verified = false
+tag_object_url = "https://api.github.com/repos/linebender/resvg/git/tags/898b377cb4f1b55f6f7b1dde4d0448277179812f"
+source_commit_url = "https://github.com/linebender/resvg/commit/3a0fdba53ccf2d346b54cc53ba7adf0ee60d0707"
+source_identity = "Archive VCS revision exactly equals the annotated tag peeled commit."
+normal_dependencies = [
+  "log ^0.4",
+  "pico-args ^0.5 features=eq-separator",
+  "rgb ^0.8",
+  "svgtypes ^0.16.1",
+  "tiny-skia ^0.12.0 default-features=true",
+  "usvg ^0.47.0 default-features=false",
+]
+build_dependencies = []
+dev_dependencies = ["once_cell ^1.21", "png ^0.18.0"]
+supported_surface = "Closed static SVG shape/path subset after FastMCP pre-entry validation"
+disabled_surface = "text, system fonts, memory-mapped fonts, raster image decoders, scripts, events, animation, links, image, foreignObject, use, external resources, custom resolvers, network, filesystem, and font-provider access"
+critical_upstream_note = "Disabling raster-images does not disable SVG-data image elements; FastMCP must reject every image element before usvg/resvg entry."
+
+[[transitive_source_audit]]
+name = "tiny-skia"
+version = "0.12.0"
+required_by = "resvg"
+archive_url = "https://static.crates.io/crates/tiny-skia/tiny-skia-0.12.0.crate"
+archive_bytes = 268071
+archive_sha256 = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
+archive_checked_in = true
+archive_path = "evidence/fnd-01/vectors/media/tiny-skia-0.12.0.crate"
+source_vcs_revision = "e48b9027762d33731e60e40eb17eaa4f583b0185"
+source_path = ""
+cargo_toml_bytes = 2211
+cargo_toml_sha256 = "07ef83606b1448bcbd70fd6065cd0b71a51f61ad377a642b7796e4ea0dab0b52"
+cargo_toml_orig_bytes = 1256
+cargo_toml_orig_sha256 = "cb3bc15796f54dcc213cb220334b336c0d300bb20a0cfe9aa7d57c85f5302cc9"
+license = "BSD-3-Clause"
+license_bytes = 1564
+license_sha256 = "6d41e05f1d54fe726997cb0334ec539f1dff50600b1d5d90462ec2b392770ced"
+unsafe_count = 152
+extern_c_count = 0
+build_scripts = []
+panic_family_rule = "Count exact archive source tokens panic!, unreachable!, todo!, unimplemented!; assert family counts assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 8
+assert_family_count = 148
+panic_assert_total = 156
+source_audit_verified = true
+unsafe_ffi_panic_build_audit = "archive scan complete; canonical target receipt producer .1.1 and independent validator .1.15 remain fail-closed"
+owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+
+[[transitive_source_audit]]
+name = "tiny-skia-path"
+version = "0.12.0"
+required_by = "tiny-skia"
+archive_url = "https://static.crates.io/crates/tiny-skia-path/tiny-skia-path-0.12.0.crate"
+archive_bytes = 49022
+archive_sha256 = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
+archive_checked_in = true
+archive_path = "evidence/fnd-01/vectors/media/tiny-skia-path-0.12.0.crate"
+source_vcs_revision = "e48b9027762d33731e60e40eb17eaa4f583b0185"
+source_path = "path"
+cargo_toml_bytes = 1352
+cargo_toml_sha256 = "57385d5a00ab54c415cd63a08ef1365e87b661019c74cccd4b50d6d9e6d659ad"
+cargo_toml_orig_bytes = 842
+cargo_toml_orig_sha256 = "e42a3ad132f048814b333123c687fc12b312de3d27ac495b3b7e62ad1a1546b5"
+license = "BSD-3-Clause"
+license_bytes = 1564
+license_sha256 = "6d41e05f1d54fe726997cb0334ec539f1dff50600b1d5d90462ec2b392770ced"
+unsafe_count = 3
+extern_c_count = 0
+build_scripts = []
+panic_family_rule = "Count exact archive source tokens panic!, unreachable!, todo!, unimplemented!; assert family counts assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 1
+assert_family_count = 176
+panic_assert_total = 177
+source_audit_verified = true
+unsafe_ffi_panic_build_audit = "archive scan complete; canonical target receipt producer .1.1 and independent validator .1.15 remain fail-closed"
+owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+
+[[transitive_source_audit]]
+name = "usvg"
+version = "0.47.0"
+required_by = "resvg"
+archive_url = "https://static.crates.io/crates/usvg/usvg-0.47.0.crate"
+archive_bytes = 142336
+archive_sha256 = "d46cf96c5f498d36b7a9693bc6a7075c0bb9303189d61b2249b0dc3d309c07de"
+archive_checked_in = true
+archive_path = "evidence/fnd-01/vectors/media/usvg-0.47.0.crate"
+source_vcs_revision = "3a0fdba53ccf2d346b54cc53ba7adf0ee60d0707"
+source_path = "crates/usvg"
+cargo_toml_bytes = 2526
+cargo_toml_sha256 = "be218372a2aadad0b28e39ac6470674f1c79492fe64055a9612b715f441b1dac"
+cargo_toml_orig_bytes = 1951
+cargo_toml_orig_sha256 = "f7f91edbde0240fbab2197aeacf04dc94075a86093527a18feeb3559162434d0"
+license = "MIT OR Apache-2.0"
+license_apache_bytes = 10173
+license_apache_sha256 = "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+license_mit_bytes = 1057
+license_mit_sha256 = "f5d934dc281b44e0003ee461ac740b18b6629a454decd872c774d34e4ee0b21d"
+unsafe_count = 0
+extern_c_count = 0
+build_scripts = []
+panic_family_rule = "Count exact archive source tokens panic!, unreachable!, todo!, unimplemented!; assert family counts assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 4
+assert_family_count = 19
+panic_assert_total = 23
+source_audit_verified = true
+unsafe_ffi_panic_build_audit = "archive scan complete; canonical target receipt producer .1.1 and independent validator .1.15 remain fail-closed"
+owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+
+[vectors]
+graph_path = "evidence/fnd-01/vectors/media/graph-snapshot.toml"
+graph_byte_length = 13937
+graph_sha256 = "3d26fc603329af4f89d7ec3f41cd4286086beb8ce777ccbf516a1ce7388318df"
+security_path = "evidence/fnd-01/vectors/media/security-vectors.toml"
+security_byte_length = 21409
+security_sha256 = "93c3126fd46f413fa412eb90a7097d112c3908337ce95547edc094c9f9fd3e6d"
+security_case_count = 48
+security_literal_utf8_case_count = 37
+security_non_utf8_case_count = 11
+security_content_addressed_upstream_binary_case_count = 4
+security_content_address_reference_case_count = 4
+security_hex_case_count = 3
+binary_bodies_checked_in = true
+binary_body_verification_owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+
+[build_tool_posture]
+root_build_scripts = []
+observed_transitive_build_scripts = [
+  "proc-macro2 1.0.107: build.rs rustc cfg probing",
+  "quote 1.0.47: build.rs rustc cfg probing",
+  "libc 0.2.189: Unix target build.rs cfg probing",
+  "web_atoms 0.2.5: deterministic packaged atom-table generation into OUT_DIR",
+  "parking_lot_core 0.9.12: cfg/environment probing",
+  "num-traits 0.2.19: autocfg rustc probing",
+  "crc32fast 1.5.0: rustc version/cfg probing",
+]
+observed_build_time_packages = ["autocfg", "phf_codegen", "string_cache_codegen"]
+observed_external_native_tools = []
+must_remain_absent = ["bindgen", "cc", "cmake", "nasm", "pkg-config", "system font tools"]
+target_qualified_build_inventory = [
+  "html5ever all five targets: proc-macro2 1.0.107 and quote 1.0.47 are build-time macro packages; record rustc/cfg inputs and generated output hashes in .1.1 graph receipts",
+  "html5ever aarch64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-apple-darwin, x86_64-unknown-linux-gnu: libc 0.2.189 target Unix build edge; x86_64-pc-windows-msvc uses windows-link instead",
+]
+build_input_output_receipts = "pending canonical target graph capture by .1.1; no deterministic output claim is promoted here"
+canonical_build_graph_status = ".1.14 authors and runs the pre-integration offline verifier over locally available evidence; .1.1 produces canonical graph/archive/build/advisory/lock receipts; .1.15 independently validates final receipts"
+
+[unsafe_ffi_posture]
+root_findings = [
+  "html5ever tokenizer has x86/x86_64 SSE2 and aarch64 NEON unsafe fast paths plus unsafe tendril slicing",
+  "image has unsafe casts and unchecked pixel/slice APIs",
+  "resvg crate declares forbid(unsafe_code)",
+]
+transitive_findings = [
+  "tendril/string-cache closure contains unsafe representation code",
+  "parking_lot_core uses target OS interfaces through libc on Unix and windows-link on Windows",
+  "moxcms and pxfm default features expose AVX/SSE/NEON target-feature unsafe paths",
+  "zune-jpeg defaults expose x86 and NEON paths",
+  "png compression closure contains crc32fast and simd-adler target SIMD",
+  "tiny-skia defaults enable simd; exact 0.12.0 archive source audit is bound in transitive_source_audit",
+]
+direct_root_extern_c_observed = false
+full_selected_graph_ffi_proved_absent = false
+missing_archive_source_audit = []
+missing_archive_source_owner = ""
+link_symbol_and_target_proof_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+
+[graph_package_inventory]
+reserved_artifact_audit_hashes = { markup5ever_0_39_0 = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de", tendril_0_5_1 = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08", web_atoms_0_2_5 = "075474b12bcb3d2e3d4546580e9de478eeeead668a1761e2a8860c836b7ef297", bytemuck_1_25_1 = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424", byteorder_lite_0_1_0 = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495", moxcms_0_8_1 = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b", num_traits_0_2_19 = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841", image_webp_0_2_4 = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3", zune_core_0_5_1 = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9", zune_jpeg_0_5_15 = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296", pico_args_0_5_0 = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315", rgb_0_8_53 = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4", svgtypes_0_16_1 = "695b5790b3131dafa99b3bbfd25a216edb3d216dad9ca208d4657bfb8f2abc3d" }
+reserved_artifact_audit_scope = "Noncanonical subset only: these are locally audited artifact bytes. The authoritative closure is closure_packages (65 entries) and is the sole version/checksum inventory. bytemuck 1.25.1 here is a cached audit artifact; canonical projection resolves bytemuck 1.25.2."
+closure_package_count = 65
+closure_packages = [
+  "adler2@2.0.1#320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa",
+  "arrayref@0.3.9#76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb",
+  "arrayvec@0.7.8#d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56",
+  "autocfg@1.5.1#f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53",
+  "base64@0.22.1#72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6",
+  "bitflags@2.13.1#b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da",
+  "bytemuck@1.25.2#95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797",
+  "byteorder-lite@0.1.0#8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495",
+  "cfg-if@1.0.4#9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801",
+  "crc32fast@1.5.0#9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511",
+  "data-url@0.3.2#be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376",
+  "fastrand@2.5.0#da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223",
+  "fdeflate@0.3.7#1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c",
+  "flate2@1.1.9#843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c",
+  "float-cmp@0.9.0#98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4",
+  "html5ever@0.39.0#46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8",
+  "image@0.25.10#85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104",
+  "image-webp@0.2.4#525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3",
+  "imagesize@0.14.0#09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c",
+  "kurbo@0.13.1#4b60dfc32f652b926df6192e55525b16d186c69d47876c3ead4da5cc9f8450e2",
+  "libc@0.2.189#3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+  "lock_api@0.4.14#224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965",
+  "log@0.4.33#0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad",
+  "markup5ever@0.39.0#7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de",
+  "memchr@2.8.3#cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+  "miniz_oxide@0.8.9#1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316",
+  "moxcms@0.8.1#bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b",
+  "new_debug_unreachable@1.0.6#650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086",
+  "num-traits@0.2.19#071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841",
+  "parking_lot@0.12.5#93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a",
+  "parking_lot_core@0.9.12#2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1",
+  "phf@0.13.1#c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf",
+  "phf_codegen@0.13.1#49aa7f9d80421bca176ca8dbfebe668cc7a2684708594ec9f3c0db0805d5d6e1",
+  "phf_generator@0.13.1#135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737",
+  "phf_shared@0.13.1#e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266",
+  "pico-args@0.5.0#5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315",
+  "png@0.18.1#60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61",
+  "polycool@0.4.0#50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6",
+  "precomputed-hash@0.1.1#925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c",
+  "proc-macro2@1.0.107#985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+  "pxfm@0.1.30#d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea",
+  "quick-error@2.0.1#a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3",
+  "quote@1.0.47#1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+  "resvg@0.47.0#9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81",
+  "rgb@0.8.53#47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4",
+  "roxmltree@0.21.1#f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb",
+  "scopeguard@1.2.0#94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49",
+  "simd-adler32@0.3.10#3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea",
+  "simplecss@0.2.2#7a9c6883ca9c3c7c90e888de77b7a5c849c779d25d74a1269b0218b14e8b136c",
+  "siphasher@1.0.3#8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649",
+  "smallvec@1.15.2#8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90",
+  "strict-num@0.1.1#6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731",
+  "string_cache@0.9.0#a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901",
+  "string_cache_codegen@0.6.1#585635e46db231059f76c5849798146164652513eb9e8ab2685939dd90f29b69",
+  "svgtypes@0.16.1#695b5790b3131dafa99b3bbfd25a216edb3d216dad9ca208d4657bfb8f2abc3d",
+  "tendril@0.5.1#5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08",
+  "tiny-skia@0.12.0#47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea",
+  "tiny-skia-path@0.12.0#edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9",
+  "unicode-ident@1.0.24#e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75",
+  "usvg@0.47.0#d46cf96c5f498d36b7a9693bc6a7075c0bb9303189d61b2249b0dc3d309c07de",
+  "web_atoms@0.2.5#075474b12bcb3d2e3d4546580e9de478eeeead668a1761e2a8860c836b7ef297",
+  "windows-link@0.2.1#f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+  "xmlwriter@0.1.0#ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9",
+  "zune-core@0.5.1#cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9",
+  "zune-jpeg@0.5.15#27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296",
+]
+package_audit_scope = "Every package in the compatible projection must carry archive hash, source, features, build.rs, unsafe/FFI, panic/allocation/termination, and advisory fields; .1.1 authors canonical receipts and .1.15 validates them."
+source_audit_complete_for_reserved_transitives = true
+canonical_full_graph_audit_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+receipt_validation_owner = "bd-mcp-2026-07-28-support-ahet.1.15"
+
+[[unsafe_ffi_panic_inventory]]
+package = "html5ever 0.39.0"
+feature_surface = "default-features=false"
+targets = "all five supported targets"
+source_hash = "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8"
+unsafe_or_target_feature = "tokenizer SIMD and tendril slicing; target_feature-qualified paths"
+extern_c = false
+build_script = false
+panic_allocation_termination = "synchronous Parser::process loop and allocation behavior require bounded helper proof"
+disposition = "supervised_helper_required; exact locations/target receipts pending .1.1 and final validation .1.15"
+
+[[unsafe_ffi_panic_inventory]]
+package = "image 0.25.10"
+feature_surface = "default-features=false; jpeg,png,webp"
+targets = "all five supported targets"
+source_hash = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+unsafe_or_target_feature = "unchecked pixel/slice APIs; moxcms/pxfm SIMD dispatch"
+extern_c = false
+build_script = false
+panic_allocation_termination = "CHANGES warns decoder panic paths; limits are non-strict and require helper isolation"
+disposition = "supervised_helper_required; package/location call graph pending .1.1 and final validation .1.15"
+
+[[unsafe_ffi_panic_inventory]]
+package = "resvg 0.47.0"
+feature_surface = "default-features=false"
+targets = "all five supported targets"
+source_hash = "9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81"
+unsafe_or_target_feature = "crate-level forbid(unsafe_code)"
+extern_c = false
+build_script = false
+panic_allocation_termination = "geometry allocation/unwrap paths require isolated helper"
+disposition = "fail-closed; .1.1 produces canonical target receipts and .1.15 independently validates them"
+
+[[unsafe_ffi_panic_inventory]]
+package = "tiny-skia 0.12.0"
+feature_surface = "default transitive features from resvg"
+targets = "all five supported targets"
+source_hash = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
+unsafe_or_target_feature = "152 unsafe tokens; SIMD target paths"
+extern_c = false
+build_script = false
+panic_family_rule = "Exact archive-src count of panic!, unreachable!, todo!, unimplemented!; assert-family count of assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 8
+assert_family_count = 148
+panic_assert_total = 156
+panic_allocation_termination = "geometry allocation requires isolated helper"
+disposition = "fail-closed; canonical target reachability receipt owned by .1.1"
+
+[[unsafe_ffi_panic_inventory]]
+package = "tiny-skia-path 0.12.0"
+feature_surface = "tiny-skia transitive"
+targets = "all five supported targets"
+source_hash = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
+unsafe_or_target_feature = "3 unsafe tokens; no extern-C"
+extern_c = false
+build_script = false
+panic_family_rule = "Exact archive-src count of panic!, unreachable!, todo!, unimplemented!; assert-family count of assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 1
+assert_family_count = 176
+panic_assert_total = 177
+panic_allocation_termination = "path allocation requires isolated helper"
+disposition = "fail-closed; canonical target reachability receipt owned by .1.1"
+
+[[unsafe_ffi_panic_inventory]]
+package = "usvg 0.47.0"
+feature_surface = "default-features=false"
+targets = "all five supported targets"
+source_hash = "d46cf96c5f498d36b7a9693bc6a7075c0bb9303189d61b2249b0dc3d309c07de"
+unsafe_or_target_feature = "0 unsafe tokens; no extern-C"
+extern_c = false
+build_script = false
+panic_family_rule = "Exact archive-src count of panic!, unreachable!, todo!, unimplemented!; assert-family count of assert!, debug_assert!, assert_eq!, assert_ne!, and debug variants."
+panic_family_count = 4
+assert_family_count = 19
+panic_assert_total = 23
+panic_allocation_termination = "parser/render allocation requires isolated helper"
+disposition = "fail-closed; canonical target reachability receipt owned by .1.1"
+
+[panic_isolation_posture]
+image_upstream_warning = "image 0.25.10 CHANGES.md states that many decoders panic on malicious input"
+image_limits = "image::Limits has no default width/height ceiling and its allocation limit is non-strict; decoder compliance is not universal"
+html_termination = "Public Parser::process synchronously loops until done and exposes no proved node/depth/work cancellation hook"
+resvg_posture = "resvg contains allocation/geometry unwrap paths even though its own crate forbids unsafe"
+in_process_safe_proved = false
+default_disposition = "supervised_helper_required"
+timeout_alone_sufficient = false
+executor_owner = "FND-04 generic bounded-execution facility only"
+raster_svg_runtime_owner = "PRT-02"
+html_runtime_owner = "APP-01"
+
+[advisory_snapshot]
+database_repository = "https://github.com/RustSec/advisory-db"
+database_commit = "7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
+database_date = "2026-07-29"
+scan_kind = "direct-name/range inspection only; not cargo-audit"
+direct_findings = [
+  "RUSTSEC-2019-0014 affects image before 0.21.3; 0.25.10 is outside the range",
+  "RUSTSEC-2020-0073 affects image before 0.23.12; 0.25.10 is outside the range",
+]
+required_exclusion = "RUSTSEC-2026-0206 marks rustybuzz unmaintained with no patched release; the final no-text resvg graph must prove rustybuzz absent"
+full_lock_scan_executed = false
+full_lock_scan_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+full_lock_advisory_clearance_claimed = false
+
+[raster_policy]
+mime_magic_binding_required = true
+exact_decoders_only = true
+accepted_mime = ["image/png", "image/jpeg", "image/jpg", "image/webp"]
+mime_alias = "image/jpg maps to the JPEG decoder and is not a Cargo feature"
+accepted_formats = ["PNG", "JPEG", "static WebP"]
+rejected_formats = ["APNG", "animated WebP", "multi-frame WebP", "AVIF", "BMP", "DDS", "EXR", "Farbfeld", "GIF", "HDR", "ICO", "PNM", "QOI", "TGA", "TIFF", "unknown"]
+apng_disposition = "reject_before_renderer_entry; APNG is not admitted because the static raster policy permits exactly one frame (frames_default=1, frames_hard=1)"
+apng_vector_case = "apng-two-frame-static-policy-negative"
+animation_frames_default = 1
+animation_frames_hard = 1
+metadata = "EXIF, XMP, ICC, comments, and orientation are non-authoritative, not returned, and may trigger no external access"
+orientation = "no automatic orientation transform"
+color = "admit only bounded 8-bit L/LA/RGB/RGBA decoder output, normalize to RGBA8, preserve alpha where present, set JPEG alpha to 255, and perform no ambient ICC/system color-profile transform"
+external_decoder_hooks = "forbidden"
+format_guessing = "forbidden"
+encoder_api = "forbidden"
+offline_body_identities = [
+  "PNG 110 bytes SHA-256 b95534c515880250a4d87a2dede9d39f086249c6d0b61d1d448da28ea43a444c",
+  "JPEG 4263 bytes SHA-256 5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751",
+  "static WebP 314 bytes SHA-256 284ddab37b3cf76424a5a9a32351a84e815a0972f4bffd68571f6f67874c38d3",
+  "animated WebP 10818 bytes SHA-256 459d0f8601844487cebd09dd11d0f50346fa45820bb7a7d817140dcc811496b4",
+]
+offline_body_storage = "checked in under vectors/media with exact content addresses; .1.14 independently verifies offline bytes"
+
+[offline_fixtures]
+png_path = "evidence/fnd-01/vectors/media/png-valid-upstream.png"
+png_bytes = 110
+png_sha256 = "b95534c515880250a4d87a2dede9d39f086249c6d0b61d1d448da28ea43a444c"
+jpeg_path = "evidence/fnd-01/vectors/media/jpeg-metadata-valid-upstream.jpg"
+jpeg_bytes = 4263
+jpeg_sha256 = "5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751"
+webp_static_path = "evidence/fnd-01/vectors/media/webp-static-valid-upstream.webp"
+webp_static_bytes = 314
+webp_static_sha256 = "284ddab37b3cf76424a5a9a32351a84e815a0972f4bffd68571f6f67874c38d3"
+webp_animated_path = "evidence/fnd-01/vectors/media/webp-animated-upstream.webp"
+webp_animated_bytes = 10818
+webp_animated_sha256 = "459d0f8601844487cebd09dd11d0f50346fa45820bb7a7d817140dcc811496b4"
+
+[limits]
+fetched_bytes_default = 1048576
+fetched_bytes_hard = 8388608
+width_default = 4096
+width_hard = 16384
+height_default = 4096
+height_hard = 16384
+pixels_default = 4194304
+pixels_hard = 67108864
+frames_default = 1
+frames_hard = 1
+output_plus_scratch_bytes_default = 67108864
+output_plus_scratch_bytes_hard = 268435456
+concurrent_decodes_per_partition_default = 4
+concurrent_decodes_per_partition_hard = 32
+data_uri_prefix_bytes_default = 256
+data_uri_prefix_bytes_hard = 1024
+data_uri_encoded_bytes_default_formula = "4 * ceil(1 MiB / 3) + 256 B"
+data_uri_encoded_bytes_hard_formula = "4 * ceil(8 MiB / 3) + 1 KiB"
+reservation_rule = "Reserve encoded input, prospective decoded bytes, checked dimensions/pixels, conservative output+scratch, work, concurrency, and deadline before decoder or renderer entry."
+svg_complexity_numeric_limits = "pending LIMIT-01 and PRT-02; no value is invented by this evidence child"
+
+[svg_preentry_policy]
+closed_allowlist = true
+namespace_aware = true
+reject_elements = ["a", "animate", "animateMotion", "animateTransform", "discard", "feImage", "foreignObject", "image", "script", "set", "text", "use"]
+reject_attributes = ["any on* event attribute", "external href", "external xlink:href", "font-family requiring a font provider"]
+reject_constructs = [
+  "DOCTYPE or entity declaration",
+  "XML stylesheet processing instruction",
+  "CSS @import, @font-face, or external url()",
+  "script or event execution",
+  "SMIL/CSS animation",
+  "any link",
+  "any image element including data: embedded SVG",
+  "foreignObject",
+  "custom image/text/font resolver",
+  "network, filesystem, environment, proxy, or system-font access",
+]
+internal_use = "rejected to keep reference recursion outside the closed subset"
+renderer_entry_count_for_rejection = 0
+network_calls_for_all_cases = 0
+filesystem_calls_for_all_cases = 0
+font_provider_calls_for_all_cases = 0
+runtime_proof = "pending PRT-02"
+
+[html_policy]
+whatwg_revision = "24c5e48bf66ea61bc199ec6338c81258275ba9c6"
+parser_is_authoring_checker = false
+complete_document_required = true
+nodes_default = 100000
+nodes_hard = 1000000
+nesting_default = 256
+nesting_hard = 1024
+decoded_text_bytes_default = 8388608
+decoded_text_bytes_hard = 33554432
+work_score_default = 1000000
+work_score_hard = 50000000
+network = "forbidden"
+filesystem = "forbidden"
+script_css_browser_execution = "forbidden"
+authoring_conformance_owner = "APP-01"
+bounded_executor_owner = "FND-04 generic bounded-execution facility only; PRT-02/APP-01 wire concrete media helpers"
+
+[[substitution_negative]]
+id = "root-version-drift"
+mutation = "Change any exact root version or requirement."
+expected = "reject"
+
+[[substitution_negative]]
+id = "archive-checksum-or-length-drift"
+mutation = "Change archive bytes, length, checksum, or content address independently."
+expected = "reject"
+
+[[substitution_negative]]
+id = "source-ref-drift"
+mutation = "Change repository, VCS path, commit, tree, tag object, or peeled revision."
+expected = "reject"
+
+[[substitution_negative]]
+id = "invent-html5ever-tag"
+mutation = "Claim a html5ever 0.39.0 tag instead of the observed commit-only release identity."
+expected = "reject"
+
+[[substitution_negative]]
+id = "license-or-msrv-drift"
+mutation = "Change or omit license expression/files, edition, or declared MSRV."
+expected = "reject"
+
+[[substitution_negative]]
+id = "html-feature-enabled"
+mutation = "Enable any html5ever optional or default feature."
+expected = "reject"
+
+[[substitution_negative]]
+id = "image-codec-removed"
+mutation = "Remove png, jpeg, or webp from the exact image feature set."
+expected = "reject"
+
+[[substitution_negative]]
+id = "image-extra-codec-or-rayon"
+mutation = "Enable a fourth image format, default/default-formats, Rayon, NASM, native AVIF, Serde, or another image feature."
+expected = "reject"
+
+[[substitution_negative]]
+id = "resvg-feature-enabled"
+mutation = "Enable any resvg feature, including text, system-fonts, memmap-fonts, or raster-images."
+expected = "reject"
+
+[[substitution_negative]]
+id = "graph-kind-or-target-omitted"
+mutation = "Omit or change a normal/build/dev/features graph kind, profile, or supported target."
+expected = "reject"
+
+[[substitution_negative]]
+id = "compatible-projection-promoted"
+mutation = "Describe the compatible local projection as the canonical FastMCP Cargo.lock or target graph."
+expected = "reject"
+
+[[substitution_negative]]
+id = "build-unsafe-ffi-panic-finding-omitted"
+mutation = "Omit or silently reclassify a build-tool, unsafe, FFI, target-feature, panic, allocation, or termination finding."
+expected = "reject"
+
+[[substitution_negative]]
+id = "missing-archive-audit-promoted"
+mutation = "Promote without content-addressed source audit of usvg, tiny-skia, and tiny-skia-path."
+expected = "reject"
+
+[[substitution_negative]]
+id = "advisory-scan-inferred"
+mutation = "Treat direct-name lookup, a missing database/tool, or an unexecuted full-lock scan as a clean advisory result."
+expected = "reject"
+
+[[substitution_negative]]
+id = "mime-magic-mismatch-admitted"
+mutation = "Select a decoder when exact MIME and magic disagree."
+expected = "reject"
+
+[[substitution_negative]]
+id = "animated-or-multiframe-admitted"
+mutation = "Admit animated or multi-frame WebP, or more than one frame."
+expected = "reject"
+
+[[substitution_negative]]
+id = "apng-static-policy-admitted"
+mutation = "Admit APNG or any multi-frame PNG despite the exact one-frame static raster policy."
+expected = "reject"
+
+[[substitution_negative]]
+id = "jpeg-alias-positive-coverage-removed"
+mutation = "Remove the positive image/jpg JPEG-alias vector or reject a valid JPEG solely because the MIME alias is used."
+expected = "reject"
+
+[[substitution_negative]]
+id = "limit-or-overflow-bypass"
+mutation = "Enter a decoder/renderer before checked input, dimension, pixel, output, scratch, work, concurrency, or deadline reservation."
+expected = "reject"
+
+[[substitution_negative]]
+id = "metadata-or-color-authority"
+mutation = "Treat embedded metadata, orientation, ICC data, or a system color profile as authority or an external-resource permission."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-script-event-animation"
+mutation = "Permit script, event attributes, or animation to reach usvg/resvg."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-image-or-foreign-object"
+mutation = "Permit image, feImage, or foreignObject to reach usvg/resvg, including embedded data."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-external-resource"
+mutation = "Permit an external href/xlink/use, link, stylesheet, CSS URL/import/font, DTD/entity, resolver, network, filesystem, or font-provider path."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-css-animation-import-font-vectors-omitted"
+mutation = "Omit dedicated CSS animation, @import, or @font-face rejection vectors while claiming complete CSS external-resource coverage."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-text-silent-drop"
+mutation = "Treat text or system-font content as successfully rendered when text/font features are disabled."
+expected = "reject"
+
+[[substitution_negative]]
+id = "html-parser-equals-conformance"
+mutation = "Treat html5ever parser success as complete WHATWG authoring conformance."
+expected = "reject"
+
+[[substitution_negative]]
+id = "timeout-without-kill-or-bound"
+mutation = "Use a caller timeout without finite-operation/allocation proof or a killable supervised helper."
+expected = "reject"
+
+[[substitution_negative]]
+id = "runtime-handoff-promoted"
+mutation = "Mark a pending APP-01, PRT-02, FND-04, LIMIT-01, .1.1, or .1.14 result complete without its receipt."
+expected = "reject"
+
+[[substitution_negative]]
+id = "source-index-entry-unbound"
+mutation = "Omit or alter the exact sparse-index path, byte length, or SHA-256 for any root release entry."
+expected = "reject"
+
+[[substitution_negative]]
+id = "transitive-renderer-audit-omitted"
+mutation = "Promote tiny-skia, tiny-skia-path, or usvg unsafe/FFI/panic/build evidence without exact immutable archive bytes."
+expected = "reject"
+
+[[substitution_negative]]
+id = "compiled-image-encoder-surface-admitted"
+mutation = "Treat image open/guess/encoder APIs or PNG/JPEG/WebP encoders as admitted FastMCP input surfaces."
+expected = "reject"
+
+[[substitution_negative]]
+id = "raster-body-offline-binding-omitted"
+mutation = "Use an external raster URL without binding the exact accepted byte identity before runtime admission."
+expected = "reject"
+
+[[substitution_negative]]
+id = "mime-unknown-or-svg-mismatch-admitted"
+mutation = "Admit unknown MIME or image/svg+xml bytes under a mismatched raster MIME without exact magic policy."
+expected = "reject"
+
+[[substitution_negative]]
+id = "svg-case-namespace-evasion-admitted"
+mutation = "Allow case or namespace evasions for script, xlink, or CSS @import to reach the renderer."
+expected = "reject"
+
+[current_workspace_gap]
+root_dependencies_present = false
+client_features_present = false
+server_apps_dependency_present = false
+workspace_lock_entries_present = false
+current_workspace_rust_version = "1.85"
+planned_workspace_rust_version = "1.99 plus nightly-2026-07-11"
+shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+
+[gate]
+root_archive_identity_verified = true
+root_source_identity_verified = true
+root_license_msrv_verified = true
+root_feature_policy_frozen = true
+declared_direct_graphs_frozen = true
+compatible_projection_is_canonical = false
+authoritative_fastmcp_lock_present = false
+canonical_target_graphs_verified = false
+missing_transitive_archives_audited = true
+full_lock_advisory_scan_verified = false
+runtime_vectors_executed = false
+workspace_manifests_integrated = false
+workspace_lock_integrated = false
+rch_build_or_test_verified = false
+claim = "Exact root artifacts, source refs, feature policies, declarative edges, compatible projections, limits, and expected security vectors are frozen. Every integration, archive-audit, advisory, target, packaged-consumer, and runtime-support claim remains fail-closed."
+
+[handoff]
+integration_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+offline_verification_owner = "bd-mcp-2026-07-28-support-ahet.1.14"
+offline_verifier_role = "authors offline verification only; does not produce canonical graph/archive/build/advisory/lock receipts"
+receipt_validation_owner = "bd-mcp-2026-07-28-support-ahet.1.15"
+runtime_executor_owner = "FND-04 generic bounded-execution facility only"
+numeric_svg_limit_owner = "LIMIT-01"
+html_runtime_owner = "APP-01"
+media_runtime_owner = "PRT-02"
+integration_pending = [
+  "add exact root/client/server/CLI/facade dependency and feature edges in shared manifests",
+  "create and review the authoritative FastMCP Cargo.lock",
+  "capture canonical normal/build/dev/features trees, archive/source/build/advisory/lock receipts for all profiles and five targets",
+  "run all compilation/package checks only through the designated RCH coordinator",
+]
+verification_pending = [
+  "run canonical full-lock advisory/license/source/build-tool/unsafe/FFI/prohibited-runtime mutation checks (.1.1)",
+]
+closure_boundary = "Closure of .1.12 is evidence-child-only. It cannot imply Apps, safe-icon-rendering, workspace dependency support, or aggregate FND-01 support."

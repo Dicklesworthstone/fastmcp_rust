@@ -1,0 +1,940 @@
+schema_version = 1
+evidence_id = "FND-01/auth-standards"
+package_id = "FND-01"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.4"
+owner = "IndigoHeron"
+retrieved_on = "2026-07-29"
+hash_algorithm = "sha256"
+hash_scope = "Exact identity-coded representation-data bytes after HTTP transfer framing removal, with no character-set, newline, whitespace, DOM, or other text normalization"
+storage_model = "primary-source URL pinned by byte length and SHA-256 content address"
+vendor_copy_count = 0
+content_addressed_remote_artifact_count = 13
+offline_body_rehash_available = false
+content_address_resolution = "Fetch the exact retrieval_url under retrieval_policy and accept bytes only when both byte_length and sha256 match."
+primary_source_only = true
+standard_artifact_count = 11
+scenario_source_artifact_count = 2
+scenario_count = 3
+
+[retrieval_policy]
+scheme = "https"
+accept_encoding = "identity"
+required_http_status = 200
+required_redirect_count = 0
+require_effective_url_equals_retrieval_url = true
+follow_floating_latest = false
+content_encoding_must_be_absent = true
+hash_http_transfer_framing = false
+note = "Lengths and digests cover identity-coded representation data after HTTP transfer framing removal, not HTTP headers, framing, a compressed content coding, or normalized text."
+
+[retrieval_observation]
+verified_on = "2026-07-29"
+artifact_count = 13
+http_status = 200
+redirect_count = 0
+effective_url = "exactly each artifact retrieval_url"
+content_encoding = "absent; identity representation requested"
+
+[title_policy]
+auth_extension = "Exact frontmatter title."
+ietf_archived_text = "Exact document title block."
+openid_final = "Exact h1 document title; html_title records the browser-title Final prefix separately."
+openid_enterprise = "Exact h1 and HTML title."
+verification_input = "Local evidence label; exact scenario IDs are recorded separately from source-defined class names."
+
+[source_revisions]
+auth_extensions_git = "fb374c7db2b34f18ca9183882e0beecdf661892b"
+conformance_git = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+conformance_tree = "699705222f144a15fb7fdcc1b4f0b0a62825aef0"
+conformance_package = "0.2.0-alpha.10"
+
+[required_sets]
+auth_extensions = [
+  "mcp-enterprise-managed-authorization",
+  "mcp-oauth-client-credentials",
+]
+enterprise_identity = [
+  "id-jag-04",
+  "identity-chaining-12",
+  "oidc-core-errata2",
+  "oidc-discovery-errata2",
+  "oidc-dynamic-registration-errata2",
+  "oidc-enterprise-extensions-01",
+]
+core_authorization_drafts = [
+  "oauth-2.1-13",
+  "oauth-2.1-14",
+  "cimd-00",
+]
+scenario_sources = [
+  "conformance-enterprise-managed-authorization",
+  "conformance-client-credentials",
+]
+scenarios = [
+  "auth/enterprise-managed-authorization",
+  "auth/client-credentials-jwt",
+  "auth/client-credentials-basic",
+]
+
+[authority]
+wire_shape = "The final tagged MCP schema remains authoritative for core wire structures."
+core_behavior = "The final dated MCP prose remains authoritative for core behavior."
+extension_behavior = "Each pinned extension specification governs only its negotiated extension surface."
+draft_override = "Draft extension prose never overrides final-core error allocation."
+enterprise_delegation = "The stable enterprise profile delegates its grant contract to ID-JAG -04, which delegates identity-chaining definitions to -12."
+
+[clause_provenance]
+oauth_general_security = "oauth-2.1-13"
+oauth_refresh_token_confidentiality = "oauth-2.1-14"
+core_client_id_metadata_document = "cimd-00"
+enterprise_client_registration = "exact issuer-bound preregistration; neither CIMD revision nor DCR is admitted"
+oidc_enterprise_vocabulary = "oidc-enterprise-extensions-01 governs only tenant and aud_sub"
+id_jag_signing_authority = "issuer-bound out-of-band IdJagIssuerCryptoPolicy; no OIDC metadata member is an ID-JAG signing-algorithm registry"
+
+[rendered_document_drift]
+observed_on = "2026-07-29"
+drift_only_urls = [
+  "https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization",
+  "https://modelcontextprotocol.io/extensions/auth/overview",
+]
+rendered_identifiers = [
+  "io.modelcontextprotocol/enterprise-managed-authorization",
+  "io.modelcontextprotocol/oauth-client-credentials",
+]
+rendered_capability_settings = "empty"
+normative_authority = false
+required_artifact = false
+wire_negotiation_allowed = false
+decision = "Preserve as tracked upstream drift only; the commit-pinned repository profiles define metadata-selected OAuth deployment profiles and define no MCP core capability-map entry or settings schema."
+
+[[artifacts]]
+id = "mcp-enterprise-managed-authorization"
+group = "auth_extension"
+title = "Enterprise-Managed Authorization"
+title_source = "frontmatter.title"
+status = "stable"
+revision = "git:fb374c7db2b34f18ca9183882e0beecdf661892b"
+published_on = "not-stated-in-artifact"
+source_path = "specification/stable/enterprise-managed-authorization.mdx"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/ext-auth/fb374c7db2b34f18ca9183882e0beecdf661892b/specification/stable/enterprise-managed-authorization.mdx"
+retrieved_on = "2026-07-29"
+format = "mdx"
+byte_length = 14376
+sha256 = "df4fe01daec0eac6069e17a293d4ed7e197ab20463038d806f71e63b22fd8986"
+content_address = "sha256:df4fe01daec0eac6069e17a293d4ed7e197ab20463038d806f71e63b22fd8986"
+storage = "content-addressed-primary-source"
+authority = "Stable negotiated MCP enterprise-managed authorization profile."
+must_not_substitute = "The rendered extension website, repository default branch, or another ext-auth commit."
+
+[[artifacts]]
+id = "mcp-oauth-client-credentials"
+group = "auth_extension"
+title = "OAuth Client Credentials Extension"
+title_source = "frontmatter.title"
+status = "draft"
+revision = "git:fb374c7db2b34f18ca9183882e0beecdf661892b"
+published_on = "not-stated-in-artifact"
+source_path = "specification/draft/oauth-client-credentials.mdx"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/ext-auth/fb374c7db2b34f18ca9183882e0beecdf661892b/specification/draft/oauth-client-credentials.mdx"
+retrieved_on = "2026-07-29"
+format = "mdx"
+byte_length = 5541
+sha256 = "5db1ffb20f0f33ddbebd6e9747be20c1be3a395a1bd1faad3719334c35a70d3f"
+content_address = "sha256:5db1ffb20f0f33ddbebd6e9747be20c1be3a395a1bd1faad3719334c35a70d3f"
+storage = "content-addressed-primary-source"
+authority = "Optional draft MCP client-credentials extension only; it is not final-core authority."
+must_not_substitute = "The rendered extension website, repository default branch, or another ext-auth commit."
+
+[[artifacts]]
+id = "id-jag-04"
+group = "enterprise_identity"
+title = "Identity Assertion JWT Authorization Grant"
+title_source = "document title block"
+status = "internet-draft"
+revision = "draft-ietf-oauth-identity-assertion-authz-grant-04"
+published_on = "2026-05-21"
+retrieval_url = "https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.txt"
+retrieved_on = "2026-07-29"
+format = "ietf-archived-text"
+byte_length = 137376
+sha256 = "a59c1dffc0b5e59d1bd541276c6948eb9191f3b83685be5810a32e63effb4653"
+content_address = "sha256:a59c1dffc0b5e59d1bd541276c6948eb9191f3b83685be5810a32e63effb4653"
+storage = "content-addressed-primary-source"
+authority = "Enterprise grant, metadata, claim, replay, and optional sender-constraining rules delegated by the stable MCP enterprise profile."
+must_not_substitute = "Datatracker HTML, drafts.oauth.net latest, a browser-rendered page, or any revision other than -04."
+
+[[artifacts]]
+id = "identity-chaining-12"
+group = "enterprise_identity"
+title = "OAuth Identity and Authorization Chaining Across Domains"
+title_source = "document title block"
+status = "internet-draft"
+revision = "draft-ietf-oauth-identity-chaining-12"
+published_on = "2026-05-11"
+retrieval_url = "https://www.ietf.org/archive/id/draft-ietf-oauth-identity-chaining-12.txt"
+retrieved_on = "2026-07-29"
+format = "ietf-archived-text"
+byte_length = 63052
+sha256 = "35b90e3e85c5e3e6f2ca15abcf2b70e968506ff7d00e7c7c77ec6ad861390c1c"
+content_address = "sha256:35b90e3e85c5e3e6f2ca15abcf2b70e968506ff7d00e7c7c77ec6ad861390c1c"
+storage = "content-addressed-primary-source"
+authority = "Delegated cross-domain identity-chaining definitions used by ID-JAG -04."
+must_not_substitute = "Datatracker HTML, a floating latest page, a browser-rendered page, or any revision other than -12."
+
+[[artifacts]]
+id = "oidc-core-errata2"
+group = "enterprise_identity"
+title = "OpenID Connect Core 1.0 incorporating errata set 2"
+title_source = "h1"
+html_title = "Final: OpenID Connect Core 1.0 incorporating errata set 2"
+status = "final"
+revision = "OpenID Connect Core 1.0 final, errata set 2"
+published_on = "2023-12-15"
+retrieval_url = "https://openid.net/specs/openid-connect-core-1_0-errata2.html"
+retrieved_on = "2026-07-29"
+format = "html"
+byte_length = 437508
+sha256 = "4d016752a645e8a3c259baa4173b5a90cb6c82898ce868fc8444adde262a5aed"
+content_address = "sha256:4d016752a645e8a3c259baa4173b5a90cb6c82898ce868fc8444adde262a5aed"
+storage = "content-addressed-primary-source"
+authority = "Admitted ID Token, nonce, audience/azp, time, authentication-event, and pairwise-subject rules."
+must_not_substitute = "Errata set 1, the 2014 final bytes, a browser-rendered capture, or another OpenID document."
+
+[[artifacts]]
+id = "oidc-discovery-errata2"
+group = "enterprise_identity"
+title = "OpenID Connect Discovery 1.0 incorporating errata set 2"
+title_source = "h1"
+html_title = "Final: OpenID Connect Discovery 1.0 incorporating errata set 2"
+status = "final"
+revision = "OpenID Connect Discovery 1.0 final, errata set 2"
+published_on = "2023-12-15"
+retrieval_url = "https://openid.net/specs/openid-connect-discovery-1_0-errata2.html"
+retrieved_on = "2026-07-29"
+format = "html"
+byte_length = 109112
+sha256 = "0401a07b35de50e914e195aa2c3c64cc4f6542464381c885d24a2623fbf75ec2"
+content_address = "sha256:0401a07b35de50e914e195aa2c3c64cc4f6542464381c885d24a2623fbf75ec2"
+storage = "content-addressed-primary-source"
+authority = "Mandatory OpenID Provider metadata and endpoint/capability admission."
+must_not_substitute = "Errata set 1, the 2014 final bytes, a browser-rendered capture, or another OpenID document."
+
+[[artifacts]]
+id = "oidc-dynamic-registration-errata2"
+group = "enterprise_identity"
+title = "OpenID Connect Dynamic Client Registration 1.0 incorporating errata set 2"
+title_source = "h1"
+html_title = "Final: OpenID Connect Dynamic Client Registration 1.0 incorporating errata set 2"
+status = "final"
+revision = "OpenID Connect Dynamic Client Registration 1.0 final, errata set 2"
+published_on = "2023-12-15"
+retrieval_url = "https://openid.net/specs/openid-connect-registration-1_0-errata2.html"
+retrieved_on = "2026-07-29"
+format = "html"
+byte_length = 109630
+sha256 = "c151a4abab7704f2efa9b00530dcfeeefb3de6acbdbdf5ba05c9903f1de2a318"
+content_address = "sha256:c151a4abab7704f2efa9b00530dcfeeefb3de6acbdbdf5ba05c9903f1de2a318"
+storage = "content-addressed-primary-source"
+authority = "Preregistered relying-party metadata semantics; the stable enterprise profile does not perform dynamic registration."
+must_not_substitute = "Errata set 1, the 2014 final bytes, a browser-rendered capture, or permission to execute DCR."
+
+[[artifacts]]
+id = "oidc-enterprise-extensions-01"
+group = "enterprise_identity"
+title = "OpenID Connect Enterprise Extensions 1.0 - draft 01"
+title_source = "h1"
+html_title = "OpenID Connect Enterprise Extensions 1.0 - draft 01"
+status = "draft"
+revision = "OpenID Connect Enterprise Extensions 1.0 draft 01"
+published_on = "2025-09-25"
+retrieval_url = "https://openid.net/specs/openid-connect-enterprise-extensions-1_0-01.html"
+retrieved_on = "2026-07-29"
+format = "html"
+byte_length = 54265
+sha256 = "13832c150ecb7b8d31d08240214388cbfc4982142ecf4808c443014c573c868b"
+content_address = "sha256:13832c150ecb7b8d31d08240214388cbfc4982142ecf4808c443014c573c868b"
+storage = "content-addressed-primary-source"
+authority = "Only the closed tenant and aud_sub vocabulary explicitly consumed by the FastMCP enterprise profile."
+must_not_substitute = "A later draft, floating latest page, broader Enterprise Extensions surface, or ID-JAG signing authority."
+
+[[artifacts]]
+id = "oauth-2.1-13"
+group = "core_authorization"
+title = "The OAuth 2.1 Authorization Framework"
+title_source = "document title block"
+status = "internet-draft"
+revision = "draft-ietf-oauth-v2-1-13"
+published_on = "2025-05-28"
+retrieval_url = "https://www.ietf.org/archive/id/draft-ietf-oauth-v2-1-13.txt"
+retrieved_on = "2026-07-29"
+format = "ietf-archived-text"
+byte_length = 224331
+sha256 = "7ce5ce0f3c145fa4db484809baf2d11ea96fdacfd6a1cc5741ff5ea687b51ee1"
+content_address = "sha256:7ce5ce0f3c145fa4db484809baf2d11ea96fdacfd6a1cc5741ff5ea687b51ee1"
+storage = "content-addressed-primary-source"
+authority = "General OAuth 2.1 security and behavior clauses linked by the final dated MCP authorization pages."
+must_not_substitute = "OAuth 2.1 -14, a floating OAuth 2.1 page, or another revision."
+
+[[artifacts]]
+id = "oauth-2.1-14"
+group = "core_authorization"
+title = "The OAuth 2.1 Authorization Framework"
+title_source = "document title block"
+status = "internet-draft"
+revision = "draft-ietf-oauth-v2-1-14"
+published_on = "2025-10-20"
+retrieval_url = "https://www.ietf.org/archive/id/draft-ietf-oauth-v2-1-14.txt"
+retrieved_on = "2026-07-29"
+format = "ietf-archived-text"
+byte_length = 227847
+sha256 = "5baa544505a2f6de053402b138cd59dc0354c56d93fd229ab97da8183c97a6e1"
+content_address = "sha256:5baa544505a2f6de053402b138cd59dc0354c56d93fd229ab97da8183c97a6e1"
+storage = "content-addressed-primary-source"
+authority = "Only the refresh-token confidentiality clause linked by the final dated MCP authorization pages."
+must_not_substitute = "OAuth 2.1 -13, a floating OAuth 2.1 page, or use as the generic authority for all OAuth clauses."
+
+[[artifacts]]
+id = "cimd-00"
+group = "core_authorization"
+title = "OAuth Client ID Metadata Document"
+title_source = "document title block"
+status = "internet-draft"
+revision = "draft-ietf-oauth-client-id-metadata-document-00"
+published_on = "2025-10-08"
+retrieval_url = "https://www.ietf.org/archive/id/draft-ietf-oauth-client-id-metadata-document-00.txt"
+retrieved_on = "2026-07-29"
+format = "ietf-archived-text"
+byte_length = 26867
+sha256 = "267795fbde5df0b8252c1e3497026a31a84a4c572268fc18a61e8fb8cc6f4fc9"
+content_address = "sha256:267795fbde5df0b8252c1e3497026a31a84a4c572268fc18a61e8fb8cc6f4fc9"
+storage = "content-addressed-primary-source"
+authority = "Client ID Metadata Document behavior for ordinary final-core OAuth."
+must_not_substitute = "CIMD -01, a floating CIMD page, or inheritance into the stable enterprise profile."
+
+[[artifacts]]
+id = "conformance-enterprise-managed-authorization"
+group = "verification_input"
+title = "Pinned enterprise-managed authorization scenario source"
+title_source = "local evidence label"
+status = "audit-baseline"
+revision = "git:49103de6ed70804e940637bf3e9e29e4a3f54e64"
+published_on = "not-applicable"
+source_path = "src/scenarios/client/auth/enterprise-managed-authorization.ts"
+git_blob = "eff5e255fac86344d2d212c5942454fa4664c731"
+scenario_ids = ["auth/enterprise-managed-authorization"]
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/enterprise-managed-authorization.ts"
+retrieved_on = "2026-07-29"
+format = "typescript"
+byte_length = 18666
+sha256 = "caec7e9a28f6de14678612682115cb5b6f3125d3e233f6a52250435f6a0383c2"
+content_address = "sha256:caec7e9a28f6de14678612682115cb5b6f3125d3e233f6a52250435f6a0383c2"
+storage = "content-addressed-primary-source"
+authority = "Reproducible verification input only; never normative authority or permanent release oracle."
+must_not_substitute = "A later conformance revision, a source-adjusted fixture, or file-level classification in place of scenario-level classification."
+
+[[artifacts]]
+id = "conformance-client-credentials"
+group = "verification_input"
+title = "Pinned client-credentials scenario source"
+title_source = "local evidence label"
+status = "audit-baseline"
+revision = "git:49103de6ed70804e940637bf3e9e29e4a3f54e64"
+published_on = "not-applicable"
+source_path = "src/scenarios/client/auth/client-credentials.ts"
+git_blob = "d633f7a57fe3da3a3e9eaff28af213c3669beac9"
+scenario_ids = [
+  "auth/client-credentials-jwt",
+  "auth/client-credentials-basic",
+]
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/client-credentials.ts"
+retrieved_on = "2026-07-29"
+format = "typescript"
+byte_length = 13961
+sha256 = "fe9b9e2a0f62962d2eeecc772b3ed1ee8be9941a7bc792c19a9a29a8b452c3c4"
+content_address = "sha256:fe9b9e2a0f62962d2eeecc772b3ed1ee8be9941a7bc792c19a9a29a8b452c3c4"
+storage = "content-addressed-primary-source"
+authority = "Reproducible verification input containing two distinct scenarios; never normative authority or permanent release oracle."
+must_not_substitute = "A later conformance revision, a source-adjusted fixture, or one file-level result for both scenarios."
+
+[scenario_classification]
+taxonomy = [
+  "forced_input_incompatibility: a frozen peer input or configuration that conforming FastMCP must encounter; the named profile decides whether it rejects or emits a nonconformance diagnostic",
+  "missing_or_overpermissive_oracle: an omitted or permissive mock assertion that cannot be named as the client's actual rejection",
+  "missing_production_evidence: a production property the mock fixture does not establish",
+]
+classification_is_per_scenario = true
+raw_expected_rejection_is_upstream_pass = false
+source_adjusted_fixture_is_upstream_pass = false
+local_derivative_is_upstream_pass = false
+first_observed_rejection_may_be_inferred = false
+first_rejection_eligibility = "For enterprise authorization, record only the rejection actually emitted before assertion acquisition, protected-credential access, or either token dispatch; the canonical inventory's missing-production-evidence findings are not eligible inferred first rejections. For client-credentials JWT, an actual pre-dispatch trace is likewise required. Category or source order alone is insufficient. Client-credentials Basic has no required first rejection because its canonical inventory has zero forced-input incompatibilities; its independent runtime result remains pending CONF-02."
+canonical_enterprise_inventory_path = "evidence/fnd-01/core-conformance.toml"
+canonical_enterprise_inventory_selector = "conformance_findings where scenario_id=auth/enterprise-managed-authorization"
+canonical_enterprise_inventory_count = 29
+canonical_enterprise_inventory_owns = [
+  "ordinal",
+  "category",
+  "finding text",
+  "registration finding granularity",
+  "ID-JAG key-policy finding granularity",
+]
+duplicate_enterprise_inventory_in_this_manifest = false
+
+[[scenarios]]
+id = "auth/enterprise-managed-authorization"
+source_artifact = "conformance-enterprise-managed-authorization"
+profile = "stable-enterprise-managed-authorization"
+classification_basis = "Canonical enterprise conformance_findings in evidence/fnd-01/core-conformance.toml plus COMPREHENSIVE_PLAN Sections 4.2 and AUTHX-01; this manifest adds no independent ordered inventory."
+harness_extension_id = "io.modelcontextprotocol/enterprise-managed-authorization"
+harness_extension_id_is_normative_wire_authority = false
+raw_execution_status = "not-run-by-this-evidence-package"
+first_observed_pre_dispatch_rejection = "unobserved"
+required_first_rejection_record = "Record the first rejection actually emitted by the unmodified FastMCP client; do not infer it from source order or a permissive mock."
+upstream_pass_claim = "forbidden"
+summary = "Multi-cause negative; ES256 is only one incompatibility."
+condition_order_semantics = "This manifest defines no second ordered enterprise condition array. The canonical 29-entry ordinal, category, finding-text, registration, and ID-JAG-key inventory is the enterprise conformance_findings sequence in evidence/fnd-01/core-conformance.toml."
+canonical_inventory_path = "evidence/fnd-01/core-conformance.toml"
+canonical_inventory_selector = "conformance_findings where scenario_id=auth/enterprise-managed-authorization"
+canonical_inventory_count = 29
+canonical_inventory_must_match_by_reference = true
+requested_enterprise_scope_set_in_pinned_raw_scenario = "empty"
+signed_id_jag_scope_omission_in_pinned_raw_scenario = "correct"
+nonempty_signed_scope_binding_coverage = "missing_or_overpermissive_oracle; requires a separately hashed nonempty vector"
+token_response_cache_header_disposition = "The two endpoint-specific missing Cache-Control: no-store plus Pragma: no-cache findings are diagnostic/oracle gaps and do not alone force rejection of an otherwise admitted response."
+raw_idp_id_token_disposition = "missing_production_evidence; match the canonical core-conformance inventory. Raw idp_id_token context injection supplies no identity-backend session or provider proof, but this source audit does not independently reclassify it as the client's rejection."
+raw_client_secret_disposition = "missing_production_evidence; match the canonical core-conformance inventory. Raw confidential-client-secret context injection supplies no issuer-bound credential-provider evidence, but this source audit does not independently reclassify it as the client's rejection."
+
+[[scenarios]]
+id = "auth/client-credentials-jwt"
+source_artifact = "conformance-client-credentials"
+profile = "draft-oauth-client-credentials-private-key-jwt"
+classification_basis = "Pinned source audit plus COMPREHENSIVE_PLAN Sections 4.2 and 5.6"
+harness_extension_id = "io.modelcontextprotocol/oauth-client-credentials"
+harness_extension_id_is_normative_wire_authority = false
+raw_execution_status = "not-run-by-this-evidence-package"
+first_observed_pre_dispatch_rejection = "unobserved"
+required_first_rejection_record = "Record the first rejection actually emitted by the unmodified FastMCP client; do not infer ES256 as first merely because it appears first here."
+upstream_pass_claim = "forbidden"
+summary = "Multi-cause private_key_jwt policy negative."
+condition_order_semantics = "The first four condition IDs are the exact source-audited forced-input vector; no ordinal is an observed runtime rejection."
+source_audited_forced_input_vector = [
+  "es256-generated-and-advertised",
+  "raw-private-key-pem",
+  "external-signer-receipt-absent",
+  "rsa-kid-binding-absent",
+]
+
+[[scenarios.conditions]]
+order = 1
+id = "es256-generated-and-advertised"
+classification = "forced_input_incompatibility"
+detail = "The scenario generates and advertises ES256 instead of the admitted RS256 profile."
+
+[[scenarios.conditions]]
+order = 2
+id = "raw-private-key-pem"
+classification = "forced_input_incompatibility"
+detail = "The scenario hands a raw private-key PEM to the client; FastMCP ships no in-process signer or local private-key input."
+
+[[scenarios.conditions]]
+order = 3
+id = "external-signer-receipt-absent"
+classification = "forced_input_incompatibility"
+detail = "No FND-09 external-signer registration receipt is supplied."
+
+[[scenarios.conditions]]
+order = 4
+id = "rsa-kid-binding-absent"
+classification = "forced_input_incompatibility"
+detail = "No admitted issuer-bound RSA kid registration is supplied."
+
+[[scenarios.conditions]]
+order = 5
+id = "audience-trailing-slash-normalization"
+classification = "missing_or_overpermissive_oracle"
+detail = "The verifier accepts issuer identifiers differing by trailing slash instead of exact ClientAssertionAudience."
+
+[[scenarios.conditions]]
+order = 6
+id = "bounded-exp-check-absent"
+classification = "missing_or_overpermissive_oracle"
+detail = "The verifier does not require the bounded exp claim selected by the FastMCP RFC 7523 profile."
+
+[[scenarios.conditions]]
+order = 7
+id = "unique-jti-check-absent"
+classification = "missing_or_overpermissive_oracle"
+detail = "The verifier does not require the unique jti claim selected by the FastMCP RFC 7523 profile."
+
+[[scenarios.conditions]]
+order = 8
+id = "external-real-peer-absent"
+classification = "missing_production_evidence"
+detail = "The authorization server is an in-process mock, not an independently versioned external HTTP peer."
+
+[[scenarios.conditions]]
+order = 9
+id = "external-signer-custody-evidence-absent"
+classification = "missing_production_evidence"
+detail = "No real external signer, custody boundary, immutable configuration, TLS identity, or wire-capture evidence is exercised."
+
+[[scenarios]]
+id = "auth/client-credentials-basic"
+source_artifact = "conformance-client-credentials"
+profile = "draft-oauth-client-credentials-basic"
+classification_basis = "Canonical Basic conformance_scenarios and conformance_findings in evidence/fnd-01/core-conformance.toml plus COMPREHENSIVE_PLAN Sections 4.2 and 5.6; this manifest adds no independent Basic condition inventory."
+harness_extension_id = "io.modelcontextprotocol/oauth-client-credentials"
+harness_extension_id_is_normative_wire_authority = false
+raw_execution_status = "not-run-by-this-evidence-package"
+required_first_pre_dispatch_rejection = "not_applicable; canonical Basic has zero forced_input_incompatibility findings"
+independent_runtime_result = "pending"
+independent_runtime_result_owner = "CONF-02"
+upstream_pass_claim = "forbidden-as-production-evidence"
+summary = "Applicable raw Basic wire evidence with no ES256/private-key blocker; not production-positive evidence."
+condition_order_semantics = "This manifest defines no second Basic condition array. The canonical three-entry ordinal, category, and finding-text inventory is the Basic conformance_findings sequence in evidence/fnd-01/core-conformance.toml."
+canonical_inventory_path = "evidence/fnd-01/core-conformance.toml"
+canonical_inventory_selector = "conformance_findings where scenario_id=auth/client-credentials-basic"
+canonical_inventory_count = 3
+canonical_forced_input_incompatibility_count = 0
+canonical_missing_or_overpermissive_oracle_count = 0
+canonical_missing_production_evidence_count = 3
+canonical_inventory_must_match_by_reference = true
+
+[derived_algorithm_negative]
+purpose = "Prove the stable algorithm policy independently of the multi-cause upstream scenarios."
+baseline = "A separately hashed, nonempty RS256 real-peer positive with admitted issuer, kid, key policy, registration, custody, TLS, and transport evidence."
+single_mutation = "Change only the admitted signing algorithm and signature from RS256 to ES256."
+expected_result = "reject"
+exact_diff_required = true
+derivative_digest_required = true
+may_be_labeled_upstream_conformance = false
+status = "required-downstream-fixture; no conforming RS256 real-peer baseline exists in this source-freeze child"
+
+[real_peer_evidence_contract]
+status = "required-downstream; no real-peer result is claimed by this source-freeze child"
+required_categories = [
+  "stable enterprise-managed authorization with independently versioned external authorization-server and IdP processes",
+  "client-credentials private_key_jwt with the admitted RS256 registration and named external signer",
+  "client-credentials Basic over HTTPS Streamable HTTP with the named attested secret provider",
+]
+required_fields = [
+  "peer artifact, version, and digest",
+  "immutable configuration digest",
+  "launch command and environment schema with secrets redacted",
+  "TLS trust identity",
+  "registration, custody, and trust setup",
+  "client and FastMCP artifact identities",
+  "exact scenario and role inventory",
+  "wire-capture digest",
+  "expected and actual result",
+  "exact emitted OidcTokenErrorTransportVariant for every OIDC invalid_client peer case",
+  "every skip, filter, and xfail count",
+  "the public transport and cryptographic custody boundary exercised by the claim",
+]
+forbidden_substitutes = [
+  "in-process mock",
+  "FastMCP issuer path",
+  "source-adjusted conformance fixture",
+  "self-test against the same implementation",
+  "test-only adapter",
+  "loopback-cleartext waiver",
+  "empty category or matrix",
+]
+
+[closure_boundary]
+scope = "evidence-child-only"
+closure_statement = "Closure of bd-mcp-2026-07-28-support-ahet.1.4 establishes only this immutable auth-source, clause-routing, scenario-delegation, and substitution-negative evidence child."
+aggregate_auth_support_claimed = false
+aggregate_fnd_01_support_claimed = false
+forbidden_closure_inference = "Never treat this child as aggregate authorization support, production real-peer evidence, completed runtime conformance, or aggregate FND-01 support."
+
+[handoff_owners]
+runtime_first_result_evidence = "CONF-02"
+runtime_first_result_status = "pending independent runtime execution; no first-result evidence is claimed here"
+enterprise_real_peer_and_derived_negative = "AUTHX-01, promoted by CI-EMA-01, aggregated by GATE-EMA-READY"
+client_credentials_real_peer_and_derived_negative = "AUTHX-02, promoted by CI-EXPERIMENTAL-AUTH-01, aggregated by GATE-EXPERIMENTAL-AUTH-BUILD"
+offline_manifest_mutation_checks = "bd-mcp-2026-07-28-support-ahet.1.14"
+fnd_01_integration = "bd-mcp-2026-07-28-support-ahet.1.1"
+
+[[ambiguities]]
+id = "section-5.6-auth-profile-wire-negotiation"
+source_artifacts = [
+  "mcp-enterprise-managed-authorization",
+  "mcp-oauth-client-credentials",
+  "conformance-enterprise-managed-authorization",
+  "conformance-client-credentials",
+]
+decision = "Treat the commit-pinned repository prose as the profile wire authority. Select both profiles through local OAuth deployment policy plus exact authorization-server metadata, never an invented MCP core capability. Follow the metadata/harness HTTP Basic interpretation for client credentials."
+must_reject = [
+  "Registering, advertising, requiring, or parsing an invented io.modelcontextprotocol core extension capability for either profile.",
+  "Promoting rendered-document identifiers from tracked drift evidence to normative wire authority.",
+  "Sending client_id, client_secret, or both in the client-credentials token request body, or combining body credentials with HTTP Basic.",
+  "Trailing-slash normalization of the private_key_jwt assertion audience, or omission of bounded exp and unique jti controls.",
+  "Treating stable enterprise authorization and experimental client credentials as one profile or as core MCP conformance.",
+  "Omitting the first token exchange resource without explicit single-resource configuration that binds the canonical MCP resource through ID-JAG validation and the final access-token audience policy.",
+]
+
+[[ambiguities]]
+id = "section-5.24-id-jag-response-grants"
+source_artifacts = ["id-jag-04", "mcp-enterprise-managed-authorization"]
+decision = "Require the composed EnterpriseAccessTokenResponse overlay after generic OAuth admission: one required JSON string resource equal to the exact canonical MCP resource, and explicit final scope when nonempty."
+distinct_scope_sets = [
+  "RequestedEnterpriseScopeSet: the one bounded literal set frozen before the first exchange",
+  "G: the distinct bounded literal set granted and signed by the IdP",
+  "FinalGrantedEnterpriseScopeSet: the distinct bounded literal set granted by the resource authorization server",
+]
+scope_invariants = [
+  "For a nonempty request, G is nonempty, signed in the ID-JAG, and a literal subset of RequestedEnterpriseScopeSet.",
+  "For an empty request, the ID-JAG scope claim and first-stage top-level scope are absent.",
+  "The first-stage top-level scope may be absent only when G exactly equals the nonempty requested set; after narrowing it is present and exactly equals G.",
+  "For a nonempty final grant, stage-two scope is present, equals FinalGrantedEnterpriseScopeSet, and is a literal subset of G.",
+  "For an empty final grant, stage-two scope is absent.",
+]
+must_reject = [
+  "Missing, null, boolean, number, array, object, duplicate, additional, noncanonical, or textually foreign stage-two resource.",
+  "Missing signed ID-JAG scope or a zero-scope grant for a nonempty request.",
+  "Signed scope on an empty request, or empty, malformed, mismatched, broadened, or unrequested scope at either stage.",
+  "Omitted first-stage top-level scope after IdP narrowing, or a top-level scope differing from signed G.",
+  "Omitted stage-two scope for a nonempty final grant, a final scope not a literal subset of G, or any stage-two scope for an empty final grant.",
+  "Omitting stage-two resource because an admitted single-resource mapping allowed first-stage resource omission.",
+  "Using the examples' omissions to override the ID-JAG -04 Section 4.4.1 grant requirement.",
+]
+
+[[ambiguities]]
+id = "section-5.25-enterprise-cimd-revision"
+source_artifacts = ["cimd-00", "mcp-enterprise-managed-authorization"]
+decision = "Ordinary core OAuth uses CIMD -00. Stable enterprise authorization uses exact issuer-bound preregistration for all three relationships and admits neither URL-form/portable CIMD nor DCR."
+must_reject = [
+  "Applying core CIMD -00 semantics to an enterprise URL-form client ID.",
+  "Silently substituting the enterprise profile's linked CIMD -01 for final-core CIMD -00.",
+  "Portable CIMD reuse, DCR, mixed registration origins, or one registration standing in for another.",
+]
+
+[[ambiguities]]
+id = "section-5.26-oidc-invalid-client-status"
+source_artifacts = ["oidc-core-errata2", "oauth-2.1-13"]
+decision = "Admit a closed client-side transport variant: HTTP 400 with an admitted OIDC/OAuth token-error body, or HTTP 401 only for invalid_client after Basic authentication and exactly one unambiguous matching Basic challenge. Other syntactically valid bounded non-Basic challenge schemes may coexist."
+scope = "client-admission-only"
+fastmcp_emitter_may_inherit = false
+must_reject = [
+  "Any other code/status pair as a typed denial.",
+  "A malformed, duplicate-bearing, oversized, or otherwise unadmitted token-error body at either admitted status.",
+  "Zero, multiple, or conflicting matching Basic challenges on the HTTP 401 variant.",
+  "Describing either admitted peer variant as satisfying both conflicting server-side mandates.",
+  "Fallback, credential reuse, browser retry, or token commit after either denial.",
+]
+
+[[substitution_negatives]]
+id = "missing-required-artifact"
+mutation = "Remove any ID from a required_sets list or its corresponding artifact table."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "extra-artifact-alias"
+mutation = "Add a duplicate or alias intended to satisfy a required artifact ID."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "changed-retrieval-url"
+mutation = "Change a retrieval URL even when title or apparent content is similar."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "changed-byte-length"
+mutation = "Change an artifact byte length independently of its digest."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "wrong-sha256-or-content-address-mismatch"
+mutation = "For any artifact, substitute bytes whose computed SHA-256 differs from either the declared sha256 or the digest encoded by content_address, or make those two declared digests disagree."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "changed-revision-commit-or-path"
+mutation = "Change a revision, Git commit, Git blob, or repository source path independently of the reviewed artifact identity."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "changed-retrieval-date"
+mutation = "Change a retrieval date without a new primary-source retrieval and semantic review record."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "changed-artifact-format"
+mutation = "Change an artifact format or media-family label independently of its exact source bytes."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "truncated-body"
+mutation = "Truncate any artifact body."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "normalized-body"
+mutation = "Normalize newlines, character encoding, HTML, whitespace, or a terminal newline before hashing."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "floating-latest"
+mutation = "Replace a revisioned IETF archive, commit-pinned raw GitHub URL, or named OpenID revision with a latest/default-branch URL."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "browser-rendered-or-github-blob"
+mutation = "Replace primary response bytes with a browser-rendered capture or GitHub blob-viewer HTML."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "redirected-effective-url"
+mutation = "Accept a redirect or silently normalize an effective URL that differs from the retrieval URL."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "content-encoding-or-transfer-framing"
+mutation = "Accept a Content-Encoding or include HTTP headers, chunk framing, or other transfer-specific octets in the artifact digest."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "openid-document-swap"
+mutation = "Swap Core, Discovery, Dynamic Registration, or Enterprise Extensions bytes, URL, length, digest, or authority label."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "openid-revision-swap"
+mutation = "Replace an errata-set-2 document or Enterprise Extensions draft 01 with another revision."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oauth-13-14-clause-swap"
+mutation = "Use OAuth 2.1 -14 as general authority or OAuth 2.1 -13 as refresh-token-confidentiality authority."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "single-floating-oauth"
+mutation = "Collapse OAuth 2.1 -13 and -14 into one unversioned OAuth 2.1 source."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "core-cimd-revision-swap"
+mutation = "Replace core CIMD -00 with CIMD -01 or another revision."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "enterprise-inherits-core-cimd"
+mutation = "Treat core CIMD -00 as permission for enterprise URL-form/portable CIMD or DCR."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "enterprise-identity-delegate-omission"
+mutation = "Omit ID-JAG -04 or identity-chaining -12 because an optional delegated branch is rejected locally."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-metadata-as-id-jag-algorithm-authority"
+mutation = "Invent or reuse an OIDC metadata field as an ID-JAG signing-algorithm registry."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-enterprise-authority-broadening"
+mutation = "Use Enterprise Extensions draft 01 for anything beyond the closed tenant and aud_sub vocabulary."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "dynamic-registration-operation-from-metadata-semantics"
+mutation = "Treat the pinned OIDC Dynamic Registration document's preregistered metadata semantics as permission to execute DCR in the stable enterprise profile."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "id-jag-example-omission"
+mutation = "Treat an example's omitted stage-two resource or scope as authority over the composed Section 5.24 decision."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "generic-oauth-scope-omission-in-enterprise-stage-two"
+mutation = "Apply generic omission-means-requested scope handling to a nonempty enterprise stage-two grant."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-conflict-collapse"
+mutation = "Erase the Section 5.26 HTTP 400 versus qualified HTTP 401 transport variant or claim one peer response satisfies both mandates."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "scenario-file-level-classification"
+mutation = "Assign one result to client-credentials.ts instead of independently classifying its JWT and Basic scenarios."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "scenario-inventory-drift"
+mutation = "Remove, rename, duplicate, or reorder a scenario ID without an exact pinned source change and reviewed classification update."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "duplicate-enterprise-condition-inventory"
+mutation = "Define or claim a second exact ordered enterprise condition inventory in this manifest instead of referencing the canonical 29-entry core-conformance inventory, including different registration or ID-JAG-key granularity."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "empty-scope-omission-as-forced-rejection"
+mutation = "Classify omitted signed ID-JAG scope as a forced failure in the pinned raw run even though its RequestedEnterpriseScopeSet is empty, rather than recording the unexercised nonempty binding as a missing or overpermissive coverage/oracle gap."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "cache-header-diagnostic-as-forced-rejection"
+mutation = "Treat either endpoint's missing Cache-Control: no-store plus Pragma: no-cache pair as independently forcing rejection instead of an endpoint-specific diagnostic/oracle gap."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "raw-provider-input-reclassified"
+mutation = "Reclassify raw idp_id_token or raw confidential-client-secret context injection independently of the canonical missing_production_evidence findings."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "scenario-es256-only-attribution"
+mutation = "Describe either multi-cause raw negative as rejected for ES256 alone."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "scenario-oracle-defect-as-client-rejection"
+mutation = "Name a permissive mock verifier defect as the client's actual rejection without an observed client result."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "raw-expected-rejection-as-upstream-pass"
+mutation = "Count an expected FastMCP policy rejection as a passing upstream conformance scenario."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "adjusted-fixture-as-upstream-pass"
+mutation = "Label a source-adjusted fixture, local derivative, or one-variable negative as passing upstream conformance."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "basic-inherits-jwt-blocker"
+mutation = "Assign the JWT scenario's ES256/private-key blocker to the distinct Basic scenario."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "mock-as-production-positive"
+mutation = "Promote an in-process mock, loopback-cleartext run, context-injected secret/key, empty matrix, skip, filter, or xfail as production-positive real-peer evidence."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "rendered-auth-identifier-as-wire-authority"
+mutation = "Register or negotiate a rendered-document io.modelcontextprotocol auth identifier absent from the two commit-pinned profile sources."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "client-secret-in-body"
+mutation = "Send client_id or client_secret form members for the selected client_secret_basic method."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "dual-client-authentication"
+mutation = "Combine HTTP Basic client authentication with any body credential."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "auth-profile-stability-conflation"
+mutation = "Treat stable enterprise authorization and experimental client credentials as one profile, or count either as core MCP conformance."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "first-stage-resource-unproven-omission"
+mutation = "Omit the first token-exchange resource without an exact explicit single-resource mapping bound through ID-JAG and final audience validation."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "signed-scope-on-empty-request"
+mutation = "Include an ID-JAG scope claim when the frozen RequestedEnterpriseScopeSet is empty."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "signed-scope-missing-on-nonempty-request"
+mutation = "Omit the ID-JAG scope claim when RequestedEnterpriseScopeSet is nonempty."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "zero-scope-grant-on-nonempty-request"
+mutation = "Return a successful empty IdP grant for a nonempty RequestedEnterpriseScopeSet."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "top-level-scope-omitted-after-narrowing"
+mutation = "Omit the first-stage top-level scope when the IdP narrowed a nonempty requested scope set."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "top-level-scope-differs-from-signed-grant"
+mutation = "Return a first-stage top-level scope that differs from the exact signed ID-JAG grant G."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "stage-two-scope-on-empty-grant"
+mutation = "Include an empty or invented stage-two scope member when the final enterprise grant is empty."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "stage-two-scope-not-subset-of-idp-grant"
+mutation = "Return a FinalGrantedEnterpriseScopeSet that is not a literal subset of the IdP-granted set G."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "stage-two-resource-omitted-after-implicit-first-stage-mapping"
+mutation = "Omit the required stage-two resource because an admitted single-resource mapping allowed first-stage resource omission."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "enterprise-registration-role-reuse"
+mutation = "Reuse one Client-to-IdP, Client-to-resource-AS, or Resource-AS-to-IdP registration for another because identifiers or subjects happen to match."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "enterprise-dynamic-registration-substitute"
+mutation = "Use URL-form CIMD, portable CIMD, DCR, or an assertion-selected registration independently at either token endpoint or for the Resource-AS-to-IdP relationship."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "unpinned-enterprise-cimd-01"
+mutation = "Activate enterprise CIMD -01 without separately pinning its bytes, semantic diff, role-specific authority, and interop/security gates."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-enterprise-vs-cimd-family-confusion"
+mutation = "Treat OpenID Connect Enterprise Extensions 1.0 draft 01 as the distinct OAuth CIMD -01 draft."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-401-wrong-method"
+mutation = "Admit HTTP 401 invalid_client when the selected token endpoint authentication method was not HTTP Basic."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-401-wrong-error"
+mutation = "Admit HTTP 401 for a token error other than invalid_client."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-malformed-challenge"
+mutation = "Admit HTTP 401 with no matching Basic challenge, a malformed match, multiple matches, or conflicting matching challenges."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-unadmitted-error-body"
+mutation = "Admit HTTP 400 or qualified HTTP 401 with a malformed, duplicate-bearing, oversized, or otherwise unadmitted OIDC/OAuth token-error body."
+expected = "reject"
+
+[[substitution_negatives]]
+id = "oidc-invalid-client-emitter-inheritance"
+mutation = "Treat the client-admission transport union as permission for a FastMCP token endpoint to emit either status variant without its own exact governing server rule."
+expected = "reject"
+
+[update_policy]
+manual_review_required = true
+steps = [
+  "Retrieve each candidate from its exact primary URL with identity content encoding and no redirect.",
+  "Record effective URL, response status, exact byte length, SHA-256, retrieval date, title, and revision.",
+  "Review the semantic diff against the currently pinned bytes before changing any artifact table.",
+  "Review clause routing, delegated authority, all three scenario classifications, and every substitution negative.",
+  "Never update a digest alone, never follow a floating latest page, and never use a source-rewriting generator.",
+]

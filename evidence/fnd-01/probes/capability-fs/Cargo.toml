@@ -1,0 +1,15 @@
+[package]
+name = "fastmcp-fnd01-capability-fs-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cap-fs-ext = { version = "=4.0.2", default-features = false, features = ["std"] }
+cap-std = { version = "=4.0.2", default-features = false }
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+resolver = "3"
