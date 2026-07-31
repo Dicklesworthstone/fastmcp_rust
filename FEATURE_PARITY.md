@@ -1,18 +1,24 @@
 # FastMCP Rust Feature Parity Report
 
-> **Assessment Date:** 2026-01-28
+> **Assessment Date:** 2026-01-28 (historical matrix below; FND-01 status updated 2026-07-31)
 > **Assessed by:** VioletFalcon (claude-opus-4-5-20251101)
 > **Prior Assessors:** GoldReef, AzureDeer, DustyReef (claude-opus-4-5-20251101)
 > **Methodology:** Porting-to-Rust Phase 5 Conformance Analysis (comprehensive source comparison)
 > **Python FastMCP Version:** 2.14.4
 
+## FND-01 / MCP 2026-07-28 status (authoritative)
+
+**MCP 2026-07-28 support is under implementation and remains unverified.**  
+**Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
+
+Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`).  
+Production JWT (`jsonwebtoken`), Docket/Redis, Apps media rendering, and aggregate release-gate claims are **not** FND-01 deliverables. Treat rows below that still say “complete” for those areas as **historical pre-FND notes**, not current support claims.
+
 ## Executive Summary
 
-This is a comprehensive feature parity assessment comparing the Rust port against Python FastMCP v2.14.4. The analysis reflects actual implementation state based on code review.
+This is a comprehensive feature parity assessment comparing the Rust port against Python FastMCP v2.14.4. The historical matrix below was produced before FND-01 freeze discipline; **do not treat it as a current aggregate-support certificate**.
 
-**Feature Parity Estimate: ~100%** ✅ (all previously identified gaps have been implemented)
-
-The Rust port now covers **all Python FastMCP functionality** with several Rust-exclusive improvements.
+**Current honest posture:** MCP 2026-07-28 foundation work is in progress under FND-01; later packages own full protocol-era parity, Redis Tasks, and media.
 
 ### Key Strengths (Better Than Python)
 - **Cancel-correctness**: Cooperative cancellation via checkpoints and masks
@@ -22,17 +28,10 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 - **Rich console**: Banners, traffic display, statistics collection
 - **Parallel combinators**: join_all, race, quorum, first_ok
 
-### Recently Completed (Formerly Listed as Gaps)
-- ✅ **Full OAuth 2.0/2.1 Server** - Complete with PKCE, authorization code flow, token issuance/revocation
-- ✅ **OIDC Provider** - ID tokens, UserInfo, discovery document
-- ✅ **Tool Transformations** - Dynamic schema modification, argument transforms
-- ✅ **Middleware Ecosystem** - ResponseCachingMiddleware, RateLimitingMiddleware, SlidingWindowRateLimiting
-- ✅ **Docket Distributed Task Queue** - Memory backend + Redis backend (feature-gated)
-- ✅ **CLI Tooling** - fastmcp run/inspect/install commands
-- ✅ **EventStore** - SSE resumability with TTL
-- ✅ **HTTP Transport** - Stateless and streamable modes
-- ✅ **MemoryTransport** - In-process testing transport
-- ✅ **MCPConfig** - Server registry from config files
+### Landed areas (subject to FND-01 nonpromotion)
+- OAuth/OIDC code paths exist in-tree but are **not** aggregate 2026-07-28 certified
+- Middleware / HTTP / CLI / transports exist; Redis Docket is **not** a production FND-01 edge
+- MCPConfig and memory transport remain useful for development
 
 ---
 
@@ -240,8 +239,8 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 | Static token verifier | ✅ | ✅ | `StaticTokenVerifier` |
 | JWT support | ✅ | 🚧 | Process-global JWT crypto removed under FND-01; ring RS256 evidence path supersedes `jsonwebtoken` (no `jwt` feature) |
 | Access token handling | ✅ | ✅ | `AuthContext` with token |
-| **Full OAuth 2.0/2.1 Server** | ✅ | ✅ | `oauth.rs` - Authorization code + PKCE |
-| **OIDC Provider** | ✅ | ✅ | `oidc.rs` - ID tokens, UserInfo, discovery |
+| **Full OAuth 2.0/2.1 Server** | ✅ | 🚧 | `oauth.rs` present; not an FND-01 aggregate support claim |
+| **OIDC Provider** | ✅ | 🚧 | `oidc.rs` present; enterprise/OIDC promotion is later packages |
 | **Authorization code flow** | ✅ | ✅ | With PKCE (OAuth 2.1 compliant) |
 | **Token issuance** | ✅ | ✅ | Access + refresh tokens |
 | **Token revocation** | ✅ | ✅ | RFC 7009 compliant |
@@ -347,9 +346,9 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 
 ---
 
-## Summary: All Gaps Closed ✅
+## Summary: Historical gap list (not an MCP 2026-07-28 certificate)
 
-All previously identified gaps have been implemented:
+The list below is a historical Phase-5 gap-closure inventory. It does **not** certify aggregate MCP 2026-07-28 support.
 
 ### Completed Features (Formerly Listed as Gaps)
 
@@ -377,7 +376,7 @@ All previously identified gaps have been implemented:
 3. TestClient (httpx) → Using Lab runtime + MemoryTransport
 4. OpenAPI provider → Out of scope
 5. TypeAdapter caching → serde handles differently
-6. check_for_updates → Implemented for the CLI (crates.io version check)
+6. check_for_updates → Removed for FND-01 (no eager crates.io / ureq update path)
 
 ---
 
@@ -397,35 +396,18 @@ All previously identified gaps have been implemented:
 
 ## Conclusion
 
-The FastMCP Rust port has achieved **100% feature parity** with Python FastMCP v2.14.4! 🎉
+Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2.14.4. **That is not a current MCP 2026-07-28 support claim.**
 
-**Complete Feature Coverage:**
-- ✅ Core protocol methods (tools, resources, prompts)
-- ✅ Background tasks (SEP-1686 protocol with Docket)
-- ✅ All transport types (Stdio, SSE, WebSocket, HTTP, Memory)
-- ✅ Full authentication (static tokens, JWT, OAuth 2.0/2.1, OIDC)
-- ✅ Complete middleware ecosystem (caching, rate limiting)
-- ✅ Proxy support and server composition (mount, as_proxy)
-- ✅ Cancel-correct async (superior to Python)
-- ✅ Rich console and statistics
-- ✅ Sampling and elicitation protocols
-- ✅ Tool transformations
-- ✅ Full CLI tooling (run, inspect, install, dev, list, test, tasks)
-- ✅ MCPConfig file support
-- ✅ EventStore for SSE resumability
-- ✅ FilesystemProvider
-- ✅ Cross-component handler access (ctx.read_resource, ctx.call_tool)
-- ✅ Component metadata (tags, icons, versions)
-- ✅ Per-handler timeouts and output schemas
+**Current FND-01 stance (2026-07-31):**
+- Foundation evidence, dependency freeze, and integration assembly are in progress under beads FND-01
+- JWT/`jsonwebtoken` and Redis optional features are **removed** from the default graph for FND-01
+- OAuth/OIDC/Redis Tasks/Apps/media remain later work packages (AUTH-*, TASKR-01, etc.)
+- Aggregate support requires GATE / final attestation packages — not this document
 
-**Estimated completion:** ~100%
+**Honest current strengths (not an aggregate claim):**
+- Cancel-correct async (asupersync `Cx`, 4-valued outcomes)
+- Core protocol surfaces and transports with ongoing 2026-07-28 modernization
+- CLI tooling without eager crates.io update networking
+- Rich console and structured concurrency patterns
 
-The port is suitable for:
-- Production MCP servers with full functionality
-- Applications requiring cancel-correct async
-- Systems needing distributed task execution
-- OAuth-protected deployments
-- Binary distribution scenarios
-- Development workflows via CLI tooling
-
-**The FastMCP Rust port is fully production-ready and feature-complete.**
+**Not production-certified for MCP 2026-07-28** until final attestation and GATE packages pass.

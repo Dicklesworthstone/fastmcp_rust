@@ -81,8 +81,9 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 - **Porting methodology:** Extract spec from legacy → implement from spec → never translate line-by-line
 - **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for cancel-correct async (not tokio directly)
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-07-11` (see `rust-toolchain.toml`)
-- **MCP 2026-07-28:** under implementation (FND-01 foundation evidence); not an aggregate support claim
+- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`)
+- **MCP 2026-07-28 support is under implementation and remains unverified.**
+- **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
 
 ---
 

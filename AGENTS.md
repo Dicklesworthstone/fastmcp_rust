@@ -2,6 +2,10 @@
 
 > Guidelines for AI coding agents working in this Rust codebase.
 
+**MCP 2026-07-28 support is under implementation and remains unverified.**  
+**Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+Toolchain: pinned `nightly-2026-07-11` (rustc 1.99.0-nightly) with workspace `rust-version = "1.99"`.
+
 ---
 
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
@@ -83,9 +87,9 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `sha2` + `hmac` | Cryptography (OAuth PKCE, OIDC signing) |
 | `regex` | JSON Schema `pattern` validation |
 | `base64` | Opaque cursor encoding for pagination |
-| `semver` + `ureq` | Update checking (CLI) |
+| `semver` | Version parsing (evidence / gates; no CLI network update client) |
 | `redis` | Not on default FND-01 graph (TASKR-01 later) |
-| `jsonwebtoken` | Optional JWT authentication |
+| JWT / `jsonwebtoken` | Not on FND-01 production graph (FACADE-NO-JSONWEBTOKEN) |
 | `log` | Logging facade (zero-cost when disabled) |
 | `proc-macro2` + `quote` + `syn` | Procedural macros (`#[tool]`, `#[resource]`, `#[prompt]`) |
 
@@ -197,7 +201,7 @@ cargo test --workspace --all-features
 | `fastmcp-core` | McpContext lifecycle, error types, budget/cancellation semantics, auth context, combinators, duration parsing, session state |
 | `fastmcp-protocol` | JSON-RPC message parsing/serialization, MCP types round-trip, JSON Schema generation/validation, protocol version negotiation |
 | `fastmcp-transport` | Stdio framing, SSE event streaming, WebSocket frame encode/decode, HTTP request/response, memory transport, codec correctness, event store persistence |
-| `fastmcp-server` | Handler dispatch, router registration, tool/resource/prompt lifecycle, builder API, middleware chains, caching, rate limiting, OAuth/OIDC flows, JWT auth, proxy client, session management, Docket distributed backend, bidirectional communication, task management |
+| `fastmcp-server` | Handler dispatch, router registration, tool/resource/prompt lifecycle, builder API, middleware chains, caching, rate limiting, OAuth/OIDC code paths, proxy client, session management, bidirectional communication, task management (no FND-01 Docket/Redis production edge) |
 | `fastmcp-client` | Client connection lifecycle, session management, tool calling, resource reading, MCP config file parsing |
 | `fastmcp-derive` | `#[tool]` macro expansion, `#[resource]` macro expansion, `#[prompt]` macro expansion, JsonSchema derive |
 | `fastmcp-console` | Rich console output formatting, log level filtering |
@@ -257,7 +261,7 @@ fastmcp_rust/
 │   ├── fastmcp-core/                  # Core types: McpContext, errors, budget, auth, combinators
 │   ├── fastmcp-protocol/             # MCP protocol types, JSON-RPC, JSON Schema
 │   ├── fastmcp-transport/            # Transports: stdio, SSE, WebSocket, HTTP, memory
-│   ├── fastmcp-server/               # Server: router, handlers, middleware, auth, proxy, Docket
+│   ├── fastmcp-server/               # Server: router, handlers, middleware, auth, proxy
 │   ├── fastmcp-client/               # Client: connection, session, MCP config parsing
 │   ├── fastmcp-macros/               # Proc macros: #[tool], #[resource], #[prompt], JsonSchema
 │   ├── fastmcp-console/              # Rich console output (rich_rust integration)
@@ -380,7 +384,7 @@ json = ["rich_rust/json"]            # JSON pretty-printing
 - **Middleware pipeline** — caching, rate limiting, transforms compose as chainable middleware
 - **Multiple auth strategies** — OAuth 2.1, OIDC, JWT, static tokens; `AuthProvider` trait for custom schemes
 - **Proxy gateway** — `ProxyClient` + `ProxyCatalog` for aggregating multiple remote MCP servers
-- **Docket distributed backend** — optional Redis-backed distributed task queue
+- **Docket distributed backend** — deferred; not a FND-01 production edge (TASKR-01 later)
 - **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
 - **Structured tracing** via `log` facade — zero-cost when disabled
 - **`#![forbid(unsafe_code)]`** throughout all crates

@@ -12,7 +12,10 @@ Development since the v0.2.0 release on 2026-02-15, covering concurrency infrast
 
 ### MCP 2026-07-28 support (in progress)
 
-- **FND-01 foundation** — freeze authoritative protocol/SDK/toolchain evidence, core crypto/URI pins, and integration-surface dependency policy. Aggregate MCP 2026-07-28 support is **not** claimed until GATE / final attestation packages complete. JWT (`jsonwebtoken`) and Redis optional features are removed from the default graph; Redis Tasks and enterprise auth remain later packages.
+MCP 2026-07-28 support is under implementation and remains unverified.  
+Aggregate MCP 2026-07-28 support is not claimed by FND-01.
+
+- **FND-01 foundation** — freeze authoritative protocol/SDK/toolchain evidence, core crypto/URI pins, and integration-surface dependency policy. Supported compiler: `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`). JWT (`jsonwebtoken`) and Redis optional features are removed from the default graph; Redis Tasks and enterprise auth remain later packages.
 
 ### Concurrency and Dispatch
 
