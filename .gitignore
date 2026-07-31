@@ -60,3 +60,6 @@ perf.data
 
 # FND-01: exact active ignore for verifier/integration run scratch
 .fnd01-run/
+
+# Beads compliance audit artifacts (local only)
+beads_compliance_audit/
