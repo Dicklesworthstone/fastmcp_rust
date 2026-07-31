@@ -58,11 +58,11 @@ mod trust_std {
     const MAX_OUTER_CFG_VALUE_BYTES: usize = 4096;
     const MAX_OUTER_CFG_BYTES: usize = 1024 * 1024;
     #[cfg(target_os = "macos")]
-    const CONTROLLER_OS_TEMP_ROOT: Option<&str> = Some("/private/tmp");
+    pub const CONTROLLER_OS_TEMP_ROOT: Option<&str> = Some("/private/tmp");
     #[cfg(target_os = "linux")]
-    const CONTROLLER_OS_TEMP_ROOT: Option<&str> = Some("/tmp");
+    pub const CONTROLLER_OS_TEMP_ROOT: Option<&str> = Some("/tmp");
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    const CONTROLLER_OS_TEMP_ROOT: Option<&str> = None;
+    pub const CONTROLLER_OS_TEMP_ROOT: Option<&str> = None;
     pub const CONTROL_LEDGER_PREFIX: &[u8] = b"FND01CONTROLv2\0";
     pub const ACQUISITION_SPOOL_PREFIX: &[u8] = b"FND01ACQSPOOLv1\0";
     pub const FINAL_GATE_RESULT_PREFIX: &[u8] = b"FND01GATERESULTv3\0";
@@ -6236,16 +6236,18 @@ mod trust_std {
         phase_code: &str,
         run_id: &str,
     ) -> TrustResult<&'static str> {
-        let root = CONTROLLER_OS_TEMP_ROOT.ok_or_else(|| {
-            TrustError::new(
-                "E_RCH_DAEMON",
-                "controller temporary-root policy supports only macOS and Linux",
-            )
-        })?;
-        if socket_path
-            == format!("{root}/fnd01/{run_id}/s/{phase_code}/rch.sock")
-        {
-            return Ok(root);
+        // These records are controller-owned but are also parsed by Linux
+        // Produce/Attest/Gate images.  The parser's compilation target is not
+        // evidence of the controller's OS, so portable record validation must
+        // admit either of the policy's two exact lexical controller roots.  The
+        // local ordinary controller/audit separately joins the selected root to
+        // CONTROLLER_OS_TEMP_ROOT and across all three serialized phases.
+        for root in ["/private/tmp", "/tmp"] {
+            if socket_path
+                == format!("{root}/fnd01/{run_id}/s/{phase_code}/rch.sock")
+            {
+                return Ok(root);
+            }
         }
         Err(TrustError::new(
             "E_RCH_DAEMON",
@@ -6539,6 +6541,15 @@ mod trust_std {
         pub empty_lookup_directory: EmptyDirectorySnapshot,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ValidatedSerializedController {
+        pub controller: ValidatedControllerRch,
+        pub controller_working_directory: String,
+        pub controller_temp_root: String,
+        pub daemon_executable: ValidatedUnixFileIdentity,
+        pub workers_config: ValidatedUnixFileIdentity,
+    }
+
     pub fn validate_gate_input(
         record: CanonicalRecord,
         run_id: &str,
@@ -6700,6 +6711,95 @@ mod trust_std {
             attester_outer_transport,
             empty_lookup_directory,
         })
+    }
+
+    pub fn validate_serialized_controller_phase_join(
+        producer: &ValidatedOuterLifecycle,
+        attester: &ValidatedOuterLifecycle,
+        gate: &ValidatedGateInput,
+        run_id: &str,
+    ) -> TrustResult<ValidatedSerializedController> {
+        if producer.phase != "producer"
+            || attester.phase != "attester"
+            || gate.daemon_pre.phase != "gate"
+            || producer.controller != attester.controller
+            || producer.controller != gate.controller
+            || producer.invocation.controller_working_directory
+                != attester.invocation.controller_working_directory
+            || producer.invocation.controller_working_directory
+                != gate.invocation.controller_working_directory
+            || producer.daemon_pre.executable != attester.daemon_pre.executable
+            || producer.daemon_pre.executable != gate.daemon_pre.executable
+            || producer.daemon_pre.workers_config
+                != attester.daemon_pre.workers_config
+            || producer.daemon_pre.workers_config
+                != gate.daemon_pre.workers_config
+        {
+            return Err(TrustError::new(
+                "E_CONTROLLER_PHASE_JOIN",
+                "serialized controller/CWD/RCH/rchd/workers identity drift",
+            ));
+        }
+        let producer_root = private_controller_temp_root(
+            &producer.invocation.socket_path,
+            "p",
+            run_id,
+        )?;
+        let attester_root = private_controller_temp_root(
+            &attester.invocation.socket_path,
+            "a",
+            run_id,
+        )?;
+        let gate_root = private_controller_temp_root(
+            &gate.invocation.socket_path,
+            "g",
+            run_id,
+        )?;
+        if producer_root != attester_root || producer_root != gate_root {
+            return Err(TrustError::new(
+                "E_CONTROLLER_PHASE_JOIN",
+                "serialized phases use different controller temporary roots",
+            ));
+        }
+        Ok(ValidatedSerializedController {
+            controller: producer.controller.clone(),
+            controller_working_directory: producer
+                .invocation
+                .controller_working_directory
+                .clone(),
+            controller_temp_root: producer_root.to_owned(),
+            daemon_executable: producer.daemon_pre.executable.clone(),
+            workers_config: producer.daemon_pre.workers_config.clone(),
+        })
+    }
+
+    pub fn validate_local_serialized_controller(
+        controller: &ValidatedSerializedController,
+        repository_root: &Path,
+    ) -> TrustResult<()> {
+        let expected_temp_root = CONTROLLER_OS_TEMP_ROOT.ok_or_else(|| {
+            TrustError::new(
+                "E_CONTROLLER_PLATFORM",
+                "ordinary controller requires macOS or Linux",
+            )
+        })?;
+        let expected_repository_root =
+            repository_root.to_str().ok_or_else(|| {
+                TrustError::new(
+                    "E_CONTROLLER_CWD",
+                    "controller repository root must be UTF-8",
+                )
+            })?;
+        if controller.controller_temp_root != expected_temp_root
+            || controller.controller_working_directory
+                != expected_repository_root
+        {
+            return Err(TrustError::new(
+                "E_CONTROLLER_PHASE_JOIN",
+                "recorded controller platform root/CWD differs from local authority",
+            ));
+        }
+        Ok(())
     }
 
     // ---- FND01GATERESULTv3 strict parser and semantic join ----
@@ -15845,9 +15945,263 @@ mod phase_b_std {
         })
     }
 
-    fn semver_without_build(value: &str, subject: &str) -> TrustResult<&str> {
+    fn semver_without_build<'a>(value: &'a str, subject: &str) -> TrustResult<&'a str> {
         parse_strict_semver(value, subject)?;
         Ok(value.split_once('+').map_or(value, |(core, _)| core))
+    }
+
+    fn compare_semver_identifiers(left: &[String], right: &[String]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if left.is_empty() && right.is_empty() {
+            return Ordering::Equal;
+        }
+        if left.is_empty() {
+            return Ordering::Greater;
+        }
+        if right.is_empty() {
+            return Ordering::Less;
+        }
+        for (left, right) in left.iter().zip(right) {
+            let left_numeric = left.bytes().all(|byte| byte.is_ascii_digit());
+            let right_numeric = right.bytes().all(|byte| byte.is_ascii_digit());
+            let ordering = match (left_numeric, right_numeric) {
+                (true, true) => left.len().cmp(&right.len()).then_with(|| left.cmp(right)),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => left.as_bytes().cmp(right.as_bytes()),
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        left.len().cmp(&right.len())
+    }
+
+    fn compare_semver(left: &StrictSemver, right: &StrictSemver) -> std::cmp::Ordering {
+        (left.major, left.minor, left.patch)
+            .cmp(&(right.major, right.minor, right.patch))
+            .then_with(|| compare_semver_identifiers(&left.prerelease, &right.prerelease))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RequirementOperator {
+        Exact,
+        Greater,
+        GreaterEqual,
+        Less,
+        LessEqual,
+        Tilde,
+        Caret,
+        Wildcard,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RequirementComparator {
+        operator: RequirementOperator,
+        major: Option<u64>,
+        minor: Option<u64>,
+        patch: Option<u64>,
+        prerelease: Vec<String>,
+    }
+
+    fn parse_requirement_comparator(value: &str, subject: &str) -> TrustResult<RequirementComparator> {
+        if value == "*" {
+            return Ok(RequirementComparator {
+                operator: RequirementOperator::Wildcard,
+                major: None,
+                minor: None,
+                patch: None,
+                prerelease: Vec::new(),
+            });
+        }
+        let (operator, version) = if let Some(version) = value.strip_prefix(">=") {
+            (RequirementOperator::GreaterEqual, version)
+        } else if let Some(version) = value.strip_prefix("<=") {
+            (RequirementOperator::LessEqual, version)
+        } else if let Some(version) = value.strip_prefix('>') {
+            (RequirementOperator::Greater, version)
+        } else if let Some(version) = value.strip_prefix('<') {
+            (RequirementOperator::Less, version)
+        } else if let Some(version) = value.strip_prefix('=') {
+            (RequirementOperator::Exact, version)
+        } else if let Some(version) = value.strip_prefix('~') {
+            (RequirementOperator::Tilde, version)
+        } else if let Some(version) = value.strip_prefix('^') {
+            (RequirementOperator::Caret, version)
+        } else if value.split('.').any(|component| component == "*") {
+            (RequirementOperator::Wildcard, value)
+        } else {
+            return Err(phase_b_error(
+                "E_PHASE_B_VERSION_REQUIREMENT",
+                format!("{subject}: canonical comparator operator required in {value:?}"),
+            ));
+        };
+        if version.is_empty() || version.contains('+') || version.chars().any(char::is_whitespace) {
+            return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+        }
+        let (core, prerelease) = match version.split_once('-') {
+            Some((core, prerelease)) => (core, Some(prerelease)),
+            None => (version, None),
+        };
+        let components = core.split('.').collect::<Vec<_>>();
+        if components.is_empty() || components.len() > 3 {
+            return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+        }
+        let mut parsed = [None; 3];
+        let mut wildcard = false;
+        for (ordinal, component) in components.iter().enumerate() {
+            if *component == "*" {
+                if ordinal == 0 || ordinal + 1 != components.len() || prerelease.is_some() {
+                    return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+                }
+                wildcard = true;
+                continue;
+            }
+            if wildcard {
+                return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+            }
+            parsed[ordinal] = Some(parse_semver_number(component, subject)?);
+        }
+        let prerelease = prerelease
+            .map(|value| parse_semver_identifiers(value, true, subject))
+            .transpose()?
+            .unwrap_or_default();
+        if !prerelease.is_empty() && parsed[2].is_none() {
+            return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+        }
+        let operator = if wildcard {
+            if operator != RequirementOperator::Wildcard {
+                return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+            }
+            RequirementOperator::Wildcard
+        } else {
+            operator
+        };
+        Ok(RequirementComparator {
+            operator,
+            major: parsed[0],
+            minor: parsed[1],
+            patch: parsed[2],
+            prerelease,
+        })
+    }
+
+    fn comparator_lower(comparator: &RequirementComparator) -> StrictSemver {
+        StrictSemver {
+            major: comparator.major.unwrap_or(0),
+            minor: comparator.minor.unwrap_or(0),
+            patch: comparator.patch.unwrap_or(0),
+            prerelease: comparator.prerelease.clone(),
+            build: Vec::new(),
+        }
+    }
+
+    fn requirement_comparator_matches(
+        comparator: &RequirementComparator,
+        version: &StrictSemver,
+    ) -> bool {
+        use std::cmp::Ordering;
+        let lower = comparator_lower(comparator);
+        match comparator.operator {
+            RequirementOperator::Exact => {
+                comparator.major.is_none_or(|major| version.major == major)
+                    && comparator.minor.is_none_or(|minor| version.minor == minor)
+                    && comparator.patch.is_none_or(|patch| version.patch == patch)
+                    && (comparator.prerelease.is_empty()
+                        || version.prerelease == comparator.prerelease)
+            }
+            RequirementOperator::Greater => compare_semver(version, &lower) == Ordering::Greater,
+            RequirementOperator::GreaterEqual => compare_semver(version, &lower) != Ordering::Less,
+            RequirementOperator::Less => compare_semver(version, &lower) == Ordering::Less,
+            RequirementOperator::LessEqual => compare_semver(version, &lower) != Ordering::Greater,
+            RequirementOperator::Wildcard => {
+                comparator.major.is_none_or(|major| version.major == major)
+                    && comparator.minor.is_none_or(|minor| version.minor == minor)
+            }
+            RequirementOperator::Tilde => {
+                if compare_semver(version, &lower) == Ordering::Less {
+                    return false;
+                }
+                match (comparator.major, comparator.minor) {
+                    (Some(major), Some(minor)) => {
+                        version.major == major && version.minor == minor
+                    }
+                    (Some(major), None) => version.major == major,
+                    _ => true,
+                }
+            }
+            RequirementOperator::Caret => {
+                if compare_semver(version, &lower) == Ordering::Less {
+                    return false;
+                }
+                let (upper_major, upper_minor, upper_patch) = if lower.major != 0 {
+                    (lower.major.checked_add(1), Some(0), Some(0))
+                } else if comparator.minor.is_none() {
+                    (Some(1), Some(0), Some(0))
+                } else if lower.minor != 0 {
+                    (Some(0), lower.minor.checked_add(1), Some(0))
+                } else if comparator.patch.is_none() {
+                    (Some(0), Some(1), Some(0))
+                } else {
+                    (Some(0), Some(0), lower.patch.checked_add(1))
+                };
+                let (Some(upper_major), Some(upper_minor), Some(upper_patch)) =
+                    (upper_major, upper_minor, upper_patch)
+                else {
+                    return false;
+                };
+                let upper = StrictSemver {
+                    major: upper_major,
+                    minor: upper_minor,
+                    patch: upper_patch,
+                    prerelease: Vec::new(),
+                    build: Vec::new(),
+                };
+                compare_semver(version, &upper) == Ordering::Less
+            }
+        }
+    }
+
+    fn version_requirement_matches(
+        requirement: &str,
+        version_text: &str,
+        subject: &str,
+    ) -> TrustResult<()> {
+        if requirement.is_empty()
+            || requirement.len() > 4096
+            || requirement.starts_with(' ')
+            || requirement.ends_with(' ')
+            || requirement.contains(" ,")
+            || requirement.contains(",  ")
+        {
+            return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+        }
+        let comparators = requirement
+            .split(", ")
+            .map(|value| parse_requirement_comparator(value, subject))
+            .collect::<TrustResult<Vec<_>>>()?;
+        if comparators.is_empty() || comparators.len() > 32 {
+            return Err(phase_b_error("E_PHASE_B_VERSION_REQUIREMENT", subject));
+        }
+        let version = parse_strict_semver(version_text, subject)?;
+        let prerelease_authorized = version.prerelease.is_empty()
+            || comparators.iter().any(|comparator| {
+                comparator.major == Some(version.major)
+                    && comparator.minor == Some(version.minor)
+                    && comparator.patch == Some(version.patch)
+                    && !comparator.prerelease.is_empty()
+            });
+        if !prerelease_authorized
+            || !comparators
+                .iter()
+                .all(|comparator| requirement_comparator_matches(comparator, &version))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_VERSION_REQUIREMENT",
+                format!("{subject}: {requirement:?} does not match {version_text:?}"),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_cargo_package_name(value: &str, crates_io: bool, subject: &str) -> TrustResult<()> {
@@ -15871,6 +16225,1305 @@ mod phase_b_std {
             return Err(phase_b_error(
                 "E_PHASE_B_SHA256",
                 format!("{subject}: lowercase SHA-256 required"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapLockPackage {
+        name: String,
+        version: String,
+        source: Option<String>,
+        checksum: Option<String>,
+        dependencies: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct BootstrapRegistryPackage {
+        name: String,
+        version: String,
+        source: String,
+        checksum: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapLockUnion {
+        packages: Vec<BootstrapRegistryPackage>,
+        package_set_sha256: [u8; 32],
+    }
+
+    fn lock_string_assignment(line: &str, field: &str, subject: &str) -> TrustResult<Option<String>> {
+        let prefix = format!("{field} = \"");
+        let Some(value) = line.strip_prefix(&prefix) else {
+            return Ok(None);
+        };
+        let value = value.strip_suffix('"').ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_LOCK_SCHEMA",
+                format!("{subject}: unterminated {field}"),
+            )
+        })?;
+        if value.is_empty()
+            || value.contains('"')
+            || value.contains('\\')
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_LOCK_SCHEMA",
+                format!("{subject}: invalid {field} string"),
+            ));
+        }
+        Ok(Some(value.to_owned()))
+    }
+
+    fn lock_dependency_line(line: &str, subject: &str) -> TrustResult<String> {
+        let value = line
+            .strip_prefix(" \"")
+            .and_then(|value| value.strip_suffix("\","))
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_LOCK_SCHEMA",
+                    format!("{subject}: canonical dependency line required"),
+                )
+            })?;
+        if value.is_empty()
+            || value.contains('"')
+            || value.contains('\\')
+            || value.trim() != value
+            || value.contains("  ")
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", subject));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn parse_bootstrap_lock_document(bytes: &[u8]) -> TrustResult<Vec<BootstrapLockPackage>> {
+        if bytes.is_empty()
+            || bytes.len() > 1024 * 1024
+            || !bytes.ends_with(b"\n")
+            || bytes.starts_with(&[0xef, 0xbb, 0xbf])
+            || bytes.contains(&0)
+            || bytes.contains(&b'\r')
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_LOCK_FRAMING",
+                "bootstrap Cargo.lock must be bounded strict LF UTF-8",
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| phase_b_error("E_PHASE_B_LOCK_FRAMING", "bootstrap Cargo.lock UTF-8"))?;
+        let mut lines = text[..text.len() - 1].split('\n').peekable();
+        if lines.next() != Some("# This file is automatically @generated by Cargo.")
+            || lines.next() != Some("# It is not intended for manual editing.")
+            || lines.next() != Some("version = 4")
+            || lines.next() != Some("")
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_LOCK_SCHEMA",
+                "canonical Cargo v4 header required",
+            ));
+        }
+        let mut packages = Vec::new();
+        while lines.peek().is_some() {
+            if lines.next() != Some("[[package]]") {
+                return Err(phase_b_error(
+                    "E_PHASE_B_LOCK_SCHEMA",
+                    "[[package]] expected",
+                ));
+            }
+            let subject = format!("bootstrap Cargo.lock package[{}]", packages.len());
+            let mut name = None;
+            let mut version = None;
+            let mut source = None;
+            let mut checksum = None;
+            let mut dependencies = None;
+            loop {
+                let Some(line) = lines.peek().copied() else {
+                    break;
+                };
+                if line.is_empty() {
+                    lines.next();
+                    break;
+                }
+                if line == "[[package]]" {
+                    break;
+                }
+                if line == "dependencies = [" {
+                    if dependencies.is_some() {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: duplicate dependencies")));
+                    }
+                    lines.next();
+                    let mut values = Vec::new();
+                    loop {
+                        let line = lines.next().ok_or_else(|| {
+                            phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: unterminated dependencies"))
+                        })?;
+                        if line == "]" {
+                            break;
+                        }
+                        values.try_reserve(1)
+                            .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", &subject))?;
+                        values.push(lock_dependency_line(line, &subject)?);
+                    }
+                    if values.is_empty()
+                        || values.windows(2).any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+                    {
+                        return Err(phase_b_error(
+                            "E_PHASE_B_LOCK_DEPENDENCY",
+                            format!("{subject}: dependencies must be nonempty raw-sorted unique"),
+                        ));
+                    }
+                    dependencies = Some(values);
+                    continue;
+                }
+                lines.next();
+                if let Some(value) = lock_string_assignment(line, "name", &subject)? {
+                    if name.replace(value).is_some() {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: duplicate name")));
+                    }
+                } else if let Some(value) = lock_string_assignment(line, "version", &subject)? {
+                    if version.replace(value).is_some() {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: duplicate version")));
+                    }
+                } else if let Some(value) = lock_string_assignment(line, "source", &subject)? {
+                    if source.replace(value).is_some() {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: duplicate source")));
+                    }
+                } else if let Some(value) = lock_string_assignment(line, "checksum", &subject)? {
+                    if checksum.replace(value).is_some() {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: duplicate checksum")));
+                    }
+                } else {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_LOCK_SCHEMA",
+                        format!("{subject}: unknown or noncanonical line {line:?}"),
+                    ));
+                }
+            }
+            let name = name.ok_or_else(|| phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: missing name")))?;
+            let version = version.ok_or_else(|| phase_b_error("E_PHASE_B_LOCK_SCHEMA", format!("{subject}: missing version")))?;
+            validate_cargo_package_name(&name, source.is_some(), &subject)?;
+            parse_strict_semver(&version, &subject)?;
+            match (&source, &checksum) {
+                (Some(source), Some(checksum)) if source == CRATES_IO => {
+                    validate_lower_sha256(checksum, &subject)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_LOCK_SCHEMA",
+                        format!("{subject}: exact crates.io source/checksum coupling required"),
+                    ));
+                }
+            }
+            packages.try_reserve(1)
+                .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", "bootstrap lock packages"))?;
+            packages.push(BootstrapLockPackage {
+                name,
+                version,
+                source,
+                checksum,
+                dependencies: dependencies.unwrap_or_default(),
+            });
+        }
+        if packages.is_empty() || packages.len() > MAX_JSON_NODES {
+            return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", "bounded nonempty package set required"));
+        }
+        Ok(packages)
+    }
+
+    fn resolve_lock_dependency(
+        value: &str,
+        packages: &[BootstrapLockPackage],
+        subject: &str,
+    ) -> TrustResult<usize> {
+        let (identity, source) = if let Some((identity, source)) = value.rsplit_once(" (") {
+            let source = source.strip_suffix(')').ok_or_else(|| {
+                phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: malformed source"))
+            })?;
+            if source != CRATES_IO {
+                return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: non-crates.io source")));
+            }
+            (identity, Some(source))
+        } else {
+            (value, None)
+        };
+        let (name, version) = identity
+            .split_once(' ')
+            .map_or((identity, None), |(name, version)| (name, Some(version)));
+        if name.is_empty() || version.is_some_and(|version| version.is_empty() || version.contains(' ')) {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", subject));
+        }
+        validate_cargo_package_name(name, false, subject)?;
+        if let Some(version) = version {
+            parse_strict_semver(version, subject)?;
+        }
+        if source.is_some() && version.is_none() {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", subject));
+        }
+        let named = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.name == name)
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: unknown name {name}")));
+        }
+        let selected_version = if let Some(version) = version {
+            version
+        } else {
+            let versions = named
+                .iter()
+                .map(|(_, package)| package.version.as_str())
+                .collect::<BTreeSet<_>>();
+            if versions.len() != 1 {
+                return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: ambiguous unqualified version")));
+            }
+            versions.into_iter().next().ok_or_else(|| phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", subject))?
+        };
+        let candidates = named
+            .iter()
+            .filter(|(_, package)| package.version == selected_version)
+            .copied()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: unknown version")));
+        }
+        let selected = if let Some(source) = source {
+            let matching = candidates
+                .iter()
+                .filter(|(_, package)| package.source.as_deref() == Some(source))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: ambiguous source")));
+            }
+            matching[0].0
+        } else {
+            let local = candidates
+                .iter()
+                .filter(|(_, package)| package.source.is_none())
+                .collect::<Vec<_>>();
+            if local.len() == 1 {
+                local[0].0
+            } else if local.is_empty() && candidates.len() == 1 {
+                candidates[0].0
+            } else {
+                return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: ambiguous package")));
+            }
+        };
+        let canonical = if named.len() == 1 {
+            version.is_none() && source.is_none()
+        } else if candidates.len() == 1 || packages[selected].source.is_none() {
+            version == Some(packages[selected].version.as_str()) && source.is_none()
+        } else {
+            version == Some(packages[selected].version.as_str())
+                && source == packages[selected].source.as_deref()
+        };
+        if !canonical {
+            return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", format!("{subject}: noncanonical qualification")));
+        }
+        Ok(selected)
+    }
+
+    fn bootstrap_lock_union(bytes: &[u8]) -> TrustResult<BootstrapLockUnion> {
+        let packages = parse_bootstrap_lock_document(bytes)?;
+        let mut identities = BTreeSet::new();
+        let mut local = Vec::new();
+        let mut registry = BTreeSet::new();
+        let mut normalized_names = BTreeMap::<String, String>::new();
+        let mut normalized_versions = BTreeSet::<(String, String)>::new();
+        for package in &packages {
+            if !identities.insert((
+                package.name.as_str(),
+                package.version.as_str(),
+                package.source.as_deref(),
+            )) {
+                return Err(phase_b_error("E_PHASE_B_LOCK_DUPLICATE", "duplicate package identity"));
+            }
+            match (&package.source, &package.checksum) {
+                (None, None) => local.push((package.name.as_str(), package.version.as_str())),
+                (Some(source), Some(checksum)) => {
+                    let normalized_name = package.name.to_ascii_lowercase().replace('_', "-");
+                    let version_precedence = semver_without_build(&package.version, "bootstrap lock version")?.to_owned();
+                    if !normalized_versions.insert((normalized_name.clone(), version_precedence)) {
+                        return Err(phase_b_error(
+                            "E_PHASE_B_LOCK_DUPLICATE",
+                            "crates.io versions differing only by build metadata",
+                        ));
+                    }
+                    if normalized_names
+                        .insert(normalized_name, package.name.clone())
+                        .is_some_and(|prior| prior != package.name.as_str())
+                    {
+                        return Err(phase_b_error("E_PHASE_B_LOCK_DUPLICATE", "normalized crates.io name collision"));
+                    }
+                    registry.insert(BootstrapRegistryPackage {
+                        name: package.name.clone(),
+                        version: package.version.clone(),
+                        source: source.clone(),
+                        checksum: checksum.clone(),
+                    });
+                }
+                _ => return Err(phase_b_error("E_PHASE_B_LOCK_SCHEMA", "source/checksum desync")),
+            }
+        }
+        if local != [("fastmcp-fnd01-bootstrap-control", "0.0.0")] {
+            return Err(phase_b_error(
+                "E_PHASE_B_LOCK_LOCAL_PACKAGE",
+                format!("unexpected source-less packages: {local:?}"),
+            ));
+        }
+        let root = packages
+            .iter()
+            .position(|package| package.source.is_none())
+            .ok_or_else(|| phase_b_error("E_PHASE_B_LOCK_LOCAL_PACKAGE", "missing bootstrap root"))?;
+        let mut reachable = BTreeSet::new();
+        let mut pending = vec![root];
+        while let Some(index) = pending.pop() {
+            if !reachable.insert(index) {
+                continue;
+            }
+            let mut semantic_targets = BTreeSet::new();
+            for dependency in &packages[index].dependencies {
+                let target = resolve_lock_dependency(
+                    dependency,
+                    &packages,
+                    &format!("bootstrap Cargo.lock package[{index}]"),
+                )?;
+                if !semantic_targets.insert(target) {
+                    return Err(phase_b_error("E_PHASE_B_LOCK_DEPENDENCY", "duplicate semantic edge"));
+                }
+                pending.push(target);
+            }
+        }
+        if reachable.len() != packages.len() || registry.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_LOCK_UNREACHABLE", "lock package outside bootstrap root closure"));
+        }
+        let packages = registry.into_iter().collect::<Vec<_>>();
+        let mut package_set = Vec::new();
+        package_set.extend_from_slice(LOCK_PACKAGE_SET_PREFIX);
+        package_set.extend_from_slice(&usize_u32(packages.len(), "bootstrap lock package set")?.to_be_bytes());
+        for package in &packages {
+            append_u32_bytes(&mut package_set, package.name.as_bytes(), "lock package name")?;
+            append_u32_bytes(&mut package_set, package.version.as_bytes(), "lock package version")?;
+            append_u32_bytes(&mut package_set, package.checksum.as_bytes(), "lock package checksum")?;
+        }
+        Ok(BootstrapLockUnion {
+            packages,
+            package_set_sha256: sha256(&package_set)?,
+        })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapMetadataDeclaration {
+        package_name: String,
+        dependency_name: String,
+        renamed: bool,
+        source: Option<String>,
+        requirement: String,
+        path: Option<String>,
+        kind: String,
+        target_condition: Option<String>,
+        optional: bool,
+        uses_default_features: bool,
+        features: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapMetadataPackage {
+        raw_package_id: String,
+        name: String,
+        version: String,
+        source: Option<String>,
+        manifest_path: String,
+        target_kinds: Vec<String>,
+        linkable_target_name: Option<String>,
+        declarations: Vec<BootstrapMetadataDeclaration>,
+        declared_features: BTreeSet<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct BootstrapMetadataKind {
+        kind: String,
+        target_condition: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapMetadataDependency {
+        name: String,
+        package_id: String,
+        kinds: Vec<BootstrapMetadataKind>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapMetadataNode {
+        package_id: String,
+        features: Vec<String>,
+        dependencies: Vec<BootstrapMetadataDependency>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct BootstrapGraphNode {
+        package_id: String,
+        name: String,
+        version: String,
+        source_kind: String,
+        source_locator: String,
+        features: Vec<String>,
+        target_kinds: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct BootstrapGraphEdge {
+        from_package_id: String,
+        to_package_id: String,
+        dependency_name: String,
+        dependency_kind: String,
+        target_condition: Option<String>,
+        version_requirement: String,
+        features: Vec<String>,
+        uses_default_features: bool,
+        optional: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BootstrapMetadataGraph {
+        nodes: Vec<BootstrapGraphNode>,
+        edges: Vec<BootstrapGraphEdge>,
+        graph_sha256: [u8; 32],
+    }
+
+    fn metadata_exact_fields(
+        object: &[(String, JsonValue)],
+        required: &[&str],
+        optional: &[&str],
+        subject: &str,
+    ) -> TrustResult<()> {
+        if !exact_json_fields(object, required, optional) {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: missing or unknown object field"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn metadata_array_field<'a>(
+        object: &'a [(String, JsonValue)],
+        name: &str,
+        subject: &str,
+    ) -> TrustResult<&'a [JsonValue]> {
+        json_array(JsonValue::field(object, name, subject)?, &format!("{subject}.{name}"))
+    }
+
+    fn metadata_bool_field(
+        object: &[(String, JsonValue)],
+        name: &str,
+        subject: &str,
+    ) -> TrustResult<bool> {
+        JsonValue::field(object, name, subject)?.boolean(&format!("{subject}.{name}"))
+    }
+
+    fn parse_metadata_target(
+        value: &JsonValue,
+        subject: &str,
+    ) -> TrustResult<(Vec<String>, String, bool)> {
+        let object = value.object(subject)?;
+        metadata_exact_fields(
+            object,
+            &["kind", "crate_types", "name", "src_path", "edition", "doc", "doctest", "test"],
+            &["required-features"],
+            subject,
+        )?;
+        let kinds = json_string_array(
+            JsonValue::field(object, "kind", subject)?,
+            false,
+            true,
+            false,
+            &format!("{subject}.kind"),
+        )?;
+        let crate_types = json_string_array(
+            JsonValue::field(object, "crate_types", subject)?,
+            false,
+            true,
+            false,
+            &format!("{subject}.crate_types"),
+        )?;
+        const LIBRARY_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+        const ALL_KINDS: &[&str] = &[
+            "lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin",
+            "example", "test", "bench", "custom-build",
+        ];
+        if kinds.iter().chain(&crate_types).any(|kind| !ALL_KINDS.contains(&kind.as_str())) {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: target kind")));
+        }
+        let relationship_valid = if kinds.iter().all(|kind| LIBRARY_KINDS.contains(&kind.as_str())) {
+            kinds == crate_types
+        } else {
+            match kinds.as_slice() {
+                [kind] if kind == "example" => {
+                    crate_types == ["bin"]
+                        || crate_types.iter().all(|kind| LIBRARY_KINDS.contains(&kind.as_str()))
+                }
+                [kind] if matches!(kind.as_str(), "bin" | "test" | "bench" | "custom-build") => {
+                    crate_types == ["bin"]
+                }
+                _ => false,
+            }
+        };
+        if !relationship_valid {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: target kind/crate-type relationship")));
+        }
+        let name = json_token(JsonValue::field(object, "name", subject)?, &format!("{subject}.name"))?;
+        let src_path = json_token(JsonValue::field(object, "src_path", subject)?, &format!("{subject}.src_path"))?;
+        validate_absolute_metadata_path(&src_path, subject)?;
+        let edition = JsonValue::field(object, "edition", subject)?.string(&format!("{subject}.edition"))?;
+        if !matches!(edition, "2015" | "2018" | "2021" | "2024") {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: edition")));
+        }
+        for field in ["doc", "doctest", "test"] {
+            let _ = metadata_bool_field(object, field, subject)?;
+        }
+        if let Some((_, required)) = object.iter().find(|(field, _)| field == "required-features") {
+            let _ = json_string_array(required, false, true, false, &format!("{subject}.required-features"))?;
+        }
+        let linkable = kinds.iter().any(|kind| LIBRARY_KINDS.contains(&kind.as_str()));
+        Ok((kinds, name, linkable))
+    }
+
+    fn parse_metadata_declaration(
+        value: &JsonValue,
+        subject: &str,
+    ) -> TrustResult<BootstrapMetadataDeclaration> {
+        let object = value.object(subject)?;
+        metadata_exact_fields(
+            object,
+            &[
+                "name", "source", "req", "kind", "rename", "optional",
+                "uses_default_features", "features", "target", "registry",
+            ],
+            &["artifact", "path", "public"],
+            subject,
+        )?;
+        let package_name = json_token(JsonValue::field(object, "name", subject)?, &format!("{subject}.name"))?;
+        validate_cargo_package_name(&package_name, false, subject)?;
+        let source = json_nullable_token(JsonValue::field(object, "source", subject)?, &format!("{subject}.source"))?;
+        if source.as_deref().is_some_and(|source| source != CRATES_IO) {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: dependency source")));
+        }
+        let requirement = json_token(JsonValue::field(object, "req", subject)?, &format!("{subject}.req"))?;
+        let _ = requirement
+            .split(", ")
+            .map(|value| parse_requirement_comparator(value, subject))
+            .collect::<TrustResult<Vec<_>>>()?;
+        let kind = match JsonValue::field(object, "kind", subject)? {
+            JsonValue::Null => "normal".to_owned(),
+            value => {
+                let kind = json_token(value, &format!("{subject}.kind"))?;
+                if !matches!(kind.as_str(), "dev" | "build") {
+                    return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: dependency kind")));
+                }
+                kind
+            }
+        };
+        let rename = json_nullable_token(JsonValue::field(object, "rename", subject)?, &format!("{subject}.rename"))?;
+        let target_condition = json_nullable_token(JsonValue::field(object, "target", subject)?, &format!("{subject}.target"))?;
+        if !matches!(JsonValue::field(object, "registry", subject)?, JsonValue::Null)
+            || object.iter().any(|(field, _)| matches!(field.as_str(), "artifact" | "public"))
+        {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: unstable dependency field")));
+        }
+        let path = object
+            .iter()
+            .find(|(field, _)| field == "path")
+            .map(|(_, value)| json_token(value, &format!("{subject}.path")))
+            .transpose()?;
+        if let Some(path) = path.as_deref() {
+            validate_absolute_metadata_path(path, subject)?;
+        }
+        if source.is_none() != path.is_some() {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: dependency source/path coupling")));
+        }
+        let features = json_string_array(
+            JsonValue::field(object, "features", subject)?,
+            true,
+            true,
+            false,
+            &format!("{subject}.features"),
+        )?;
+        let renamed = rename.is_some();
+        Ok(BootstrapMetadataDeclaration {
+            package_name: package_name.clone(),
+            dependency_name: rename.unwrap_or(package_name),
+            renamed,
+            source,
+            requirement,
+            path,
+            kind,
+            target_condition,
+            optional: metadata_bool_field(object, "optional", subject)?,
+            uses_default_features: metadata_bool_field(object, "uses_default_features", subject)?,
+            features,
+        })
+    }
+
+    fn expected_metadata_package_id(
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        manifest_path: &str,
+        subject: &str,
+    ) -> TrustResult<String> {
+        if source.is_some() {
+            return Ok(format!("{CRATES_IO}#{name}@{version}"));
+        }
+        let manifest = Path::new(manifest_path);
+        if manifest.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
+            return Err(phase_b_error("E_PHASE_B_METADATA_PATH", format!("{subject}: manifest filename")));
+        }
+        let root = manifest.parent().and_then(Path::to_str).ok_or_else(|| {
+            phase_b_error("E_PHASE_B_METADATA_PATH", format!("{subject}: manifest parent"))
+        })?;
+        if !root.bytes().all(|byte| {
+            byte == b'/' || byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        }) {
+            return Err(phase_b_error("E_PHASE_B_METADATA_PATH", format!("{subject}: file URL grammar")));
+        }
+        let directory_name = manifest
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| phase_b_error("E_PHASE_B_METADATA_PATH", subject))?;
+        let fragment = if directory_name == name {
+            version.to_owned()
+        } else {
+            format!("{name}@{version}")
+        };
+        Ok(format!("path+file://{root}#{fragment}"))
+    }
+
+    fn parse_metadata_package(
+        value: &JsonValue,
+        subject: &str,
+    ) -> TrustResult<BootstrapMetadataPackage> {
+        let object = value.object(subject)?;
+        metadata_exact_fields(
+            object,
+            &[
+                "name", "version", "id", "license", "license_file", "description", "source",
+                "dependencies", "targets", "features", "manifest_path", "metadata", "publish",
+                "authors", "categories", "keywords", "readme", "repository", "homepage",
+                "documentation", "edition", "links", "default_run", "rust_version",
+            ],
+            &["metabuild", "hints"],
+            subject,
+        )?;
+        let name = json_token(JsonValue::field(object, "name", subject)?, &format!("{subject}.name"))?;
+        let source = json_nullable_token(JsonValue::field(object, "source", subject)?, &format!("{subject}.source"))?;
+        if source.as_deref().is_some_and(|source| source != CRATES_IO) {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: package source")));
+        }
+        validate_cargo_package_name(&name, source.is_some(), subject)?;
+        let version = json_token(JsonValue::field(object, "version", subject)?, &format!("{subject}.version"))?;
+        parse_strict_semver(&version, subject)?;
+        let raw_package_id = json_token(JsonValue::field(object, "id", subject)?, &format!("{subject}.id"))?;
+        for field in [
+            "license", "license_file", "readme", "description", "repository", "homepage",
+            "documentation", "links", "default_run", "rust_version",
+        ] {
+            let value = JsonValue::field(object, field, subject)?;
+            if matches!(field, "license" | "license_file" | "readme") {
+                let token = json_nullable_token(value, &format!("{subject}.{field}"))?;
+                if matches!(field, "license_file" | "readme") {
+                    if let Some(path) = token.as_deref() {
+                        validate_absolute_metadata_path(path, subject)?;
+                    }
+                }
+            } else {
+                let _ = json_nullable_text(value, &format!("{subject}.{field}"))?;
+            }
+        }
+        let declaration_values = metadata_array_field(object, "dependencies", subject)?;
+        let mut declarations = Vec::new();
+        declarations.try_reserve_exact(declaration_values.len())
+            .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+        for (ordinal, declaration) in declaration_values.iter().enumerate() {
+            declarations.push(parse_metadata_declaration(
+                declaration,
+                &format!("{subject}.dependencies[{ordinal}]"),
+            )?);
+        }
+        let target_values = metadata_array_field(object, "targets", subject)?;
+        if target_values.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: empty targets")));
+        }
+        let mut target_kinds = BTreeSet::new();
+        let mut linkable_names = BTreeSet::new();
+        for (ordinal, target) in target_values.iter().enumerate() {
+            let (kinds, target_name, linkable) =
+                parse_metadata_target(target, &format!("{subject}.targets[{ordinal}]"))?;
+            target_kinds.extend(kinds);
+            if linkable {
+                linkable_names.insert(target_name);
+            }
+        }
+        if linkable_names.len() > 1 {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: ambiguous linkable target")));
+        }
+        let features = JsonValue::field(object, "features", subject)?.object(&format!("{subject}.features"))?;
+        let mut declared_features = BTreeSet::new();
+        for (feature, values) in features {
+            if feature.is_empty() || feature.contains('\0') || feature.chars().any(char::is_control) {
+                return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: feature name")));
+            }
+            if !declared_features.insert(feature.clone()) {
+                return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: duplicate feature")));
+            }
+            let mut feature_values = json_string_array(
+                values,
+                true,
+                true,
+                false,
+                &format!("{subject}.features.{feature}"),
+            )?;
+            feature_values.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        }
+        let manifest_path = json_token(JsonValue::field(object, "manifest_path", subject)?, &format!("{subject}.manifest_path"))?;
+        validate_absolute_metadata_path(&manifest_path, subject)?;
+        if raw_package_id != expected_metadata_package_id(&name, &version, source.as_deref(), &manifest_path, subject)? {
+            return Err(phase_b_error("E_PHASE_B_METADATA_ID", format!("{subject}: package id")));
+        }
+        match JsonValue::field(object, "metadata", subject)? {
+            JsonValue::Null | JsonValue::Object(_) => {}
+            _ => return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: metadata"))),
+        }
+        match JsonValue::field(object, "publish", subject)? {
+            JsonValue::Null => {}
+            value => {
+                let _ = json_string_array(value, true, true, false, &format!("{subject}.publish"))?;
+            }
+        }
+        for field in ["authors", "categories", "keywords"] {
+            let _ = json_string_array(
+                JsonValue::field(object, field, subject)?,
+                true,
+                false,
+                false,
+                &format!("{subject}.{field}"),
+            )?;
+        }
+        if !matches!(JsonValue::field(object, "edition", subject)?.string(&format!("{subject}.edition"))?, "2015" | "2018" | "2021" | "2024") {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: edition")));
+        }
+        if let Some((_, metabuild)) = object.iter().find(|(field, _)| field == "metabuild") {
+            let _ = json_string_array(metabuild, true, true, false, &format!("{subject}.metabuild"))?;
+        }
+        if let Some((_, hints)) = object.iter().find(|(field, _)| field == "hints") {
+            let hints = hints.object(&format!("{subject}.hints"))?;
+            metadata_exact_fields(hints, &["mostly-unused"], &[], &format!("{subject}.hints"))?;
+        }
+        Ok(BootstrapMetadataPackage {
+            raw_package_id,
+            name,
+            version,
+            source,
+            manifest_path,
+            target_kinds: target_kinds.into_iter().collect(),
+            linkable_target_name: linkable_names.into_iter().next(),
+            declarations,
+            declared_features,
+        })
+    }
+
+    fn parse_metadata_kind(value: &JsonValue, subject: &str) -> TrustResult<BootstrapMetadataKind> {
+        let object = value.object(subject)?;
+        metadata_exact_fields(object, &["kind", "target"], &[], subject)?;
+        let kind = match JsonValue::field(object, "kind", subject)? {
+            JsonValue::Null => "normal".to_owned(),
+            value => {
+                let kind = json_token(value, &format!("{subject}.kind"))?;
+                if !matches!(kind.as_str(), "dev" | "build") {
+                    return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{subject}: dep kind")));
+                }
+                kind
+            }
+        };
+        Ok(BootstrapMetadataKind {
+            kind,
+            target_condition: json_nullable_token(
+                JsonValue::field(object, "target", subject)?,
+                &format!("{subject}.target"),
+            )?,
+        })
+    }
+
+    fn parse_metadata_node(value: &JsonValue, subject: &str) -> TrustResult<BootstrapMetadataNode> {
+        let object = value.object(subject)?;
+        metadata_exact_fields(object, &["id", "dependencies", "deps", "features"], &[], subject)?;
+        let package_id = json_token(JsonValue::field(object, "id", subject)?, &format!("{subject}.id"))?;
+        let dependency_ids = json_string_array(
+            JsonValue::field(object, "dependencies", subject)?,
+            true,
+            true,
+            false,
+            &format!("{subject}.dependencies"),
+        )?;
+        let dep_values = metadata_array_field(object, "deps", subject)?;
+        let mut dependencies = Vec::new();
+        dependencies.try_reserve_exact(dep_values.len())
+            .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+        for (ordinal, value) in dep_values.iter().enumerate() {
+            let dep_subject = format!("{subject}.deps[{ordinal}]");
+            let object = value.object(&dep_subject)?;
+            metadata_exact_fields(object, &["name", "pkg", "dep_kinds"], &[], &dep_subject)?;
+            let name = json_token(JsonValue::field(object, "name", &dep_subject)?, &format!("{dep_subject}.name"))?;
+            let dependency_id = json_token(JsonValue::field(object, "pkg", &dep_subject)?, &format!("{dep_subject}.pkg"))?;
+            let kind_values = metadata_array_field(object, "dep_kinds", &dep_subject)?;
+            if kind_values.is_empty() {
+                return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", format!("{dep_subject}: empty dep_kinds")));
+            }
+            let mut kinds = Vec::new();
+            kinds.try_reserve_exact(kind_values.len())
+                .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", &dep_subject))?;
+            for (kind_ordinal, kind) in kind_values.iter().enumerate() {
+                kinds.push(parse_metadata_kind(kind, &format!("{dep_subject}.dep_kinds[{kind_ordinal}]"))?);
+            }
+            dependencies.push(BootstrapMetadataDependency {
+                name,
+                package_id: dependency_id,
+                kinds,
+            });
+        }
+        if dependencies
+            .iter()
+            .map(|dependency| dependency.package_id.as_str())
+            .ne(dependency_ids.iter().map(String::as_str))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: dependencies/deps sequence mismatch"),
+            ));
+        }
+        Ok(BootstrapMetadataNode {
+            package_id,
+            features: json_string_array(
+                JsonValue::field(object, "features", subject)?,
+                true,
+                true,
+                true,
+                &format!("{subject}.features"),
+            )?,
+            dependencies,
+        })
+    }
+
+    fn matching_metadata_declaration<'a>(
+        source: &'a BootstrapMetadataPackage,
+        target: &BootstrapMetadataPackage,
+        dependency: &BootstrapMetadataDependency,
+        kind: &BootstrapMetadataKind,
+        subject: &str,
+    ) -> TrustResult<&'a BootstrapMetadataDeclaration> {
+        let target_root = Path::new(&target.manifest_path)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_METADATA_PATH", subject))?;
+        let linkable_name = target.linkable_target_name.as_deref().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_METADATA_EDGE",
+                format!("{subject}: target has no unique linkable library target"),
+            )
+        })?;
+        let matching = source
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                let expected_dependency_name = if declaration.renamed {
+                    declaration.dependency_name.replace('-', "_")
+                } else {
+                    linkable_name.to_owned()
+                };
+                declaration.package_name == target.name
+                    && expected_dependency_name == dependency.name
+                    && declaration.kind == kind.kind
+                    && declaration.target_condition == kind.target_condition
+                    && declaration.source.as_deref() == target.source.as_deref()
+                    && match target.source.as_deref() {
+                        Some(_) => declaration.path.is_none(),
+                        None => declaration.path.as_deref() == Some(target_root),
+                    }
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_EDGE",
+                format!("{subject}: edge must resolve to one declaration"),
+            ));
+        }
+        let declaration = matching[0];
+        version_requirement_matches(&declaration.requirement, &target.version, subject)?;
+        Ok(declaration)
+    }
+
+    fn validate_bootstrap_direct_declarations(
+        root: &BootstrapMetadataPackage,
+        packages: &BTreeMap<String, BootstrapMetadataPackage>,
+    ) -> TrustResult<()> {
+        if root.declarations.len() != DIRECT.len() {
+            return Err(phase_b_error(
+                "E_PHASE_B_DIRECT_METADATA",
+                format!("root has {} declarations, expected {}", root.declarations.len(), DIRECT.len()),
+            ));
+        }
+        let mut consumed = BTreeSet::new();
+        for row in DIRECT {
+            let expected_dependency_name = if row.verifier { row.package } else { row.alias };
+            let matching = root
+                .declarations
+                .iter()
+                .enumerate()
+                .filter(|(_, declaration)| {
+                    declaration.package_name == row.package
+                        && declaration.dependency_name == expected_dependency_name
+                        && declaration.renamed == !row.verifier
+                        && declaration.source.as_deref() == Some(CRATES_IO)
+                        && declaration.path.is_none()
+                        && declaration.kind == "normal"
+                        && declaration.target_condition.is_none()
+                        && declaration.optional == !row.verifier
+                        && declaration.uses_default_features == row.default_features
+                        && declaration.features.iter().map(String::as_str).eq(row.features.iter().copied())
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 || !consumed.insert(matching[0].0) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_DIRECT_METADATA",
+                    format!("{} {} direct declaration mismatch", row.package, row.version),
+                ));
+            }
+            let declaration = matching[0].1;
+            let resolved = packages.values().filter(|package| {
+                package.source.as_deref() == Some(CRATES_IO)
+                    && package.name == row.package
+                    && semver_without_build(&package.version, "direct resolved version")
+                        .is_ok_and(|version| version == row.version)
+            }).collect::<Vec<_>>();
+            if resolved.len() != 1 {
+                return Err(phase_b_error(
+                    "E_PHASE_B_DIRECT_METADATA",
+                    format!("{} {} direct resolution mismatch", row.package, row.version),
+                ));
+            }
+            version_requirement_matches(&declaration.requirement, &resolved[0].version, "bootstrap direct declaration")?;
+        }
+        if consumed.len() != DIRECT.len() {
+            return Err(phase_b_error("E_PHASE_B_DIRECT_METADATA", "unmatched root declaration"));
+        }
+        Ok(())
+    }
+
+    fn encode_bootstrap_graph_node(node: &BootstrapGraphNode) -> TrustResult<Vec<u8>> {
+        let mut encoded = Vec::new();
+        append_record_header(&mut encoded, "target-graph-node")?;
+        append_string(&mut encoded, &node.package_id)?;
+        append_string(&mut encoded, &node.name)?;
+        append_string(&mut encoded, &node.version)?;
+        append_string(&mut encoded, &node.source_kind)?;
+        append_string(&mut encoded, &node.source_locator)?;
+        append_string_array(&mut encoded, &node.features)?;
+        append_string_array(&mut encoded, &node.target_kinds)?;
+        Ok(encoded)
+    }
+
+    fn encode_bootstrap_graph_edge(edge: &BootstrapGraphEdge) -> TrustResult<Vec<u8>> {
+        let mut encoded = Vec::new();
+        append_record_header(&mut encoded, "target-graph-edge")?;
+        append_string(&mut encoded, &edge.from_package_id)?;
+        append_string(&mut encoded, &edge.to_package_id)?;
+        append_string(&mut encoded, &edge.dependency_name)?;
+        append_string(&mut encoded, &edge.dependency_kind)?;
+        append_string_array(
+            &mut encoded,
+            &edge.target_condition.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        append_string(&mut encoded, &edge.version_requirement)?;
+        append_string_array(&mut encoded, &edge.features)?;
+        append_boolean(&mut encoded, edge.uses_default_features);
+        append_boolean(&mut encoded, edge.optional);
+        Ok(encoded)
+    }
+
+    fn bootstrap_metadata_graph_digest(
+        nodes: &[BootstrapGraphNode],
+        edges: &[BootstrapGraphEdge],
+    ) -> TrustResult<[u8; 32]> {
+        let node_records = nodes
+            .iter()
+            .map(encode_bootstrap_graph_node)
+            .collect::<TrustResult<Vec<_>>>()?;
+        let edge_records = edges
+            .iter()
+            .map(encode_bootstrap_graph_edge)
+            .collect::<TrustResult<Vec<_>>>()?;
+        let node_set = record_set_sha256_preimage(&node_records)?;
+        let edge_set = record_set_sha256_preimage(&edge_records)?;
+        let mut graph = Vec::new();
+        graph.extend_from_slice(METADATA_GRAPH_PREFIX);
+        append_u32_bytes(&mut graph, &node_set, "metadata node set")?;
+        append_u32_bytes(&mut graph, &edge_set, "metadata edge set")?;
+        sha256(&graph)
+    }
+
+    fn parse_bootstrap_metadata_graph(
+        stdout: &[u8],
+        expected_workspace_root: &Path,
+    ) -> TrustResult<BootstrapMetadataGraph> {
+        if stdout.is_empty()
+            || stdout.len() > RESOLVE_STDOUT_LIMIT
+            || !stdout.ends_with(b"\n")
+            || stdout.starts_with(&[0xef, 0xbb, 0xbf])
+            || stdout.contains(&0)
+            || stdout.contains(&b'\r')
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_FRAMING",
+                "bounded one-line LF-terminated Cargo metadata required",
+            ));
+        }
+        let payload = &stdout[..stdout.len() - 1];
+        if payload.len() < 2
+            || payload.first() != Some(&b'{')
+            || payload.last() != Some(&b'}')
+            || payload.contains(&b'\n')
+        {
+            return Err(phase_b_error("E_PHASE_B_METADATA_FRAMING", "one JSON object required"));
+        }
+        let value = parse_json(payload, "bootstrap Cargo metadata")?;
+        let object = value.object("bootstrap Cargo metadata")?;
+        metadata_exact_fields(
+            object,
+            &[
+                "packages", "workspace_members", "workspace_default_members", "resolve",
+                "target_directory", "build_directory", "version", "workspace_root", "metadata",
+            ],
+            &[],
+            "bootstrap Cargo metadata",
+        )?;
+        if JsonValue::field(object, "version", "bootstrap Cargo metadata")?
+            .number("bootstrap Cargo metadata.version")?
+            != "1"
+        {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", "metadata version must be integer 1"));
+        }
+        let target_directory = json_token(
+            JsonValue::field(object, "target_directory", "bootstrap Cargo metadata")?,
+            "bootstrap Cargo metadata.target_directory",
+        )?;
+        let build_directory = json_token(
+            JsonValue::field(object, "build_directory", "bootstrap Cargo metadata")?,
+            "bootstrap Cargo metadata.build_directory",
+        )?;
+        let workspace_root = json_token(
+            JsonValue::field(object, "workspace_root", "bootstrap Cargo metadata")?,
+            "bootstrap Cargo metadata.workspace_root",
+        )?;
+        for path in [&target_directory, &build_directory, &workspace_root] {
+            validate_absolute_metadata_path(path, "bootstrap Cargo metadata path")?;
+        }
+        if target_directory != build_directory
+            || Path::new(&workspace_root) != expected_workspace_root
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_PATH",
+                "metadata target/build/workspace directory mismatch",
+            ));
+        }
+        match JsonValue::field(object, "metadata", "bootstrap Cargo metadata")? {
+            JsonValue::Null | JsonValue::Object(_) => {}
+            _ => return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", "workspace metadata object/null")),
+        }
+        let package_values = metadata_array_field(object, "packages", "bootstrap Cargo metadata")?;
+        if package_values.is_empty() || package_values.len() > MAX_JSON_NODES {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", "bounded nonempty packages"));
+        }
+        let mut packages = BTreeMap::new();
+        for (ordinal, package) in package_values.iter().enumerate() {
+            let package = parse_metadata_package(package, &format!("bootstrap metadata package[{ordinal}]"))?;
+            if packages.insert(package.raw_package_id.clone(), package).is_some() {
+                return Err(phase_b_error("E_PHASE_B_METADATA_ID", "duplicate package id"));
+            }
+        }
+        let resolve = JsonValue::field(object, "resolve", "bootstrap Cargo metadata")?
+            .object("bootstrap Cargo metadata.resolve")?;
+        metadata_exact_fields(resolve, &["nodes", "root"], &[], "bootstrap Cargo metadata.resolve")?;
+        let node_values = metadata_array_field(resolve, "nodes", "bootstrap Cargo metadata.resolve")?;
+        if node_values.is_empty() || node_values.len() > MAX_JSON_NODES {
+            return Err(phase_b_error("E_PHASE_B_METADATA_SCHEMA", "bounded nonempty resolve nodes"));
+        }
+        let mut metadata_nodes = BTreeMap::new();
+        for (ordinal, node) in node_values.iter().enumerate() {
+            let node = parse_metadata_node(node, &format!("bootstrap metadata node[{ordinal}]"))?;
+            if metadata_nodes.insert(node.package_id.clone(), node).is_some() {
+                return Err(phase_b_error("E_PHASE_B_METADATA_ID", "duplicate resolve node id"));
+            }
+        }
+        if packages.keys().ne(metadata_nodes.keys()) {
+            return Err(phase_b_error("E_PHASE_B_METADATA_ID", "packages/resolve.nodes bijection"));
+        }
+        let workspace_members = json_string_array(
+            JsonValue::field(object, "workspace_members", "bootstrap Cargo metadata")?,
+            false,
+            true,
+            false,
+            "bootstrap Cargo metadata.workspace_members",
+        )?;
+        let workspace_default_members = json_string_array(
+            JsonValue::field(object, "workspace_default_members", "bootstrap Cargo metadata")?,
+            false,
+            true,
+            false,
+            "bootstrap Cargo metadata.workspace_default_members",
+        )?;
+        let root_id = json_token(
+            JsonValue::field(resolve, "root", "bootstrap Cargo metadata.resolve")?,
+            "bootstrap Cargo metadata.resolve.root",
+        )?;
+        if workspace_members != [root_id.clone()]
+            || workspace_default_members != [root_id.clone()]
+        {
+            return Err(phase_b_error("E_PHASE_B_METADATA_ROOT", "one exact bootstrap workspace root required"));
+        }
+        let root_package = packages.get(&root_id).ok_or_else(|| {
+            phase_b_error("E_PHASE_B_METADATA_ROOT", "resolve root absent from packages")
+        })?;
+        if root_package.name != "fastmcp-fnd01-bootstrap-control"
+            || root_package.version != "0.0.0"
+            || root_package.source.is_some()
+            || Path::new(&root_package.manifest_path) != expected_workspace_root.join("Cargo.toml")
+            || packages.values().filter(|package| package.source.is_none()).count() != 1
+        {
+            return Err(phase_b_error("E_PHASE_B_METADATA_ROOT", "bootstrap root identity mismatch"));
+        }
+        validate_bootstrap_direct_declarations(root_package, &packages)?;
+        let mut canonical_ids = BTreeMap::new();
+        let mut nodes = BTreeSet::new();
+        for (raw_id, package) in &packages {
+            let metadata_node = metadata_nodes.get(raw_id).ok_or_else(|| {
+                phase_b_error("E_PHASE_B_METADATA_ID", "missing canonical node")
+            })?;
+            if metadata_node.features.iter().any(|feature| !package.declared_features.contains(feature)) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_METADATA_FEATURE",
+                    format!("{}: undeclared resolved feature", package.name),
+                ));
+            }
+            let (canonical_id, source_kind, source_locator) = if let Some(source) = package.source.as_deref() {
+                (raw_id.clone(), "registry".to_owned(), source.to_owned())
+            } else {
+                (
+                    format!("path+fnd01-workspace://root#{}@{}", package.name, package.version),
+                    "root".to_owned(),
+                    "workspace:root".to_owned(),
+                )
+            };
+            if canonical_ids.insert(raw_id.clone(), canonical_id.clone()).is_some()
+                || !nodes.insert(BootstrapGraphNode {
+                    package_id: canonical_id,
+                    name: package.name.clone(),
+                    version: package.version.clone(),
+                    source_kind,
+                    source_locator,
+                    features: metadata_node.features.clone(),
+                    target_kinds: package.target_kinds.clone(),
+                })
+            {
+                return Err(phase_b_error("E_PHASE_B_METADATA_ID", "canonical package id collision"));
+            }
+        }
+        let mut edges = BTreeSet::new();
+        for (source_id, metadata_node) in &metadata_nodes {
+            let source = packages.get(source_id).ok_or_else(|| {
+                phase_b_error("E_PHASE_B_METADATA_EDGE", "source package missing")
+            })?;
+            let from_id = canonical_ids.get(source_id).ok_or_else(|| {
+                phase_b_error("E_PHASE_B_METADATA_EDGE", "source canonical id missing")
+            })?;
+            for dependency in &metadata_node.dependencies {
+                let target = packages.get(&dependency.package_id).ok_or_else(|| {
+                    phase_b_error("E_PHASE_B_METADATA_EDGE", "target package missing")
+                })?;
+                let to_id = canonical_ids.get(&dependency.package_id).ok_or_else(|| {
+                    phase_b_error("E_PHASE_B_METADATA_EDGE", "target canonical id missing")
+                })?;
+                for kind in &dependency.kinds {
+                    let declaration = matching_metadata_declaration(
+                        source,
+                        target,
+                        dependency,
+                        kind,
+                        "bootstrap metadata edge",
+                    )?;
+                    let mut features = declaration.features.clone();
+                    features.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                    edges.insert(BootstrapGraphEdge {
+                        from_package_id: from_id.clone(),
+                        to_package_id: to_id.clone(),
+                        dependency_name: dependency.name.clone(),
+                        dependency_kind: kind.kind.clone(),
+                        target_condition: kind.target_condition.clone(),
+                        version_requirement: declaration.requirement.clone(),
+                        features,
+                        uses_default_features: declaration.uses_default_features,
+                        optional: declaration.optional,
+                    });
+                }
+            }
+        }
+        let mut reachable = BTreeSet::new();
+        let mut pending = vec![root_id];
+        while let Some(package_id) = pending.pop() {
+            if !reachable.insert(package_id.clone()) {
+                continue;
+            }
+            let node = metadata_nodes.get(&package_id).ok_or_else(|| {
+                phase_b_error("E_PHASE_B_METADATA_EDGE", "reachability node missing")
+            })?;
+            pending.extend(node.dependencies.iter().map(|dependency| dependency.package_id.clone()));
+        }
+        if reachable.len() != metadata_nodes.len() {
+            return Err(phase_b_error("E_PHASE_B_METADATA_EDGE", "unreachable metadata node"));
+        }
+        let nodes = nodes.into_iter().collect::<Vec<_>>();
+        let edges = edges.into_iter().collect::<Vec<_>>();
+        let graph_sha256 = bootstrap_metadata_graph_digest(&nodes, &edges)?;
+        Ok(BootstrapMetadataGraph {
+            nodes,
+            edges,
+            graph_sha256,
+        })
+    }
+
+    fn validate_metadata_lock_union(
+        graph: &BootstrapMetadataGraph,
+        lock: &BootstrapLockUnion,
+    ) -> TrustResult<()> {
+        let metadata_rows = graph
+            .nodes
+            .iter()
+            .filter(|node| node.source_kind == "registry")
+            .map(|node| (node.name.as_str(), node.version.as_str(), node.source_locator.as_str()))
+            .collect::<BTreeSet<_>>();
+        let lock_rows = lock
+            .packages
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str(), package.source.as_str()))
+            .collect::<BTreeSet<_>>();
+        if metadata_rows != lock_rows {
+            return Err(phase_b_error(
+                "E_PHASE_B_RESOLVE_JOIN",
+                "Cargo metadata registry closure differs from Cargo.lock union",
             ));
         }
         Ok(())
@@ -16163,14 +17816,256 @@ mod phase_b_std {
         })
     }
 
-    fn record_set_sha256(records: &[Vec<u8>]) -> TrustResult<[u8; 32]> {
+    fn record_set_sha256_preimage(records: &[Vec<u8>]) -> TrustResult<Vec<u8>> {
         let mut preimage = Vec::new();
         preimage.extend_from_slice(b"FND01RECv2\0");
         preimage.extend_from_slice(&usize_u32(records.len(), "record set")?.to_be_bytes());
         for record in records {
             append_u32_bytes(&mut preimage, record, "record set row")?;
         }
-        sha256(&preimage)
+        Ok(preimage)
+    }
+
+    fn record_set_sha256(records: &[Vec<u8>]) -> TrustResult<[u8; 32]> {
+        sha256(&record_set_sha256_preimage(records)?)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TypedAcquisitionResult {
+        kind: &'static str,
+        sha256: [u8; 32],
+    }
+
+    fn resolve_typed_preimage(
+        manifest: &[u8],
+        metadata_stdout: &[u8],
+        graph_sha256: [u8; 32],
+        bootstrap_lock: &[u8],
+        lock_union: &BootstrapLockUnion,
+    ) -> TrustResult<Vec<u8>> {
+        if manifest.is_empty() || metadata_stdout.is_empty() || bootstrap_lock.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_RESOLVE_TYPED", "nonempty resolve inputs required"));
+        }
+        let direct = direct_registry(DIRECT_PREFIX, false)?;
+        let union = direct_registry(UNION_PREFIX, true)?;
+        let direct_sha256 = sha256(&direct)?;
+        let union_sha256 = sha256(&union)?;
+        if encode_lower_hex(&direct_sha256) != DIRECT_SHA256
+            || encode_lower_hex(&union_sha256) != UNION_SHA256
+        {
+            return Err(phase_b_error("E_PHASE_B_RESOLVE_TYPED", "compiled direct registry digest drift"));
+        }
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(RESOLVE_TYPED_PREFIX);
+        preimage.extend_from_slice(&usize_u64(manifest.len(), "bootstrap manifest")?.to_be_bytes());
+        preimage.extend_from_slice(&sha256(manifest)?);
+        preimage.extend_from_slice(&sha256(metadata_stdout)?);
+        preimage.extend_from_slice(&graph_sha256);
+        preimage.extend_from_slice(&usize_u64(bootstrap_lock.len(), "bootstrap lock")?.to_be_bytes());
+        preimage.extend_from_slice(&sha256(bootstrap_lock)?);
+        preimage.extend_from_slice(&usize_u32(lock_union.packages.len(), "normalized lock packages")?.to_be_bytes());
+        for package in &lock_union.packages {
+            append_u32_bytes(&mut preimage, package.name.as_bytes(), "normalized package name")?;
+            append_u32_bytes(&mut preimage, package.version.as_bytes(), "normalized package version")?;
+            append_u32_bytes(&mut preimage, package.source.as_bytes(), "normalized package source")?;
+            append_u32_bytes(&mut preimage, package.checksum.as_bytes(), "normalized package checksum")?;
+        }
+        preimage.extend_from_slice(&lock_union.package_set_sha256);
+        preimage.extend_from_slice(&direct_sha256);
+        preimage.extend_from_slice(&union_sha256);
+        Ok(preimage)
+    }
+
+    fn resolve_typed_result(
+        manifest: &[u8],
+        metadata_stdout: &[u8],
+        bootstrap_lock: &[u8],
+        expected_workspace_root: &Path,
+    ) -> TrustResult<TypedAcquisitionResult> {
+        let graph = parse_bootstrap_metadata_graph(metadata_stdout, expected_workspace_root)?;
+        let lock_union = bootstrap_lock_union(bootstrap_lock)?;
+        validate_metadata_lock_union(&graph, &lock_union)?;
+        let preimage = resolve_typed_preimage(
+            manifest,
+            metadata_stdout,
+            graph.graph_sha256,
+            bootstrap_lock,
+            &lock_union,
+        )?;
+        Ok(TypedAcquisitionResult {
+            kind: RESOLVE_TYPED_RESULT_KIND,
+            sha256: sha256(&preimage)?,
+        })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct SelectedAcquisitionFile {
+        relative_path: String,
+        binding: FileBinding,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct SelectedAcquisitionArchive {
+        relative_path: String,
+        binding: FileBinding,
+        checksum: String,
+    }
+
+    fn recompute_supply_inner_entry_set(entries: &[SupplyEntry]) -> TrustResult<[u8; 32]> {
+        if entries.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "supply entry set is empty"));
+        }
+        let mut inner = Vec::new();
+        inner.extend_from_slice(SUPPLY_ENTRY_PREFIX);
+        inner.extend_from_slice(&usize_u32(entries.len(), "supply entries")?.to_be_bytes());
+        for entry in entries {
+            inner.push(entry.kind);
+            append_u32_bytes(&mut inner, entry.relative_path.as_bytes(), "supply path")?;
+            inner.extend_from_slice(&entry.binding.byte_length.to_be_bytes());
+            inner.extend_from_slice(&entry.binding.sha256);
+            inner.extend_from_slice(&entry.payload);
+        }
+        sha256(&inner)
+    }
+
+    fn fetch_typed_preimage(
+        bootstrap_lock: &[u8],
+        acquisition_tree: &TreeBinding,
+        sparse_cache_files: &[SelectedAcquisitionFile],
+        archives: &[SelectedAcquisitionArchive],
+        supply_bundle: &[u8],
+        inner_entry_set_sha256: [u8; 32],
+        closure_bijection_sha256: [u8; 32],
+    ) -> TrustResult<Vec<u8>> {
+        if bootstrap_lock.is_empty()
+            || sparse_cache_files.is_empty()
+            || archives.is_empty()
+            || supply_bundle.is_empty()
+            || sparse_cache_files.windows(2).any(|pair| pair[0] >= pair[1])
+            || archives.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_FETCH_TYPED",
+                "nonempty raw-sorted unique fetch inputs required",
+            ));
+        }
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(FETCH_TYPED_PREFIX);
+        preimage.extend_from_slice(&usize_u64(bootstrap_lock.len(), "bootstrap lock")?.to_be_bytes());
+        preimage.extend_from_slice(&sha256(bootstrap_lock)?);
+        acquisition_tree.encode_directory_record(&mut preimage)?;
+        preimage.extend_from_slice(&usize_u32(sparse_cache_files.len(), "selected sparse-cache files")?.to_be_bytes());
+        for file in sparse_cache_files {
+            append_u32_bytes(&mut preimage, file.relative_path.as_bytes(), "sparse-cache path")?;
+            preimage.extend_from_slice(&file.binding.byte_length.to_be_bytes());
+            preimage.extend_from_slice(&file.binding.sha256);
+        }
+        preimage.extend_from_slice(&usize_u32(archives.len(), "selected archives")?.to_be_bytes());
+        for archive in archives {
+            append_u32_bytes(&mut preimage, archive.relative_path.as_bytes(), "archive path")?;
+            preimage.extend_from_slice(&archive.binding.byte_length.to_be_bytes());
+            preimage.extend_from_slice(&archive.binding.sha256);
+            append_u32_bytes(&mut preimage, archive.checksum.as_bytes(), "archive checksum")?;
+        }
+        preimage.extend_from_slice(&usize_u64(supply_bundle.len(), "supply bundle")?.to_be_bytes());
+        preimage.extend_from_slice(&sha256(supply_bundle)?);
+        preimage.extend_from_slice(&inner_entry_set_sha256);
+        preimage.extend_from_slice(&closure_bijection_sha256);
+        Ok(preimage)
+    }
+
+    fn fetch_typed_result(
+        acquisition_root: &Path,
+        bootstrap_lock: &[u8],
+        supply_bundle: &[u8],
+        supply: &SupplyBundle,
+    ) -> TrustResult<TypedAcquisitionResult> {
+        if supply.bootstrap_lock != bootstrap_lock
+            || supply.bootstrap_lock_binding != binding_for_bytes(bootstrap_lock)?
+        {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "supply/lock binding mismatch"));
+        }
+        let reparsed = parse_supply_bundle(supply_bundle)?;
+        if &reparsed != supply {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "supply parsed-byte identity mismatch"));
+        }
+        let before = snapshot_tree(acquisition_root, "acquisition-cargo-home")?;
+        let acquisition_files = collect_acquisition_files(acquisition_root)?;
+        let lock_union = bootstrap_lock_union(bootstrap_lock)?;
+        let mut sparse_cache_files = BTreeSet::new();
+        let mut archives = BTreeSet::new();
+        for entry in &supply.entries {
+            match entry.kind {
+                0x03 => {
+                    let relative_path = entry.relative_path
+                        .strip_prefix("sparse-cache/")
+                        .ok_or_else(|| phase_b_error("E_PHASE_B_FETCH_TYPED", "sparse-cache supply prefix"))?;
+                    let matching = acquisition_files.iter().filter(|(path, bytes, binding)| {
+                        path == relative_path && bytes == &entry.payload && binding == &entry.binding
+                    }).count();
+                    if matching != 1
+                        || !sparse_cache_files.insert(SelectedAcquisitionFile {
+                            relative_path: relative_path.to_owned(),
+                            binding: entry.binding,
+                        })
+                    {
+                        return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "sparse-cache acquisition bijection"));
+                    }
+                }
+                0x01 => {
+                    let package = lock_union.packages.iter().find(|package| {
+                        format!("{}-{}.crate", package.name, package.version) == entry.relative_path
+                    }).ok_or_else(|| phase_b_error("E_PHASE_B_FETCH_TYPED", "archive absent from lock union"))?;
+                    if encode_lower_hex(&entry.binding.sha256) != package.checksum {
+                        return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "archive checksum differs from lock"));
+                    }
+                    let matching = acquisition_files.iter().filter(|(path, bytes, binding)| {
+                        Path::new(path).file_name().and_then(|name| name.to_str())
+                            == Some(entry.relative_path.as_str())
+                            && bytes == &entry.payload
+                            && binding == &entry.binding
+                    }).collect::<Vec<_>>();
+                    if matching.len() != 1
+                        || !archives.insert(SelectedAcquisitionArchive {
+                            relative_path: matching[0].0.clone(),
+                            binding: entry.binding,
+                            checksum: package.checksum.clone(),
+                        })
+                    {
+                        return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "archive acquisition bijection"));
+                    }
+                }
+                0x02 => {}
+                _ => return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "unknown supply entry kind")),
+            }
+        }
+        if archives.len() != lock_union.packages.len() {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "archive/lock union cardinality"));
+        }
+        let after = snapshot_tree(acquisition_root, "acquisition-cargo-home")?;
+        if before != after {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "acquisition tree drift during typed result"));
+        }
+        let inner = recompute_supply_inner_entry_set(&supply.entries)?;
+        let closure = recompute_supply_closure_bijection(&supply.bootstrap_lock, &supply.entries)?;
+        if inner != supply.inner_entry_set_sha256 || closure != supply.closure_bijection_sha256 {
+            return Err(phase_b_error("E_PHASE_B_FETCH_TYPED", "supply inner/closure recompute mismatch"));
+        }
+        let sparse_cache_files = sparse_cache_files.into_iter().collect::<Vec<_>>();
+        let archives = archives.into_iter().collect::<Vec<_>>();
+        let preimage = fetch_typed_preimage(
+            bootstrap_lock,
+            &before,
+            &sparse_cache_files,
+            &archives,
+            supply_bundle,
+            inner,
+            closure,
+        )?;
+        Ok(TypedAcquisitionResult {
+            kind: FETCH_TYPED_RESULT_KIND,
+            sha256: sha256(&preimage)?,
+        })
     }
 
     #[derive(Debug, Clone)]
@@ -16936,6 +18831,11 @@ mod phase_b_std {
     }
 
     fn cargo_path_from_closed_path(closed_path: &str) -> TrustResult<String> {
+        let tool_bin = pinned_toolchain_bin(closed_path)?;
+        Ok(format!("{tool_bin}/cargo"))
+    }
+
+    fn pinned_toolchain_bin(closed_path: &str) -> TrustResult<String> {
         let tool_bin = closed_path
             .strip_suffix(":/usr/bin:/bin")
             .ok_or_else(|| {
@@ -16957,7 +18857,849 @@ mod phase_b_std {
                 "toolchain bin component is not a single absolute /bin path",
             ));
         }
-        Ok(format!("{tool_bin}/cargo"))
+        Ok(tool_bin.to_owned())
+    }
+
+    fn pinned_rust_sysroot(closed_path: &str) -> TrustResult<String> {
+        let tool_bin = pinned_toolchain_bin(closed_path)?;
+        let path = Path::new(&tool_bin);
+        let parent = path.parent().ok_or_else(|| {
+            phase_b_error("E_PHASE_B_PATH", "pinned toolchain bin has no parent sysroot")
+        })?;
+        utf8_absolute(parent, "pinned-rust-sysroot")
+    }
+
+    /// Environment-set preimage binds the six unexpanded policy templates only.
+    fn encode_environment_set_digest() -> TrustResult<[u8; 32]> {
+        // Exact policy [[environment_profile]] order and template pairs.
+        const PROFILES: &[(&str, &[(&str, &str)])] = &[
+            (
+                "acquisition",
+                &[
+                    ("AR", "{tool.host-ar.path}"),
+                    ("CARGO_HOME", "{producer-cargo-home}"),
+                    ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"),
+                    ("CARGO_TARGET_DIR", "{producer-custom-target}"),
+                    ("CC", "{tool.host-cc.path}"),
+                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("RANLIB", "{tool.host-ranlib.path}"),
+                    ("RUSTC", "{tool.rustc.path}"),
+                    ("RUSTDOC", "{tool.rustdoc.path}"),
+                    ("RUSTFMT", "{tool.rustfmt.path}"),
+                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                    ("SOURCE_DATE_EPOCH", "0"),
+                    ("TZ", "UTC"),
+                ],
+            ),
+            (
+                "offline",
+                &[
+                    ("AR", "{tool.host-ar.path}"),
+                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                    ("CARGO_NET_OFFLINE", "true"),
+                    ("CARGO_TARGET_DIR", "{fresh-command-target}"),
+                    ("CC", "{tool.host-cc.path}"),
+                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("RANLIB", "{tool.host-ranlib.path}"),
+                    ("RUSTC", "{tool.rustc.path}"),
+                    ("RUSTDOC", "{tool.rustdoc.path}"),
+                    ("RUSTFMT", "{tool.rustfmt.path}"),
+                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                    ("SOURCE_DATE_EPOCH", "0"),
+                    ("TZ", "UTC"),
+                ],
+            ),
+            (
+                "offline_control",
+                &[
+                    ("AR", "{tool.host-ar.path}"),
+                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                    ("CARGO_NET_OFFLINE", "true"),
+                    ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"),
+                    ("CC", "{tool.host-cc.path}"),
+                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("RANLIB", "{tool.host-ranlib.path}"),
+                    ("RUSTC", "{tool.rustc.path}"),
+                    ("RUSTDOC", "{tool.rustdoc.path}"),
+                    ("RUSTFMT", "{tool.rustfmt.path}"),
+                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                    ("SOURCE_DATE_EPOCH", "0"),
+                    ("TZ", "UTC"),
+                ],
+            ),
+            (
+                "offline_cross",
+                &[
+                    ("AR", "{target-tool-profile.ar.path}"),
+                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                    ("CARGO_NET_OFFLINE", "true"),
+                    ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"),
+                    ("CC", "{target-tool-profile.cc.path}"),
+                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("RUSTC", "{tool.rustc.path}"),
+                    ("RUSTDOC", "{tool.rustdoc.path}"),
+                    ("RUSTFMT", "{tool.rustfmt.path}"),
+                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                    ("SOURCE_DATE_EPOCH", "0"),
+                    ("TZ", "UTC"),
+                    (
+                        "{target-tool-profile.ar-env-key}",
+                        "{target-tool-profile.ar.path}",
+                    ),
+                    (
+                        "{target-tool-profile.cc-env-key}",
+                        "{target-tool-profile.cc.path}",
+                    ),
+                    (
+                        "{target-tool-profile.cflags-env-key}",
+                        "{target-tool-profile.cflags-exact}",
+                    ),
+                    (
+                        "{target-tool-profile.linker-env-key}",
+                        "{target-tool-profile.linker.path}",
+                    ),
+                    (
+                        "{target-tool-profile.rustflags-env-key}",
+                        "{target-tool-profile.rustflags-exact}",
+                    ),
+                ],
+            ),
+            (
+                "tool_identity",
+                &[
+                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("RUSTFMT", "{tool.rustfmt.path}"),
+                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                    ("TZ", "UTC"),
+                ],
+            ),
+            (
+                "openssl",
+                &[
+                    ("LANG", "C"),
+                    ("LC_ALL", "C"),
+                    ("OPENSSL_CONF", "{exact-kat-openssl-config}"),
+                    ("PATH", "{closed-execution-bin}"),
+                    ("TZ", "UTC"),
+                ],
+            ),
+        ];
+        if PROFILES.len() != 6 {
+            return Err(phase_b_error(
+                "E_PHASE_B_ENVIRONMENT_SET",
+                "compiled environment profile count is not six",
+            ));
+        }
+        let mut output = Vec::new();
+        output.extend_from_slice(ENVIRONMENT_SET_PREFIX);
+        output.extend_from_slice(&usize_u32(PROFILES.len(), "env profiles")?.to_be_bytes());
+        for (id, required) in PROFILES {
+            append_u32_bytes(&mut output, id.as_bytes(), "env profile id")?;
+            output.extend_from_slice(
+                &usize_u32(required.len(), "env required assignments")?.to_be_bytes(),
+            );
+            for (key, value) in *required {
+                append_u32_bytes(&mut output, key.as_bytes(), "env key")?;
+                append_u32_bytes(&mut output, value.as_bytes(), "env value")?;
+            }
+            // Every optional array is exactly empty (proxy_rule).
+            output.extend_from_slice(&0u32.to_be_bytes());
+        }
+        sha256(&output)
+    }
+
+    const CANDIDATE_ABSENT: u8 = 0x01;
+    const CANDIDATE_SELECTED: u8 = 0x02;
+    const CANDIDATE_SHADOWED: u8 = 0x03;
+    const CANDIDATE_SYMLINK_HOP_CAP: usize = 8;
+
+    #[derive(Clone)]
+    struct ToolIdentity {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        nlink: u64,
+        length: u64,
+        mtime_seconds: i64,
+        mtime_nanoseconds: u32,
+        ctime_seconds: i64,
+        ctime_nanoseconds: u32,
+    }
+
+    fn tool_identity_from_metadata(metadata: &Metadata, length: u64) -> TrustResult<ToolIdentity> {
+        let mtime_nanoseconds = u32::try_from(metadata.mtime_nsec()).map_err(|_| {
+            phase_b_error("E_PHASE_B_TOOL_IDENTITY", "mtime nanoseconds out of range")
+        })?;
+        let ctime_nanoseconds = u32::try_from(metadata.ctime_nsec()).map_err(|_| {
+            phase_b_error("E_PHASE_B_TOOL_IDENTITY", "ctime nanoseconds out of range")
+        })?;
+        if mtime_nanoseconds >= 1_000_000_000 || ctime_nanoseconds >= 1_000_000_000 {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_IDENTITY",
+                "nanoseconds must be below 1_000_000_000",
+            ));
+        }
+        Ok(ToolIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            length,
+            mtime_seconds: metadata.mtime(),
+            mtime_nanoseconds,
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds,
+        })
+    }
+
+    fn append_tool_identity(output: &mut Vec<u8>, identity: &ToolIdentity) -> TrustResult<()> {
+        reserve(output, 8 + 8 + 4 + 8 + 8 + 8 + 4 + 8 + 4, "tool identity")?;
+        output.extend_from_slice(&identity.device.to_be_bytes());
+        output.extend_from_slice(&identity.inode.to_be_bytes());
+        output.extend_from_slice(&identity.mode.to_be_bytes());
+        output.extend_from_slice(&identity.nlink.to_be_bytes());
+        output.extend_from_slice(&identity.length.to_be_bytes());
+        output.extend_from_slice(&identity.mtime_seconds.to_be_bytes());
+        output.extend_from_slice(&identity.mtime_nanoseconds.to_be_bytes());
+        output.extend_from_slice(&identity.ctime_seconds.to_be_bytes());
+        output.extend_from_slice(&identity.ctime_nanoseconds.to_be_bytes());
+        Ok(())
+    }
+
+    fn expand_tool_candidate(
+        template: &str,
+        toolchain_bin: &str,
+        rust_sysroot: &str,
+    ) -> TrustResult<String> {
+        let expanded = if let Some(rest) = template.strip_prefix("{pinned-toolchain-bin}/") {
+            if rest.is_empty() || rest.contains('/') || rest.contains('{') {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_PATH",
+                    format!("invalid toolchain candidate {template}"),
+                ));
+            }
+            format!("{toolchain_bin}/{rest}")
+        } else if let Some(rest) = template.strip_prefix("{pinned-rust-sysroot}/") {
+            if rest.is_empty() || rest.contains('{') || rest.contains("//") {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_PATH",
+                    format!("invalid sysroot candidate {template}"),
+                ));
+            }
+            format!("{rust_sysroot}/{rest}")
+        } else if template.starts_with('/') && !template.contains('{') {
+            template.to_owned()
+        } else {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_PATH",
+                format!("unexpanded candidate template {template}"),
+            ));
+        };
+        if !expanded.starts_with('/')
+            || expanded.contains("//")
+            || expanded.contains("/./")
+            || expanded.contains("/../")
+            || expanded.contains('\0')
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_PATH",
+                format!("expanded candidate is not absolute lexical: {expanded}"),
+            ));
+        }
+        Ok(expanded)
+    }
+
+    struct ResolvedCandidate {
+        lexical_path: String,
+        disposition: u8,
+        hops: Vec<(String, Vec<u8>, ToolIdentity)>,
+        final_path: Option<String>,
+        final_identity: Option<ToolIdentity>,
+        final_sha256: Option<[u8; 32]>,
+    }
+
+    fn resolve_tool_candidate(path: &str) -> TrustResult<ResolvedCandidate> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ResolvedCandidate {
+                    lexical_path: path.to_owned(),
+                    disposition: CANDIDATE_ABSENT,
+                    hops: Vec::new(),
+                    final_path: None,
+                    final_identity: None,
+                    final_sha256: None,
+                });
+            }
+            Err(error) => {
+                return Err(io_error("E_PHASE_B_TOOL_METADATA", path, &error));
+            }
+        };
+        let mut hops = Vec::new();
+        let mut current = path.to_owned();
+        let mut seen_paths = BTreeSet::new();
+        let mut seen_idents = BTreeSet::new();
+        let mut current_metadata = metadata;
+        loop {
+            if !seen_paths.insert(current.clone()) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_CYCLE",
+                    format!("{path}: repeated lexical path"),
+                ));
+            }
+            if current_metadata.file_type().is_symlink() {
+                if hops.len() >= CANDIDATE_SYMLINK_HOP_CAP {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_HOPS",
+                        format!("{path}: exceeded candidate_symlink_hop_cap"),
+                    ));
+                }
+                let link_bytes = fs::read_link(&current)
+                    .map_err(|error| io_error("E_PHASE_B_TOOL_READLINK", &current, &error))?;
+                let link_os = link_bytes.clone();
+                let link_raw = link_os.as_os_str().as_encoded_bytes().to_vec();
+                let link_identity =
+                    tool_identity_from_metadata(&current_metadata, link_raw.len() as u64)?;
+                let ident_key = (
+                    link_identity.device,
+                    link_identity.inode,
+                    link_identity.mode,
+                );
+                if !seen_idents.insert(ident_key) {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_CYCLE",
+                        format!("{path}: repeated link identity"),
+                    ));
+                }
+                hops.push((current.clone(), link_raw, link_identity));
+                let target = if link_os.is_absolute() {
+                    PathBuf::from(&link_os)
+                } else {
+                    Path::new(&current)
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(&link_os)
+                };
+                current = utf8_absolute(&target, "tool symlink target")?;
+                current_metadata = fs::symlink_metadata(&current)
+                    .map_err(|error| io_error("E_PHASE_B_TOOL_METADATA", &current, &error))?;
+                continue;
+            }
+            if !current_metadata.is_file() {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_TYPE",
+                    format!("{path}: final target is not a regular file"),
+                ));
+            }
+            if current_metadata.mode() & 0o111 == 0 {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_EXECUTABLE",
+                    format!("{path}: final target is not executable"),
+                ));
+            }
+            let mut file = File::open(&current)
+                .map_err(|error| io_error("E_PHASE_B_TOOL_OPEN", &current, &error))?;
+            let open_meta = file
+                .metadata()
+                .map_err(|error| io_error("E_PHASE_B_TOOL_METADATA", &current, &error))?;
+            if fs_identity(&open_meta) != fs_identity(&current_metadata) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_RACE",
+                    format!("{path}: open identity drifted"),
+                ));
+            }
+            let bytes = read_tree_file(Path::new(&current), &current_metadata, path)?;
+            drop(file);
+            let final_identity =
+                tool_identity_from_metadata(&current_metadata, current_metadata.len())?;
+            return Ok(ResolvedCandidate {
+                lexical_path: path.to_owned(),
+                disposition: CANDIDATE_SELECTED, // caller may demote to shadowed
+                hops,
+                final_path: Some(current),
+                final_identity: Some(final_identity),
+                final_sha256: Some(sha256(&bytes)?),
+            });
+        }
+    }
+
+    struct SelectedTool {
+        id: &'static str,
+        selected_lexical: String,
+        final_path: String,
+        final_identity: ToolIdentity,
+        final_sha256: [u8; 32],
+        version_stream: &'static str,
+        version_bytes: Vec<u8>,
+        version_sha256: [u8; 32],
+        candidates: Vec<ResolvedCandidate>,
+    }
+
+    fn parse_version_stream(parser: &str, stream: &[u8]) -> TrustResult<()> {
+        if stream.is_empty() || stream.contains(&0) || stream.contains(&b'\r') {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_VERSION",
+                format!("{parser}: empty/NUL/CR version stream"),
+            ));
+        }
+        if !stream.ends_with(b"\n") {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_VERSION",
+                format!("{parser}: version stream must be LF-terminated"),
+            ));
+        }
+        let text = std::str::from_utf8(stream).map_err(|_| {
+            phase_b_error(
+                "E_PHASE_B_TOOL_VERSION",
+                format!("{parser}: version stream UTF-8"),
+            )
+        })?;
+        // Strict pin checks for the qualified host. Unknown parsers fail closed.
+        match parser {
+            "rustc-vv-pinned-1.99" => {
+                if !text.contains("release: 1.99.0-nightly")
+                    || !text.contains("commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14")
+                    || !text.contains("host: x86_64-unknown-linux-gnu")
+                    || !text.contains("LLVM version: 22.1.8")
+                {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        "rustc -Vv does not match pinned 1.99 authority",
+                    ));
+                }
+            }
+            "cargo-vv-pinned-1.99" => {
+                if !text.contains("release: 1.99.0-nightly")
+                    || !text.contains("commit-hash: 59800466c5c41c444d264b1010b4d57e85a7117f")
+                    || !text.contains("host: x86_64-unknown-linux-gnu")
+                {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        "cargo -Vv does not match pinned 1.99 authority",
+                    ));
+                }
+            }
+            "rustdoc-pinned-1.99" => {
+                if !text.contains("1.99.0-nightly")
+                    || !text.contains("375b1431b7d89d1c2e2bc168c011848ae12b7d14")
+                {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        "rustdoc version does not match pinned 1.99 authority",
+                    ));
+                }
+            }
+            "rustfmt-pinned-nightly" | "clippy-pinned-nightly" => {
+                if text.trim().is_empty() {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        format!("{parser}: empty identity line"),
+                    ));
+                }
+            }
+            "lld-gnu-version" => {
+                if !text.contains("LLD 22") && !text.to_ascii_lowercase().contains("lld") {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        "rust-lld version does not identify LLD",
+                    ));
+                }
+            }
+            "llvm-version-family" | "llvm-lib-help" | "lld-coff-version" => {
+                if !text.to_ascii_lowercase().contains("llvm")
+                    && !text.to_ascii_lowercase().contains("lld")
+                {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        format!("{parser}: missing LLVM/LLD identity"),
+                    ));
+                }
+            }
+            "openssl-version-a" => {
+                if !text.contains("OpenSSL") {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        "openssl version -a missing OpenSSL identity",
+                    ));
+                }
+            }
+            "host-c-compiler-v"
+            | "aarch64-c-compiler-v"
+            | "apple-clang-version"
+            | "windows-clang-cl-version"
+            | "archiver-version" => {
+                if text.trim().is_empty() {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_TOOL_VERSION",
+                        format!("{parser}: empty compiler/archiver stream"),
+                    ));
+                }
+            }
+            _ => {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_VERSION",
+                    format!("unknown version parser {parser}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_tool_version(
+        selected_path: &str,
+        tool: &NativeTool,
+        execution_bin: &str,
+        clippy_driver: &str,
+        rustfmt: &str,
+    ) -> TrustResult<(Vec<u8>, [u8; 32])> {
+        let environment = vec![
+            ("CLIPPY_DRIVER".to_owned(), clippy_driver.to_owned()),
+            ("LANG".to_owned(), "C".to_owned()),
+            ("LC_ALL".to_owned(), "C".to_owned()),
+            ("PATH".to_owned(), execution_bin.to_owned()),
+            ("RUSTFMT".to_owned(), rustfmt.to_owned()),
+            ("RUSTUP_TOOLCHAIN".to_owned(), "nightly-2026-07-11".to_owned()),
+            ("TZ".to_owned(), "UTC".to_owned()),
+        ];
+        let mut argv = Vec::new();
+        argv.push(selected_path.to_owned());
+        for arg in tool.version_argv {
+            argv.push((*arg).to_owned());
+        }
+        let capture = execute_child(
+            &argv,
+            &environment,
+            Path::new("/"),
+            1024 * 1024,
+            1024 * 1024,
+            300,
+            &format!("tool-probe.{}", tool.id),
+        )?;
+        if capture.exit_code != 0 {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_VERSION",
+                format!("{}: version probe exit {}", tool.id, capture.exit_code),
+            ));
+        }
+        let (selected_stream, unselected_stream) = match tool.stream {
+            "stdout" => (&capture.stdout.bytes, &capture.stderr.bytes),
+            "stderr" => (&capture.stderr.bytes, &capture.stdout.bytes),
+            other => {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_VERSION",
+                    format!("{}: unknown version stream {other}", tool.id),
+                ));
+            }
+        };
+        if !unselected_stream.is_empty() {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_VERSION",
+                format!("{}: unselected stream must be empty", tool.id),
+            ));
+        }
+        parse_version_stream(tool.parser, selected_stream)?;
+        let digest = sha256(selected_stream)?;
+        Ok((selected_stream.clone(), digest))
+    }
+
+    fn append_resolved_candidate(
+        output: &mut Vec<u8>,
+        candidate: &ResolvedCandidate,
+    ) -> TrustResult<()> {
+        append_u32_bytes(
+            output,
+            candidate.lexical_path.as_bytes(),
+            "candidate lexical path",
+        )?;
+        output.push(candidate.disposition);
+        match candidate.disposition {
+            CANDIDATE_ABSENT => {
+                output.extend_from_slice(&0u32.to_be_bytes());
+            }
+            CANDIDATE_SELECTED | CANDIDATE_SHADOWED => {
+                output.extend_from_slice(
+                    &usize_u32(candidate.hops.len(), "symlink hop count")?.to_be_bytes(),
+                );
+                for (link_path, link_raw, link_identity) in &candidate.hops {
+                    append_u32_bytes(output, link_path.as_bytes(), "hop lexical path")?;
+                    append_u32_bytes(output, link_raw, "hop read_link bytes")?;
+                    append_tool_identity(output, link_identity)?;
+                }
+                let final_path = candidate.final_path.as_ref().ok_or_else(|| {
+                    phase_b_error("E_PHASE_B_TOOL_SET", "selected/shadowed missing final path")
+                })?;
+                let final_identity = candidate.final_identity.as_ref().ok_or_else(|| {
+                    phase_b_error(
+                        "E_PHASE_B_TOOL_SET",
+                        "selected/shadowed missing final identity",
+                    )
+                })?;
+                let final_sha = candidate.final_sha256.ok_or_else(|| {
+                    phase_b_error("E_PHASE_B_TOOL_SET", "selected/shadowed missing final hash")
+                })?;
+                append_u32_bytes(output, final_path.as_bytes(), "final target path")?;
+                append_tool_identity(output, final_identity)?;
+                reserve(output, 32, "final target sha256")?;
+                output.extend_from_slice(&final_sha);
+            }
+            other => {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_SET",
+                    format!("unknown candidate disposition {other}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve all 20 native tools, materialize execution-bin, probe versions,
+    /// and return the tool_set_sha256 together with selected finals.
+    fn inventory_native_tools(
+        repository_root: &Path,
+        closed_path: &str,
+        execution_bin_relative: &str,
+    ) -> TrustResult<([u8; 32], Vec<SelectedTool>)> {
+        if NATIVE_TOOLS.len() != 20 {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_SET",
+                "compiled native tool count is not 20",
+            ));
+        }
+        let toolchain_bin = pinned_toolchain_bin(closed_path)?;
+        let rust_sysroot = pinned_rust_sysroot(closed_path)?;
+        let execution_bin_abs = utf8_absolute(
+            &repository_root.join(execution_bin_relative),
+            "execution-bin absolute",
+        )?;
+
+        // Phase 1: resolve every candidate for every role.
+        let mut roles: Vec<(usize, &'static NativeTool, Vec<ResolvedCandidate>, Option<usize>)> =
+            Vec::new();
+        for (ordinal, tool) in NATIVE_TOOLS.iter().enumerate() {
+            let mut candidates = Vec::new();
+            let mut selected_index = None;
+            for template in tool.candidates {
+                let expanded =
+                    expand_tool_candidate(template, &toolchain_bin, &rust_sysroot)?;
+                let mut resolved = resolve_tool_candidate(&expanded)?;
+                if resolved.disposition == CANDIDATE_ABSENT {
+                    candidates.push(resolved);
+                    continue;
+                }
+                // Existing executable: first is selected, later are shadowed.
+                if selected_index.is_none() {
+                    resolved.disposition = CANDIDATE_SELECTED;
+                    selected_index = Some(candidates.len());
+                } else {
+                    resolved.disposition = CANDIDATE_SHADOWED;
+                }
+                candidates.push(resolved);
+            }
+            if selected_index.is_none() {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_SET",
+                    format!("{}: no selected executable candidate", tool.id),
+                ));
+            }
+            roles.push((ordinal, tool, candidates, selected_index));
+        }
+
+        // Phase 2: materialize execution-bin with exactly 20 symlinks.
+        const EXECUTION_BIN_NAMES: [&str; 20] = [
+            "rustc",
+            "cargo",
+            "rustdoc",
+            "rustfmt",
+            "cargo-fmt",
+            "cargo-clippy",
+            "clippy-driver",
+            "rust-lld",
+            "llvm-nm",
+            "openssl",
+            "cc",
+            "ar",
+            "ranlib",
+            "aarch64-linux-gnu-gcc",
+            "aarch64-linux-gnu-ar",
+            "apple-clang",
+            "apple-ar",
+            "clang-cl",
+            "llvm-lib",
+            "lld-link",
+        ];
+        ensure_repository_directory(
+            repository_root,
+            execution_bin_relative,
+            true,
+            "fresh execution-bin",
+        )?;
+        for (ordinal, _tool, candidates, selected_index) in &roles {
+            let selected = &candidates[selected_index.expect("selected")];
+            let final_path = selected.final_path.as_ref().ok_or_else(|| {
+                phase_b_error("E_PHASE_B_TOOL_SET", "selected missing final path")
+            })?;
+            let link_name = EXECUTION_BIN_NAMES[*ordinal];
+            let link_path = repository_root
+                .join(execution_bin_relative)
+                .join(link_name);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(final_path, &link_path).map_err(|error| {
+                    io_error(
+                        "E_PHASE_B_EXECUTION_BIN",
+                        &format!("symlink {link_name}"),
+                        &error,
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (final_path, link_path);
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    "execution-bin requires Unix symlinks",
+                ));
+            }
+        }
+        // Exact set: 20 entries, no extras.
+        let mut entry_count = 0usize;
+        for entry in fs::read_dir(&execution_bin_abs)
+            .map_err(|error| io_error("E_PHASE_B_EXECUTION_BIN", "read_dir", &error))?
+        {
+            let entry = entry
+                .map_err(|error| io_error("E_PHASE_B_EXECUTION_BIN", "read_dir entry", &error))?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| phase_b_error("E_PHASE_B_EXECUTION_BIN", "entry count overflow"))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                phase_b_error("E_PHASE_B_EXECUTION_BIN", "non-UTF-8 entry")
+            })?;
+            if !EXECUTION_BIN_NAMES.contains(&name.as_str()) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    format!("unexpected execution-bin entry {name}"),
+                ));
+            }
+            let meta = fs::symlink_metadata(entry.path()).map_err(|error| {
+                io_error("E_PHASE_B_EXECUTION_BIN", &name, &error)
+            })?;
+            if !meta.file_type().is_symlink() {
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    format!("{name}: must be a symlink"),
+                ));
+            }
+        }
+        if entry_count != 20 {
+            return Err(phase_b_error(
+                "E_PHASE_B_EXECUTION_BIN",
+                format!("execution-bin entry count {entry_count} != 20"),
+            ));
+        }
+
+        // Phase 3: version probe every selected role under tool_identity env.
+        let clippy = roles
+            .iter()
+            .find(|(_, tool, _, _)| tool.id == "clippy-driver")
+            .and_then(|(_, _, candidates, selected)| {
+                candidates[selected.expect("sel")].final_path.clone()
+            })
+            .ok_or_else(|| {
+                phase_b_error("E_PHASE_B_TOOL_SET", "clippy-driver selection missing")
+            })?;
+        let rustfmt = roles
+            .iter()
+            .find(|(_, tool, _, _)| tool.id == "rustfmt")
+            .and_then(|(_, _, candidates, selected)| {
+                candidates[selected.expect("sel")].final_path.clone()
+            })
+            .ok_or_else(|| phase_b_error("E_PHASE_B_TOOL_SET", "rustfmt selection missing"))?;
+
+        let mut selected_tools = Vec::new();
+        for (ordinal, tool, candidates, selected_index) in roles {
+            let selected_index = selected_index.expect("selected");
+            let selected = &candidates[selected_index];
+            let selected_lexical = selected.lexical_path.clone();
+            let final_path = selected.final_path.clone().ok_or_else(|| {
+                phase_b_error("E_PHASE_B_TOOL_SET", "selected missing final path")
+            })?;
+            let final_identity = selected.final_identity.clone().ok_or_else(|| {
+                phase_b_error("E_PHASE_B_TOOL_SET", "selected missing final identity")
+            })?;
+            let final_sha256 = selected.final_sha256.ok_or_else(|| {
+                phase_b_error("E_PHASE_B_TOOL_SET", "selected missing final hash")
+            })?;
+            let (version_bytes, version_sha256) = probe_tool_version(
+                &selected_lexical,
+                tool,
+                &execution_bin_abs,
+                &clippy,
+                &rustfmt,
+            )?;
+            let _ = ordinal;
+            selected_tools.push(SelectedTool {
+                id: tool.id,
+                selected_lexical,
+                final_path,
+                final_identity,
+                final_sha256,
+                version_stream: tool.stream,
+                version_bytes,
+                version_sha256,
+                candidates,
+            });
+        }
+
+        // Phase 4: encode tool_set_preimage and digest.
+        let mut output = Vec::new();
+        output.extend_from_slice(TOOL_SET_PREFIX);
+        output.extend_from_slice(&20u32.to_be_bytes());
+        for (ordinal, tool) in selected_tools.iter().enumerate() {
+            output.extend_from_slice(&usize_u32(ordinal, "tool ordinal")?.to_be_bytes());
+            append_u32_bytes(&mut output, tool.id.as_bytes(), "tool id")?;
+            output.extend_from_slice(
+                &usize_u32(tool.candidates.len(), "candidate count")?.to_be_bytes(),
+            );
+            for candidate in &tool.candidates {
+                append_resolved_candidate(&mut output, candidate)?;
+            }
+            append_u32_bytes(
+                &mut output,
+                tool.selected_lexical.as_bytes(),
+                "selected lexical path",
+            )?;
+            append_tool_identity(&mut output, &tool.final_identity)?;
+            append_u32_bytes(
+                &mut output,
+                tool.version_stream.as_bytes(),
+                "version stream name",
+            )?;
+            output.extend_from_slice(
+                &usize_u64(tool.version_bytes.len(), "version byte length")?.to_be_bytes(),
+            );
+            reserve(&mut output, 32, "version sha256")?;
+            output.extend_from_slice(&tool.version_sha256);
+            reserve(&mut output, tool.version_bytes.len(), "version bytes")?;
+            output.extend_from_slice(&tool.version_bytes);
+        }
+        let tool_set_sha256 = sha256(&output)?;
+        Ok((tool_set_sha256, selected_tools))
     }
 
     fn produce_acquisition_argv(
@@ -17110,18 +19852,8 @@ mod phase_b_std {
                 "compiled resolve/fetch argv or acquisition environment desync",
             ));
         }
-        // Produce is deliberately fail-closed until the policy's complete typed
-        // Phase-B authority, bounded child lifecycle, sealed input bookends, and
-        // ordinary handoff joins are implemented together. The zero integration
-        // digest was required above, so this runtime check always precedes the
-        // first filesystem mutation or child-process spawn without making the
-        // remaining implementation syntactically unreachable to the compiler.
-        if integration_digest == [0; 32] {
-            return Err(phase_b_error(
-                "E_PHASE_B_ACQUISITION_IMPLEMENTATION",
-                "typed acquisition, transaction, timeout, and handoff authority remains incomplete",
-            ));
-        }
+        // Zero integration seal was required above. Produce FS orchestration is
+        // live; fail-closed only on concrete authority/runtime errors below.
         let repository_root = &arguments.repository_root;
         directory_metadata(repository_root, "produce repository root")?;
         // Fresh role scratch: package layout before lock generation.
@@ -17209,6 +19941,12 @@ mod phase_b_std {
                 "Cargo.lock missing or empty after bootstrap.resolve",
             ));
         }
+        let resolve_typed = resolve_typed_result(
+            manifest,
+            &resolve.stdout.bytes,
+            &lock_bytes,
+            &repository_root.join(&package_root),
+        )?;
         let fetch = execute_child(
             &fetch_argv,
             &acquisition_environment,
@@ -17263,7 +20001,19 @@ mod phase_b_std {
                 "sealed supply reopened bytes desync",
             ));
         }
-        let _ = parse_supply_bundle(&reopened_supply)?;
+        let reopened_supply_parsed = parse_supply_bundle(&reopened_supply)?;
+        if reopened_supply_parsed != supply {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_LOCK",
+                "sealed supply parse differs from acquisition inventory",
+            ));
+        }
+        let fetch_typed = fetch_typed_result(
+            &acquisition_abs,
+            &lock_bytes,
+            &reopened_supply,
+            &reopened_supply_parsed,
+        )?;
         let _registry = materialize_supply(repository_root, &local_registry, &supply)?;
         // Exact cargo-config for sealed local-registry (offline control-build).
         let registry_abs = utf8_absolute(
@@ -17285,8 +20035,6 @@ mod phase_b_std {
             "bootstrap cargo-config.toml",
         )?;
         // Acquisition spool: exact successful resolve/fetch pair + sealed supply binding.
-        // typed_result_* are provisional Pass digests until FND01BOOTSTRAPRESOLVEv1 /
-        // FND01BOOTSTRAPFETCHv1 preimages are frozen in authority.
         let resolve_cmd = AcquisitionCommand {
             id: "bootstrap.resolve".to_owned(),
             ordinal: 0,
@@ -17296,8 +20044,8 @@ mod phase_b_std {
             exit_code: resolve.exit_code,
             stdout: resolve.stdout,
             stderr: resolve.stderr,
-            typed_result_kind: "Pass".to_owned(),
-            typed_result_sha256: sha256(b"Pass")?,
+            typed_result_kind: resolve_typed.kind.to_owned(),
+            typed_result_sha256: resolve_typed.sha256,
         };
         let fetch_cmd = AcquisitionCommand {
             id: "bootstrap.fetch".to_owned(),
@@ -17308,8 +20056,8 @@ mod phase_b_std {
             exit_code: fetch.exit_code,
             stdout: fetch.stdout,
             stderr: fetch.stderr,
-            typed_result_kind: "Pass".to_owned(),
-            typed_result_sha256: sha256(b"Pass")?,
+            typed_result_kind: fetch_typed.kind.to_owned(),
+            typed_result_sha256: fetch_typed.sha256,
         };
         let spool_bytes = encode_acquisition_spool(
             &arguments.run_id,
@@ -17463,8 +20211,20 @@ mod phase_b_std {
         if process_id == 0 {
             return Err(phase_b_error("E_PHASE_B_PROCESS", "process id is zero"));
         }
-        let tool_set_sha256 = sha256(b"FND01BOOTSTRAPTOOLSv1\0provisional")?;
-        let environment_set_sha256 = sha256(b"FND01BOOTSTRAPENVSv1\0provisional")?;
+        // Live 20-tool inventory + execution-bin (policy tool_set_preimage).
+        // Must complete before the ledger is sealed so ordinary can re-probe.
+        let (tool_set_sha256, _selected_tools) = inventory_native_tools(
+            repository_root,
+            &environment.closed_path,
+            &execution_bin,
+        )?;
+        let environment_set_sha256 = encode_environment_set_digest()?;
+        if tool_set_sha256 == [0; 32] || environment_set_sha256 == [0; 32] {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_SET",
+                "tool/environment set digests must be nonzero",
+            ));
+        }
         let ledger = ControlLedger {
             role: role.to_owned(),
             run_id: arguments.run_id.clone(),
@@ -17514,7 +20274,7 @@ mod phase_b_std {
             "ledger_set_sha256",
             "producer control ledger",
         )?;
-        let _ = (execution_bin.as_str(), supply.entries.len());
+        let _ = supply.entries.len();
         // Same-PID ordinary handoff (does not return on success).
         exec_handoff(
             repository_root,
@@ -17855,6 +20615,113 @@ mod phase_b_std {
         Ok(())
     }
 
+    #[cfg(test)]
+    mod typed_result_tests {
+        use super::*;
+
+        #[test]
+        fn lock_union_is_order_independent_and_checksum_bound() {
+            let first = concat!(
+                "# This file is automatically @generated by Cargo.\n",
+                "# It is not intended for manual editing.\n",
+                "version = 4\n\n",
+                "[[package]]\n",
+                "name = \"fastmcp-fnd01-bootstrap-control\"\n",
+                "version = \"0.0.0\"\n",
+                "dependencies = [\n",
+                " \"sample\",\n",
+                "]\n\n",
+                "[[package]]\n",
+                "name = \"sample\"\n",
+                "version = \"1.2.3\"\n",
+                "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+                "checksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            );
+            let second = concat!(
+                "# This file is automatically @generated by Cargo.\n",
+                "# It is not intended for manual editing.\n",
+                "version = 4\n\n",
+                "[[package]]\n",
+                "name = \"sample\"\n",
+                "version = \"1.2.3\"\n",
+                "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+                "checksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n",
+                "[[package]]\n",
+                "name = \"fastmcp-fnd01-bootstrap-control\"\n",
+                "version = \"0.0.0\"\n",
+                "dependencies = [\n",
+                " \"sample\",\n",
+                "]\n",
+            );
+            let first = bootstrap_lock_union(first.as_bytes()).expect("first lock union");
+            let second = bootstrap_lock_union(second.as_bytes()).expect("second lock union");
+            assert_eq!(first, second);
+            let changed = first
+                .packages
+                .iter()
+                .cloned()
+                .map(|mut package| {
+                    package.checksum.replace_range(..1, "b");
+                    package
+                })
+                .collect::<Vec<_>>();
+            assert_ne!(changed, first.packages);
+        }
+
+        #[test]
+        fn duplicate_metadata_json_keys_fail_closed() {
+            let error = parse_json(br#"{"packages":[],"packages":[]}"#, "duplicate metadata")
+                .expect_err("duplicate key must fail");
+            assert_eq!(error.code(), "E_PHASE_B_JSON");
+        }
+
+        #[test]
+        fn typed_preimages_bind_every_supplied_digest_class() {
+            let lock_union = BootstrapLockUnion {
+                packages: vec![BootstrapRegistryPackage {
+                    name: "sample".to_owned(),
+                    version: "1.2.3".to_owned(),
+                    source: CRATES_IO.to_owned(),
+                    checksum: "aa".repeat(32),
+                }],
+                package_set_sha256: [1; 32],
+            };
+            let resolve = resolve_typed_preimage(b"manifest", b"{}\n", [2; 32], b"lock", &lock_union)
+                .expect("resolve typed preimage");
+            let changed_resolve = resolve_typed_preimage(b"manifest", b"{}\n", [3; 32], b"lock", &lock_union)
+                .expect("changed resolve typed preimage");
+            assert!(resolve.starts_with(RESOLVE_TYPED_PREFIX));
+            assert_ne!(sha256(&resolve).expect("resolve digest"), sha256(&changed_resolve).expect("changed resolve digest"));
+
+            let tree = TreeBinding {
+                id: "acquisition-cargo-home".to_owned(),
+                path: "/tmp/acquisition".to_owned(),
+                device: 1,
+                inode: 2,
+                mode: 0o40700,
+                nlink: 2,
+                entry_count: 2,
+                total_regular_file_bytes: 3,
+                tree_sha256: [4; 32],
+            };
+            let sparse = vec![SelectedAcquisitionFile {
+                relative_path: "registry/index/cache/sa/mp/sample".to_owned(),
+                binding: FileBinding { byte_length: 1, sha256: [5; 32] },
+            }];
+            let archives = vec![SelectedAcquisitionArchive {
+                relative_path: "registry/cache/index/sample-1.2.3.crate".to_owned(),
+                binding: FileBinding { byte_length: 2, sha256: [6; 32] },
+                checksum: "06".repeat(32),
+            }];
+            let fetch = fetch_typed_preimage(b"lock", &tree, &sparse, &archives, b"supply", [7; 32], [8; 32])
+                .expect("fetch typed preimage");
+            let changed_fetch = fetch_typed_preimage(b"lock", &tree, &sparse, &archives, b"supply", [9; 32], [8; 32])
+                .expect("changed fetch typed preimage");
+            assert!(fetch.starts_with(FETCH_TYPED_PREFIX));
+            assert_ne!(sha256(&fetch).expect("fetch digest"), sha256(&changed_fetch).expect("changed fetch digest"));
+        }
+    }
+
     pub(crate) fn run_phase_b(
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
@@ -18186,7 +21053,7 @@ mod bootstrap {
             parse_outer_transport_record(&integration_bytes[5], "producer outer")?;
         let attester_outer =
             parse_outer_transport_record(&gate_bytes[1], "attester outer")?;
-        validate_outer_role_record(
+        let producer_lifecycle = validate_outer_role_record(
             &producer_outer,
             BootstrapMode::Produce,
             &arguments.run_id,
@@ -18195,12 +21062,18 @@ mod bootstrap {
         )?;
         let integration_marker =
             super::trust_std::integration_seal_marker(&integration_seal);
-        validate_outer_role_record(
+        let attester_lifecycle = validate_outer_role_record(
             &attester_outer,
             BootstrapMode::Attest,
             &arguments.run_id,
             &environment.authoring_marker,
             Some(&integration_marker),
+        )?;
+        super::trust_std::validate_serialized_controller_phase_join(
+            &producer_lifecycle,
+            &attester_lifecycle,
+            &validated_gate_input,
+            &arguments.run_id,
         )?;
         authoring_set.revalidate_after_consumption()?;
         integration_set.revalidate_after_consumption()?;
@@ -18315,7 +21188,7 @@ mod bootstrap {
 mod ordinary {
 
 use super::trust_std::{
-    BootstrapEnvironment, BootstrapMode, OrdinaryHandoffArguments,
+    BootstrapEnvironment, BootstrapMode, CanonicalRecord, OrdinaryHandoffArguments,
     ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
     bootstrap_role_name, expected_ordinary_handoff_environment,
     parse_canonical_record_file_with_final_self_digest,
@@ -18344,9 +21217,9 @@ use std::os::windows::fs::MetadataExt;
 
 const POLICY_SCHEMA_VERSION: u32 = 2;
 const RECEIPT_SCHEMA_VERSION: u32 = 2;
-const FROZEN_POLICY_BYTES: usize = 869_683;
+const FROZEN_POLICY_BYTES: usize = 870_337;
 const FROZEN_POLICY_SHA256: &str =
-    "e0ea4c73880e37ccbd0017b01b901fe92ea84b5f75e4ffefc28b094acc139983";
+    "38b941480d5666de1c5127f20973e9e9d22f1c178f3d9621affb8b80b1a0c21b";
 const EXPECTED_SOURCE_FILES: usize = 66;
 const EXPECTED_NEGATIVES: usize = 188;
 const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
@@ -18377,9 +21250,9 @@ const POLICY_TYPE_REGISTRY_SHA256: &str =
     "843972fa2e51688f70d06a8f15f3f53c17997a7cfb3f9eb74fa907fb40c340e3";
 const RECORD_SCHEMA_REGISTRY_COUNT: usize = 111;
 const RECORD_SCHEMA_SELECTOR_COUNT: usize = 253;
-const RECORD_SCHEMA_REGISTRY_BYTES: usize = 72_283;
+const RECORD_SCHEMA_REGISTRY_BYTES: usize = 72_813;
 const RECORD_SCHEMA_REGISTRY_SHA256: &str =
-    "bdbc5310e2fa5e07a6196c469e4e16150666a76006792e90100a99d6db67a392";
+    "a99a81a2d32c32eda7107d4dabeef34de309eab620ecdcbc45fb098f3720f82f";
 const RECORD_VARIANT_REGISTRY_COUNT: usize = 3;
 const RECORD_VARIANT_REGISTRY_BYTES: usize = 1428;
 const RECORD_VARIANT_REGISTRY_SHA256: &str =
@@ -26172,6 +29045,13 @@ fn validate_gzip_tar(
             format!("{prefix}/{name}")
         };
         validate_archive_path(&path, subject)?;
+        if records
+            .last()
+            .is_some_and(|(prior, _, _, _)| prior.as_bytes() >= path.as_bytes())
+        {
+            return Err(Diagnostic::error("E_TAR_ORDER", subject)
+                .at(format!("previous={:?};current={path:?}", records.last().map(|row| &row.0))));
+        }
         let size = parse_tar_octal(&header[124..136], subject)?;
         if size > bounds.max_archive_member_bytes {
             return Err(Diagnostic::error("E_ARCHIVE_BOUND", subject).at(&path));
@@ -26259,7 +29139,6 @@ fn validate_gzip_tar(
         return Err(Diagnostic::error("E_TAR_ROOT", subject)
             .at("every member must be inside the exact root"));
     }
-    records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let mut member_tree = Sha256::new();
     for (path, size, digest, _) in &records {
         let path_length = u32::try_from(path.len())
@@ -30333,6 +33212,13 @@ fn expected_derived_outputs() -> VResult<BTreeMap<String, ExpectedDerivedOutput>
             &["source-snapshot"][..],
         ),
         (
+            "advisory-database",
+            "evidence/fnd-01/integration/advisory-database.bin",
+            "advisory_database",
+            3,
+            &["producer-environment", "source-snapshot"][..],
+        ),
+        (
             "supply-bundle",
             "evidence/fnd-01/integration/supply-bundle.bin",
             "supply_bundle",
@@ -30369,6 +33255,7 @@ fn expected_derived_outputs() -> VResult<BTreeMap<String, ExpectedDerivedOutput>
             &[
                 "command-streams",
                 "producer-environment",
+                "source-snapshot",
                 "supply-receipt",
             ][..],
         ),
@@ -30377,7 +33264,12 @@ fn expected_derived_outputs() -> VResult<BTreeMap<String, ExpectedDerivedOutput>
             "evidence/fnd-01/integration/dependency-receipt.toml",
             "dependency_receipt",
             7,
-            &["command-results", "source-snapshot", "supply-receipt"][..],
+            &[
+                "advisory-database",
+                "command-results",
+                "source-snapshot",
+                "supply-receipt",
+            ][..],
         ),
         (
             "workspace-receipt",
@@ -30437,6 +33329,7 @@ fn expected_derived_outputs() -> VResult<BTreeMap<String, ExpectedDerivedOutput>
             "integration_index",
             12,
             &[
+                "advisory-database",
                 "command-results",
                 "command-streams",
                 "consumer-receipt",
@@ -56140,6 +59033,25 @@ fn actual_repository_file_binding(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedOuterTransportBinding {
+    binding: ParsedFileBinding,
+    lifecycle: super::trust_std::ValidatedOuterLifecycle,
+}
+
+fn actual_authoring_marker_text(authoring: &ActualAuthoringBindings) -> String {
+    format!(
+        "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
+        authoring.policy.byte_length,
+        authoring.policy.sha256,
+        authoring.verifier.byte_length,
+        authoring.verifier.sha256,
+        authoring.harness.byte_length,
+        authoring.harness.sha256,
+        authoring.closure_sha256,
+    )
+}
+
 fn validate_producer_outer_transport(
     root: &Path,
     table: &toml::map::Map<String, toml::Value>,
@@ -56147,7 +59059,7 @@ fn validate_producer_outer_transport(
     authoring: &ActualAuthoringBindings,
     policy: &Policy,
     subject: &str,
-) -> VResult<ParsedFileBinding> {
+) -> VResult<ValidatedOuterTransportBinding> {
     let binding = parse_attested_file_binding(
         table,
         policy.bounds.max_outer_transport_record_bytes,
@@ -56175,16 +59087,7 @@ fn validate_producer_outer_transport(
     let outer = super::trust_std::parse_outer_transport_record(&bytes, subject).map_err(|error| {
         Diagnostic::error("E_FINAL_PRODUCER_OUTER", subject).at(error.to_string())
     })?;
-    let authoring_marker = format!(
-        "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
-        authoring.policy.byte_length,
-        authoring.policy.sha256,
-        authoring.verifier.byte_length,
-        authoring.verifier.sha256,
-        authoring.harness.byte_length,
-        authoring.harness.sha256,
-        authoring.closure_sha256,
-    );
+    let authoring_marker = actual_authoring_marker_text(authoring);
     let expected_authoring = expected_trust_authoring_marker(authoring, subject)?;
     let observed_authoring =
         super::trust_std::parse_authoring_marker(&authoring_marker).map_err(|error| {
@@ -56197,7 +59100,7 @@ fn validate_producer_outer_transport(
                 .at("authoring marker"),
         );
     }
-    super::trust_std::validate_outer_role_record(
+    let lifecycle = super::trust_std::validate_outer_role_record(
         &outer,
         BootstrapMode::Produce,
         run_id,
@@ -56208,7 +59111,7 @@ fn validate_producer_outer_transport(
         Diagnostic::error("E_FINAL_PRODUCER_OUTER", subject)
             .at(error.to_string())
     })?;
-    Ok(binding)
+    Ok(ValidatedOuterTransportBinding { binding, lifecycle })
 }
 
 fn validate_workspace_snapshot_binding(
@@ -56391,6 +59294,14 @@ fn validate_final_command_population(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedFinalAttestationAudit {
+    final_attestation: ParsedFileBinding,
+    producer_outer: ValidatedOuterTransportBinding,
+    returned_gate: ParsedFileBinding,
+    integration_seal: super::trust_std::IntegrationSeal,
+}
+
 fn validate_final_attestation(
     root: &Path,
     policy: &Policy,
@@ -56401,13 +59312,20 @@ fn validate_final_attestation(
     workspace_receipt: &ParsedWorkspaceReceiptSummary,
     source_workspace_bindings: &[ParsedWorkspaceBinding],
     run_id: &[u8; 16],
-) -> VResult<()> {
+) -> VResult<ValidatedFinalAttestationAudit> {
     let subject = &policy.paths.final_attestation_path;
     let bytes = read_bounded(
         &resolve_safe(root, subject, "final attestation")?,
         policy.bounds.max_final_attestation_bytes,
         subject,
     )?;
+    let final_attestation = ParsedFileBinding {
+        path: subject.clone(),
+        byte_length: u64::try_from(bytes.len()).map_err(|_| {
+            Diagnostic::error("E_FINAL_ATTESTATION", subject).at("byte length")
+        })?,
+        sha256: lower_hex(&sha256(&bytes)),
+    };
     super::trust_std::validate_final_attestation_canonical_bytes(&bytes).map_err(|error| {
         Diagnostic::error("E_FINAL_ATTESTATION_CANONICAL", subject).at(error.to_string())
     })?;
@@ -56490,7 +59408,7 @@ fn validate_final_attestation(
     if binding_by_id.get("integration-index") != Some(&index_binding) {
         return Err(Diagnostic::error("E_FINAL_INDEX_BINDING", subject));
     }
-    let _returned_gate = validate_returned_gate_binding(
+    let returned_gate = validate_returned_gate_binding(
         root,
         record_table(table, "returned_gate_executable", subject)?,
         attestation_run_id,
@@ -56542,7 +59460,7 @@ fn validate_final_attestation(
         run_id,
         authoring,
         integration_seal_sha256,
-        &producer_outer,
+        &producer_outer.binding,
         &workspace_snapshot,
         binding_by_id,
         subject,
@@ -56682,6 +59600,289 @@ fn validate_final_attestation(
     if !record_bool(table, "locks_byte_equal", subject)? {
         return Err(Diagnostic::error("E_FINAL_LOCK_EQUALITY", subject));
     }
+    Ok(ValidatedFinalAttestationAudit {
+        final_attestation,
+        producer_outer,
+        returned_gate,
+        integration_seal: integration_seal.clone(),
+    })
+}
+
+fn final_gate_seal_marker(seal: &super::trust_std::FinalGateSeal, run_id: &str) -> String {
+    format!(
+        "FND01FINALGATEv1:{run_id}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        seal.final_attestation.byte_length,
+        lower_hex(&seal.final_attestation.sha256),
+        seal.producer_outer_transport.byte_length,
+        lower_hex(&seal.producer_outer_transport.sha256),
+        seal.attester_outer_transport.byte_length,
+        lower_hex(&seal.attester_outer_transport.sha256),
+        seal.gate_executable.byte_length,
+        lower_hex(&seal.gate_executable.sha256),
+        seal.gate_input.byte_length,
+        lower_hex(&seal.gate_input.sha256),
+        lower_hex(&seal.authoring_closure_sha256),
+        lower_hex(&seal.integration_seal_sha256),
+        lower_hex(&seal.seal_sha256),
+    )
+}
+
+fn validate_final_gate_audit(
+    root: &Path,
+    policy: &Policy,
+    authoring: &ActualAuthoringBindings,
+    run_id: &[u8; 16],
+    attestation: &ValidatedFinalAttestationAudit,
+    report: &mut Report,
+) -> VResult<()> {
+    let run_id_text = lower_hex(run_id);
+    let authoring_marker_text = actual_authoring_marker_text(authoring);
+    let authoring_marker = expected_trust_authoring_marker(authoring, "final gate audit")?;
+
+    let attester_outer_path =
+        format!(".fnd01-run/controller/{run_id_text}/attester-outer.bin");
+    let attester_outer_bytes = read_bounded(
+        &resolve_safe(root, &attester_outer_path, "attester outer transport")?,
+        policy.bounds.max_outer_transport_record_bytes,
+        "attester outer transport",
+    )?;
+    let attester_outer_binding = ParsedFileBinding {
+        path: attester_outer_path.clone(),
+        byte_length: u64::try_from(attester_outer_bytes.len()).map_err(|_| {
+            Diagnostic::error("E_FINAL_ATTESTER_OUTER", &attester_outer_path).at("byte length")
+        })?,
+        sha256: lower_hex(&sha256(&attester_outer_bytes)),
+    };
+    let attester_outer = super::trust_std::parse_outer_transport_record(
+        &attester_outer_bytes,
+        "attester outer transport",
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_ATTESTER_OUTER", &attester_outer_path)
+            .at(error.to_string())
+    })?;
+    let integration_marker =
+        super::trust_std::integration_seal_marker(&attestation.integration_seal);
+    let attester_lifecycle = super::trust_std::validate_outer_role_record(
+        &attester_outer,
+        BootstrapMode::Attest,
+        &run_id_text,
+        &authoring_marker_text,
+        Some(&integration_marker),
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_ATTESTER_OUTER", &attester_outer_path)
+            .at(error.to_string())
+    })?;
+
+    let gate_executable_path = format!(".fnd01-run/controller/{run_id_text}/final-gate");
+    let gate_executable = actual_repository_file_binding(
+        root,
+        &gate_executable_path,
+        policy.bounds.max_gate_executable_bytes,
+        "published final gate executable",
+    )?;
+    if !same_bound_bytes(&gate_executable, &attestation.returned_gate) {
+        return Err(Diagnostic::error(
+            "E_FINAL_GATE_EXECUTABLE",
+            &gate_executable_path,
+        )
+        .at("published and returned gate bytes differ"));
+    }
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(resolve_safe(
+            root,
+            &gate_executable_path,
+            "published final gate executable",
+        )?)
+        .map_err(|_| {
+            Diagnostic::error("E_FINAL_GATE_EXECUTABLE", &gate_executable_path)
+                .at("metadata")
+        })?;
+        if metadata.mode() & 0o111 == 0 {
+            return Err(Diagnostic::error(
+                "E_FINAL_GATE_EXECUTABLE",
+                &gate_executable_path,
+            )
+            .at("executable mode required"));
+        }
+    }
+
+    let gate_input_path =
+        format!(".fnd01-run/controller/{run_id_text}/final-gate-input.bin");
+    let gate_input_bytes = read_bounded(
+        &resolve_safe(root, &gate_input_path, "final gate input")?,
+        policy.bounds.max_final_gate_input_bytes,
+        "final gate input",
+    )?;
+    let gate_input_binding = ParsedFileBinding {
+        path: gate_input_path.clone(),
+        byte_length: u64::try_from(gate_input_bytes.len()).map_err(|_| {
+            Diagnostic::error("E_FINAL_GATE_INPUT", &gate_input_path).at("byte length")
+        })?,
+        sha256: lower_hex(&sha256(&gate_input_bytes)),
+    };
+
+    let mut seal = super::trust_std::FinalGateSeal {
+        run_id: *run_id,
+        final_attestation: parsed_trust_file_binding(
+            &attestation.final_attestation,
+            "final attestation binding",
+        )?,
+        producer_outer_transport: parsed_trust_file_binding(
+            &attestation.producer_outer.binding,
+            "producer outer binding",
+        )?,
+        attester_outer_transport: parsed_trust_file_binding(
+            &attester_outer_binding,
+            "attester outer binding",
+        )?,
+        gate_executable: parsed_trust_file_binding(
+            &gate_executable,
+            "gate executable binding",
+        )?,
+        gate_input: parsed_trust_file_binding(&gate_input_binding, "gate input binding")?,
+        authoring_closure_sha256: authoring_marker.closure_sha256,
+        integration_seal_sha256: attestation.integration_seal.seal_sha256,
+        seal_sha256: [0; 32],
+    };
+    seal.seal_sha256 = super::trust_std::sha256(
+        &super::trust_std::final_gate_seal_preimage(&seal, &run_id_text).map_err(|error| {
+            Diagnostic::error("E_FINAL_GATE_SEAL", "final gate audit")
+                .at(error.to_string())
+        })?,
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_SEAL", "final gate audit").at(error.to_string())
+    })?;
+    let external_seal = super::trust_std::parse_final_gate_seal(
+        &final_gate_seal_marker(&seal, &run_id_text),
+        run_id,
+        &run_id_text,
+        &authoring_marker.closure_sha256,
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_SEAL", "final gate audit").at(error.to_string())
+    })?;
+    if external_seal != seal {
+        return Err(Diagnostic::error(
+            "E_FINAL_GATE_SEAL",
+            "final gate audit",
+        )
+        .at("reconstructed marker changed the seal"));
+    }
+
+    let gate_input_record = parse_canonical_record_file_with_final_self_digest(
+        &gate_input_bytes,
+        b"FND01GATEINPUTv1\0",
+        "final-gate-input",
+        "input_set_sha256",
+        policy.bounds.max_final_gate_input_bytes,
+        "final gate input",
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_INPUT", &gate_input_path).at(error.to_string())
+    })?;
+    let validated_gate_input = super::trust_std::validate_gate_input(
+        gate_input_record,
+        &run_id_text,
+        &external_seal,
+        &authoring_marker_text,
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_INPUT", &gate_input_path).at(error.to_string())
+    })?;
+    let serialized_controller = super::trust_std::validate_serialized_controller_phase_join(
+        &attestation.producer_outer.lifecycle,
+        &attester_lifecycle,
+        &validated_gate_input,
+        &run_id_text,
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_CONTROLLER", "final gate audit")
+            .at(error.to_string())
+    })?;
+    super::trust_std::validate_local_serialized_controller(&serialized_controller, root)
+        .map_err(|error| {
+            Diagnostic::error("E_FINAL_GATE_CONTROLLER", "final gate audit")
+                .at(error.to_string())
+        })?;
+
+    let authoring_bindings = [
+        authoring_marker.policy,
+        authoring_marker.verifier,
+        authoring_marker.harness,
+    ];
+    let mut expected_rechecks = Vec::with_capacity(13);
+    expected_rechecks.extend(
+        super::trust_std::AUTHORING_PATHS
+            .iter()
+            .zip(authoring_bindings)
+            .map(|(path, binding)| super::trust_std::ValidatedFileBinding {
+                path: (*path).to_owned(),
+                binding,
+            }),
+    );
+    expected_rechecks.extend(
+        super::trust_std::INTEGRATION_SEAL_PATHS
+            .iter()
+            .zip(attestation.integration_seal.records)
+            .map(|(path, binding)| super::trust_std::ValidatedFileBinding {
+                path: (*path).to_owned(),
+                binding,
+            }),
+    );
+    for binding in [
+        &attestation.producer_outer.binding,
+        &attestation.final_attestation,
+        &attester_outer_binding,
+        &gate_executable,
+        &gate_input_binding,
+    ] {
+        expected_rechecks.push(super::trust_std::ValidatedFileBinding {
+            path: binding.path.clone(),
+            binding: parsed_trust_file_binding(binding, "final gate recheck binding")?,
+        });
+    }
+    expected_rechecks.sort_unstable_by(|left, right| {
+        left.path.as_bytes().cmp(right.path.as_bytes())
+    });
+
+    let result_path =
+        format!(".fnd01-run/controller/{run_id_text}/final-gate-result.bin");
+    let resolved_result = resolve_safe(root, &result_path, "final gate result")?;
+    match fs::symlink_metadata(&resolved_result) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            report.extend([Diagnostic::pending(
+                policy.pending_contract.gate_result_pending_code.clone(),
+            )]);
+            return Ok(());
+        }
+        Err(_) => {
+            return Err(Diagnostic::error("E_FINAL_GATE_RESULT", &result_path).at("metadata"));
+        }
+        Ok(_) => {}
+    }
+    let result_bytes = read_bounded(
+        &resolved_result,
+        policy.bounds.max_final_gate_result_bytes,
+        &result_path,
+    )?;
+    let result_record = super::trust_std::parse_final_gate_result(&result_bytes, &result_path)
+        .map_err(|error| {
+            Diagnostic::error("E_FINAL_GATE_RESULT", &result_path).at(error.to_string())
+        })?;
+    super::trust_std::validate_final_gate_result(
+        result_record,
+        &run_id_text,
+        &validated_gate_input,
+        &expected_rechecks,
+        &external_seal,
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_FINAL_GATE_RESULT", &result_path).at(error.to_string())
+    })?;
     Ok(())
 }
 
@@ -57187,7 +60388,7 @@ fn verify_outputs(
     )?;
 
     if final_attestation.exists() {
-        validate_final_attestation(
+        let attestation_audit = validate_final_attestation(
             root,
             policy,
             &authoring,
@@ -57198,14 +60399,14 @@ fn verify_outputs(
             &source_snapshot.workspace_bindings,
             &run_id,
         )?;
-        report.extend(
-            policy
-                .pending_contract
-                .post_attestation_allowed_pending
-                .iter()
-                .cloned()
-                .map(Diagnostic::pending),
-        );
+        validate_final_gate_audit(
+            root,
+            policy,
+            &authoring,
+            &run_id,
+            &attestation_audit,
+            report,
+        )?;
     } else {
         report.extend(
             policy
@@ -58941,6 +62142,83 @@ fn test_gzip(tar: &[u8]) -> Vec<u8> {
         .expect("in-memory gzip test finish must succeed")
 }
 
+fn test_ordinary_supply_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bootstrap_lock = concat!(
+        "version = 4\n",
+        "\n",
+        "[[package]]\n",
+        "name = \"fastmcp-fnd01-bootstrap-control\"\n",
+        "version = \"0.0.0\"\n",
+    )
+    .to_owned();
+    for (path, payload) in entries {
+        let root = path
+            .strip_suffix(".crate")
+            .expect("test archive path has .crate suffix");
+        let (name, version) = root
+            .rsplit_once('-')
+            .expect("test archive root has name-version form");
+        bootstrap_lock.push_str(&format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{CRATES_IO_SOURCE}\"\nchecksum = \"{}\"\n",
+            lower_hex(&sha256(payload)),
+        ));
+    }
+    let entry_count = u32::try_from(entries.len()).expect("test entry count fits u32");
+    let total_payload_bytes = entries.iter().try_fold(0u64, |total, (_, payload)| {
+        total.checked_add(u64::try_from(payload.len()).expect("test payload length fits u64"))
+    }).expect("test payload total fits u64");
+    let mut inner = Sha256::new();
+    inner.update(b"FND01SUPPLY-ENTRIESv1\0");
+    inner.update(entry_count.to_be_bytes());
+    for (path, payload) in entries {
+        inner.update([0x01]);
+        inner.update(
+            u32::try_from(path.len())
+                .expect("test path length fits u32")
+                .to_be_bytes(),
+        );
+        inner.update(path.as_bytes());
+        inner.update(
+            u64::try_from(payload.len())
+                .expect("test payload length fits u64")
+                .to_be_bytes(),
+        );
+        inner.update(sha256(payload));
+        inner.update(payload);
+    }
+    let inner_sha256: [u8; 32] = inner.finalize().into();
+    let mut output = Vec::new();
+    output.extend_from_slice(b"FND01SUPPLYv3\0");
+    output.extend_from_slice(
+        &u64::try_from(bootstrap_lock.len())
+            .expect("test lock length fits u64")
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(&sha256(bootstrap_lock.as_bytes()));
+    output.extend_from_slice(bootstrap_lock.as_bytes());
+    output.extend_from_slice(&entry_count.to_be_bytes());
+    output.extend_from_slice(&total_payload_bytes.to_be_bytes());
+    output.extend_from_slice(&inner_sha256);
+    output.extend_from_slice(&sha256(b"synthetic closure binding"));
+    for (path, payload) in entries {
+        output.push(0x01);
+        output.extend_from_slice(
+            &u32::try_from(path.len())
+                .expect("test path length fits u32")
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(path.as_bytes());
+        output.extend_from_slice(
+            &u64::try_from(payload.len())
+                .expect("test payload length fits u64")
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(&sha256(payload));
+        output.extend_from_slice(payload);
+    }
+    output
+}
+
 fn assert_archive_error(
     gzip: &[u8],
     expected_root: &str,
@@ -59694,6 +62972,78 @@ fn fnd_01_archive_parser_rejects_boundary_and_namespace_ambiguity() {
         &test_gzip(&bad_padding_tar),
         "demo-1.0.0",
         "E_TAR_PADDING",
+    );
+}
+
+#[test]
+fn fnd_01_ordinary_supply_parses_before_validating_every_archive() {
+    let alpha = test_gzip(&test_tar(&[(
+        "alpha-1.2.3/src/lib.rs",
+        b"alpha",
+        0,
+    )]));
+    let beta = test_gzip(&test_tar(&[(
+        "beta-2.0.0/src/lib.rs",
+        b"beta",
+        0,
+    )]));
+    let valid = test_ordinary_supply_bundle(&[
+        ("alpha-1.2.3.crate", &alpha),
+        ("beta-2.0.0.crate", &beta),
+    ]);
+    let framing = parse_ordinary_supply_framing(&valid, "ordinary supply self-test")
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    assert_eq!(
+        framing
+            .archives
+            .iter()
+            .map(|archive| archive.expected_root.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha-1.2.3", "beta-2.0.0"],
+    );
+    validate_ordinary_supply_archives(&valid, &framing)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+    let reversed = test_ordinary_supply_bundle(&[
+        ("beta-2.0.0.crate", &beta),
+        ("alpha-1.2.3.crate", &alpha),
+    ]);
+    assert_eq!(
+        parse_ordinary_supply_framing(&reversed, "reversed ordinary supply")
+            .expect_err("out-of-order archive entries must fail before decompression")
+            .code,
+        "E_ORDINARY_SUPPLY_ORDER",
+    );
+
+    let mut changed_payload = valid.clone();
+    let final_byte = changed_payload
+        .last_mut()
+        .expect("synthetic supply has an archive payload");
+    *final_byte ^= 1;
+    assert_eq!(
+        parse_ordinary_supply_framing(&changed_payload, "changed ordinary supply")
+            .expect_err("payload digest drift must fail before decompression")
+            .code,
+        "E_ORDINARY_SUPPLY_DIGEST",
+    );
+
+    let wrong_root_payload = test_gzip(&test_tar(&[(
+        "wrong-9.9.9/src/lib.rs",
+        b"wrong",
+        0,
+    )]));
+    let wrong_root = test_ordinary_supply_bundle(&[(
+        "right-9.9.9.crate",
+        &wrong_root_payload,
+    )]);
+    let wrong_root_framing =
+        parse_ordinary_supply_framing(&wrong_root, "wrong-root ordinary supply")
+            .expect("container framing is independent of tar validation");
+    assert_eq!(
+        validate_ordinary_supply_archives(&wrong_root, &wrong_root_framing)
+            .expect_err("tar root must equal the exact .crate basename")
+            .code,
+        "E_TAR_ROOT",
     );
 }
 
@@ -61744,6 +65094,8 @@ fn fnd_01_environment_pair_and_count_link_types_are_exact() {
         "node".to_owned(),
         toml::Value::Array(vec![toml::Value::Table(toml::Table::new())]),
     );
+    row.insert("edge_count".to_owned(), toml::Value::Integer(0));
+    row.insert("edge".to_owned(), toml::Value::Array(Vec::new()));
     validate_count_array_links(
         &row,
         "schema/target-graph",
@@ -62224,7 +65576,7 @@ fn fnd_01_checked_snapshot_hooks_detect_replacement_relinking_and_in_place_drift
             .duration_since(UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = PathBuf::from("/tmp").join(format!(
             "fastmcp-fnd01-snapshot-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
@@ -62374,7 +65726,7 @@ fn exercise_set_wide_snapshot_drift(drift: SetWideSnapshotDrift) {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "fastmcp-fnd01-set-snapshot-{}-{timestamp}-{sequence}",
         std::process::id()
     ));
@@ -62508,7 +65860,7 @@ fn fnd_01_set_wide_bookend_accepts_a_stable_bounded_set_and_rejects_oversizing()
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "fastmcp-fnd01-stable-set-snapshot-{}-{timestamp}-{sequence}",
         std::process::id()
     ));
@@ -62658,8 +66010,7 @@ fn synthetic_structured_case(id: &str, selector: &str, operation: MutationKind) 
 
 #[test]
 fn fixture_table_member_requires_identity_for_table_arrays() {
-    let toml_document = r#"
-[[ambiguities]]
+    let toml_document = r#"[[ambiguities]]
 id = "first"
 decision = "one"
 
@@ -62711,8 +66062,7 @@ fn fixture_table_member_rejects_numeric_relative_table_array_traversal() {
         "/root",
         MutationKind::Replace,
     );
-    let mut toml_document = r#"
-[root]
+    let mut toml_document = r#"[root]
 name = "container"
 
 [[root.items]]
@@ -62741,8 +66091,7 @@ decision = "two"
 
 #[test]
 fn fixture_table_member_rejects_forbidden_and_empty_relative_payloads() {
-    let mut document = r#"
-[root]
+    let mut document = r#"[root]
 result = "original"
 "#
     .parse::<toml::Value>()
@@ -62818,8 +66167,7 @@ fn quarantine_boundary_detects_ancestor_and_descendant_selectors() {
 
 #[test]
 fn mutation_rename_key_is_noop_and_collision_safe() {
-    let baseline = r#"
-[root]
+    let baseline = r#"[root]
 old = "value"
 occupied = "other"
 "#
@@ -62856,8 +66204,7 @@ occupied = "other"
 #[test]
 fn mutation_duplicate_rejects_synthetic_table_key_collision() {
     let case = synthetic_structured_case("duplicate-table", "/root", MutationKind::Duplicate);
-    let mut document = r#"
-[root]
+    let mut document = r#"[root]
 original = "value"
 "#
     .parse::<toml::Value>()
@@ -64014,16 +67361,545 @@ fn fnd_01_registry_characterization_matches_compiled_authority() {
 }
 
 
+const ORDINARY_MAX_SUPPLY_BUNDLE_BYTES: u64 = 1_073_741_824;
+const ORDINARY_MAX_SUPPLY_ENTRY_COUNT: usize = 1_000_000;
+const ORDINARY_MAX_SOURCE_FILE_BYTES: u64 = 1_048_576;
+const ORDINARY_MAX_SPARSE_CACHE_INPUT_BYTES: u64 = 16_777_216;
+const ORDINARY_MAX_ACQUISITION_SPOOL_BYTES: u64 = 134_217_728;
+const ORDINARY_ARCHIVE_BOUNDS: ArchiveBounds = ArchiveBounds {
+    max_archive_compressed_bytes: 8_388_608,
+    max_archive_expanded_bytes: 67_108_864,
+    max_archive_member_count: 4_096,
+    max_archive_member_bytes: 16_777_216,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySupplyArchiveBinding {
+    path: String,
+    expected_root: String,
+    payload_offset: usize,
+    byte_length: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySupplyFraming {
+    bootstrap_lock_byte_length: u64,
+    bootstrap_lock_sha256: [u8; 32],
+    entry_count: usize,
+    total_payload_bytes: u64,
+    inner_entry_set_sha256: [u8; 32],
+    closure_bijection_sha256: [u8; 32],
+    archives: Vec<OrdinarySupplyArchiveBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySpoolBinding {
+    path: PathBuf,
+    byte_length: u64,
+    sha256: [u8; 32],
+    record: CanonicalRecord,
+}
+
+fn parse_ordinary_supply_framing(
+    bytes: &[u8],
+    subject: &str,
+) -> VResult<OrdinarySupplyFraming> {
+    let container_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if bytes.is_empty() || container_length > ORDINARY_MAX_SUPPLY_BUNDLE_BYTES {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject)
+            .at("complete container"));
+    }
+    let mut cursor = BinaryCursor::new(bytes, subject);
+    if cursor.read_exact(b"FND01SUPPLYv3\0".len())? != b"FND01SUPPLYv3\0" {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_HEADER", subject));
+    }
+    let bootstrap_lock_byte_length = cursor.read_u64()?;
+    let bootstrap_lock_length = checked_payload_length(
+        bootstrap_lock_byte_length,
+        ORDINARY_MAX_SOURCE_FILE_BYTES,
+        subject,
+    )?;
+    let bootstrap_lock_sha256: [u8; 32] = cursor
+        .read_exact(32)?
+        .try_into()
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject))?;
+    let bootstrap_lock = cursor.read_exact(bootstrap_lock_length)?;
+    if sha256(bootstrap_lock) != bootstrap_lock_sha256 {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject)
+            .at("bootstrap lock digest"));
+    }
+    let bootstrap_lock_toml = parse_toml_strict::<toml::Value>(
+        bootstrap_lock,
+        "ordinary supply bootstrap Cargo.lock",
+    )?;
+    let bootstrap_lock_root = bootstrap_lock_toml.as_table().ok_or_else(|| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject).at("root table")
+    })?;
+    let lock_packages = bootstrap_lock_root
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject).at("package array")
+        })?;
+    if bootstrap_lock_root.len() != 2
+        || bootstrap_lock_root
+            .get("version")
+            .and_then(toml::Value::as_integer)
+            != Some(4)
+        || lock_packages.is_empty()
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject)
+            .at("exact nonempty Cargo.lock v4 root"));
+    }
+    let mut expected_archives = BTreeMap::<String, [u8; 32]>::new();
+    let mut local_packages = BTreeSet::<(String, String)>::new();
+    for (ordinal, package) in lock_packages.iter().enumerate() {
+        let logical = format!("ordinary supply bootstrap Cargo.lock/package[{ordinal}]");
+        let package = package.as_table().ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical).at("package table")
+        })?;
+        if package.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "name" | "version" | "source" | "checksum" | "dependencies"
+            )
+        }) {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                .at("unknown package field"));
+        }
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical).at("name")
+            })?;
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical).at("version")
+            })?;
+        if name.is_empty()
+            || name.len() > 1_048_576
+            || version.is_empty()
+            || version.len() > 1_048_576
+            || SemverVersion::parse(version).is_err()
+        {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                .at("package name/version"));
+        }
+        match (package.get("source"), package.get("checksum")) {
+            (None, None) => {
+                if !local_packages.insert((name.to_owned(), version.to_owned())) {
+                    return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                        .at("duplicate local package"));
+                }
+            }
+            (Some(source), Some(checksum)) => {
+                validate_crates_io_package_name(name, &logical)?;
+                let source = source.as_str().ok_or_else(|| {
+                    Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical).at("source")
+                })?;
+                let checksum = checksum.as_str().ok_or_else(|| {
+                    Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical).at("checksum")
+                })?;
+                if source != CRATES_IO_SOURCE {
+                    return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                        .at("non-crates.io source"));
+                }
+                validate_sha256(checksum, &logical)?;
+                let checksum: [u8; 32] = decode_lower_hex(checksum, &logical)?
+                    .try_into()
+                    .map_err(|_| {
+                        Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                            .at("checksum width")
+                    })?;
+                let archive_path = format!("{name}-{version}.crate");
+                if expected_archives.insert(archive_path.clone(), checksum).is_some() {
+                    return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                        .at(format!("duplicate archive identity {archive_path}")));
+                }
+            }
+            _ => {
+                return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
+                    .at("source/checksum coupling"));
+            }
+        }
+    }
+    if local_packages
+        != [(
+            "fastmcp-fnd01-bootstrap-control".to_owned(),
+            "0.0.0".to_owned(),
+        )]
+        .into_iter()
+        .collect()
+        || expected_archives.is_empty()
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject)
+            .at("exact local package and nonempty crates.io set"));
+    }
+
+    let entry_count = usize::try_from(cursor.read_u32()?)
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", subject))?;
+    if entry_count == 0 || entry_count > ORDINARY_MAX_SUPPLY_ENTRY_COUNT {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", subject)
+            .at(entry_count.to_string()));
+    }
+    let declared_payload_bytes = cursor.read_u64()?;
+    if declared_payload_bytes == 0
+        || declared_payload_bytes > ORDINARY_MAX_SUPPLY_BUNDLE_BYTES
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject)
+            .at("declared payload bytes"));
+    }
+    let declared_inner_sha256: [u8; 32] = cursor
+        .read_exact(32)?
+        .try_into()
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", subject))?;
+    let closure_bijection_sha256: [u8; 32] = cursor
+        .read_exact(32)?
+        .try_into()
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", subject))?;
+    let mut inner = Sha256::new();
+    inner.update(b"FND01SUPPLY-ENTRIESv1\0");
+    inner.update(
+        u32::try_from(entry_count)
+            .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", subject))?
+            .to_be_bytes(),
+    );
+    let mut paths = Vec::new();
+    paths.try_reserve_exact(entry_count).map_err(|_| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", subject)
+            .at("entry paths")
+    })?;
+    let mut archives = Vec::new();
+    let mut seen_archives = BTreeSet::new();
+    let mut prior_key = None::<(u8, Vec<u8>)>;
+    let mut total_payload_bytes = 0u64;
+    for ordinal in 0..entry_count {
+        let logical = format!("{subject}/entry[{ordinal}]");
+        let kind = cursor.read_u8()?;
+        if !matches!(kind, 0x01 | 0x02 | 0x03) {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_KIND", &logical)
+                .at(format!("{kind:#04x}")));
+        }
+        let path = cursor.read_string(240)?;
+        validate_ascii_posix_path(&path, &logical)?;
+        match kind {
+            0x01 => {
+                let basename = path.strip_suffix(".crate").ok_or_else(|| {
+                    Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_PATH", &logical)
+                        .at(&path)
+                })?;
+                if path.contains('/') || basename.is_empty() {
+                    return Err(
+                        Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_PATH", &logical)
+                            .at(&path),
+                    );
+                }
+            }
+            0x02 => {
+                let package_name = path.rsplit('/').next().unwrap_or_default();
+                if crates_io_index_path(package_name, &logical)? != path {
+                    return Err(
+                        Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_PATH", &logical)
+                            .at(&path),
+                    );
+                }
+            }
+            0x03 => {
+                if path
+                    .strip_prefix("sparse-cache/")
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(
+                        Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_PATH", &logical)
+                            .at(&path),
+                    );
+                }
+            }
+            _ => unreachable!("kind domain checked above"),
+        }
+        let key = (kind, path.as_bytes().to_vec());
+        if prior_key.as_ref().is_some_and(|prior| prior >= &key) {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_ORDER", &logical)
+                .at(&path));
+        }
+        prior_key = Some(key);
+        paths.push(path.clone());
+
+        let payload_byte_length = cursor.read_u64()?;
+        let payload_limit = match kind {
+            0x01 => ORDINARY_ARCHIVE_BOUNDS.max_archive_compressed_bytes,
+            0x02 => ORDINARY_MAX_SOURCE_FILE_BYTES,
+            0x03 => ORDINARY_MAX_SPARSE_CACHE_INPUT_BYTES,
+            _ => unreachable!("kind domain checked above"),
+        };
+        let payload_length =
+            checked_payload_length(payload_byte_length, payload_limit, &logical)?;
+        let payload_sha256: [u8; 32] = cursor
+            .read_exact(32)?
+            .try_into()
+            .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", &logical))?;
+        let payload_offset = cursor.position();
+        let payload = cursor.read_exact(payload_length)?;
+        if sha256(payload) != payload_sha256 {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", &logical)
+                .at(&path));
+        }
+        if kind == 0x01 {
+            let expected_sha256 = expected_archives.get(&path).ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BINDING", &logical)
+                    .at(format!("{path}: absent from bootstrap lock"))
+            })?;
+            if expected_sha256 != &payload_sha256 || !seen_archives.insert(path.clone()) {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BINDING", &logical)
+                        .at(format!("{path}: lock checksum or uniqueness")),
+                );
+            }
+        }
+        total_payload_bytes = total_payload_bytes
+            .checked_add(payload_byte_length)
+            .ok_or_else(|| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject))?;
+        if total_payload_bytes > declared_payload_bytes
+            || total_payload_bytes > ORDINARY_MAX_SUPPLY_BUNDLE_BYTES
+        {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject)
+                .at("aggregate entry payloads"));
+        }
+        inner.update([kind]);
+        inner.update(
+            u32::try_from(path.len())
+                .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", &logical))?
+                .to_be_bytes(),
+        );
+        inner.update(path.as_bytes());
+        inner.update(payload_byte_length.to_be_bytes());
+        inner.update(payload_sha256);
+        inner.update(payload);
+        if kind == 0x01 {
+            let expected_root = path
+                .strip_suffix(".crate")
+                .ok_or_else(|| {
+                    Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_PATH", &logical)
+                })?
+                .to_owned();
+            archives.try_reserve(1).map_err(|_| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", subject)
+                    .at("archive bindings")
+            })?;
+            archives.push(OrdinarySupplyArchiveBinding {
+                path,
+                expected_root,
+                payload_offset,
+                byte_length: payload_byte_length,
+                sha256: payload_sha256,
+            });
+        }
+    }
+    cursor.finish()?;
+    validate_case_unique(paths, "ordinary supply entry paths")?;
+    if total_payload_bytes != declared_payload_bytes {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject)
+            .at("declared/actual payload total"));
+    }
+    let actual_inner_sha256: [u8; 32] = inner.finalize().into();
+    if actual_inner_sha256 != declared_inner_sha256 {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", subject)
+            .at("inner entry-set digest"));
+    }
+    if archives.is_empty()
+        || seen_archives.len() != expected_archives.len()
+        || expected_archives
+            .keys()
+            .any(|path| !seen_archives.contains(path))
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_SET", subject)
+            .at("0x01 archive set differs from bootstrap lock"));
+    }
+    Ok(OrdinarySupplyFraming {
+        bootstrap_lock_byte_length,
+        bootstrap_lock_sha256,
+        entry_count,
+        total_payload_bytes,
+        inner_entry_set_sha256: declared_inner_sha256,
+        closure_bijection_sha256,
+        archives,
+    })
+}
+
+fn validate_ordinary_supply_archives(
+    bytes: &[u8],
+    framing: &OrdinarySupplyFraming,
+) -> VResult<()> {
+    for archive in &framing.archives {
+        let payload_length = usize::try_from(archive.byte_length).map_err(|_| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BOUND", &archive.path)
+        })?;
+        let payload_end = archive
+            .payload_offset
+            .checked_add(payload_length)
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BOUND", &archive.path)
+            })?;
+        let payload = bytes
+            .get(archive.payload_offset..payload_end)
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BOUND", &archive.path)
+            })?;
+        if sha256(payload) != archive.sha256 {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BINDING", &archive.path)
+                    .at("pre-validation digest"),
+            );
+        }
+        let summary = validate_gzip_tar(
+            payload,
+            &ORDINARY_ARCHIVE_BOUNDS,
+            &archive.path,
+            Some(&archive.expected_root),
+        )?;
+        if summary.root != archive.expected_root
+            || u64::try_from(payload.len()).unwrap_or(u64::MAX) != archive.byte_length
+            || sha256(payload) != archive.sha256
+        {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_BINDING", &archive.path)
+                    .at("post-validation binding"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reopen_ordinary_bound_file(
+    path: &Path,
+    maximum: u64,
+    expected_byte_length: u64,
+    expected_sha256: [u8; 32],
+    subject: &str,
+) -> VResult<Vec<u8>> {
+    if expected_byte_length == 0 || expected_byte_length > maximum {
+        return Err(Diagnostic::error("E_ORDINARY_RECHECK_BOUND", subject));
+    }
+    let bytes = read_bounded(path, maximum, subject)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_byte_length
+        || sha256(&bytes) != expected_sha256
+    {
+        return Err(Diagnostic::error("E_ORDINARY_RECHECK_BINDING", subject));
+    }
+    Ok(bytes)
+}
+
+fn parse_ordinary_acquisition_spool(
+    bytes: &[u8],
+    run_id: &str,
+    supply_path: &str,
+    supply_byte_length: u64,
+    supply_sha256: [u8; 32],
+) -> Result<CanonicalRecord, String> {
+    let record = parse_canonical_record_file_with_final_self_digest(
+        bytes,
+        ACQUISITION_SPOOL_PREFIX,
+        "acquisition-spool",
+        "spool_set_sha256",
+        ORDINARY_MAX_ACQUISITION_SPOOL_BYTES,
+        "ordinary acquisition spool",
+    )
+    .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let commands = record
+        .records("command")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    if record
+        .string("format")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+        != "FND01ACQSPOOLv1"
+        || record
+            .unsigned("schema_version")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != 1
+        || record
+            .string("role")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != "integration-producer"
+        || record
+            .string("run_id")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != run_id
+        || record
+            .unsigned("command_count")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != 2
+        || commands.len() != 2
+    {
+        return Err("E_HANDOFF_SPOOL: format/schema/role/run/count mismatch".to_owned());
+    }
+    for (ordinal, (command, expected_id)) in commands
+        .iter()
+        .zip(["bootstrap.resolve", "bootstrap.fetch"])
+        .enumerate()
+    {
+        if command
+            .string("id")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != expected_id
+            || command
+                .unsigned("ordinal")
+                .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+                != u64::try_from(ordinal)
+                    .map_err(|_| "E_HANDOFF_SPOOL: ordinal conversion".to_owned())?
+            || command
+                .signed("exit_code")
+                .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+                != 0
+            || command
+                .string("evidence_verdict")
+                .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+                != "Pass"
+        {
+            return Err(format!(
+                "E_HANDOFF_SPOOL: command ordinal {ordinal} mismatch"
+            ));
+        }
+    }
+    let spool_supply = record
+        .record("supply_bundle")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let spool_supply_sha256 = super::trust_std::decode_lower_hex::<32>(
+        spool_supply
+            .string("sha256")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?,
+        "ordinary spool supply SHA-256",
+    )
+    .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    if spool_supply
+        .string("path")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+        != supply_path
+        || spool_supply
+            .unsigned("byte_length")
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?
+            != supply_byte_length
+        || spool_supply_sha256 != supply_sha256
+    {
+        return Err("E_HANDOFF_SPOOL: supply binding mismatch".to_owned());
+    }
+    Ok(record)
+}
+
+
 /// Ordinary same-PID handoff entry for produce/attest.
 ///
 /// Implements the first fail-closed checks from
 /// `bootstrap_control_plane_contract.harness_entry_rule` that can run without
 /// the full Phase-B producer ledger pipeline:
 /// argv/env closedness, current-exe identity, repository root, control-ledger
-/// presence/prefix/bound, and nonzero process-id inequality against zero.
-/// Full ledger reparse, acquisition-spool import, supply archive validation,
-/// tool re-probe, and evidence dispatch remain fail-closed until Phase-B
-/// acquisition/archive implementation lands and freezes.
+/// presence/prefix/bound, nonzero process-id inequality against zero, complete
+/// supply framing and archive validation, and the mandatory post-validation
+/// ledger/supply/spool recheck. Tool re-probe and evidence dispatch remain
+/// fail-closed until their ordinary matrix lands and freezes.
 ///
 /// harness_entry_rule: ordinary role handoff never writes direct stdout/stderr;
 /// every failure/pending path returns 3 silently.
@@ -64037,7 +67913,8 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
         Err(_) => return 3,
     };
     match validate_ordinary_handoff_entry(&invocation, &environment) {
-        Ok(()) => 3,
+        // Success must not be conflated with admission failure (both used to return 3).
+        Ok(()) => 0,
         Err(_) => 3,
     }
 }
@@ -64150,6 +68027,7 @@ fn validate_ordinary_handoff_entry(
             return Err("E_HANDOFF_LEDGER: post-read inode/nlink desync".to_owned());
         }
     }
+    drop(file);
     if !bytes.starts_with(CONTROL_LEDGER_PREFIX) {
         return Err(
             "E_HANDOFF_LEDGER: control ledger missing exact FND01CONTROLv2 prefix".to_owned(),
@@ -64166,6 +68044,7 @@ fn validate_ordinary_handoff_entry(
         "control ledger",
     )
     .map_err(|error| format!("E_HANDOFF_LEDGER: {error}"))?;
+    let ledger_first_sha256 = sha256(&bytes);
     let role = bootstrap_role_name(invocation.mode)
         .map_err(|error| format!("E_HANDOFF_MODE: {error}"))?;
     if record.string("format").map_err(|error| format!("E_HANDOFF_LEDGER: {error}"))?
@@ -64215,6 +68094,13 @@ fn validate_ordinary_handoff_entry(
     let selected_len = selected
         .unsigned("byte_length")
         .map_err(|error| format!("E_HANDOFF_EXECUTABLE: {error}"))?;
+    let selected_sha256 = super::trust_std::decode_lower_hex::<32>(
+        selected
+            .string("sha256")
+            .map_err(|error| format!("E_HANDOFF_EXECUTABLE: {error}"))?,
+        "ordinary selected executable SHA-256",
+    )
+    .map_err(|error| format!("E_HANDOFF_EXECUTABLE: {error}"))?;
     if selected_len == 0 {
         return Err("E_HANDOFF_EXECUTABLE: selected_executable empty".to_owned());
     }
@@ -64229,6 +68115,37 @@ fn validate_ordinary_handoff_entry(
                 .to_owned(),
         );
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if exe_meta.nlink() != 1 || exe_meta.permissions().mode() & 0o111 == 0 {
+            return Err(
+                "E_HANDOFF_EXECUTABLE: current executable must be nlink-one and executable"
+                    .to_owned(),
+            );
+        }
+    }
+    let executable_relative = current_executable
+        .strip_prefix(&invocation.repository_root)
+        .map_err(|_| {
+            "E_HANDOFF_EXECUTABLE: current executable escapes the physical repository"
+                .to_owned()
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            "E_HANDOFF_EXECUTABLE: repository-relative executable path must be UTF-8"
+                .to_owned()
+        })?;
+    super::trust_std::checked_snapshot(
+        &invocation.repository_root,
+        executable_relative,
+        selected_len,
+        Some(super::trust_std::FileBinding {
+            byte_length: selected_len,
+            sha256: selected_sha256,
+        }),
+    )
+    .map_err(|error| format!("E_HANDOFF_EXECUTABLE: {error}"))?;
     // Rebind supply-bundle path/length/sha256 against the sealed tree before the
     // full ControlLedgerExpectation join (which still needs tool/env/scratch digests).
     let supply = record
@@ -64284,13 +68201,14 @@ fn validate_ordinary_handoff_entry(
         Ok(_) => return Err("E_HANDOFF_SUPPLY: grew past declared length".to_owned()),
         Err(error) => return Err(format!("E_HANDOFF_SUPPLY: trailing probe: {error}")),
     }
-    let actual_sha = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&supply_bytes);
-        format!("{:x}", hasher.finalize())
-    };
-    if actual_sha != supply_sha {
+    drop(supply_file);
+    let expected_supply_sha256 = super::trust_std::decode_lower_hex::<32>(
+        supply_sha,
+        "ordinary supply bundle SHA-256",
+    )
+    .map_err(|error| format!("E_HANDOFF_SUPPLY: {error}"))?;
+    let supply_first_sha256 = sha256(&supply_bytes);
+    if supply_first_sha256 != expected_supply_sha256 {
         return Err("E_HANDOFF_SUPPLY: supply SHA-256 desync from ledger".to_owned());
     }
     if !supply_bytes.starts_with(b"FND01SUPPLYv3\0") {
@@ -64338,13 +68256,804 @@ fn validate_ordinary_handoff_entry(
                 .to_owned(),
         );
     }
-    // Full ControlLedgerExpectation join, acquisition-spool option, full ordinary
-    // archive member validation, tool reprobe, and evidence dispatch remain
-    // fail-closed until Phase-B freezes the producer path.
-    let _ = (&record, supply_bytes.len(), handoff_argv.len(), ledger_env.len());
-    Err(
-        "E_ORDINARY_HANDOFF_PENDING: structural reparse, PID/role/run, selected-executable path/length, supply rebind/hash, handoff argv, and handoff_environment join passed; full expectation/archive/tool/evidence matrix remains fail-closed".to_owned(),
+
+    // Bind the role-appropriate acquisition-spool option before touching archive
+    // contents. Produce carries one exact immutable spool; Attest carries no value.
+    let spool_option = record
+        .record("acquisition_spool")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let spool_present = spool_option
+        .boolean("present")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let spool_path = spool_option
+        .optional_string("path")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let spool_byte_length = spool_option
+        .optional_unsigned("byte_length")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let spool_sha256_text = spool_option
+        .optional_string("sha256")
+        .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+    let first_spool = match invocation.mode {
+        BootstrapMode::Produce => {
+            let (spool_path, spool_byte_length, spool_sha256_text) = match (
+                spool_path,
+                spool_byte_length,
+                spool_sha256_text,
+            ) {
+                (Some(path), Some(byte_length), Some(sha256)) if spool_present => {
+                    (path, byte_length, sha256)
+                }
+                _ => {
+                    return Err(
+                        "E_HANDOFF_SPOOL: Produce requires one complete present binding"
+                            .to_owned(),
+                    );
+                }
+            };
+            let expected_spool_path = invocation
+                .repository_root
+                .join(".fnd01-run")
+                .join("integration-producer")
+                .join(&invocation.run_id)
+                .join("acquisition-spool.bin");
+            if !Path::new(spool_path).is_absolute()
+                || Path::new(spool_path) != expected_spool_path.as_path()
+            {
+                return Err(
+                    "E_HANDOFF_SPOOL: producer spool path differs from exact run formula"
+                        .to_owned(),
+                );
+            }
+            let spool_sha256 = super::trust_std::decode_lower_hex::<32>(
+                spool_sha256_text,
+                "ordinary acquisition spool SHA-256",
+            )
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
+            let spool_bytes = reopen_ordinary_bound_file(
+                &expected_spool_path,
+                ORDINARY_MAX_ACQUISITION_SPOOL_BYTES,
+                spool_byte_length,
+                spool_sha256,
+                "ordinary acquisition spool first binding",
+            )
+            .map_err(|error| format!("E_HANDOFF_SPOOL: {}", error.stable()))?;
+            let spool_record = parse_ordinary_acquisition_spool(
+                &spool_bytes,
+                &invocation.run_id,
+                supply_path,
+                supply_len,
+                supply_first_sha256,
+            )?;
+            Some(OrdinarySpoolBinding {
+                path: expected_spool_path,
+                byte_length: spool_byte_length,
+                sha256: spool_sha256,
+                record: spool_record,
+            })
+        }
+        BootstrapMode::Attest => {
+            if spool_present
+                || spool_path.is_some()
+                || spool_byte_length.is_some()
+                || spool_sha256_text.is_some()
+            {
+                return Err(
+                    "E_HANDOFF_SPOOL: Attest requires the exact absent option".to_owned(),
+                );
+            }
+            None
+        }
+        BootstrapMode::Gate => {
+            return Err("E_HANDOFF_MODE: Gate cannot enter ordinary handoff".to_owned());
+        }
+    };
+
+    // ordinary_archive_validation_rule step 2: parse the complete custom
+    // container first, then validate every already-bound 0x01 payload. No
+    // archive decompression occurs until framing/order/bounds/digests reach EOF.
+    let first_supply_framing = parse_ordinary_supply_framing(
+        &supply_bytes,
+        "ordinary handoff supply bundle",
     )
+    .map_err(|error| format!("E_HANDOFF_SUPPLY_PARSE: {}", error.stable()))?;
+    validate_ordinary_supply_archives(&supply_bytes, &first_supply_framing)
+        .map_err(|error| format!("E_HANDOFF_ARCHIVE: {}", error.stable()))?;
+    drop(bytes);
+    drop(supply_bytes);
+
+    // ordinary_archive_validation_rule step 3: after the final archive, reopen
+    // and independently strict-reparse/re-hash every first-bound handoff object.
+    let ledger_recheck_bytes = reopen_ordinary_bound_file(
+        &ledger_path,
+        MAX_CONTROL_LEDGER_BYTES,
+        declared_len,
+        ledger_first_sha256,
+        "ordinary control ledger post-archive recheck",
+    )
+    .map_err(|error| format!("E_HANDOFF_LEDGER_RECHECK: {}", error.stable()))?;
+    let ledger_recheck = parse_canonical_record_file_with_final_self_digest(
+        &ledger_recheck_bytes,
+        CONTROL_LEDGER_PREFIX,
+        "control-ledger",
+        "ledger_set_sha256",
+        MAX_CONTROL_LEDGER_BYTES,
+        "ordinary control ledger post-archive recheck",
+    )
+    .map_err(|error| format!("E_HANDOFF_LEDGER_RECHECK: {error}"))?;
+    if ledger_recheck != record {
+        return Err(
+            "E_HANDOFF_LEDGER_RECHECK: canonical ledger differs from first binding"
+                .to_owned(),
+        );
+    }
+
+    let supply_recheck_bytes = reopen_ordinary_bound_file(
+        &supply_abs,
+        ORDINARY_MAX_SUPPLY_BUNDLE_BYTES,
+        supply_len,
+        supply_first_sha256,
+        "ordinary supply bundle post-archive recheck",
+    )
+    .map_err(|error| format!("E_HANDOFF_SUPPLY_RECHECK: {}", error.stable()))?;
+    let supply_recheck_framing = parse_ordinary_supply_framing(
+        &supply_recheck_bytes,
+        "ordinary supply bundle post-archive recheck",
+    )
+    .map_err(|error| format!("E_HANDOFF_SUPPLY_RECHECK: {}", error.stable()))?;
+    if supply_recheck_framing != first_supply_framing {
+        return Err(
+            "E_HANDOFF_SUPPLY_RECHECK: framing differs from first binding".to_owned(),
+        );
+    }
+
+    if let Some(first_spool) = &first_spool {
+        let spool_recheck_bytes = reopen_ordinary_bound_file(
+            &first_spool.path,
+            ORDINARY_MAX_ACQUISITION_SPOOL_BYTES,
+            first_spool.byte_length,
+            first_spool.sha256,
+            "ordinary acquisition spool post-archive recheck",
+        )
+        .map_err(|error| format!("E_HANDOFF_SPOOL_RECHECK: {}", error.stable()))?;
+        let spool_recheck = parse_ordinary_acquisition_spool(
+            &spool_recheck_bytes,
+            &invocation.run_id,
+            supply_path,
+            supply_len,
+            supply_first_sha256,
+        )?;
+        if spool_recheck != first_spool.record {
+            return Err(
+                "E_HANDOFF_SPOOL_RECHECK: canonical spool differs from first binding"
+                    .to_owned(),
+            );
+        }
+    }
+
+    // ordinary_tool_reprobe_rule step 4: recompute pure environment-set template
+    // digest and re-resolve/re-probe all 20 native tools against closed PATH and
+    // the role execution-bin before any workspace/evidence child.
+    let tool_set_hex = record
+        .string("tool_set_sha256")
+        .map_err(|error| format!("E_HANDOFF_TOOL_SET: {error}"))?;
+    let environment_set_hex = record
+        .string("environment_set_sha256")
+        .map_err(|error| format!("E_HANDOFF_ENVIRONMENT_SET: {error}"))?;
+    let tool_set = ordinary_decode_sha256_hex(tool_set_hex, "tool_set_sha256")?;
+    let environment_set =
+        ordinary_decode_sha256_hex(environment_set_hex, "environment_set_sha256")?;
+    if tool_set == [0; 32] || environment_set == [0; 32] {
+        return Err(
+            "E_HANDOFF_TOOL_SET: tool/environment set digests must be nonzero".to_owned(),
+        );
+    }
+    let expected_env = ordinary_environment_set_digest();
+    if environment_set != expected_env {
+        return Err(
+            "E_HANDOFF_ENVIRONMENT_SET: environment template digest desync from compiled authority"
+                .to_owned(),
+        );
+    }
+    let expected_tool = ordinary_reprobe_tool_set(
+        &invocation.repository_root,
+        &environment.closed_path,
+        &invocation.run_root,
+    )?;
+    if tool_set != expected_tool {
+        return Err(
+            "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
+        );
+    }
+    // Evidence matrix: run the dependency-backed verifier on the sealed workspace
+    // after control-ledger, supply, spool, and tool/env joins.
+    // Diagnostics remain silent on the ordinary handoff path (harness_entry_rule);
+    // only the exit code is observed by the bootstrap parent.
+    match run_verifier() {
+        Ok(report) => {
+            if report.has_errors() {
+                Err(
+                    "E_ORDINARY_EVIDENCE: dependency-backed verifier reported stable diagnostics"
+                        .to_owned(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => Err(
+            "E_ORDINARY_EVIDENCE: dependency-backed verifier failed before report".to_owned(),
+        ),
+    }
+}
+
+fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn ordinary_append_u32_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("ordinary length bound");
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(bytes);
+}
+
+/// Pure environment-set template digest (must match produce encode_environment_set_digest).
+fn ordinary_environment_set_digest() -> [u8; 32] {
+    const PROFILES: &[(&str, &[(&str, &str)])] = &[
+        (
+            "acquisition",
+            &[
+                ("AR", "{tool.host-ar.path}"),
+                ("CARGO_HOME", "{producer-cargo-home}"),
+                ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"),
+                ("CARGO_TARGET_DIR", "{producer-custom-target}"),
+                ("CC", "{tool.host-cc.path}"),
+                ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("PATH", "{closed-execution-bin}"),
+                ("RANLIB", "{tool.host-ranlib.path}"),
+                ("RUSTC", "{tool.rustc.path}"),
+                ("RUSTDOC", "{tool.rustdoc.path}"),
+                ("RUSTFMT", "{tool.rustfmt.path}"),
+                ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                ("SOURCE_DATE_EPOCH", "0"),
+                ("TZ", "UTC"),
+            ],
+        ),
+        (
+            "offline",
+            &[
+                ("AR", "{tool.host-ar.path}"),
+                ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                ("CARGO_NET_OFFLINE", "true"),
+                ("CARGO_TARGET_DIR", "{fresh-command-target}"),
+                ("CC", "{tool.host-cc.path}"),
+                ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("PATH", "{closed-execution-bin}"),
+                ("RANLIB", "{tool.host-ranlib.path}"),
+                ("RUSTC", "{tool.rustc.path}"),
+                ("RUSTDOC", "{tool.rustdoc.path}"),
+                ("RUSTFMT", "{tool.rustfmt.path}"),
+                ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                ("SOURCE_DATE_EPOCH", "0"),
+                ("TZ", "UTC"),
+            ],
+        ),
+        (
+            "offline_control",
+            &[
+                ("AR", "{tool.host-ar.path}"),
+                ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                ("CARGO_NET_OFFLINE", "true"),
+                ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"),
+                ("CC", "{tool.host-cc.path}"),
+                ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("PATH", "{closed-execution-bin}"),
+                ("RANLIB", "{tool.host-ranlib.path}"),
+                ("RUSTC", "{tool.rustc.path}"),
+                ("RUSTDOC", "{tool.rustdoc.path}"),
+                ("RUSTFMT", "{tool.rustfmt.path}"),
+                ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                ("SOURCE_DATE_EPOCH", "0"),
+                ("TZ", "UTC"),
+            ],
+        ),
+        (
+            "offline_cross",
+            &[
+                ("AR", "{target-tool-profile.ar.path}"),
+                ("CARGO_HOME", "{fresh-role-cargo-home}"),
+                ("CARGO_NET_OFFLINE", "true"),
+                ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"),
+                ("CC", "{target-tool-profile.cc.path}"),
+                ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("PATH", "{closed-execution-bin}"),
+                ("RUSTC", "{tool.rustc.path}"),
+                ("RUSTDOC", "{tool.rustdoc.path}"),
+                ("RUSTFMT", "{tool.rustfmt.path}"),
+                ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                ("SOURCE_DATE_EPOCH", "0"),
+                ("TZ", "UTC"),
+                (
+                    "{target-tool-profile.ar-env-key}",
+                    "{target-tool-profile.ar.path}",
+                ),
+                (
+                    "{target-tool-profile.cc-env-key}",
+                    "{target-tool-profile.cc.path}",
+                ),
+                (
+                    "{target-tool-profile.cflags-env-key}",
+                    "{target-tool-profile.cflags-exact}",
+                ),
+                (
+                    "{target-tool-profile.linker-env-key}",
+                    "{target-tool-profile.linker.path}",
+                ),
+                (
+                    "{target-tool-profile.rustflags-env-key}",
+                    "{target-tool-profile.rustflags-exact}",
+                ),
+            ],
+        ),
+        (
+            "tool_identity",
+            &[
+                ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("PATH", "{closed-execution-bin}"),
+                ("RUSTFMT", "{tool.rustfmt.path}"),
+                ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
+                ("TZ", "UTC"),
+            ],
+        ),
+        (
+            "openssl",
+            &[
+                ("LANG", "C"),
+                ("LC_ALL", "C"),
+                ("OPENSSL_CONF", "{exact-kat-openssl-config}"),
+                ("PATH", "{closed-execution-bin}"),
+                ("TZ", "UTC"),
+            ],
+        ),
+    ];
+    let mut output = b"FND01BOOTSTRAPENVSv1\0".to_vec();
+    output.extend_from_slice(&6u32.to_be_bytes());
+    for (id, required) in PROFILES {
+        ordinary_append_u32_bytes(&mut output, id.as_bytes());
+        output.extend_from_slice(&(required.len() as u32).to_be_bytes());
+        for (key, value) in *required {
+            ordinary_append_u32_bytes(&mut output, key.as_bytes());
+            ordinary_append_u32_bytes(&mut output, value.as_bytes());
+        }
+        output.extend_from_slice(&0u32.to_be_bytes());
+    }
+    ordinary_sha256(&output)
+}
+
+/// Re-resolve and re-probe all 20 native tools; return tool_set_sha256.
+/// Mirrors produce inventory_native_tools without creating a fresh execution-bin
+/// (produce already sealed it; ordinary revalidates the existing set).
+fn ordinary_reprobe_tool_set(
+    repository_root: &Path,
+    closed_path: &str,
+    run_root: &Path,
+) -> Result<[u8; 32], String> {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Command, Stdio};
+
+    struct NativeTool {
+        id: &'static str,
+        candidates: &'static [&'static str],
+        version_argv: &'static [&'static str],
+        stream: &'static str,
+        parser: &'static str,
+    }
+    const NATIVE_TOOLS: &[NativeTool] = &[
+        NativeTool { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", parser:"rustc-vv-pinned-1.99" },
+        NativeTool { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", parser:"cargo-vv-pinned-1.99" },
+        NativeTool { id:"rustdoc", candidates:&["{pinned-toolchain-bin}/rustdoc"], version_argv:&["--version"], stream:"stdout", parser:"rustdoc-pinned-1.99" },
+        NativeTool { id:"rustfmt", candidates:&["{pinned-toolchain-bin}/rustfmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
+        NativeTool { id:"cargo-fmt", candidates:&["{pinned-toolchain-bin}/cargo-fmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
+        NativeTool { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
+        NativeTool { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
+        NativeTool { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", parser:"lld-gnu-version" },
+        NativeTool { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeTool { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", parser:"openssl-version-a" },
+        NativeTool { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
+        NativeTool { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeTool { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeTool { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", parser:"aarch64-c-compiler-v" },
+        NativeTool { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeTool { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
+        NativeTool { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeTool { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
+        NativeTool { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
+        NativeTool { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
+    ];
+    const EXECUTION_BIN_NAMES: [&str; 20] = [
+        "rustc", "cargo", "rustdoc", "rustfmt", "cargo-fmt", "cargo-clippy", "clippy-driver",
+        "rust-lld", "llvm-nm", "openssl", "cc", "ar", "ranlib", "aarch64-linux-gnu-gcc",
+        "aarch64-linux-gnu-ar", "apple-clang", "apple-ar", "clang-cl", "llvm-lib", "lld-link",
+    ];
+    const ABSENT: u8 = 0x01;
+    const SELECTED: u8 = 0x02;
+    const SHADOWED: u8 = 0x03;
+
+    let toolchain_bin = closed_path
+        .strip_suffix(":/usr/bin:/bin")
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: closed PATH suffix".to_owned())?;
+    if toolchain_bin.is_empty()
+        || toolchain_bin.contains(':')
+        || !toolchain_bin.starts_with('/')
+        || !toolchain_bin.ends_with("/bin")
+    {
+        return Err("E_HANDOFF_TOOL_SET: invalid pinned toolchain bin".to_owned());
+    }
+    let rust_sysroot = Path::new(toolchain_bin)
+        .parent()
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: missing sysroot".to_owned())?
+        .to_str()
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: sysroot UTF-8".to_owned())?;
+    let execution_bin = run_root.join("execution-bin");
+    if !execution_bin.is_dir() {
+        return Err("E_HANDOFF_TOOL_SET: execution-bin missing".to_owned());
+    }
+    // Revalidate exact 20-symlink execution-bin set.
+    let mut seen = BTreeSet::new();
+    for entry in std::fs::read_dir(&execution_bin)
+        .map_err(|e| format!("E_HANDOFF_TOOL_SET: execution-bin read_dir: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("E_HANDOFF_TOOL_SET: entry: {e}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "E_HANDOFF_TOOL_SET: non-UTF-8 entry".to_owned())?;
+        if !EXECUTION_BIN_NAMES.contains(&name.as_str()) || !seen.insert(name.clone()) {
+            return Err(format!("E_HANDOFF_TOOL_SET: unexpected/duplicate entry {name}"));
+        }
+        let meta = std::fs::symlink_metadata(entry.path())
+            .map_err(|e| format!("E_HANDOFF_TOOL_SET: {name} metadata: {e}"))?;
+        if !meta.file_type().is_symlink() {
+            return Err(format!("E_HANDOFF_TOOL_SET: {name} must be symlink"));
+        }
+    }
+    if seen.len() != 20 {
+        return Err(format!(
+            "E_HANDOFF_TOOL_SET: execution-bin entry count {} != 20",
+            seen.len()
+        ));
+    }
+
+    fn expand(template: &str, toolchain_bin: &str, rust_sysroot: &str) -> Result<String, String> {
+        if let Some(rest) = template.strip_prefix("{pinned-toolchain-bin}/") {
+            Ok(format!("{toolchain_bin}/{rest}"))
+        } else if let Some(rest) = template.strip_prefix("{pinned-rust-sysroot}/") {
+            Ok(format!("{rust_sysroot}/{rest}"))
+        } else if template.starts_with('/') {
+            Ok(template.to_owned())
+        } else {
+            Err(format!("E_HANDOFF_TOOL_SET: unexpanded {template}"))
+        }
+    }
+
+    // device u64 + inode u64 + mode u32 + nlink u64 + length u64
+    // + mtime i64 + mtime_nsec u32 + ctime i64 + ctime_nsec u32 = 60 bytes
+    fn identity_bytes(meta: &std::fs::Metadata, length: u64) -> Result<[u8; 60], String> {
+        let mtn = u32::try_from(meta.mtime_nsec())
+            .map_err(|_| "E_HANDOFF_TOOL_SET: mtime nsec".to_owned())?;
+        let ctn = u32::try_from(meta.ctime_nsec())
+            .map_err(|_| "E_HANDOFF_TOOL_SET: ctime nsec".to_owned())?;
+        if mtn >= 1_000_000_000 || ctn >= 1_000_000_000 {
+            return Err("E_HANDOFF_TOOL_SET: nsec bound".to_owned());
+        }
+        let mut out = Vec::with_capacity(60);
+        out.extend_from_slice(&meta.dev().to_be_bytes());
+        out.extend_from_slice(&meta.ino().to_be_bytes());
+        out.extend_from_slice(&meta.mode().to_be_bytes());
+        out.extend_from_slice(&meta.nlink().to_be_bytes());
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&meta.mtime().to_be_bytes());
+        out.extend_from_slice(&mtn.to_be_bytes());
+        out.extend_from_slice(&meta.ctime().to_be_bytes());
+        out.extend_from_slice(&ctn.to_be_bytes());
+        if out.len() != 60 {
+            return Err("E_HANDOFF_TOOL_SET: identity layout".to_owned());
+        }
+        let mut fixed = [0u8; 60];
+        fixed.copy_from_slice(&out);
+        Ok(fixed)
+    }
+
+    struct Cand {
+        path: String,
+        disposition: u8,
+        hops: Vec<(String, Vec<u8>, [u8; 60])>,
+        final_path: Option<String>,
+        final_ident: Option<[u8; 60]>,
+        final_sha: Option<[u8; 32]>,
+    }
+
+    fn resolve_cand(path: &str) -> Result<Cand, String> {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Cand {
+                    path: path.to_owned(),
+                    disposition: ABSENT,
+                    hops: Vec::new(),
+                    final_path: None,
+                    final_ident: None,
+                    final_sha: None,
+                });
+            }
+            Err(e) => return Err(format!("E_HANDOFF_TOOL_SET: metadata {path}: {e}")),
+        };
+        let mut hops = Vec::new();
+        let mut current = path.to_owned();
+        let mut current_meta = meta;
+        let mut seen_paths = BTreeSet::new();
+        loop {
+            if !seen_paths.insert(current.clone()) {
+                return Err(format!("E_HANDOFF_TOOL_SET: cycle at {path}"));
+            }
+            if current_meta.file_type().is_symlink() {
+                if hops.len() >= 8 {
+                    return Err(format!("E_HANDOFF_TOOL_SET: hop cap at {path}"));
+                }
+                let link = std::fs::read_link(&current)
+                    .map_err(|e| format!("E_HANDOFF_TOOL_SET: readlink {current}: {e}"))?;
+                let link_raw = link.as_os_str().as_encoded_bytes().to_vec();
+                let ident = identity_bytes(&current_meta, link_raw.len() as u64)?;
+                hops.push((current.clone(), link_raw, ident));
+                let target = if link.is_absolute() {
+                    link
+                } else {
+                    Path::new(&current)
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(link)
+                };
+                current = target
+                    .to_str()
+                    .ok_or_else(|| "E_HANDOFF_TOOL_SET: target UTF-8".to_owned())?
+                    .to_owned();
+                current_meta = std::fs::symlink_metadata(&current)
+                    .map_err(|e| format!("E_HANDOFF_TOOL_SET: metadata {current}: {e}"))?;
+                continue;
+            }
+            if !current_meta.is_file() || current_meta.mode() & 0o111 == 0 {
+                return Err(format!(
+                    "E_HANDOFF_TOOL_SET: non-executable final for {path}"
+                ));
+            }
+            let mut file = std::fs::File::open(&current)
+                .map_err(|e| format!("E_HANDOFF_TOOL_SET: open {current}: {e}"))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("E_HANDOFF_TOOL_SET: read {current}: {e}"))?;
+            if bytes.len() as u64 != current_meta.len() {
+                return Err(format!("E_HANDOFF_TOOL_SET: length race {current}"));
+            }
+            let final_ident = identity_bytes(&current_meta, current_meta.len())?;
+            let final_sha = ordinary_sha256(&bytes);
+            return Ok(Cand {
+                path: path.to_owned(),
+                disposition: SELECTED,
+                hops,
+                final_path: Some(current),
+                final_ident: Some(final_ident),
+                final_sha: Some(final_sha),
+            });
+        }
+    }
+
+    // Resolve all roles.
+    let mut role_candidates: Vec<Vec<Cand>> = Vec::new();
+    let mut selected_paths: Vec<String> = Vec::new();
+    let mut selected_finals: Vec<String> = Vec::new();
+    for tool in NATIVE_TOOLS {
+        let mut cands = Vec::new();
+        let mut selected = None;
+        for template in tool.candidates {
+            let expanded = expand(template, toolchain_bin, rust_sysroot)?;
+            let mut cand = resolve_cand(&expanded)?;
+            if cand.disposition == ABSENT {
+                cands.push(cand);
+                continue;
+            }
+            if selected.is_none() {
+                cand.disposition = SELECTED;
+                selected = Some(cands.len());
+            } else {
+                cand.disposition = SHADOWED;
+            }
+            cands.push(cand);
+        }
+        let idx = selected.ok_or_else(|| {
+            format!("E_HANDOFF_TOOL_SET: {} has no selected candidate", tool.id)
+        })?;
+        selected_paths.push(cands[idx].path.clone());
+        selected_finals.push(
+            cands[idx]
+                .final_path
+                .clone()
+                .ok_or_else(|| format!("E_HANDOFF_TOOL_SET: {} missing final", tool.id))?,
+        );
+        role_candidates.push(cands);
+    }
+
+    let clippy = selected_finals
+        .get(6)
+        .cloned()
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: clippy-driver missing".to_owned())?;
+    let rustfmt = selected_finals
+        .get(3)
+        .cloned()
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: rustfmt missing".to_owned())?;
+    let execution_bin_str = execution_bin
+        .to_str()
+        .ok_or_else(|| "E_HANDOFF_TOOL_SET: execution-bin UTF-8".to_owned())?;
+
+    // Version probes.
+    let mut version_streams: Vec<Vec<u8>> = Vec::new();
+    for (tool, selected_path) in NATIVE_TOOLS.iter().zip(selected_paths.iter()) {
+        let mut cmd = Command::new(selected_path);
+        cmd.args(tool.version_argv)
+            .env_clear()
+            .env("CLIPPY_DRIVER", &clippy)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("PATH", execution_bin_str)
+            .env("RUSTFMT", &rustfmt)
+            .env("RUSTUP_TOOLCHAIN", "nightly-2026-07-11")
+            .env("TZ", "UTC")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd
+            .output()
+            .map_err(|e| format!("E_HANDOFF_TOOL_SET: probe {}: {e}", tool.id))?;
+        if !output.status.success() {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: probe {} exit {:?}",
+                tool.id,
+                output.status.code()
+            ));
+        }
+        let (selected_stream, unselected) = match tool.stream {
+            "stdout" => (output.stdout, output.stderr),
+            "stderr" => (output.stderr, output.stdout),
+            other => {
+                return Err(format!(
+                    "E_HANDOFF_TOOL_SET: unknown stream {other} for {}",
+                    tool.id
+                ));
+            }
+        };
+        if !unselected.is_empty() {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: {} unselected stream nonempty",
+                tool.id
+            ));
+        }
+        if selected_stream.is_empty()
+            || selected_stream.contains(&0)
+            || selected_stream.contains(&b'\r')
+            || !selected_stream.ends_with(b"\n")
+        {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: {} version stream framing",
+                tool.id
+            ));
+        }
+        version_streams.push(selected_stream);
+    }
+
+    // Encode tool_set_preimage.
+    let mut output = b"FND01BOOTSTRAPTOOLSv1\0".to_vec();
+    output.extend_from_slice(&20u32.to_be_bytes());
+    for (ordinal, tool) in NATIVE_TOOLS.iter().enumerate() {
+        output.extend_from_slice(&(ordinal as u32).to_be_bytes());
+        ordinary_append_u32_bytes(&mut output, tool.id.as_bytes());
+        let cands = &role_candidates[ordinal];
+        output.extend_from_slice(&(cands.len() as u32).to_be_bytes());
+        for cand in cands {
+            ordinary_append_u32_bytes(&mut output, cand.path.as_bytes());
+            output.push(cand.disposition);
+            match cand.disposition {
+                ABSENT => {
+                    output.extend_from_slice(&0u32.to_be_bytes());
+                }
+                SELECTED | SHADOWED => {
+                    output.extend_from_slice(&(cand.hops.len() as u32).to_be_bytes());
+                    for (link_path, link_raw, ident) in &cand.hops {
+                        ordinary_append_u32_bytes(&mut output, link_path.as_bytes());
+                        ordinary_append_u32_bytes(&mut output, link_raw);
+                        output.extend_from_slice(ident);
+                    }
+                    let fp = cand
+                        .final_path
+                        .as_ref()
+                        .ok_or_else(|| "E_HANDOFF_TOOL_SET: missing final".to_owned())?;
+                    let fi = cand
+                        .final_ident
+                        .ok_or_else(|| "E_HANDOFF_TOOL_SET: missing final ident".to_owned())?;
+                    let fs = cand
+                        .final_sha
+                        .ok_or_else(|| "E_HANDOFF_TOOL_SET: missing final sha".to_owned())?;
+                    ordinary_append_u32_bytes(&mut output, fp.as_bytes());
+                    output.extend_from_slice(&fi);
+                    output.extend_from_slice(&fs);
+                }
+                other => {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: bad disposition {other}"
+                    ));
+                }
+            }
+        }
+        // Selected path + final identity + version stream.
+        let selected = cands
+            .iter()
+            .find(|c| c.disposition == SELECTED)
+            .ok_or_else(|| format!("E_HANDOFF_TOOL_SET: {} no selected", tool.id))?;
+        ordinary_append_u32_bytes(&mut output, selected.path.as_bytes());
+        output.extend_from_slice(
+            &selected
+                .final_ident
+                .ok_or_else(|| "E_HANDOFF_TOOL_SET: selected final ident".to_owned())?,
+        );
+        ordinary_append_u32_bytes(&mut output, tool.stream.as_bytes());
+        let version = &version_streams[ordinal];
+        output.extend_from_slice(&(version.len() as u64).to_be_bytes());
+        output.extend_from_slice(&ordinary_sha256(version));
+        output.extend_from_slice(version);
+    }
+    let _ = repository_root;
+    Ok(ordinary_sha256(&output))
+}
+
+fn ordinary_decode_sha256_hex(hex: &str, subject: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| {
+        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+    }) {
+        return Err(format!(
+            "E_HANDOFF_DIGEST: {subject} must be 64 lowercase hex characters"
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = ordinary_hex_nibble(chunk[0])?;
+        let lo = ordinary_hex_nibble(chunk[1])?;
+        out[index] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn ordinary_hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err("E_HANDOFF_DIGEST: non-lowercase hex nibble".to_owned()),
+    }
 }
 
 pub fn harness_main<I>(arguments: I) -> i32
