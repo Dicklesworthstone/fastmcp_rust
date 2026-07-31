@@ -15655,6 +15655,227 @@ mod phase_b_std {
         JsonParser::new(bytes, subject).parse()
     }
 
+    fn json_array<'a>(value: &'a JsonValue, subject: &str) -> TrustResult<&'a [JsonValue]> {
+        match value {
+            JsonValue::Array(values) => Ok(values),
+            _ => Err(phase_b_error(
+                "E_PHASE_B_JSON_TYPE",
+                format!("{subject}: array required"),
+            )),
+        }
+    }
+
+    fn json_token(value: &JsonValue, subject: &str) -> TrustResult<String> {
+        let value = value.string(subject)?;
+        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: nonempty control-free string required"),
+            ));
+        }
+        let mut copied = String::new();
+        copied.try_reserve_exact(value.len())
+            .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+        copied.push_str(value);
+        Ok(copied)
+    }
+
+    fn json_nullable_token(value: &JsonValue, subject: &str) -> TrustResult<Option<String>> {
+        match value {
+            JsonValue::Null => Ok(None),
+            _ => json_token(value, subject).map(Some),
+        }
+    }
+
+    fn json_nullable_text(value: &JsonValue, subject: &str) -> TrustResult<Option<String>> {
+        match value {
+            JsonValue::Null => Ok(None),
+            JsonValue::String(text) if !text.contains('\0') => Ok(Some(text.clone())),
+            _ => Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: string or null required"),
+            )),
+        }
+    }
+
+    fn json_string_array(
+        value: &JsonValue,
+        allow_empty: bool,
+        require_unique: bool,
+        require_sorted: bool,
+        subject: &str,
+    ) -> TrustResult<Vec<String>> {
+        let values = json_array(value, subject)?;
+        if !allow_empty && values.is_empty() {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: nonempty array required"),
+            ));
+        }
+        let mut parsed = Vec::new();
+        parsed.try_reserve_exact(values.len())
+            .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+        for (ordinal, value) in values.iter().enumerate() {
+            parsed.push(json_token(value, &format!("{subject}[{ordinal}]"))?);
+        }
+        if require_unique && parsed.iter().collect::<BTreeSet<_>>().len() != parsed.len() {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: duplicate array member"),
+            ));
+        }
+        if require_sorted
+            && parsed.windows(2).any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_SCHEMA",
+                format!("{subject}: raw-byte sorted unique array required"),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn validate_absolute_metadata_path(value: &str, subject: &str) -> TrustResult<()> {
+        let path = Path::new(value);
+        if value.len() > 4096
+            || value.contains('\0')
+            || !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(component, Component::CurDir | Component::ParentDir)
+            })
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_METADATA_PATH",
+                format!("{subject}: absolute lexical path required"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StrictSemver {
+        major: u64,
+        minor: u64,
+        patch: u64,
+        prerelease: Vec<String>,
+        build: Vec<String>,
+    }
+
+    fn parse_semver_number(value: &str, subject: &str) -> TrustResult<u64> {
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SEMVER",
+                format!("{subject}: invalid numeric component {value:?}"),
+            ));
+        }
+        value.parse::<u64>().map_err(|_| {
+            phase_b_error(
+                "E_PHASE_B_SEMVER",
+                format!("{subject}: numeric component overflow"),
+            )
+        })
+    }
+
+    fn parse_semver_identifiers(
+        value: &str,
+        numeric_no_leading_zero: bool,
+        subject: &str,
+    ) -> TrustResult<Vec<String>> {
+        if value.is_empty() {
+            return Err(phase_b_error("E_PHASE_B_SEMVER", format!("{subject}: empty identifier set")));
+        }
+        let mut identifiers = Vec::new();
+        for identifier in value.split('.') {
+            if identifier.is_empty()
+                || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || (numeric_no_leading_zero
+                    && identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    && identifier.len() > 1
+                    && identifier.starts_with('0'))
+            {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SEMVER",
+                    format!("{subject}: invalid identifier {identifier:?}"),
+                ));
+            }
+            identifiers.try_reserve(1)
+                .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+            identifiers.push(identifier.to_owned());
+        }
+        Ok(identifiers)
+    }
+
+    fn parse_strict_semver(value: &str, subject: &str) -> TrustResult<StrictSemver> {
+        if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err(phase_b_error("E_PHASE_B_SEMVER", subject));
+        }
+        let (without_build, build) = match value.split_once('+') {
+            Some((without_build, build)) => (without_build, Some(build)),
+            None => (value, None),
+        };
+        if without_build.contains('+') || build.is_some_and(|build| build.contains('+')) {
+            return Err(phase_b_error("E_PHASE_B_SEMVER", format!("{subject}: multiple build separators")));
+        }
+        let (core, prerelease) = match without_build.split_once('-') {
+            Some((core, prerelease)) => (core, Some(prerelease)),
+            None => (without_build, None),
+        };
+        let mut components = core.split('.');
+        let major = parse_semver_number(components.next().unwrap_or_default(), subject)?;
+        let minor = parse_semver_number(components.next().unwrap_or_default(), subject)?;
+        let patch = parse_semver_number(components.next().unwrap_or_default(), subject)?;
+        if components.next().is_some() {
+            return Err(phase_b_error("E_PHASE_B_SEMVER", format!("{subject}: exactly three core components required")));
+        }
+        Ok(StrictSemver {
+            major,
+            minor,
+            patch,
+            prerelease: prerelease
+                .map(|value| parse_semver_identifiers(value, true, subject))
+                .transpose()?
+                .unwrap_or_default(),
+            build: build
+                .map(|value| parse_semver_identifiers(value, false, subject))
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+
+    fn semver_without_build(value: &str, subject: &str) -> TrustResult<&str> {
+        parse_strict_semver(value, subject)?;
+        Ok(value.split_once('+').map_or(value, |(core, _)| core))
+    }
+
+    fn validate_cargo_package_name(value: &str, crates_io: bool, subject: &str) -> TrustResult<()> {
+        let valid = !value.is_empty()
+            && value.len() <= if crates_io { 64 } else { 256 }
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && (!crates_io || value.as_bytes()[0].is_ascii_alphabetic());
+        if !valid {
+            return Err(phase_b_error(
+                "E_PHASE_B_PACKAGE_NAME",
+                format!("{subject}: invalid package name {value:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_lower_sha256(value: &str, subject: &str) -> TrustResult<()> {
+        if value.len() != 64
+            || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SHA256",
+                format!("{subject}: lowercase SHA-256 required"),
+            ));
+        }
+        Ok(())
+    }
+
     fn exact_json_fields(
         object: &[(String, JsonValue)],
         required: &[&str],
