@@ -51,9 +51,7 @@ glob = { workspace = true }
 # Console output
 console = { workspace = true }
 
-# Update checking (parity with Python's check_for_updates)
-semver = { workspace = true }
-ureq = { workspace = true }
+# FND-01 CLI-NO-UREQ / CLI-NO-SEMVER: no eager network update client.
 
 [lints]
 workspace = true

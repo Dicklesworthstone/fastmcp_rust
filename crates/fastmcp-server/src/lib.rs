@@ -63,8 +63,6 @@ pub mod transform;
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "jwt")]
-pub use auth::JwtTokenVerifier;
 pub use auth::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier,

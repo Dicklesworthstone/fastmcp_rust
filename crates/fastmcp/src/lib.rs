@@ -9,7 +9,15 @@
 //! - **Fast**: Zero-copy parsing, minimal allocations
 //! - **Cancel-correct**: Built on asupersync for structured concurrency
 //! - **Simple**: Familiar API inspired by FastMCP (Python)
-//! - **Complete**: Tools, resources, prompts, and all MCP features
+//! - **MCP tools/resources/prompts**: ergonomic macros and handler APIs
+//!
+//! # Protocol status (FND-01)
+//!
+//! The published wire pin in this workspace is still the pre-migration MCP era
+//! until FND-01 closes and later protocol packages land. Treat MCP **2026-07-28**
+//! support as **under implementation**: do not assume JWT/OIDC production
+//! readiness, Redis Tasks, Apps media rendering, or aggregate release-gate
+//! evidence from this façade alone.
 //!
 //! # Quick Start
 //!
@@ -83,6 +91,22 @@ pub use fastmcp_core::{
     RegionId, ResultExt, Scope, TaskId, cancelled, err, ok,
 };
 
+// FND-01: sealed crypto + URI primitives live in core (no ambient sha2/hmac/getrandom edges).
+pub use fastmcp_core::{
+    AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError, AbsoluteUriScheme, AuthorityErrorKind,
+    CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES, CanonicalHttpUrl, CanonicalHttpUrlError,
+    CanonicalResourceId, CanonicalResourceIdError, CanonicalResourceIdPolicy, CanonicalUrlPolicy,
+    CryptoInputTooLongError, DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES,
+    DefaultPortPolicy, DotSegmentPolicy, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,
+    FragmentPolicy, HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
+    HmacVerificationError, IdnaPolicy, NONCE_DOMAIN_MATERIAL_BYTES, NonceDomainMaterial,
+    PercentEncodingPolicy, QueryPolicy, RandomDrawError, ResourceEndpointPathPolicy,
+    SECURITY_IDENTIFIER_BYTES, SHA256_DIGEST_BYTES, SchemeHostCasePolicy, SecurityIdentifier,
+    Sha256Digest, SyntaxViolationPolicy, TrailingSlashPolicy, UriComponentState, UserinfoPolicy,
+    WEBSOCKET_MASK_BYTES, WebSocketMask, draw_ephemeral_key_material, draw_hmac_sha256_key,
+    draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, sha256_bounded,
+};
+
 // Re-export logging module
 pub use fastmcp_core::logging;
 
@@ -105,8 +129,7 @@ pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
 pub use fastmcp_transport::{event_store, http, memory};
 
 // Re-export server types
-#[cfg(feature = "jwt")]
-pub use fastmcp_server::JwtTokenVerifier;
+// FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, NotificationSender,
     PendingRequests, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient, RequestSender,

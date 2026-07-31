@@ -22,7 +22,6 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -31,63 +30,6 @@ use fastmcp_client::Client;
 use fastmcp_console::rich_rust::prelude::*;
 use fastmcp_core::McpResult;
 use fastmcp_protocol::TaskStatus;
-
-#[derive(Debug, Deserialize)]
-struct CratesIoCrateResponse {
-    #[serde(rename = "crate")]
-    krate: CratesIoCrateInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct CratesIoCrateInfo {
-    max_version: String,
-}
-
-fn should_check_for_updates() -> bool {
-    // Default to enabled; allow opt-out for offline/CI environments.
-    let val = env::var("FASTMCP_CHECK_FOR_UPDATES").ok();
-    !matches!(val.as_deref(), Some("0" | "false" | "FALSE" | "no" | "NO"))
-}
-
-fn fetch_latest_crate_version(crate_name: &str) -> Option<String> {
-    let url = format!("https://crates.io/api/v1/crates/{crate_name}");
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_millis(500)))
-        .timeout_global(Some(Duration::from_millis(800)))
-        .build();
-    let agent: ureq::Agent = config.into();
-
-    let mut resp = agent.get(&url).call().ok()?;
-    let body = resp.body_mut().read_to_string().ok()?;
-    let parsed: CratesIoCrateResponse = serde_json::from_str(&body).ok()?;
-    Some(parsed.krate.max_version)
-}
-
-fn maybe_print_update_notice() {
-    if !should_check_for_updates() {
-        return;
-    }
-    if env::var("CI").is_ok() {
-        return;
-    }
-
-    // Check only the CLI crate. If the user is on `cargo install fastmcp-cli`,
-    // this produces actionable guidance.
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok();
-    let latest = fetch_latest_crate_version("fastmcp-cli")
-        .and_then(|v| semver::Version::parse(&v).ok().map(|sv| (v, sv)));
-
-    let (Some(current), Some((latest_str, latest))) = (current, latest) else {
-        return;
-    };
-
-    if latest > current {
-        eprintln!(
-            "Update available: fastmcp-cli {} -> {}. Run: cargo install fastmcp-cli",
-            current, latest_str
-        );
-    }
-}
 
 /// FastMCP CLI - Run, inspect, and install MCP servers.
 #[derive(Parser)]
@@ -484,7 +426,7 @@ impl std::str::FromStr for InstallTarget {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    maybe_print_update_notice();
+    // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
 
     let result = match cli.command {
         Commands::Run {
