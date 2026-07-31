@@ -45,58 +45,58 @@ readme = "README.md"
 # `Transport::close`); until then we opt into `test-internals` to keep the
 # constructors visible. NOTE: `fastmcp-core::block_on` does NOT rely on this —
 # it was fixed to use `Runtime::block_on`'s own ambient `Cx`.
-asupersync = { version = "0.3.9", features = ["test-internals"] }
-rich_rust = "0.2"
+asupersync = { version = "=0.3.9", features = ["test-internals"] }
+rich_rust = { version = "=0.2.2" }
 
 # Serialization (only these)
-serde = { version = "1", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 # FND-01 ROOT-SERDE-JSON: exact version + arbitrary_precision for protocol numbers
-serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
-serde_yaml = "0.9"
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
+serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
-log = "0.4"
+log = { version = "=0.4.33" }
 
 # Opaque cursor encoding for pagination
-base64 = "0.22"
+base64 = { version = "=0.22.1" }
 # FND-01 ROOT-SEMVER (facade evidence / future gates; CLI must not depend on this)
-semver = { version = "1.0.28" }
+semver = { version = "=1.0.28" }
 # FND-01 ROOT-FLATE2 (facade evidence / supply archive paths)
-flate2 = { version = "1.1.9" }
+flate2 = { version = "=1.1.9" }
 
 # Date/time
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock"] }
 
 # File watching
-notify = "8"
-glob = "0.3"
+notify = { version = "=8.2.0" }
+glob = { version = "=0.3.4" }
 
 # Console output
-console = "0.16"
+console = { version = "=0.16.4" }
 
 # Configuration file parsing
-toml = "1.1"
-dirs = "6"
+toml = { version = "=1.1.3" }
+dirs = { version = "=6.0.0" }
 
 # FND-01 foundation pins (exact feature surfaces)
-url = { version = "2.5.8", default-features = false, features = ["std"] }
-getrandom = { version = "0.4.3", default-features = false }
-sha2 = { version = "0.10.9", default-features = false }
-hmac = { version = "0.12.1", default-features = false }
-zeroize = { version = "1.9.0", default-features = false, features = ["alloc", "derive"] }
+url = { version = "=2.5.8", default-features = false, features = ["std"] }
+getrandom = { version = "=0.4.3", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+hmac = { version = "=0.12.1", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
 # FND-01 ROOT-RING-EVIDENCE / JOSE RS256 (alloc only on the direct edge)
-ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 # FND-01 ROOT-PROC-MACRO2-EVIDENCE (facade evidence harness)
-proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
+proc-macro2 = { version = "=1.0.107", default-features = false, features = ["span-locations"] }
 
 # Regex (JSON Schema `pattern` validation)
-regex = "1"
+regex = { version = "=1.13.1" }
 
 # CLI argument parsing
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap = { version = "=4.6.4", features = ["derive", "env", "wrap_help"] }
 
 # Testing
-trybuild = { version = "1", default-features = false }
+trybuild = { version = "=1.0.118", default-features = false }
 
 # Internal crates
 fastmcp-rust = { version = "0.3.2", path = "crates/fastmcp" }
@@ -111,6 +111,9 @@ fastmcp-cli = { version = "0.3.2", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+# Admit the FND-01 bootstrap harness custom cfg only; all other unexpected_cfgs
+# remain fatal under -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fnd01_bootstrap)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
