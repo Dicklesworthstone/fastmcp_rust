@@ -49,7 +49,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (pinned `nightly-2026-07-11` — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
@@ -84,7 +84,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `regex` | JSON Schema `pattern` validation |
 | `base64` | Opaque cursor encoding for pagination |
 | `semver` + `ureq` | Update checking (CLI) |
-| `redis` | Optional distributed backend (Docket) |
+| `redis` | Not on default FND-01 graph (TASKR-01 later) |
 | `jsonwebtoken` | Optional JWT authentication |
 | `log` | Logging facade (zero-cost when disabled) |
 | `proc-macro2` + `quote` + `syn` | Procedural macros (`#[tool]`, `#[resource]`, `#[prompt]`) |
@@ -313,12 +313,8 @@ fastmcp_rust/
 
 ```toml
 [features]
-# fastmcp-rust (facade crate)
-jwt = ["fastmcp-server/jwt"]         # JWT authentication support
-
-# fastmcp-server
-jwt = ["dep:jsonwebtoken"]           # JWT token verification
-redis = ["dep:redis"]                # Docket distributed backend via Redis
+# FND-01: no jwt/jsonwebtoken or redis features on the default graph.
+# Redis Tasks / enterprise JWT profiles are later optional packages.
 
 # fastmcp-console
 full = ["rich_rust/full"]            # Full rich_rust features

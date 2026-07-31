@@ -238,7 +238,7 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 | AuthProvider base trait | ✅ | ✅ | `AuthProvider` trait |
 | Token verification | ✅ | ✅ | `TokenVerifier` trait |
 | Static token verifier | ✅ | ✅ | `StaticTokenVerifier` |
-| JWT support | ✅ | ✅ | `JwtTokenVerifier` (feature: jwt) |
+| JWT support | ✅ | 🚧 | Process-global JWT crypto removed under FND-01; ring RS256 evidence path supersedes `jsonwebtoken` (no `jwt` feature) |
 | Access token handling | ✅ | ✅ | `AuthContext` with token |
 | **Full OAuth 2.0/2.1 Server** | ✅ | ✅ | `oauth.rs` - Authorization code + PKCE |
 | **OIDC Provider** | ✅ | ✅ | `oidc.rs` - ID tokens, UserInfo, discovery |
@@ -341,7 +341,7 @@ The Rust port now covers **all Python FastMCP functionality** with several Rust-
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Docket (distributed tasks)** | ✅ | ✅ | `docket.rs` - Memory backend + Redis backend (feature-gated: `fastmcp-server/redis`) |
+| **Docket (distributed tasks)** | ✅ | 🚧 | Memory backend present; Redis backend gated by later TASKR-01 (no `redis` feature on default FND-01 graph) |
 | **EventStore** | ✅ | ✅ | `event_store.rs` - SSE resumability with TTL |
 | **Rich content types** | ✅ | ✅ | `Content` supports `audio` and includes helpers: `Content::{text,image_base64,image_bytes,audio_base64,audio_bytes,resource_text,resource_blob_base64,resource_blob_bytes}` |
 

@@ -14,8 +14,9 @@
 
 <p align="center">
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B_(nightly)-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/rust-nightly--2026--07--11-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
+  <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
 
 ---
@@ -80,7 +81,8 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 - **Porting methodology:** Extract spec from legacy → implement from spec → never translate line-by-line
 - **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for cancel-correct async (not tokio directly)
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-- **Toolchain:** Rust 2024 edition, nightly required
+- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-07-11` (see `rust-toolchain.toml`)
+- **MCP 2026-07-28:** under implementation (FND-01 foundation evidence); not an aggregate support claim
 
 ---
 
@@ -262,7 +264,7 @@ cargo install fastmcp-cli
 ```
 
 **Requirements:**
-- Rust 1.85+ (nightly) for Edition 2024 features
+- Rust nightly-2026-07-11 (see `rust-toolchain.toml`) for Edition 2024 + FND-01 contract
 - [asupersync](https://github.com/Dicklesworthstone/asupersync) as a sibling directory (or adjust path in `Cargo.toml`)
 
 ---

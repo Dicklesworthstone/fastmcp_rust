@@ -10,6 +10,10 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 Development since the v0.2.0 release on 2026-02-15, covering concurrency infrastructure, HTTP serving, public dispatch APIs, and continued hardening.
 
+### MCP 2026-07-28 support (in progress)
+
+- **FND-01 foundation** — freeze authoritative protocol/SDK/toolchain evidence, core crypto/URI pins, and integration-surface dependency policy. Aggregate MCP 2026-07-28 support is **not** claimed until GATE / final attestation packages complete. JWT (`jsonwebtoken`) and Redis optional features are removed from the default graph; Redis Tasks and enterprise auth remain later packages.
+
 ### Concurrency and Dispatch
 
 - **Concurrent tool dispatch (Phase 1)** -- Replace sequential Phase 0 stubs with true concurrent combinators (`join_all`, `race`, `quorum`, `first_ok`) using safe-Rust `poll_fn` + pinned futures. HTTP accept loop now spawns one `std::thread` per connection with an `AtomicUsize` semaphore enforcing `max_connections`. ([`9a24313`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/9a243130c0660e1465030d662d5494c43cd4ca88))

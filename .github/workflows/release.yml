@@ -50,47 +50,47 @@ jobs:
             artifact: fastmcp.exe
             asset: fastmcp-windows-amd64.exe
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # FND-01: pin the exact dated nightly from rust-toolchain.toml (not floating "nightly").
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-11
           targets: ${{ matrix.target }}
+          components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-nightly-2026-07-11
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release CLI binary
+        run: cargo build --release --locked -p fastmcp-cli --target ${{ matrix.target }}
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cd target/${{ matrix.target }}/release
-          # Find the actual binary (might be in crates/)
-          if [ -f "${{ matrix.artifact }}" ]; then
-            tar -cJf ../../../dist/${{ matrix.asset }}.tar.xz ${{ matrix.artifact }}
-          fi
-          cd ../../../dist
-          for f in *.tar.xz; do
-            [ -f "$f" ] && shasum -a 256 "$f" > "$f.sha256"
-          done
+          binary="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          test -f "${binary}"
+          tar -C "target/${{ matrix.target }}/release" -cJf "dist/${{ matrix.asset }}.tar.xz" "${{ matrix.artifact }}"
+          (cd dist && shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256")
 
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          if (Test-Path $binary) {
-            Compress-Archive -Path $binary -DestinationPath "dist/${{ matrix.asset }}.zip"
-            cd dist
-            $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}.zip").Hash.ToLower()
-            "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ASCII "${{ matrix.asset }}.zip.sha256"
-          }
+          if (-not (Test-Path $binary)) { throw "missing release binary: $binary" }
+          Compress-Archive -Path $binary -DestinationPath "dist/${{ matrix.asset }}.zip"
+          Push-Location dist
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}.zip").Hash.ToLower()
+          "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ASCII "${{ matrix.asset }}.zip.sha256"
+          Pop-Location
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.asset }}
           path: dist/*
@@ -103,9 +103,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: dist
           merge-multiple: true
@@ -123,7 +123,7 @@ jobs:
           fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: FastMCP Rust ${{ steps.version.outputs.version }}
@@ -152,13 +152,17 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
+      # FND-01: same dated nightly contract as rust-toolchain.toml / build matrix.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          key: publish-${{ runner.os }}
+          toolchain: nightly-2026-07-11
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: publish-${{ runner.os }}-nightly-2026-07-11
 
       - name: Ensure crates.io token
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
