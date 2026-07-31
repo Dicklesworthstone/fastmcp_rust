@@ -13,11 +13,12 @@
 //!
 //! # Protocol status (FND-01)
 //!
-//! The published wire pin in this workspace is still the pre-migration MCP era
-//! until FND-01 closes and later protocol packages land. Treat MCP **2026-07-28**
-//! support as **under implementation**: do not assume JWT/OIDC production
-//! readiness, Redis Tasks, Apps media rendering, or aggregate release-gate
-//! evidence from this façade alone.
+//! **MCP 2026-07-28 support is under implementation and remains unverified.**  
+//! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+//! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
+//! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
+//! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
+//! this façade alone.
 //!
 //! # Quick Start
 //!
@@ -93,12 +94,13 @@ pub use fastmcp_core::{
 
 // FND-01: sealed crypto + URI primitives live in core (no ambient sha2/hmac/getrandom edges).
 pub use fastmcp_core::{
-    AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError, AbsoluteUriScheme, AuthorityErrorKind,
-    CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES, CanonicalHttpUrl, CanonicalHttpUrlError,
-    CanonicalResourceId, CanonicalResourceIdError, CanonicalResourceIdPolicy, CanonicalUrlPolicy,
-    CryptoInputTooLongError, DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES,
-    DefaultPortPolicy, DotSegmentPolicy, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,
-    FragmentPolicy, HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
+    ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
+    AbsoluteUriScheme, AuthorityErrorKind, CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES,
+    CanonicalHttpUrl, CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
+    CanonicalResourceIdPolicy, CanonicalUrlPolicy, CryptoInputTooLongError,
+    DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES, DefaultPortPolicy,
+    DotSegmentPolicy, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial, FragmentPolicy,
+    HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
     HmacVerificationError, IdnaPolicy, NONCE_DOMAIN_MATERIAL_BYTES, NonceDomainMaterial,
     PercentEncodingPolicy, QueryPolicy, RandomDrawError, ResourceEndpointPathPolicy,
     SECURITY_IDENTIFIER_BYTES, SHA256_DIGEST_BYTES, SchemeHostCasePolicy, SecurityIdentifier,
@@ -106,6 +108,9 @@ pub use fastmcp_core::{
     WEBSOCKET_MASK_BYTES, WebSocketMask, draw_ephemeral_key_material, draw_hmac_sha256_key,
     draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, sha256_bounded,
 };
+
+// Module re-exports for namespaced access (`fastmcp_rust::crypto`, `fastmcp_rust::uri`).
+pub use fastmcp_core::{crypto, uri};
 
 // Re-export logging module
 pub use fastmcp_core::logging;
@@ -141,8 +146,8 @@ pub use fastmcp_server::{
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
 pub use fastmcp_server::bidirectional;
 
-// Re-export server middleware modules
-pub use fastmcp_server::{caching, docket, oauth, oidc, rate_limiting, transform};
+// Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
 pub use fastmcp_client::{Client, ClientBuilder, ClientSession};

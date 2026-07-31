@@ -11,6 +11,8 @@ readme.workspace = true
 documentation = "https://docs.rs/fastmcp-server"
 keywords = ["mcp", "server", "json-rpc", "async", "tools"]
 categories = ["network-programming", "development-tools"]
+# Preserve docket.rs bytes on disk without compiling redis-gated paths.
+exclude = ["src/docket.rs"]
 
 [dependencies]
 fastmcp-core.workspace = true
