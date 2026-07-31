@@ -19852,8 +19852,18 @@ mod phase_b_std {
                 "compiled resolve/fetch argv or acquisition environment desync",
             ));
         }
-        // Zero integration seal was required above. Produce FS orchestration is
-        // live; fail-closed only on concrete authority/runtime errors below.
+        // Produce remains fail-closed until the complete typed Phase-B
+        // authority, bounded child lifecycle, real tool/environment digests,
+        // and ordinary handoff joins are implemented together. The zero
+        // integration digest was required above, so this guard precedes the
+        // first filesystem mutation or child-process spawn without making the
+        // remaining implementation syntactically unreachable.
+        if integration_digest == [0; 32] {
+            return Err(phase_b_error(
+                "E_PHASE_B_ACQUISITION_IMPLEMENTATION",
+                "typed acquisition, transaction, timeout, and handoff authority remains incomplete",
+            ));
+        }
         let repository_root = &arguments.repository_root;
         directory_metadata(repository_root, "produce repository root")?;
         // Fresh role scratch: package layout before lock generation.
