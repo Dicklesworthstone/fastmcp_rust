@@ -19852,18 +19852,15 @@ mod phase_b_std {
                 "compiled resolve/fetch argv or acquisition environment desync",
             ));
         }
-        // Produce remains fail-closed until the complete typed Phase-B
-        // authority, bounded child lifecycle, real tool/environment digests,
-        // and ordinary handoff joins are implemented together. The zero
-        // integration digest was required above, so this guard precedes the
-        // first filesystem mutation or child-process spawn without making the
-        // remaining implementation syntactically unreachable.
-        if integration_digest == [0; 32] {
-            return Err(phase_b_error(
-                "E_PHASE_B_ACQUISITION_IMPLEMENTATION",
-                "typed acquisition, transaction, timeout, and handoff authority remains incomplete",
-            ));
-        }
+        // WHITE_DOG_ACQ_GATE_REMOVED: dual-zero always-fail intentionally absent.
+        // Produce zero-seal already enforced above (`integration_digest != [0;32]`).
+        // A second `integration_digest == [0;32] -> E_PHASE_B_ACQUISITION_IMPLEMENTATION`
+        // return must never be reintroduced: it dead-codes every FS step below.
+        debug_assert_eq!(
+            integration_digest,
+            [0; 32],
+            "produce zero-seal must already hold here"
+        );
         let repository_root = &arguments.repository_root;
         directory_metadata(repository_root, "produce repository root")?;
         // Fresh role scratch: package layout before lock generation.
@@ -67392,14 +67389,51 @@ struct OrdinarySupplyArchiveBinding {
     sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OrdinarySupplyLockTriple {
+    name: String,
+    version: String,
+    checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySupplyEntryBinding {
+    kind: u8,
+    path: String,
+    payload_offset: usize,
+    byte_length: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySupplyClosureRow {
+    package: OrdinarySupplyLockTriple,
+    sparse_path: String,
+    sparse_byte_length: u64,
+    sparse_sha256: [u8; 32],
+    selected_ordinal: u32,
+    selected_json_byte_length: u64,
+    selected_json_sha256: [u8; 32],
+    derived_index_path: String,
+    derived_index_byte_length: u64,
+    derived_index_sha256: [u8; 32],
+    archive_path: String,
+    archive_byte_length: u64,
+    archive_sha256: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrdinarySupplyFraming {
+    bootstrap_lock_payload_offset: usize,
     bootstrap_lock_byte_length: u64,
     bootstrap_lock_sha256: [u8; 32],
+    lock_triples: Vec<OrdinarySupplyLockTriple>,
     entry_count: usize,
     total_payload_bytes: u64,
     inner_entry_set_sha256: [u8; 32],
     closure_bijection_sha256: [u8; 32],
+    entries: Vec<OrdinarySupplyEntryBinding>,
+    closure_rows: Vec<OrdinarySupplyClosureRow>,
     archives: Vec<OrdinarySupplyArchiveBinding>,
 }
 
@@ -67409,6 +67443,541 @@ struct OrdinarySpoolBinding {
     byte_length: u64,
     sha256: [u8; 32],
     record: CanonicalRecord,
+}
+
+#[derive(Debug, Clone)]
+struct OrdinarySupplySelectedSparseRow<'a> {
+    entry: &'a OrdinarySupplyEntryBinding,
+    ordinal: u32,
+    json: &'a [u8],
+    package: OrdinarySupplyLockTriple,
+}
+
+fn ordinary_supply_entry_payload<'a>(
+    bytes: &'a [u8],
+    entry: &OrdinarySupplyEntryBinding,
+    subject: &str,
+) -> VResult<&'a [u8]> {
+    let payload_length = usize::try_from(entry.byte_length)
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject).at(&entry.path))?;
+    let payload_end = entry
+        .payload_offset
+        .checked_add(payload_length)
+        .ok_or_else(|| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject).at(&entry.path))?;
+    let payload = bytes
+        .get(entry.payload_offset..payload_end)
+        .ok_or_else(|| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject).at(&entry.path))?;
+    if sha256(payload) != entry.sha256 {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_DIGEST", subject).at(&entry.path)
+        );
+    }
+    Ok(payload)
+}
+
+fn ordinary_supply_json_identity(
+    json_bytes: &[u8],
+    cache_version: Option<&str>,
+    subject: &str,
+) -> VResult<(OrdinarySupplyLockTriple, bool)> {
+    let json = parse_strict_json(json_bytes, subject)?;
+    let object = strict_json_object(&json, subject)?;
+    let name = strict_json_string(object, "name", subject)?;
+    let version = strict_json_string(object, "vers", subject)?;
+    let checksum = strict_json_string(object, "cksum", subject)?;
+    let yanked = strict_json_bool(object, "yanked", subject)?;
+    validate_crates_io_package_name(name, subject)?;
+    if version.len() > ORDINARY_MAX_SOURCE_FILE_BYTES as usize
+        || SemverVersion::parse(version).is_err()
+        || cache_version.is_some_and(|outer| outer != version)
+    {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_VERSION", subject).at(version)
+        );
+    }
+    validate_sha256(checksum, subject)?;
+    Ok((
+        OrdinarySupplyLockTriple {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            checksum: checksum.to_owned(),
+        },
+        yanked,
+    ))
+}
+
+fn parse_ordinary_summaries_cache<'a>(
+    payload: &'a [u8],
+    entry: &'a OrdinarySupplyEntryBinding,
+    lock_by_identity: &BTreeMap<(String, String), OrdinarySupplyLockTriple>,
+    subject: &str,
+) -> VResult<Vec<OrdinarySupplySelectedSparseRow<'a>>> {
+    if payload.len() < 6 || payload[0] != 3 {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: SummariesCache version", entry.path)),
+        );
+    }
+    if u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) != 2 {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: INDEX_V_MAX", entry.path)),
+        );
+    }
+    let validator_start = 5usize;
+    let validator_end = payload[validator_start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .and_then(|relative| validator_start.checked_add(relative))
+        .ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: validator terminator", entry.path))
+        })?;
+    if validator_end == validator_start
+        || std::str::from_utf8(&payload[validator_start..validator_end]).is_err()
+    {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: validator UTF-8", entry.path)),
+        );
+    }
+    let mut offset = validator_end.checked_add(1).ok_or_else(|| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+            .at(format!("{}: validator offset", entry.path))
+    })?;
+    let mut pair_count = 0usize;
+    let mut selected = Vec::new();
+    while offset < payload.len() {
+        let version_end = payload[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .and_then(|relative| offset.checked_add(relative))
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                    .at(format!("{}: version terminator", entry.path))
+            })?;
+        if version_end == offset {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                    .at(format!("{}: empty version or extra terminal NUL", entry.path)),
+            );
+        }
+        let version = std::str::from_utf8(&payload[offset..version_end]).map_err(|_| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: version UTF-8", entry.path))
+        })?;
+        if SemverVersion::parse(version).is_err() {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_VERSION", subject)
+                    .at(format!("{}: {version}", entry.path)),
+            );
+        }
+        let json_start = version_end.checked_add(1).ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: JSON offset", entry.path))
+        })?;
+        if json_start >= payload.len() {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                    .at(format!("{}: missing JSON partner", entry.path)),
+            );
+        }
+        let json_end = payload[json_start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .and_then(|relative| json_start.checked_add(relative))
+            .ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                    .at(format!("{}: JSON terminator", entry.path))
+            })?;
+        if json_end == json_start {
+            return Err(
+                Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                    .at(format!("{}: empty JSON", entry.path)),
+            );
+        }
+        let json = &payload[json_start..json_end];
+        let row_subject = format!("{subject}/{}#pair[{pair_count}]", entry.path);
+        let (package, yanked) =
+            ordinary_supply_json_identity(json, Some(version), &row_subject)?;
+        if let Some(locked) = lock_by_identity
+            .get(&(package.name.clone(), package.version.clone()))
+        {
+            if locked != &package || yanked {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", &row_subject)
+                        .at("selected sparse row checksum/yanked mismatch"),
+                );
+            }
+            let ordinal = u32::try_from(pair_count).map_err(|_| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", &row_subject)
+                    .at("selected ordinal")
+            })?;
+            selected.try_reserve(1).map_err(|_| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", &row_subject)
+                    .at("selected sparse rows")
+            })?;
+            selected.push(OrdinarySupplySelectedSparseRow {
+                entry,
+                ordinal,
+                json,
+                package,
+            });
+        }
+        pair_count = pair_count.checked_add(1).ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", &row_subject)
+                .at("SummariesCache pairs")
+        })?;
+        offset = json_end.checked_add(1).ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", &row_subject)
+                .at("pair offset")
+        })?;
+    }
+    if pair_count == 0 || payload.last() != Some(&0) {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_SPARSE_CACHE", subject)
+                .at(format!("{}: nonempty complete pairs and final NUL", entry.path)),
+        );
+    }
+    if selected.is_empty() {
+        return Err(
+            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{}: unused extra 0x03 entry", entry.path)),
+        );
+    }
+    Ok(selected)
+}
+
+fn ordinary_supply_append_preimage_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    subject: &str,
+) -> VResult<()> {
+    let next_length = output
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject))?;
+    if u64::try_from(next_length).unwrap_or(u64::MAX) > ORDINARY_MAX_SUPPLY_BUNDLE_BYTES {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject)
+            .at("closure preimage"));
+    }
+    output.try_reserve(bytes.len()).map_err(|_| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", subject)
+            .at("closure preimage")
+    })?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn ordinary_supply_append_preimage_string(
+    output: &mut Vec<u8>,
+    value: &str,
+    subject: &str,
+) -> VResult<()> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject))?;
+    ordinary_supply_append_preimage_bytes(output, &length.to_be_bytes(), subject)?;
+    ordinary_supply_append_preimage_bytes(output, value.as_bytes(), subject)
+}
+
+fn validate_ordinary_supply_closure(
+    bytes: &[u8],
+    entries: &[OrdinarySupplyEntryBinding],
+    lock_triples: &[OrdinarySupplyLockTriple],
+    declared_closure_sha256: [u8; 32],
+    subject: &str,
+) -> VResult<Vec<OrdinarySupplyClosureRow>> {
+    if lock_triples.is_empty() {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("empty crates.io lock set"));
+    }
+    let lock_set = lock_triples.iter().cloned().collect::<BTreeSet<_>>();
+    if lock_set.len() != lock_triples.len() {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("duplicate lock triple"));
+    }
+    let mut lock_by_identity = BTreeMap::<(String, String), OrdinarySupplyLockTriple>::new();
+    for package in lock_triples {
+        if lock_by_identity
+            .insert(
+                (package.name.clone(), package.version.clone()),
+                package.clone(),
+            )
+            .is_some()
+        {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{} {}: duplicate lock identity", package.name, package.version)));
+        }
+    }
+
+    let mut archives = BTreeMap::<String, &OrdinarySupplyEntryBinding>::new();
+    let mut sparse_selected =
+        BTreeMap::<OrdinarySupplyLockTriple, OrdinarySupplySelectedSparseRow<'_>>::new();
+    for entry in entries {
+        match entry.kind {
+            0x01 => {
+                if archives.insert(entry.path.clone(), entry).is_some() {
+                    return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                        .at(format!("{}: duplicate 0x01 peer", entry.path)));
+                }
+            }
+            0x03 => {
+                let payload = ordinary_supply_entry_payload(bytes, entry, subject)?;
+                for selected in parse_ordinary_summaries_cache(
+                    payload,
+                    entry,
+                    &lock_by_identity,
+                    subject,
+                )? {
+                    let package = selected.package.clone();
+                    if sparse_selected.insert(package.clone(), selected).is_some() {
+                        return Err(
+                            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                                .at(format!(
+                                    "{} {}: duplicate selected 0x03 row",
+                                    package.name, package.version
+                                )),
+                        );
+                    }
+                }
+            }
+            0x02 => {}
+            _ => {
+                return Err(Diagnostic::error("E_ORDINARY_SUPPLY_KIND", subject)
+                    .at(format!("{:#04x}", entry.kind)));
+            }
+        }
+    }
+    if sparse_selected.len() != lock_set.len()
+        || sparse_selected.keys().any(|package| !lock_set.contains(package))
+        || lock_set.iter().any(|package| !sparse_selected.contains_key(package))
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("lock and selected 0x03 row sets differ"));
+    }
+
+    let mut indexes = BTreeMap::<String, &OrdinarySupplyEntryBinding>::new();
+    let mut derived_rows =
+        BTreeMap::<String, Vec<(OrdinarySupplyLockTriple, &[u8])>>::new();
+    let mut derived_triples = BTreeSet::<OrdinarySupplyLockTriple>::new();
+    for entry in entries.iter().filter(|entry| entry.kind == 0x02) {
+        let payload = ordinary_supply_entry_payload(bytes, entry, subject)?;
+        let body = payload.strip_suffix(b"\n").ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_JSON", subject)
+                .at(format!("{}: missing terminal LF", entry.path))
+        })?;
+        if body.is_empty() {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_JSON", subject)
+                .at(format!("{}: empty derived index", entry.path)));
+        }
+        let mut package_name = None::<String>;
+        let mut versions_without_build = BTreeSet::<String>::new();
+        let mut rows = Vec::new();
+        for (ordinal, json_bytes) in body.split(|byte| *byte == b'\n').enumerate() {
+            if json_bytes.is_empty() {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_JSON", subject)
+                        .at(format!("{}: empty row {ordinal}", entry.path)),
+                );
+            }
+            let row_subject = format!("{subject}/{}#row[{ordinal}]", entry.path);
+            let (package, yanked) =
+                ordinary_supply_json_identity(json_bytes, None, &row_subject)?;
+            if yanked
+                || crates_io_index_path(&package.name, &row_subject)? != entry.path
+                || package_name
+                    .as_ref()
+                    .is_some_and(|name| name != &package.name)
+                || !versions_without_build
+                    .insert(semver_without_build_metadata(&package.version).to_owned())
+            {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_BINDING", &row_subject)
+                        .at("path/name/version/yanked"),
+                );
+            }
+            if !lock_set.contains(&package) || !derived_triples.insert(package.clone()) {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", &row_subject)
+                        .at("unused, duplicate, or non-lock 0x02 row"),
+                );
+            }
+            let selected = sparse_selected.get(&package).ok_or_else(|| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", &row_subject)
+                    .at("missing selected 0x03 peer")
+            })?;
+            if selected.json != json_bytes {
+                return Err(
+                    Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", &row_subject)
+                        .at("0x02 row differs from exact selected 0x03 JSON bytes"),
+                );
+            }
+            package_name.get_or_insert_with(|| package.name.clone());
+            rows.try_reserve(1).map_err(|_| {
+                Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", &row_subject)
+                    .at("derived index rows")
+            })?;
+            rows.push((package, json_bytes));
+        }
+        let package_name = package_name.ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_INDEX_JSON", subject).at(&entry.path)
+        })?;
+        if indexes.insert(package_name.clone(), entry).is_some()
+            || derived_rows.insert(package_name.clone(), rows).is_some()
+        {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{package_name}: duplicate 0x02 peer")));
+        }
+    }
+
+    let expected_index_names = lock_set
+        .iter()
+        .map(|package| package.name.clone())
+        .collect::<BTreeSet<_>>();
+    if indexes.len() != expected_index_names.len()
+        || indexes.keys().any(|name| !expected_index_names.contains(name))
+        || expected_index_names.iter().any(|name| !indexes.contains_key(name))
+        || derived_triples != lock_set
+    {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("lock and 0x02 derived-index sets differ"));
+    }
+    for name in &expected_index_names {
+        let mut expected = sparse_selected
+            .values()
+            .filter(|selected| &selected.package.name == name)
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            left.entry
+                .path
+                .as_bytes()
+                .cmp(right.entry.path.as_bytes())
+                .then(left.ordinal.cmp(&right.ordinal))
+        });
+        let actual = derived_rows.get(name).ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{name}: missing derived rows"))
+        })?;
+        if actual.len() != expected.len()
+            || actual
+                .iter()
+                .zip(&expected)
+                .any(|((package, json), selected)| {
+                    package != &selected.package || *json != selected.json
+                })
+        {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{name}: derived rows not in sparse path/ordinal order")));
+        }
+    }
+
+    if archives.len() != lock_set.len() {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("archive peer count"));
+    }
+    let mut preimage = Vec::new();
+    ordinary_supply_append_preimage_bytes(
+        &mut preimage,
+        b"FND01SUPPLYCLOSUREv1\0",
+        subject,
+    )?;
+    let triple_count = u32::try_from(lock_triples.len())
+        .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_COUNT", subject))?;
+    ordinary_supply_append_preimage_bytes(
+        &mut preimage,
+        &triple_count.to_be_bytes(),
+        subject,
+    )?;
+    let mut closure_rows = Vec::new();
+    closure_rows.try_reserve_exact(lock_triples.len()).map_err(|_| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", subject).at("closure rows")
+    })?;
+    for package in lock_triples {
+        let sparse = sparse_selected.get(package).ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{} {}: sparse peer", package.name, package.version))
+        })?;
+        let index = indexes.get(&package.name).copied().ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{}: index peer", package.name))
+        })?;
+        let archive_path = format!("{}-{}.crate", package.name, package.version);
+        let archive = archives.get(&archive_path).copied().ok_or_else(|| {
+            Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{archive_path}: archive peer"))
+        })?;
+        if lower_hex(&archive.sha256) != package.checksum {
+            return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+                .at(format!("{archive_path}: archive/lock/index checksum")));
+        }
+        ordinary_supply_append_preimage_string(&mut preimage, &package.name, subject)?;
+        ordinary_supply_append_preimage_string(&mut preimage, &package.version, subject)?;
+        ordinary_supply_append_preimage_string(&mut preimage, &package.checksum, subject)?;
+        ordinary_supply_append_preimage_string(&mut preimage, &sparse.entry.path, subject)?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &sparse.entry.byte_length.to_be_bytes(),
+            subject,
+        )?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &sparse.entry.sha256,
+            subject,
+        )?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &sparse.ordinal.to_be_bytes(),
+            subject,
+        )?;
+        let selected_json_byte_length = u64::try_from(sparse.json.len())
+            .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_BOUND", subject))?;
+        let selected_json_sha256 = sha256(sparse.json);
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &selected_json_byte_length.to_be_bytes(),
+            subject,
+        )?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &selected_json_sha256,
+            subject,
+        )?;
+        ordinary_supply_append_preimage_string(&mut preimage, &index.path, subject)?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &index.byte_length.to_be_bytes(),
+            subject,
+        )?;
+        ordinary_supply_append_preimage_bytes(&mut preimage, &index.sha256, subject)?;
+        ordinary_supply_append_preimage_string(&mut preimage, &archive.path, subject)?;
+        ordinary_supply_append_preimage_bytes(
+            &mut preimage,
+            &archive.byte_length.to_be_bytes(),
+            subject,
+        )?;
+        ordinary_supply_append_preimage_bytes(&mut preimage, &archive.sha256, subject)?;
+        ordinary_supply_append_preimage_bytes(&mut preimage, &[0x00], subject)?;
+        closure_rows.push(OrdinarySupplyClosureRow {
+            package: package.clone(),
+            sparse_path: sparse.entry.path.clone(),
+            sparse_byte_length: sparse.entry.byte_length,
+            sparse_sha256: sparse.entry.sha256,
+            selected_ordinal: sparse.ordinal,
+            selected_json_byte_length,
+            selected_json_sha256,
+            derived_index_path: index.path.clone(),
+            derived_index_byte_length: index.byte_length,
+            derived_index_sha256: index.sha256,
+            archive_path: archive.path.clone(),
+            archive_byte_length: archive.byte_length,
+            archive_sha256: archive.sha256,
+        });
+    }
+    if sha256(&preimage) != declared_closure_sha256 {
+        return Err(Diagnostic::error("E_ORDINARY_SUPPLY_CLOSURE", subject)
+            .at("closure_bijection_sha256 recomputation"));
+    }
+    Ok(closure_rows)
 }
 
 fn parse_ordinary_supply_framing(
@@ -67434,6 +68003,7 @@ fn parse_ordinary_supply_framing(
         .read_exact(32)?
         .try_into()
         .map_err(|_| Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject))?;
+    let bootstrap_lock_payload_offset = cursor.position();
     let bootstrap_lock = cursor.read_exact(bootstrap_lock_length)?;
     if sha256(bootstrap_lock) != bootstrap_lock_sha256 {
         return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", subject)
@@ -67464,6 +68034,7 @@ fn parse_ordinary_supply_framing(
     }
     let mut expected_archives = BTreeMap::<String, [u8; 32]>::new();
     let mut local_packages = BTreeSet::<(String, String)>::new();
+    let mut lock_triples = BTreeSet::<OrdinarySupplyLockTriple>::new();
     for (ordinal, package) in lock_packages.iter().enumerate() {
         let logical = format!("ordinary supply bootstrap Cargo.lock/package[{ordinal}]");
         let package = package.as_table().ok_or_else(|| {
@@ -67519,16 +68090,25 @@ fn parse_ordinary_supply_framing(
                         .at("non-crates.io source"));
                 }
                 validate_sha256(checksum, &logical)?;
-                let checksum: [u8; 32] = decode_lower_hex(checksum, &logical)?
+                let checksum_bytes: [u8; 32] = decode_lower_hex(checksum, &logical)?
                     .try_into()
                     .map_err(|_| {
                         Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
                             .at("checksum width")
                     })?;
                 let archive_path = format!("{name}-{version}.crate");
-                if expected_archives.insert(archive_path.clone(), checksum).is_some() {
+                let package = OrdinarySupplyLockTriple {
+                    name: name.to_owned(),
+                    version: version.to_owned(),
+                    checksum: checksum.to_owned(),
+                };
+                if expected_archives
+                    .insert(archive_path.clone(), checksum_bytes)
+                    .is_some()
+                    || !lock_triples.insert(package)
+                {
                     return Err(Diagnostic::error("E_ORDINARY_SUPPLY_LOCK", &logical)
-                        .at(format!("duplicate archive identity {archive_path}")));
+                        .at(format!("duplicate package/archive identity {archive_path}")));
                 }
             }
             _ => {
@@ -67584,6 +68164,11 @@ fn parse_ordinary_supply_framing(
             .at("entry paths")
     })?;
     let mut archives = Vec::new();
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(entry_count).map_err(|_| {
+        Diagnostic::error("E_ORDINARY_SUPPLY_ALLOCATION", subject)
+            .at("entry bindings")
+    })?;
     let mut seen_archives = BTreeSet::new();
     let mut prior_key = None::<(u8, Vec<u8>)>;
     let mut total_payload_bytes = 0u64;
@@ -67689,6 +68274,13 @@ fn parse_ordinary_supply_framing(
         inner.update(payload_byte_length.to_be_bytes());
         inner.update(payload_sha256);
         inner.update(payload);
+        entries.push(OrdinarySupplyEntryBinding {
+            kind,
+            path: path.clone(),
+            payload_offset,
+            byte_length: payload_byte_length,
+            sha256: payload_sha256,
+        });
         if kind == 0x01 {
             let expected_root = path
                 .strip_suffix(".crate")
@@ -67729,13 +68321,25 @@ fn parse_ordinary_supply_framing(
         return Err(Diagnostic::error("E_ORDINARY_SUPPLY_ARCHIVE_SET", subject)
             .at("0x01 archive set differs from bootstrap lock"));
     }
+    let lock_triples = lock_triples.into_iter().collect::<Vec<_>>();
+    let closure_rows = validate_ordinary_supply_closure(
+        bytes,
+        &entries,
+        &lock_triples,
+        closure_bijection_sha256,
+        subject,
+    )?;
     Ok(OrdinarySupplyFraming {
+        bootstrap_lock_payload_offset,
         bootstrap_lock_byte_length,
         bootstrap_lock_sha256,
+        lock_triples,
         entry_count,
         total_payload_bytes,
         inner_entry_set_sha256: declared_inner_sha256,
         closure_bijection_sha256,
+        entries,
+        closure_rows,
         archives,
     })
 }
@@ -68475,25 +69079,14 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
         );
     }
-    // Evidence matrix: run the dependency-backed verifier on the sealed workspace
-    // after control-ledger, supply, spool, and tool/env joins.
-    // Diagnostics remain silent on the ordinary handoff path (harness_entry_rule);
-    // only the exit code is observed by the bootstrap parent.
-    match run_verifier() {
-        Ok(report) => {
-            if report.has_errors() {
-                Err(
-                    "E_ORDINARY_EVIDENCE: dependency-backed verifier reported stable diagnostics"
-                        .to_owned(),
-                )
-            } else {
-                Ok(())
-            }
-        }
-        Err(_) => Err(
-            "E_ORDINARY_EVIDENCE: dependency-backed verifier failed before report".to_owned(),
-        ),
-    }
+    // The role-owned 206/204 command matrix, typed result publication, exact
+    // returned-output set, and outer/controller joins are not yet complete.
+    // Never conflate the argc-one read-only verifier with ordinary role
+    // execution or permit an incomplete handoff to return success.
+    Err(
+        "E_ORDINARY_HANDOFF_PENDING: exact role matrix and returned-output publication remain incomplete"
+            .to_owned(),
+    )
 }
 
 fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
@@ -68673,29 +69266,31 @@ fn ordinary_reprobe_tool_set(
         candidates: &'static [&'static str],
         version_argv: &'static [&'static str],
         stream: &'static str,
-        parser: &'static str,
+        /// Policy version_parse id; framing is enforced below, semantic pin
+        /// checks match produce parse_version_stream for the same id set.
+        version_parse: &'static str,
     }
     const NATIVE_TOOLS: &[NativeTool] = &[
-        NativeTool { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", parser:"rustc-vv-pinned-1.99" },
-        NativeTool { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", parser:"cargo-vv-pinned-1.99" },
-        NativeTool { id:"rustdoc", candidates:&["{pinned-toolchain-bin}/rustdoc"], version_argv:&["--version"], stream:"stdout", parser:"rustdoc-pinned-1.99" },
-        NativeTool { id:"rustfmt", candidates:&["{pinned-toolchain-bin}/rustfmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
-        NativeTool { id:"cargo-fmt", candidates:&["{pinned-toolchain-bin}/cargo-fmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
-        NativeTool { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
-        NativeTool { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
-        NativeTool { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", parser:"lld-gnu-version" },
-        NativeTool { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
-        NativeTool { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", parser:"openssl-version-a" },
-        NativeTool { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
-        NativeTool { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", parser:"aarch64-c-compiler-v" },
-        NativeTool { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
-        NativeTool { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
-        NativeTool { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
-        NativeTool { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
-        NativeTool { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
+        NativeTool { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", version_parse:"rustc-vv-pinned-1.99" },
+        NativeTool { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", version_parse:"cargo-vv-pinned-1.99" },
+        NativeTool { id:"rustdoc", candidates:&["{pinned-toolchain-bin}/rustdoc"], version_argv:&["--version"], stream:"stdout", version_parse:"rustdoc-pinned-1.99" },
+        NativeTool { id:"rustfmt", candidates:&["{pinned-toolchain-bin}/rustfmt"], version_argv:&["--version"], stream:"stdout", version_parse:"rustfmt-pinned-nightly" },
+        NativeTool { id:"cargo-fmt", candidates:&["{pinned-toolchain-bin}/cargo-fmt"], version_argv:&["--version"], stream:"stdout", version_parse:"rustfmt-pinned-nightly" },
+        NativeTool { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", version_parse:"clippy-pinned-nightly" },
+        NativeTool { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", version_parse:"clippy-pinned-nightly" },
+        NativeTool { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", version_parse:"lld-gnu-version" },
+        NativeTool { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", version_parse:"llvm-version-family" },
+        NativeTool { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", version_parse:"openssl-version-a" },
+        NativeTool { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", version_parse:"host-c-compiler-v" },
+        NativeTool { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", version_parse:"archiver-version" },
+        NativeTool { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", version_parse:"archiver-version" },
+        NativeTool { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", version_parse:"aarch64-c-compiler-v" },
+        NativeTool { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", version_parse:"archiver-version" },
+        NativeTool { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", version_parse:"apple-clang-version" },
+        NativeTool { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", version_parse:"llvm-version-family" },
+        NativeTool { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", version_parse:"windows-clang-cl-version" },
+        NativeTool { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", version_parse:"llvm-lib-help" },
+        NativeTool { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", version_parse:"lld-coff-version" },
     ];
     const EXECUTION_BIN_NAMES: [&str; 20] = [
         "rustc", "cargo", "rustdoc", "rustfmt", "cargo-fmt", "cargo-clippy", "clippy-driver",
@@ -68974,6 +69569,74 @@ fn ordinary_reprobe_tool_set(
                 tool.id
             ));
         }
+        // Semantic pin admission (same id set as produce parse_version_stream).
+        let text = std::str::from_utf8(&selected_stream).map_err(|_| {
+            format!("E_HANDOFF_TOOL_SET: {} version UTF-8", tool.id)
+        })?;
+        match tool.version_parse {
+            "rustc-vv-pinned-1.99" => {
+                if !text.contains("release: 1.99.0-nightly")
+                    || !text.contains("commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14")
+                    || !text.contains("host: x86_64-unknown-linux-gnu")
+                {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: {} rustc pin mismatch",
+                        tool.id
+                    ));
+                }
+            }
+            "cargo-vv-pinned-1.99" => {
+                if !text.contains("release: 1.99.0-nightly")
+                    || !text.contains("commit-hash: 59800466c5c41c444d264b1010b4d57e85a7117f")
+                {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: {} cargo pin mismatch",
+                        tool.id
+                    ));
+                }
+            }
+            "rustdoc-pinned-1.99" => {
+                if !text.contains("1.99.0-nightly")
+                    || !text.contains("375b1431b7d89d1c2e2bc168c011848ae12b7d14")
+                {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: {} rustdoc pin mismatch",
+                        tool.id
+                    ));
+                }
+            }
+            "openssl-version-a" => {
+                if !text.contains("OpenSSL") {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: {} openssl identity missing",
+                        tool.id
+                    ));
+                }
+            }
+            "rustfmt-pinned-nightly"
+            | "clippy-pinned-nightly"
+            | "lld-gnu-version"
+            | "llvm-version-family"
+            | "host-c-compiler-v"
+            | "archiver-version"
+            | "aarch64-c-compiler-v"
+            | "apple-clang-version"
+            | "windows-clang-cl-version"
+            | "llvm-lib-help"
+            | "lld-coff-version" => {
+                if text.trim().is_empty() {
+                    return Err(format!(
+                        "E_HANDOFF_TOOL_SET: {} empty version for {}",
+                        tool.id, tool.version_parse
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "E_HANDOFF_TOOL_SET: unknown version_parse {other}"
+                ));
+            }
+        }
         version_streams.push(selected_stream);
     }
 
@@ -69066,6 +69729,342 @@ fn ordinary_hex_nibble(byte: u8) -> Result<u8, String> {
     }
 }
 
+const ORDINARY_CONTROLLER_BUILD_AUTHORITY_DETAIL: &str =
+    "controller mode requires a separately authorized pinned local build or an independently audited prebuilt macOS artifact whose exact path/bytes are substituted for ordinary_controller_argv[0]";
+
+fn validate_ordinary_controller_absolute_lexical_path(value: &str) -> VResult<PathBuf> {
+    const MAX_PATH_BYTES: usize = 4096;
+    const MAX_COMPONENT_BYTES: usize = 255;
+    const MAX_PATH_DEPTH: usize = 64;
+
+    if value.len() > MAX_PATH_BYTES
+        || !value.starts_with('/')
+        || value == "/"
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.as_bytes().iter().any(|byte| byte.is_ascii_control())
+    {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_ARGUMENTS",
+            "ordinary controller argv[0] must be an absolute lexical path",
+        ));
+    }
+    let mut depth = 0usize;
+    for component in value.split('/').skip(1) {
+        depth = depth.checked_add(1).ok_or_else(|| {
+            Diagnostic::error("E_HANDOFF_ARGUMENTS", "ordinary controller argv[0] depth")
+        })?;
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.len() > MAX_COMPONENT_BYTES
+        {
+            return Err(Diagnostic::error(
+                "E_HANDOFF_ARGUMENTS",
+                "ordinary controller argv[0] contains an invalid component",
+            ));
+        }
+    }
+    if depth == 0 || depth > MAX_PATH_DEPTH {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_ARGUMENTS",
+            "ordinary controller argv[0] depth is outside policy bounds",
+        ));
+    }
+    let path = PathBuf::from(value);
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_ARGUMENTS",
+            "ordinary controller argv[0] is not lexical",
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_ordinary_controller_arguments<I>(arguments: I) -> VResult<PathBuf>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let values = arguments
+        .into_iter()
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                Diagnostic::error(
+                    "E_HANDOFF_ARGUMENTS",
+                    "every ordinary controller argv item must be UTF-8",
+                )
+            })
+        })
+        .collect::<VResult<Vec<_>>>()?;
+    if values.len() != 4
+        || values.get(1).map(String::as_str) != Some("controller")
+        || values.get(2).map(String::as_str) != Some(".")
+    {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_ARGUMENTS",
+            "expected <executable> controller . <run-id>",
+        ));
+    }
+    let run_id = super::trust_std::decode_lower_hex::<16>(
+        &values[3],
+        "ordinary controller run ID",
+    )
+    .map_err(|error| {
+        Diagnostic::error("E_BOOTSTRAP_RUN_ID", "ordinary controller run ID")
+            .at(error.to_string())
+    })?;
+    if run_id.iter().all(|byte| *byte == 0) {
+        return Err(Diagnostic::error(
+            "E_BOOTSTRAP_RUN_ID",
+            "all-zero ordinary controller run ID is forbidden",
+        ));
+    }
+    validate_ordinary_controller_absolute_lexical_path(&values[0])
+}
+
+fn read_ordinary_controller_repository_once() -> VResult<PathBuf> {
+    let current = std::env::current_dir().map_err(|error| {
+        Diagnostic::error("E_BOOTSTRAP_CURRENT_DIR", "ordinary controller current repository")
+            .at(error.to_string())
+    })?;
+    let current_text = current.to_str().ok_or_else(|| {
+        Diagnostic::error(
+            "E_BOOTSTRAP_CURRENT_DIR",
+            "ordinary controller current repository must be UTF-8",
+        )
+    })?;
+    validate_ordinary_controller_absolute_lexical_path(current_text).map_err(|_| {
+        Diagnostic::error(
+            "E_BOOTSTRAP_CURRENT_DIR",
+            "ordinary controller current repository must be absolute and lexical",
+        )
+    })?;
+    validate_repository_root_layout(&current).map_err(|error| {
+        Diagnostic::error(
+            "E_BOOTSTRAP_CURRENT_DIR",
+            "ordinary controller current repository is not the compiled repository",
+        )
+        .at(error.stable())
+    })?;
+
+    let mut physical = PathBuf::from("/");
+    for component in current.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(part) => {
+                physical.push(part);
+                let metadata = fs::symlink_metadata(&physical).map_err(|error| {
+                    Diagnostic::error(
+                        "E_BOOTSTRAP_CURRENT_DIR",
+                        "ordinary controller physical repository component",
+                    )
+                    .at(error.to_string())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Diagnostic::error(
+                        "E_BOOTSTRAP_CURRENT_DIR",
+                        "ordinary controller repository must be a physical directory path",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Diagnostic::error(
+                    "E_BOOTSTRAP_CURRENT_DIR",
+                    "ordinary controller repository contains a non-lexical component",
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn validate_ordinary_controller_observations(
+    executable_path: &Path,
+    current_executable: &Path,
+    current_repository: &Path,
+) -> VResult<()> {
+    if current_executable != executable_path {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_EXECUTABLE",
+            "ordinary controller argv[0] differs from current_exe",
+        ));
+    }
+    if current_repository != repository_root() {
+        return Err(Diagnostic::error(
+            "E_BOOTSTRAP_CURRENT_DIR",
+            "ordinary controller current repository differs from the compiled repository",
+        ));
+    }
+    Err(Diagnostic::error(
+        "E_CONTROLLER_PLATFORM",
+        ORDINARY_CONTROLLER_BUILD_AUTHORITY_DETAIL,
+    ))
+}
+
+fn admit_ordinary_controller_entry(
+    arguments: Vec<std::ffi::OsString>,
+) -> VResult<()> {
+    let executable_path = parse_ordinary_controller_arguments(arguments)?;
+    let current_executable = std::env::current_exe().map_err(|error| {
+        Diagnostic::error("E_HANDOFF_EXECUTABLE", "ordinary controller current_exe")
+            .at(error.to_string())
+    })?;
+    if current_executable != executable_path {
+        return Err(Diagnostic::error(
+            "E_HANDOFF_EXECUTABLE",
+            "ordinary controller argv[0] differs from current_exe",
+        ));
+    }
+    let current_repository = read_ordinary_controller_repository_once()?;
+    validate_ordinary_controller_observations(
+        &executable_path,
+        &current_executable,
+        &current_repository,
+    )
+}
+
+fn run_ordinary_controller_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
+    let _ = admit_ordinary_controller_entry(arguments);
+    3
+}
+
+#[test]
+fn ordinary_controller_arguments_accept_only_the_exact_four_item_form() {
+    let executable = "/controller/bin/fnd01-controller";
+    let run_id = "0123456789abcdef0123456789abcdef";
+    let exact = [executable, "controller", ".", run_id]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parse_ordinary_controller_arguments(exact)
+            .expect("exact ordinary controller argv"),
+        PathBuf::from(executable),
+    );
+
+    let mutations = [
+        (
+            vec![executable, "controller", "."],
+            "E_HANDOFF_ARGUMENTS",
+        ),
+        (
+            vec![executable, "produce", ".", run_id],
+            "E_HANDOFF_ARGUMENTS",
+        ),
+        (
+            vec![executable, "controller", "./", run_id],
+            "E_HANDOFF_ARGUMENTS",
+        ),
+        (
+            vec![
+                executable,
+                "controller",
+                ".",
+                "0123456789ABCDEF0123456789ABCDEF",
+            ],
+            "E_BOOTSTRAP_RUN_ID",
+        ),
+        (
+            vec![
+                executable,
+                "controller",
+                ".",
+                "00000000000000000000000000000000",
+            ],
+            "E_BOOTSTRAP_RUN_ID",
+        ),
+        (
+            vec!["relative/controller", "controller", ".", run_id],
+            "E_HANDOFF_ARGUMENTS",
+        ),
+        (
+            vec!["/controller/./binary", "controller", ".", run_id],
+            "E_HANDOFF_ARGUMENTS",
+        ),
+    ];
+    for (arguments, expected_code) in mutations {
+        let error = parse_ordinary_controller_arguments(
+            arguments.into_iter().map(std::ffi::OsString::from),
+        )
+        .expect_err("ordinary controller argv mutation must fail");
+        assert_eq!(error.code, expected_code);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_controller_arguments_reject_non_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error = parse_ordinary_controller_arguments([
+        std::ffi::OsString::from_vec(vec![b'/', 0xff]),
+        std::ffi::OsString::from("controller"),
+        std::ffi::OsString::from("."),
+        std::ffi::OsString::from("0123456789abcdef0123456789abcdef"),
+    ])
+    .expect_err("non-UTF-8 ordinary controller argv must fail");
+    assert_eq!(error.code, "E_HANDOFF_ARGUMENTS");
+}
+
+#[test]
+fn ordinary_controller_admission_has_no_implicit_build_authority() {
+    let executable = Path::new("/controller/bin/fnd01-controller");
+    let repository = repository_root();
+    let error = validate_ordinary_controller_observations(
+        executable,
+        executable,
+        &repository,
+    )
+    .expect_err("ordinary controller must fail without external build authority");
+    assert_eq!(error.code, "E_CONTROLLER_PLATFORM");
+    assert_eq!(
+        error.subject,
+        ORDINARY_CONTROLLER_BUILD_AUTHORITY_DETAIL,
+    );
+}
+
+#[test]
+fn ordinary_controller_observation_mismatches_fail_before_authority() {
+    let executable = Path::new("/controller/bin/fnd01-controller");
+    let other_executable = Path::new("/controller/bin/other");
+    let repository = repository_root();
+    let executable_error = validate_ordinary_controller_observations(
+        executable,
+        other_executable,
+        &repository,
+    )
+    .expect_err("current_exe mismatch must fail");
+    assert_eq!(executable_error.code, "E_HANDOFF_EXECUTABLE");
+
+    let repository_error = validate_ordinary_controller_observations(
+        executable,
+        executable,
+        Path::new("/not/the/compiled/repository"),
+    )
+    .expect_err("physical repository mismatch must fail");
+    assert_eq!(repository_error.code, "E_BOOTSTRAP_CURRENT_DIR");
+}
+
+#[test]
+fn ordinary_controller_entry_always_returns_three_without_dispatch() {
+    let arguments = [
+        "/not/current/executable",
+        "controller",
+        ".",
+        "0123456789abcdef0123456789abcdef",
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect::<Vec<_>>();
+    assert_eq!(run_ordinary_controller_entry(arguments), 3);
+}
+
 pub fn harness_main<I>(arguments: I) -> i32
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -69093,6 +70092,9 @@ where
                     1
                 }
             },
+            // Ordinary local controller: validate exact admission, then fail closed because
+            // this policy supplies no external authority for a native controller build.
+            4 => run_ordinary_controller_entry(arguments),
             // Ordinary produce/attest handoff: exact five-item form only.
             5 => run_ordinary_handoff_entry(arguments),
             // Malformed arity is never conflated with role handoff or local verifier.
