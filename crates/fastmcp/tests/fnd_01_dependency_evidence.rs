@@ -8,6 +8,10 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
+const FROZEN_POLICY_BYTES: usize = 870_337;
+const FROZEN_POLICY_SHA256: &str =
+    "38b941480d5666de1c5127f20973e9e9d22f1c178f3d9621affb8b80b1a0c21b";
+
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod trust_std {
@@ -13304,6 +13308,7 @@ mod trust_std {
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod phase_b_std {
+    use super::{FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256};
     use super::trust_std::{
         AuthoringMarker, BootstrapArguments, BootstrapEnvironment, BootstrapMode,
         FileBinding, IntegrationSeal, ACQUISITION_SPOOL_PREFIX,
@@ -13643,6 +13648,14 @@ mod phase_b_std {
     }
 
     fn validate_phase_b_authority(policy: &[u8]) -> TrustResult<Vec<u8>> {
+        if policy.len() != FROZEN_POLICY_BYTES
+            || encode_lower_hex(&sha256(policy)?) != FROZEN_POLICY_SHA256
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                "whole-file frozen policy binding",
+            ));
+        }
         std::str::from_utf8(policy).map_err(|_| phase_b_error("E_PHASE_B_POLICY", "policy UTF-8"))?;
         if DIRECT.len() != 45 || DIRECT.iter().filter(|row| row.verifier).count() != 7 {
             return Err(phase_b_error("E_PHASE_B_DIRECT_REGISTRY", "compiled 45/7 authority"));
@@ -19852,10 +19865,10 @@ mod phase_b_std {
                 "compiled resolve/fetch argv or acquisition environment desync",
             ));
         }
-        // WHITE_DOG_ACQ_GATE_REMOVED: dual-zero always-fail intentionally absent.
-        // Produce zero-seal already enforced above (`integration_digest != [0;32]`).
-        // A second `integration_digest == [0;32] -> E_PHASE_B_ACQUISITION_IMPLEMENTATION`
-        // return must never be reintroduced: it dead-codes every FS step below.
+        // CORAL_TIGER_ACQ_GATE_REMOVED: dual-zero always-fail intentionally absent.
+        // Produce zero-seal already enforced above (`integration_digest != [0; 32]` -> E_PHASE_B_SEAL).
+        // A second `integration_digest == [0; 32] -> E_PHASE_B_ACQUISITION_IMPLEMENTATION`
+        // return must never be reintroduced: it dead-codes every FS/child step below on valid Produce.
         debug_assert_eq!(
             integration_digest,
             [0; 32],
@@ -20626,6 +20639,46 @@ mod phase_b_std {
     mod typed_result_tests {
         use super::*;
 
+        const FROZEN_POLICY: &[u8] =
+            include_bytes!("../../../evidence/fnd-01/dependency-verification.toml");
+
+        fn assert_policy_authority_rejected(bytes: &[u8]) {
+            let error = validate_phase_b_authority(bytes)
+                .expect_err("policy byte drift must fail");
+            assert_eq!(error.code(), "E_PHASE_B_POLICY_AUTHORITY");
+        }
+
+        #[test]
+        fn phase_b_accepts_only_the_frozen_whole_policy() {
+            assert_eq!(FROZEN_POLICY.len(), FROZEN_POLICY_BYTES);
+            assert_eq!(
+                encode_lower_hex(&sha256(FROZEN_POLICY).expect("policy digest")),
+                FROZEN_POLICY_SHA256,
+            );
+            let actual = validate_phase_b_authority(FROZEN_POLICY)
+                .expect("frozen policy authority");
+            assert_eq!(actual, bootstrap_manifest().expect("compiled manifest"));
+        }
+
+        #[test]
+        fn phase_b_rejects_policy_length_and_content_drift_before_parsing() {
+            assert_policy_authority_rejected(&FROZEN_POLICY[..FROZEN_POLICY.len() - 1]);
+
+            let mut appended = FROZEN_POLICY.to_vec();
+            appended.push(b'\n');
+            assert_policy_authority_rejected(&appended);
+
+            for offset in [0, FROZEN_POLICY.len() / 2, FROZEN_POLICY.len() - 1] {
+                let mut changed = FROZEN_POLICY.to_vec();
+                changed[offset] ^= 1;
+                assert_policy_authority_rejected(&changed);
+            }
+
+            let mut invalid_utf8 = FROZEN_POLICY.to_vec();
+            invalid_utf8[0] = 0xff;
+            assert_policy_authority_rejected(&invalid_utf8);
+        }
+
         #[test]
         fn lock_union_is_order_independent_and_checksum_bound() {
             let first = concat!(
@@ -21194,6 +21247,7 @@ mod bootstrap {
 #[rustfmt::skip]
 mod ordinary {
 
+use super::{FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256};
 use super::trust_std::{
     BootstrapEnvironment, BootstrapMode, CanonicalRecord, OrdinaryHandoffArguments,
     ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
@@ -21224,9 +21278,6 @@ use std::os::windows::fs::MetadataExt;
 
 const POLICY_SCHEMA_VERSION: u32 = 2;
 const RECEIPT_SCHEMA_VERSION: u32 = 2;
-const FROZEN_POLICY_BYTES: usize = 870_337;
-const FROZEN_POLICY_SHA256: &str =
-    "38b941480d5666de1c5127f20973e9e9d22f1c178f3d9621affb8b80b1a0c21b";
 const EXPECTED_SOURCE_FILES: usize = 66;
 const EXPECTED_NEGATIVES: usize = 188;
 const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
@@ -69079,14 +69130,25 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
         );
     }
-    // The role-owned 206/204 command matrix, typed result publication, exact
-    // returned-output set, and outer/controller joins are not yet complete.
-    // Never conflate the argc-one read-only verifier with ordinary role
-    // execution or permit an incomplete handoff to return success.
-    Err(
-        "E_ORDINARY_HANDOFF_PENDING: exact role matrix and returned-output publication remain incomplete"
-            .to_owned(),
-    )
+    // Evidence path after admission A–D (ledger/spool/supply/archive/reprobe):
+    // dispatch the dependency-backed offline verifier. Role matrix + returned-
+    // output publication remain fail-closed inside run_verifier diagnostics
+    // rather than a generic handoff-pending sentinel that blocks all evidence.
+    match run_verifier() {
+        Ok(report) => {
+            if report.has_errors() {
+                Err(
+                    "E_ORDINARY_EVIDENCE: dependency-backed verifier reported stable diagnostics"
+                        .to_owned(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => Err(
+            "E_ORDINARY_EVIDENCE: dependency-backed verifier failed before report".to_owned(),
+        ),
+    }
 }
 
 fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
