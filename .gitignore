@@ -57,3 +57,6 @@ test_meminfo
 perf.data
 # br doctor per-run artifacts
 .doctor/
+
+# FND-01: exact active ignore for verifier/integration run scratch
+.fnd01-run/

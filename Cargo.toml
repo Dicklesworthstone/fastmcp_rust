@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/fastmcp",
     "crates/fastmcp-core",
@@ -16,7 +16,9 @@ members = [
 version = "0.3.2"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+# Cargo lower-bound check only; the supported compiler is the dated nightly
+# pinned in rust-toolchain.toml (nightly-2026-07-11 / rustc 1.99.0-nightly).
+rust-version = "1.99"
 repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
 homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
 readme = "README.md"
@@ -48,7 +50,8 @@ rich_rust = "0.2"
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# FND-01 ROOT-SERDE-JSON: exact version + arbitrary_precision for protocol numbers
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 serde_yaml = "0.9"
 
 # Logging (facade only, zero-cost when disabled)
@@ -56,8 +59,10 @@ log = "0.4"
 
 # Opaque cursor encoding for pagination
 base64 = "0.22"
-semver = "1"
-ureq = "3"
+# FND-01 ROOT-SEMVER (facade evidence / future gates; CLI must not depend on this)
+semver = { version = "1.0.28" }
+# FND-01 ROOT-FLATE2 (facade evidence / supply archive paths)
+flate2 = { version = "1.1.9" }
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -69,19 +74,20 @@ glob = "0.3"
 # Console output
 console = "0.16"
 
-# Redis (optional, for Docket distributed backend)
-redis = "1"
-
 # Configuration file parsing
 toml = "1.1"
 dirs = "6"
 
-# Cryptographic RNG (for WebSocket masking)
-getrandom = "0.4"
-
-# Cryptography (OAuth PKCE, OIDC signing)
-sha2 = "0.10"
-hmac = "0.12"
+# FND-01 foundation pins (exact feature surfaces)
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+getrandom = { version = "0.4.3", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc", "derive"] }
+# FND-01 ROOT-RING-EVIDENCE / JOSE RS256 (alloc only on the direct edge)
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+# FND-01 ROOT-PROC-MACRO2-EVIDENCE (facade evidence harness)
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 
 # Regex (JSON Schema `pattern` validation)
 regex = "1"
