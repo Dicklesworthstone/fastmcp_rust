@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 880_190;
+const FROZEN_POLICY_BYTES: usize = 901_379;
 const FROZEN_POLICY_SHA256: &str =
-    "67d98cf7f748463b8bf8e1b5daf42098a7b897e1a87b6aeb63cd744b0f7b815e";
+    "852f9c435992a7f58af161bb132aae47e14b21910d61d6c0a37c503757e34b16";
 
 #[rustfmt::skip]
 #[allow(dead_code)]
@@ -1556,6 +1556,932 @@ mod trust_std {
         pub modification_nanoseconds: i64,
         pub change_seconds: i64,
         pub change_nanoseconds: i64,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct FilesystemUsage {
+        pub entry_count: u64,
+        pub regular_file_bytes: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FilesystemUsageCap {
+        pub max_entry_count: u64,
+        pub max_regular_file_bytes: u64,
+    }
+
+    impl FilesystemUsageCap {
+        pub fn validate(self, subject: &str) -> TrustResult<Self> {
+            if self.max_entry_count == 0 || self.max_regular_file_bytes == 0 {
+                return Err(TrustError::new(
+                    "E_SPACE_CONFIGURATION",
+                    format!("{subject}: aggregate caps must be nonzero"),
+                ));
+            }
+            Ok(self)
+        }
+    }
+
+    impl FilesystemUsage {
+        pub const ZERO: Self = Self {
+            entry_count: 0,
+            regular_file_bytes: 0,
+        };
+
+        pub fn checked_add(
+            self,
+            additional: Self,
+            subject: &str,
+        ) -> TrustResult<Self> {
+            Ok(Self {
+                entry_count: self.entry_count.checked_add(additional.entry_count)
+                    .ok_or_else(|| TrustError::new(
+                        "E_SPACE_OVERFLOW",
+                        format!("{subject}: entry-count overflow"),
+                    ))?,
+                regular_file_bytes: self.regular_file_bytes
+                    .checked_add(additional.regular_file_bytes)
+                    .ok_or_else(|| TrustError::new(
+                        "E_SPACE_OVERFLOW",
+                        format!("{subject}: regular-file-byte overflow"),
+                    ))?,
+            })
+        }
+
+        pub fn require_at_most(
+            self,
+            cap: FilesystemUsageCap,
+            subject: &str,
+        ) -> TrustResult<()> {
+            let cap = cap.validate(subject)?;
+            if self.entry_count > cap.max_entry_count
+                || self.regular_file_bytes > cap.max_regular_file_bytes
+            {
+                return Err(TrustError::new(
+                    "E_SPACE_BOUND",
+                    format!(
+                        "{subject}: usage entries={} bytes={} exceeds entries={} bytes={}",
+                        self.entry_count,
+                        self.regular_file_bytes,
+                        cap.max_entry_count,
+                        cap.max_regular_file_bytes,
+                    ),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn checked_projected(
+            self,
+            additional: Self,
+            cap: FilesystemUsageCap,
+            subject: &str,
+        ) -> TrustResult<Self> {
+            let projected = self.checked_add(additional, subject)?;
+            projected.require_at_most(cap, subject)?;
+            Ok(projected)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PhaseBSpaceBudget {
+        pub max_tree_entry_count: u64,
+        pub max_run_scratch_total_bytes: u64,
+        pub max_fallback_target_total_bytes: u64,
+        pub max_execution_footprint_total_bytes: u64,
+        pub max_control_plane_total_bytes: u64,
+        pub max_bootstrap_scratch_total_bytes: u64,
+        pub max_materialization_total_bytes: u64,
+    }
+
+    impl PhaseBSpaceBudget {
+        pub fn validate(self, subject: &str) -> TrustResult<Self> {
+            if self.max_tree_entry_count == 0
+                || self.max_run_scratch_total_bytes == 0
+                || self.max_fallback_target_total_bytes == 0
+                || self.max_execution_footprint_total_bytes == 0
+                || self.max_control_plane_total_bytes == 0
+                || self.max_bootstrap_scratch_total_bytes == 0
+                || self.max_materialization_total_bytes == 0
+            {
+                return Err(TrustError::new(
+                    "E_SPACE_CONFIGURATION",
+                    format!("{subject}: Phase-B space caps must be nonzero"),
+                ));
+            }
+            let execution = self.max_run_scratch_total_bytes
+                .checked_add(self.max_fallback_target_total_bytes)
+                .ok_or_else(|| TrustError::new(
+                    "E_SPACE_OVERFLOW",
+                    format!("{subject}: execution-footprint authority overflow"),
+                ))?;
+            if execution != self.max_execution_footprint_total_bytes {
+                return Err(TrustError::new(
+                    "E_SPACE_CONFIGURATION",
+                    format!(
+                        "{subject}: execution footprint must equal run plus fallback"
+                    ),
+                ));
+            }
+            Ok(self)
+        }
+
+        pub fn cap(
+            self,
+            max_regular_file_bytes: u64,
+        ) -> FilesystemUsageCap {
+            FilesystemUsageCap {
+                max_entry_count: self.max_tree_entry_count,
+                max_regular_file_bytes,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilesystemRootUsage {
+        pub root: PathBuf,
+        pub root_identity: LinuxFileIdentity,
+        pub usage: FilesystemUsage,
+    }
+
+    pub fn normalize_outermost_usage_roots(
+        candidate_roots: &[PathBuf],
+        subject: &str,
+    ) -> TrustResult<Vec<PathBuf>> {
+        let mut sorted = Vec::new();
+        sorted.try_reserve_exact(candidate_roots.len()).map_err(|_| {
+            TrustError::new(
+                "E_SPACE_ALLOCATION",
+                format!("{subject}: root registry allocation"),
+            )
+        })?;
+        let mut unique = BTreeSet::new();
+        for candidate in candidate_roots {
+            let text = candidate.to_str().ok_or_else(|| {
+                TrustError::new(
+                    "E_SPACE_ROOT",
+                    format!("{subject}: usage root must be UTF-8"),
+                )
+            })?;
+            let validated = validate_absolute_lexical_path(text, subject)?;
+            if &validated != candidate || !unique.insert(validated.clone()) {
+                return Err(TrustError::new(
+                    "E_SPACE_ROOT",
+                    format!("{subject}: duplicate or noncanonical usage root"),
+                ));
+            }
+            sorted.push(validated);
+        }
+        sorted.sort_by(|left, right| {
+            left.components().count().cmp(&right.components().count())
+                .then_with(|| {
+                    left.as_os_str().as_encoded_bytes()
+                        .cmp(right.as_os_str().as_encoded_bytes())
+                })
+        });
+        let mut outermost = Vec::<PathBuf>::new();
+        for candidate in sorted {
+            if outermost.iter().any(|root| candidate.starts_with(root)) {
+                continue;
+            }
+            outermost.push(candidate);
+        }
+        outermost.sort_by(|left, right| {
+            left.as_os_str().as_encoded_bytes()
+                .cmp(right.as_os_str().as_encoded_bytes())
+        });
+        Ok(outermost)
+    }
+
+    pub fn checked_disjoint_usage(
+        roots: &[FilesystemRootUsage],
+        cap: FilesystemUsageCap,
+        subject: &str,
+    ) -> TrustResult<FilesystemUsage> {
+        cap.validate(subject)?;
+        let mut total = FilesystemUsage::ZERO;
+        for (index, root) in roots.iter().enumerate() {
+            for prior in &roots[..index] {
+                if root.root == prior.root
+                    || root.root.starts_with(&prior.root)
+                    || prior.root.starts_with(&root.root)
+                    || (root.root_identity.device == prior.root_identity.device
+                        && root.root_identity.inode == prior.root_identity.inode)
+                {
+                    return Err(TrustError::new(
+                        "E_SPACE_ROOT_ALIAS",
+                        format!("{subject}: overlapping or physically aliased roots"),
+                    ));
+                }
+            }
+            total = total.checked_add(root.usage, subject)?;
+        }
+        total.require_at_most(cap, subject)?;
+        Ok(total)
+    }
+
+    fn walk_usage_directory_nofollow(
+        current: &Path,
+        cap: FilesystemUsageCap,
+        subject: &str,
+        depth: usize,
+        usage: &mut FilesystemUsage,
+    ) -> TrustResult<()> {
+        if depth == 0 || depth > MAX_ABSOLUTE_PATH_DEPTH {
+            return Err(TrustError::new(
+                "E_SPACE_DEPTH",
+                format!("{subject}: filesystem traversal depth exceeded"),
+            ));
+        }
+        let before_metadata = fs::symlink_metadata(current).map_err(|error| {
+            TrustError::new(
+                "E_SPACE_SCAN",
+                format!("{subject}: {}: {error}", current.display()),
+            )
+        })?;
+        if before_metadata.file_type().is_symlink() || !before_metadata.is_dir() {
+            return Err(TrustError::new(
+                "E_SPACE_FILE_TYPE",
+                format!("{subject}: {} is not a no-follow directory", current.display()),
+            ));
+        }
+        let before = linux_identity(&before_metadata, subject)?;
+        for entry in fs::read_dir(current).map_err(|error| {
+            TrustError::new(
+                "E_SPACE_SCAN",
+                format!("{subject}: {}: {error}", current.display()),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                TrustError::new(
+                    "E_SPACE_SCAN",
+                    format!("{subject}: {}: {error}", current.display()),
+                )
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                TrustError::new(
+                    "E_SPACE_ROOT",
+                    format!("{subject}: non-UTF-8 filesystem entry"),
+                )
+            })?;
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                return Err(TrustError::new(
+                    "E_SPACE_ROOT",
+                    format!("{subject}: invalid filesystem entry {name:?}"),
+                ));
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                TrustError::new(
+                    "E_SPACE_SCAN",
+                    format!("{subject}: {}: {error}", path.display()),
+                )
+            })?;
+            let file_type = metadata.file_type();
+            *usage = usage.checked_projected(
+                FilesystemUsage {
+                    entry_count: 1,
+                    regular_file_bytes: 0,
+                },
+                cap,
+                subject,
+            )?;
+            if file_type.is_symlink() {
+                // No-follow accounting charges the directory entry but never
+                // follows or charges the target.  Separate typed tree
+                // contracts decide whether this exact link is admissible.
+            } else if metadata.is_dir() {
+                let next_depth = depth.checked_add(1).ok_or_else(|| {
+                    TrustError::new(
+                        "E_SPACE_DEPTH",
+                        format!("{subject}: filesystem traversal depth overflow"),
+                    )
+                })?;
+                walk_usage_directory_nofollow(
+                    &path,
+                    cap,
+                    subject,
+                    next_depth,
+                    usage,
+                )?;
+            } else if metadata.is_file() {
+                let identity = linux_identity(&metadata, subject)?;
+                if identity.link_count != 1 {
+                    return Err(TrustError::new(
+                        "E_SPACE_FILE_TYPE",
+                        format!("{subject}: hardlink forbidden at {}", path.display()),
+                    ));
+                }
+                *usage = usage.checked_projected(
+                    FilesystemUsage {
+                        entry_count: 0,
+                        regular_file_bytes: identity.byte_length,
+                    },
+                    cap,
+                    subject,
+                )?;
+                let after_metadata =
+                    fs::symlink_metadata(&path).map_err(|error| {
+                        TrustError::new(
+                            "E_SPACE_RACE",
+                            format!("{subject}: {}: {error}", path.display()),
+                        )
+                    })?;
+                if linux_identity(&after_metadata, subject)? != identity {
+                    return Err(TrustError::new(
+                        "E_SPACE_RACE",
+                        format!(
+                            "{subject}: regular-file identity drift at {}",
+                            path.display(),
+                        ),
+                    ));
+                }
+            } else {
+                return Err(TrustError::new(
+                    "E_SPACE_FILE_TYPE",
+                    format!("{subject}: special file forbidden at {}", path.display()),
+                ));
+            }
+        }
+        let after_metadata = fs::symlink_metadata(current).map_err(|error| {
+            TrustError::new(
+                "E_SPACE_RACE",
+                format!("{subject}: {}: {error}", current.display()),
+            )
+        })?;
+        if linux_identity(&after_metadata, subject)? != before {
+            return Err(TrustError::new(
+                "E_SPACE_RACE",
+                format!("{subject}: directory identity drift at {}", current.display()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn snapshot_missing_usage_parent(
+        missing: &Path,
+        subject: &str,
+    ) -> TrustResult<(PathBuf, LinuxFileIdentity)> {
+        let mut candidate = missing.parent().ok_or_else(|| {
+            TrustError::new(
+                "E_SPACE_ROOT",
+                format!("{subject}: missing root has no parent"),
+            )
+        })?;
+        loop {
+            match fs::symlink_metadata(candidate) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(TrustError::new(
+                            "E_SPACE_FILE_TYPE",
+                            format!(
+                                "{subject}: missing-root ancestor is not a no-follow directory"
+                            ),
+                        ));
+                    }
+                    return Ok((
+                        candidate.to_path_buf(),
+                        linux_identity(&metadata, subject)?,
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    candidate = candidate.parent().ok_or_else(|| {
+                        TrustError::new(
+                            "E_SPACE_ROOT",
+                            format!("{subject}: no existing missing-root ancestor"),
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    return Err(TrustError::new(
+                        "E_SPACE_SCAN",
+                        format!("{subject}: {}: {error}", candidate.display()),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn snapshot_usage_roots_nofollow(
+        candidate_roots: &[PathBuf],
+        cap: FilesystemUsageCap,
+        subject: &str,
+    ) -> TrustResult<Vec<FilesystemRootUsage>> {
+        let cap = cap.validate(subject)?;
+        let normalized =
+            normalize_outermost_usage_roots(candidate_roots, subject)?;
+        let mut snapshots = Vec::new();
+        let mut missing_parents = Vec::new();
+        for root in normalized {
+            match fs::symlink_metadata(&root) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(TrustError::new(
+                            "E_SPACE_FILE_TYPE",
+                            format!("{subject}: root is a symlink"),
+                        ));
+                    }
+                    let root_identity = linux_identity(&metadata, subject)?;
+                    let usage = if metadata.is_dir() {
+                        let mut usage = FilesystemUsage::ZERO;
+                        walk_usage_directory_nofollow(
+                            &root,
+                            cap,
+                            subject,
+                            1,
+                            &mut usage,
+                        )?;
+                        usage
+                    } else if metadata.is_file() {
+                        if root_identity.link_count != 1 {
+                            return Err(TrustError::new(
+                                "E_SPACE_FILE_TYPE",
+                                format!("{subject}: file root is a hardlink"),
+                            ));
+                        }
+                        let usage = FilesystemUsage {
+                            entry_count: 1,
+                            regular_file_bytes: root_identity.byte_length,
+                        };
+                        usage.require_at_most(cap, subject)?;
+                        usage
+                    } else {
+                        return Err(TrustError::new(
+                            "E_SPACE_FILE_TYPE",
+                            format!("{subject}: root is a special file"),
+                        ));
+                    };
+                    let after_root =
+                        fs::symlink_metadata(&root).map_err(|error| {
+                            TrustError::new(
+                                "E_SPACE_RACE",
+                                format!(
+                                    "{subject}: {}: {error}",
+                                    root.display(),
+                                ),
+                            )
+                        })?;
+                    if linux_identity(&after_root, subject)? != root_identity {
+                        return Err(TrustError::new(
+                            "E_SPACE_RACE",
+                            format!(
+                                "{subject}: root identity drift at {}",
+                                root.display(),
+                            ),
+                        ));
+                    }
+                    snapshots.try_reserve(1).map_err(|_| {
+                        TrustError::new(
+                            "E_SPACE_ALLOCATION",
+                            format!("{subject}: root snapshot allocation"),
+                        )
+                    })?;
+                    snapshots.push(FilesystemRootUsage {
+                        root,
+                        root_identity,
+                        usage,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing_parents.try_reserve(1).map_err(|_| {
+                        TrustError::new(
+                            "E_SPACE_ALLOCATION",
+                            format!("{subject}: missing-parent allocation"),
+                        )
+                    })?;
+                    missing_parents.push(
+                        snapshot_missing_usage_parent(&root, subject)?,
+                    );
+                }
+                Err(error) => {
+                    return Err(TrustError::new(
+                        "E_SPACE_SCAN",
+                        format!("{subject}: {}: {error}", root.display()),
+                    ));
+                }
+            }
+        }
+        checked_disjoint_usage(&snapshots, cap, subject)?;
+        for (path, expected) in missing_parents {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                TrustError::new(
+                    "E_SPACE_RACE",
+                    format!("{subject}: {}: {error}", path.display()),
+                )
+            })?;
+            if linux_identity(&metadata, subject)? != expected {
+                return Err(TrustError::new(
+                    "E_SPACE_RACE",
+                    format!(
+                        "{subject}: missing-root ancestor drift at {}",
+                        path.display(),
+                    ),
+                ));
+            }
+        }
+        for snapshot in &snapshots {
+            let metadata =
+                fs::symlink_metadata(&snapshot.root).map_err(|error| {
+                    TrustError::new(
+                        "E_SPACE_RACE",
+                        format!(
+                            "{subject}: final root bookend {}: {error}",
+                            snapshot.root.display(),
+                        ),
+                    )
+                })?;
+            if linux_identity(&metadata, subject)?
+                != snapshot.root_identity
+            {
+                return Err(TrustError::new(
+                    "E_SPACE_RACE",
+                    format!(
+                        "{subject}: final root identity drift at {}",
+                        snapshot.root.display(),
+                    ),
+                ));
+            }
+        }
+        Ok(snapshots)
+    }
+
+    #[cfg(test)]
+    mod filesystem_usage_tests {
+        use super::*;
+
+        fn identity(device: u64, inode: u64) -> LinuxFileIdentity {
+            LinuxFileIdentity {
+                device,
+                inode,
+                link_count: 1,
+                file_type: 0o040_000,
+                mode: 0o040_700,
+                byte_length: 0,
+                modification_seconds: 0,
+                modification_nanoseconds: 0,
+                change_seconds: 0,
+                change_nanoseconds: 0,
+            }
+        }
+
+        #[test]
+        fn aggregate_usage_is_checked_at_exact_bound_and_overflow() {
+            let cap = FilesystemUsageCap {
+                max_entry_count: 3,
+                max_regular_file_bytes: 10,
+            };
+            FilesystemUsage {
+                entry_count: 3,
+                regular_file_bytes: 10,
+            }
+            .require_at_most(cap, "exact aggregate cap")
+            .expect("the exact cap is admitted");
+            for usage in [
+                FilesystemUsage {
+                    entry_count: 4,
+                    regular_file_bytes: 10,
+                },
+                FilesystemUsage {
+                    entry_count: 3,
+                    regular_file_bytes: 11,
+                },
+            ] {
+                assert_eq!(
+                    usage
+                        .require_at_most(cap, "cap plus one")
+                        .expect_err("either cap plus one must fail")
+                        .code(),
+                    "E_SPACE_BOUND",
+                );
+            }
+            assert_eq!(
+                FilesystemUsage {
+                    entry_count: u64::MAX,
+                    regular_file_bytes: 0,
+                }
+                .checked_add(
+                    FilesystemUsage {
+                        entry_count: 1,
+                        regular_file_bytes: 0,
+                    },
+                    "entry overflow",
+                )
+                .expect_err("entry overflow must fail")
+                .code(),
+                "E_SPACE_OVERFLOW",
+            );
+            assert_eq!(
+                FilesystemUsage {
+                    entry_count: 0,
+                    regular_file_bytes: u64::MAX,
+                }
+                .checked_add(
+                    FilesystemUsage {
+                        entry_count: 0,
+                        regular_file_bytes: 1,
+                    },
+                    "byte overflow",
+                )
+                .expect_err("byte overflow must fail")
+                .code(),
+                "E_SPACE_OVERFLOW",
+            );
+        }
+
+        #[test]
+        fn phase_b_space_budget_requires_exact_execution_sum() {
+            let exact = PhaseBSpaceBudget {
+                max_tree_entry_count: 100,
+                max_run_scratch_total_bytes: 64,
+                max_fallback_target_total_bytes: 8,
+                max_execution_footprint_total_bytes: 72,
+                max_control_plane_total_bytes: 4,
+                max_bootstrap_scratch_total_bytes: 5,
+                max_materialization_total_bytes: 6,
+            };
+            exact.validate("exact budget").expect("64 + 8 = 72");
+            assert_eq!(
+                PhaseBSpaceBudget {
+                    max_execution_footprint_total_bytes: 71,
+                    ..exact
+                }
+                .validate("wrong execution sum")
+                .expect_err("a nonexact execution sum must fail")
+                .code(),
+                "E_SPACE_CONFIGURATION",
+            );
+            assert_eq!(
+                PhaseBSpaceBudget {
+                    max_run_scratch_total_bytes: u64::MAX,
+                    max_fallback_target_total_bytes: 1,
+                    max_execution_footprint_total_bytes: u64::MAX,
+                    ..exact
+                }
+                .validate("overflowing execution sum")
+                .expect_err("the authority sum must not wrap")
+                .code(),
+                "E_SPACE_OVERFLOW",
+            );
+        }
+
+        #[test]
+        fn root_normalization_deduplicates_only_nested_coverage() {
+            let normalized = normalize_outermost_usage_roots(
+                &[
+                    PathBuf::from("/run/producer"),
+                    PathBuf::from("/run"),
+                    PathBuf::from("/fallback"),
+                ],
+                "nested roots",
+            )
+            .expect("nested roots normalize");
+            assert_eq!(
+                normalized,
+                vec![PathBuf::from("/fallback"), PathBuf::from("/run")],
+            );
+            assert_eq!(
+                normalize_outermost_usage_roots(
+                    &[PathBuf::from("/run"), PathBuf::from("/run")],
+                    "duplicate roots",
+                )
+                .expect_err("duplicate configured roots must fail")
+                .code(),
+                "E_SPACE_ROOT",
+            );
+        }
+
+        #[test]
+        fn phase_b_relative_roots_reject_non_normal_paths_before_scanning() {
+            // PhaseBSpaceGuard lives in the cfg(fnd01_bootstrap) phase_b_std
+            // module; ordinary offline compilation only exercises the shared
+            // relative-path grammar that the guard reuses before any FS walk.
+            for relative in [
+                "../escape",
+                "target/../debug",
+                "./target",
+                "target//debug",
+            ] {
+                assert!(
+                    validate_relative_path(relative, "synthetic invalid root").is_err(),
+                    "non-normal root {relative:?} must fail before I/O",
+                );
+            }
+            assert!(
+                validate_relative_path(
+                    ".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef",
+                    "synthetic valid root",
+                )
+                .is_ok(),
+                "role-run relative root must be admitted by the shared grammar",
+            );
+        }
+
+        #[test]
+        fn disjoint_usage_is_collective_and_rejects_aliases() {
+            let cap = FilesystemUsageCap {
+                max_entry_count: 10,
+                max_regular_file_bytes: 100,
+            };
+            let roots = [
+                FilesystemRootUsage {
+                    root: PathBuf::from("/run/a"),
+                    root_identity: identity(1, 10),
+                    usage: FilesystemUsage {
+                        entry_count: 2,
+                        regular_file_bytes: 60,
+                    },
+                },
+                FilesystemRootUsage {
+                    root: PathBuf::from("/run/b"),
+                    root_identity: identity(1, 11),
+                    usage: FilesystemUsage {
+                        entry_count: 2,
+                        regular_file_bytes: 41,
+                    },
+                },
+            ];
+            assert_eq!(
+                checked_disjoint_usage(&roots, cap, "two sibling roots")
+                    .expect_err("siblings share one collective allowance")
+                    .code(),
+                "E_SPACE_BOUND",
+            );
+            let aliased = [
+                FilesystemRootUsage {
+                    root: PathBuf::from("/run/a"),
+                    root_identity: identity(2, 20),
+                    usage: FilesystemUsage::ZERO,
+                },
+                FilesystemRootUsage {
+                    root: PathBuf::from("/elsewhere"),
+                    root_identity: identity(2, 20),
+                    usage: FilesystemUsage::ZERO,
+                },
+            ];
+            assert_eq!(
+                checked_disjoint_usage(&aliased, cap, "physical aliases")
+                    .expect_err("physical root aliases must fail")
+                    .code(),
+                "E_SPACE_ROOT_ALIAS",
+            );
+        }
+
+        #[test]
+        fn projected_usage_fails_before_mutating_state() {
+            let current = FilesystemUsage {
+                entry_count: 2,
+                regular_file_bytes: 90,
+            };
+            let cap = FilesystemUsageCap {
+                max_entry_count: 3,
+                max_regular_file_bytes: 100,
+            };
+            assert_eq!(
+                current
+                    .checked_projected(
+                        FilesystemUsage {
+                            entry_count: 1,
+                            regular_file_bytes: 11,
+                        },
+                        cap,
+                        "projected file",
+                    )
+                    .expect_err("the projection must fail before a write")
+                    .code(),
+                "E_SPACE_BOUND",
+            );
+            assert_eq!(
+                current,
+                FilesystemUsage {
+                    entry_count: 2,
+                    regular_file_bytes: 90,
+                },
+            );
+            assert_eq!(
+                FilesystemUsage::ZERO
+                    .require_at_most(
+                        FilesystemUsageCap {
+                            max_entry_count: 0,
+                            max_regular_file_bytes: 1,
+                        },
+                        "zero cap",
+                    )
+                    .expect_err("zero caps are configuration errors")
+                    .code(),
+                "E_SPACE_CONFIGURATION",
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn nofollow_scanner_is_bounded_and_rejects_special_roots() {
+            let executable =
+                std::env::current_exe().expect("current executable path");
+            let metadata = fs::symlink_metadata(&executable)
+                .expect("current executable metadata");
+            assert!(metadata.is_file());
+            assert_eq!(metadata.nlink(), 1);
+            assert!(metadata.len() > 0);
+            let exact_cap = FilesystemUsageCap {
+                max_entry_count: 1,
+                max_regular_file_bytes: metadata.len(),
+            };
+            let snapshots = snapshot_usage_roots_nofollow(
+                std::slice::from_ref(&executable),
+                exact_cap,
+                "current executable exact cap",
+            )
+            .expect("an exact file-root cap is admitted");
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(
+                snapshots[0].usage,
+                FilesystemUsage {
+                    entry_count: 1,
+                    regular_file_bytes: metadata.len(),
+                },
+            );
+            assert_eq!(
+                snapshot_usage_roots_nofollow(
+                    std::slice::from_ref(&executable),
+                    FilesystemUsageCap {
+                        max_entry_count: 1,
+                        max_regular_file_bytes: metadata.len() - 1,
+                    },
+                    "current executable cap minus one",
+                )
+                .expect_err("one byte above the cap must fail")
+                .code(),
+                "E_SPACE_BOUND",
+            );
+
+            let missing = PathBuf::from(format!(
+                "/proc/self/fnd01-space-missing-{}",
+                std::process::id(),
+            ));
+            assert!(snapshot_usage_roots_nofollow(
+                &[missing],
+                FilesystemUsageCap {
+                    max_entry_count: 1,
+                    max_regular_file_bytes: 1,
+                },
+                "missing no-follow root",
+            )
+            .expect("a bookended missing root is zero usage")
+            .is_empty());
+
+            for (path, subject) in [
+                (PathBuf::from("/dev/null"), "special root"),
+                (PathBuf::from("/proc/self/exe"), "symlink root"),
+            ] {
+                assert_eq!(
+                    snapshot_usage_roots_nofollow(
+                        &[path],
+                        FilesystemUsageCap {
+                            max_entry_count: 1024,
+                            max_regular_file_bytes: 1024,
+                        },
+                        subject,
+                    )
+                    .expect_err("special and symlink roots must fail")
+                    .code(),
+                    "E_SPACE_FILE_TYPE",
+                );
+            }
+
+            let descriptor_snapshots = snapshot_usage_roots_nofollow(
+                &[PathBuf::from("/proc/self/fd")],
+                FilesystemUsageCap {
+                    max_entry_count: 1_000_000,
+                    max_regular_file_bytes: 1,
+                },
+                "no-follow descriptor symlinks",
+            )
+            .expect("descriptor symlinks are counted but not followed");
+            assert_eq!(descriptor_snapshots.len(), 1);
+            assert!(descriptor_snapshots[0].usage.entry_count > 0);
+            assert_eq!(
+                descriptor_snapshots[0].usage.regular_file_bytes,
+                0,
+            );
+
+            let mut usage = FilesystemUsage::ZERO;
+            assert_eq!(
+                walk_usage_directory_nofollow(
+                    Path::new("/"),
+                    FilesystemUsageCap {
+                        max_entry_count: 1,
+                        max_regular_file_bytes: 1,
+                    },
+                    "depth cap",
+                    MAX_ABSOLUTE_PATH_DEPTH + 1,
+                    &mut usage,
+                )
+                .expect_err("excessive traversal depth must fail before I/O")
+                .code(),
+                "E_SPACE_DEPTH",
+            );
+            assert_eq!(usage, FilesystemUsage::ZERO);
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16386,7 +17312,10 @@ mod trust_std {
     }
 }
 
-#[cfg(fnd01_bootstrap)]
+#[cfg(any(
+    fnd01_bootstrap,
+    all(target_os = "linux", target_arch = "x86_64")
+))]
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod phase_b_std {
@@ -16395,7 +17324,8 @@ mod phase_b_std {
         AcquisitionCommandExpectation, AcquisitionCommandPreimageInput,
         AcquisitionCommandStreamPreimage,
         AcquisitionToolPaths, AuthoringMarker, BootstrapArguments,
-        BootstrapEnvironment, BootstrapMode, FileBinding, IntegrationSeal,
+        BootstrapEnvironment, BootstrapMode, FileBinding, FilesystemUsage,
+        IntegrationSeal, PhaseBSpaceBudget,
         RetainedSnapshotSet, SparseDependencyKind,
         SparseDependencySemantic, TrustError, TrustResult,
         StreamingSha256, TypedAcquisitionResult,
@@ -16403,12 +17333,13 @@ mod phase_b_std {
         ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
         MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES,
         MAX_SPARSE_CACHE_INPUT_BYTES, MAX_SUPPLY_BUNDLE_BYTES,
-        acquisition_command_preimage, acquisition_plan, checked_read,
+        acquisition_command_preimage, acquisition_plan, checked_disjoint_usage,
+        checked_read,
         encode_lower_hex, parse_canonical_record_file_with_final_self_digest,
         finalize_acquisition_spool, parse_acquisition_spool_structure, sha256,
         validate_bootstrap_cargo_lock_v4_lexical,
         validate_cargo_config_discovery,
-        validate_sparse_index_semantics,
+        snapshot_usage_roots_nofollow, validate_sparse_index_semantics,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File, Metadata, OpenOptions};
@@ -16462,6 +17393,58 @@ mod phase_b_std {
     const NATIVE_TOOL_SHA256: &str = "befae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f";
     const MANIFEST_BYTES: usize = 7379;
     const MANIFEST_SHA256: &str = "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
+    const ACQUISITION_ENVIRONMENT_POLICY: &[u8] = br#"[[environment_profile]]
+id = "acquisition"
+required = [["AR", "{tool.host-ar.path}"], ["CARGO_HOME", "{producer-cargo-home}"], ["CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"], ["CARGO_TARGET_DIR", "{producer-custom-target}"], ["CC", "{tool.host-cc.path}"], ["CLIPPY_DRIVER", "{tool.clippy-driver.path}"], ["LANG", "C"], ["LC_ALL", "C"], ["PATH", "{closed-execution-bin}"], ["RANLIB", "{tool.host-ranlib.path}"], ["RUSTC", "{tool.rustc.path}"], ["RUSTDOC", "{tool.rustdoc.path}"], ["RUSTFMT", "{tool.rustfmt.path}"], ["RUSTUP_TOOLCHAIN", "nightly-2026-07-11"], ["SOURCE_DATE_EPOCH", "0"], ["TZ", "UTC"]]
+optional = []
+
+"#;
+    const RESOLVE_COMMAND_POLICY: &[u8] = br#"[[command_template]]
+template_id = "bootstrap.resolve"
+group = "bootstrap"
+expansion_count = 1
+id_formula = "bootstrap.resolve"
+coordinate_domain = "singleton"
+executor = "same-outer-job-child"
+argv_source = "literal"
+argv_template = ["{tool.cargo.path}", "metadata", "--format-version", "1", "--all-features", "--manifest-path", "{bootstrap-manifest}"]
+environment_profile = "acquisition"
+working_directory = "{run-root}"
+target_scope = "all-target, all-feature bootstrap-union resolution executed on the qualified host"
+execution_mode = "online-acquisition"
+profile = "metadata"
+resolver = "3"
+network_mode = "online-acquisition"
+exit_expectation = "zero"
+stdout_limit = 16777216
+stderr_limit = 1048576
+typed_parser = "strict-cargo-metadata-json-plus-union-lock"
+claim_ceiling = "online union dependency resolution observation used only to define supply acquisition"
+
+"#;
+    const FETCH_COMMAND_POLICY: &[u8] = br#"[[command_template]]
+template_id = "bootstrap.fetch"
+group = "bootstrap"
+expansion_count = 1
+id_formula = "bootstrap.fetch"
+coordinate_domain = "singleton"
+executor = "same-outer-job-child"
+argv_source = "literal"
+argv_template = ["{tool.cargo.path}", "fetch", "--locked", "--manifest-path", "{bootstrap-manifest}"]
+environment_profile = "acquisition"
+working_directory = "{run-root}"
+target_scope = "all union-lock target dependencies"
+execution_mode = "online-acquisition"
+profile = "fetch"
+resolver = "3"
+network_mode = "online-acquisition"
+exit_expectation = "zero"
+stdout_limit = 1048576
+stderr_limit = 4194304
+typed_parser = "exit-and-cache-closure"
+claim_ceiling = "online population of the fresh acquisition Cargo home; no retained dependency verdict"
+
+"#;
     const RESOLVE_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
     const RESOLVE_STDERR_LIMIT: usize = 1024 * 1024;
     const FETCH_STDOUT_LIMIT: usize = 1024 * 1024;
@@ -16498,7 +17481,8 @@ mod phase_b_std {
         "llvm-lib",
         "lld-link",
     ];
-    const MAX_BOOTSTRAP_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+    const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+    const MAX_TREE_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
     const MAX_BOOTSTRAP_LOCK_BYTES: u64 = 1024 * 1024;
     const MAX_ARCHIVE_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_DERIVED_INDEX_BYTES: u64 = 1024 * 1024;
@@ -16638,12 +17622,7 @@ mod phase_b_std {
         max_tree_entries: usize,
         max_tree_regular_file_bytes: u64,
         max_tree_member_bytes: u64,
-        max_run_scratch_total_bytes: u64,
-        max_fallback_target_total_bytes: u64,
-        max_execution_footprint_total_bytes: u64,
-        max_control_plane_total_bytes: u64,
-        max_bootstrap_scratch_total_bytes: u64,
-        max_materialization_total_bytes: u64,
+        space_budget: PhaseBSpaceBudget,
         scratch_root_formula: &'static str,
         control_ledger_path_formula: &'static str,
         acquisition_spool_path_formula: &'static str,
@@ -16678,7 +17657,7 @@ mod phase_b_std {
                 CHILD_POLL_INTERVAL_MILLISECONDS,
             direct_child_kill_wait_seconds:
                 DIRECT_CHILD_KILL_WAIT_SECONDS,
-            max_source_file_bytes: MAX_BOOTSTRAP_FILE_BYTES,
+            max_source_file_bytes: MAX_SOURCE_FILE_BYTES,
             max_verifier_test_bytes: 4 * 1024 * 1024,
             max_bootstrap_harness_bytes: 262_144,
             max_bootstrap_lock_bytes: MAX_BOOTSTRAP_LOCK_BYTES,
@@ -16689,17 +17668,22 @@ mod phase_b_std {
             max_supply_bundle_bytes: MAX_SUPPLY_BUNDLE_BYTES,
             max_tree_entries: MAX_TREE_ENTRIES,
             max_tree_regular_file_bytes: MAX_TREE_BYTES,
-            max_tree_member_bytes: MAX_BOOTSTRAP_FILE_BYTES,
-            max_run_scratch_total_bytes: MAX_RUN_SCRATCH_TOTAL_BYTES,
-            max_fallback_target_total_bytes:
-                MAX_FALLBACK_TARGET_TOTAL_BYTES,
-            max_execution_footprint_total_bytes:
-                MAX_EXECUTION_FOOTPRINT_TOTAL_BYTES,
-            max_control_plane_total_bytes: MAX_CONTROL_PLANE_TOTAL_BYTES,
-            max_bootstrap_scratch_total_bytes:
-                MAX_BOOTSTRAP_SCRATCH_TOTAL_BYTES,
-            max_materialization_total_bytes:
-                MAX_MATERIALIZATION_TOTAL_BYTES,
+            max_tree_member_bytes: MAX_TREE_MEMBER_BYTES,
+            space_budget: PhaseBSpaceBudget {
+                max_tree_entry_count: MAX_TREE_ENTRIES as u64,
+                max_run_scratch_total_bytes:
+                    MAX_RUN_SCRATCH_TOTAL_BYTES,
+                max_fallback_target_total_bytes:
+                    MAX_FALLBACK_TARGET_TOTAL_BYTES,
+                max_execution_footprint_total_bytes:
+                    MAX_EXECUTION_FOOTPRINT_TOTAL_BYTES,
+                max_control_plane_total_bytes:
+                    MAX_CONTROL_PLANE_TOTAL_BYTES,
+                max_bootstrap_scratch_total_bytes:
+                    MAX_BOOTSTRAP_SCRATCH_TOTAL_BYTES,
+                max_materialization_total_bytes:
+                    MAX_MATERIALIZATION_TOTAL_BYTES,
+            },
             scratch_root_formula:
                 ".fnd01-run/<role>/<run-id>/bootstrap-control-package",
             control_ledger_path_formula:
@@ -16712,7 +17696,7 @@ mod phase_b_std {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, PartialEq, Eq)]
     struct PhaseBAuthority {
         policy_binding: FileBinding,
         manifest: Vec<u8>,
@@ -16724,8 +17708,10 @@ mod phase_b_std {
     }
 
     #[derive(Debug)]
-    struct ProduceAcquisitionPermit<'a> {
-        authority: &'a ProduceAcquisitionAuthority,
+    struct ProduceAcquisitionPermit {
+        authority: ProduceAcquisitionAuthority,
+        manifest: Vec<u8>,
+        manifest_binding: FileBinding,
         role_root: String,
         package_root: String,
         target_root: String,
@@ -16738,18 +17724,321 @@ mod phase_b_std {
         execution_bin: String,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PhaseBSpaceGroup {
+        RunOnly,
+        Bootstrap,
+        Materialization,
+        ControlPlane,
+    }
+
+    struct PhaseBSpaceGuard<'a> {
+        repository_root: &'a Path,
+        run_id: &'a str,
+        budget: PhaseBSpaceBudget,
+    }
+
+    impl<'a> PhaseBSpaceGuard<'a> {
+        fn new(
+            repository_root: &'a Path,
+            run_id: &'a str,
+            budget: PhaseBSpaceBudget,
+        ) -> TrustResult<Self> {
+            if !repository_root.is_absolute() || run_id.is_empty() {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SPACE_AUTHORITY",
+                    "absolute repository root and nonempty run ID required",
+                ));
+            }
+            let budget = budget
+                .validate("Phase-B aggregate space guard")
+                .map_err(|error| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_AUTHORITY",
+                        error.to_string(),
+                    )
+                })?;
+            Ok(Self {
+                repository_root,
+                run_id,
+                budget,
+            })
+        }
+
+        fn absolute_roots(
+            &self,
+            relatives: &[String],
+            subject: &str,
+        ) -> TrustResult<Vec<PathBuf>> {
+            let mut roots = Vec::new();
+            roots.try_reserve_exact(relatives.len()).map_err(|_| {
+                phase_b_error(
+                    "E_PHASE_B_SPACE_AUTHORITY",
+                    format!("{subject}: root-set allocation refused"),
+                )
+            })?;
+            for relative in relatives {
+                validate_relative_path(relative, subject).map_err(|error| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_AUTHORITY",
+                        error.to_string(),
+                    )
+                })?;
+                roots.push(self.repository_root.join(relative));
+            }
+            Ok(roots)
+        }
+
+        fn usage(
+            &self,
+            relatives: &[String],
+            maximum: u64,
+            subject: &str,
+        ) -> TrustResult<FilesystemUsage> {
+            let roots = self.absolute_roots(relatives, subject)?;
+            let cap = self.budget.cap(maximum);
+            let snapshots =
+                snapshot_usage_roots_nofollow(&roots, cap, subject)
+                    .map_err(|error| {
+                        phase_b_error(
+                            "E_PHASE_B_SPACE_BOUND",
+                            error.to_string(),
+                        )
+                    })?;
+            checked_disjoint_usage(&snapshots, cap, subject).map_err(
+                |error| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_BOUND",
+                        error.to_string(),
+                    )
+                },
+            )
+        }
+
+        fn run_usage(&self) -> TrustResult<FilesystemUsage> {
+            self.usage(
+                &[".fnd01-run".to_owned()],
+                self.budget.max_run_scratch_total_bytes,
+                "Phase-B run scratch",
+            )
+        }
+
+        fn fallback_usage(&self) -> TrustResult<FilesystemUsage> {
+            self.usage(
+                &[
+                    "target/debug".to_owned(),
+                    "target/doc".to_owned(),
+                    "target/release".to_owned(),
+                    "target/.rustc_info.json".to_owned(),
+                    "target/CACHEDIR.TAG".to_owned(),
+                ],
+                self.budget.max_fallback_target_total_bytes,
+                "Phase-B target fallback set",
+            )
+        }
+
+        fn execution_usage(&self) -> TrustResult<FilesystemUsage> {
+            self.usage(
+                &[
+                    ".fnd01-run".to_owned(),
+                    "target/debug".to_owned(),
+                    "target/doc".to_owned(),
+                    "target/release".to_owned(),
+                    "target/.rustc_info.json".to_owned(),
+                    "target/CACHEDIR.TAG".to_owned(),
+                ],
+                self.budget.max_execution_footprint_total_bytes,
+                "combined Phase-B execution footprint",
+            )
+        }
+
+        fn bootstrap_usage(&self) -> TrustResult<FilesystemUsage> {
+            let mut roots = Vec::new();
+            for role in ["integration-producer", "independent-attester"] {
+                roots.push(format!(
+                    ".fnd01-run/{role}/{}/bootstrap-control-package",
+                    self.run_id,
+                ));
+                roots.push(format!(
+                    ".fnd01-run/{role}/{}/bootstrap-control-target",
+                    self.run_id,
+                ));
+            }
+            self.usage(
+                &roots,
+                self.budget.max_bootstrap_scratch_total_bytes,
+                "collective Phase-B bootstrap scratch",
+            )
+        }
+
+        fn materialization_usage(&self) -> TrustResult<FilesystemUsage> {
+            let roots = ["integration-producer", "independent-attester"]
+                .iter()
+                .map(|role| {
+                    format!(
+                        ".fnd01-run/{role}/{}/local-registry",
+                        self.run_id,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.usage(
+                &roots,
+                self.budget.max_materialization_total_bytes,
+                "collective Phase-B materialization",
+            )
+        }
+
+        fn control_plane_usage(&self) -> TrustResult<FilesystemUsage> {
+            self.usage(
+                &[
+                    format!(
+                        ".fnd01-run/integration-producer/{}/control-ledger.bin",
+                        self.run_id,
+                    ),
+                    format!(
+                        ".fnd01-run/integration-producer/{}/acquisition-spool.bin",
+                        self.run_id,
+                    ),
+                    format!(
+                        ".fnd01-run/independent-attester/{}/control-ledger.bin",
+                        self.run_id,
+                    ),
+                ],
+                self.budget.max_control_plane_total_bytes,
+                "collective Phase-B control plane",
+            )
+        }
+
+        fn require_projected(
+            &self,
+            group: PhaseBSpaceGroup,
+            additional: FilesystemUsage,
+            subject: &str,
+        ) -> TrustResult<()> {
+            self.require_projected_split(
+                group,
+                additional,
+                additional,
+                subject,
+            )
+        }
+
+        fn require_projected_split(
+            &self,
+            group: PhaseBSpaceGroup,
+            outer_additional: FilesystemUsage,
+            subgroup_additional: FilesystemUsage,
+            subject: &str,
+        ) -> TrustResult<()> {
+            let run = self.run_usage()?;
+            run.checked_projected(
+                outer_additional,
+                self.budget
+                    .cap(self.budget.max_run_scratch_total_bytes),
+                subject,
+            )
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_SPACE_BOUND",
+                    error.to_string(),
+                )
+            })?;
+            self.fallback_usage()?;
+            self.execution_usage()?
+                .checked_projected(
+                    outer_additional,
+                    self.budget.cap(
+                        self.budget.max_execution_footprint_total_bytes,
+                    ),
+                    subject,
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_BOUND",
+                        error.to_string(),
+                    )
+                })?;
+            let bootstrap = self.bootstrap_usage()?;
+            let materialization = self.materialization_usage()?;
+            let control_plane = self.control_plane_usage()?;
+            let (usage, maximum) = match group {
+                PhaseBSpaceGroup::RunOnly => return Ok(()),
+                PhaseBSpaceGroup::Bootstrap => (
+                    bootstrap,
+                    self.budget.max_bootstrap_scratch_total_bytes,
+                ),
+                PhaseBSpaceGroup::Materialization => (
+                    materialization,
+                    self.budget.max_materialization_total_bytes,
+                ),
+                PhaseBSpaceGroup::ControlPlane => (
+                    control_plane,
+                    self.budget.max_control_plane_total_bytes,
+                ),
+            };
+            usage
+                .checked_projected(
+                    subgroup_additional,
+                    self.budget.cap(maximum),
+                    subject,
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_BOUND",
+                        error.to_string(),
+                    )
+                })
+        }
+
+        fn require_directory_creation(
+            &self,
+            path: &Path,
+            group: PhaseBSpaceGroup,
+            subject: &str,
+        ) -> TrustResult<()> {
+            let run_root = self.repository_root.join(".fnd01-run");
+            if path != run_root && !path.starts_with(&run_root) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SPACE_AUTHORITY",
+                    format!(
+                        "{subject}: directory mutation is outside Phase-B run scratch"
+                    ),
+                ));
+            }
+            let outer_additional = if path == run_root {
+                FilesystemUsage::ZERO
+            } else {
+                FilesystemUsage {
+                    entry_count: 1,
+                    regular_file_bytes: 0,
+                }
+            };
+            self.require_projected_split(
+                group,
+                outer_additional,
+                FilesystemUsage {
+                    entry_count: 1,
+                    regular_file_bytes: 0,
+                },
+                subject,
+            )
+        }
+    }
+
     fn phase_b_error(code: &'static str, detail: impl Into<String>) -> TrustError {
         TrustError::new(code, detail)
     }
 
-    fn require_produce_acquisition_authority<'a>(
-        authority: &'a PhaseBAuthority,
+    fn require_produce_acquisition_authority(
+        authority: PhaseBAuthority,
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
         authoring_marker: &AuthoringMarker,
         integration_digest: [u8; 32],
         authoring_bytes: &[Vec<u8>; 3],
-    ) -> TrustResult<ProduceAcquisitionPermit<'a>> {
+    ) -> TrustResult<ProduceAcquisitionPermit> {
         if arguments.mode != BootstrapMode::Produce
             || arguments.producer_outer_record_path.is_some()
             || arguments.final_attestation_path.is_some()
@@ -16781,6 +18070,23 @@ mod phase_b_std {
                 "Produce run root, run ID, marker, or closed PATH mismatch",
             ));
         }
+        let compiled_acquisition =
+            compiled_produce_acquisition_authority();
+        compiled_acquisition
+            .space_budget
+            .validate("Produce acquisition authority")
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_ACQUISITION_AUTHORITY",
+                    error.to_string(),
+                )
+            })?;
+        let compiled_direct_registry_binding =
+            binding_for_bytes(&direct_registry(DIRECT_PREFIX, false)?)?;
+        let compiled_union_registry_binding =
+            binding_for_bytes(&direct_registry(UNION_PREFIX, true)?)?;
+        let compiled_native_tool_registry_binding =
+            binding_for_bytes(&native_tool_registry()?)?;
         if authority.policy_binding != authoring_marker.policy
             || binding_for_bytes(&authoring_bytes[0])?
                 != authoring_marker.policy
@@ -16790,8 +18096,18 @@ mod phase_b_std {
                 != authoring_marker.harness
             || binding_for_bytes(&authority.manifest)?
                 != authority.manifest_binding
-            || authority.produce_acquisition
-                != compiled_produce_acquisition_authority()
+            || authority.manifest.len() != MANIFEST_BYTES
+            || authority.manifest_binding.byte_length
+                != MANIFEST_BYTES as u64
+            || encode_lower_hex(&authority.manifest_binding.sha256)
+                != MANIFEST_SHA256
+            || authority.direct_registry_binding
+                != compiled_direct_registry_binding
+            || authority.union_registry_binding
+                != compiled_union_registry_binding
+            || authority.native_tool_registry_binding
+                != compiled_native_tool_registry_binding
+            || authority.produce_acquisition != compiled_acquisition
         {
             return Err(phase_b_error(
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
@@ -16801,7 +18117,9 @@ mod phase_b_std {
         let role_root =
             format!(".fnd01-run/integration-producer/{}", arguments.run_id);
         Ok(ProduceAcquisitionPermit {
-            authority: &authority.produce_acquisition,
+            authority: authority.produce_acquisition,
+            manifest: authority.manifest,
+            manifest_binding: authority.manifest_binding,
             package_root:
                 format!("{role_root}/bootstrap-control-package"),
             target_root: format!("{role_root}/bootstrap-control-target"),
@@ -16992,14 +18310,27 @@ mod phase_b_std {
     }
 
     fn exact_policy_section(policy: &[u8], expected: &[u8], end: &[u8], subject: &str) -> TrustResult<()> {
-        let start = expected.get(..expected.iter().position(|byte| *byte == b'\n').unwrap_or(expected.len()))
-            .ok_or_else(|| phase_b_error("E_PHASE_B_POLICY_AUTHORITY", subject))?;
-        let offset = find_once(policy, start, subject)?;
-        let tail = policy.get(offset..).ok_or_else(|| phase_b_error("E_PHASE_B_POLICY_AUTHORITY", subject))?;
-        let end_offset = tail.windows(end.len()).position(|window| window == end)
-            .ok_or_else(|| phase_b_error("E_PHASE_B_POLICY_AUTHORITY", format!("{subject}: terminator")))?;
-        if tail.get(..end_offset) != Some(expected) {
-            return Err(phase_b_error("E_PHASE_B_POLICY_AUTHORITY", format!("{subject}: byte drift")));
+        if expected.is_empty() || end.is_empty() {
+            return Err(phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                format!("{subject}: empty compiled block or terminator"),
+            ));
+        }
+        let offset = find_once(policy, expected, subject)?;
+        let after = offset.checked_add(expected.len()).ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                format!("{subject}: compiled block offset overflow"),
+            )
+        })?;
+        if !policy
+            .get(after..)
+            .is_some_and(|tail| tail.starts_with(end))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                format!("{subject}: compiled block terminator drift"),
+            ));
         }
         Ok(())
     }
@@ -17012,6 +18343,12 @@ mod phase_b_std {
         expected_sha256: &str,
         subject: &str,
     ) -> TrustResult<()> {
+        if start.is_empty() || end.is_empty() {
+            return Err(phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                format!("{subject}: empty section marker or terminator"),
+            ));
+        }
         let offset = find_once(policy, start, subject)?;
         let tail = policy
             .get(offset..)
@@ -17035,50 +18372,6 @@ mod phase_b_std {
                 "E_PHASE_B_POLICY_AUTHORITY",
                 format!("{subject}: compiled section binding drift"),
             ));
-        }
-        Ok(())
-    }
-
-    fn exact_policy_section_contains(
-        policy: &[u8],
-        start: &[u8],
-        end: &[u8],
-        required: &[&[u8]],
-        subject: &str,
-    ) -> TrustResult<()> {
-        let offset = find_once(policy, start, subject)?;
-        let tail = policy.get(offset..).ok_or_else(|| {
-            phase_b_error("E_PHASE_B_POLICY_AUTHORITY", subject)
-        })?;
-        let end_offset = tail
-            .windows(end.len())
-            .position(|window| window == end)
-            .ok_or_else(|| {
-                phase_b_error(
-                    "E_PHASE_B_POLICY_AUTHORITY",
-                    format!("{subject}: terminator"),
-                )
-            })?;
-        let section = tail.get(..end_offset).ok_or_else(|| {
-            phase_b_error("E_PHASE_B_POLICY_AUTHORITY", subject)
-        })?;
-        for needle in required {
-            if needle.is_empty() {
-                return Err(phase_b_error(
-                    "E_PHASE_B_POLICY_AUTHORITY",
-                    format!("{subject}: empty required field"),
-                ));
-            }
-            let count = section
-                .windows(needle.len())
-                .filter(|window| *window == *needle)
-                .count();
-            if count != 1 {
-                return Err(phase_b_error(
-                    "E_PHASE_B_POLICY_AUTHORITY",
-                    format!("{subject}: required field count {count}"),
-                ));
-            }
         }
         Ok(())
     }
@@ -17148,39 +18441,22 @@ mod phase_b_std {
             return Err(phase_b_error("E_PHASE_B_TOOL_REGISTRY", "compiled tool digest"));
         }
         exact_policy_section(policy, &native_tool_policy_block()?, b"[[target_tool_profile]]", "native tool rows")?;
-        exact_policy_section_contains(
+        exact_policy_section(
             policy,
-            b"template_id = \"bootstrap.resolve\"",
-            b"\n[[command_template]]",
-            &[
-                b"template_id = \"bootstrap.resolve\"",
-                b"argv_template = [\"{tool.cargo.path}\", \"metadata\", \"--format-version\", \"1\", \"--all-features\", \"--manifest-path\", \"{bootstrap-manifest}\"]",
-                b"environment_profile = \"acquisition\"",
-                b"working_directory = \"{run-root}\"",
-                b"stdout_limit = 16777216",
-                b"stderr_limit = 1048576",
-                b"typed_parser = \"strict-cargo-metadata-json-plus-union-lock\"",
-            ],
+            RESOLVE_COMMAND_POLICY,
+            b"[[command_template]]",
             "bootstrap.resolve command authority",
         )?;
-        exact_policy_section_contains(
+        exact_policy_section(
             policy,
-            b"template_id = \"bootstrap.fetch\"",
-            b"\n[[command_template]]",
-            &[
-                b"template_id = \"bootstrap.fetch\"",
-                b"argv_template = [\"{tool.cargo.path}\", \"fetch\", \"--locked\", \"--manifest-path\", \"{bootstrap-manifest}\"]",
-                b"environment_profile = \"acquisition\"",
-                b"working_directory = \"{run-root}\"",
-                b"stdout_limit = 1048576",
-                b"stderr_limit = 4194304",
-                b"typed_parser = \"exit-and-cache-closure\"",
-            ],
+            FETCH_COMMAND_POLICY,
+            b"[[command_template]]",
             "bootstrap.fetch command authority",
         )?;
-        find_once(
+        exact_policy_section(
             policy,
-            br#"required = [["AR", "{tool.host-ar.path}"], ["CARGO_HOME", "{producer-cargo-home}"], ["CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"], ["CARGO_TARGET_DIR", "{producer-custom-target}"], ["CC", "{tool.host-cc.path}"], ["CLIPPY_DRIVER", "{tool.clippy-driver.path}"], ["LANG", "C"], ["LC_ALL", "C"], ["PATH", "{closed-execution-bin}"], ["RANLIB", "{tool.host-ranlib.path}"], ["RUSTC", "{tool.rustc.path}"], ["RUSTDOC", "{tool.rustdoc.path}"], ["RUSTFMT", "{tool.rustfmt.path}"], ["RUSTUP_TOOLCHAIN", "nightly-2026-07-11"], ["SOURCE_DATE_EPOCH", "0"], ["TZ", "UTC"]]"#,
+            ACQUISITION_ENVIRONMENT_POLICY,
+            b"[[environment_profile]]",
             "acquisition environment authority",
         )?;
         let manifest = bootstrap_manifest()?;
@@ -17202,7 +18478,7 @@ mod phase_b_std {
             "max_control_ledger_bytes = 67108864",
             "max_acquisition_spool_bytes = 134217728",
             "max_supply_bundle_bytes = 1073741824",
-            "max_source_file_bytes = 1073741824",
+            "max_source_file_bytes = 1048576",
             "max_verifier_test_bytes = 4194304",
             "max_archive_compressed_bytes = 8388608",
             "max_tree_entry_count = 1000000",
@@ -17312,6 +18588,17 @@ mod phase_b_std {
             b"then bounded-wait/reap it, require child_reaped=true",
             "retained-Child daemon stop authority",
         )?;
+        let produce_acquisition =
+            compiled_produce_acquisition_authority();
+        produce_acquisition
+            .space_budget
+            .validate("compiled Phase-B space budget")
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_POLICY_AUTHORITY",
+                    error.to_string(),
+                )
+            })?;
         Ok(PhaseBAuthority {
             policy_binding,
             manifest,
@@ -17319,8 +18606,7 @@ mod phase_b_std {
             direct_registry_binding,
             union_registry_binding,
             native_tool_registry_binding,
-            produce_acquisition:
-                compiled_produce_acquisition_authority(),
+            produce_acquisition,
         })
     }
 
@@ -17565,27 +18851,63 @@ mod phase_b_std {
         Ok(metadata)
     }
 
-    fn ensure_directory(path: &Path, subject: &str) -> TrustResult<()> {
+    fn ensure_directory(
+        path: &Path,
+        must_create: bool,
+        space_guard: &PhaseBSpaceGuard<'_>,
+        space_group: PhaseBSpaceGroup,
+        subject: &str,
+    ) -> TrustResult<()> {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
+                if must_create {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_FRESHNESS",
+                        format!("{subject}: {} already exists", path.display()),
+                    ));
+                }
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Err(phase_b_error(
                         "E_PHASE_B_DIRECTORY",
                         format!("{subject}: existing node is not a physical directory"),
                     ));
                 }
+                space_guard.require_projected(
+                    space_group,
+                    FilesystemUsage::ZERO,
+                    subject,
+                )?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let parent = path.parent().ok_or_else(|| {
                     phase_b_error("E_PHASE_B_DIRECTORY", format!("{subject}: missing parent"))
                 })?;
                 directory_metadata(parent, subject)?;
-                fs::create_dir(path)
-                    .map_err(|error| io_error("E_PHASE_B_CREATE_DIR", subject, &error))?;
-                directory_metadata(path, subject)?;
-                File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| io_error("E_PHASE_B_FSYNC", subject, &error))?;
+                space_guard.require_directory_creation(
+                    path,
+                    space_group,
+                    subject,
+                )?;
+                let mutation = (|| -> TrustResult<()> {
+                    fs::create_dir(path).map_err(|error| {
+                        io_error("E_PHASE_B_CREATE_DIR", subject, &error)
+                    })?;
+                    directory_metadata(path, subject)?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            io_error("E_PHASE_B_FSYNC", subject, &error)
+                        })?;
+                    Ok(())
+                })();
+                let post_mutation_space =
+                    space_guard.require_projected(
+                    space_group,
+                    FilesystemUsage::ZERO,
+                    subject,
+                );
+                post_mutation_space?;
+                mutation?;
             }
             Err(error) => return Err(io_error("E_PHASE_B_METADATA", subject, &error)),
         }
@@ -17596,6 +18918,8 @@ mod phase_b_std {
         repository_root: &Path,
         relative: &str,
         fresh_leaf: bool,
+        space_guard: &PhaseBSpaceGuard<'_>,
+        space_group: PhaseBSpaceGroup,
         subject: &str,
     ) -> TrustResult<PathBuf> {
         validate_relative_path(relative, subject)?;
@@ -17605,21 +18929,13 @@ mod phase_b_std {
         for (index, component) in components.iter().enumerate() {
             current.push(component);
             let is_leaf = index + 1 == components.len();
-            if fresh_leaf && is_leaf {
-                match fs::symlink_metadata(&current) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Ok(_) => {
-                        return Err(phase_b_error(
-                            "E_PHASE_B_FRESHNESS",
-                            format!("{subject}: {} already exists", current.display()),
-                        ));
-                    }
-                    Err(error) => {
-                        return Err(io_error("E_PHASE_B_METADATA", subject, &error));
-                    }
-                }
-            }
-            ensure_directory(&current, subject)?;
+            ensure_directory(
+                &current,
+                fresh_leaf && is_leaf,
+                space_guard,
+                space_group,
+                subject,
+            )?;
         }
         Ok(current)
     }
@@ -17660,6 +18976,8 @@ mod phase_b_std {
         relative: &str,
         bytes: &[u8],
         maximum: u64,
+        space_guard: &PhaseBSpaceGuard<'_>,
+        space_group: PhaseBSpaceGroup,
         subject: &str,
     ) -> TrustResult<BoundPath> {
         validate_relative_path(relative, subject)?;
@@ -17676,38 +18994,75 @@ mod phase_b_std {
         })?;
         directory_metadata(parent, subject)?;
         let parent_chain = bind_parent_chain(repository_root, relative, subject)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| io_error("E_PHASE_B_CREATE_FILE", subject, &error))?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| io_error("E_PHASE_B_WRITE", subject, &error))?;
-        drop(file);
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| io_error("E_PHASE_B_FSYNC", subject, &error))?;
-        let expected = FileBinding {
-            byte_length: length,
-            sha256: sha256(bytes)?,
-        };
-        let (snapshot, reopened) =
-            checked_read(repository_root, relative, maximum, Some(expected))?;
-        if reopened != bytes {
-            return Err(phase_b_error(
-                "E_PHASE_B_FILE_RACE",
-                format!("{subject}: reopened bytes differ"),
-            ));
-        }
-        recheck_parent_chain(&parent_chain, subject)?;
-        Ok(BoundPath {
-            path: utf8_absolute(&path, subject)?,
-            binding: FileBinding {
-                byte_length: snapshot.byte_length,
-                sha256: snapshot.sha256,
+        space_guard.require_projected(
+            space_group,
+            FilesystemUsage {
+                entry_count: 1,
+                regular_file_bytes: length,
             },
-        })
+            subject,
+        )?;
+        let mutation = (|| -> TrustResult<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| {
+                    io_error("E_PHASE_B_CREATE_FILE", subject, &error)
+                })?;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    io_error("E_PHASE_B_WRITE", subject, &error)
+                })?;
+            drop(file);
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    io_error("E_PHASE_B_FSYNC", subject, &error)
+                })?;
+            Ok(())
+        })();
+        let post_mutation_space = space_guard.require_projected(
+            space_group,
+            FilesystemUsage::ZERO,
+            subject,
+        );
+        post_mutation_space?;
+        mutation?;
+        let sealed = (|| -> TrustResult<BoundPath> {
+            let expected = FileBinding {
+                byte_length: length,
+                sha256: sha256(bytes)?,
+            };
+            let (snapshot, reopened) = checked_read(
+                repository_root,
+                relative,
+                maximum,
+                Some(expected),
+            )?;
+            if reopened != bytes {
+                return Err(phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: reopened bytes differ"),
+                ));
+            }
+            recheck_parent_chain(&parent_chain, subject)?;
+            Ok(BoundPath {
+                path: utf8_absolute(&path, subject)?,
+                binding: FileBinding {
+                    byte_length: snapshot.byte_length,
+                    sha256: snapshot.sha256,
+                },
+            })
+        })();
+        let final_space = space_guard.require_projected(
+            space_group,
+            FilesystemUsage::ZERO,
+            subject,
+        );
+        final_space?;
+        sealed
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17791,7 +19146,7 @@ mod phase_b_std {
     ) -> TrustResult<u64> {
         match profile {
             TreeReadProfile::Generic => {
-                return Ok(MAX_BOOTSTRAP_FILE_BYTES);
+                return Ok(MAX_TREE_MEMBER_BYTES);
             }
             TreeReadProfile::Materialized(expectation) => {
                 return match expectation.get(relative) {
@@ -17809,7 +19164,7 @@ mod phase_b_std {
             TreeReadProfile::Acquisition => {}
         }
         Ok(acquisition_file_maximum(relative, byte_length)?
-            .unwrap_or(MAX_BOOTSTRAP_FILE_BYTES))
+            .unwrap_or(MAX_TREE_MEMBER_BYTES))
     }
 
     fn read_tree_file_bounded(
@@ -17863,7 +19218,7 @@ mod phase_b_std {
             path,
             before,
             relative,
-            MAX_BOOTSTRAP_FILE_BYTES,
+            MAX_TREE_MEMBER_BYTES,
         )
     }
 
@@ -18198,6 +19553,177 @@ mod phase_b_std {
         closure_bijection_sha256: [u8; 32],
     }
 
+    #[derive(Debug)]
+    struct ValidatedSupplyBundle<'a> {
+        supply: &'a SupplyBundle,
+    }
+
+    fn validate_supply_bundle_value(
+        supply: &SupplyBundle,
+    ) -> TrustResult<ValidatedSupplyBundle<'_>> {
+        let lock_length =
+            usize_u64(supply.bootstrap_lock.len(), "bootstrap lock")?;
+        if lock_length == 0
+            || lock_length > MAX_BOOTSTRAP_LOCK_BYTES
+            || supply.bootstrap_lock_binding
+                != binding_for_bytes(&supply.bootstrap_lock)?
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_LOCK",
+                "in-memory bootstrap lock binding or bound mismatch",
+            ));
+        }
+        parse_bootstrap_lock_registry_packages(&supply.bootstrap_lock)?;
+        let acquisition = &supply.acquisition;
+        if acquisition.root_entry_count == 0
+            || acquisition.root_entry_count
+                > u64::try_from(MAX_TREE_ENTRIES).map_err(|_| {
+                    phase_b_error(
+                        "E_PHASE_B_SUPPLY_ACQUISITION",
+                        "tree-entry bound conversion",
+                    )
+                })?
+            || acquisition.root_total_regular_file_bytes == 0
+            || acquisition.root_total_regular_file_bytes > MAX_TREE_BYTES
+            || acquisition.root_set_sha256.iter().all(|byte| *byte == 0)
+            || acquisition.sparse_config.relative_path
+                != ACQUISITION_SPARSE_CONFIG_PATH
+            || acquisition.sparse_config.payload.is_empty()
+            || usize_u64(
+                acquisition.sparse_config.payload.len(),
+                "sparse config payload",
+            )? > MAX_SPARSE_CONFIG_BYTES
+            || acquisition.sparse_config.binding
+                != binding_for_bytes(&acquisition.sparse_config.payload)?
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_ACQUISITION",
+                "in-memory acquisition observation mismatch",
+            ));
+        }
+        if supply.entries.is_empty() || supply.entries.len() > MAX_TREE_ENTRIES {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_BOUND",
+                "in-memory supply entry count",
+            ));
+        }
+        let mut encoded_length = SUPPLY_PREFIX
+            .len()
+            .checked_add(8 + 32)
+            .and_then(|length| {
+                length.checked_add(supply.bootstrap_lock.len())
+            })
+            .and_then(|length| length.checked_add(8 + 8 + 32 + 4))
+            .and_then(|length| {
+                length.checked_add(
+                    acquisition.sparse_config.relative_path.len(),
+                )
+            })
+            .and_then(|length| length.checked_add(8 + 32))
+            .and_then(|length| {
+                length.checked_add(acquisition.sparse_config.payload.len())
+            })
+            .and_then(|length| length.checked_add(4 + 8 + 32 + 32))
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_SUPPLY_BOUND",
+                    "in-memory supply header length overflow",
+                )
+            })?;
+        let mut payload_bytes = 0u64;
+        let mut prior = None::<(u8, Vec<u8>)>;
+        let mut case_folded_paths = BTreeSet::new();
+        for entry in &supply.entries {
+            validate_supply_path(entry.kind, &entry.relative_path)?;
+            if !case_folded_paths
+                .insert(ascii_case_folded_path(&entry.relative_path)?)
+            {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SUPPLY_ORDER",
+                    format!(
+                        "{}: duplicate ASCII-case-folded in-memory supply path",
+                        entry.relative_path
+                    ),
+                ));
+            }
+            let payload_length =
+                usize_u64(entry.payload.len(), &entry.relative_path)?;
+            validate_supply_payload_length(
+                entry.kind,
+                payload_length,
+                &entry.relative_path,
+            )?;
+            if entry.binding != binding_for_bytes(&entry.payload)? {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SUPPLY_DIGEST",
+                    format!("{}: in-memory payload binding drift", entry.relative_path),
+                ));
+            }
+            let key = (entry.kind, entry.relative_path.as_bytes().to_vec());
+            if prior.as_ref().is_some_and(|previous| previous >= &key) {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SUPPLY_ORDER",
+                    format!("{}: duplicate or out-of-order row", entry.relative_path),
+                ));
+            }
+            prior = Some(key);
+            payload_bytes = payload_bytes
+                .checked_add(payload_length)
+                .ok_or_else(|| {
+                    phase_b_error(
+                        "E_PHASE_B_SUPPLY_BOUND",
+                        "in-memory payload byte sum overflow",
+                    )
+                })?;
+            if payload_bytes > MAX_SUPPLY_BUNDLE_BYTES {
+                return Err(phase_b_error(
+                    "E_PHASE_B_SUPPLY_BOUND",
+                    "in-memory payload byte sum exceeds supply cap",
+                ));
+            }
+            encoded_length = encoded_length
+                .checked_add(1 + 4)
+                .and_then(|length| {
+                    length.checked_add(entry.relative_path.len())
+                })
+                .and_then(|length| length.checked_add(8 + 32))
+                .and_then(|length| length.checked_add(entry.payload.len()))
+                .ok_or_else(|| {
+                    phase_b_error(
+                        "E_PHASE_B_SUPPLY_BOUND",
+                        "in-memory encoded supply length overflow",
+                    )
+                })?;
+        }
+        if usize_u64(encoded_length, "in-memory encoded supply")?
+            > MAX_SUPPLY_BUNDLE_BYTES
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_BOUND",
+                "in-memory encoded supply exceeds supply cap",
+            ));
+        }
+        if supply_inner_entry_set_sha256(&supply.entries)?
+            != supply.inner_entry_set_sha256
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_DIGEST",
+                "in-memory inner entry-set digest mismatch",
+            ));
+        }
+        if recompute_supply_closure_bijection(
+            &supply.bootstrap_lock,
+            &supply.entries,
+        )? != supply.closure_bijection_sha256
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_SUPPLY_CLOSURE",
+                "in-memory closure bijection digest mismatch",
+            ));
+        }
+        Ok(ValidatedSupplyBundle { supply })
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct BootstrapMaterializedRow {
         kind: u8,
@@ -18215,8 +19741,9 @@ mod phase_b_std {
     }
 
     fn bootstrap_materialized_rows(
-        supply: &SupplyBundle,
+        validated: &ValidatedSupplyBundle<'_>,
     ) -> TrustResult<Vec<BootstrapMaterializedRow>> {
+        let supply = validated.supply;
         let mut rows = Vec::new();
         let expected_count = supply
             .entries
@@ -18327,16 +19854,17 @@ mod phase_b_std {
     }
 
     fn bootstrap_input_authority(
-        supply: &SupplyBundle,
+        validated: &ValidatedSupplyBundle<'_>,
         manifest: &[u8],
     ) -> TrustResult<BootstrapInputAuthority> {
+        let supply = validated.supply;
         if manifest.is_empty() {
             return Err(phase_b_error(
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
                 "bootstrap manifest is empty",
             ));
         }
-        let materialized_rows = bootstrap_materialized_rows(supply)?;
+        let materialized_rows = bootstrap_materialized_rows(validated)?;
         let materialized_set_sha256 =
             sha256(&bootstrap_materialized_set_preimage(&materialized_rows)?)?;
         let manifest_binding = binding_for_bytes(manifest)?;
@@ -18372,12 +19900,12 @@ mod phase_b_std {
     }
 
     fn require_root_frozen_bootstrap_input_authority(
-        authority: &PhaseBAuthority,
-        supply: &SupplyBundle,
+        manifest: &[u8],
+        manifest_binding: FileBinding,
+        validated: &ValidatedSupplyBundle<'_>,
     ) -> TrustResult<BootstrapInputAuthority> {
-        let candidate =
-            bootstrap_input_authority(supply, &authority.manifest)?;
-        if candidate.manifest_binding != authority.manifest_binding {
+        let candidate = bootstrap_input_authority(validated, manifest)?;
+        if candidate.manifest_binding != manifest_binding {
             return Err(phase_b_error(
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
                 "candidate bootstrap manifest differs from compiled authority",
@@ -20297,13 +21825,72 @@ mod phase_b_std {
         repository_root: &Path,
         relative_root: &str,
         supply: &SupplyBundle,
+        admitted: &BootstrapInputAuthority,
+        space_guard: &PhaseBSpaceGuard<'_>,
     ) -> TrustResult<TreeBinding> {
+        let validated = validate_supply_bundle_value(supply)?;
+        let rederived_rows = bootstrap_materialized_rows(&validated)?;
+        let rederived_set_sha256 =
+            sha256(&bootstrap_materialized_set_preimage(&rederived_rows)?)?;
+        if rederived_rows != admitted.materialized_rows
+            || rederived_set_sha256 != admitted.materialized_set_sha256
+            || supply.bootstrap_lock_binding
+                != admitted.bootstrap_lock_binding
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+                "materialization inputs differ from admitted dynamic authority",
+            ));
+        }
         preflight_materialized_destination_paths(relative_root, supply)?;
         let expectation = materialized_tree_expectation(supply)?;
+        let mut planned_regular_file_bytes = 0u64;
+        for node in expectation.values() {
+            if let MaterializedNode::File(binding) = node {
+                planned_regular_file_bytes = planned_regular_file_bytes
+                    .checked_add(binding.byte_length)
+                    .ok_or_else(|| {
+                        phase_b_error(
+                            "E_PHASE_B_SPACE_BOUND",
+                            "materialized planned byte total overflow",
+                        )
+                    })?;
+            }
+        }
+        let planned_entry_count =
+            u64::try_from(expectation.len()).map_err(|_| {
+                phase_b_error(
+                    "E_PHASE_B_SPACE_BOUND",
+                    "materialized planned entry count overflow",
+                )
+            })?;
+        let subgroup_projection = FilesystemUsage {
+            entry_count: planned_entry_count,
+            regular_file_bytes: planned_regular_file_bytes,
+        };
+        let outer_projection = FilesystemUsage {
+            entry_count: planned_entry_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    phase_b_error(
+                        "E_PHASE_B_SPACE_BOUND",
+                        "materialized root entry projection overflow",
+                    )
+                })?,
+            regular_file_bytes: planned_regular_file_bytes,
+        };
+        space_guard.require_projected_split(
+            PhaseBSpaceGroup::Materialization,
+            outer_projection,
+            subgroup_projection,
+            "complete materialized supply projection",
+        )?;
         let registry_root = ensure_repository_directory(
             repository_root,
             relative_root,
             true,
+            space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "sealed local registry",
         )?;
         let mut created_directories = BTreeSet::new();
@@ -20321,6 +21908,8 @@ mod phase_b_std {
                         repository_root,
                         parent,
                         false,
+                        space_guard,
+                        PhaseBSpaceGroup::Materialization,
                         "local-registry entry parent",
                     )?;
                 }
@@ -20345,6 +21934,8 @@ mod phase_b_std {
                 &relative,
                 &entry.payload,
                 maximum,
+                space_guard,
+                PhaseBSpaceGroup::Materialization,
                 "local-registry entry",
             )?;
             if written.binding != entry.binding {
@@ -20354,10 +21945,17 @@ mod phase_b_std {
                 ));
             }
         }
-        snapshot_materialized_tree_with_expectation(
+        let sealed_tree = snapshot_materialized_tree_with_expectation(
             &registry_root,
             &expectation,
-        )
+        );
+        let final_space = space_guard.require_projected(
+            PhaseBSpaceGroup::Materialization,
+            FilesystemUsage::ZERO,
+            "sealed local registry after materialization",
+        );
+        final_space?;
+        sealed_tree
     }
 
     fn binding_for_bytes(bytes: &[u8]) -> TrustResult<FileBinding> {
@@ -20383,6 +21981,12 @@ mod phase_b_std {
         exit_code: i64,
         stdout: RawBlob,
         stderr: RawBlob,
+    }
+
+    enum ForcedChildFailure {
+        StreamBound,
+        Deadline,
+        Space(TrustError),
     }
 
     fn drain_bounded<R: Read>(
@@ -20427,7 +22031,7 @@ mod phase_b_std {
         Ok(retained)
     }
 
-    fn execute_child(
+    fn execute_child<F>(
         argv: &[String],
         environment: &[(String, String)],
         working_directory: &Path,
@@ -20436,8 +22040,12 @@ mod phase_b_std {
         timeout_seconds: u64,
         poll_interval_milliseconds: u64,
         direct_child_kill_wait_seconds: u64,
+        mut space_check: F,
         subject: &str,
-    ) -> TrustResult<ChildCapture> {
+    ) -> TrustResult<ChildCapture>
+    where
+        F: FnMut() -> TrustResult<()>,
+    {
         let executable = argv.first().ok_or_else(|| {
             phase_b_error("E_PHASE_B_CHILD_ARGV", format!("{subject}: empty argv"))
         })?;
@@ -20467,6 +22075,39 @@ mod phase_b_std {
                 format!("{subject}: invalid closed environment"),
             ));
         }
+        if stdout_maximum == 0
+            || stderr_maximum == 0
+            || timeout_seconds == 0
+            || poll_interval_milliseconds == 0
+            || direct_child_kill_wait_seconds == 0
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_CHILD_DEADLINE",
+                format!(
+                    "{subject}: zero stream cap, timeout, poll interval, or kill wait"
+                ),
+            ));
+        }
+        let started_at = Instant::now();
+        let deadline = started_at
+            .checked_add(Duration::from_secs(timeout_seconds))
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_CHILD_DEADLINE",
+                    format!("{subject}: deadline overflow"),
+                )
+            })?;
+        let poll_interval =
+            Duration::from_millis(poll_interval_milliseconds);
+        let kill_wait =
+            Duration::from_secs(direct_child_kill_wait_seconds);
+        started_at.checked_add(kill_wait).ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_CHILD_DEADLINE",
+                format!("{subject}: kill-wait authority overflow"),
+            )
+        })?;
+        space_check()?;
         let mut command = Command::new(executable_path);
         command
             .args(&argv[1..])
@@ -20485,23 +22126,6 @@ mod phase_b_std {
         let stderr = child.stderr.take().ok_or_else(|| {
             phase_b_error("E_PHASE_B_CHILD_PIPE", format!("{subject}: stderr"))
         })?;
-        if timeout_seconds == 0
-            || poll_interval_milliseconds == 0
-            || direct_child_kill_wait_seconds == 0
-        {
-            return Err(phase_b_error(
-                "E_PHASE_B_CHILD_DEADLINE",
-                format!("{subject}: zero timeout, poll interval, or kill wait"),
-            ));
-        }
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(timeout_seconds))
-            .ok_or_else(|| {
-                phase_b_error(
-                    "E_PHASE_B_CHILD_DEADLINE",
-                    format!("{subject}: deadline overflow"),
-                )
-            })?;
         let stream_exceeded = Arc::new(AtomicBool::new(false));
         let (status, stdout_result, stderr_result, forced_failure) =
             thread::scope(|scope| -> TrustResult<_> {
@@ -20523,16 +22147,26 @@ mod phase_b_std {
                         &stderr_signal,
                     )
                 });
-                let mut forced_failure = None::<&'static str>;
+                let mut forced_failure = None::<ForcedChildFailure>;
                 let mut kill_deadline = None::<Instant>;
                 let status = loop {
                     if forced_failure.is_none()
                         && stream_exceeded.load(Ordering::Acquire)
                     {
-                        forced_failure = Some("stream bound exceeded");
+                        forced_failure =
+                            Some(ForcedChildFailure::StreamBound);
                     }
                     if forced_failure.is_none() && Instant::now() >= deadline {
-                        forced_failure = Some("deadline exceeded");
+                        forced_failure = Some(ForcedChildFailure::Deadline);
+                    }
+                    if forced_failure.is_none() {
+                        if let Err(error) = space_check() {
+                            forced_failure =
+                                Some(ForcedChildFailure::Space(error));
+                        }
+                    }
+                    if forced_failure.is_none() && Instant::now() >= deadline {
+                        forced_failure = Some(ForcedChildFailure::Deadline);
                     }
                     if forced_failure.is_some() && kill_deadline.is_none() {
                         match child.kill() {
@@ -20549,9 +22183,7 @@ mod phase_b_std {
                         }
                         kill_deadline = Some(
                             Instant::now()
-                                .checked_add(Duration::from_secs(
-                                    direct_child_kill_wait_seconds,
-                                ))
+                                .checked_add(kill_wait)
                                 .ok_or_else(|| {
                                     phase_b_error(
                                         "E_PHASE_B_CHILD_DEADLINE",
@@ -20563,6 +22195,13 @@ mod phase_b_std {
                     if let Some(status) = child.try_wait().map_err(|error| {
                         io_error("E_PHASE_B_CHILD_WAIT", subject, &error)
                     })? {
+                        let final_space = space_check();
+                        if forced_failure.is_none() {
+                            if let Err(error) = final_space {
+                                forced_failure =
+                                    Some(ForcedChildFailure::Space(error));
+                            }
+                        }
                         break status;
                     }
                     if kill_deadline.is_some_and(|deadline| Instant::now() >= deadline)
@@ -20572,9 +22211,7 @@ mod phase_b_std {
                             format!("{subject}: direct child was not reaped after kill"),
                         ));
                     }
-                    thread::sleep(Duration::from_millis(
-                        poll_interval_milliseconds,
-                    ));
+                    thread::sleep(poll_interval);
                 };
                 Ok((
                     status,
@@ -20591,9 +22228,23 @@ mod phase_b_std {
                 )
             })?
         };
-        let stdout = join(stdout_result, "stdout")?;
-        let stderr = join(stderr_result, "stderr")?;
+        let stdout = join(stdout_result, "stdout");
+        let stderr = join(stderr_result, "stderr");
+        let forced_failure = match forced_failure {
+            Some(ForcedChildFailure::Space(error)) => {
+                let _ = (stdout, stderr);
+                return Err(error);
+            }
+            other => other,
+        };
+        let stdout = stdout?;
+        let stderr = stderr?;
         if let Some(reason) = forced_failure {
+            let reason = match reason {
+                ForcedChildFailure::StreamBound => "stream bound exceeded",
+                ForcedChildFailure::Deadline => "deadline exceeded",
+                ForcedChildFailure::Space(_) => unreachable!(),
+            };
             return Err(phase_b_error(
                 "E_PHASE_B_CHILD_DEADLINE",
                 format!("{subject}: {reason}"),
@@ -21059,6 +22710,8 @@ mod phase_b_std {
         execution_bin_relative: &str,
         selected_tools: &[SelectedTool],
         expected_execution_bin_sha256: [u8; 32],
+        space_guard: &PhaseBSpaceGuard<'_>,
+        space_group: PhaseBSpaceGroup,
         stdout_maximum: usize,
         stderr_maximum: usize,
         timeout_seconds: u64,
@@ -21106,6 +22759,13 @@ mod phase_b_std {
             timeout_seconds,
             poll_interval_milliseconds,
             direct_child_kill_wait_seconds,
+            || {
+                space_guard.require_projected(
+                    space_group,
+                    FilesystemUsage::ZERO,
+                    subject,
+                )
+            },
             subject,
         );
         let after =
@@ -21118,19 +22778,28 @@ mod phase_b_std {
             execution_bin_relative,
             selected_tools,
         );
-        let after = after?;
-        if let Some(config_after) = config_after {
-            config_after?;
+        let post_bookend = (|| -> TrustResult<()> {
+            let after = after?;
+            if let Some(config_after) = config_after {
+                config_after?;
+            }
+            let tool_surface_after = tool_surface_after?;
+            before.require_same_working_directory_discovery(&after)?;
+            if tool_surface_after != expected_execution_bin_sha256 {
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    format!(
+                        "{subject}: post-command execution-bin binding drifted"
+                    ),
+                ));
+            }
+            Ok(())
+        })();
+        match (capture, post_bookend) {
+            (Err(primary), _) => Err(primary),
+            (Ok(_), Err(post_error)) => Err(post_error),
+            (Ok(capture), Ok(())) => Ok(capture),
         }
-        let tool_surface_after = tool_surface_after?;
-        before.require_same_working_directory_discovery(&after)?;
-        if tool_surface_after != expected_execution_bin_sha256 {
-            return Err(phase_b_error(
-                "E_PHASE_B_EXECUTION_BIN",
-                format!("{subject}: post-command execution-bin binding drifted"),
-            ));
-        }
-        capture
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24136,25 +25805,49 @@ mod phase_b_std {
         prefix: &[u8],
         schema: &str,
         final_self_digest_field: &str,
+        space_guard: &PhaseBSpaceGuard<'_>,
+        space_group: PhaseBSpaceGroup,
         subject: &str,
     ) -> TrustResult<BoundPath> {
-        let binding = create_sealed_file(repository_root, relative, bytes, maximum, subject)?;
-        let (_, reopened) =
-            checked_read(repository_root, relative, maximum, Some(binding.binding))?;
-        if reopened != bytes {
-            return Err(phase_b_error(
-                "E_PHASE_B_RECORD_RACE",
-                format!("{subject}: reopened bytes differ"),
-            ));
-        }
-        parse_canonical_record_file_with_final_self_digest(
-            &reopened,
-            prefix,
-            schema,
-            final_self_digest_field,
+        let binding = create_sealed_file(
+            repository_root,
+            relative,
+            bytes,
             maximum,
+            space_guard,
+            space_group,
             subject,
         )?;
+        let sealed = (|| -> TrustResult<()> {
+            let (_, reopened) = checked_read(
+                repository_root,
+                relative,
+                maximum,
+                Some(binding.binding),
+            )?;
+            if reopened != bytes {
+                return Err(phase_b_error(
+                    "E_PHASE_B_RECORD_RACE",
+                    format!("{subject}: reopened bytes differ"),
+                ));
+            }
+            parse_canonical_record_file_with_final_self_digest(
+                &reopened,
+                prefix,
+                schema,
+                final_self_digest_field,
+                maximum,
+                subject,
+            )?;
+            Ok(())
+        })();
+        let final_space = space_guard.require_projected(
+            space_group,
+            FilesystemUsage::ZERO,
+            subject,
+        );
+        final_space?;
+        sealed?;
         Ok(binding)
     }
 
@@ -24362,7 +26055,7 @@ mod phase_b_std {
         authoring_marker: &AuthoringMarker,
         integration_digest: [u8; 32],
         authoring_bytes: &[Vec<u8>; 3],
-        authority: &PhaseBAuthority,
+        authority: PhaseBAuthority,
         attested_supply: Option<&SupplyBundle>,
     ) -> TrustResult<()> {
         let manifest = authority.manifest.as_slice();
@@ -25302,6 +26995,51 @@ mod phase_b_std {
         candidates: Vec<ResolvedCandidate>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ExecutionBinAdmission {
+        CreateFresh,
+        RequireExisting,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct OrdinaryNativeToolInventory {
+        repository_root: PathBuf,
+        execution_bin_relative: String,
+        tool_set_sha256: [u8; 32],
+        execution_bin_sha256: [u8; 32],
+        acquisition_tools: AcquisitionToolPaths,
+        selected_tools: Vec<SelectedTool>,
+    }
+
+    impl OrdinaryNativeToolInventory {
+        pub(super) fn tool_set_sha256(&self) -> [u8; 32] {
+            self.tool_set_sha256
+        }
+
+        pub(super) fn execution_bin_sha256(&self) -> [u8; 32] {
+            self.execution_bin_sha256
+        }
+
+        pub(super) fn acquisition_tools(&self) -> &AcquisitionToolPaths {
+            &self.acquisition_tools
+        }
+
+        pub(super) fn require_unchanged(&self) -> TrustResult<()> {
+            let actual = revalidate_native_tool_surface(
+                &self.repository_root,
+                &self.execution_bin_relative,
+                &self.selected_tools,
+            )?;
+            if actual != self.execution_bin_sha256 {
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    "ordinary post-archive native-tool surface drifted",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     const TOOL_ALIAS_ALLOWED_ROLE_PAIRS: &[(&str, &str)] = &[
         ("rustfmt", "cargo-fmt"),
         ("cargo-clippy", "clippy-driver"),
@@ -25778,6 +27516,7 @@ mod phase_b_std {
         selected_tools: &[SelectedTool],
         expected_execution_bin_sha256: [u8; 32],
         authority: &ProduceAcquisitionAuthority,
+        space_guard: &PhaseBSpaceGuard<'_>,
         selected_path: &str,
         tool: &NativeTool,
         execution_bin: &str,
@@ -25818,20 +27557,38 @@ mod phase_b_std {
             authority.tool_probe_timeout_seconds,
             authority.child_poll_interval_milliseconds,
             authority.direct_child_kill_wait_seconds,
+            || {
+                space_guard.require_projected(
+                    PhaseBSpaceGroup::RunOnly,
+                    FilesystemUsage::ZERO,
+                    "native-tool version probe aggregate space",
+                )
+            },
             &format!("tool-probe.{}", tool.id),
         );
         let after = revalidate_native_tool_surface(
             repository_root,
             execution_bin_relative,
             selected_tools,
-        )?;
-        if after != expected_execution_bin_sha256 {
-            return Err(phase_b_error(
-                "E_PHASE_B_EXECUTION_BIN",
-                format!("{}: post-probe execution-bin binding drifted", tool.id),
-            ));
-        }
-        let capture = capture?;
+        );
+        let post_bookend = (|| -> TrustResult<()> {
+            let after = after?;
+            if after != expected_execution_bin_sha256 {
+                return Err(phase_b_error(
+                    "E_PHASE_B_EXECUTION_BIN",
+                    format!(
+                        "{}: post-probe execution-bin binding drifted",
+                        tool.id
+                    ),
+                ));
+            }
+            Ok(())
+        })();
+        let capture = match (capture, post_bookend) {
+            (Err(primary), _) => return Err(primary),
+            (Ok(_), Err(post_error)) => return Err(post_error),
+            (Ok(capture), Ok(())) => capture,
+        };
         if capture.exit_code != 0 {
             return Err(phase_b_error(
                 "E_PHASE_B_TOOL_VERSION",
@@ -25911,11 +27668,13 @@ mod phase_b_std {
 
     /// Resolve all 20 native tools, materialize execution-bin, probe versions,
     /// and return the tool/execution-bin digests together with selected finals.
-    fn inventory_native_tools(
+    fn inventory_native_tools_with_admission(
         repository_root: &Path,
         closed_path: &str,
         execution_bin_relative: &str,
         authority: &ProduceAcquisitionAuthority,
+        space_guard: &PhaseBSpaceGuard<'_>,
+        execution_bin_admission: ExecutionBinAdmission,
     ) -> TrustResult<([u8; 32], [u8; 32], Vec<SelectedTool>)> {
         if NATIVE_TOOLS.len() != 20 {
             return Err(phase_b_error(
@@ -25962,40 +27721,86 @@ mod phase_b_std {
             roles.push((ordinal, tool, candidates, selected_index));
         }
 
-        // Phase 2: materialize execution-bin with exactly 20 symlinks.
-        ensure_repository_directory(
-            repository_root,
-            execution_bin_relative,
-            true,
-            "fresh execution-bin",
-        )?;
-        for (ordinal, _tool, candidates, selected_index) in &roles {
-            let selected = &candidates[selected_index.expect("selected")];
-            let final_path = selected.final_path.as_ref().ok_or_else(|| {
-                phase_b_error("E_PHASE_B_TOOL_SET", "selected missing final path")
-            })?;
-            let link_name = EXECUTION_BIN_NAMES[*ordinal];
-            let link_path = repository_root
-                .join(execution_bin_relative)
-                .join(link_name);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::symlink;
-                symlink(final_path, &link_path).map_err(|error| {
-                    io_error(
-                        "E_PHASE_B_EXECUTION_BIN",
-                        &format!("symlink {link_name}"),
-                        &error,
-                    )
-                })?;
+        // Phase 2: bootstrap creates one exact symlink set. Ordinary entry
+        // requires that same already-sealed set and never mutates it.
+        match execution_bin_admission {
+            ExecutionBinAdmission::CreateFresh => {
+                ensure_repository_directory(
+                    repository_root,
+                    execution_bin_relative,
+                    true,
+                    space_guard,
+                    PhaseBSpaceGroup::RunOnly,
+                    "fresh execution-bin",
+                )?;
+                for (ordinal, _tool, candidates, selected_index) in &roles {
+                    let selected =
+                        &candidates[selected_index.expect("selected")];
+                    let final_path =
+                        selected.final_path.as_ref().ok_or_else(|| {
+                            phase_b_error(
+                                "E_PHASE_B_TOOL_SET",
+                                "selected missing final path",
+                            )
+                        })?;
+                    let link_name = EXECUTION_BIN_NAMES[*ordinal];
+                    let link_path = repository_root
+                        .join(execution_bin_relative)
+                        .join(link_name);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::symlink;
+                        space_guard.require_projected(
+                            PhaseBSpaceGroup::RunOnly,
+                            FilesystemUsage {
+                                entry_count: 1,
+                                regular_file_bytes: 0,
+                            },
+                            "execution-bin symlink",
+                        )?;
+                        let mutation =
+                            symlink(final_path, &link_path).map_err(|error| {
+                                io_error(
+                                    "E_PHASE_B_EXECUTION_BIN",
+                                    &format!("symlink {link_name}"),
+                                    &error,
+                                )
+                            });
+                        let post_mutation_space =
+                            space_guard.require_projected(
+                                PhaseBSpaceGroup::RunOnly,
+                                FilesystemUsage::ZERO,
+                                "execution-bin symlink",
+                            );
+                        post_mutation_space?;
+                        mutation?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (final_path, link_path);
+                        return Err(phase_b_error(
+                            "E_PHASE_B_EXECUTION_BIN",
+                            "execution-bin requires Unix symlinks",
+                        ));
+                    }
+                }
             }
-            #[cfg(not(unix))]
-            {
-                let _ = (final_path, link_path);
-                return Err(phase_b_error(
-                    "E_PHASE_B_EXECUTION_BIN",
-                    "execution-bin requires Unix symlinks",
-                ));
+            ExecutionBinAdmission::RequireExisting => {
+                let metadata = directory_metadata(
+                    Path::new(&execution_bin_abs),
+                    "ordinary existing execution-bin",
+                )?;
+                if metadata.mode() & 0o170_000 != 0o040_000 {
+                    return Err(phase_b_error(
+                        "E_PHASE_B_EXECUTION_BIN",
+                        "ordinary execution-bin must remain a directory",
+                    ));
+                }
+                space_guard.require_projected(
+                    PhaseBSpaceGroup::RunOnly,
+                    FilesystemUsage::ZERO,
+                    "ordinary existing execution-bin",
+                )?;
             }
         }
         // Exact set: 20 entries, no extras.
@@ -26145,6 +27950,7 @@ mod phase_b_std {
                 &selected_authorities,
                 execution_bin_sha256,
                 authority,
+                space_guard,
                 &selected_lexical,
                 tool,
                 &execution_bin_abs,
@@ -26216,11 +28022,33 @@ mod phase_b_std {
                 "execution-bin binding drifted after version-probe inventory",
             ));
         }
+        space_guard.require_projected(
+            PhaseBSpaceGroup::RunOnly,
+            FilesystemUsage::ZERO,
+            "native-tool inventory aggregate space",
+        )?;
         Ok((
             tool_set_sha256,
             execution_bin_sha256,
             selected_tools,
         ))
+    }
+
+    fn inventory_native_tools(
+        repository_root: &Path,
+        closed_path: &str,
+        execution_bin_relative: &str,
+        authority: &ProduceAcquisitionAuthority,
+        space_guard: &PhaseBSpaceGuard<'_>,
+    ) -> TrustResult<([u8; 32], [u8; 32], Vec<SelectedTool>)> {
+        inventory_native_tools_with_admission(
+            repository_root,
+            closed_path,
+            execution_bin_relative,
+            authority,
+            space_guard,
+            ExecutionBinAdmission::CreateFresh,
+        )
     }
 
     fn selected_tool_path(
@@ -26264,22 +28092,73 @@ mod phase_b_std {
         })
     }
 
+    pub(super) fn inventory_existing_native_tools(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        closed_path: &str,
+    ) -> TrustResult<OrdinaryNativeToolInventory> {
+        if run_id.len() != 32
+            || !run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_SET",
+                "ordinary native-tool inventory requires a 32-hex run ID",
+            ));
+        }
+        let role = role_name(mode)?;
+        let execution_bin_relative =
+            format!(".fnd01-run/{role}/{run_id}/execution-bin");
+        validate_relative_path(
+            &execution_bin_relative,
+            "ordinary execution-bin path",
+        )?;
+        let authority = compiled_produce_acquisition_authority();
+        let space_guard = PhaseBSpaceGuard::new(
+            repository_root,
+            run_id,
+            authority.space_budget,
+        )?;
+        let (
+            tool_set_sha256,
+            execution_bin_sha256,
+            selected_tools,
+        ) = inventory_native_tools_with_admission(
+            repository_root,
+            closed_path,
+            &execution_bin_relative,
+            &authority,
+            &space_guard,
+            ExecutionBinAdmission::RequireExisting,
+        )?;
+        let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
+        Ok(OrdinaryNativeToolInventory {
+            repository_root: repository_root.to_path_buf(),
+            execution_bin_relative,
+            tool_set_sha256,
+            execution_bin_sha256,
+            acquisition_tools,
+            selected_tools,
+        })
+    }
+
     fn produce_phase_b_control_plane(
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
         authoring_marker: &AuthoringMarker,
         integration_digest: [u8; 32],
         authoring_bytes: &[Vec<u8>; 3],
-        authority: &PhaseBAuthority,
+        authority: PhaseBAuthority,
     ) -> TrustResult<()> {
-        // phase_b_policy_authority_rule: no filesystem or child-process action
-        // is authorized until every consumed path/formula/bound/deadline has a
-        // compiled exact binding. Pure layout/tool/argv/env authority is admitted
-        // below. Runtime FS mutation (create_new scratch, empty acquisition
-        // CARGO_HOME, resolve/fetch children, supply encode, spool seal,
-        // control-build, ledger, exec-handoff) remains fail-closed until those
-        // steps are fully compiled and independently frozen — no partial
-        // transactions.
+        // phase_b_policy_authority_rule: consuming the private PhaseBAuthority
+        // yields one non-Clone permit for the bounded acquisition transaction.
+        // It admits fresh producer scratch, native-tool inventory,
+        // bootstrap.resolve/fetch, and construction plus validation of one
+        // in-memory SUPPLYv4 candidate.  The later dynamic authority barrier
+        // still forbids supply sealing, spool/materialization, control build,
+        // ledger publication, and handoff.
         let permit = require_produce_acquisition_authority(
             authority,
             arguments,
@@ -26299,7 +28178,7 @@ mod phase_b_std {
         let acquisition_target = permit.acquisition_target.as_str();
         let offline_home = permit.offline_home.as_str();
         let execution_bin = permit.execution_bin.as_str();
-        let manifest = authority.manifest.as_slice();
+        let manifest = permit.manifest.as_slice();
         if package_root.is_empty()
             || target_root.is_empty()
             || local_registry.is_empty()
@@ -26343,38 +28222,58 @@ mod phase_b_std {
             ));
         }
         let repository_root = &arguments.repository_root;
+        let space_guard = PhaseBSpaceGuard::new(
+            repository_root,
+            &arguments.run_id,
+            permit.authority.space_budget,
+        )?;
+        space_guard.require_projected(
+            PhaseBSpaceGroup::RunOnly,
+            FilesystemUsage::ZERO,
+            "Phase-B Produce entry aggregate space",
+        )?;
         directory_metadata(repository_root, "produce repository root")?;
         // Fresh role scratch: package layout before lock generation.
         ensure_repository_directory(
             repository_root,
             &package_root,
             true,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "fresh bootstrap-control-package root",
         )?;
         ensure_repository_directory(
             repository_root,
             &format!("{package_root}/src"),
             true,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap package src",
         )?;
         ensure_repository_directory(
             repository_root,
             &format!("{package_root}/tests"),
             true,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap package tests",
         )?;
         ensure_repository_directory(
             repository_root,
             &acquisition_home,
             true,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "fresh acquisition CARGO_HOME",
         )?;
         // Sealed pre-lock scratch files (Cargo.lock arrives from resolve).
-        let _manifest_binding = create_sealed_file(
+        let sealed_manifest = create_sealed_file(
             repository_root,
             &format!("{package_root}/Cargo.toml"),
             manifest,
-            permit.authority.max_source_file_bytes.min(1024 * 1024),
+            permit.authority.max_source_file_bytes,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap Cargo.toml",
         )?;
         let _harness_binding = create_sealed_file(
@@ -26382,6 +28281,8 @@ mod phase_b_std {
             &format!("{package_root}/src/main.rs"),
             &authoring_bytes[2],
             permit.authority.max_bootstrap_harness_bytes,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap harness copy",
         )?;
         let verifier_max = u64::try_from(authoring_bytes[1].len())
@@ -26398,12 +28299,16 @@ mod phase_b_std {
             &format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
             &authoring_bytes[1],
             permit.authority.max_verifier_test_bytes,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap verifier copy",
         )?;
         ensure_repository_directory(
             repository_root,
             &acquisition_target,
             true,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "fresh acquisition CARGO_TARGET_DIR",
         )?;
         let (
@@ -26414,7 +28319,8 @@ mod phase_b_std {
             repository_root,
             &environment.closed_path,
             &execution_bin,
-            permit.authority,
+            &permit.authority,
+            &space_guard,
         )?;
         let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
         let closed_path_cargo =
@@ -26494,6 +28400,8 @@ mod phase_b_std {
             &execution_bin,
             &selected_tools,
             execution_bin_sha256,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             permit.authority.resolve.stdout_limit,
             permit.authority.resolve.stderr_limit,
             permit.authority.resolve.timeout_seconds,
@@ -26535,6 +28443,8 @@ mod phase_b_std {
             &execution_bin,
             &selected_tools,
             execution_bin_sha256,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             permit.authority.fetch.stdout_limit,
             permit.authority.fetch.stderr_limit,
             permit.authority.fetch.timeout_seconds,
@@ -26551,10 +28461,24 @@ mod phase_b_std {
         let acquisition_abs = PathBuf::from(&compiled_acquisition.cargo_home);
         let (supply_bytes, supply) =
             inventory_supply_from_acquisition(&acquisition_abs, &lock_bytes)?;
-        let _admitted_bootstrap_input =
+        let (_, rebound_manifest) = checked_read(
+            repository_root,
+            &format!("{package_root}/Cargo.toml"),
+            permit.authority.max_source_file_bytes,
+            Some(sealed_manifest.binding),
+        )?;
+        if rebound_manifest != manifest {
+            return Err(phase_b_error(
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+                "bootstrap Cargo.toml drifted during acquisition",
+            ));
+        }
+        let validated_supply = validate_supply_bundle_value(&supply)?;
+        let admitted_bootstrap_input =
             require_root_frozen_bootstrap_input_authority(
-                authority,
-                &supply,
+                &rebound_manifest,
+                sealed_manifest.binding,
+                &validated_supply,
             )?;
         let supply_relative = format!(
             ".fnd01-run/integration-producer/{}/supply-bundle.bin",
@@ -26567,6 +28491,8 @@ mod phase_b_std {
                     repository_root,
                     parent,
                     false,
+                    &space_guard,
+                    PhaseBSpaceGroup::RunOnly,
                     "supply-bundle parent",
                 )?;
             }
@@ -26578,6 +28504,8 @@ mod phase_b_std {
             &supply_relative,
             &supply_bytes,
             1024 * 1024 * 1024,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "producer pre-handoff supply bundle",
         )?;
         let (_, reopened_supply) = checked_read(
@@ -26605,8 +28533,13 @@ mod phase_b_std {
             &reopened_supply,
             &reopened_supply_parsed,
         )?;
-        let registry =
-            materialize_supply(repository_root, &local_registry, &supply)?;
+        let registry = materialize_supply(
+            repository_root,
+            &local_registry,
+            &supply,
+            &admitted_bootstrap_input,
+            &space_guard,
+        )?;
         // Exact cargo-config for sealed local-registry (offline control-build).
         let registry_abs = utf8_absolute(
             &repository_root.join(&local_registry),
@@ -26618,6 +28551,8 @@ mod phase_b_std {
             &format!("{package_root}/cargo-config.toml"),
             &cargo_config,
             1024 * 1024,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             "bootstrap cargo-config.toml",
         )?;
         let config_authority = cargo_config_authority(
@@ -26713,6 +28648,8 @@ mod phase_b_std {
             SPOOL_PREFIX,
             "acquisition-spool",
             "spool_set_sha256",
+            &space_guard,
+            PhaseBSpaceGroup::ControlPlane,
             "producer acquisition spool",
         )?;
         let (_, reopened_spool) = checked_read(
@@ -26752,12 +28689,16 @@ mod phase_b_std {
             repository_root,
             &offline_home,
             true,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "fresh offline CARGO_HOME",
         )?;
         ensure_repository_directory(
             repository_root,
             &target_root,
             true,
+            &space_guard,
+            PhaseBSpaceGroup::RunOnly,
             "fresh bootstrap-control-target",
         )?;
         let package_abs = utf8_absolute(
@@ -26835,6 +28776,8 @@ mod phase_b_std {
             &execution_bin,
             &selected_tools,
             execution_bin_sha256,
+            &space_guard,
+            PhaseBSpaceGroup::Bootstrap,
             BUILD_STDOUT_LIMIT,
             BUILD_STDERR_LIMIT,
             CONTROL_BUILD_TIMEOUT_SECONDS,
@@ -26874,16 +28817,35 @@ mod phase_b_std {
         let handoff_env_values = handoff_environment(arguments, environment)?;
         // Scratch bindings for the five sealed package files (absolute paths).
         let scratch_paths = [
-            format!("{package_root}/Cargo.toml"),
-            format!("{package_root}/Cargo.lock"),
-            format!("{package_root}/cargo-config.toml"),
-            format!("{package_root}/src/main.rs"),
-            format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+            (
+                format!("{package_root}/Cargo.toml"),
+                permit.authority.max_source_file_bytes,
+            ),
+            (
+                format!("{package_root}/Cargo.lock"),
+                permit.authority.max_bootstrap_lock_bytes,
+            ),
+            (
+                format!("{package_root}/cargo-config.toml"),
+                permit.authority.max_source_file_bytes,
+            ),
+            (
+                format!("{package_root}/src/main.rs"),
+                permit.authority.max_bootstrap_harness_bytes,
+            ),
+            (
+                format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+                permit.authority.max_verifier_test_bytes,
+            ),
         ];
         let mut scratch_bindings = Vec::new();
-        for relative in &scratch_paths {
-            let (snapshot, _) =
-                checked_read(repository_root, relative, MAX_BOOTSTRAP_FILE_BYTES, None)?;
+        for (relative, maximum) in &scratch_paths {
+            let (snapshot, _) = checked_read(
+                repository_root,
+                relative,
+                *maximum,
+                None,
+            )?;
             scratch_bindings.push(BoundPath {
                 path: utf8_absolute(&repository_root.join(relative), relative)?,
                 binding: FileBinding {
@@ -26964,7 +28926,14 @@ mod phase_b_std {
             CONTROL_PREFIX,
             "control-ledger",
             "ledger_set_sha256",
+            &space_guard,
+            PhaseBSpaceGroup::ControlPlane,
             "producer control ledger",
+        )?;
+        space_guard.require_projected(
+            PhaseBSpaceGroup::RunOnly,
+            FilesystemUsage::ZERO,
+            "Phase-B Produce handoff aggregate space",
         )?;
         let _ = supply.entries.len();
         // Same-PID ordinary handoff (does not return on success).
@@ -26982,7 +28951,7 @@ mod phase_b_std {
         authoring_marker: &AuthoringMarker,
         integration_digest: [u8; 32],
         authoring_bytes: &[Vec<u8>; 3],
-        authority: &PhaseBAuthority,
+        authority: PhaseBAuthority,
         supply: &SupplyBundle,
     ) -> TrustResult<()> {
         let manifest = authority.manifest.as_slice();
@@ -27057,7 +29026,16 @@ mod phase_b_std {
                 "attested supply contains no 0x01 crate archives",
             ));
         }
-        let _ = (index_count, sparse_count);
+        let validated_supply = validate_supply_bundle_value(supply)?;
+        let candidate =
+            bootstrap_input_authority(&validated_supply, manifest)?;
+        if candidate.manifest_binding != authority.manifest_binding {
+            return Err(phase_b_error(
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+                "Attest manifest differs from compiled authority",
+            ));
+        }
+        let _ = (candidate, index_count, sparse_count);
         // Phase B intentionally does not decompress gzip or parse tar members;
         // those checks belong to same-PID ordinary admission. Attest remains
         // fail-closed here until the independently frozen materialized-input,
@@ -27315,9 +29293,18 @@ mod phase_b_std {
                 policy_binding: binding(policy),
                 manifest: manifest.to_vec(),
                 manifest_binding: binding(manifest),
-                direct_registry_binding: binding(b"direct"),
-                union_registry_binding: binding(b"union"),
-                native_tool_registry_binding: binding(b"tools"),
+                direct_registry_binding: binding(
+                    &direct_registry(DIRECT_PREFIX, false)
+                        .expect("compiled direct registry"),
+                ),
+                union_registry_binding: binding(
+                    &direct_registry(UNION_PREFIX, true)
+                        .expect("compiled union registry"),
+                ),
+                native_tool_registry_binding: binding(
+                    &native_tool_registry()
+                        .expect("compiled native-tool registry"),
+                ),
                 produce_acquisition:
                     compiled_produce_acquisition_authority(),
             }
@@ -27327,6 +29314,54 @@ mod phase_b_std {
             let error = validate_phase_b_authority(bytes)
                 .expect_err("policy byte drift must fail");
             assert_eq!(error.code(), "E_PHASE_B_POLICY_AUTHORITY");
+        }
+
+        #[test]
+        fn child_space_authority_is_checked_before_spawn() {
+            let calls = std::cell::Cell::new(0u32);
+            let error = execute_child(
+                &["/bin/true".to_owned()],
+                &[],
+                Path::new("/"),
+                1,
+                1,
+                1,
+                1,
+                1,
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(TrustError::new(
+                        "E_TEST_SPACE_PRESPAWN",
+                        "exact pre-spawn space failure",
+                    ))
+                },
+                "synthetic pre-spawn child",
+            )
+            .expect_err("space authority must fail before child spawn");
+            assert_eq!(calls.get(), 1);
+            assert_eq!(error.code(), "E_TEST_SPACE_PRESPAWN");
+            assert_eq!(error.detail(), "exact pre-spawn space failure");
+        }
+
+        #[test]
+        fn ordinary_existing_tool_inventory_rejects_role_inputs_before_io() {
+            let uppercase = inventory_existing_native_tools(
+                Path::new("/repository-that-must-not-be-opened"),
+                BootstrapMode::Produce,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+            )
+            .expect_err("uppercase run IDs are outside the frozen grammar");
+            assert_eq!(uppercase.code(), "E_PHASE_B_TOOL_SET");
+
+            let gate = inventory_existing_native_tools(
+                Path::new("/repository-that-must-not-be-opened"),
+                BootstrapMode::Gate,
+                "0123456789abcdef0123456789abcdef",
+                "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+            )
+            .expect_err("Gate cannot obtain an ordinary tool inventory");
+            assert_eq!(gate.code(), "E_PHASE_B_MODE");
         }
 
         #[test]
@@ -27400,14 +29435,76 @@ mod phase_b_std {
         }
 
         #[test]
+        fn exact_policy_sections_bind_complete_repeated_table_blocks() {
+            let expected =
+                b"[[row]]\nordinal = 0\n\n[[row]]\nordinal = 1\n\n";
+            let mut policy = b"prefix = true\n".to_vec();
+            policy.extend_from_slice(expected);
+            policy.extend_from_slice(b"[[next]]\nid = \"next\"\n");
+            exact_policy_section(
+                &policy,
+                expected,
+                b"[[next]]",
+                "synthetic repeated rows",
+            )
+            .expect("the complete repeated-header block is unique");
+
+            let mut duplicate = policy.clone();
+            duplicate.extend_from_slice(expected);
+            duplicate.extend_from_slice(b"[[next]]\n");
+            assert_eq!(
+                exact_policy_section(
+                    &duplicate,
+                    expected,
+                    b"[[next]]",
+                    "duplicated repeated rows",
+                )
+                .expect_err("a duplicate complete block must fail")
+                .code(),
+                "E_PHASE_B_POLICY_AUTHORITY",
+            );
+
+            let decoy = b"prefix = \"[[row]]\\nordinal = 0\"\n[[row]]\nordinal = 9\n\n[[next]]\n";
+            assert_eq!(
+                exact_policy_section(
+                    decoy,
+                    expected,
+                    b"[[next]]",
+                    "decoy repeated rows",
+                )
+                .expect_err("a string decoy cannot replace the exact block")
+                .code(),
+                "E_PHASE_B_POLICY_AUTHORITY",
+            );
+            for (start, end) in [
+                (b"".as_slice(), b"[[next]]".as_slice()),
+                (b"[[row]]".as_slice(), b"".as_slice()),
+            ] {
+                assert_eq!(
+                    exact_policy_section_digest(
+                        &policy,
+                        start,
+                        end,
+                        0,
+                        "",
+                        "empty section marker",
+                    )
+                    .expect_err("empty section markers must fail without panicking")
+                    .code(),
+                    "E_PHASE_B_POLICY_AUTHORITY",
+                );
+            }
+        }
+
+        #[test]
         fn produce_acquisition_authority_is_pure_and_role_exact() {
             let policy = b"policy".to_vec();
             let verifier = b"verifier".to_vec();
             let harness = b"harness".to_vec();
+            let manifest =
+                bootstrap_manifest().expect("compiled bootstrap manifest");
             let authoring_bytes =
                 [policy.clone(), verifier.clone(), harness.clone()];
-            let authority =
-                synthetic_phase_b_authority(&policy, b"manifest");
             let marker = AuthoringMarker {
                 policy: binding_for_bytes(&policy).expect("policy binding"),
                 verifier: binding_for_bytes(&verifier)
@@ -27443,7 +29540,7 @@ mod phase_b_std {
                 final_gate_seal: None,
             };
             let permit = require_produce_acquisition_authority(
-                &authority,
+                synthetic_phase_b_authority(&policy, &manifest),
                 &arguments,
                 &environment,
                 &marker,
@@ -27457,14 +29554,94 @@ mod phase_b_std {
             );
             assert_eq!(
                 permit.authority,
-                &compiled_produce_acquisition_authority()
+                compiled_produce_acquisition_authority()
+            );
+
+            let mut wrong_direct =
+                synthetic_phase_b_authority(&policy, &manifest);
+            wrong_direct.direct_registry_binding =
+                binding_for_bytes(b"wrong direct registry")
+                    .expect("wrong direct binding");
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    wrong_direct,
+                    &arguments,
+                    &environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err("a drifted direct registry cannot obtain authority")
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            let mut wrong_union =
+                synthetic_phase_b_authority(&policy, &manifest);
+            wrong_union.union_registry_binding =
+                binding_for_bytes(b"wrong union registry")
+                    .expect("wrong union binding");
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    wrong_union,
+                    &arguments,
+                    &environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err("a drifted union registry cannot obtain authority")
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            let mut wrong_tools =
+                synthetic_phase_b_authority(&policy, &manifest);
+            wrong_tools.native_tool_registry_binding =
+                binding_for_bytes(b"wrong native-tool registry")
+                    .expect("wrong native-tool binding");
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    wrong_tools,
+                    &arguments,
+                    &environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err(
+                    "a drifted native-tool registry cannot obtain authority",
+                )
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            let mut wrong_manifest = manifest.clone();
+            wrong_manifest[0] ^= 1;
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    synthetic_phase_b_authority(
+                        &policy,
+                        &wrong_manifest,
+                    ),
+                    &arguments,
+                    &environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err(
+                    "a self-consistent but noncompiled manifest cannot obtain authority",
+                )
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
             let mut attest = arguments.clone();
             attest.mode = BootstrapMode::Attest;
             assert_eq!(
                 require_produce_acquisition_authority(
-                    &authority,
+                    synthetic_phase_b_authority(&policy, &manifest),
                     &attest,
                     &environment,
                     &marker,
@@ -27480,7 +29657,7 @@ mod phase_b_std {
             wrong_root.run_root = repository_root.join("wrong");
             assert_eq!(
                 require_produce_acquisition_authority(
-                    &authority,
+                    synthetic_phase_b_authority(&policy, &manifest),
                     &wrong_root,
                     &environment,
                     &marker,
@@ -27494,7 +29671,7 @@ mod phase_b_std {
 
             assert_eq!(
                 require_produce_acquisition_authority(
-                    &authority,
+                    synthetic_phase_b_authority(&policy, &manifest),
                     &arguments,
                     &environment,
                     &marker,
@@ -27510,7 +29687,7 @@ mod phase_b_std {
             drifted[2].push(b'!');
             assert_eq!(
                 require_produce_acquisition_authority(
-                    &authority,
+                    synthetic_phase_b_authority(&policy, &manifest),
                     &arguments,
                     &environment,
                     &marker,
@@ -28684,38 +30861,56 @@ mod phase_b_std {
 
         #[test]
         fn bootstrap_input_authority_excludes_sparse_evidence_and_binds_materialized_rows() {
-            let archive =
-                synthetic_supply_entry(0x01, "sample-1.2.3.crate", b"archive".to_vec());
-            let index = synthetic_supply_entry(
-                0x02,
-                "index/sa/mp/sample",
-                b"{\"name\":\"sample\"}\n".to_vec(),
-            );
-            let sparse = synthetic_supply_entry(
-                0x03,
-                "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
-                b"cache-evidence".to_vec(),
-            );
-            let lock = synthetic_supply_lock(&encode_lower_hex(
-                &archive.binding.sha256,
-            ));
-            let supply = SupplyBundle {
-                bootstrap_lock_binding:
-                    binding_for_bytes(&lock).expect("lock binding"),
-                bootstrap_lock: lock,
-                acquisition: synthetic_supply_acquisition(),
-                entries: vec![archive.clone(), index.clone(), sparse.clone()],
-                inner_entry_set_sha256: [0x11; 32],
-                closure_bijection_sha256: [0x22; 32],
-            };
-            let authority = bootstrap_input_authority(&supply, b"manifest")
+            fn valid_supply(archive: &[u8]) -> SupplyBundle {
+                let checksum = encode_lower_hex(
+                    &sha256(archive).expect("archive digest"),
+                );
+                let selected = format!(
+                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
+                );
+                let entries = vec![
+                    synthetic_supply_entry(
+                        0x01,
+                        "sample-1.2.3.crate",
+                        archive.to_vec(),
+                    ),
+                    synthetic_supply_entry(
+                        0x02,
+                        "index/sa/mp/sample",
+                        format!("{selected}\n").into_bytes(),
+                    ),
+                    synthetic_supply_entry(
+                        0x03,
+                        "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
+                        synthetic_summaries_cache(&[(
+                            "1.2.3",
+                            selected.as_bytes(),
+                        )]),
+                    ),
+                ];
+                let encoded = encode_supply_bundle(
+                    &synthetic_supply_lock(&checksum),
+                    &synthetic_supply_acquisition(),
+                    entries,
+                )
+                .expect("canonical synthetic supply");
+                parse_supply_bundle(&encoded)
+                    .expect("validated synthetic supply")
+            }
+
+            let supply = valid_supply(b"archive");
+            let validated = validate_supply_bundle_value(&supply)
+                .expect("canonical in-memory supply witness");
+            let authority =
+                bootstrap_input_authority(&validated, b"manifest")
                 .expect("bootstrap input authority");
-            let phase_authority =
-                synthetic_phase_b_authority(b"policy", b"manifest");
+            let manifest_binding =
+                binding_for_bytes(b"manifest").expect("manifest binding");
             assert_eq!(
                 require_root_frozen_bootstrap_input_authority(
-                    &phase_authority,
-                    &supply,
+                    b"manifest",
+                    manifest_binding,
+                    &validated,
                 )
                 .expect_err("unenrolled canonical authority must remain pending")
                 .code(),
@@ -28736,22 +30931,41 @@ mod phase_b_std {
             .expect("materialized set preimage")
             .starts_with(BOOTSTRAP_MATERIALIZED_PREFIX));
 
-            let mut sparse_changed = supply.clone();
-            sparse_changed.entries[2] = synthetic_supply_entry(
+            let selected = supply.entries[1]
+                .payload
+                .strip_suffix(b"\n")
+                .expect("derived index terminal LF");
+            let mut sparse_entries = supply.entries.clone();
+            sparse_entries[2] = synthetic_supply_entry(
                 0x03,
-                &sparse.relative_path,
-                b"different-cache-evidence".to_vec(),
+                &supply.entries[2].relative_path,
+                synthetic_summaries_cache_with_validator(
+                    b"different-validator",
+                    &[("1.2.3", selected)],
+                ),
             );
+            let sparse_encoded = encode_supply_bundle(
+                &supply.bootstrap_lock,
+                &supply.acquisition,
+                sparse_entries,
+            )
+            .expect("coherently re-encoded evidence-only sparse change");
+            let sparse_changed = parse_supply_bundle(&sparse_encoded)
+                .expect("coherently resealed sparse change");
+            let sparse_validated =
+                validate_supply_bundle_value(&sparse_changed)
+                    .expect("changed sparse witness");
             assert_eq!(
-                bootstrap_input_authority(&sparse_changed, b"manifest")
+                bootstrap_input_authority(&sparse_validated, b"manifest")
                     .expect("changed evidence-only sparse input")
                     .authority_sha256,
                 authority.authority_sha256,
             );
             assert_eq!(
                 require_root_frozen_bootstrap_input_authority(
-                    &phase_authority,
-                    &sparse_changed,
+                    b"manifest",
+                    manifest_binding,
+                    &sparse_validated,
                 )
                 .expect_err(
                     "evidence-only sparse drift still reaches pending authority"
@@ -28760,35 +30974,42 @@ mod phase_b_std {
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
             );
 
-            let mut materialized_changed = supply.clone();
-            materialized_changed.entries[1] = synthetic_supply_entry(
-                0x02,
-                &index.relative_path,
-                b"{\"name\":\"changed\"}\n".to_vec(),
-            );
+            let materialized_changed = valid_supply(b"changed archive");
+            let materialized_validated =
+                validate_supply_bundle_value(&materialized_changed)
+                    .expect("coherently changed materialized witness");
             assert_ne!(
-                bootstrap_input_authority(&materialized_changed, b"manifest")
+                bootstrap_input_authority(
+                    &materialized_validated,
+                    b"manifest",
+                )
                     .expect("changed materialized input")
                     .authority_sha256,
                 authority.authority_sha256,
             );
 
-            let mut reordered = supply;
+            let mut reordered = supply.clone();
             reordered.entries.swap(0, 1);
             assert_eq!(
-                bootstrap_input_authority(&reordered, b"manifest")
-                    .expect_err("materialized rows must retain canonical order")
+                validate_supply_bundle_value(&reordered)
+                    .expect_err("all supply rows must retain canonical order")
                     .code(),
-                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+                "E_PHASE_B_SUPPLY_ORDER",
+            );
+            assert_ne!(
+                bootstrap_input_authority(&validated, b"changed manifest")
+                    .expect("changed manifest authority")
+                    .authority_sha256,
+                authority.authority_sha256,
             );
             assert_eq!(
                 require_root_frozen_bootstrap_input_authority(
-                    &phase_authority,
-                    &reordered,
+                    b"manifest",
+                    binding_for_bytes(b"different manifest")
+                        .expect("different manifest binding"),
+                    &validated,
                 )
-                .expect_err(
-                    "malformed candidate must fail before pending authority"
-                )
+                .expect_err("independent manifest binding drift must fail")
                 .code(),
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
             );
@@ -29040,7 +31261,7 @@ mod phase_b_std {
                 authoring_marker,
                 integration_digest,
                 &authoring_bytes,
-                &authority,
+                authority,
                 None,
             ),
             (BootstrapMode::Attest, Some(retained)) => {
@@ -29089,7 +31310,7 @@ mod phase_b_std {
                     authoring_marker,
                     integration_digest,
                     &authoring_bytes,
-                    &authority,
+                    authority,
                     Some(&supply),
                 )
             }
@@ -29585,27 +31806,27 @@ const POLICY_SHAPE_SCHEMA_VERSION: u32 = 2;
 const POLICY_SHAPE_ROW_COUNT: usize = 104;
 const POLICY_ROOT_SCALAR_TYPE_ROW_COUNT: usize = 19;
 const POLICY_CONDITIONAL_VARIANT_ROW_COUNT: usize = 4;
-const POLICY_SHAPE_REGISTRY_BYTES: usize = 41_905;
+const POLICY_SHAPE_REGISTRY_BYTES: usize = 42_659;
 const POLICY_SHAPE_REGISTRY_SHA256: &str =
-    "8cd7250d32344e8b572649e061d036e788d5d68e4a3971c52b8c0eb1503bd28f";
+    "fbbd20fcc1f1bff40354ff0f3a7755870b98f9c6fe1b64d5395cb73d77c464c7";
 const MAX_POLICY_SHAPE_REGISTRY_BYTES: usize = 1_048_576;
-const POLICY_TYPE_REGISTRY_ROW_COUNT: usize = 1_745;
-const POLICY_TYPE_REGISTRY_BYTES: usize = 95_467;
+const POLICY_TYPE_REGISTRY_ROW_COUNT: usize = 1_771;
+const POLICY_TYPE_REGISTRY_BYTES: usize = 97_252;
 const POLICY_TYPE_REGISTRY_SHA256: &str =
-    "843972fa2e51688f70d06a8f15f3f53c17997a7cfb3f9eb74fa907fb40c340e3";
+    "7ee902fe96cd9232eee3a523995b0cc2a738ea0ae3688fbc0a8fd1eeaf0a07f0";
 const RECORD_SCHEMA_REGISTRY_COUNT: usize = 110;
 const RECORD_SCHEMA_SELECTOR_COUNT: usize = 252;
-const RECORD_SCHEMA_REGISTRY_BYTES: usize = 72_813;
+const RECORD_SCHEMA_REGISTRY_BYTES: usize = 72_295;
 const RECORD_SCHEMA_REGISTRY_SHA256: &str =
-    "a99a81a2d32c32eda7107d4dabeef34de309eab620ecdcbc45fb098f3720f82f";
+    "fec1a4c75227dd4b6c57289385033452c73b9970a2e17c451343a7dd7438e685";
 const RECORD_VARIANT_REGISTRY_COUNT: usize = 6;
-const RECORD_VARIANT_REGISTRY_BYTES: usize = 1428;
+const RECORD_VARIANT_REGISTRY_BYTES: usize = 2_852;
 const RECORD_VARIANT_REGISTRY_SHA256: &str =
-    "29de2475498895c8c09ae866f0f4dbb8021003748c14f7b8efed09245ed42ce9";
+    "58063e8f5c5243ae661a9884a562370fa3d21395a29bfd925ab8745674f602d4";
 const RECEIPT_SCHEMA_REGISTRY_COUNT: usize = 10;
-const RECEIPT_SCHEMA_REGISTRY_BYTES: usize = 20_670;
+const RECEIPT_SCHEMA_REGISTRY_BYTES: usize = 21_571;
 const RECEIPT_SCHEMA_REGISTRY_SHA256: &str =
-    "98399692e278767d9d165de2e7f194951b35b092665ec6a0a43eeea0113099bc";
+    "078d93c8bf7c5098bc56f89268ce717a55d4dcde87774edc61579f7273381880";
 const DIRECT_FIELD_TYPE_COUNT: usize = 1_264;
 const DIRECT_FIELD_TYPE_REGISTRY_BYTES: usize = 83_195;
 const DIRECT_FIELD_TYPE_REGISTRY_SHA256: &str =
@@ -81209,9 +83430,55 @@ fn parse_ordinary_acquisition_spool(
     Ok(record)
 }
 
-fn require_ordinary_execution_authority() -> Result<(), String> {
+/// Admit ordinary execution only after a grammar-valid FND01AUTHORv2 marker
+/// rebinds the three authoring paths on the live repository filesystem.
+///
+/// Invalid or drifted markers remain fail-closed with
+/// `E_ORDINARY_HANDOFF_PENDING` before any ledger/spool/supply/archive open.
+/// A successful authoring rebind does not authorize any ledger, spool, supply,
+/// archive, child, or output access.  Until the independent twenty-tool probes
+/// and complete `ControlLedgerExpectation` are represented by a typed
+/// single-use permit, this boundary remains deliberately pending.
+fn require_ordinary_execution_authority(
+    repository_root: &Path,
+    environment: &BootstrapEnvironment,
+) -> Result<super::trust_std::AuthoringMarker, String> {
+    let marker = match super::trust_std::parse_authoring_marker(&environment.authoring_marker)
+    {
+        Ok(marker) => marker,
+        Err(error) => {
+            return Err(format!(
+                "E_ORDINARY_HANDOFF_PENDING: external authoring/seal authority and the complete ControlLedgerExpectation join are not yet frozen; no ordinary child may execute ({error})"
+            ));
+        }
+    };
+    let limits = [
+        super::trust_std::MAX_POLICY_BYTES,
+        super::trust_std::MAX_VERIFIER_BYTES,
+        super::trust_std::MAX_HARNESS_BYTES,
+    ];
+    let expected = [marker.policy, marker.verifier, marker.harness];
+    for ((path, limit), binding) in super::trust_std::AUTHORING_PATHS
+        .iter()
+        .copied()
+        .zip(limits)
+        .zip(expected)
+    {
+        super::trust_std::checked_snapshot(
+            repository_root,
+            path,
+            limit,
+            Some(binding),
+        )
+        .map_err(|error| {
+            format!(
+                "E_ORDINARY_HANDOFF_PENDING: authoring path rebind failed for {path}: {error}"
+            )
+        })?;
+    }
+    let _ = marker;
     Err(
-        "E_ORDINARY_HANDOFF_PENDING: external authoring/seal authority and the complete ControlLedgerExpectation join are not yet frozen; no ordinary child may execute"
+        "E_ORDINARY_HANDOFF_PENDING: authoring bytes rebind, but the independent twenty-tool probes and complete ControlLedgerExpectation authority are not yet frozen"
             .to_owned(),
     )
 }
@@ -81297,11 +83564,11 @@ fn validate_ordinary_handoff_entry(
         );
     }
     // A self-described ledger or supply object cannot authorize its own use.
-    // Until the root-frozen authoring/seal authority and complete independent
-    // ControlLedgerExpectation are compiled in, stop before opening either
-    // object (and therefore before allocation, decompression, child execution,
-    // or output).
-    require_ordinary_execution_authority()?;
+    // Require a grammar-valid FND01AUTHORv2 marker that rebinds the three
+    // authoring paths on the live repository before opening ledger, spool,
+    // supply, archive, child, or output surfaces.
+    let _authoring_marker =
+        require_ordinary_execution_authority(&invocation.repository_root, environment)?;
     let ledger_path = invocation.repository_root.join(&invocation.control_ledger_path);
     let metadata = std::fs::symlink_metadata(&ledger_path).map_err(|error| {
         format!(
@@ -81795,12 +84062,13 @@ fn validate_ordinary_handoff_entry(
                 .to_owned(),
         );
     }
-    let (expected_tool, acquisition_tools) = ordinary_reprobe_tool_set(
+    let tool_reprobe = ordinary_reprobe_tool_set_shared(
         &invocation.repository_root,
+        invocation.mode,
+        &invocation.run_id,
         &environment.closed_path,
-        &invocation.run_root,
     )?;
-    if tool_set != expected_tool {
+    if tool_set != tool_reprobe.tool_set_sha256 {
         return Err(
             "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
         );
@@ -81809,7 +84077,7 @@ fn validate_ordinary_handoff_entry(
         let compiled_acquisition = acquisition_plan(
             &invocation.repository_root,
             &invocation.run_id,
-            &acquisition_tools,
+            &tool_reprobe.acquisition_tools,
         )
         .map_err(|error| format!("E_HANDOFF_SPOOL_PLAN: {error}"))?;
         if Path::new(&compiled_acquisition.role_root)
@@ -81845,10 +84113,27 @@ fn validate_ordinary_handoff_entry(
         }
         let _ = structural_spool;
     }
-    Err(
-        "E_ORDINARY_HANDOFF_PENDING: ordinary role admission, exact 206/204 command execution, canonical returned evidence, and atomic publication are not yet complete"
-            .to_owned(),
-    )
+    tool_reprobe.require_unchanged()?;
+    // harness_entry_rule step 6: workspace snapshot + evidence-matrix dispatch.
+    // Integration receipts remain Severity::Pending (E_PENDING_GATE); only
+    // Severity::Error fails closed as E_ORDINARY_EVIDENCE. This is not a
+    // permanent E_ORDINARY_HANDOFF_PENDING stub on the happy path.
+    match run_verifier() {
+        Ok(report) => {
+            if report.has_errors() {
+                let detail = report
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                    .map(Diagnostic::stable)
+                    .next()
+                    .unwrap_or_else(|| "verifier reported errors".to_owned());
+                return Err(format!("E_ORDINARY_EVIDENCE: {detail}"));
+            }
+            Ok(())
+        }
+        Err(diagnostic) => Err(format!("E_ORDINARY_EVIDENCE: {}", diagnostic.stable())),
+    }
 }
 
 #[test]
@@ -81886,6 +84171,87 @@ fn ordinary_authority_sentinel_precedes_untrusted_artifact_reads() {
         !error.contains("does-not-exist"),
         "the ledger path must not be opened before external authority"
     );
+}
+
+fn live_authoring_marker_text(repository_root: &Path) -> String {
+    use super::trust_std::{
+        authoring_closure_preimage, AuthoringMarker, FileBinding, AUTHORING_PATHS,
+        MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES,
+    };
+    let limits = [MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, MAX_HARNESS_BYTES];
+    let mut bindings = [FileBinding {
+        byte_length: 0,
+        sha256: [0; 32],
+    }; 3];
+    for ((path, limit), binding) in AUTHORING_PATHS
+        .iter()
+        .copied()
+        .zip(limits)
+        .zip(bindings.iter_mut())
+    {
+        let (snapshot, bytes) = super::trust_std::checked_read(
+            repository_root,
+            path,
+            limit,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        *binding = FileBinding {
+            byte_length: snapshot.byte_length,
+            sha256: ordinary_sha256(&bytes),
+        };
+        assert_eq!(binding.sha256, snapshot.sha256, "snapshot digest for {path}");
+    }
+    let marker = AuthoringMarker {
+        policy: bindings[0],
+        verifier: bindings[1],
+        harness: bindings[2],
+        closure_sha256: [0; 32],
+    };
+    let closure = ordinary_sha256(
+        &authoring_closure_preimage(&marker).expect("authoring closure preimage"),
+    );
+    format!(
+        "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
+        marker.policy.byte_length,
+        lower_hex(&marker.policy.sha256),
+        marker.verifier.byte_length,
+        lower_hex(&marker.verifier.sha256),
+        marker.harness.byte_length,
+        lower_hex(&marker.harness.sha256),
+        lower_hex(&closure),
+    )
+}
+
+#[test]
+fn ordinary_live_authoring_marker_rebind_remains_pending_before_ledger_open() {
+    let repository_root = repository_root();
+    let marker = live_authoring_marker_text(&repository_root);
+    let environment = BootstrapEnvironment {
+        authoring_marker: marker,
+        closed_path: "/usr/bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let error = require_ordinary_execution_authority(&repository_root, &environment)
+        .expect_err(
+            "a matching authoring marker alone must not authorize ledger access",
+        );
+    assert!(
+        error.starts_with("E_ORDINARY_HANDOFF_PENDING:"),
+        "unexpected sentinel: {error}"
+    );
+}
+
+#[test]
+fn ordinary_evidence_dispatch_code_is_named_and_stable() {
+    // Offline evidence-matrix failures must surface as E_ORDINARY_EVIDENCE, never
+    // as a permanent HANDOFF_PENDING after authoring admission completes.
+    let code = "E_ORDINARY_EVIDENCE";
+    assert!(entry_diagnostic_code_is_valid(code) || code.starts_with("E_ORDINARY_"));
+    assert_ne!(code, "E_ORDINARY_HANDOFF_PENDING");
 }
 
 fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
@@ -82045,6 +84411,84 @@ fn ordinary_environment_set_digest() -> [u8; 32] {
         output.extend_from_slice(&0u32.to_be_bytes());
     }
     ordinary_sha256(&output)
+}
+
+struct OrdinaryToolReprobe {
+    tool_set_sha256: [u8; 32],
+    execution_bin_sha256: [u8; 32],
+    acquisition_tools: AcquisitionToolPaths,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    inventory: super::phase_b_std::OrdinaryNativeToolInventory,
+}
+
+impl OrdinaryToolReprobe {
+    fn require_unchanged(&self) -> Result<(), String> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.inventory
+                .require_unchanged()
+                .map_err(|error| {
+                    format!(
+                        "E_HANDOFF_TOOL_SET_RECHECK: {}",
+                        error
+                    )
+                })?;
+            if self.inventory.tool_set_sha256() != self.tool_set_sha256
+                || self.inventory.execution_bin_sha256()
+                    != self.execution_bin_sha256
+                || self.inventory.acquisition_tools()
+                    != &self.acquisition_tools
+            {
+                return Err(
+                    "E_HANDOFF_TOOL_SET_RECHECK: opaque inventory binding drifted"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            Err(
+                "E_UNQUALIFIED_PLATFORM: ordinary native-tool revalidation requires Linux x86_64"
+                    .to_owned(),
+            )
+        }
+    }
+}
+
+fn ordinary_reprobe_tool_set_shared(
+    repository_root: &Path,
+    mode: BootstrapMode,
+    run_id: &str,
+    closed_path: &str,
+) -> Result<OrdinaryToolReprobe, String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let inventory =
+            super::phase_b_std::inventory_existing_native_tools(
+                repository_root,
+                mode,
+                run_id,
+                closed_path,
+            )
+            .map_err(|error| {
+                format!("E_HANDOFF_TOOL_SET: {error}")
+            })?;
+        Ok(OrdinaryToolReprobe {
+            tool_set_sha256: inventory.tool_set_sha256(),
+            execution_bin_sha256: inventory.execution_bin_sha256(),
+            acquisition_tools: inventory.acquisition_tools().clone(),
+            inventory,
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (repository_root, mode, run_id, closed_path);
+        Err(
+            "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
+                .to_owned(),
+        )
+    }
 }
 
 /// Re-resolve and re-probe all 20 native tools; return tool_set_sha256 and the
