@@ -79,8 +79,9 @@ pub use uri::{
     CanonicalHttpUrl, CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
     CanonicalResourceIdPolicy, CanonicalUrlPolicy, DEFAULT_ABSOLUTE_URI_MAX_BYTES,
     DEFAULT_CANONICAL_URL_MAX_BYTES, DefaultPortPolicy, DotSegmentPolicy, FragmentPolicy,
-    IdnaPolicy, PercentEncodingPolicy, QueryPolicy, ResourceEndpointPathPolicy, SchemeHostCasePolicy,
-    SyntaxViolationPolicy, TrailingSlashPolicy, UriComponentState, UserinfoPolicy,
+    IdnaPolicy, PercentEncodingPolicy, QueryPolicy, ResourceEndpointPathPolicy,
+    SchemeHostCasePolicy, SyntaxViolationPolicy, TrailingSlashPolicy, UriComponentState,
+    UserinfoPolicy,
 };
 
 // Re-export key asupersync types for convenience

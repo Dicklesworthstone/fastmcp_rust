@@ -192,13 +192,13 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43de945026234551713296888f2f695fe342808692d55030aed16d5e353af71d"
+checksum = "2792b6a6d99856814acdf0b854dd208125d032939f996dc3e6c3eaff2a8edb25"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -741,13 +741,13 @@ dependencies = [
 
 [[package]]
 name = "displaydoc"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
+checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1012,9 +1012,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "763ba284c68c173e3c5b3147b214bd115c1be55bc04f79738027b2a9a5037eb0"
+checksum = "69ebbe3cb66f3d9c4f780ff9d7f03d666b770d5cf8c2cbec20d64dd2c4efd394"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1023,9 +1023,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ca41db3fe4b037a73b71e764f118e8f182afbae188635a0721aafa078588dd8"
+checksum = "5b88c812fbe5a25cad64e4bbe4bed49e1a5e8951e4c84d7778d7414bb85cdc46"
 dependencies = [
  "serde",
  "serde_json",
@@ -1033,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7cd75f374e2b7ba2316b3c11987b410ba0487211d5d868ade5f66bb7a6d3cb2"
+checksum = "dd75a2ab20875a185f2f9231f46561de802556f69fee2025c43091a12630ae92"
 dependencies = [
  "serde",
 ]
@@ -1226,9 +1226,9 @@ dependencies = [
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "typenum",
 ]
@@ -2730,9 +2730,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.2+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow",
 ]
