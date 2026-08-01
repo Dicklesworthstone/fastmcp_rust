@@ -3,16 +3,24 @@
 - Status: proposed implementation plan
 - Target protocol: MCP `2026-07-28` final
 - Plan date: 2026-07-28
-- Fresh audit revalidation: 2026-07-29; all five pinned upstream
-  default-branch heads below remained unchanged
-- Implementation snapshot assessed:
-  `a609b68170ea99b2ab74b3c103f56dca02ddd62e` on `main`; the
-  `921b34a1eaec9028c85ec789bce09c114f4af295` revalidation base differs
-  only by this plan and Beads tracker artifacts
+- Original audit revalidation: 2026-07-29. Fresh reality-check
+  revalidation: 2026-07-31 through 2026-08-01. Immutable implementation
+  pins remain available and authoritative; mutable comparison heads have
+  moved and are recorded separately below.
+- Historical implementation snapshots:
+  `921b34a1eaec9028c85ec789bce09c114f4af295` and
+  `a609b68170ea99b2ab74b3c103f56dca02ddd62e` on `main`.
+- Fresh implementation snapshot assessed:
+  `ad451a842a79624dd54811e6db9fd9afa1f764ef` on `main`, in a shared
+  dirty worktree 17 commits ahead of `origin/main`. Uncommitted FND-01
+  verifier and Beads changes were inspected in place and were not
+  treated as sealed evidence.
 - Workspace version at audit time: `0.3.2`
 - Primary owner: FastMCP Rust maintainers
-- Execution tracker: Beads graph created from the work packages in
-  this document
+- Execution tracker: the existing Beads projection is a historical,
+  incomplete projection of this document. It is unsafe to mutate at the
+  current live snapshot and must be reconciled and rematerialized under
+  Section 36 before it can become execution authority.
 
 ---
 
@@ -69,6 +77,18 @@ The recommended end state is:
     transition interoperability.
 13. The stale local `2024-11-05` public contract is not retained as a
     compatibility API.
+14. Operators receive a bounded, privacy-safe local health/telemetry
+    contract that is distinct from MCP logging and hosted product
+    control planes.
+15. Downstream crates receive a production-faithful modern test toolkit,
+    including deterministic and real stdio/HTTP paths.
+16. Separately packaged, compile-linked Rust crates can author extensions
+    through one capability-safe public contract without a dynamic-plugin
+    ABI or unchecked JSON-RPC escape hatch.
+17. Core latency, throughput, memory, overload recovery, package size,
+    compile cost, and soak claims are explicit evidence-scoped gates.
+18. REL-01 seals a no-publish handoff; only separately authorized REL-02
+    can execute the resumable registry/GitHub transaction.
 
 This is a breaking release.
 
@@ -165,6 +185,13 @@ following statements are true.
 
 ### 2.5 Extension behavior
 
+The following requirements apply only to a separately claimed optional
+profile. Core MCP `2026-07-28` support neither implies nor waits for the
+Tasks, Apps, Redis Tasks, enterprise authorization, built-in issuer,
+experimental authorization, legacy, modern-proxy, proxy-dual, or
+proxy-Tasks profiles. Each optional claim requires exactly its own
+Section 25 inventory and evidence boundary.
+
 - Extensions are disabled unless explicitly enabled by the developer.
 - Extension capabilities are declared per request (or by the descriptor-bound
   current-message proof required for a stateless notification) and in
@@ -196,12 +223,30 @@ following statements are true.
   `schema.ts`-derived corrected rule there, and is recorded as a named raw
   mismatch rather than counted as generic schema success.
 - Raw-socket HTTP tests cover positive and negative header behavior.
-- LabRuntime tests cover cancellation, retry, and task state races.
-- Security tests cover issuer mix-up, audience confusion, scope
-  escalation, cache isolation, request-state tampering, and header
-  injection.
+- LabRuntime tests cover core cancellation and retry races. Task-state
+  races are required only by the separately claimed Tasks profile.
+- Core security tests cover applicable issuer mix-up, audience
+  confusion, scope escalation, cache isolation, request-state tampering,
+  and header injection. Optional enterprise, built-in issuer, Tasks,
+  Apps, Redis, legacy, and proxy variants are required only by their
+  separately claimed profiles.
 - A forbidden-dependency check proves that no Tokio runtime ecosystem
   entered the dependency graph.
+- Public testing helpers exercise the same modern admission, routing,
+  cancellation, and transport semantics as production code; packaged
+  downstream consumers can use them without importing private crates.
+- Out-of-tree extensions compile against a documented, capability-safe
+  authoring contract and cannot bypass protocol admission, limits,
+  authorization, or result/notification validation.
+- Bounded liveness, readiness, saturation, queue, cancellation, and
+  failure telemetry is available to operators without exposing raw
+  credentials, request bodies, tenant identifiers, or unbounded labels.
+- Reproducible performance, capacity, and soak evidence proves explicit
+  budgets for the supported core profile; no throughput or latency claim
+  is inferred from functional conformance alone.
+- Registry and release publication is a separately authorized,
+  resumable transaction whose receipts bind every published artifact to
+  the exact sealed release identity.
 
 ---
 
@@ -251,6 +296,11 @@ following statements are true.
 - CLI diagnostics.
 - Documentation and migration guides.
 - Official conformance and interoperability testing.
+- Bounded operator health and telemetry semantics.
+- A public modern testing toolkit for downstream consumers.
+- A safe out-of-tree extension authoring contract.
+- Reproducible performance, capacity, and soak qualification.
+- A separately authorized, resumable publication transaction.
 
 ### 3.2 Explicitly out of scope
 
@@ -262,6 +312,9 @@ following statements are true.
 - Treating Claude product features as normative MCP requirements.
 - Implementing Claude's private-network tunnel service.
 - Implementing Claude's connector observability control plane.
+- Treating OPS-01's local bounded snapshot/exporter contract as that
+  hosted product control plane. OPS-01 is framework production-
+  readiness plumbing only and makes no Claude connector-service claim.
 - Claiming support for the experimental/community “Skills over MCP”
   work without a separately pinned, versioned specification and
   implementation profile.
@@ -275,6 +328,9 @@ following statements are true.
   activating them.
 - Building a browser, webview, or iframe renderer inside this Rust
   workspace.
+- Loading extension code dynamically, defining a stable Rust dynamic-
+  library/plugin ABI, or executing downloaded extension code. EXT-DEV-01
+  supports separately packaged crates linked at compile time only.
 - Claiming that Apps support includes host rendering.
 - Enabling any extension by default merely because both endpoints know
   its identifier.
@@ -355,17 +411,17 @@ example without checking the final dated source.
     `ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203`.
 - Prior-version comparison:
   <https://github.com/modelcontextprotocol/modelcontextprotocol/compare/2025-11-25...2026-07-28>
-- Latest post-release default-branch revision initially inspected on
-  2026-07-28 and revalidated unchanged on 2026-07-29:
-  `aa7306efa4dcc03a2a9f2f223e3b2d7a0c5f3ded`.
-  Its dated-spec tree is
-  `973d19bffc162f84656bb91cf87cc818a49a30d2`; the schema tree remains
-  exactly `8b5e263be073848f9531151cb363ccb764eb2da6`.
-  The only net changes to the dated spec tree after the final tag are
-  link-target repairs in
-  `db4bfcff3d60f5df01a21bdf6b78f7012cac4634`; no wire shape,
-  normative requirement, or behavioral prose changed. The immutable
-  final tag remains the implementation authority.
+- Historical post-release default-branch comparison inspected on
+  2026-07-28 and 2026-07-29:
+  `aa7306efa4dcc03a2a9f2f223e3b2d7a0c5f3ded`. The limited comparison
+  made at that time found only the recorded dated-spec link repairs.
+- Fresh mutable default-branch comparison observed on 2026-07-31:
+  `73763114e511106fc07543f6096b3a814b1a3583`. This moving head is
+  comparison-only; this reality-check does not generalize the earlier
+  link-repair-only diff claim to later commits. The immutable
+  `5f5440bb26a62e2cf3440b92da5a667efa03b267` final tag, dated tree and
+  artifact hashes above remain implementation authority until an
+  explicit re-pin package proves otherwise.
 - OAuth 2.1 draft revisions normatively linked by the dated
   authorization pages:
   - most security clauses:
@@ -395,6 +451,12 @@ draft.
   `0.2.0-alpha.10`
 - Conformance repository:
   <https://github.com/modelcontextprotocol/conformance>
+- Fresh mutable conformance default-branch comparison observed on
+  2026-07-31:
+  `81eb1c3edaed87d7fd585d7b80186da7a2960660`. It is comparison-only;
+  the immutable `49103de6ed70804e940637bf3e9e29e4a3f54e64` launch-day
+  pin remains the reproducible input until CONF-01 performs its explicit
+  reviewed promotion.
 - Pinned auth-scenario artifact SHA-256 values:
   - `src/scenarios/client/auth/enterprise-managed-authorization.ts`:
     `caec7e9a28f6de14678612682115cb5b6f3125d3e233f6a52250435f6a0383c2`;
@@ -694,6 +756,20 @@ connector observability, and private-network tunnel research.
 The first three correspond to official extension or authorization-
 profile work in this plan. The observability control plane and tunnel
 service are product features, not core protocol clauses.
+OPS-01's bounded local snapshot/exporter contract is a framework
+production-readiness requirement and does not implement or claim either
+hosted Claude product feature.
+
+The crates.io sparse-index/API observation made on 2026-07-31 found
+published `fastmcp-rust` and `fastmcp-cli` histories from `0.1.0`
+through `0.3.2`, with `0.3.2` observed as the latest version and dated
+2026-06-18. The `0.4.0` work is therefore an upgrade of an existing
+public crate family, not a first publication; current unpinned install
+instructions resolve to the old protocol implementation until a new
+version is explicitly authorized and published. FND-01 freezes the
+registry observation bytes/digest, and REL-PREP-01/REL-01 revalidate
+registry identity, owner permission, Cargo Registry Web API contract,
+and exact version availability immediately before handoff.
 
 ---
 
@@ -2839,7 +2915,10 @@ types, JSON-RPC envelopes, schema handling, server dispatch, client
 lifecycle, transports, auth, OAuth/OIDC, proxying, Tasks, macros, CLI,
 tests, and CI.
 
-The repository contains approximately 108,000 lines of Rust.
+The repository contains approximately 131,000 lines of Rust code as of
+the 2026-07-31 reality-check pass. One FND-01 integration verifier alone
+is 85,519 physical lines, so raw test volume is no longer a useful proxy
+for reviewability or independent evidence quality.
 
 The test inventory is substantial, but it verifies the existing
 protocol model rather than the target one.
@@ -3135,15 +3214,86 @@ They must never be reachable from a modern transport policy.
 - The Redis Docket backend stores blocking `redis::Connection` values
   behind `std::sync::Mutex`, with no admitted cancel-correct worker/
   connector boundary.
-- Root and CLI manifests retain `ureq`, and CLI startup performs an
-  eager update-check HTTP request outside asupersync's guarded fetch
-  policy with an unbounded `read_to_string`.
-- `rust-toolchain.toml`, every CI job, and release jobs select floating
-  `nightly` rather than the exact audited compiler.
-- The current lock graph's ring edge is an accidental CLI-to-`ureq`
-  TLS consequence. The target graph removes `ureq`; JOSE directly
-  constrains ring when enabled, while the admitted asupersync/rustls
-  TLS graph is audited separately.
+- The earlier direct `ureq` dependency and floating-nightly selections
+  have been removed: the workspace and workflows now name
+  `nightly-2026-07-11`, and no `ureq` manifest edge remains. Those are
+  real foundational improvements, but their FND-01 aggregate remains
+  under implementation and does not prove the modern protocol profile.
+- The JOSE/ring, clean-machine, packaged-consumer, constant-time, and
+  negative-vector evidence recorded by the FND-01 child graph is not
+  yet complete enough to support the aggregate claim.
+
+### 7.21 Verification, operability, and delivery gaps found on 2026-07-31
+
+- `rch exec -- cargo check --workspace --all-targets` succeeds, but the
+  workspace still emits unused-import/dead-code warnings.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
+  fails in `fastmcp-core` before it can qualify the remainder of the
+  workspace.
+- `rch exec -- cargo test --workspace -j 6` fails in the CLI dev-mode
+  end-to-end suite: the hot-reload fixture observes an internal build
+  failure and times out waiting for the child-server start marker.
+- The default test run stops at that failure, so the present suite is
+  not a green workspace qualification run.
+- A later serialized non-CLI RCH sweep also fails two
+  `fastmcp-rust::testing::trace` serde round-trip tests because an
+  arbitrary-precision JSON number serializes as a map where the trace
+  model expects `f64`; this is independent evidence that the facade
+  test surface is not clean.
+- The public testing module is coupled to legacy lifecycle/result
+  shapes and cannot yet serve as a truthful downstream modern-protocol
+  toolkit.
+- There is no bounded, privacy-reviewed liveness/readiness/metrics
+  contract spanning stdio, HTTP, subscriptions, auth, caches, proxying,
+  or durable Tasks.
+- There is no reproducible performance, saturation, capacity, or soak
+  baseline for the modern core profile.
+- The framework has no packaged, out-of-tree extension-author test that
+  proves a third-party extension cannot bypass admission, limits,
+  authorization, or wire validation.
+- Handler timeout metadata is generated but not applied consistently at
+  dispatch. The effective deadline must be the minimum of ambient,
+  server, protocol/request, and handler budgets, with no zero-value
+  escape from an already tighter deadline.
+- Panic payload rendering can reach peer-facing error text; the protocol
+  boundary needs a fixed sanitized error while retaining bounded local
+  diagnostics.
+- The HTTP server constructs or uses defaults that bypass configured
+  handler policy on part of the path, and the CLI can collapse failures
+  into successful-looking/default output.
+- The 85,519-line FND verifier is a review, compile-time, mutation-test,
+  and package-size concentration risk. Its normative evidence corpus,
+  parser, independent negative oracles, and integration wiring must be
+  decomposed into reviewable bounded units without weakening the gate.
+
+### 7.22 Tracker and release-control gaps found on 2026-07-31
+
+- The revised formal MCP plan contains 129 packages and 662 package
+  dependencies, but the historical tracker maps only the older 122-
+  package/606-edge revision; none of the 129 has current synchronized
+  completion evidence.
+- Twelve FND-01 children were closed without attached gate receipts,
+  while several child descriptions explicitly defer required clean-
+  machine, packaged-consumer, cryptographic, or target-build evidence.
+- The live FND-01 child graph is missing 24 provenance dependencies that
+  the frozen aggregate design requires.
+- FND-01's only in-progress child has a 1,440-minute estimate, three
+  times the 480-minute claimability ceiling. It requires the staged-
+  aggregate decomposition in Section 11, but no reset/reassignment/
+  decomposition is permitted until its fresh owner checkpoints and
+  hands off.
+- Several other formal packages exceed the same narrow-ownership test;
+  they must become planning aggregates before they can become ready.
+- The registry already contains the old `0.3.2` crate family. Release
+  work is therefore an upgrade transaction, not a first-publication
+  exercise, and current install instructions resolve to the old
+  protocol implementation until a separately authorized release lands.
+- The existing release workflow can reach publishing without depending
+  on the planned sealed authorization artifact. It must be quarantined
+  at both source and provider state before ordinary repository work can
+  accidentally treat a tag/manual dispatch as release authorization.
+  Main-branch edits cannot disable historical-ref YAML or disposition a
+  pre-quarantine queued/in-progress run.
 
 ---
 
@@ -3185,6 +3335,11 @@ They must never be reachable from a modern transport policy.
 | Icons | Required source, arrays, theme | Partial single icon | Correct models |
 | Content | Final variants/annotations | Partial | Correct models |
 | Completion | Core method | Absent | Implement |
+| Operator health | Bounded liveness/readiness and privacy-safe telemetry | Ad hoc logs only | Define one operational contract |
+| Public test support | Production-faithful downstream harness | Legacy-shaped helpers | Rebuild and package |
+| External extensions | Capability-safe out-of-tree authoring | Internal registries only | Publish sealed authoring contract |
+| Performance | Evidence-scoped latency/capacity/soak budgets | No modern baseline | Add reproducible qualification |
+| Publication | Authorized resumable artifact transaction | Tag/manual workflow can publish directly | Separate preparation from execution |
 
 ---
 
@@ -3797,6 +3952,63 @@ Schema-derived header validation consumes the resulting
 `AuthorizedOperation`; it cannot independently look up a private tool
 or reconstruct an authorization decision.
 
+### ADR-018: operator telemetry is a separate bounded contract
+
+Decision:
+
+Protocol logging, application logs, release evidence, and operator
+health/metrics are separate surfaces. A typed snapshot service owns a
+small fixed-cardinality vocabulary for liveness, readiness, saturation,
+queue pressure, cancellation, rejection, and dependency health.
+
+Raw credentials, request bodies, untrusted names, task or continuation
+handles, and tenant/principal identifiers never become metric labels or
+health payloads. Exporters are replaceable renderers and cannot acquire
+new protocol, authorization, or state authority.
+
+### ADR-019: public test helpers use production semantics
+
+Decision:
+
+The facade's testing toolkit composes production protocol admission,
+router, transport, clock, entropy, and cancellation interfaces. It may
+provide deterministic fakes for capabilities explicitly injected by an
+application, but it may not maintain a second permissive protocol stack
+or silently initialize a legacy session.
+
+### ADR-020: external extensions cross one capability boundary
+
+Decision:
+
+Out-of-tree extension authors register typed descriptors and handlers
+through a sealed public API. The framework retains ownership of raw
+wire admission, namespaces, directionality, limits, authorization,
+result discrimination, subscriptions, cancellation, and transport
+projection. No extension receives private ingress constructors or an
+escape hatch for emitting unchecked JSON-RPC.
+
+### ADR-021: performance claims are evidence-scoped
+
+Decision:
+
+Functional conformance does not imply performance. Every latency,
+throughput, memory, queue, startup, or recovery claim names the sealed
+source/profile identity, workload, limits, hardware class, compiler,
+sample method, warmup, duration, variance, and pass threshold. A
+regression budget can block a release only when its environment and
+measurement noise are controlled and its artifact is reproducible.
+
+### ADR-022: publication is an irreversible resumable transaction
+
+Decision:
+
+REL-01 prepares and seals a release authorization manifest but never
+publishes. REL-02, and only REL-02, may consume a separate explicit user
+authorization to submit that exact crate family and associated release
+artifacts. Every external side effect is receipt-bearing and idempotent;
+partial publication resumes only for the same immutable identity and
+there is no fictitious rollback of a registry version.
+
 ---
 
 ## 10. Target component model
@@ -3876,6 +4088,7 @@ Transport response
 - MRTR state-codec traits;
 - extension-neutral outcome primitives;
 - application-state handle traits;
+- bounded operator-snapshot value types and privacy-safe health state;
 - no wire-specific serde contract.
 
 #### `fastmcp-protocol`
@@ -3932,6 +4145,7 @@ Transport response
 - proxy/gateway;
 - `ServerExtensionRegistry` for handlers, authorization, and catalog
   contributions;
+- readiness contributors and bounded operator-snapshot aggregation;
 - optional legacy adapter host.
 
 #### `fastmcp-client`
@@ -3950,6 +4164,8 @@ Transport response
 - task client.
 - `ClientExtensionRegistry` for result/notification dispatch,
   fallbacks, and input resolvers.
+- bounded dependency-health and saturation observations without
+  credential or peer-identity disclosure.
 
 #### `fastmcp-macros`
 
@@ -3977,6 +4193,8 @@ Transport response
 - optional modern task commands;
 - auth setup diagnostics;
 - explicit error reporting.
+- liveness/readiness/diagnostic rendering that consumes the typed
+  operator snapshot without redefining its semantics.
 
 #### `fastmcp-rust`
 
@@ -3984,7 +4202,8 @@ Transport response
 - deliberate legacy module;
 - extension modules;
 - builder exports;
-- testing utilities.
+- sealed out-of-tree extension authoring exports;
+- production-faithful testing utilities.
 
 ---
 
@@ -3994,8 +4213,11 @@ The remainder of the plan is the execution specification.
 
 The numbered “Phase” headings are thematic workstreams, not a
 topological execution order.
-Only each package's explicit dependency list and the milestone gates
-in Section 24 determine execution order.
+Only each package's explicit dependency list, the milestone gates in
+Section 24, and Section 36's REL-QUAR-00 global preclaim/merge safety
+barrier determine execution order. That barrier is intentionally not
+duplicated as a prerequisite edge on every package and does not alter
+closure inventories.
 
 Each work package contains:
 
@@ -4023,16 +4245,24 @@ An estimate is a positive integer number of minutes in Beads
 split into independently verifiable children.
 
 The following packages are mandatory planning aggregates and may never
-be claimed monolithically: FND-04, FND-08, FND-09, AUTH-00, LIMIT-01,
-HTTP-02, TASK-02, TASKP-01, TASKR-01, AUTHX-01, AUTHX-03, and PXY-02. FND-04 has
-three unresolved upstream runtime/I/O prerequisites. FND-08 and FND-09
-each combine provider custody, cryptography, bounded execution, and
-consumer integration. TASKR-01 spans connector qualification, bounded
-RESP, topology, scripts, durability, ACLs, and destructive fault
+be claimed monolithically: REL-QUAR-00, FND-01, FND-02, FND-04, FND-08, FND-09,
+AUTH-00, LIMIT-01,
+PRT-02, CLT-01, STD-01, HTTP-02, HTTP-03, SCH-01, MRTR-03, AUTH-02,
+AUTH-03, AUTH-04, AUTH-06, TASK-01, TASK-02, TASK-03, TASKP-01,
+TASKR-01, EXT-01, APP-01, APP-02, AUTHX-01, AUTHX-02, AUTHX-03,
+PXY-02, OPS-01, DX-TEST-01, EXT-DEV-01, PERF-01, CI-BASE-01,
+REL-PREP-01, CI-CORE-01, CI-FINAL-CORE-01, REL-01, and REL-02. FND-04
+has three unresolved upstream runtime/I/O prerequisites. FND-08 and
+FND-09 each combine provider custody, cryptography, bounded execution,
+and consumer integration. TASKR-01 spans connector qualification,
+bounded RESP, topology, scripts, durability, ACLs, and destructive fault
 evidence. AUTHX-01 and AUTHX-03 each cross protocol, provider, trust,
-store, and integration surfaces. The remaining aggregates likewise
-combine unusually broad implementation, test, state, or security
-surfaces. Their parent closes only after their implementation children,
+store, and integration surfaces. The additional packages were promoted
+to mandatory aggregates by the 2026-07-31 ownership-card review: each
+crosses enough implementation, security, transport, packaging,
+operability, or independent-evidence surfaces that a truthful estimate
+cannot fit inside one 480-minute claim. Their parent closes only after
+their implementation children,
 a named integration child, and any declared independent final
 verification child close. Enforce that order in Beads, not only in
 prose: the integration child formally `blocks`-depends on every
@@ -4076,17 +4306,81 @@ Every mandatory or voluntary decomposition uses the same schema:
   to validate the assembled result;
 - hierarchy never substitutes for those dependency edges.
 
+An implementation child that itself exceeds 480 minutes may become a
+`staged-implementation-aggregate` only when the plan records why its
+surface cannot first be partitioned into independent sibling ownership.
+This is a sequencing contract, not permission for concurrent duplicate
+ownership:
+
+- the implementation child remains a direct child of the formal package,
+  keeps `implementation-child`, adds
+  `staged-implementation-aggregate`, has no assignee/estimate, and is no
+  longer directly claimable;
+- it has at least two task children labelled `work-package-stage` and
+  `implementation-stage`, inheriting the package/domain/profile and
+  `wp-parent-*` labels; stable external references are
+  `<PACKAGE>/<implementation-slug>/stage-<NN>-<ascii-slug>`;
+- every stage has one 1-through-480-minute estimate, complete acceptance/
+  test criteria, and an ownership card. Prefer disjoint modules. If an
+  unavoidable file overlaps another stage, only the currently ready
+  stage may reserve it, the stages form one strict `blocks` chain, and a
+  byte-digested checkpoint plus explicit Agent Mail handoff is required
+  before the next claim;
+- stage N `blocks`-depends on stage N-1 and on its real external
+  prerequisites. The implementation aggregate `blocks`-depends only on
+  the terminal stage. The formal package's integration child depends on
+  this implementation aggregate, not simultaneously on its stages;
+- no two stages may be in progress together. An overlap outside one
+  declared sequential stage chain, a missing/gapped handoff, a stage
+  that weakens the parent's criteria, or use of hierarchy as a
+  dependency is rejected;
+- once a stage extracts genuine modules, later stage ownership names the
+  new exact module paths. The original monolith cannot remain the
+  permanent integration point merely to evade reviewable ownership.
+
+FND-01's current verifier-authoring child requires this exception: its
+85,519-line integration verifier and exact shared policy/evidence inputs
+cannot honestly fit a 1,440-minute direct claim. Before rematerializing
+it, the current owner must checkpoint and hand back the fresh claim.
+Then split it into sequential, independently testable parser/corpus,
+acquisition/supply-authority, handoff/control-ledger, and mutation/
+integration/freeze stages, extracting reviewable modules and updating
+the declared author-marker module set. Do not reset or relabel the live
+claim, invent concurrent sibling ownership, or split the Bead without
+first applying this contract.
+
 The tracker checker rejects a decomposed package with a missing,
 duplicate, wrongly parented, wrongly labelled, or dependency-bypassing
 child. A voluntarily decomposed package is no longer directly
 claimable and follows the same implementation-to-integration-to-
-optional-verification-to-aggregate closure chain as the twelve
+optional-verification-to-aggregate closure chain as the listed
 mandatory aggregates. The checker also rejects more than one
 verification child, a verification child without an integration child,
 a missing integration-to-verification edge, or an aggregate that
 targets both children instead of its one terminal child. It also
 rejects a verification child that writes an input/receipt or reuses
 the integration producer identity.
+
+REL-QUAR-00 is an authority-separated mandatory aggregate even on its
+emergency path. Its decomposition contains distinct implementation
+children for (1) source workflow quarantine and reachability checks,
+(2) provider workflow-ID disablement plus ambient-token removal/rotation,
+and (3) queued/in-progress historical-run inventory and separately
+authorized disposition; one integration child binds their immutable
+digests and actor/timestamp/provider read-backs into the quarantine
+receipt; one different-actor read-only verification child attests the
+combined postcondition. Source authors receive no provider credential,
+provider operators do not edit source, run-disposition authority is
+limited to the exact enumerated runs, and the verifier performs no
+repair. Any child exceeding 480 minutes uses the staged-implementation
+schema above. Because Section 36.1 permits this safety work before
+tracker repair, the emergency receipt must record these stable child
+external references, owners/actors, exact scope, commands, evidence
+digests, authorization text, and handoffs at execution time. Once the
+tracker is safely reconciled, `br` materialization projects those
+records into the same checker-valid child/dependency chain before the
+aggregate can close; urgency never turns it into a direct monolithic
+claim or fabricates a retroactive shared owner.
 
 More than twelve implementation bullets, more than eight test groups,
 or ownership across three or more crates is a mandatory decomposition
@@ -4193,6 +4487,13 @@ Implementation:
   that the cross-SDK matrix contains exactly every Tier-1-at-freeze
   SDK, with lower-tier exclusions and any later tier drift reported
   explicitly.
+- Freeze the 2026-07-31 crates.io sparse-index/API observations for
+  `fastmcp-rust` and `fastmcp-cli`, including every `0.1.0` through
+  `0.3.2` entry, latest-version/date fields, index/config endpoint
+  identity, response bytes, and digest. Freeze the official Cargo
+  Registry Web API publish/reference pages used by REL-PREP-01 with
+  retrieval date and content digest; never infer first-publication or
+  exact-upload behavior from package absence/search UI alone.
 - Freeze the exact immutable source set in the package evidence:
   core `5f5440bb26a62e2cf3440b92da5a667efa03b267`,
   conformance `49103de6ed70804e940637bf3e9e29e4a3f54e64`,
@@ -4568,6 +4869,131 @@ Dependencies:
 
 - None.
 
+### REL-QUAR-00 — Quarantine ambient release mutation
+
+Outcome:
+
+Make the checked-in release workflow default-inert before any further
+implementation so that a tag, manual dispatch, rerun, token, ref shape,
+or new workflow invocation cannot publish crates, create a public GitHub
+release, upload public assets, create or move tags, or otherwise mutate
+an external release surface. A pre-quarantine queued or in-progress run
+is not neutralized by source changes; it remains an unresolved manual
+stop-the-line item requiring provider-side review under separate
+authority.
+
+Reason:
+
+The audited workflow currently grants write permission, creates a public
+GitHub release from tag or dispatch input, exposes the crates.io token,
+and blindly retries `cargo publish` up to twelve times. That is live
+ambient publication authority before the evidence, transaction,
+authorization, and reconciliation design in this plan exists. Because
+CI-BASE-01 depends on the foundational packages, making quarantine wait
+for CI-BASE-01 would leave the repository dangerous throughout early
+implementation. This package is therefore an intentional second seed
+with a narrow safety-only scope and no authority to publish.
+
+Implementation:
+
+- Replace `.github/workflows/release.yml` with a verification/staging-
+  only quarantine workflow. Remove production-mutating jobs, actions,
+  API calls, release creation, tag mutation, public asset upload, and
+  every `cargo publish` or registry-upload loop rather than hiding them
+  behind an expression that could later evaluate true.
+- Under separate, exact human authorization, disable the existing
+  `release.yml` workflow by its immutable GitHub workflow ID before the
+  source quarantine is treated as effective, and remove/rotate the
+  repository/organization crates.io token so historical YAML cannot use
+  it. Record the provider response, workflow ID/state, credential
+  inventory, actor, timestamp, and postcondition. Source edits alone do
+  not neutralize a tag pointed at an old commit or a historical-ref
+  dispatch whose old YAML still requests `contents: write`.
+- Remove `push.tags` as a release trigger. If a manual quarantine
+  diagnostic remains, give it no release/tag/version input and no path
+  from user-controlled input to a shell command, ref, environment,
+  action argument, or credential selection.
+- Set workflow and every job to the minimum read-only permissions;
+  reject `contents: write`, `packages: write`, `id-token: write`, and
+  every other mutation-capable permission. Do not reference repository,
+  organization, environment, or registry secrets. Do not declare a
+  crates.io token or production environment.
+- Permit only deterministic checkout-free policy diagnostics or pinned
+  read-only checkout plus build/package verification. Any produced
+  artifact remains a private, expiring GitHub Actions diagnostic and is
+  explicitly not a release asset, registry body, signature, provenance
+  publication, or publication candidate.
+- Add a checked-in event/job/permission/action matrix and a reachability
+  checker that starts from tag push, branch push, pull request, manual
+  dispatch, workflow rerun, reusable-workflow invocation, environment
+  approval, fork context, token presence, adversarial ref/input, and
+  historical queued-run assumptions. Every path must end in zero
+  external mutation and zero secret access.
+- Treat old queued or in-progress runs as an operational stop-the-line
+  condition requiring a human GitHub Actions review; a source edit
+  cannot revoke credentials already materialized into a historical run.
+  This package grants no authority to cancel, delete, rerun, or signal
+  such a run.
+- Preserve this quarantine while REL-PREP-01 checks in the reviewed
+  coordinator entry point at a new workflow path and therefore a new
+  GitHub workflow identity absent from old refs. That new identity stays
+  provider-disabled, has no tag/branch trigger or ambient credential, and
+  is sealed into the candidate before CI-FINAL-CORE-01. Never re-enable
+  the historical `release.yml` workflow ID. CI-BASE-01 may strengthen
+  verification but cannot reintroduce a mutation path. REL-PREP-01 and
+  REL-01 remain incapable of lifting quarantine; only REL-02's exact
+  authorization grant may temporarily enable/provision the new protected
+  identity, transaction, and in-flight barrier to reach a production
+  provider, followed by verified disablement/credential revocation.
+
+Acceptance:
+
+- Static workflow analysis finds no event-to-secret, event-to-write-
+  permission, event-to-release, event-to-registry, event-to-tag, or
+  event-to-public-asset path.
+- Provider evidence proves the historical `release.yml` workflow ID is
+  disabled and the ambient crates.io token is absent/rotated. Until both
+  facts are verified, this package reports the repository externally
+  unsafe and cannot close even if the current source workflow is inert.
+- A tag push, branch push, pull request, manual dispatch, rerun, fork,
+  adversarial input/ref, present token, and absent token all have the
+  same externally inert result for every run created from the
+  quarantined workflow definition.
+- Every pre-quarantine queued or in-progress run is enumerated and
+  reported as unresolved until a separately authorized provider-side
+  cancellation/credential review supplies evidence; the workflow source
+  change never marks it safe by inference.
+- No workflow job can infer publication authority from a version-like
+  tag, main-branch ref, dispatch actor, repository owner, token presence,
+  prior successful run, or already-published-version response.
+- CI-BASE-01 consumes and continuously verifies this quarantine, and no
+  later package can weaken it before REL-02.
+
+Tests:
+
+- YAML parse and action-SHA pin checks.
+- Exhaustive trigger, input, ref, permission, secret, environment, job-
+  dependency, reusable-workflow, and action/shell call-graph matrix.
+- Historical-ref tests target old commits/tags and prove the disabled
+  workflow ID cannot start; credential tests prove old YAML has no live
+  crates.io token even if provider state is accidentally queried. These
+  tests are read-only unless a separately authorized provider fixture is
+  explicitly supplied.
+- Mutation tests reintroducing tag triggers, write permissions, secret
+  references, `cargo publish`, GitHub release/tag/asset APIs, registry
+  upload, public provenance/signature upload, permissive reusable calls,
+  or a conditionally reachable production job; each must fail.
+- Deliberate tag, dispatch, rerun, pull-request, fork, malformed input,
+  and token-present dry executions against a non-production fixture prove
+  zero outbound mutation attempts and zero credential reads.
+- Historical-run inventory test reports any queued/in-progress run from
+  a pre-quarantine workflow as blocking manual evidence rather than
+  claiming the source change neutralized it.
+
+Dependencies:
+
+- None.
+
 ### FND-02 — Build normative traceability
 
 Outcome:
@@ -4606,11 +5032,113 @@ Implementation:
   `--reservations-json <path|->`; the execution layer obtains that
   snapshot from Agent Mail rather than giving the checker network or
   mutation authority.
+- Implement that command as one non-publishable workspace package at
+  `tools/xtask` named `fastmcp-xtask`, with `publish = false`, an
+  explicit binary target, `src/main.rs`, and bounded modules under
+  `src/plan_tracker/`. Add the workspace member and a checked-in
+  `.cargo/config.toml` alias
+  `xtask = "run --locked --quiet -p fastmcp-xtask --"`; do not rely on
+  an ambient `cargo-xtask` executable or `PATH`. The tool may depend on
+  exact workspace serialization/error crates needed for offline parsing
+  but never on a publishable FastMCP facade/server/client crate, a
+  network client, Agent Mail, `br`, `bv`, GitHub, or a production
+  feature. Keep it out of package/publish inventories and prove the
+  alias and the equivalent
+  `cargo run --locked --quiet -p fastmcp-xtask -- ...` invocation are
+  identical in CI and a packaged-source checkout.
+- Put `#![forbid(unsafe_code)]` at the `fastmcp-xtask` crate root. Raise
+  the root workspace lint to `unsafe_code = "forbid"`, require every
+  current and future workspace member to inherit the workspace lint
+  policy, and make the checker reject a member whose manifest or crate
+  root weakens, omits, or conditionally bypasses that policy. This is a
+  repository invariant, not a warning-only release check.
 - Have the checker parse this plan and the Beads database and validate
   canonical package/label mapping, formal dependency parity, child
   parent/role/closure chains, estimates, ownership-card values, exact
   active reservations, profile projection, canonical package
   fingerprints, and graph/corpus snapshots.
+- Have the same parsed graph generate and compare
+  `CoreImplementationInventory`, `CoreReleaseCandidateInventory`,
+  `CoreReleaseProfileInventory`, and every canonical optional-profile
+  closure. Reject hand-authored counts, endpoint drift, a delta-only
+  label where a full closure is required, or a Beads `profile-*` label
+  whose membership differs from the generated full closure.
+- Parse Markdown with an explicit bounded fence-aware state machine, not
+  a package-heading regex over raw lines. The canonical region begins at
+  the first outside-fence exact `### FND-01 —` heading and ends immediately
+  before the outside-fence `## 24. Dependency graph and critical path`
+  heading. Recognize CommonMark backtick/tilde fences only at zero through
+  three spaces of indentation, remember fence character and opening run
+  length, and close only on the same character with at least that length.
+  Package headings and the final `Dependencies:` heading/bullets are
+  recognized only outside fences; a heading-like example, quoted line,
+  list item, or shorter/mismatched fence is ordinary package text.
+- Define canonical package bytes by converting CRLF to LF, rejecting bare
+  CR, BOM, NUL, invalid UTF-8, tabs in structural headings, and over-limit
+  input, stripping trailing space/tab from each line, removing outer blank
+  lines, and appending exactly one LF. Require exactly one outside-fence
+  dependency section at the end of each package, canonical ASCII package
+  IDs, no duplicate package/dependency, no unresolved/self edge, and no
+  nonblank package-owned text after the final dependency bullet. Between
+  packages, permit only blank lines, horizontal separators, and outside-
+  fence structural phase headings whose level is one or two; these are
+  interstitial region syntax, are excluded from both neighboring package
+  bodies, and cannot contain normative package requirements. Reject any
+  other interstitial prose or heading so that a requirement cannot fall
+  silently outside the canonical corpus.
+- Define the exact structural grammar. A package ID is 1–64 ASCII bytes
+  matching `[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*`; lowercase, underscore,
+  leading digit/hyphen, doubled/trailing hyphen, whitespace, control, and
+  non-ASCII forms are invalid. A package heading begins in column zero
+  and is exactly `### <PACKAGE-ID> — <TITLE>` with one ASCII space around
+  the literal U+2014 em dash, no tab or trailing whitespace, and a
+  nonempty 1–512-byte valid-UTF-8 title containing no control/newline.
+  `Dependencies:` also begins in column zero, has no trailing bytes, and
+  is followed by exactly one blank line. Its list is either the single
+  exact column-zero bullet `- None.` for zero edges or one or more exact
+  column-zero bullets `- <PACKAGE-ID>.`; never mix the sentinel and IDs.
+  A bullet uses one ASCII space, one terminal period, and no indentation,
+  comment, suffix, or trailing whitespace. Dependency order remains
+  physical plan order but fingerprints sort graph edges independently.
+- Replace delimiter-ambiguous fingerprints with versioned domain-separated
+  binary records. Graph bytes start with ASCII `FMCPGRF\0`, big-endian
+  `u16` version `2`, bounded `u32` node count, sorted nodes encoded as
+  `u16 id_len || id`, bounded `u32` edge count, then sorted edges encoded
+  as `u16 dependent_len || dependent || u16 prerequisite_len ||
+  prerequisite`. Sort IDs by unsigned ASCII-byte lexicographic order and
+  edges by the tuple `(dependent, prerequisite)` using that same
+  comparator; never use locale, Unicode collation, case folding, or
+  numeric/natural sorting. Corpus bytes start with ASCII `FMCPCOR\0`, big-endian
+  `u16` version `2`, bounded `u32` package count, then physical-order
+  records `u16 id_len || id || u64 body_len || canonical_body`.
+- Define every graph/corpus fingerprint as the full 32-byte SHA-256 of
+  the complete v2 byte stream exactly once. Internal Rust APIs carry
+  `[u8; 32]`; machine JSON and prose snapshots carry only the required
+  64-character lowercase hexadecimal rendering with no `0x`,
+  whitespace, or newline. The checker package may own an exact tool-only
+  `sha2 =0.10.9` edge and must cross-check known answers against
+  FND-01's bounded core primitive without depending on the publishable
+  core crate. Reject truncation, uppercase, alternate algorithm,
+  double-hash, prefix/suffix, or hashing a textual hex rendering.
+- Set hard parser limits before allocation: plan bytes at most 64 MiB,
+  4,096 packages, 65,536 dependency edges, package ID at most 64 ASCII
+  bytes, and one canonical package body at most 2 MiB. Use checked
+  arithmetic and exact-consumption decode. Reject overflow, truncation,
+  trailing bytes, zero/over-limit lengths, unsorted/duplicate records,
+  count mismatch, ambiguous fence EOF, and a canonical re-encode that is
+  not byte-identical.
+- Implement independent encoder and decoder/oracle modules and compare
+  them against a second simple test-only implementation. Mutate every
+  header/version/count/length/order/fence/heading/dependency boundary and
+  prove no malformed record or Markdown ambiguity can preserve a trusted
+  graph/corpus digest.
+- Keep the checker reviewable. Split plan parsing/canonical encoding,
+  Beads projection, ownership/reservation validation, profile closure,
+  mutation fixtures, CLI/reporting, and end-to-end snapshot integration
+  into bounded modules with their own tests and ownership. FND-02 must not
+  append another monolithic verifier to the existing 85,519-line FND-01
+  integration test; the staged FND-01 remediation extracts its own
+  parser/corpus/oracle/integration units before FND-01 closes.
 - Define the reservation snapshot schema as exact project key,
   registered agent identity, generation time, lease IDs, normalized
   paths, exclusivity, reason/issue ID, lease/renewal history, and lease
@@ -4639,9 +5167,17 @@ Acceptance:
 - The tracker checker detects every deliberately injected mismatch in
   package text, edge direction, labels, child role/parent/closure,
   estimate, ownership card, reservation, profile, and fingerprint.
+- Package extraction is fence-aware and the graph/corpus v2 streams are
+  bounded, unambiguous, domain-separated, exactly decodable, and stable
+  across the documented line-ending normalization only.
+- No single checker/verifier source becomes an unreviewable substitute
+  for independent modules, negative oracles, and end-to-end evidence.
 - Before the checker exists, the manual bootstrap permits only
-  FND-01's validated lineage and then FND-02's validated lineage, in
-  that order. A lineage is either its directly claimable formal issue
+  REL-QUAR-00 emergency closure under Section 36.1; after that closure
+  is independently verified, FND-01's validated lineage; and then
+  FND-02's validated lineage, in that order. REL-QUAR-00 is the
+  independent safety barrier, not an implementation lineage, and is not
+  presently satisfied merely because this plan names it. A lineage is either its directly claimable formal issue
   or, if the package exceeds the ownership/480-minute boundary, its
   manually validated implementation-child → integration-child →
   aggregate chain under the exact Section 11 schema. Use the frozen
@@ -4662,6 +5198,34 @@ Tests:
   fixture exporter.
 - Proof that the checker leaves the plan, Beads database, Agent Mail
   reservations, worktree, and Git index byte-for-byte unchanged.
+- Fence corpus covering backtick/tilde lengths, indentation 0–4,
+  mismatched/shorter closers, embedded package/dependency headings,
+  unclosed fences, block quotes, lists, and CRLF/bare-CR/BOM/NUL cases.
+- Package-ID, exact H3/em-dash/title, dependency-heading/blank-line,
+  `None` sentinel, bullet indentation/spacing/period/comment, and every
+  0/1/64/65-byte or invalid-character boundary mutation.
+- Graph/corpus v2 encode/decode known answers plus every truncated byte
+  boundary, endian/count/length overflow, extra trailing byte,
+  reorder/duplicate/unresolved/self edge, body substitution, domain-
+  swap, version-swap, and independent-oracle differential mutation.
+- Full-digest known answers plus truncated/uppercase/prefixed/suffixed/
+  double-hashed/text-hex/alternate-algorithm substitution tests.
+- Ordering vectors containing `A-2`, `A-10`, `AA`, prefix IDs, and
+  reversed dependent/prerequisite tuples prove exact unsigned-byte tuple
+  ordering and reject locale/natural-sort substitution.
+- Source-size/module-inventory and mutation-kill gates proving the
+  checker is decomposed and every parser/oracle/integration module is
+  exercised independently.
+- Workspace-member, `publish = false`, Cargo-alias resolution, ambient-
+  binary shadowing, dependency-isolation, equivalent-invocation, and
+  packaged-source-checkout tests for `fastmcp-xtask`.
+- Workspace-policy mutation tests remove or weaken
+  `#![forbid(unsafe_code)]`, workspace lint inheritance, and the root
+  `unsafe_code = "forbid"`; every mutation must fail before a package is
+  claimable.
+- Inventory-generation mutation tests for every core and optional
+  endpoint, candidate-versus-published boundary, full-closure label,
+  count, and omitted/extra member.
 
 Dependencies:
 
@@ -4974,14 +5538,14 @@ Tests:
   external-epoch positive scenario evidence; never pretend a PID check
   detects a same-PID memory clone.
 
-Dependencies:
-
-- FND-02.
-
 Tracker mapping:
 
 - FND-04 is the plan identity for existing Beads issue `bd-63l5`.
 - Update and reuse that issue; do not create a second FND-04 issue.
+
+Dependencies:
+
+- FND-02.
 
 ### FND-05 — Prove HTTP, TLS, DNS, and streaming feasibility
 
@@ -8025,6 +8589,11 @@ Implementation:
 - Add HTTP status mapping separately from JSON-RPC code mapping.
 - Map `MissingRequiredClientCapabilityError` exactly to HTTP 400 plus
   JSON-RPC `-32021`.
+- Define one canonical peer-facing internal-failure constructor with a
+  fixed code/message and no arbitrary source/panic text. Accept only
+  bounded typed public error data explicitly owned by another package;
+  incident IDs, backtraces, Rust type names, panic payloads, and error
+  chains remain local and cannot be flattened into `Error.data`.
 - Provide version-aware parsing for the legacy adapter.
 
 Acceptance:
@@ -8042,6 +8611,8 @@ Acceptance:
   Invalid Params behavior.
 - Legacy clients may still recognize their historic missing-resource
   code inside the legacy decoder.
+- A handler/middleware/extension panic or opaque internal error can map
+  only to the canonical sanitized peer shape, never its payload.
 
 Tests:
 
@@ -8078,6 +8649,9 @@ Tests:
 - HTTP status plus JSON-RPC body tests.
 - Exact HTTP 400/`-32021` goldens for generic capability-gated,
   MRTR, Tasks, and registered-extension requests.
+- Canonical internal-error goldens plus payload/backtrace/type-name/
+  incident-ID/error-chain substitution negatives and exact absence of
+  those values from JSON-RPC, HTTP, and SSE bytes.
 
 Dependencies:
 
@@ -9346,6 +9920,19 @@ Implementation:
 - Update middleware response types.
 - Update all built-in providers.
 - Break and migrate old handler signatures directly.
+- Make handler-level timeout metadata an enforced dispatch contract.
+  Compute one absolute effective deadline as the minimum of the ambient
+  `Cx`/request budget, server policy, protocol/request ceiling, and
+  handler declaration. Absent or zero/unlimited values may omit one
+  additional ceiling but can never relax an already tighter deadline;
+  retry, progress, middleware, or clock conversion cannot reset it.
+- Catch panics only at the narrow handler/extension boundary needed to
+  preserve process/stream integrity. Emit one fixed sanitized peer error
+  and terminal outcome; never render the panic payload or arbitrary error
+  chain into JSON-RPC, SSE, HTTP reason text, CLI stdout, or untrusted
+  terminal markup. Retain only a bounded local incident ID/class and a
+  fixed redaction-safe diagnostic; OPS-01 later consumes that typed class
+  without observing the payload.
 
 Acceptance:
 
@@ -9355,6 +9942,11 @@ Acceptance:
 - Resource and prompt handlers can request MRTR input.
 - Middleware can inspect the discriminator without re-parsing JSON.
 - Invalid result combinations cannot be built safely.
+- Macro/manual handler timeouts are actually enforced and the effective
+  deadline is never later than any contributing deadline.
+- A panic yields exactly one sanitized terminal outcome, cancels owned
+  child work, commits no later notification/result, and exposes no panic
+  payload to the peer.
 
 Tests:
 
@@ -9363,6 +9955,15 @@ Tests:
 - Tool error versus JSON-RPC error tests.
 - Input-required conversion tests.
 - Extension result conversion tests.
+- Ambient/server/protocol/handler deadline Cartesian matrix, including
+  zero/absent, equal, already-expired, overflow, middleware delay,
+  multi-round retry, and exact earliest-deadline enforcement.
+- Macro-generated versus manual timeout parity and a regression test that
+  fails if trait timeout metadata is never read by dispatch.
+- Panic canaries containing bearer tokens, ANSI/OSC/Rich/bidi/newlines,
+  huge strings, non-string payloads, and panicking `Display`; assert one
+  fixed peer error, bounded redacted local incident, no post-terminal
+  bytes, and clean child cancellation on stdio and HTTP SSE.
 
 Dependencies:
 
@@ -10203,6 +10804,13 @@ Implementation:
 - Define request-scoped SSE response.
 - Define subscription response.
 - Tie each stream to a request child scope.
+- Accept one immutable `BoundHttpService` at listener construction,
+  containing the exact request callback/router identity, handler and
+  middleware policy, limits, auth hooks, operator routes, protocol
+  policy, and configuration generation selected by the builder. Every
+  accepted connection and per-request child borrows this binding; the
+  transport has no constructor or fallback that synthesizes a default
+  handler/configuration after bind.
 - Let every long-lived response retain AUTH-00's applicable purpose-
   typed `LongLivedAuthorizationGuard` inside transport-owned stream
   state and expose a revalidation gate for HTTP-06. Auth-dependent work
@@ -10248,6 +10856,10 @@ Acceptance:
   revocation, grant loss, or maximum revalidation staleness; proven-
   public streaming cannot outlive its exact public-visibility proof or
   captured generations.
+- Nondefault router/handler/middleware/auth/limit/operator configuration
+  is identical across every connection and request in one binding; a
+  reload creates a new generation without mixing old and new fields
+  inside an admitted request.
 
 Tests:
 
@@ -10270,6 +10882,9 @@ Tests:
 - Bounded graceful drain.
 - Protected-stream lease expiry, revocation, grant loss, provider
   outage on both sides of maximum staleness, and lease-drop teardown.
+- Multi-connection sentinel-policy tests for every `BoundHttpService`
+  field, default-reconstruction compile/behavior negatives, concurrent
+  old/new generation acceptance, and exact per-request binding capture.
 
 Dependencies:
 
@@ -12105,6 +12720,10 @@ Implementation:
 - Reject a retry whose signed counters regress, exceed the original
   snapshot, or request looser limits than current hard ceilings.
 - Propagate cancellation through all rounds.
+- Contribute bounded round, resolver, retry, rejection, timeout, and
+  cancellation-class observations to OPS-01. Never expose input keys,
+  schemas, request state, principal identity, or logical-request IDs as
+  labels or health payloads.
 
 Acceptance:
 
@@ -12185,12 +12804,15 @@ Tests:
 - Cross-retry counter-reset, deadline-reset, and limit-snapshot
   tampering tests.
 - Cancellation between rounds.
+- OPS-01 fixed-cardinality round/retry/resolver/terminal observations,
+  queue saturation/recovery, and unique-state/key/principal floods.
 
 Dependencies:
 
 - PRT-04.
 - SRV-04.
 - CLT-01.
+- OPS-01.
 
 ### MRTR-02 — Protect MRTR request state
 
@@ -13170,6 +13792,10 @@ Implementation:
   it never resets an absolute lifetime silently.
 - Exclude progress and request-scoped logs.
 - Let extensions register subscription event variants.
+- Contribute bounded active/capacity, enqueue/delivery/drop, slow-
+  consumer, reconnect, expiry, authorization-loss, and cancellation
+  observations to OPS-01 without subscription IDs, filters, resource
+  URIs, principals, or extension identifiers as dimensions.
 
 Acceptance:
 
@@ -13245,6 +13871,8 @@ Tests:
   teardown tests.
 - Opaque-token introspection, JWT expiry, provider outage on both sides
   of the staleness boundary, cancellation, and lease-drop cleanup.
+- OPS-01 capacity/readiness, slow-consumer/drop/reconnect/expiry/recovery,
+  and unique-ID/filter/URI/principal/extension cardinality tests.
 
 Dependencies:
 
@@ -13254,6 +13882,7 @@ Dependencies:
 - AUTH-00.
 - EXT-01.
 - LIMIT-01.
+- OPS-01.
 
 ### SUB-02 — Bind subscriptions to stdio
 
@@ -14586,6 +15215,166 @@ Dependencies:
 - HTTP-04.
 - LIMIT-01.
 
+### OPS-01 — Define bounded operational telemetry and health semantics
+
+Outcome:
+
+Give operators a privacy-safe, bounded, transport-neutral view of
+whether a FastMCP endpoint is alive, ready, saturated, degraded, or
+failing without turning protocol logging into an observability control
+plane.
+
+Reason:
+
+Conformance proves wire behavior, not whether a deployed server can
+accept useful work. Today the project has logs and console rendering but
+no stable health contract, no fixed-cardinality metric vocabulary, and
+no rule for how auth, dependency, queue, subscription, proxy, or durable
+task failures affect readiness. Ad hoc exporters would leak identities,
+create unbounded labels, and disagree about operational state.
+
+Implementation:
+
+- Define an immutable `OperatorSnapshot` in `fastmcp-core` with a
+  monotonic capture instant, configuration generation, protocol/profile
+  identity, lifecycle state, readiness state, bounded reason codes,
+  saturation flags, and fixed counters/gauges. Do not include wall-clock
+  timestamps unless an exporter explicitly adds them outside the
+  versioned, content-addressed semantic snapshot. The core snapshot does
+  not imply an FND-09 signature.
+- Use a closed readiness algebra such as `Starting`, `Ready`,
+  `Degraded`, `NotReady`, and `Stopping`, plus closed machine-readable
+  reason codes. Free-form peer, provider, route, tool, extension, tenant,
+  principal, task, and request values are not labels or reasons.
+- Define liveness narrowly as process/executor progress and internal
+  snapshot availability. Define readiness as the ability to admit a new
+  request structurally under the configured profile, including required
+  worker-pool existence, listener state, credential/key availability,
+  durable-backend state, upstream conditions, and nonzero configured
+  capacities. A snapshot is an observation, not a reservation: mutable
+  last-slot availability, queue depth, and saturation are reported
+  separately and a stale snapshot never promises a future admission.
+  Document which optional dependency failures degrade only their profile
+  and which failures make the endpoint not ready.
+- When a caller truly needs an immediate-admission assertion, expose a
+  separate optional one-shot `AdmissionProbe` that linearizes at the same
+  admission primitive as a real request and returns either a typed
+  rejection or a bounded permit that actually reserves the applicable
+  slot and byte budget. The permit is single-use, profile/configuration-
+  generation bound, expires under a monotonic deadline, releases on drop
+  or cancellation, carries no protocol or authorization authority, and
+  cannot be serialized or cached. Ordinary health/readiness collection
+  never acquires a permit.
+- Define bounded contributor interfaces and implement the core server
+  ingress, client executor, stdio writer, and HTTP listener/response-
+  stream contributors here. Auth, cache, subscription, proxy, and Tasks
+  packages integrate their own contributors after depending on OPS-01;
+  OPS-01 does not claim their readiness semantics in advance. A
+  contributor publishes only typed deltas through a cancel-correct
+  bounded channel or lock-free snapshot cell; exporters never call back
+  into protocol dispatch.
+- Cover accepted, rejected-by-class, completed-by-terminal-class,
+  cancelled-by-source, panicked-sanitized, deadline-exceeded,
+  queue-full, byte-budget, concurrency-limit, stream-close, cache
+  hit/miss/stale, reconnect, retry, and dropped-observation totals.
+- Keep every dimension closed and low-cardinality: profile, transport,
+  direction, operation family, terminal class, rejection class, and
+  bounded dependency class. Never label by method/tool/resource/prompt
+  name, URL, issuer, client ID, subject, token digest, request ID,
+  progress token, subscription/task/continuation handle, error text, or
+  extension identifier.
+- Use checked or saturating arithmetic with an explicit overflow bit.
+  Bound observation queues by item count and encoded bytes; coalesce
+  gauges and count dropped deltas without blocking or cancelling the
+  request being observed.
+- Capture gauges from one internally consistent generation. A snapshot
+  cannot combine a pre-reload queue value with a post-reload capacity or
+  expose a partially rotated key/configuration set.
+- Make readiness transition monotonic within one generation where the
+  lifecycle requires it: `Stopping` cannot return to `Ready`; a stopped
+  listener cannot be reported ready; drained capacity is not available
+  capacity. Dependency recovery may produce a new snapshot generation
+  and documented transition.
+- Keep MCP per-request logging under OBS-02 and local application logs
+  under the logging facade. Neither may be scraped or parsed to derive
+  normative health state.
+- Provide an exporter-neutral snapshot trait. The console and CLI may
+  render it locally. HTTP health/metrics endpoints, when installed, live
+  outside the MCP method namespace, use separately configured routing
+  and access control, enforce response-size/time budgets, and never
+  inherit a peer's MCP authorization context by accident.
+- Stdio never writes health or metric bytes to protocol stdout. Local
+  human rendering goes to stderr; agent mode emits a documented bounded
+  machine format only on an explicitly selected diagnostic command.
+- Define deterministic behavior when an exporter is slow, absent,
+  panics, or is cancelled: protocol work continues, the exporter is
+  isolated, and a bounded local fault counter/reason records the loss.
+- Bind snapshot schema/version and configured thresholds into release
+  evidence. Unsupported exporter-specific metrics cannot satisfy the
+  core operational gate.
+
+Acceptance:
+
+- A single documented snapshot answers liveness, readiness, saturation,
+  active/bounded capacity, and installed core-dependency degradation for
+  stdio and HTTP without inspecting logs. Optional profiles extend it
+  only through the same bounded contributor contract.
+- No snapshot, metric, health response, or diagnostic contains secrets,
+  peer-controlled text, request payloads, stable tenant/principal
+  identifiers, opaque handles, or unbounded-cardinality labels.
+- Snapshot collection and export cannot block request completion,
+  consume a response slot, write to stdio protocol stdout, or become a
+  new authorization oracle.
+- Structural readiness agrees with the immutable admission preconditions
+  at its capture generation, while saturation/capacity remain explicitly
+  time-varying observations. Only a successfully acquired live
+  `AdmissionProbe` permit asserts one immediate reserved admission; a
+  snapshot alone never makes that assertion.
+- Queue saturation, dropped observations, counter overflow, cancellation,
+  panic sanitation, stream close, and dependency recovery are observable
+  through bounded typed state.
+- Core operation remains correct with every exporter disabled or failed.
+
+Tests:
+
+- Golden snapshots for startup, ready, degraded, saturated, not-ready,
+  draining, and stopped states on stdio and HTTP.
+- Structural-readiness, saturation, and one-shot permit tests at N/N+1
+  core request, byte, executor-queue, stdio-writer, and HTTP-stream
+  limits. Prove the Nth permit reserves real capacity, the N+1 probe is
+  rejected, a snapshot may remain structurally ready while saturated,
+  and expiry/drop/cancellation releases exactly once. Subscription,
+  proxy-route, auth, cache, and task-worker N/N+1 tests live in their
+  consuming packages.
+- Fixed-cardinality enumeration and cardinality-budget tests, including
+  floods of unique method names, issuers, subjects, URLs, extension
+  identifiers, request IDs, task IDs, and error strings.
+- Secret/personal-data canaries across bearer tokens, cookies, headers,
+  request bodies, auth claims, MRTR state, task handles, proxy errors,
+  and nested provider failures. Core uses synthetic canaries; AUTH,
+  MRTR, Tasks, and proxy packages own their live integration matrices.
+- Generation-consistency, reload, key rotation, listener restart,
+  dependency loss/recovery, and stopping monotonicity tests.
+- Counter saturation/overflow, observation-queue overflow, exporter
+  backpressure, exporter panic, cancellation, and no-request-impact
+  tests under deterministic virtual time.
+- Black-box stdio purity tests proving diagnostic activity never writes
+  non-JSON-RPC bytes to stdout. API-01/HTTP-01 own installed health-route
+  access-control and configured-listener integration.
+
+Dependencies:
+
+- FND-04.
+- LIMIT-01.
+- AUTH-00.
+- SRV-01.
+- SRV-04.
+- CLT-01.
+- STD-01.
+- HTTP-02.
+- OBS-01.
+- OBS-02.
+
 ---
 
 ## 18. Phase 6 — Full JSON Schema and caching
@@ -15091,6 +15880,10 @@ Implementation:
   current policy before serving it.
 - Prevent stampede with structured, cancellable ownership.
 - Keep cache stats free of sensitive keys.
+- Publish only OPS-01's fixed hit/miss/stale/fill/invalidation/
+  saturation classes and bounded capacity gauges. Cache keys, methods,
+  resources, principals, token digests, and result metadata never become
+  labels or diagnostic values.
 
 Acceptance:
 
@@ -15133,6 +15926,8 @@ Tests:
   extension revision; a dependency-tree/API test proves the client
   imports only `fastmcp-protocol`/core and has no server edge.
 - Stats redaction.
+- OPS-01 hit/miss/fill/invalidation/saturation/recovery parity plus
+  unique-key/method/resource/principal cardinality and secret canaries.
 
 Dependencies:
 
@@ -15141,6 +15936,7 @@ Dependencies:
 - AUTH-00.
 - SRV-MW-01.
 - LIMIT-01.
+- OPS-01.
 
 ### CACHE-03 — Implement client cache and invalidation
 
@@ -15363,6 +16159,10 @@ Implementation:
   would require its own descriptor and support claim rather than
   silently reusing the HTTP profile.
 - Redact headers, claims, codes, and tokens in all traffic output.
+- Contribute fixed pre-auth/admitted/rejected/provider-degraded/
+  lease-expired/saturated classes and bounded verifier/fetch capacity to
+  OPS-01. Issuers, subjects, clients, tokens, claims, URLs, scopes, and
+  provider error text are forbidden dimensions.
 
 Acceptance:
 
@@ -15410,6 +16210,9 @@ Tests:
   overload response, atomic pre-auth-to-verified charge transition,
   cancellation/late-result discard, and provider contract/startup-
   rejection tests.
+- OPS-01 pre-auth/admitted/provider-degraded/lease/saturation/readiness
+  transitions plus unique issuer/subject/client/token/scope cardinality
+  and secret/error-text canaries.
 
 Dependencies:
 
@@ -15418,6 +16221,7 @@ Dependencies:
 - AUTH-00.
 - FND-04.
 - LIMIT-01.
+- OPS-01.
 
 ### AUTH-02 — Implement Protected Resource Metadata and challenges
 
@@ -18517,6 +19321,11 @@ Implementation:
   remaining set in every later `DetailedTask` snapshot; only the
   transition that satisfies the last key may resume work.
 - Never reuse input keys.
+- Contribute bounded durable queue/worker/lease/recovery/reclaim/
+  authorization-loss/terminal/saturation state to OPS-01. Task IDs,
+  owners, input keys, backend record keys, payloads, and provider errors
+  are never labels; readiness reflects the installed backend/supervisor
+  contract and configured capacity generation.
 
 Acceptance:
 
@@ -18739,6 +19548,9 @@ Tests:
 - Two anonymous clients plus a leaked handle, default create denial,
   get/update/cancel/result denial, and verified stable-owner positive
   cases.
+- OPS-01 durable-capacity/readiness/queue/worker/lease/recovery/reclaim/
+  saturation transitions, plus unique task/owner/key/error cardinality
+  and payload/secret canaries.
 
 Dependencies:
 
@@ -18747,6 +19559,7 @@ Dependencies:
 - AUTH-00.
 - LIMIT-01.
 - FND-08.
+- OPS-01.
 
 ### TASKP-01 — Qualify and implement the baseline local persistent Tasks adapter
 
@@ -24486,6 +25299,11 @@ Implementation:
   independently established. A downstream proof, registration,
   discovery record, prior request, or gateway connection never
   activates the upstream leg.
+- Route an EXT-DEV-01 out-of-tree descriptor only through its public
+  typed codecs, activation contract, authorization requirements, result
+  discriminator, and subscription descriptors. The proxy must not
+  downcast to private built-in types or expose an unchecked JSON
+  passthrough merely because both legs register the same identifier.
 - Apply registered fallback rules per route, not globally.
 - Select a route by stable configured priority after capability,
   authorization, extension, and health eligibility filtering.
@@ -24512,6 +25330,10 @@ Implementation:
 - Handle partial upstream availability deterministically.
 - Freeze upstream alias, priority, and grouping configuration into the
   catalog revision and proxy fingerprint.
+- Contribute bounded route availability, upstream-dependency health,
+  saturation, rejection-class, retry, and failover observations to
+  OPS-01 without using endpoint URLs, self-reported names, extension
+  identifiers, principals, or handles as metric labels.
 
 Acceptance:
 
@@ -24553,6 +25375,13 @@ Tests:
   generation, stale mapped owner, non-lossless representation,
   downstream-receipt reuse, prior-request reuse, and no-upstream-send
   rejection cases.
+- Packaged out-of-tree extension proxy test using only EXT-DEV-01's
+  public facade types on both legs, plus malformed output, one-sided
+  registration, settings/version mismatch, capability-negative,
+  authorization, cancellation, and no-unchecked-passthrough cases.
+- OPS-01 fixed-cardinality proxy contributor tests for route outage,
+  saturation, recovery, failover, and floods of unique endpoints,
+  names, extensions, principals, and handles.
 - Upstream tool-page default/explicit/unsupported dialect, invalid
   schema/reference, page-atomic failure, no partial union/cursor/cache/
   forwarding, and sibling-upstream isolation tests.
@@ -24584,6 +25413,8 @@ Dependencies:
 - EXT-01.
 - FND-04.
 - TOOL-01.
+- OPS-01.
+- EXT-DEV-01.
 
 ### PXY-LEG-01 — Add mixed-era proxy routing
 
@@ -25250,6 +26081,10 @@ Implementation:
 - Support input-required declarations.
 - Accept title, icon arrays, metadata, annotations, and cache policy.
 - Accept `x-mcp-header` property annotations.
+- Parse handler timeout attributes into SRV-04's typed handler deadline
+  declaration and generate the exact trait method dispatch consumes.
+  Zero/absent cannot relax ambient/server/request/hard ceilings; invalid,
+  overflowing, or sub-resolution values are compile errors.
 - Emit full schema through SCH-02.
 - Route every generated path through a documented, `#[doc(hidden)]`
   facade `__private` module that re-exports the exact macro runtime
@@ -25283,6 +26118,9 @@ Tests:
 - Expansion snapshots.
 - Expansion deny check for `block_on`, runtime construction, and
   out-of-band context creation.
+- Timeout expansion snapshots and runtime integration proving the
+  generated trait value is read, participates in the effective-minimum
+  deadline, and cannot disable a tighter caller/server budget.
 - Complete tool/resource/prompt examples.
 - MRTR example.
 - Header annotation errors.
@@ -25375,6 +26213,21 @@ Implementation:
 - Add MRTR resolvers.
 - Add subscription APIs.
 - Add HTTP client/server configuration.
+- Export OPS-01's read-only `OperatorSnapshotHandle`, bounded contributor
+  registration, and exporter installation through the facade. Exporters
+  receive immutable snapshots only; they cannot construct trusted
+  contributors, raw ingress/auth contexts, response writers, or dynamic
+  label keys.
+- Make HTTP liveness/readiness/metrics routes a separate explicit builder
+  installation outside the MCP path and method registry. Bind exact path,
+  methods, origin/network exposure, authentication/access policy,
+  response/time limits, cache policy, and configuration generation before
+  listener start; disabled means no route.
+- Freeze the exact configured router, handler/middleware policy, limits,
+  auth providers, operator routes, and protocol policy into one server-
+  binding value. Every accepted HTTP connection and request stream must
+  borrow that exact binding; no accept/connection path may reconstruct a
+  default handler or silently drop configured policy.
 - Expose injection of FND-04's bounded `BlockingWorkExecutor` and a
   startup capability probe that proves admitted work runs off the
   async executor. Do not infer safety merely from the existence of
@@ -25437,6 +26290,12 @@ Acceptance:
   of allowing schema work to run inline on an executor task.
 - Deprecated-feature API and runtime signals match the pinned registry
   without prematurely removing the final-release wire surface.
+- Operator handles/exporters and separately installed HTTP health routes
+  expose no raw ingress/credential authority and agree with the exact
+  configured server generation.
+- Every connection uses the builder's exact router/handler/auth/limit/
+  operator configuration; changing a nondefault policy changes observed
+  behavior, and no default reconstruction path exists.
 
 Tests:
 
@@ -25456,6 +26315,15 @@ Tests:
   non-inline worker-thread proof.
 - Feature-off builds.
 - Legacy module isolation.
+- Facade-only snapshot/exporter compile/run tests, contributor-forgery and
+  raw-ingress/auth/label-authority compile failures, slow/panicking
+  exporter isolation, and disabled-route absence.
+- Authenticated/unauthenticated HTTP health-route matrix with exact path/
+  method/origin/cache/size/deadline policy and no inheritance from a peer's
+  MCP authorization context.
+- Multi-connection nondefault-router/handler/middleware/auth/limit/
+  operator-policy test that fails if any accept path constructs defaults;
+  concurrent reload generations never mix bindings within a request.
 - Compile-time deprecation-note snapshots and one-per-generation
   runtime-warning tests for every Section 5.22 feature, including
   disabled/no-use silence, redaction, migration/date/event text, and
@@ -25474,6 +26342,236 @@ Dependencies:
 - MRTR-03.
 - SUB-03.
 - CACHE-03.
+- OPS-01.
+
+### EXT-DEV-01 — Ship a safe out-of-tree extension authoring contract
+
+Outcome:
+
+Let downstream crates implement explicitly enabled MCP extensions
+without importing private workspace crates or bypassing FastMCP's
+admission, authorization, limits, lifecycle, and wire invariants.
+
+Reason:
+
+EXT-01 defines the framework's internal extension model, but a framework
+that claims extensibility needs a supported external authoring surface
+for separately packaged Rust crates linked at compile time. This package
+does not define dynamic loading or a stable dynamic-library/plugin ABI.
+Exposing internal registries or raw JSON-RPC would make third-party code
+an authority escalation path and would couple consumers to private crate
+layout.
+
+Implementation:
+
+- Export the minimum authoring API from the facade under a deliberate
+  `extension` module: validated identifier/settings schema builders,
+  typed descriptor builders, request/notification/result codecs,
+  direction and activation declarations, authorization requirements,
+  subscription-event descriptors, and async `&Cx`-first handler traits.
+- Keep descriptor construction sealed until every field has passed the
+  same namespace, duplicate, size, schema, direction, method-collision,
+  result-discriminator, header-projection, and capability checks used by
+  built-in extensions. There is no unchecked/public struct-literal path.
+- Require a developer-chosen extension identifier and method/result
+  namespace that cannot collide with core, another installed extension,
+  reserved FastMCP identifiers, case/Unicode look-alikes, or a legacy
+  adapter. Registration is atomic and fails before any listener starts.
+- Separate wire codecs from handlers. Decode through PRT-01/PRT-04 and
+  the registered bounded schema; provide only admitted typed values to
+  application code; validate and size-bound every returned result or
+  notification before transport commit.
+- Give handlers an `ExtensionContext` that borrows the ordinary
+  `McpContext` plus the exact authorized descriptor/settings snapshot.
+  It exposes cancellation, budget, principal-safe facts, and approved
+  services, but no raw bearer token, private transport ingress,
+  response writer, registry mutation, runtime construction, or
+  unchecked JSON-RPC emitter.
+- Require explicit compile-time inclusion and runtime installation.
+  Knowledge of an identifier, discovery from an earlier request, or a
+  downstream-provided capability map never activates an extension.
+- Bind every request/notification activation proof to descriptor digest,
+  settings digest, endpoint/configuration generation, direction,
+  authenticated security partition, and current message. Reuse or
+  cross-route replay fails before handler effects.
+- Provide typed extension errors that map only through the registered
+  contract. Panic payloads and arbitrary Rust error chains are sanitized
+  at the peer boundary while bounded local diagnostics retain the cause.
+- Define wire descriptor/schema compatibility as an explicit version
+  change rather than a permissive unknown-field parse. This is separate
+  from—and does not waive—the facade crate's ordinary documented Rust
+  semver obligations.
+  Multiple installed versions require distinct noncolliding identifiers
+  or a documented descriptor-owned negotiation rule.
+- Define capability-limited public fixture hooks that DX-TEST-01 can
+  wrap without private constructors. Document how an author proves core
+  isolation, capability-negative behavior, bounded decode/encode, auth,
+  cancellation, and packaged-consumer compatibility.
+- Include a complete example extension in existing example surfaces and
+  build it as a separate temporary consumer depending only on the
+  packaged facade under both canonical and renamed dependency names.
+- Keep the public surface free of compatibility shims for the old core
+  task, resource-subscription, reverse-request, or session contracts.
+
+Acceptance:
+
+- A downstream crate can define, install, discover, invoke, test, and
+  document an extension using only public facade APIs.
+- The same crate cannot register a core/reserved/colliding method, forge
+  activation, observe raw credentials/ingress, emit unchecked envelopes,
+  escape configured limits, or create an orphan runtime/task.
+- Extension-disabled and unadvertised paths produce no handler effects,
+  catalog entries, result discriminators, headers, notifications, or
+  subscription events.
+- Built-in and out-of-tree extensions pass the same descriptor and
+  admission pipeline; exporter/example-only success is insufficient.
+- Public authoring types remain feature-isolated from Tasks, Apps,
+  enterprise auth, and the legacy adapter unless the consumer explicitly
+  enables and composes those profiles.
+
+Tests:
+
+- Packaged-consumer compile/run matrix using only `fastmcp-rust`, a
+  renamed facade dependency, minimal/no-default features, and every
+  supported target class.
+- Descriptor goldens and collision negatives for core/reserved/legacy/
+  duplicate/case/Unicode-look-alike identifiers, methods, result types,
+  headers, and subscription events.
+- Raw duplicate/oversize/depth/numeric/schema-invalid request/settings/
+  result/notification tests proving the handler never observes rejected
+  input and no bytes commit on invalid output.
+- Compile-fail tests for private ingress construction, raw token access,
+  unchecked response emission, registry mutation after freeze, runtime
+  ownership, and non-`&Cx` async handlers.
+- Activation proof absent/stale/replayed/wrong-direction/wrong-principal/
+  wrong-generation/wrong-settings tests with zero side effects.
+- Authorization, cancellation, deadline, panic sanitation, subscription,
+  transport-neutral descriptor preservation, and reload-generation
+  integration tests. PXY-01 owns actual two-leg forwarding.
+- Feature cross-product tests proving no accidental dependency or claim
+  on Tasks, Apps, enterprise auth, or legacy support.
+
+Dependencies:
+
+- PRT-04.
+- PRT-05.
+- HDR-01.
+- SCH-01.
+- EXT-01.
+- XPORT-01.
+- API-01.
+
+### DX-TEST-01 — Rebuild the public modern testing toolkit
+
+Outcome:
+
+Provide downstream developers with deterministic, production-faithful
+helpers for modern server, client, transport, auth, extension, and
+cancellation tests.
+
+Reason:
+
+The current facade testing module is useful but reflects the legacy
+initialize/session/result model. Projects need ergonomic tests without a
+second protocol implementation that can pass while production fails.
+
+Implementation:
+
+- Rework `fastmcp_rust::testing` around production `Client`, `Server`,
+  router, codec, admission, and memory/stdio/HTTP transport boundaries.
+  Helpers may assemble these components but never duplicate dispatch,
+  capability, auth, cache, result, or extension rules.
+- Provide a `TestRuntime`/scope fixture that is explicitly supplied by
+  the test, uses `LabRuntime` where deterministic scheduling is needed,
+  exposes virtual time and schedule exploration, and never hides a
+  global or nested `block_on`.
+- Put the LabRuntime-backed layer behind a distinct non-default
+  `testing-lab` feature and audit its resolved graph. Ordinary `testing`
+  and every production/default build must remain free of asupersync
+  `test-internals`; enabling `testing-lab` is an explicit downstream
+  test-build choice and does not add protocol or auth authority.
+- Provide deterministic injectable clock, entropy, DNS/fetch, credential,
+  key, blocking-work, and durable-store fixtures only through the same
+  capability traits accepted by production builders. Put synthetic and
+  loopback-only fixtures behind a non-default `testing` facade feature;
+  treat that feature as ergonomics, not a security boundary, and ensure
+  no fixture can mint a production-trusted ingress, principal,
+  key-custody receipt, or arbitrary-network authority.
+- Add a typed `TestServer`/`TestClient` harness for modern memory
+  transport plus black-box child-process stdio and loopback Streamable
+  HTTP harnesses that exercise actual framing, headers, response streams,
+  cancellation on close, stdout purity, and shutdown.
+- Add a bounded raw-wire peer for negative tests. It may send malformed
+  bytes and record exact frames but cannot construct internally trusted
+  request/context/authorization types.
+- Provide fixture builders for required metadata, discovery, tools,
+  resources, prompts, MRTR, subscriptions, auth challenges, cache hints,
+  and registered extensions. Defaults are valid modern values and are
+  explicit about principal/profile/limit generations.
+- Provide structured event capture with monotonic sequence numbers,
+  bounded payloads, redacted human rendering, exact escaped machine
+  values, and causal request/stream/task identifiers local to the test.
+  On failure, emit seed, virtual time, schedule, frame direction, and
+  bounded state transitions.
+- Supply assertions for no bytes/effects before admission, exactly one
+  terminal outcome, response-ID preservation, no post-terminal progress,
+  cancellation provenance, queue bounds, secret absence, and clean
+  structured shutdown.
+- Support fault injection at every transport read/write/flush/close,
+  auth fetch/refresh, cache commit, durable commit, exporter, and handler
+  boundary with deterministic Nth-operation selection.
+- Keep protocol-era helpers explicit. Modern helpers never initialize or
+  create Session state; legacy helpers exist only behind the legacy
+  profile and are named as such.
+- Publish rustdoc and runnable examples for minimal tool, MRTR, HTTP,
+  auth, extension, cancellation, virtual-time, and malformed-peer tests.
+- Expose a facade-only operator-snapshot/exporter fixture and example;
+  prove a custom downstream exporter can observe bounded OPS-01 state
+  without obtaining raw ingress, credentials, or protocol authority.
+
+Acceptance:
+
+- A facade-only downstream consumer can express happy, malformed-wire,
+  auth, cancellation, concurrency, and extension tests without private
+  imports or sleep-based timing.
+- In-process convenience tests and real stdio/HTTP black-box tests use
+  identical production admission and result semantics.
+- Failed tests report enough bounded deterministic context to reproduce
+  the seed/schedule/frame sequence without revealing secrets.
+- No helper grants trusted ingress/auth types, silently initializes a
+  legacy session, owns a process-global runtime, or turns test-only
+  insecure providers into production defaults.
+
+Tests:
+
+- Facade-only and renamed-dependency packaged consumers for every public
+  helper and documented example.
+- Packaged custom-exporter positive test plus compile-fail attempts to
+  obtain raw ingress, credential, or unchecked metric-label authority.
+- Differential runs of the same scenario over memory, child stdio, HTTP
+  JSON, and HTTP SSE response modes.
+- LabRuntime virtual-time, seeded schedule reproduction, DPOR race, and
+  no-real-sleep assertions.
+- Malformed frame/header/body, duplicate key, unknown response ID,
+  disconnect, half-write, flush failure, stream close, timeout, panic,
+  and cancellation-before/during/after-commit matrices.
+- Failure-log goldens proving seed/schedule/causal detail plus secret,
+  terminal-control, unbounded-payload, and nondeterministic-field absence.
+- Compile-fail tests for private context/ingress construction, hidden
+  runtime ownership, and legacy helpers without the legacy feature;
+  default/no-default graph tests prove `testing`, `testing-lab`, and
+  asupersync `test-internals` remain absent unless explicitly selected.
+
+Dependencies:
+
+- FND-04.
+- PRT-05.
+- SRV-02.
+- SRV-04.
+- CLT-01.
+- XPORT-01.
+- API-01.
+- EXT-DEV-01.
 
 ### CLI-01 — Upgrade run, inspect, and diagnostics
 
@@ -25504,6 +26602,9 @@ Implementation:
 - Add subscription listen/watch.
 - Add MRTR interactive resolvers where safe.
 - Add OAuth metadata and issuer diagnostics.
+- Render OPS-01 liveness, readiness, degradation, saturation, capacity,
+  and dropped-observation state without inventing new semantics or
+  exposing forbidden dimensions.
 - Render every peer-controlled human-facing field only through
   OBS-02's bounded `UntrustedDisplayText`; disable Rich markup and
   terminal hyperlinks for untrusted values. Keep exact machine JSON
@@ -25511,6 +26612,11 @@ Implementation:
 - Never swallow list failures with defaults.
 - Make exit status reflect diagnostic failure.
 - Keep machine-readable JSON output.
+- Preserve protocol-stream purity and lifecycle truth in every execution
+  path: child stdio stdout contains JSON-RPC only; diagnostics use
+  stderr or the selected machine channel; startup/build/handler/transport
+  errors yield nonzero status; signal/cancellation/EOF triggers bounded
+  structured shutdown rather than a detached child.
 
 Acceptance:
 
@@ -25537,6 +26643,13 @@ Tests:
   exact JSON-versus-sanitized-human comparison.
 - JSON schema for CLI output.
 - Subscription commands.
+- Black-box child-process stdio tests with the packaged CLI and packaged
+  fixture server, exact stdout/stderr separation, concurrent request/
+  notification traffic, startup/build failure propagation, EOF,
+  cancellation, and bounded shutdown.
+- Real loopback Streamable HTTP JSON/SSE tests with origin/header/auth
+  failures, response-stream close cancellation, readiness transitions,
+  and nonzero exit codes.
 
 Dependencies:
 
@@ -25545,6 +26658,7 @@ Dependencies:
 - HTTP-03.
 - AUTH-05.
 - OBS-02.
+- OPS-01.
 
 ### CLI-02 — Add Tasks extension commands
 
@@ -25831,6 +26945,11 @@ Tests:
   boundary, complete standard-reuse inventory, error profile, six-shape
   reserved-result rule, and sampling/Tasks/MRTR exclusion wording checks.
 - Provisional support-matrix vocabulary check.
+- Operator snapshot/readiness/cardinality/privacy documentation and
+  CLI-rendering parity checks.
+- Public testing-toolkit and out-of-tree extension-authoring examples,
+  packaged-consumer commands, capability-boundary warnings, and private-
+  API import deny checks.
 
 Dependencies:
 
@@ -25839,6 +26958,9 @@ Dependencies:
 - FND-03.
 - PRT-05.
 - SCH-01.
+- OPS-01.
+- EXT-DEV-01.
+- DX-TEST-01.
 
 ### DOC-02 — Publish evidence-backed support claims
 
@@ -26283,6 +27405,10 @@ Implementation:
 - Test cache tenant crossing.
 - Test MRTR state tampering and replay.
 - Snapshot logs for secret leakage.
+- Inject panics and opaque internal errors at handler, middleware,
+  extension, auth-provider, cache, proxy, and transport-adapter boundaries;
+  require PRT-03's fixed peer error, bounded local classification, exact
+  one-terminal behavior, and no payload/backtrace/type/error-chain leak.
 
 Acceptance:
 
@@ -26297,9 +27423,14 @@ Tests:
 - LabRuntime.
 - Local fake OAuth endpoints.
 - Log snapshots.
+- Panic payload corpus with secrets, terminal controls, markup, bidi,
+  newlines, huge strings, non-string payloads, and panicking formatters
+  over stdio, HTTP JSON, and HTTP SSE, including post-terminal races.
 
 Dependencies:
 
+- PRT-03.
+- SRV-04.
 - HTTP-02.
 - HTTP-05.
 - HTTP-06.
@@ -26329,6 +27460,11 @@ Implementation:
 - Add blocking `cargo audit` and a reviewed `cargo deny` policy for
   vulnerabilities, licenses, sources, duplicate-risk, and prohibited
   dependencies.
+- Pin the exact `cargo-audit` and `cargo-deny` executable versions and
+  installer/source digests. Pin the RustSec advisory database by commit
+  plus tree/content digest; record retrieval time and freshness ceiling.
+  A moving database, mutable installer tag, or cache lacking its pinned
+  provenance cannot satisfy the gate.
 - Make advisory and policy tools fail closed on execution error,
   network/cache ambiguity, unparsable output, or missing database;
   “scanner did not run” is never success.
@@ -26351,6 +27487,31 @@ Implementation:
   disabled, xfail, filtered, cancelled, and not-run required checks.
 - Create feature-matrix and packaged-artifact job skeletons that later
   packages fill without weakening their policy.
+- Make every declared report, capture, package, manifest, checksum, and
+  evidence upload a required artifact with schema, nonempty inventory,
+  source identity, and digest checks. Missing/truncated/unparseable
+  artifacts and ignored upload failures are fatal.
+- Continuously verify REL-QUAR-00's source and provider-side quarantine.
+  The historical workflow identity stays disabled, ambient publication
+  secrets stay absent/rotated, and every historical run has an exact
+  disposition. Before REL-PREP-01, current source contains no mutation
+  job or dormant production entry point. After REL-PREP-01, permit
+  exactly one exception: the sealed new-path
+  `.github/workflows/publish-authorized.yml` definition, whose immutable
+  provider workflow ID remains disabled, trigger-bounded,
+  credentialless, environmentless, wrong-ref rejecting, and unable to
+  pass coordinator authorization. CI-BASE-01 only verifies this
+  exception; it never enables, provisions, dispatches, or weakens it,
+  and every other dormant or reachable mutation path remains forbidden.
+  REL-02 may temporarily enable/provision/dispatch only that already
+  sealed identity through REL-PREP-01's separately sealed bootstrap
+  controller and exact effect automaton.
+- Freeze a CI job inventory with trigger, prerequisites, runner class,
+  timeout, retry policy, maximum concurrency, estimated compute minutes,
+  artifact-size/retention budget, and required/optional classification.
+  Enforce a project-level same-worktree Cargo concurrency cap, RCH use for
+  agent builds, bounded queues, and no scheduled-job substitution for a
+  required gate. Cost/time changes require reviewed inventory updates.
 - Run lightweight checks on every change and schedule extended
   security/fuzz work separately without allowing scheduled coverage to
   substitute for required pull-request gates.
@@ -26367,6 +27528,16 @@ Acceptance:
 - Actions and external tools are immutable and reproducible.
 - CI cannot pass when the plan-tracker checker is absent, mutates
   state, reports a noncanonical snapshot, or finds a mismatch.
+- Before REL-PREP-01, no existing workflow contains or reaches an
+  external mutation job, production secret, release environment, dormant
+  publisher, or ambient fallback. After REL-PREP-01, its exact sealed
+  new-path identity is the sole permitted dormant publisher definition
+  and remains provider-disabled, trigger-bounded, credentialless,
+  environmentless, wrong-ref rejecting, and coordinator-denied until
+  REL-02. No other workflow may contain or reach a mutation job. The old
+  workflow ID remains disabled forever.
+- Required-artifact, pinned-advisory, job-inventory, time,
+  concurrency, and cost limits fail closed.
 
 Tests:
 
@@ -26379,11 +27550,472 @@ Tests:
 - Action/tool mutable-reference deny test.
 - Plan-tracker checker clean-snapshot and deliberately corrupted
   package/edge/child/card/profile/fingerprint fixtures.
+- Mutable/missing/stale RustSec DB, cargo-audit/cargo-deny tool drift,
+  ignored scanner exit, and absent/malformed evidence-artifact tests.
+- Release workflow trigger/call-graph matrix proving tag/dispatch/rerun/
+  token/ref and historical refs find zero reachable publish/tag/public-
+  asset/publicize job, secret, or environment; after REL-PREP-01 the
+  matrix recognizes only the exact sealed, provider-disabled new-path
+  exception and rejects a second dormant path, wrong workflow identity,
+  enabled state, attached environment/secret, wrong-ref admission, or
+  weakened coordinator denial. Provider-state fixtures also reject an
+  enabled old workflow ID or undispositioned historical run.
+- CI inventory mutation tests for undeclared jobs, missing prerequisite,
+  excessive timeout/retry/concurrency/compute/artifact retention, and a
+  scheduled-only substitute for required pull-request/release evidence.
 
 Dependencies:
 
 - FND-01.
 - FND-02.
+- REL-QUAR-00.
+
+### REL-PREP-01 — Build the bounded no-authority publication coordinator
+
+Outcome:
+
+Check in and qualify the exact registry/GitHub coordinator, sealed-upload
+format, durable journal, supply-chain signer boundary, and provider
+sandboxes that REL-01 can seal and REL-02 can use only after separate
+authorization.
+
+Reason:
+
+REL-QUAR-00 must quarantine ambient publishing immediately and CI-BASE-01
+must continuously verify it, but a real
+publisher cannot precede audited asupersync DNS/TLS/HTTP, capability-
+filesystem, cancellation, and secret-custody boundaries. Hiding the work
+behind `curl`, a Cargo subprocess, or an unbounded workflow script would
+reintroduce the exact runtime and byte-identity gaps the release gate is
+meant to prevent.
+
+Implementation:
+
+- Implement one `&Cx`-first structured coordinator using only FND-05's
+  admitted asupersync DNS/TLS/HTTP primitives and FND-04's bounded
+  blocking executor. It creates no runtime/thread, uses no Tokio-family
+  client, invokes no ambient `curl`, and never shells out to Cargo on the
+  production mutation path.
+- Keep the coordinator library strictly `&Cx`-first. Its non-published
+  process entry point owns exactly one bounded top-level asupersync
+  runtime, enters one structured root region, passes that `Cx` downward,
+  and performs bounded structured shutdown. It enables no
+  `test-internals`, secondary runtime, detached thread/task, or orphan
+  blocking/network work.
+- Put `#![forbid(unsafe_code)]` at every library, publisher, bootstrap,
+  and sandbox crate root in `tools/release-coordinator`; inherit the
+  workspace `unsafe_code = "forbid"` lint without an override. The
+  release tooling cannot qualify if a target omits or weakens either
+  layer.
+- Define a non-Clone, non-serializable `ReleaseCredentialProvider` that
+  borrows short-lived crates.io, GitHub, signer, protected remote-
+  journal/lease, and authorization-status credentials from the protected
+  execution environment, scopes each to one provider/action, returns
+  redacted error classes, and zeroizes framework-owned buffers.
+  Credential presence conveys capability to authenticate, not authority
+  to publish; the exact REL-02 authorization receipt is separate.
+- Resolve registry API base and download/index endpoints only from the
+  pinned authenticated registry configuration and bind canonical scheme,
+  host, port, path, TLS roots, DNS policy, redirect prohibition, content
+  coding, response limit, and timeout. The core release permits only the
+  exact crates.io identity captured by FND-01/REL-01.
+- Implement the Cargo Registry Web API publish body documented by the
+  pinned Cargo reference: `PUT /api/v1/crates/new`,
+  `Content-Type: application/octet-stream`, checked little-endian `u32`
+  metadata length, bounded Cargo publish metadata JSON, checked little-
+  endian `u32` archive length, then exact `.crate` bytes. Reject bodies
+  or archives beyond registry/project limits before allocation/send.
+- Do not hand-maintain Cargo publish metadata. In preparation mode only,
+  run the pinned Cargo against a non-mutating loopback capture registry,
+  parse and bound its exact request, require the embedded archive to be
+  byte-identical to the separately sealed `cargo package` archive,
+  validate metadata against packaged manifests/dependencies/features/
+  README/license/repository/rust-version, and emit a content-addressed
+  `SealedRegistryUploadBody`. Production mode sends that exact body and
+  cannot invoke packaging.
+- Resolve the repository's contradictory release-license metadata before
+  this package closes. The current workspace manifest says `MIT`, the
+  root `LICENSE` contains an additional rider, `LICENSE-MIT` contains
+  plain MIT text, and README wording/linkage does not make one
+  authoritative answer unambiguous. Require an explicit reviewed
+  maintainer/legal `ReleaseLicenseDecision`; tooling must not infer a
+  choice. The decision selects exactly one Cargo representation for all
+  nine publishable crates: a valid SPDX expression in `license`, or a
+  nonstandard authoritative file in `license-file`. It names every
+  authoritative text, copyright/rider disposition, treatment of retained
+  nonauthoritative files, and the exact README/site/crate-page wording.
+  Align all nine manifests, packaged archives, root/crate READMEs,
+  license links, and release notes before CI-CORE-01. A conflicting,
+  missing, dual, or silently inherited representation fails closed; no
+  file deletion is required or authorized by this plan.
+- Freeze a per-crate `DocsRsBuildProfile` and check it into each of the
+  nine publishable manifests under `[package.metadata.docs.rs]`: exact
+  feature set, `all-features`/`no-default-features` disposition, default
+  target, additional targets within docs.rs limits, and any rustdoc or
+  Cargo arguments. Validate those values against the public feature
+  claims rather than enabling unsupported profiles for convenience.
+  Run a network-isolated docs.rs-equivalent build with the sealed package
+  archives, `--cfg docsrs`, the exact current docs.rs toolchain/container
+  snapshot and resource ceilings, plus the project's pinned supported
+  nightly. This is documentation-host compatibility evidence, not a new
+  production compiler-support promise. Drift in the external docs.rs
+  builder remains an observable post-publication condition.
+- Implement bounded read-only registry reconciliation for sparse-index
+  visibility, exact index checksum, yank state, authenticated download,
+  archive digest, and dependency availability. Treat successful upload
+  response and index/download observations as distinct evidence.
+- Define a capability-filesystem transaction journal using FND-07 as a
+  local write-ahead log only: append-only length-delimited records,
+  hash-chain head, fsync/atomic checkpoint contract, local exclusive
+  lock, bounded record/file size, crash recovery, strict canonical
+  decode, and credential-free diagnostics. No relative/pathname reopen
+  may escape the journal root. A local lock or ephemeral runner disk is
+  never cross-run exclusion or durable publication evidence.
+- Define a separately protected cross-run `PublicationJournalStore`
+  with append-only bounded segments, compare-and-set hash-chain head,
+  read-back verification, retention/inventory policy, and a repository/
+  registry/version/transaction lease carrying a monotonic fencing token.
+  Persist and read back each remote pre-effect record before provider
+  mutation and its observation record after reconciliation. Require
+  both protected-workflow concurrency and the fenced remote lease; loss
+  of store, CAS, lease, fencing, renewal, or read-back causes zero
+  further mutation. Journal/lease writes are themselves rendered,
+  authorized external effects.
+- Time-box production-provider feasibility and selection to ten working
+  days before this package may close. Select and freeze exactly one
+  production remote CAS journal/lease store, authorization-status and
+  trusted-time authority, immutable external rollback/audit anchor,
+  signer/transparency provider, crates.io trust configuration, and
+  GitHub API/repository/workload-identity configuration. For each,
+  record the exact service/API/action version or commit, endpoint and
+  namespace, TLS/trust roots, consistency and CAS semantics, retention,
+  restore/clone/rollback guarantees, credential and revocation model,
+  quotas/limits, regional/failure behavior, reconciliation APIs,
+  operator ownership, and rollback/exit plan. A trait, local sandbox,
+  brand name, or hypothetical provider does not satisfy selection.
+- Exercise the selected providers first through credential-free public
+  metadata and explicitly read-only production calls. Any credentialed
+  or mutating qualification requires its own exact written human
+  authorization, rendered effect list, bounded test identity/namespace,
+  and retained receipt; no sandbox result is relabeled production
+  evidence. If no candidate can prove the journal rollback/clone,
+  fencing, retention, time, signer/transparency, trust, and read-back
+  contracts by the deadline, record the failed candidates and leave
+  REL-PREP-01, REL-01, and REL-02 closed/blocked rather than choosing an
+  underspecified service.
+- Require write-once/version-retained remote segments, explicit store-
+  generation and restore/clone epochs, immutable audit history, and
+  rollback detection anchored outside the mutable head/fencing counter.
+  Bind generation/epoch into every grant and execution-authority
+  profile. A store that cannot detect restored/rolled-back heads,
+  counters, independently writable clones, privileged tampering, or
+  premature retention expiry cannot establish publication lineage.
+- Implement a bounded GitHub provider for exact tag lookup/create,
+  draft-release create/read/update, asset upload/read-back, and publicize.
+  Freeze repository/API identities, allowed methods/paths/content types,
+  redirects, pagination, request/response bytes, retries, deadlines, and
+  rate-limit behavior. No delete, force-update, asset replacement, yank,
+  or other recovery mutation exists in the coordinator API.
+- Implement external supply-chain `ReleaseArtifactSigner` and verifier
+  contracts distinct from FND-09 protocol JOSE: named provider,
+  content-addressed action/tool identity, workload identity and trust root,
+  subject-digest format, custody boundary, expiry/revocation policy,
+  verification command/API, public-transparency-side-effect declaration,
+  and offline sandbox. Raw key material never enters the workspace;
+  missing/unverifiable signer means no signature or provenance claim.
+  REL-01 may use only a proven offline/private no-public-side-effect
+  mode. Transparency-log, hosted-attestation, public-signature-record,
+  or other externally visible signer effects occur only in REL-02 and
+  appear in its exact authorization effect list.
+- Freeze a versioned `ReleaseAssetProfile` before qualification. Unix
+  release bundles use a pinned ustar-plus-zstd profile; Windows bundles
+  use a pinned ZIP profile. Both sort a closed member inventory by raw
+  UTF-8 path bytes, reject duplicate/absolute/parent paths and links,
+  normalize uid/gid and names, modes, timestamps from the sealed
+  `SOURCE_DATE_EPOCH`, compression version/level/thread count, ZIP extra
+  fields/comments/platform attributes, and tar extension/header policy.
+  A checked-in Cargo implementation performs packaging—never an ambient
+  shell `tar`, `zip`, or PowerShell archive command. Package the same
+  sealed inputs twice in disjoint clean directories and require
+  byte-identical archives. This proves deterministic archive packaging,
+  not automatically deterministic compilation.
+- Give each target a sealed `BinaryReproducibilityDisposition`. Two
+  independent clean builds with fresh Cargo homes/targets, the same
+  source/toolchain/runner/profile, and a normalized environment may set
+  `binary_bit_reproducible=true` only when binary bytes and explanatory
+  build records match. Otherwise set it to `false`, publish at most the
+  one content-addressed provenance-bound binary selected by
+  CI-FINAL-CORE-01, and make every document/receipt explicitly disclaim
+  binary bit reproducibility. Never use a reproducibly repackaged
+  nonreproducible binary to imply a reproducible compiler output.
+- Define the release SBOM profile as SPDX 3.0.1 JSON-LD using exactly the
+  Core and Software profiles, with the 3.0.1 context/model/conformance
+  artifacts vendored or checksum-pinned and no network context fetch.
+  Freeze a project JSON-LD compaction plus RFC 8785 JCS byte profile,
+  generator name/version/executable digest, deterministic identifier and
+  ordering rules, and an explicit trusted creation-time input. Cover
+  every `.crate`, standalone binary, and archive as a named SHA-256
+  subject and enumerate contained workspace/third-party packages,
+  resolved normal/build/dev dependencies, enabled features, targets,
+  source/checksum identities, and license conclusions from the approved
+  `ReleaseLicenseDecision`. Validate both SPDX conformance and exact
+  subject/inventory completeness; an omitted dependency, feature,
+  license, target, or asset is fatal.
+- Define unsigned build-provenance inputs as raw in-toto Statement v1
+  JSON with exact `_type=https://in-toto.io/Statement/v1` and SLSA
+  Provenance predicate type `https://slsa.dev/provenance/v1`, interpreted
+  against the approved SLSA v1.2 Build Provenance text. Freeze a
+  project-owned versioned `buildType` definition and exact
+  `externalParameters`, `internalParameters`, `resolvedDependencies`,
+  `runDetails.builder`/version/dependencies, invocation/timestamps,
+  byproducts, and SHA-256 subject entry for every `.crate`, binary, and
+  archive. Canonicalize raw statement bytes with the same pinned JCS
+  implementation. REL-01 stages these unsigned statements; REL-02's
+  authorized signer wraps the exact raw bytes in DSSE 1.0.2 JSON
+  envelopes with `payloadType=application/vnd.in-toto+json`, base64
+  payload/signature, signer identity, and verified subject binding.
+  Never call an unsigned statement a DSSE envelope or claim a SLSA build
+  level that the selected builder/signer pair has not independently
+  established.
+- Implement versioned `ReleasePublicationHandoff`, authorization plan,
+  transaction identity, renewable `PublicationAuthorizationGrant`,
+  per-object mutation-attempt state machines, precommit manifest,
+  completion receipt, and receipt-anchor schemas with checked bounds,
+  exact identity references, redaction, and no self-reference.
+- Define a sealed `ExecutionAuthorityProfileDigest` covering both
+  publisher and bootstrap executable/configuration digests; the exact
+  `publish-authorized.yml` path/bytes/provider workflow ID, sealed ref/
+  commit/tree/definition digest, protected environment identity/policy,
+  workload/run credential-binding policy, and bootstrap operator-host
+  trust profile; registry API/index/download identities; GitHub API/
+  repository; remote journal/lease endpoint/namespace plus store
+  generation/restore epoch/trust roots; signer action/transparency
+  identity; authorization authority; and trusted time authority.
+- Define transaction identity independently of renewable grants with a
+  domain-separated SHA-256 over an exact versioned, length-prefixed,
+  bounded binary encoding of handoff digest, execution-authority profile,
+  registry, repository, version, tag, ordered package set, and
+  `sealed_input_artifact_set`. Freeze ordering, duplicate rejection,
+  byte-exact/no-normalization rules, and field ceilings. Define each grant
+  ID with a distinct domain over the transaction ID, actor, issuance/not-
+  before/expiry, nonce, `grant_base_head`, store generation/restore epoch,
+  canonical finite effect-automaton digest, and second confirmation.
+  Every invocation/resume needs a fresh current two-step grant; renewal
+  does not change transaction identity.
+- Define a protected `PublicationAuthorizationAuthority` and trusted
+  nondecreasing `AuthorizationTimeAuthority`. The authority records
+  CAS/read-back revocation/completion state; clock rollback, uncertain
+  time, expired/revoked/completed grants, or authority unavailability
+  prevents new writes. Expiry/revocation after dispatch permits bounded
+  read-only reconciliation only; any later journal/provider write needs
+  a fresh grant.
+- Replace a prose “remaining effects” list with a canonical bounded
+  effect automaton: exact irreversible targets and input/subject digests,
+  preallocated effect/attempt ordinals, allowed conditional transitions,
+  maximum provider/journal/signer/lease mutations and read-only polls,
+  byte/deadline ceilings, and no wildcard target or unbounded retry. A
+  bound exhaustion requires a newly rendered two-step grant.
+- Seal a `derived_output_policy_digest` for signer identity, exact
+  subject digest, algorithm/profile, transparency endpoint, output
+  schema, and byte/count bounds. Derived signatures/provenance are
+  journaled and read back in REL-02, then require a fresh grant bound to
+  their exact bytes before upload/publicize.
+- Model every mutation as immutable numbered attempts, not only crate
+  packages: `pending -> attempt_prepared(n) -> dispatching(n)`, then
+  either `observed(n) -> verified`, `outcome_unknown(n)`, or the
+  separately proved `failed_before_dispatch(n)`. Apply equivalent
+  state machines to registry uploads, tag creation, draft creation,
+  each asset/signer/publicize action, receipt upload, anchor upload,
+  remote segment append, CAS-head advance, and lease acquire/renew/
+  handoff/release. A timed-out journal/lease mutation is read back before
+  retry. An unknown attempt never returns to pending.
+- Persist an `in_flight_attempt` barrier before provider dispatch. A new
+  lease holder may reconcile that unresolved attempt but cannot begin
+  another mutation for the object; handoff stays blocked until verified
+  or terminal conflict. Size renewal margin above the admitted operation
+  deadline. Lease loss after any possible byte dispatch produces
+  `outcome_unknown`; fencing guards coordinator admission/journal
+  lineage, not provider-side commit.
+- Check in `.github/workflows/publish-authorized.yml` as the sole new
+  protected coordinator workflow identity, absent from historical refs
+  and included in CI-FINAL-CORE-01's sealed source. It has no tag/branch/
+  reusable trigger, no trusted declared shell/version/ref input, and
+  only a pinned manual entry point. `workflow_dispatch` nevertheless
+  carries a caller-selected ref: the authorized bootstrap dispatches the
+  sealed full commit, and the workflow compares its resolved full commit,
+  tree, definition digest, and workflow identity with the handoff/grant
+  before any credential access or effect. Arbitrary-ref dispatch fails
+  closed. Once the provider assigns the new workflow ID, a separate
+  exact safety-only human authorization disables it and records the
+  command, actor, ID, state read-back, absence of environment/secrets,
+  and receipt. The definition is credentialless and coordinator-denied
+  even during the registration-to-disable interval. This safety action
+  grants no publication authority. Add no mutation job to CI-BASE-01 or
+  the permanently disabled historical workflow.
+- Implement a separately sealed, human-invoked
+  `PublicationBootstrapController` as an explicit
+  `release-bootstrap` binary/mode in the same non-publishable tool
+  package. It runs from a protected operator host at the sealed source
+  identity, never from the workflow it administers, and has a disjoint
+  credential type/API surface limited to the authorization/time
+  authority, remote journal/lease, and exact GitHub workflow/environment
+  administration needed to enable, provision, dispatch, observe,
+  disable, and revoke. Compile-time and capability tests prove it cannot
+  call crates.io upload, tag/release/asset, or signer/transparency APIs
+  and cannot load their credentials. It applies the same exact two-step
+  grant, numbered attempt, in-flight, CAS/fencing, read-back,
+  reconciliation, crash-resume, and bounded-effect rules as the
+  publisher. A fresh invocation can finish cleanup after operator-host
+  loss; a workflow run cannot declare itself successfully cleaned up.
+- Define the workflow publisher and bootstrap interfaces separately.
+  The checked-in defaults remain no-authority/no-side-effect, and local
+  sandboxes cannot select production endpoints or credentials. Freeze
+  an exact workload-identity binding for every one-run credential—such
+  as provider-side OIDC/trusted-publisher conditions over repository,
+  workflow path, sealed ref/commit, environment, and run identity, or an
+  equivalently attested one-run injection. GitHub environment naming or
+  reviewer approval alone is not proof that another workflow cannot use
+  a secret. If the selected providers cannot enforce and read back the
+  frozen workflow/source/run binding, leave publication blocked and
+  state the residual admin trust rather than claiming isolation. REL-02's
+  effect automaton separately authorizes bootstrap enablement,
+  provisioning, sealed-ref dispatch, run binding, post-run disablement,
+  and credential/environment revocation/read-back.
+- Provide a hermetic local registry with delayed index/download views and
+  GitHub-provider, signer, and durable remote-journal/lease sandboxes
+  capable of fault injection before/after every side effect. Sandbox
+  state and credentials are synthetic, bounded, and isolated from
+  production DNS/routes.
+
+Acceptance:
+
+- Publication tooling is checked in, reproducible, and included in the
+  source identity before CI-FINAL-CORE-01, while its default execution
+  has zero external mutation authority.
+- The new-path workflow identity is sealed, safety-authorized and
+  provider-read-back as disabled, trigger-bounded, credentialless,
+  environmentless, arbitrary-ref rejecting, and coordinator-denied; the
+  historical workflow ID remains disabled. The registration-to-disable
+  interval has no credentials or authorization path. Neither
+  REL-PREP-01 nor REL-01 can enable or provision it for publication.
+- The bootstrap executable/configuration is sealed independently from
+  the publisher, has no registry/release/asset/signer capability, and
+  can recover through final workflow disablement and one-run credential/
+  environment revocation after interruption. Provider evidence proves
+  credential issuance is bound to the exact authorized workflow,
+  source/ref, environment, and run or closure remains blocked with the
+  residual trust stated explicitly.
+- One exact production provider set is selected, immutable inputs and
+  operational guarantees are frozen, and real read-only evidence matches
+  every required contract. Missing, marketing-only, sandbox-only,
+  version-floating, or failed provider evidence prevents closure.
+- The production registry path sends the exact sealed archive/body and
+  cannot repackage, use an alternate registry, follow an unapproved
+  redirect, or fall back to Cargo/curl/another HTTP stack.
+- Registry/GitHub/signer credentials are scoped, non-serializable,
+  redacted, zeroized, and insufficient without exact REL-02 authorization.
+- Local-WAL and protected cross-run journal recovery is monotonic,
+  exactly decodable, bounded, fenced, CAS/read-back verified, and cannot
+  repeat a verified side effect or hide an unknown outcome.
+- GitHub support has no delete/replace/force-move surface; provider and
+  signer outputs are independently read back/verified.
+- The approved license representation is unambiguous and identical
+  across all nine manifests, package archives, license texts, README/
+  release wording, SBOM conclusions, and registry metadata. Every
+  `DocsRsBuildProfile` passes its sealed network-isolated preflight.
+- Asset packaging is byte-reproducible from sealed inputs; binary
+  reproducibility is claimed only for target rows with two matching
+  clean builds. SPDX 3.0.1 SBOMs and raw in-toto/SLSA statements are
+  schema/conformance-valid and cover every required subject exactly.
+- Every external request, response, retry, reconciliation poll, upload,
+  artifact, log, and receipt has a configured byte/count/time bound and
+  structured cancellation owner.
+
+Tests:
+
+- No-Tokio/runtime/thread/curl/production-`cargo publish` dependency and
+  call-site gates; cancellation at DNS/TLS/write/read/retry/journal/
+  provider boundaries with no orphan work.
+- Process-entry tests proving exactly one top-level asupersync runtime/
+  root region, no `test-internals` or nested runtime, bounded shutdown,
+  and complete child-work ownership.
+- Crate-root/workspace-lint mutations proving every release-tool target
+  has `#![forbid(unsafe_code)]` and cannot weaken the inherited forbid.
+- Capture-registry known answers and malformed/oversize/truncated/
+  duplicate metadata, endian/length overflow, metadata/package drift,
+  archive substitution, and exact byte-replay tests.
+- Credential compile/redaction/zeroization, wrong-provider/action/scope,
+  expired/replayed capability, environment-dump, and credential-present-
+  without-authorization negatives.
+- Domain-separated transaction/grant known answers; exact canonical
+  ordering/length/bound/no-normalization mutations; effect-automaton
+  ordinal/transition/count/byte/deadline exhaustion; authorization audit
+  verbatim/digest/redaction; grant renewal/base-head/prefix; authority
+  revocation; and trusted-time rollback/jump tests.
+- Local-WAL partial-write/fsync/rename/lock/contention/truncation/hash-
+  chain/recovery/size-limit and capability-root escape tests; remote
+  journal segment/CAS/read-back/retention, split-brain runner, lease
+  expiry/renewal/loss, stale fencing token, and protected-workflow-
+  concurrency tests.
+- Registry delayed/stale/conflicting index, download/checksum/yank,
+  upload-response loss, timeout, ownership/token rejection, dependency-
+  lag, and multi-view reconciliation tests.
+- GitHub wrong/moved tag, duplicate/missing/altered asset, partial upload,
+  pagination/rate limit, stale release, provider timeout, publicize
+  interruption, and forbidden delete/replace/force negatives.
+- Signer identity/trust-root/subject/expiry/revocation/verification/
+  redaction tests, public-transparency-side-effect classification, and
+  missing-provider fail-closed behavior.
+- License-decision fixtures for current contradictory inputs, SPDX versus
+  `license-file` exclusivity, rider/link/README drift, per-crate manifest
+  drift, packaged-file omission, SBOM mismatch, and missing explicit
+  approval. No test “chooses” a license by heuristic.
+- docs.rs metadata matrix tests for all nine crates, unsupported-feature
+  claim leakage, target-count/resource-limit drift, network access, exact
+  `--cfg docsrs`/toolchain/container identity, and sealed-archive
+  docs.rs-equivalent build parity.
+- Deterministic ustar/zstd and ZIP known answers; member-order, path,
+  link, mode, uid/gid/name, timestamp, extra-field/comment, compressor,
+  locale/time-zone, and clean-directory differential mutations. Separate
+  two-clean-build binary comparisons prove a `false` disposition cannot
+  be rendered or documented as bit-reproducible.
+- SPDX 3.0.1 context/model/conformance and JCS known answers, plus
+  omitted/extra subject, package, dependency-kind, feature, target,
+  source/checksum, license, generator, timestamp, and ordering mutations.
+  in-toto Statement/SLSA v1.2 schema and subject-completeness tests mutate
+  `_type`, `predicateType`, build type, builder, parameters, resolved
+  dependencies, timestamps, byproducts, and subject digest. DSSE tests
+  prove the signature covers the exact raw statement bytes and reject an
+  empty/unsigned envelope, payload-type/base64 drift, or an unproved SLSA
+  level claim.
+- Production-provider selection matrix and deadline test; exact API/
+  action/version drift, TLS/trust-root drift, weak consistency, retention
+  expiry, restore/clone rollback, stale time, credential revocation,
+  quota/region failure, missing reconciliation, and provider-exit
+  fixtures. Run credential-free/public and authenticated read-only probes
+  against the selected production identities; keep separately authorized
+  bounded mutation evidence distinct and fail if it is absent where a
+  guarantee cannot be established read-only.
+- Full local registry/provider-sandbox termination and resume after every
+  durable transition, including grant renewal at the current journal
+  head and competing runners, proving default/no-authorization runs make
+  no production DNS request or external mutation.
+- New-workflow identity/path/trigger/action/permission checks, historical-
+  ref absence, safety-authorized initial-disable receipt,
+  provider-disabled/no-environment/no-secret read-back, arbitrary-ref
+  dispatch, and attempted dispatch/enablement without a REL-02 effect
+  grant. Bootstrap tests kill/restart before and after every
+  enable/provision/dispatch/run-observation/disable/revoke effect, reject
+  wrong workflow/source/ref/run identity and a credential usable by a
+  second workflow, and statically/dynamically prove the bootstrap has no
+  registry/tag/release/asset/signer capability.
+
+Dependencies:
+
+- CI-BASE-01.
+- FND-04.
+- FND-05.
+- FND-07.
 
 ### CONF-01 — Build conformance adapters
 
@@ -26780,10 +28412,12 @@ Implementation:
   implementation dependencies, excluding the gate itself and all
   downstream test, conformance, evidence, documentation, and release
   packages.
-- Leave `CoreReleaseProfileInventory` to Section 25.1,
-  CI-FINAL-CORE-01, and REL-01; it is a separate transitive closure
-  that includes this gate, CI-CORE-01 qualification, post-
-  documentation sealing, and downstream release evidence.
+- Leave `CoreReleaseCandidateInventory` to Section 25.1 and REL-01,
+  and `CoreReleaseProfileInventory` to Section 25.1 and REL-02. They
+  are separate generated transitive closures: the candidate includes
+  this gate, qualification, post-documentation sealing, and the no-
+  publish handoff; the published inventory adds only the authorized
+  REL-02 publication boundary.
 
 Acceptance:
 
@@ -26901,6 +28535,157 @@ Dependencies:
 - MAC-01.
 - API-01.
 - CLI-01.
+- OPS-01.
+- EXT-DEV-01.
+- CI-BASE-01.
+
+### PERF-01 — Establish modern performance, capacity, and soak evidence
+
+Outcome:
+
+Produce reproducible, release-blocking performance and capacity evidence
+for the implemented modern core profile without converting one machine's
+benchmark into an unsupported universal claim.
+
+Reason:
+
+The stateless protocol, exact-number parsing, bounded schema engine,
+concurrent dispatch, streaming HTTP, redaction, and structured
+cancellation can be functionally correct while exhibiting unusable tail
+latency, memory growth, queue collapse, or pathological compilation and
+package size. No modern baseline exists today.
+
+Implementation:
+
+- Build one versioned benchmark/soak manifest that binds source commit
+  and tree, `Cargo.lock`, toolchain, build profile/features, protocol and
+  limit profiles, benchmark code/data digests, OS/kernel, CPU model and
+  allocated cores, memory, storage class, worker placement, governor/
+  virtualization facts, and RCH job identity where compilation is
+  remote. Results from a different identity are comparable only through
+  an explicit normalization/rebaseline review.
+- Benchmark release artifacts using production protocol, router, server,
+  client, stdio, Streamable HTTP, schema, auth-partition, cache, and
+  operator-snapshot paths. Do not substitute a parser-only microbenchmark
+  for end-to-end evidence or use a permissive test stack.
+- Freeze a core workload matrix with small/median/near-limit request and
+  result bodies; tools/list/call, resources/list/read, prompts/list/get,
+  completion, discovery, errors, cache hit/miss, exact-number/schema
+  validation, progress, cancellation, concurrent response routing, and
+  request-scoped HTTP JSON/SSE. Optional Tasks, proxy, Apps, legacy, and
+  enterprise profiles own separate overlays and are not inferred here.
+- Run every transport at concurrency 1, a representative steady level,
+  and the configured N/N+1 admission boundary. Record offered/admitted/
+  completed/rejected/cancelled work, bytes, p50/p95/p99/max latency,
+  throughput, CPU, peak/resident memory, allocations where available,
+  queue depth, dropped observations, and structured shutdown time.
+- Separate cold startup/discovery/schema compilation from warmed steady
+  state. Record warmup, sample count, measurement duration, repetitions,
+  outlier rule, confidence/variance, and raw bounded samples. Never hide
+  a cold path inside warm results.
+- Freeze `fastmcp-core-performance-budget-v1` before the first candidate
+  measurement on a noncontended Linux x86_64 reference worker with at
+  least four dedicated cores and 8 GiB RAM. Initial absolute floors are:
+  minimal-server readiness within 2 seconds; 1 KiB no-op p99 at
+  concurrency 32 within 10 ms in memory, 50 ms over child stdio, and
+  100 ms over loopback HTTP JSON; steady successful throughput of at
+  least 1,000/250/250 responses per second respectively; minimal-server
+  RSS at most 256 MiB and full core-soak RSS at most 512 MiB; bounded
+  loaded shutdown within 5 seconds; aggregate compressed `.crate` size
+  at most 20 MiB, largest individual crate at most 8 MiB, stripped Linux
+  CLI at most 30 MiB; clean release compilation within 20 minutes and
+  incremental workspace check within 5 minutes on that class. Correctness,
+  LIMIT-01 ceilings, and zero-loss requirements remain absolute.
+- If an initial floor is infeasible, revise it only through a named
+  pre-measurement product-scope decision with rationale and independent
+  review; never measure the candidate and then choose a passing floor.
+  After the first accepted sealed baseline, median/p95/p99 may not
+  regress by more than 10/12/15 percent,
+  throughput may not regress by more than 10 percent, and peak RSS,
+  binary size, `.crate` size, or compile wall time may not regress by
+  more than 15 percent under the identical runner class. An absolute
+  LIMIT-01 admission, response, shutdown, or memory ceiling always wins
+  over a relative green comparison.
+- Require at least three measured repetitions per finite benchmark and
+  report the worst passing comparison, dispersion, and confidence. A
+  noisy/contended runner produces `inconclusive`, never pass; rebaseline
+  requires a named reason, before/after artifacts, and independent
+  review rather than deleting history.
+- Run an eight-hour steady-state core soak plus burst, cancellation,
+  disconnect/reconnect, cache churn, schema churn, and configuration-
+  generation phases. Sample memory/handles/threads/queues at bounded
+  intervals; require no unbounded positive growth, lost response,
+  post-terminal notification, stuck structured child, or failure to
+  drain within the configured shutdown budget.
+- Exercise overload deliberately at N/N+1 and sustained excess. Reject
+  or shed work according to LIMIT-01, preserve control/final-response
+  capacity, expose OPS-01 saturation, and recover to the pre-overload
+  ready state without restart or cross-principal starvation.
+- Measure the nine publishable crates' package file count, compressed/
+  unpacked size, largest files, facade dependency graph, clean and
+  incremental compile time, final CLI/library artifact size, and the
+  contribution of large generated/evidence sources. Establish explicit
+  alerts for the concentrated FND verifier rather than excluding test
+  sources from auditability metrics.
+- Store only redacted workload artifacts. Synthetic principals and
+  payloads are mandatory; commands, environment captures, profiles, raw
+  samples, and reports must contain no registry/auth/signing secrets or
+  production endpoint data.
+- Make CI-CORE-01 consume the content-addressed, CI-attested summary and
+  raw-artifact digest. A cryptographic signature is optional only when a
+  named external CI signer and custody policy are independently installed;
+  core PERF-01 does not depend on FND-09.
+  Per-change CI may run a bounded smoke subset; the full controlled
+  matrix and soak are required for a release candidate and cannot be
+  represented by a skipped/nightly-only badge.
+
+Acceptance:
+
+- Every core workload cell has nonempty reproducible measurements and a
+  declared threshold/result under one sealed environment/profile
+  identity.
+- No result is green when the runner is contended, a sample is missing,
+  the workload differs, an absolute safety bound fails, or only a
+  microbenchmark ran.
+- Tail latency, throughput, peak memory, queue behavior, package/binary
+  growth, compilation cost, overload recovery, and shutdown are all
+  visible; no single average hides a tail or saturation failure.
+- The eight-hour soak has no monotonic resource leak, orphan operation,
+  lost response, post-terminal output, identity/cardinality growth, or
+  readiness disagreement.
+- Rebaseline history is append-only, justified, independently reviewed,
+  and cannot silently convert a regression into success.
+- The evidence makes claims only for the modern core profile and named
+  hardware class.
+
+Tests:
+
+- Benchmark-manifest schema, digest, environment-identity, workload-
+  inventory, nonempty-sample, threshold, variance, and redaction tests.
+- Harness self-tests with injected clock distortion, CPU contention,
+  missing samples, reordered results, changed features/limits/workload,
+  stale baseline, and deliberately regressed latency/throughput/RSS/
+  binary/package/compile-time metrics.
+- Memory/handle/thread/queue leak canaries, allocator-failure and bounded-
+  OOM-admission tests, plus deterministic queue-drain/shutdown tests.
+- Concurrency 1/steady/N/N+1 and sustained-overload matrices for stdio,
+  HTTP JSON, and HTTP SSE, including response/control capacity, fairness,
+  readiness transition, and recovery.
+- Cold/warm schema, discovery, cache, exact-number, cancellation, and
+  response-routing benchmarks with correctness assertions enabled.
+- Eight-hour soak rehearsal shortened under ordinary CI plus a full
+  release-candidate soak whose interruption, skip, or empty cell fails
+  the evidence gate.
+- Package inventory/file-count/largest-file/compressed/unpacked-size,
+  clean/incremental compile, artifact-size, and facade-dependency
+  regression tests.
+
+Dependencies:
+
+- GATE-CORE-READY.
+- OPS-01.
+- DX-TEST-01.
+- TST-03.
 - CI-BASE-01.
 
 ### GATE-DUAL-READY — Aggregate previous-version readiness
@@ -28380,7 +30165,7 @@ Implementation:
 - Consume CI-BASE-01; do not redefine or weaken its blocking checks,
   advisory policy, immutable pins, or waiver rules.
 - Run default/core, no-default/minimal, and packaged core feature
-  checks for every published crate.
+  checks for every publishable crate in the planned nine-crate set.
 - Compile and run unit/security tests for every optional feature alone
   and in `--all-features` because shipped optional code must be safe
   and buildable.
@@ -28396,18 +30181,38 @@ Implementation:
   client→cache preservation, in the qualification manifest.
 - Add deterministic LabRuntime, raw-socket security, fuzz smoke, and
   scheduled extended fuzz jobs.
+- Run DX-TEST-01's complete public-helper inventory from facade-only and
+  renamed-dependency packaged consumers. Require nonempty memory, child-
+  stdio, HTTP JSON, HTTP SSE, malformed-peer, cancellation, virtual-time,
+  extension, auth, and operator-exporter categories; private workspace
+  imports or a permissive parallel protocol path fail qualification.
+- Consume PERF-01's exact content-addressed budget/workload/environment
+  manifests. Per-change CI runs the declared smoke subset; a release-
+  candidate qualification runs every controlled benchmark cell and the
+  full eight-hour soak. Missing, empty, shortened, stale-identity,
+  contended, noisy, `inconclusive`, or post-measurement-rebased evidence
+  is failure, not an optional artifact.
 - Add CONF-02's official core client/server/auth/metadata conformance
   with preflight scenario-inventory verification.
 - Add INTEROP-01's exact bidirectional cross-SDK matrix.
+- Build REL-PREP-01's coordinator in the supported platform matrix and
+  run its complete no-authority, sealed-upload, registry/GitHub sandbox,
+  journal, credential, signer, redaction, termination, and resume
+  inventory. Production endpoint access and mutation remain disabled.
 - Add `cargo package --list`, `cargo package`, and packaged-artifact
-  consumer smoke tests for every published crate in dependency order.
+  consumer smoke tests for every publishable crate in dependency order.
 - Validate workspace version/dependency alignment for planned
   `0.4.0`.
 - Upload redacted wire captures, test reports, dependency graphs,
-  package manifests, and exact source/harness pins.
+  package manifests, DX public-toolkit inventories, PERF raw/summary
+  artifacts, and exact source/harness pins.
 - Emit a machine-readable `core-2026-07-28-qualification` evidence
-  manifest and provisional `CoreReleaseProfileInventory`; do not
-  place optional readiness booleans in it.
+  manifest with a checker-derived `qualification_membership` equal to
+  CI-CORE-01's exact 79-member self-inclusive transitive closure (78
+  prerequisites plus CI-CORE-01). It is run membership, neither
+  `CoreReleaseCandidateInventory` nor `CoreReleaseProfileInventory`, and
+  carries no publication state. Do not place optional readiness booleans
+  in it.
 - Include the exact
   `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
   and
@@ -28440,6 +30245,12 @@ Acceptance:
 - A green core manifest cannot omit, close, round, reorder, or
   semantically promote a bounded unknown sibling on any selected
   complete/input-required result path.
+- A green core manifest contains every DX-TEST-01 public-helper category
+  and proves packaged downstream execution against production semantics.
+- A green release-candidate manifest satisfies PERF-01's pre-registered
+  absolute and regression budgets, controlled-runner checks, overload/
+  recovery matrix, package/compile-size inventory, and full soak. Smoke-
+  only, short-soak, missing, or inconclusive evidence cannot promote.
 - Artifacts contain no credentials, bearer material, MRTR state, or
   private payloads.
 
@@ -28454,7 +30265,18 @@ Tests:
 - Feature-matrix completeness.
 - Evidence-manifest schema and redaction tests.
 - Packaged consumer smoke test.
+- DX inventory mutation tests that remove a transport/fault/auth/
+  extension/operator category, introduce a private import, enable a
+  legacy initialization default, or replace production admission with a
+  fake and require CI failure.
+- PERF manifest mutations for missing workload/sample/budget/environment,
+  stale source, changed runner, contention/noise, shortened soak,
+  post-result rebaseline, threshold failure, and smoke-as-release
+  substitution.
 - Core-versus-optional-claim separation self-test.
+- `qualification_membership` omission/extra/endpoint/count/order and
+  mistaken-release-inventory mutation tests against the exact 79-member
+  closure.
 - Core root/stdio/HTTP `LatestOnly` era-policy manifest completeness
   and row-mutation tests, including a forbidden feature-off initialize,
   fallback, receipt, legacy selection, or lookup and a mutated stdio
@@ -28470,14 +30292,18 @@ Dependencies:
 - TST-02.
 - TST-03.
 - TST-04.
+- DX-TEST-01.
+- PERF-01.
+- REL-PREP-01.
 
 ### CI-FINAL-CORE-01 — Seal post-documentation core release evidence
 
 Outcome:
 
 Rebuild and attest the complete core release from the exact clean
-post-DOC-02 source tree, producing the only core evidence identity
-that REL-01 or an additive profile may publish against.
+post-DOC-02 source tree, producing the only core evidence identity that
+REL-01 may seal into a handoff and additive profiles may consume. REL-02
+alone may publish the sealed core artifacts.
 
 Reason:
 
@@ -28516,9 +30342,13 @@ Implementation:
   package archive unless its content-addressed provenance matches
   every bound identity field exactly. Do not silently rebuild only
   the mismatching fragment and retain unrelated stale evidence.
-- Emit the immutable `core-2026-07-28-release` manifest,
-  `CoreReleaseArtifactIdentity`, and final
-  `CoreReleaseProfileInventory`. The artifact identity contains the
+- Emit the immutable `core-2026-07-28-candidate-artifacts` manifest and
+  `CoreReleaseArtifactIdentity`, with
+  `publication_state="unpublished"` and a checker-derived
+  `final_evidence_membership` equal to CI-FINAL-CORE-01's exact
+  82-member self-inclusive transitive closure (81 prerequisites plus
+  CI-FINAL-CORE-01). This is neither named release inventory; REL-01
+  separately establishes the 83-member candidate inventory. The artifact identity contains the
   source/lock/toolchain/documentation/package bindings above and the
   manifest contains their digests, not merely a digest of the earlier
   qualification manifest.
@@ -28554,6 +30384,9 @@ Acceptance:
 - Any dirty state, source/tree/lock/documentation/package mismatch,
   missing inventory member, rebuilt byte, or stale cache fragment
   fails closed and yields no releasable identity.
+- The manifest remains explicitly `unpublished`, contains exactly its
+  82-member final-evidence closure, and cannot be parsed or displayed as
+  either the 83-member candidate or 84-member published inventory.
 
 Tests:
 
@@ -28570,11 +30403,11 @@ Tests:
   omission, stale-qualification, and mixed-artifact rejection.
 - Reject a manifest assembled from individually green results that
   belong to different source or artifact identities.
+- `final_evidence_membership` omission/extra/endpoint/count/order,
+  81-prerequisite-versus-82-self-inclusive, candidate/published-name, and
+  non-`unpublished` state mutation tests.
 
-Dependencies:
-
-- CI-CORE-01.
-- DOC-02.
+Additive promotion identity rule:
 
 Every additive `CI-*` promotion package below obeys one release
 identity rule:
@@ -28603,6 +30436,11 @@ identity rule:
   documentation path fails closed. Independent promotions do not
   imply a combined profile; only a named composition package may bind
   multiple parent promotions.
+
+Dependencies:
+
+- CI-CORE-01.
+- DOC-02.
 
 ### CI-DUAL-01 — Promote the dual-era profile from independent evidence
 
@@ -29488,12 +31326,14 @@ Dependencies:
 - CI-FINAL-CORE-01.
 - DOC-02.
 
-### REL-01 — Enforce the release gate
+### REL-01 — Seal the release gate and no-publish handoff
 
 Outcome:
 
-Ship the core `0.4.0` profile only after protocol, security, runtime,
-and documentation evidence agree.
+Seal the exact core `0.4.0` candidate, publication coordinator, and
+private release-asset bundle after protocol, security, runtime, and
+documentation evidence agree, then stop before every crates.io, tag,
+and public GitHub Release mutation.
 
 Reason:
 
@@ -29510,8 +31350,8 @@ Implementation:
   support-claim documents, and release-note digests exactly equal the
   sealed identity. Recheck the clean-state predicates immediately
   before packaging and immediately before the no-publish handoff.
-- Prepare one breaking `0.4.0` release line for all published workspace
-  crates.
+- Prepare one breaking `0.4.0` release line for all nine publishable
+  workspace crates; none is called published before REL-02 verifies it.
 - Run `cargo fmt --check`.
 - Run `rch exec -- cargo check --workspace --all-targets`.
 - Run `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`.
@@ -29520,7 +31360,10 @@ Implementation:
 - Treat the all-features command as shipped-code compile/unit/security
   safety, not evidence that any optional profile is conformant or
   supported.
-- Build documentation with warnings denied.
+- Build documentation with warnings denied, then reproduce every sealed
+  per-crate `DocsRsBuildProfile` from packaged archives in the pinned
+  network-isolated docs.rs-equivalent environment. A local rustdoc pass
+  cannot substitute for this host-compatibility preflight.
 - Run UBS on changed Rust and TOML files.
 - Run dependency security audit as a blocking check.
 - Run forbidden dependency graph check.
@@ -29588,18 +31431,73 @@ Implementation:
 - Verify every inter-crate dependency constraint, package version,
   lockfile, README path, license, repository URL, feature, and facade
   re-export is aligned to `0.4.0`.
-- Generate a release-authorization manifest that references the exact
+- Revalidate the explicit `ReleaseLicenseDecision` rather than inferring
+  from current files: all nine manifests use its single selected Cargo
+  representation, every `.crate` includes the authoritative texts and
+  excludes ambiguity, and README/docs/release notes/SBOM conclusions
+  agree. Any residual `MIT` versus rider contradiction invalidates the
+  candidate and returns to a new CI-FINAL-CORE-01 identity.
+- Generate a release-publication handoff manifest that references the exact
   CI-FINAL-CORE-01 source/lock/documentation/package identity and
   repeats the sealed archive digests. It cannot assemble green
   fragments from different identities or name a newly rebuilt
   artifact with a different digest.
+- Treat that artifact as a non-authorizing
+  `ReleasePublicationHandoff`, set `publication_authorized=false`, and
+  state that only REL-02 can consume it after a separate exact written
+  authorization. REL-01 completion, token presence, a tag, a branch
+  name, or workflow dispatch is never authorization.
+- Bind the handoff to the exact registry/repository, version `0.4.0`,
+  tag `v0.4.0`, nine-crate dependency order, every `.crate` digest,
+  release-note digest, binary/checksum/SBOM/signature/provenance subject,
+  offline/private signer output when it proves zero public side effects,
+  and both reviewed publisher/bootstrap executables and configurations,
+  workflow/provider/workload-identity policy, local/remote journal,
+  fencing, authorization-grant, and mutation-state schema digests.
+- Verify CI-BASE-01's checked-in release-workflow quarantine: tag pushes,
+  arbitrary/manual dispatches, token presence, branch/ref substitution,
+  and reruns cannot publish a crate, push/move the release tag, upload a
+  public asset, or publicize a GitHub Release without REL-02's protected
+  exact-identity authorization environment. REL-01 makes no workflow or
+  source edit after CI-FINAL-CORE-01.
+- Execute and verify REL-PREP-01's already checked-in resumable
+  coordinator, authorization-independent transaction identity,
+  append-only local WAL plus durable CAS/fenced remote journal,
+  exact Cargo Registry Web API upload-body capture, authoritative
+  registry reconciliation, dependency order, external supply-chain
+  signer, and provider-sandbox fault suites. Seal their source/binary/
+  configuration digests and exact prepublication upload bodies;
+  production mutation remains disabled.
+- Build each standalone binary twice in the declared independent clean
+  environments, record its per-target
+  `BinaryReproducibilityDisposition`, and select exactly one
+  content-addressed CI-FINAL-CORE-01 binary as the release input. Package
+  that same input twice with the sealed deterministic ustar/zstd or ZIP
+  profile and require archive-byte equality. A target with unequal binary
+  builds is explicitly non-bit-reproducible; archive equality cannot
+  promote the claim.
+- Stage cross-platform binaries, deterministic archives, checksums, SPDX
+  3.0.1 Core+Software JSON-LD SBOMs, raw unsigned in-toto Statement v1 /
+  SLSA v1.2 provenance statements, signature/provenance subject
+  manifests, release
+  notes, and only offline/private detached signatures whose provider
+  proves zero public side effects. Transparency-log, hosted-attestation,
+  public-signature-record, and other externally visible signer actions
+  are deferred to REL-02's exact authorized effect list. Verify all
+  staged names, sizes, digests, source identities, SBOM dependency/
+  feature/target/license coverage, provenance builder/parameter/
+  dependency/subject coverage, schema/conformance/JCS bytes, and
+  inventory before sealing the handoff; a missing or extra subject is
+  fatal. Unsigned statements are not represented as DSSE envelopes and
+  no unproved SLSA build level enters a claim.
 - Verify release notes identify the API break.
 - Verify support claims match final results.
 
 Acceptance:
 
-- Every core release gate and `CoreReleaseProfileInventory` entry
-  passes.
+- Every prerequisite member of `CoreReleaseCandidateInventory` other
+  than REL-01 passes; REL-01 itself is this handoff gate and REL-02
+  remains the sole pending publication endpoint.
 - An optional profile is unclaimed unless its independent CI evidence
   package is an explicit dependency of that profile's release Bead.
 - There is no expected-failure baseline.
@@ -29612,10 +31510,21 @@ Acceptance:
 - The release candidate can reproduce its evidence bundle.
 - Packaged artifacts, not merely workspace builds, pass consumer
   smoke tests.
+- The approved license representation and all docs.rs profiles are
+  exact, package-visible, claim-consistent, and preflight-green for all
+  nine publishable crates.
+- Deterministic archives reproduce byte-for-byte from sealed inputs;
+  every binary target carries an evidence-backed true/false
+  reproducibility disposition. Every staged SBOM and raw provenance
+  statement validates against its pinned format and has complete exact
+  subjects.
 - The only publishable archive set is byte-identical to the one bound
   by CI-FINAL-CORE-01, and all release checks resolve to that same
   source/tree/lock/documentation identity.
 - No publish action occurs without separate release authorization.
+- The handoff is machine-verifiable, explicitly non-authorizing, and
+  contains the exact inputs REL-02 needs without granting it permission
+  to mutate external state.
 
 Tests:
 
@@ -29634,14 +31543,24 @@ Tests:
   locations, and zero initialize/fallback/legacy lookup/state mutation
   tests.
 - Package-list/package/dry-run-or-local-registry tests for every
-  published crate plus facade-only, renamed-facade macro, minimal
+  publishable crate plus facade-only, renamed-facade macro, minimal
   server, stdio, and HTTP packaged consumers.
 - Core-versus-optional claim isolation, documentation/evidence
   consistency, artifact redaction, version/dependency/license/link
   alignment, and explicit no-publish-without-authorization assertion.
+- Tag-only, token-only, branch-name, arbitrary-dispatch, rerun, and
+  REL-01-completion negatives proving no crate publication, tag
+  creation/movement, public asset upload, or public release is possible.
+- Local registry/provider-sandbox termination and resume after every
+  coordinator state transition, ambiguous upload outcome, delayed index,
+  checksum conflict, missing asset, and journal persistence failure.
 - Mixed-commit, dirty-tree, wrong-lockfile, stale-documentation,
   mismatching-package, repackaged-archive, and cross-manifest
   identity-splice rejection.
+- License-decision, docs.rs-profile, binary-disposition, deterministic-
+  archive, SPDX/JCS, in-toto/SLSA raw-statement, exact-subject, and
+  unproved-SLSA-level mutation suites from REL-PREP-01 run against the
+  final sealed bytes rather than fixtures alone.
 
 Dependencies:
 
@@ -29650,6 +31569,376 @@ Dependencies:
 - INTEROP-01.
 - DOC-02.
 - GATE-CORE-READY.
+- REL-PREP-01.
+
+### REL-02 — Execute the authorized resumable publication transaction
+
+Outcome:
+
+Publish the exact REL-01-sealed core `0.4.0` candidate to crates.io and
+GitHub through one explicitly authorized, identity-bound, resumable
+transaction, then emit a complete publication receipt.
+
+Reason:
+
+REL-01 deliberately stops before irreversible external mutations.
+Registry versions cannot be overwritten, a partially published workspace
+cannot be rolled back atomically, and an ambiguous upload response or
+delayed index can make a blind retry unsafe. Tag creation, token presence,
+workflow dispatch, or completion of REL-01 must never be interpreted as
+publication authorization.
+
+Implementation:
+
+- Consume REL-01's content-addressed, policy-protected, read-back-
+  verified `ReleasePublicationHandoff`, exact
+  `CoreReleaseArtifactIdentity`, sealed `.crate` archive set, staged
+  release assets, release-note digest, separate publisher/bootstrap
+  executable and configuration digests, workflow/workload-identity
+  policy, `ExecutionAuthorityProfileDigest`, and journal schema. Do not
+  edit source, regenerate docs, change manifests, rebuild
+  a different candidate, or substitute equal-version/different-digest
+  bytes.
+- Require a fresh separate written `PublicationAuthorizationGrant` for
+  every coordinator invocation or resume, bound to the exact
+  handoff digest; repository, full commit, tree, registry, and GitHub
+  repository; version `0.4.0`; tag `v0.4.0`; ordered nine-package set;
+  every sealed input artifact digest; execution-authority and derived-
+  output-policy digests; exact coordinator invocation; canonical finite
+  effect automaton/ordinals/bounds; `grant_base_head`; store generation/
+  restore epoch and fencing lease; not-before/expiry/nonce; and
+  acknowledgement that crates.io uploads cannot be deleted or
+  overwritten. Signer-derived outputs that do not exist yet are
+  authorized first by exact action/subject/policy, journaled/read back,
+  then covered by a fresh later grant with their exact digests before
+  upload or publicize.
+- Apply the repository's irreversible-action ceremony. Render the exact
+  command, targets, package order, tag, assets, and effects from the
+  sealed handoff, bind them to a plan digest, and wait for a second
+  matching confirmation. Any changed input invalidates confirmation and
+  returns to read-only preflight.
+- Persist a protected authorization audit record containing the verbatim
+  initial user authorization and second confirmation, actor, trusted
+  timestamps, exact rendered command/effect automaton, affected targets,
+  and plan digest. Its digest and safe metadata enter the final receipt;
+  credentials and secret provider material never enter this record.
+- Never infer authorization from a tag, branch, token, protected-
+  environment access, workflow-dispatch event, previous publication,
+  REL-01 completion, or workflow rerun.
+- Treat the new sealed `publish-authorized.yml` identity itself as a
+  provider object in the effect automaton. Invoke the independently
+  sealed `PublicationBootstrapController` from its protected operator
+  host with a bootstrap-only grant. That grant separately names temporary
+  enablement of the exact workflow ID, creation/attachment of one
+  protected environment and workflow/source/run-bound short-lived
+  credentials, dispatch at the sealed full commit, run-ID/read-back
+  verification, post-run disablement, credential/environment revocation,
+  and each reconciliation call. The bootstrap can administer those
+  objects but cannot publish crates, tags, releases, assets, signatures,
+  or attestations. The historical workflow ID remains disabled
+  throughout. A fresh bootstrap invocation resumes cleanup after a
+  crash; failure to prove final disablement and revocation is a release
+  incident even when public artifacts otherwise verify.
+- Run the reviewed workflow publisher from a read-only clean checkout of
+  the sealed commit, after both bootstrap and publisher verify their
+  executable/configuration/workflow/ref/tree/run/credential-binding
+  identities against `ExecutionAuthorityProfileDigest`. Require
+  protected-workflow concurrency plus REL-
+  PREP-01's remote repository/registry/version/transaction lease and
+  monotonic fencing token. A local lock or workflow concurrency label
+  alone is insufficient. Persist/read back the current remote journal
+  head before every provider mutation; loss of CAS, lease, fencing,
+  renewal, or read-back stops before the next effect.
+  Require the sealed store generation/restore epoch and rollback/clone-
+  resistant external audit anchor to agree. Before dispatch persist an
+  in-flight-attempt barrier; if a lease expires after any possible byte
+  send, the next holder may only reconcile that attempt and cannot start
+  another object mutation. Fencing protects coordinator admission and
+  journal lineage, not a provider-side commit already in flight.
+- Derive `PublicationTransactionId` independently of authorization as
+  the exact REL-PREP-01 domain-separated length-prefixed binary encoding
+  of schema version, handoff digest, `ExecutionAuthorityProfileDigest`,
+  registry, repository, version, tag, ordered package set, and
+  `sealed_input_artifact_set`. Derive each renewable grant ID with its
+  distinct domain from transaction ID, actor/time/nonce,
+  `grant_base_head`, store generation/restore epoch, canonical effect-
+  automaton digest, and second confirmation. A renewed grant keeps the
+  transaction ID. No credential, signer secret, or bearer material enters
+  either identity, journal, logs, artifacts, or receipts.
+- To authorize an effect, CAS-append its `PreEffectRecord(grant_id,
+  effect_ordinal, previous_head)` from `grant_base_head` or an exact
+  authorized descendant; then require the live head to equal the
+  resulting `pre_effect_head` immediately before dispatch. Prove the
+  chain from `grant_base_head` contains only the grant-authorized prefix.
+  A resume grant binds the latest reconciled head. Bootstrap the first
+  remote lease/journal records through a separately enumerated
+  authorization-bootstrap transition; ambient storage access is not
+  authority.
+- Validate the protected authorization authority, trusted nondecreasing
+  time, unexpired/unrevoked/unconsumed grant, store generation/restore
+  epoch, fencing token, authorized prefix, and exact next effect before
+  every write. Expiry/revocation during dispatch permits read-only
+  reconciliation, never another write. Exhausting any effect/poll/byte/
+  deadline bound requires a newly rendered two-step grant.
+- Before mutation, revalidate commit/tree/clean state, `Cargo.lock`,
+  toolchain, manifests, documentation, release notes, package inventories,
+  archives, and staged assets. Verify destination, token identity and
+  every read-only introspectable owner/scope predicate, protected journal/
+  lease availability, and default-inert workflow policy without exposing
+  credentials. Record any registry permission that cannot be proven by a
+  read-only API as non-introspectable and potentially rejectable at
+  upload; never represent credential availability as proof of write
+  permission.
+- Verify all nine package/version pairs, the tag, GitHub Release, and
+  asset names are absent except for provable exact resumable state.
+  Registry checksum equality alone cannot prove FastMCP transaction
+  lineage: adoption requires the matching durable pre-effect journal
+  record, authorization lineage, sealed upload-body digest, index
+  checksum, and downloaded archive. Without all of them, stop for
+  explicit recovery direction. Reject any existing object whose
+  checksum, commit, lineage, transaction identity where supported, or
+  yank state differs.
+- Model every mutation as an immutable numbered attempt:
+  `pending -> attempt_prepared(n) -> dispatching(n)`, followed only by
+  `observed(n) -> verified`, `outcome_unknown(n)`, or a transport-proved
+  `failed_before_dispatch(n)`. Define the same formal machine for each
+  registry upload, tag creation, draft creation, asset/signing action,
+  publicize, receipt upload, anchor upload, remote segment append,
+  CAS-head advance, and lease acquire/renew/handoff/release. A timed-out
+  journal/lease mutation is read back before retry. Identity conflict
+  enters terminal `blocked_identity_conflict`; an unknown attempt never
+  returns to pending.
+- Persist and read back an append-only hash-chained remote journal record
+  immediately before and after every external side effect, mirrored to
+  the local WAL. Record transaction/grant/attempt identities, fencing
+  token, package/asset identity, prior/new state, redacted result, time,
+  and authoritative observation. Journal/lease writes are authorized
+  effects. A successful process exit is not publication proof.
+- Publish sealed packages sequentially in this dependency-safe order:
+  `fastmcp-derive`, `fastmcp-core`, `fastmcp-protocol`,
+  `fastmcp-transport`, `fastmcp-console`, `fastmcp-client`,
+  `fastmcp-server`, `fastmcp-cli`, `fastmcp-rust`.
+- Immediately before each upload, exact-consume and independently decode
+  REL-01's sealed `SealedRegistryUploadBody`; rehash its complete body,
+  metadata, embedded archive, and package/handoff identities, then send
+  those exact bytes with the narrow publisher. REL-01/CI-FINAL owns Cargo
+  packaging reproducibility; REL-02 invokes no pre-upload Cargo packaging
+  or reproduction step. Do not invoke `cargo publish` against the
+  production registry, because it repackages before upload and exposes no
+  archive-upload flag that can guarantee the sealed bytes. Post-upload
+  fresh-registry Cargo consumers remain verification, not construction.
+- Before a dependent upload, require every internal prerequisite to be
+  visible in the configured sparse index, downloadable, and checksum-
+  verified. Prove exact-version resolution from a fresh Cargo home with
+  no path dependency, patch, alternate registry, or cached package.
+- After every upload attempt, reconcile authoritative registry state:
+  inspect the exact index entry/checksum, download the registry archive,
+  and require index, downloaded, and sealed checksums to agree before
+  `checksum_verified`.
+- For each exact published crate/version, also read back crates.io package
+  metadata and require the selected `ReleaseLicenseDecision`, README,
+  repository, documentation link, rust-version, and feature metadata to
+  match the seal. Poll the exact-version docs.rs build status within a
+  bounded deadline, then read back the versioned crate page, rustdoc
+  target/feature inventory, and crates.io-to-docs.rs link. A docs.rs
+  outage or failed/mismatched build is an asynchronous publication
+  incident recorded in the journal and receipt; it never triggers yank,
+  overwrite, tag movement, or a claim that registry publication rolled
+  back. A source or metadata correction requires a newly sealed version.
+- Never treat `already uploaded`, exit zero, HTTP/API success, or one
+  registry view as proof. Read-only polls alone may use bounded retries.
+  A mutation can start another attempt automatically only when the
+  transport proves zero request-body bytes were handed off; once any
+  mutation byte may have been sent, timeout, loss, delay, absence from
+  one or every eventually consistent view, or disagreement remains
+  `outcome_unknown`. Reconcile to the exact provider object/checksum or
+  stop; any later attempted mutation requires a fresh grant bound to the
+  current journal head and remaining effects. A bounded reconciliation
+  timeout stops for review.
+- Resume only with the same transaction ID, source/tree, version,
+  package order, and digests plus a fresh current authorization grant.
+  Start at the first
+  state not authoritatively checksum-verified; workflow-local memory
+  cannot justify republishing or skipping an item.
+- After all packages verify, run fresh-registry exact-version consumers
+  with empty caches: every published library, renamed facade and macros,
+  minimal server, stdio client, HTTP client/server, and CLI install/smoke.
+  Agent-operated Cargo commands use RCH; hosted release jobs retain their
+  sealed runner identity.
+- Proceed to GitHub only after registry and fresh-consumer success. Push
+  or verify the content-addressed, policy-protected tag at the sealed
+  commit without force, create
+  or resume a draft release, and upload only sealed byte-exact input
+  binaries/archives/checksums/SBOMs/notes plus verified derived
+  signatures/provenance and a `PublicationPrecommitManifest`. Detached
+  signatures/provenance must be produced only through REL-PREP-01's
+  sealed signer policy by a grant naming the exact action and subject;
+  journal and read back their resulting bytes, then obtain a fresh grant
+  bound to those exact derived digests before upload/publicize. Every
+  transparency-log, hosted-attestation, or other public signer effect is
+  an explicit effect ordinal. Provenance signing wraps the exact sealed
+  raw in-toto/SLSA statement bytes in the approved DSSE envelope; it does
+  not regenerate or reinterpret the statement. FND-09 protocol keys are
+  never reused.
+- Require every SBOM/signature/provenance subject to name the same source
+  and asset digest. Read every draft asset back through the provider API
+  and verify name, size, digest, signature, provenance, and transaction
+  identity before making the release public.
+- After every draft asset and the precommit manifest verifies, make the
+  release public and read back its tag target, release ID, public state,
+  notes, and asset inventory. Then emit a content-addressed, policy-
+  protected, read-back-verified `PublicationTransactionReceipt` with
+  the ordered digests/ranges of every authorization/confirmation record
+  and
+  handoff digests; source/tree/lock/toolchain; package states, index
+  records, registry checksums and downloaded archives; consumer results;
+  tag/release identities; asset/SBOM/signature/provenance digests;
+  per-crate registry metadata plus exact-version docs.rs status/page/link
+  observations; and final support-profile inventory. Redact credentials.
+  Upload the receipt
+  once under its fixed digest-qualified asset name and read it back.
+  Treat the journal head through publicize as `H_public`; receipt upload/
+  read-back produces `H_receipt`. Append a separately attested
+  `ReleaseReceiptAnchor` payload binding the receipt digest, asset
+  identity, public release ID, and `H_receipt`; anchor upload/read-back
+  then produces terminal `CompletionObserved` at `H_done`. Final success
+  evidence is exactly `(receipt, anchor, CompletionObserved, H_done)`.
+  No object claims its own upload, and `H_receipt` is not called the
+  completed head. Final and periodic drift detection may
+  detect privileged out-of-band tag/asset changes; the plan does not
+  claim provider-level immutability that repository settings cannot
+  prove.
+- Never automatically yank a crate, delete/replace an asset or draft,
+  move a tag, or claim rollback. If exact resume is impossible, stop with
+  a partial-publication incident receipt. A fix requires a newly sealed
+  candidate/version; any recovery mutation needs separate authorization.
+
+Acceptance:
+
+- The checker-generated `CoreReleaseProfileInventory` is exactly the
+  84-member transitive closure of REL-02 plus REL-02 itself; every other
+  member is closed/passed before REL-02 executes, and neither a hand-
+  edited inventory nor an 83-member candidate inventory can satisfy the
+  published-stable boundary.
+- The exact-identity two-step publication authorization ceremony is
+  complete before the first external mutation, and a current grant bound
+  to the durable journal head and remaining effects is revalidated before
+  every mutation.
+- Only the sealed new workflow identity is temporarily enabled and
+  provisioned by exact bootstrap-only granted effects; its run resolves
+  to the sealed definition/source/ref/run identity, its publication
+  credentials cannot be used by another workflow, and final success
+  includes independent bootstrap provider read-back that it is disabled
+  and its short-lived environment credentials are revoked. The
+  historical workflow remains disabled.
+- Source, handoff, sealed input artifacts, order, version, tag, and
+  release notes remain byte/identity-equal to REL-01. Every REL-02-
+  derived signature/provenance output satisfies the sealed derived-
+  output policy, is journaled/read back, and is covered by a later fresh
+  exact-digest grant before upload/publicize.
+- All nine package/version pairs are index-visible, downloadable,
+  unyanked, and checksum-identical to sealed archives; prerequisites
+  verify before dependents are submitted.
+- All nine crates.io metadata records match the approved license,
+  README/repository/documentation/rust-version/feature seal. Their
+  exact-version docs.rs build/page/link observations are recorded;
+  failure or bounded-timeout is reported as an asynchronous incident,
+  never hidden as success or treated as rollback.
+- Ambiguous outcomes cannot cause blind retry, false success, or skip;
+  interrupted execution resumes from authoritative state and the durable
+  journal without repeating a verified effect.
+- Store generation/restore epoch, rollback-resistant audit anchor,
+  fenced lease, in-flight barrier, and authorized journal prefix agree;
+  a restored/clone/split-brain/stale runner cannot fork publication
+  lineage or start a competing mutation.
+- Fresh-cache registry-only consumers and exact CLI installation pass
+  without workspace paths, patches, alternate registries, or preloaded
+  packages.
+- `v0.4.0` resolves to the exact sealed commit, is policy-protected and
+  read-back-verified, and is never moved by the coordinator.
+- Every public GitHub artifact and its checksum, SBOM, signature,
+  provenance, notes, precommit manifest, completion receipt, and receipt
+  anchor resolves to the same transaction. Every provenance signature is
+  a verified DSSE envelope over the exact REL-01 raw in-toto/SLSA bytes,
+  and every SBOM/provenance subject covers the exact public asset digest.
+- The release remains draft until registry, consumers, staged assets,
+  and precommit-manifest read-back verify; the post-publication receipt
+  and separate anchor are independently verifiable and secret-free, and
+  no completion claim precedes the anchor.
+- A mismatch or unrecoverable partial publication fails closed and
+  produces no aggregate core release-success claim.
+- No yank, deletion, replacement, or tag rewrite occurs without a new
+  explicit authorization.
+
+Tests:
+
+- Canonical transaction identity, authorization binding, journal hash-
+  chain, monotonic numbered-attempt state, idempotent reconciliation,
+  package-order, and identity-conflict unit/property tests. Prove grant
+  renewal changes grant ID but not transaction ID, binds the current
+  journal head/remaining effects, and cannot reuse an expired/revoked/
+  completed grant.
+- Authorization negatives for absent/expired/replayed/wrong-actor,
+  handoff/registry/repository/version/tag/package/order/asset mismatch,
+  widened scope, wrong `grant_base_head`/authorized prefix/effect ordinal,
+  store generation/restore epoch, authority/time rollback, revocation or
+  expiry during dispatch, token-only, tag-only, and workflow-rerun cases.
+- New-workflow wrong path/ID/ref/definition digest, pre-enabled state,
+  environment/credential attachment, dispatch, run-ID substitution,
+  historical-workflow enablement, disablement failure, revocation
+  failure, second-workflow credential use, bootstrap capability widening,
+  bootstrap crash/resume, and post-run read-back ambiguity tests.
+- Competing-coordinator tests proving exclusive ownership and no
+  interleaved publication across separate runners, local locks, remote
+  lease renewal/loss, stale fencing tokens, CAS conflict, and protected-
+  workflow concurrency.
+- Remote-journal backup/restore, independent writable clone, head/fence
+  rollback, privileged tamper, retention expiry, and external audit-
+  anchor tests; lease-expiry-mid-body plus new-owner tests prove the new
+  owner can only reconcile the unresolved in-flight attempt.
+- Local-registry fault injection before/after every package side effect:
+  termination, connection loss, timeout, response loss after acceptance,
+  delayed/stale index/API, missing download, checksum conflict, exact or
+  conflicting pre-existing version, yank, dependency lag, token failure,
+  and ownership failure.
+- Reproducible-package and fresh-Cargo-home resolution tests at each
+  prerequisite layer and after all nine packages.
+- Registry-metadata and docs.rs exact-version build-status/page/target/
+  feature/link read-back tests, including delayed build, external outage,
+  failed rustdoc, wrong version/features/target/license/link, bounded
+  timeout, incident-receipt creation, and proof that no automatic yank or
+  other recovery mutation follows.
+- GitHub sandbox tests for wrong/moved tag, missing/duplicate/altered
+  asset, changed notes, checksum/SBOM/signature/provenance mismatch,
+  partial upload, provider timeout, interrupted publicize transition,
+  receipt self-reference, missing/mismatched receipt anchor, and a false
+  completion claim before anchor verification.
+- DSSE envelope tests bind payload type/base64/signature/signer to the
+  exact sealed raw statement bytes and reject regeneration, whitespace/
+  canonicalization substitution, subject drift, empty signatures, and
+  an unproved SLSA-level claim.
+- Ordered `H_public -> H_receipt -> anchor -> H_done` known-answer and
+  interruption tests proving no receipt/anchor/journal object binds its
+  own future upload and final success requires the complete four-item
+  tuple.
+- Mutation-attempt tests for registry upload, tag, draft, each asset,
+  public signer effect, publicize, receipt, and anchor, proving automatic
+  retry occurs only after transport proof that zero request-body bytes
+  were handed off and every possibly dispatched attempt stays unknown
+  until exact provider reconciliation.
+- Full terminate/resume rehearsal after every durable state transition,
+  with structured logs and final-receipt replay verification.
+- Secret canaries across command output, Cargo errors, provider replies,
+  environment capture, journal, evidence, and failure reports.
+- Recovery tests proving exact-state resume succeeds and any identity
+  drift requires a new candidate without automatic yank/overwrite/
+  deletion/replacement/tag movement.
+- Final production-endpoint no-side-effect preflight and read-back of the
+  exact rendered execution plan before second confirmation.
+
+Dependencies:
+
+- REL-01.
 
 ---
 
@@ -29664,6 +31953,7 @@ This section summarizes execution order and safe parallelism.
 ```mermaid
 flowchart TD
     SEED[FND-01<br/>frozen inputs]
+    QUAR[REL-QUAR-00<br/>ambient release quarantine]
     TRACE[FND-02<br/>traceability/checker]
     ERA[FND-03<br/>era policy]
     RUNTIME[FND-04<br/>runtime prerequisites]
@@ -29671,8 +31961,9 @@ flowchart TD
     FEATURES[FND-06<br/>feature isolation]
     FSF[FND-07<br/>capability-FS feasibility]
     ENVELOPE[FND-08<br/>protected envelope]
-    SIGNER[FND-09<br/>bounded JWS signer]
+    SIGNER[FND-09<br/>optional bounded JWS signer]
     CIBASE[CI-BASE-01<br/>early fail-closed checks]
+    RELPREP[REL-PREP-01<br/>no-authority release coordinator]
     LIMIT[LIMIT-01<br/>generic bounded admission]
     PRT[PRT-01..05<br/>wire foundation]
     SECID[AUTH-00<br/>verified identity/key derivation]
@@ -29680,24 +31971,30 @@ flowchart TD
     SCH[SCH-01..03<br/>schema engine]
     SRV[SRV-01..04 + SRV-MW-01<br/>stateless server]
     CLT[CLT-01..02<br/>concurrent client]
-    TX[STD-01 + HTTP-01..06 + XPORT-01<br/>modern transports]
+    TX[STD-01 + HTTP-01..06 + XPORT-01<br/>bound modern transports]
+    OBSBASE[OBS-01..02<br/>logging/progress foundation]
+    OPS[OPS-01<br/>bounded health/telemetry]
     LEG[LEG-01..03<br/>previous-version adapter]
     MRTR[MRTR-01..03]
     SUB[SUB-01..03]
-    CORE[TOOL + RES + PRM + CMP + OBS-01..03]
+    CORE[TOOL + RES + PRM + CMP + OBS-03]
     CACHE[CACHE-01..03]
     AUTH[AUTH-01..05 + AUTH-07<br/>core resource/client auth]
     BUILTIN[AUTH-06<br/>optional built-in issuer]
-    EXT[EXT-01]
+    EXT[EXT-01<br/>internal extension framework]
     TASK[TASK-01..03<br/>generic Tasks]
     TASKP[TASKP-01<br/>baseline local persistent adapter]
     REDIS[TASKR-01<br/>optional Redis Tasks backend]
     APP[APP-01..02]
     AUTHX[AUTHX-01..03<br/>auth profiles/composition]
     PXY[PXY-01..04 + optional legacy/task add-ons]
-    DX[MAC-01 + API-01 + CLI-01 + DOC-01]
+    DX[MAC-01 + API-01 + CLI-01]
+    EXTDEV[EXT-DEV-01<br/>external compile-linked extensions]
+    DXTEST[DX-TEST-01<br/>public production-faithful test kit]
+    DOCPROV[DOC-01<br/>provisional docs]
     TEST[TST-01..04]
     GCORE[GATE-CORE-READY]
+    PERF[PERF-01<br/>capacity/performance/soak evidence]
     CONF1[CONF-01 adapters]
     CONF2[CONF-02 zero baseline]
     INTEROP[INTEROP-01<br/>pinned SDK matrix]
@@ -29708,21 +32005,31 @@ flowchart TD
     PROFILECI[independent optional-profile CI evidence]
     REDISCI[CI-REDIS-TASKS-01]
     DOC[DOC-02]
-    REL[REL-01]
+    RELHANDOFF[REL-01<br/>sealed no-publish handoff]
+    RELPUBLISH[REL-02<br/>separately authorized publication]
 
     SEED --> TRACE
     SEED --> ERA
-    TRACE --> RUNTIME
+    QUAR --> CIBASE
     TRACE --> CIBASE
+    TRACE --> RUNTIME
     ERA --> FEATURES
     CIBASE --> FEATURES
     RUNTIME --> LIMIT
     RUNTIME --> HTTPF
+    LIMIT --> HTTPF
+    RUNTIME --> FSF
     LIMIT --> FSF
+    RUNTIME --> ENVELOPE
     LIMIT --> ENVELOPE
+    CIBASE --> RELPREP
+    RUNTIME --> RELPREP
+    HTTPF --> RELPREP
+    FSF --> RELPREP
     LIMIT --> PRT
+    RUNTIME --> SIGNER
+    LIMIT --> SIGNER
     PRT --> SIGNER
-    ERA --> PRT
     LIMIT --> SECID
     PRT --> HDR
     LIMIT --> HDR
@@ -29734,9 +32041,18 @@ flowchart TD
     PRT --> EXT
     ENVELOPE --> SRV
     HTTPF --> TX
+    HDR --> TX
     SRV --> TX
     CLT --> TX
     EXT --> TX
+    SRV --> OBSBASE
+    CLT --> OBSBASE
+    TX --> OBSBASE
+    OBSBASE --> OPS
+    TX --> OPS
+    SECID --> OPS
+    OPS --> MRTR
+    OPS --> SUB
     TX --> SUB
     SRV --> MRTR
     CLT --> MRTR
@@ -29747,6 +32063,8 @@ flowchart TD
     CORE --> CACHE
     TX --> AUTH
     ENVELOPE --> AUTH
+    OPS --> AUTH
+    OPS --> CACHE
     AUTH --> CACHE
     AUTH --> BUILTIN
     ENVELOPE --> BUILTIN
@@ -29754,6 +32072,7 @@ flowchart TD
     CORE --> TASK
     EXT --> TASK
     ENVELOPE --> TASK
+    OPS --> TASK
     TASK --> TASKP
     FEATURES --> TASKP
     FSF --> TASKP
@@ -29769,6 +32088,8 @@ flowchart TD
     LEG --> OPTGATES
     CACHE --> PXY
     AUTH --> PXY
+    OPS --> PXY
+    EXTDEV --> PXY
     TASK --> OPTGATES
     TASKP --> OPTGATES
     APP --> OPTGATES
@@ -29779,11 +32100,21 @@ flowchart TD
     OPTGATES --> REDISGATE
     CORE --> DX
     AUTH --> DX
+    OPS --> DX
+    DX --> EXTDEV
+    EXT --> EXTDEV
+    TX --> EXTDEV
+    EXTDEV --> DXTEST
+    DX --> DXTEST
+    DXTEST --> DOCPROV
+    OPS --> DOCPROV
     PRT --> TEST
     TX --> TEST
     MRTR --> TEST
     AUTH --> TEST
     DX --> GCORE
+    EXTDEV --> GCORE
+    OPS --> GCORE
     CACHE --> GCORE
     AUTH --> GCORE
     TX --> GCORE
@@ -29799,21 +32130,32 @@ flowchart TD
     CONF1 --> CONF2
     TEST --> CONF2
     GCORE --> INTEROP
+    GCORE --> PERF
+    OPS --> PERF
+    DXTEST --> PERF
+    TEST --> PERF
+    CIBASE --> PERF
     CONF2 --> CORECI
     INTEROP --> CORECI
     TEST --> CORECI
+    DXTEST --> CORECI
+    PERF --> CORECI
+    RELPREP --> CORECI
     CIBASE --> OPTGATES
     OPTGATES --> PROFILECI
     REDISGATE --> REDISCI
     CORECI --> DOC
+    DOCPROV --> DOC
     CORECI --> FINALCI
     DOC --> FINALCI
     FINALCI --> PROFILECI
     FINALCI --> REDISCI
     DOC --> PROFILECI
     DOC --> REDISCI
-    FINALCI --> REL
-    GCORE --> REL
+    FINALCI --> RELHANDOFF
+    GCORE --> RELHANDOFF
+    RELPREP --> RELHANDOFF
+    RELHANDOFF --> RELPUBLISH
 ```
 
 Arrows mean prerequisite → dependent. Grouped nodes are a readability
@@ -29821,9 +32163,12 @@ projection only; they do not add an edge between every member. This
 graph intentionally omits several cross-links shown in individual
 packages and must never be used to infer claim readiness.
 
-The Beads graph is the machine-checked version.
+The package dependency lists are the current planning-order graph. The
+Beads graph becomes its machine-checked execution projection only after
+Section 36's safe rematerialization, exact equality check, and clean
+doctor/sync/checker gates; the present tracker is not that projection.
 
-The only intentional terminal sinks are REL-01 and the optional
+The only intentional terminal sinks are REL-02 and the optional
 promotion/claim endpoints CI-APPS-01, CI-EMA-BUILTIN-01,
 CI-EXPERIMENTAL-AUTH-01, CI-PROXY-DUAL-01,
 CI-PROXY-TASKS-01, and CI-REDIS-TASKS-01. CI-EMA-01 and
@@ -29831,14 +32176,21 @@ CI-BUILTIN-AUTH-01 feed their composition, while CI-DUAL-01,
 CI-TASKS-01, and CI-PROXY-01 feed proxy or Redis compositions, so none
 is terminal in the complete plan graph.
 An orphan check must reject any other terminal implementation or
-verification issue.
+verification issue. REL-01 is deliberately not a sink: it seals a
+non-authorizing handoff, and only REL-02 can complete the separately
+authorized external publication transaction.
 
 ### 24.2 Critical path to core support
 
 The likely critical path is:
 
-1. FND-01 is the sole seed; FND-02 follows and makes tracker/checker
-   enforcement available.
+1. There are two intentional seeds with different authority boundaries.
+   REL-QUAR-00 is the emergency safety seed and must quarantine both the
+   current workflow source and provider-side historical workflow/token
+   reachability before ordinary implementation continues. FND-01 is the
+   implementation-evidence seed; FND-02 follows it and makes tracker/
+   checker enforcement available. Neither seed closes or authorizes the
+   other.
 2. FND-04 follows FND-02 and remains blocked until its three published
    runtime/I/O prerequisites exist.
 3. LIMIT-01 follows FND-04 and defines only the sealed generic quota
@@ -29860,24 +32212,42 @@ The likely critical path is:
    correlation registry.
 8. HTTP-01 as soon as its own prerequisites land; STD-01 and
    HTTP-02/03 after their exact EXT-01 edges.
-9. MRTR-01 through MRTR-03 and SUB-01 through SUB-03.
-10. TOOL, RES, PRM, CMP, OBS, and schema/macro tracks; RES-01 also
+9. OBS-01/02 establish the logging/progress substrate. OPS-01 then
+   establishes bounded operational state for the core server, client,
+   stdio, and HTTP surfaces; every later auth/cache/subscription/proxy/
+   task integration owns its additive contributor semantics.
+10. MRTR-01 through MRTR-03 and SUB-01 through SUB-03.
+11. TOOL, RES, PRM, CMP, OBS-03, and schema/macro tracks; RES-01 also
     waits for FND-07.
-11. CACHE-01 plus AUTH-01 through AUTH-05/AUTH-07, then CACHE-02
+12. CACHE-01 plus AUTH-01 through AUTH-05/AUTH-07, then CACHE-02
     and CACHE-03 where their exact dependencies permit.
-12. HTTP-04 through HTTP-06 and XPORT-01.
-13. MAC-01, API-01, CLI-01, and DOC-01.
-14. TST-01 through TST-04 and GATE-CORE-READY.
-15. CONF-01 closes only after GATE-CORE-READY so its complete fixture
+13. HTTP-04 through HTTP-06 and XPORT-01.
+14. MAC-01 precedes API-01. Once API-01 and the final extension/
+    transport/schema prerequisites land, CLI-01 and EXT-DEV-01 can
+    proceed in parallel; DX-TEST-01 then freezes the public production-
+    faithful test kit. DOC-01 can materialize the resulting provisional
+    documentation after both CLI-01 and DX-TEST-01.
+15. TST-01 through TST-04 and GATE-CORE-READY.
+16. CONF-01 closes only after GATE-CORE-READY so its complete fixture
     inventory cannot outrun the implementation it exercises; CONF-02
     and INTEROP-01 then follow their remaining test prerequisites.
-16. CI-CORE-01 qualification, DOC-02 claim materialization,
+17. PERF-01 measures the already gated implementation and runs its
+    controlled capacity and soak matrix. REL-PREP-01 may develop and
+    fault-test the no-authority coordinator earlier, but CI-CORE-01
+    admits only its final sealed evidence.
+18. CI-CORE-01 qualification, DOC-02 claim materialization,
     CI-FINAL-CORE-01's clean post-documentation rebuild/seal, and then
-    REL-01 for the `0.4.0` core profile.
+    REL-01's non-authorizing `0.4.0` handoff.
+19. REL-02 is the sole publication endpoint. It remains closed until a
+    separate exact-identity two-step authorization permits the sealed
+    resumable crates.io/GitHub transaction and its receipt anchor
+    verifies.
 
 This is a planning spine, not a substitute for the graph-computed
-critical path. Section 36's frozen `bv --robot-insights` snapshot and
-each package's explicit edges are authoritative for scheduling.
+critical path. Until the post-revision Beads rematerialization and fresh
+Section 36 evidence complete, each formal package's dependency list is
+planning-order truth only, never claim/readiness authority. Historical
+Section 36 snapshots are not current readiness or release evidence.
 
 ### 24.3 Parallel track A — schema and type fidelity
 
@@ -29924,7 +32294,7 @@ parser package.
 
 ### 24.5 Parallel track C — server features
 
-After SRV-01, SRV-04, MRTR-01, SUB-01, and SCH-01:
+After SRV-01, SRV-04, OPS-01, MRTR-01, SUB-01, and SCH-01:
 
 - tools;
 - resources;
@@ -29935,6 +32305,10 @@ After SRV-01, SRV-04, MRTR-01, SUB-01, and SCH-01:
 - tracing.
 
 Each feature must merge its own unit and wire tests.
+OBS-01/02 precede OPS-01; OBS-03 may proceed with the feature group
+after the core operational snapshot contract is fixed. Grouping the
+three OBS packages into a node before OPS-01 would create a misleading
+projected cycle and is forbidden in generated planning diagrams.
 
 ### 24.6 Parallel track D — authorization
 
@@ -29953,6 +32327,13 @@ neither signing implementation is smuggled into the core profile.
 ### 24.7 Parallel track E — extensions
 
 EXT-01 begins after capability and result registries.
+
+EXT-DEV-01 follows the final internal extension registry, bound
+transports, schema admission, and public API. It exposes only a
+compile-linked, capability-bounded downstream authoring contract; it
+does not promise a dynamic plugin ABI. DX-TEST-01 follows EXT-DEV-01
+and supplies packaged-consumer test support without production-only
+authorities or hidden runtime construction.
 
 Then:
 
@@ -29986,6 +32367,10 @@ support.
 
 PXY-01 begins after modern negotiation and the generic client.
 
+It also waits for OPS-01 and EXT-DEV-01 so proxy contributors and the
+public external extension boundary are tested at their real ownership
+points rather than retrofitted after promotion.
+
 Result/cache proxying follows MRTR and client caching.
 
 Core subscription proxying waits for subscription streams.
@@ -29999,6 +32384,8 @@ header projection.
 
 Checkpoint A:
 
+- REL-QUAR-00 source and separately authorized provider-side quarantine
+  evidence, with every historical run explicitly dispositioned;
 - strict JSON-RPC;
 - request/result metadata;
 - versions and errors;
@@ -30043,7 +32430,10 @@ Checkpoint F:
 
 Checkpoint G:
 
-- core macros/API/CLI and provisional docs;
+- bounded operator snapshot and readiness semantics;
+- core macros/API/CLI;
+- compile-linked external extension authoring contract;
+- production-faithful public testing kit and provisional docs;
 - GATE-CORE-READY.
 
 Checkpoint H:
@@ -30051,10 +32441,18 @@ Checkpoint H:
 - official conformance;
 - zero baseline;
 - pinned cross-SDK matrix;
+- capacity/performance matrix and required soak evidence;
+- no-authority release-coordinator/provider-sandbox evidence;
 - CI core qualification manifest;
 - evidence-backed docs;
 - final clean-tree rebuild, sealed package identities, and release
-  evidence.
+  evidence;
+- REL-01 non-authorizing publication handoff.
+
+Checkpoint I:
+
+- separately authorized REL-02 registry/GitHub transaction, completion
+  receipt, and receipt anchor.
 
 Optional checkpoints are the named dual-era, Tasks, Redis Tasks
 backend, Apps, enterprise authorization, built-in authorization-
@@ -30072,6 +32470,8 @@ The plan distinguishes protocol support from extension support.
 
 Required:
 
+- REL-QUAR-00's source and separately authorized provider-side ambient-
+  release quarantine; the historical workflow identity remains disabled.
 - FND-01 through FND-08 and LIMIT-01. FND-09 is excluded.
 - PRT-01 through PRT-05, HDR-01, and AUTH-00.
 - SRV-01 through SRV-04 and SRV-MW-01.
@@ -30081,22 +32481,37 @@ Required:
 - SUB-01 through SUB-03.
 - TOOL-01/02, RES-01/02, PRM-01/02, and CMP-01.
 - OBS-01 through OBS-03.
+- OPS-01.
 - SCH-01 through SCH-03.
 - CACHE-01 through CACHE-03.
 - AUTH-01 through AUTH-05 and AUTH-07.
 - EXT-01's generic extension framework, with no optional extension
   enabled.
+- EXT-DEV-01's compile-linked external authoring contract, with no
+  dynamic plugin ABI or implicitly installed extension.
 - MAC-01, API-01, and CLI-01.
+- DX-TEST-01's production-faithful public testing toolkit; its Lab-only
+  helpers remain separately feature-gated.
 - TST-01 through TST-04.
 - GATE-CORE-READY.
+- PERF-01.
 - CONF-01 and CONF-02 core scenarios.
 - INTEROP-01.
 - CI-BASE-01, CI-CORE-01 qualification evidence, and
   CI-FINAL-CORE-01 sealed post-documentation core evidence.
+- REL-PREP-01's no-authority coordinator, selected-production-provider
+  feasibility/read-only evidence, and provider-sandbox evidence.
 - DOC-01 and DOC-02 core documentation.
-- REL-01.
+- REL-01's sealed non-authorizing handoff.
+- REL-02's separately authorized resumable publication transaction and
+  completion receipt anchor.
 
-This profile is the minimum for claiming core support.
+This inventory is the minimum for claiming a published stable core
+`0.4.0` release. CI-FINAL-CORE-01 and REL-01 may establish an evidence-
+backed but explicitly unpublished release candidate. Refusal, expiry,
+or absence of publication authorization leaves REL-02 open and must not
+falsify the candidate's technical conformance evidence or turn the
+candidate into a published-release claim.
 Its first planned release is `0.4.0`.
 Its transport/version identity binds
 `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
@@ -30118,19 +32533,29 @@ extension-policy case.
 
 `CoreImplementationInventory` is the exact direct dependency set
 listed under GATE-CORE-READY.
-It contains implementation packages and CI-BASE-01, but not the gate
+It contains exactly 66 packages: implementation packages and
+CI-BASE-01, but not the gate
 itself or downstream conformance, interop, evidence, documentation, or
 release packages.
 
+`CoreReleaseCandidateInventory` is the complete transitive closure of
+REL-01 plus REL-01 itself. It contains exactly 83 packages and is the
+release-ready, no-publish evidence boundary.
+
 `CoreReleaseProfileInventory` is the complete transitive closure of
-REL-01's core dependencies plus REL-01 itself.
-It includes GATE-CORE-READY, CONF-01/02, INTEROP-01, TST-01..04,
-CI-BASE-01, CI-CORE-01, CI-FINAL-CORE-01, DOC-01/02, and the
-implementation closure.
+REL-02 plus REL-02 itself. It contains exactly 84 packages and is the
+published-stable boundary. Both include GATE-CORE-READY, CONF-01/02,
+INTEROP-01, TST-01..04, CI-BASE-01, OPS-01, EXT-DEV-01,
+DX-TEST-01, PERF-01, REL-PREP-01, CI-CORE-01,
+CI-FINAL-CORE-01, DOC-01/02, REL-QUAR-00, REL-01, and the
+implementation closure;
+only the published inventory includes REL-02.
 It excludes every optional profile gate and evidence package.
 
-The generated Beads checks compare these two named inventories
-separately.
+The generated Beads checks compare all three named inventories
+separately. REL-01 acceptance references
+`CoreReleaseCandidateInventory`; REL-02 acceptance references
+`CoreReleaseProfileInventory`.
 
 ### 25.2 Dual-era profile
 
@@ -30536,6 +32961,40 @@ handle mappings. The Tasks proxy add-on additionally proves exact inert
 preservation of nested completed-`CallToolResult` open siblings across
 both proxy legs.
 
+The dependency extractor must reproduce this exact closure table from
+the package-local `Dependencies:` lists. Counts include the named CI
+endpoint itself. They are inventory checks, not support claims:
+
+| Profile endpoint | Canonical full-closure Beads label | Exact transitive closure |
+|---|---|---:|
+| `REL-01` core release candidate | `profile-core-candidate` | 83 |
+| `REL-02` core release | `profile-core-published` | 84 |
+| `CI-DUAL-01` dual era | `profile-dual-era` | 87 |
+| `CI-TASKS-01` Tasks | `profile-tasks` | 90 |
+| `CI-REDIS-TASKS-01` Redis Tasks | `profile-redis-tasks` | 93 |
+| `CI-APPS-01` Apps | `profile-apps` | 86 |
+| `CI-EMA-01` enterprise authorization | `profile-enterprise-auth` | 85 |
+| `CI-BUILTIN-AUTH-01` built-in authorization server | `profile-builtin-auth-server` | 86 |
+| `CI-EMA-BUILTIN-01` enterprise + built-in composition | `profile-enterprise-builtin` | 92 |
+| `CI-EXPERIMENTAL-AUTH-01` experimental auth | `profile-experimental-auth` | 86 |
+| `CI-PROXY-01` modern proxy | `profile-proxy` | 88 |
+| `CI-PROXY-DUAL-01` proxy + dual era | `profile-proxy-dual` | 96 |
+| `CI-PROXY-TASKS-01` proxy + Tasks | `profile-proxy-tasks` | 99 |
+
+Every label names the endpoint's complete transitive closure, including
+the endpoint itself; none names only the optional delta over core. A
+formal issue may therefore carry multiple labels when it belongs to
+multiple closures. The checker derives membership from package edges and
+rejects an omitted/extra label or a delta-only projection.
+
+The formal graph has exactly 129 work packages and 662 prerequisite
+edges in this plan revision, two intentional seeds (`FND-01` and
+`REL-QUAR-00`), no unresolved package IDs, no cycles, and the seven
+terminal sinks named in Section 24.1.
+Changing any package or dependency regenerates this table, the release
+inventories, the canonical graph artifact, and the Beads projection in
+one reviewed transaction.
+
 ### 25.10 Cargo feature and propagation matrix
 
 Core `2026-07-28` behavior is compiled unconditionally in each
@@ -30560,8 +33019,21 @@ Every row below is optional and defaults off.
 | `proxy-tasks` | Tasks descriptor | — | `proxy` + `tasks` | Tasks client | — | task-proxy rendering | composite commands | S/C/O | must imply both base features |
 | `websocket-experimental` | — | bounded frame codec | already-upgraded stream adapter only | already-upgraded stream adapter only | — | experimental label | diagnostics only | T/S/C/O | nonstandard, default off, no Upgrade/endpoint/connector/CLI activation, never core evidence |
 | `redis-tasks` | — | — | `tasks` + optional Redis backend | — | — | backend diagnostics | backend config | S/O | Redis graph remains Tokio-free |
-| `jwt-resource-auth` | shared JOSE admission/RS256 | — | direct ring verifier | — | — | redacted rendering | auth config | P/S/O | resource-server verification only; no process-global JWT provider |
-| `safe-icon-rendering` | — | — | — | credentialless bounded PNG/JPEG/static-WebP/static-SVG fetch/decode | — | metadata only | explicit opt-in | C | metadata-only remains default; exact same-origin HTTPS or data only; no redirects, animation, or external SVG resources |
+| `jwt-resource-auth` | shared JOSE admission/RS256 | — | direct ring verifier | — | — | redacted rendering | auth config | P/S/O | experimental/unclaimed resource-server verification only; no process-global JWT provider or stable support inference |
+| `safe-icon-rendering` | — | — | — | credentialless bounded PNG/JPEG/static-WebP/static-SVG fetch/decode | — | metadata only | explicit opt-in | C | experimental/unclaimed; metadata-only remains default; exact same-origin HTTPS or data only; no redirects, animation, external SVG resources, or stable support inference |
+| `testing` | — | — | — | — | — | — | — | public production-faithful test kit | F | non-default downstream ergonomics; no `test-internals`, trusted-ingress constructor, hidden runtime, or protocol/profile activation |
+| `testing-lab` | — | — | — | — | — | — | — | LabRuntime/virtual-time/DPOR test helpers | F | implies `testing`; the sole feature allowed to activate `asupersync/test-internals`; intended only on a consumer's dev-dependency graph |
+
+`safe-icon-rendering` and `jwt-resource-auth` are public opt-ins but are
+deliberately experimental and unclaimed in the `0.4.0` profile graph.
+Their isolated/all-feature/package tests prove shipped-code safety only;
+they have no `profile-*` label, release gate, CI promotion endpoint, or
+stable/support claim. Documentation, CLI output, evidence manifests, and
+the tracker checker must reject wording or projection that treats either
+feature's presence or a green CI-CORE-01 safety build as qualified
+support. A future support claim requires its own named GATE, CI evidence,
+promotion endpoint, dependencies, and regenerated closure; it cannot be
+retrofit by editing this paragraph or a feature flag alone.
 
 The target feature equations below are normative. `dep:` denotes the
 optional dependency edge that must appear literally in the owning
@@ -30577,7 +33049,7 @@ An omitted crate/feature pair does not exist.
 | `fastmcp-derive` | `tasks=[]` |
 | `fastmcp-console` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps"]`; `enterprise-auth=[]`; `experimental-client-credentials=[]`; `builtin-auth-server=[]`; `proxy=[]`; `proxy-legacy=["proxy","legacy-2025-11-25"]`; `proxy-tasks=["proxy","tasks"]`; `websocket-experimental=[]`; `redis-tasks=["tasks"]`; `jwt-resource-auth=[]` |
 | `fastmcp-cli` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25","fastmcp-client/legacy-2025-11-25","fastmcp-console/legacy-2025-11-25","fastmcp-server?/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-client/tasks","fastmcp-console/tasks","fastmcp-server?/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-client/apps","fastmcp-console/apps","fastmcp-server?/apps"]`; `enterprise-auth=["fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth","fastmcp-server?/enterprise-auth"]`; `experimental-client-credentials=["fastmcp-client/experimental-client-credentials","fastmcp-console/experimental-client-credentials","fastmcp-server?/experimental-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["dep:fastmcp-server","fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["dep:fastmcp-server","fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental","fastmcp-server?/websocket-experimental"]`; `redis-tasks=["tasks","dep:fastmcp-server","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["dep:fastmcp-server","fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]` |
-| `fastmcp-rust` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25","fastmcp-server/legacy-2025-11-25","fastmcp-client/legacy-2025-11-25","fastmcp-console/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-server/tasks","fastmcp-client/tasks","fastmcp-derive/tasks","fastmcp-console/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-server/apps","fastmcp-client/apps","fastmcp-console/apps"]`; `enterprise-auth=["fastmcp-server/enterprise-auth","fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth"]`; `experimental-client-credentials=["fastmcp-server/experimental-client-credentials","fastmcp-client/experimental-client-credentials","fastmcp-console/experimental-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-server/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental"]`; `redis-tasks=["tasks","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]` |
+| `fastmcp-rust` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25","fastmcp-server/legacy-2025-11-25","fastmcp-client/legacy-2025-11-25","fastmcp-console/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-server/tasks","fastmcp-client/tasks","fastmcp-derive/tasks","fastmcp-console/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-server/apps","fastmcp-client/apps","fastmcp-console/apps"]`; `enterprise-auth=["fastmcp-server/enterprise-auth","fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth"]`; `experimental-client-credentials=["fastmcp-server/experimental-client-credentials","fastmcp-client/experimental-client-credentials","fastmcp-console/experimental-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-server/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental"]`; `redis-tasks=["tasks","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]`; `testing=[]`; `testing-lab=["testing","asupersync/test-internals"]` |
 
 Each facade feature forwards only the cells shown.
 The CLI mirrors the same feature names; it does not silently compile
@@ -30592,6 +33064,28 @@ feature plus `jwt-resource-auth`; the enabled optional server may never
 silently lack the matching feature.
 Console's existing Rich rendering features remain orthogonal and do
 not activate protocol behavior.
+
+The facade's `testing` module is absent unless `testing` or
+`testing-lab` is selected. `testing` assembles only production public
+APIs and must not expose `LabRuntime`, out-of-band `Cx` constructors, or
+`asupersync/test-internals`. `testing-lab` implies `testing` and is the
+one reviewed edge to `asupersync/test-internals`; no workspace-root or
+component-crate dependency enables that asupersync feature. Downstream
+documentation places a `testing-lab` facade dependency under
+`[dev-dependencies]`. Cargo cannot enforce dependency kind, so the
+support manifest explicitly records that selecting it in a production
+normal dependency is unsupported and causes the normal selected-feature
+tree to contain test internals. The honest invariant is that default,
+no-default, ordinary `testing`, release, and every non-Lab profile tree
+exclude `test-internals`, not that Cargo can hide an explicitly selected
+feature from its own normal dependency tree.
+
+DX-TEST-01 removes unconditional facade/core `LabRuntime`, `LabConfig`,
+and test-context re-exports. Production-faithful helpers use a caller-
+supplied runtime/scope capability; Lab-only helpers live under a nested
+`testing::lab` module compiled only by `testing-lab`. Packaged-consumer
+compile tests prove both the positive surface and the absence of those
+symbols in default and ordinary-`testing` builds.
 
 `fastmcp-server` makes `fastmcp-client` an optional dependency enabled
 only by `proxy` or a proxy add-on.
@@ -30673,7 +33167,7 @@ fastmcp-rust:           ""; legacy-2025-11-25; tasks; apps;
                         enterprise-auth,builtin-auth-server;
                         proxy; proxy-legacy;
                         proxy-tasks; websocket-experimental; redis-tasks;
-                        jwt-resource-auth
+                        jwt-resource-auth; testing; testing-lab
 ```
 
 That block is the exact empty/single/declared-composite inventory, not
@@ -30692,6 +33186,15 @@ fastmcp-cli bases =
 fastmcp-rust bases =
   server bases ∪ {safe-icon-rendering}
 ```
+
+`testing` and `testing-lab` are deliberately excluded from the protocol-
+profile pair generator: they receive their own exact four-cell toolkit
+matrix (`default`, `testing`, `testing-lab`, and the redundant explicit
+`testing,testing-lab` form), packaged dev-consumers, and tree assertions.
+The last two cells must resolve identically. Every other feature cell,
+including `--all-features`, is checked for the expected presence or
+absence of `test-internals`; all-features remains safety evidence and is
+never core-profile evidence.
 
 For each listed package, emit the canonical comma-sorted,
 duplicate-free pair `{base, anchor}` for every applicable base and
@@ -30736,6 +33239,10 @@ The three tree views for every cell are machine-checked for exact
 propagation, absence of `fastmcp-client` from a core-only server,
 absence of unrelated composite features, and prohibited runtime
 dependencies.
+For the toolkit matrix they additionally prove that `testing` alone has
+no `test-internals`, `testing-lab` has exactly the one facade-to-
+asupersync activation edge, no component package forwards that feature,
+and default/package/release consumers cannot name Lab-only symbols.
 Fresh external consumer projects install the packaged artifacts for
 each supported direct-crate, CLI, and facade profile, proving the same
 imports/commands with no workspace feature unification.
@@ -30755,6 +33262,13 @@ Implementation agents must re-inspect current contents before editing.
 
 `Cargo.toml`
 
+- add the non-publishable `tools/xtask` workspace member while keeping
+  it out of every nine-package publication/package inventory and every
+  FastMCP crate dependency graph;
+- add the non-publishable `tools/release-coordinator` workspace member
+  under the same publication/dependency isolation rule; set
+  `[workspace.lints.rust] unsafe_code = "forbid"` and require every
+  workspace member, including both tools, to inherit it without override;
 - pin `jsonschema 0.49.2` with default features disabled;
 - pin `serde_json 1.0.151` with arbitrary precision, common
   `url 2.5.8`, `zeroize 1.9.0` with default features disabled and only
@@ -30792,6 +33306,9 @@ Implementation agents must re-inspect current contents before editing.
   the final reviewed release with `default-features = false` and exact
   `nightly-outcome-try,tls,tls-native-roots` (or the documented exact
   successor equivalents proven by FND-04/FND-05);
+- give only the facade's non-default `testing-lab` feature the literal
+  `asupersync/test-internals` activation edge; `testing` alone and all
+  default/release/component graphs remain free of it;
 - implement the exact Section 25.10 per-crate features and propagation;
 - make `fastmcp-server`'s `fastmcp-client` dependency optional under
   proxy features;
@@ -30800,7 +33317,10 @@ Implementation agents must re-inspect current contents before editing.
   and experimental WebSocket masks through distinct sealed core
   methods;
 - add forbidden dependency metadata/check support if needed;
-- preserve explicit version policy.
+- preserve explicit version policy;
+- apply the explicit reviewed `ReleaseLicenseDecision` consistently and
+  add the exact per-crate `[package.metadata.docs.rs]` profile to every
+  one of the nine publishable manifests.
 
 `rust-toolchain.toml`
 
@@ -30816,7 +33336,19 @@ Implementation agents must re-inspect current contents before editing.
 
 `README.md`
 
-- rewrite lifecycle, auth, transport, limitations, and support claims.
+- rewrite lifecycle, auth, transport, limitations, license wording, and
+  support claims; compile every Rust fence with its claimed return type
+  and execute every named example command. In particular, correct the
+  current `ctx.checkpoint()?` examples whose handlers claim bare return
+  types and the nonexistent `cargo run --example server` command.
+
+`LICENSE`, `LICENSE-MIT`, every crate/package license inclusion, and
+related README/site/release wording
+
+- do not infer away the current `MIT` versus additional-rider conflict;
+  apply only the explicitly approved `ReleaseLicenseDecision`, preserve
+  any retained nonauthoritative text with an unambiguous label, and make
+  Cargo metadata, archives, SBOM conclusions, and public wording agree.
 
 `FEATURE_PARITY.md`
 
@@ -30836,11 +33368,121 @@ Implementation agents must re-inspect current contents before editing.
 - make dependency audit blocking;
 - preserve existing Rust checks.
 
+Dedicated checked-in CI workflow/job definitions, using the existing
+workflow layout unless separation is required by provider permissions:
+
+- serialize same-repository RCH-backed compilation jobs or give them
+  disjoint target identities so the matrix cannot create build
+  contention;
+- run the exact feature/toolkit/package matrices and graph assertions;
+- run bounded performance checks on a pinned reference runner and the
+  eight-hour soak only on its controlled scheduled/release-candidate
+  lane, with complete logs retained on failure;
+- run local registry/GitHub-provider release fault rehearsals with no
+  production credentials or external mutation authority;
+- fail on a skipped/missing tool, artifact, inventory cell, or evidence
+  upload rather than converting infrastructure absence to success.
+
 `.github/workflows/release.yml`
 
-- replace every floating nightly with the exact FND-01 toolchain;
-- run the packaged profile/dependency/provenance gates before publish;
-- keep release and CI toolchain/target manifests byte-consistent.
+- REL-QUAR-00 replaces this path with a read-only, secret-free,
+  non-publishing diagnostic and permanently disables its historical
+  GitHub workflow ID under separate provider-side authorization. Never
+  re-enable or repurpose this path for production publication; old refs
+  retain their old YAML even after main changes.
+
+`.github/workflows/publish-authorized.yml`, introduced by REL-PREP-01
+and sealed before REL-01
+
+- use a new path/workflow identity absent from historical refs;
+- after a separately authorized safety-only initial disable, remain
+  provider-disabled, manual-only, credentialless, environmentless,
+  arbitrary-ref rejecting, and unable to pass coordinator authorization
+  throughout preparation/sealing;
+- invoke the sealed REL-PREP-01 publisher only after REL-02's exact
+  protected two-step authorization, provider selection, remote journal/
+  lease admission, and read-only identity preflight;
+- keep release and CI toolchain/target manifests byte-consistent and
+  persist the protected transaction journal before the first external
+  effect. Temporary enablement, protected-environment provisioning,
+  dispatch, post-run disablement, and credential revocation are separate
+  REL-02 effects executed/reconciled by the separately sealed bootstrap
+  controller. Provider-side workload identity or equivalent one-run
+  attestation must bind credentials to the exact workflow path, sealed
+  source/ref, environment, and run; a mere environment name/reviewer is
+  insufficient to claim they are unavailable to another workflow.
+
+Provider-side release controls
+
+- record the exact authorized disablement of the historical
+  `release.yml` workflow ID, crates.io-token removal/rotation, current
+  queued/in-progress-run inventory, and postconditions. These controls
+  are external evidence, never effects inferred from a source diff.
+- record the safety-authorized initial disablement of the newly registered
+  `publish-authorized.yml` workflow ID and its environment/secret absence;
+  later bootstrap enable/provision/dispatch/disable/revoke operations are
+  distinct REL-02 effects with crash-resumable receipts.
+
+FND-01/FND-02 checker and evidence sources:
+
+- retain `crates/fastmcp/tests/fnd_01_dependency_evidence.rs` as a thin
+  integration entry point instead of extending the current roughly
+  85,519-line concentration;
+- move cohesive parser, acquisition/supply, policy, graph-codec,
+  mutation-oracle, and evidence-receipt responsibilities into reviewed
+  modules under one declared test-support module tree, with a stable
+  module/inventory manifest and byte digests;
+- implement FND-02's independent canonical Markdown-region parser,
+  `FMCPGRF\0` graph codec, `FMCPCOR\0` corpus codec, decoder, oracle,
+  and mutation corpus as distinct modules so encoder and verifier do
+  not share the same bug;
+- never generate or rewrite Rust source with a script; test-vector and
+  evidence generation writes only its explicitly versioned artifact
+  formats through reviewed Cargo binaries.
+
+`.cargo/config.toml` and `tools/xtask/`
+
+- add the literal Cargo alias
+  `xtask = "run --locked --quiet -p fastmcp-xtask --"`;
+- add `tools/xtask/Cargo.toml`, `src/main.rs`, and bounded
+  `src/plan_tracker/` modules for the FND-02 checker; the package is
+  `publish = false`, has no production features, network/MCP/Agent-Mail/
+  Beads/GitHub dependency, or path into a publishable crate graph, and
+  is excluded from all release package/archive inventories;
+- put `#![forbid(unsafe_code)]` in its crate root and fail if it or the
+  inherited workspace forbid is absent or weakened;
+- test alias/direct-command identity, ambient `cargo-xtask` shadowing,
+  clean-checkout and packaged-source invocation, dependency isolation,
+  and the complete parser/graph/profile/tracker mutation corpus.
+
+One genuinely new non-publishable Cargo workspace tool package for
+REL-PREP-01/REL-02 is justified by its separate authority boundary:
+
+- use one reviewed path such as `tools/release-coordinator/` with
+  `publish = false`; the root workspace inventory must prove that it is
+  not one of the nine public packages and never enters a publishable
+  package's normal/build dependency graph;
+- a no-authority library owns canonical handoff/authorization/journal/
+  registry-body/provider schemas, reconciliation state machines, and
+  provider traits;
+- a default-disabled publisher binary owns the exact narrow crates.io
+  and GitHub mutation paths and refuses to start without the sealed
+  identity and REL-02 authorization receipt;
+- a disjoint human-invoked `release-bootstrap` binary owns only exact
+  workflow/environment administration plus authority/journal access,
+  cannot load or call publication/signer capabilities, and can resume
+  post-run disable/revocation after a crash;
+- every crate root has `#![forbid(unsafe_code)]`; a checked-in Cargo
+  implementation also owns the deterministic ustar/zstd and ZIP asset
+  profiles, SPDX 3.0.1 JSON-LD/JCS generation/validation, raw in-toto /
+  SLSA statement generation, and DSSE wrapping/verification boundaries;
+- local registry/provider sandbox binaries and tests cannot select a
+  production endpoint or load production credentials; include the real
+  local registry protocol service, GitHub provider, signer, and remote
+  CAS journal/fenced-lease sandboxes;
+- its source, feature graph, executable digest, configuration, and
+  exact upload bodies are sealed by REL-01 and cannot be rebuilt or
+  substituted during REL-02.
 
 Every crate manifest named below is an implementation surface, not an
 implicit consequence of editing the root:
@@ -30872,7 +33514,10 @@ implicit consequence of editing the root:
 - `crates/fastmcp/Cargo.toml`: add/own the `fastmcp-console`
   dependency required by the literal facade feature equations, remove
   the `jsonwebtoken` dev dependency, and preserve facade propagation
-  with no accidental feature unification.
+  with no accidental feature unification; add exact non-default
+  `testing=[]` and
+  `testing-lab=["testing","asupersync/test-internals"]` equations and
+  keep Lab symbols absent from every other cell.
 
 Each manifest receives direct no-default-feature and packaged-consumer
 tree tests; a workspace-only build is insufficient.
@@ -30895,6 +33540,16 @@ tree tests; a workspace-only build is insufficient.
 - MRTR resolver/state hooks;
 - explicit application handles;
 - remove modern dependence on connection Session state.
+
+Operational snapshot responsibility, in an existing cohesive module or
+one genuinely new `src/operations.rs`:
+
+- OPS-01's immutable `OperatorSnapshot`, lifecycle/readiness algebra,
+  closed reason/dimension inventories, checked counters, consistent
+  generations, and bounded nonblocking contributor/exporter traits;
+- no peer text, secrets, high-cardinality identities, HTTP routing,
+  console rendering, or protocol method ownership;
+- synthetic test contributors remain under facade `testing`, not core.
 
 `src/auth.rs`
 
@@ -31074,6 +33729,9 @@ They must not be version-suffixed copies of existing modules.
 - status mapping;
 - modern client/server helpers;
 - no modern session store.
+- contribute fixed-cardinality listener/response-stream readiness,
+  saturation, cancellation, and stream-close state to OPS-01 without
+  allowing exporter callbacks into dispatch.
 
 `src/sse.rs`
 
@@ -31092,6 +33750,8 @@ They must not be version-suffixed copies of existing modules.
 - concurrent dispatch;
 - subscription streams;
 - fault injection.
+- expose production-equivalent test hooks only through DX-TEST-01's
+  public capability-bounded fixture surface.
 
 `src/websocket.rs`
 
@@ -31119,6 +33779,8 @@ Genuinely new responsibility candidate:
 - modern transport dispatch;
 - no global HTTP Session;
 - structured request scopes.
+- install bounded OPS-01 contributors for ingress, dispatch, executor
+  capacity, terminal classes, and sanitized panics.
 
 `src/router.rs`
 
@@ -31127,6 +33789,9 @@ Genuinely new responsibility candidate:
 - capability checks;
 - deterministic catalogs;
 - extension dispatch.
+- install only fully admitted internal or EXT-DEV-01 external
+  descriptors; downstream extension code never obtains raw dispatch or
+  registry-mutation authority.
 
 `src/handler.rs`
 
@@ -31231,6 +33896,9 @@ One genuinely new `src/redis_task_script.rs` under `redis-tasks`:
 
 - protocol policy, `ServerExtensionRegistry`, feature-unavailable
   diagnostics, and optional task/notification supervisor injection.
+- configured, immutable HTTP binding and separately authorized health
+  route/exporter installation; never reconstruct a default transport
+  service after validation.
 
 `src/tests.rs`
 
@@ -31253,6 +33921,8 @@ so dedicated modules are preferable to enlarging `lib.rs`.
 - modern result policies;
 - remove obsolete task APIs;
 - `ClientExtensionRegistry` integration.
+- bounded OPS-01 executor/connection/retry contributors and public
+  read-only snapshot access without exporter-to-client callbacks.
 
 `src/builder.rs`
 
@@ -31310,6 +33980,9 @@ Existing trybuild fixtures:
 - subscription/task views;
 - trace and auth redaction;
 - modern/legacy labels.
+- local bounded rendering of OPS-01 snapshots, readiness reasons,
+  saturation, overflow, and dropped observations; no hosted
+  observability control plane or normative state derived from logs.
 
 ### 26.9 `fastmcp-cli`
 
@@ -31321,6 +33994,8 @@ Existing trybuild fixtures:
   disabled until an explicit opt-in command can use FND-05's bounded
   asupersync `GuardedHttpFetcher` against the fixed crates.io origin;
 - diagnostics;
+- explicit local health/snapshot diagnostic command and configured
+  non-MCP HTTP health-route options with separate access control;
 - modern task commands;
 - no swallowed errors.
 
@@ -31335,7 +34010,23 @@ versioned CLI copies.
 - canonical modern prelude;
 - explicit legacy namespace;
 - extension namespaces;
-- testing exports.
+- EXT-DEV-01's minimal sealed external authoring module;
+- OPS-01's read-only operator snapshot/contributor/exporter surface;
+- `testing` exports only under the non-default `testing` feature;
+- `testing::lab` plus LabRuntime/virtual-time/DPOR exports only under
+  `testing-lab`, never in the default prelude.
+
+`src/testing/**`
+
+- rebuild helpers around the production client/server/router/codec and
+  memory, child-stdio, and loopback-HTTP paths;
+- split production-faithful fixtures from the `testing-lab` submodule at
+  the module boundary;
+- keep raw-wire negative peers unable to construct trusted ingress,
+  auth, key custody, response writers, or unchecked extension state;
+- provide bounded causal logs, deterministic faults, shutdown
+  assertions, operator-exporter fixtures, and packaged downstream
+  examples without a second protocol implementation.
 
 Existing end-to-end tests:
 
@@ -31346,6 +34037,21 @@ Existing end-to-end tests:
 - migrate macro expansion tests;
 - add real-socket and conformance adapters where existing files cannot
   represent external process behavior cleanly.
+
+Performance and soak surfaces:
+
+- add one cohesive Cargo-driven PERF-01 harness using the production
+  facade and DX-TEST-01 transport fixtures; do not hide benchmark-only
+  dispatch, relaxed limits, or an alternate runtime behind examples;
+- keep workloads, runner identity, warmup/measurement rules, raw
+  bounded samples, summaries, thresholds, and failure logs under a
+  versioned evidence schema rather than hand-edited README numbers;
+- separate quick deterministic regression cells from the controlled
+  reference-runner capacity matrix and eight-hour soak so ordinary CI
+  remains bounded while release evidence cannot skip endurance;
+- add compile-size and package/archive-size measurement to the same
+  sealed evidence identity, with RCH used for agent-operated Cargo work
+  and the reference runner recorded for performance claims.
 
 ---
 
@@ -31380,6 +34086,16 @@ semantic migration is fixed.
 | event replay | reissue request with new ID | no modern resume |
 | synthetic auth params | transport Authorization | reject body/query auth |
 | unscoped client credentials | mechanism-aware issuer/resource-bound store | invalidate issuer-bound tokens/registration; revalidate portable CIMD |
+| unconditional public testing helpers | non-default `testing`; `testing-lab` for LabRuntime/DPOR | production-faithful helpers stay feature-gated and deterministic internals never enter the default facade |
+| no stable operator health model | bounded `OperatorSnapshot` plus optional one-shot `AdmissionProbe` | snapshots report structural readiness/saturation without promising capacity; a live permit alone reserves immediate admission |
+| internal/raw extension hooks | compile-linked EXT-DEV-01 capability-safe authoring API | migrate through registered typed descriptors; no raw ingress/codec/registry/auth bypass or dynamic-plugin ABI |
+
+REL-PREP-01's `tools/release-coordinator` package is repository release
+infrastructure, not a public FastMCP API, facade export, installable user
+CLI command, library dependency, or extension mechanism. Its provider/
+credential/mutation types remain private to the protected release
+boundary; public users receive only published package artifacts and
+content-addressed verification records.
 
 ### 27.1 Application-state migration
 
@@ -31524,12 +34240,62 @@ Layer 8 — cross-SDK interoperability:
 - C#;
 - official Rust SDK comparison where useful.
 
+Layer 9 — packaged downstream API and extension consumers:
+
+- exact `.crate` artifacts, never workspace paths or patches;
+- default/no-default, renamed facade, macros, `testing`, and
+  `testing-lab` consumers;
+- compile-linked external extension positive examples;
+- compile-fail authority-escalation, private-import, raw-ingress,
+  unchecked-codec, registry-mutation, hidden-runtime, and Lab-symbol
+  negatives;
+- one scenario run unchanged over memory, child stdio, HTTP JSON, and
+  HTTP SSE using DX-TEST-01.
+
+Layer 10 — operational truth:
+
+- liveness, structural readiness, saturation, and one-shot admission-
+  permit behavior at every N/N+1 bound;
+- fixed-cardinality and overflow/dropped-observation behavior;
+- listener, exporter, required dependency, key/config generation, and
+  shutdown transitions;
+- black-box non-MCP health route authorization/size/deadline behavior;
+- stdio stdout purity and secret/personal-data canaries.
+
+Layer 11 — controlled performance and endurance:
+
+- deterministic quick regressions on ordinary CI;
+- pinned reference-runner latency/throughput/capacity/size/compile
+  matrix with raw samples and environment identity;
+- overload, cancellation, memory-growth, handle-retention, and
+  exporter-backpressure stress;
+- the required eight-hour release-candidate soak with continuous
+  bounded diagnostics and post-run leak/shutdown assertions;
+- threshold changes only through an evidence-backed reviewed plan
+  revision, never automatic baseline ratcheting.
+
+Layer 12 — publication transaction rehearsal:
+
+- a real local registry protocol service plus GitHub-provider, signer,
+  and protected remote-CAS-journal/fenced-lease sandboxes with no
+  production credentials or endpoint selection;
+- fault injection immediately before/after every durable state and
+  external-effect boundary;
+- exact Cargo Registry upload-body capture and checksum reconciliation;
+- grant renewal against the current journal head/remaining effects,
+  competing coordinators, stale fencing, ambiguous outcomes,
+  termination/resume, partial publication, tag/asset conflicts, signer
+  public-side-effect classification, and local/remote journal loss;
+- secret-canary and no-side-effect production-endpoint preflight tests.
+
 ### 28.2 Required transport matrix
 
 For the core profile, only Memory, Stdio, HTTP JSON, and HTTP SSE
 cells are required. The Legacy adapter column is conditional on
-GATE-DUAL-READY and CI-DUAL-01 and is excluded from core
-CONF-02/REL-01. The Tasks row is conditional on the Tasks profile.
+GATE-DUAL-READY and CI-DUAL-01 and is excluded from CONF-02 and the
+core candidate sealed by REL-01, and therefore absent from the core
+artifacts published by REL-02. The Tasks row is conditional on the
+Tasks profile.
 
 | Scenario | Memory | Stdio | HTTP JSON | HTTP SSE | Legacy adapter |
 |---|---:|---:|---:|---:|---:|
@@ -31544,6 +34310,13 @@ CONF-02/REL-01. The Tasks row is conditional on the Tasks profile.
 | subscriptions | yes | yes | n/a | yes | separate legacy mechanism |
 | Tasks, when enabled | yes | yes | yes | yes | not core |
 | cancellation | yes | yes | close | close | version-specific |
+| OPS readiness/admission | yes | yes | yes | stream state | profile-specific |
+| external extension fixture | yes | yes | yes | yes | only with matching adapter profile |
+
+Each required `yes` cell has both a production implementation test and
+a packaged DX-TEST-01 downstream-consumer test unless the row is itself
+the test-toolkit bootstrap. A mock transport, parser, registry, auth
+decision, or result algebra cannot satisfy a real-transport cell.
 
 ### 28.3 Required error matrix
 
@@ -31621,14 +34394,32 @@ For every asynchronous operation, test cancellation:
 20. during Task admission-permit/durable-service acceptance and,
     independently, later claim/structured-worker execution in the
     Tasks profile.
+21. during operational observation reservation/publication and exporter
+    failure, proving the observed request is not blocked or cancelled;
+22. during external-extension decode, handler execution, result
+    admission, and notification commit;
+23. during test-harness child startup, transport teardown, transcript
+    persistence, and structured shutdown;
+24. during PERF-01 environment admission, warmup, measurement, raw-
+    sample persistence, overload recovery, soak observation, and
+    structured teardown, proving a cancelled/incomplete cell cannot be
+    promoted;
+25. during REL-PREP-01/REL-02 DNS resolution, TLS handshake, provider
+    request-body streaming, journal append/CAS read-back, lease acquire/
+    renewal/handoff/release, authorization-status lookup, signer and
+    transparency operations, provider reconciliation, and coordinator
+    shutdown. Any cancellation after possible byte dispatch becomes an
+    outcome-unknown reconciliation state, never a safe retry.
 
 ### 28.5 Logging requirements for tests
 
 Every real-service end-to-end test must capture:
 
 - transport kind;
-- request ID;
-- method;
+- request ID presence state and bounded value: `absent`, `unreadable`,
+  `invalid`, or `admitted(<exact value>)`;
+- method presence state and bounded value: `absent`, `unreadable`,
+  `invalid`, or `admitted(<exact value>)`;
 - protocol version;
 - era;
 - selected extension identifiers;
@@ -31640,6 +34431,17 @@ Every real-service end-to-end test must capture:
 - timings;
 - redacted headers.
 
+The capture schema is bounded by event count, encoded bytes, field
+length, and retention time. Peer request IDs, methods, extension IDs,
+headers, and errors are retained only as exact bounded escaped test data
+inside the protected transcript; human rendering is sanitized and none
+becomes an OPS-01 label or readiness reason.
+No logger fabricates a request ID or method for malformed input, copies
+an unreadable raw fragment into a nominal field, or conflates an absent
+member with a syntactically present but invalid member. The admitted
+state is emitted only after the same production parser/admission point
+that grants the value semantic meaning.
+
 On failure, the test must preserve:
 
 - client stderr;
@@ -31648,6 +34450,14 @@ On failure, the test must preserve:
 - raw protocol transcript with secrets redacted;
 - official conformance checks;
 - seed/schedule for deterministic replay.
+
+Performance failures additionally preserve runner/toolchain/source/
+configuration identity, warmup/measurement parameters, every bounded
+raw sample, threshold source, saturation state, and resource history.
+Publication-rehearsal failures preserve the redacted journal chain,
+provider observations, exact nonsecret body/artifact digests, sandbox
+state, and resume decision. Evidence capture failure is itself a failed
+test; it is never silently ignored.
 
 ---
 
@@ -31766,6 +34576,90 @@ The following invariants are release blockers.
 - A store without an external rollback-resistant nonce/restore
   authority cannot claim persistent confidentiality.
 
+### 29.9 Operations, external extensions, and test support
+
+- Operational state uses only closed, fixed-cardinality dimensions and
+  bounded reason codes; peer/provider text, identities, handles,
+  secrets, URLs, names, and error strings never become labels.
+- Snapshot/exporter backpressure, cancellation, or panic cannot block,
+  cancel, reenter, or mutate observed protocol work.
+- Health routes are outside the MCP namespace, separately configured
+  and authorized, and never inherit peer MCP credentials implicitly.
+- A compile-linked extension receives only its admitted descriptor,
+  settings, typed values, budget/cancellation view, and explicitly
+  granted services. It cannot emit unchecked JSON-RPC, mutate the
+  registry, mint activation/auth receipts, access raw transport ingress
+  or credentials, or construct a runtime/context.
+- Test fixtures and raw-wire peers cannot construct trusted ingress,
+  principal, key-custody, provider-attestation, response-writer, or
+  extension-registration authority.
+- `testing-lab` is non-default, explicit, and the sole permitted Cargo
+  activation of `asupersync/test-internals`; no test-only authority is
+  re-exported through the production prelude.
+- Detailed test/performance logs are bounded, escaped, redacted, and
+  treated as protected evidence. A diagnostic feature never weakens
+  production validation, authorization, timing, or limits.
+
+### 29.10 Performance and release authority
+
+- Performance evidence is bound to exact source/tree/toolchain,
+  feature/profile, workload, limits, runner, and environment identity;
+  a faster unrepresentative test path cannot satisfy a production gate.
+- Thresholds cannot be loosened automatically in response to a failing
+  candidate, and missing/noisy evidence cannot be reported as success.
+- CI, tag creation, token presence, workflow dispatch, branch names,
+  REL-01 completion, and prior publication never imply REL-02 authority.
+- Transaction identity is independent of renewable authorization grants;
+  each provider/journal/lease mutation requires a current grant bound to
+  `grant_base_head`, the exact authorized journal prefix, store
+  generation/restore epoch, fencing, and a finite effect automaton.
+- Registry/GitHub mutations require the separate digest-bound two-step
+  authorization and exact rendered-effect confirmation.
+- Workflow/environment bootstrap administration is a separate sealed
+  authority from publication: its executable cannot reach registry,
+  tag/release/asset, or signer APIs, and publication credentials are
+  bound to the exact sealed workflow/source/ref/run identity.
+- Local locks and CI concurrency labels grant no authority or cross-run
+  durability. The coordinator requires the protected remote CAS journal
+  and monotonic fenced lease, persists/read-backs its hash-chain head
+  before/after every side effect, and stops on store/lease/fencing loss.
+- Remote journal lineage is rollback/clone resistant through retained
+  segments, generation/restore epochs, and an external audit anchor; a
+  restored head or fencing counter cannot become current authority.
+- Fencing guards coordinator admission, not provider-side commit. Every
+  dispatch has an in-flight barrier, and a successor lease holder may
+  reconcile but never duplicate an unresolved mutation.
+- Mutation attempts are numbered and never blindly retried. Any
+  possibly dispatched ambiguous provider state remains unknown until
+  exact reconciliation; absence from eventually consistent views is not
+  proof of non-dispatch.
+- The coordinator never skips, yanks, deletes, overwrites, replaces, or
+  moves an object based only on local process state.
+- Registry, GitHub, and supply-chain-signing credentials are
+  purpose-scoped providers; they never enter source, handoff,
+  transaction identity, logs, journals, artifacts, or receipts. FND-09
+  protocol signing keys are never reused for release signing.
+- Production publication uses only REL-01's byte-sealed archives and
+  exact Cargo Registry Web API bodies. It cannot invoke a repackaging
+  path or substitute equal-version/different-digest bytes.
+- Any public signer/transparency/attestation effect is separately listed
+  and authorized in REL-02; REL-01 permits only proven offline/private
+  no-public-side-effect signing.
+- License identity is explicit rather than inferred; Cargo metadata,
+  authoritative/retained texts, archives, documentation, SBOMs, and
+  registry read-back agree for all nine crates.
+- docs.rs host compatibility has a sealed per-crate preflight and exact-
+  version post-publish observation. Deterministic archive packaging and
+  compiler-output reproducibility are distinct claims.
+- SPDX 3.0.1 SBOMs and raw in-toto/SLSA provenance cover every exact
+  subject; DSSE signatures bind those raw bytes, and no release evidence
+  claims an unestablished SLSA level.
+- Authorization uses a protected status authority and trusted
+  nondecreasing time; expiry/revocation after dispatch permits only
+  read-only reconciliation until a fresh grant. The protected audit
+  record preserves exact user authorization text, confirmation, command,
+  targets, effects, actor, and time without credentials.
+
 ---
 
 ## 30. Risk register
@@ -31807,12 +34701,35 @@ The following invariants are release blockers.
 | Redis Task acknowledgement is not durable or namespace-isolated | medium | critical | exact AOF/WAITAOF predicate, no failover baseline, dedicated ACL/hash tag/fencing/evidence | acked transition lost, foreign key touched, or config/ACL drift |
 | optional feature leaks into core dependency/API | medium | high | FND-06 propagation matrix and feature-tree tests | core server pulls client/legacy/extension code |
 | Apps scope is overclaimed | medium | medium | state host-neutral limits clearly | docs imply renderer |
-| CI duration becomes excessive | medium | medium | tiered tests; RCH; scheduled fuzz | PR latency unacceptable |
+| operational telemetry becomes a cardinality, privacy, or availability hazard | medium | critical | closed dimensions, fixed budgets, nonblocking contributors, canary tests | unique peer/provider values increase series count or exporter stalls requests |
+| readiness snapshot is mistaken for reserved admission | medium | high | structural readiness plus separate saturation and linearized one-shot permit semantics | stale snapshot is treated as proof a mutable last slot remains available |
+| public test helper or external extension mints production authority | medium | critical | sealed builders, compile-fail negatives, no raw ingress/context/registry/runtime constructors | downstream crate bypasses admission or constructs trusted state |
+| `testing-lab` leaks into an ordinary/default graph | medium until FND-04 | high | sole facade activation edge, exact tree cells, gated symbols | `asupersync/test-internals` appears without explicit `testing-lab` |
+| performance gate is noisy, unrepresentative, or self-loosening | medium | high | pinned runner/workload, raw samples, prereviewed thresholds, separate quick/reference/soak lanes | retry passes without cause or threshold follows candidate regression |
+| giant evidence verifier hides coupled defects or becomes unreviewable | high now | high | thin entry point, cohesive modules, independent codec/oracle, mutation corpus | one source remains tens of thousands of lines or encoder/verifier share logic |
+| CI duration or build contention becomes excessive | medium | medium | tiered tests, serialized RCH lanes, disjoint target identities, scheduled fuzz/soak | concurrent same-project builds queue/storm or PR latency exceeds inventory budget |
 | advisory or scenario job fails open | low | critical | CI-BASE-01 fail-closed execution and expiring waivers | missing scanner/inventory still reports green |
 | docs claim support before zero conformance | medium | high | DOC-02 depends on CONF-02 and CI-CORE-01 qualification; CI-FINAL-CORE-01 seals the post-doc tree; optional claims require their exact profile and parent artifact identities | support matrix says complete |
 | stale green evidence is combined with changed source/docs/package bytes | medium | critical | CI-FINAL-CORE-01 full post-DOC rebuild; source/tree/clean-state/lock/docs/archive bindings; REL and additive-promotion identity checks | any evidence, claim, or package resolves to a different identity |
 | raw transport credentials reach middleware | low | critical | transport-private `TransportRequestParts`, borrowed authenticator view, safe crate seam, compile tests | Authorization becomes handler-visible |
 | hidden stale legacy method remains modern | medium | high | union/schema scan; forbidden-string gate | modern wire emits old method |
+| current or historical tag/token/workflow event bypasses publication authorization | high with current workflow | critical | REL-QUAR-00 source quarantine, permanently disabled historical workflow ID, token removal/rotation, REL-PREP-01-sealed/provider-disabled new identity, REL-02 bootstrap and protected exact two-step authorization | any current/old-ref push, dispatch, rerun, queued run, or token can mutate crates.io or public GitHub state |
+| release license metadata/text is contradictory or inferred | high now | critical | explicit maintainer/legal `ReleaseLicenseDecision`; one Cargo representation; nine-manifest/archive/README/SBOM/registry parity | `MIT`, rider, `LICENSE`, `LICENSE-MIT`, Cargo metadata, or public wording disagree |
+| docs.rs advertises a profile that was not built or the exact version fails asynchronously | medium | high | sealed per-crate metadata, network-isolated docs.rs-equivalent preflight, bounded post-publish exact-version status/page/link read-back and incident receipt | unsupported feature/target is enabled, docs link is wrong, or exact-version rustdoc fails/times out |
+| deterministic archive is misrepresented as reproducible compiler output | medium | high | separate per-target binary reproducibility disposition, two clean builds, two archive-packaging runs, explicit false claims | repackaged bytes match but clean binary builds differ or documentation says reproducible anyway |
+| SBOM/provenance omits a subject/input or overclaims attestation guarantees | medium | critical | pinned SPDX 3.0.1 Core+Software JSON-LD/JCS profile, in-toto Statement v1/SLSA v1.2 schema, exact subjects, DSSE byte binding, no unproved SLSA level | asset/dependency/feature/target/license absent, unsigned statement called DSSE, subject drifts, or level is unsupported |
+| production release provider remains hypothetical or lacks rollback/consistency evidence | medium | critical | time-boxed REL-PREP-01 exact provider selection, immutable versions/config, real read-only probes, separately authorized bounded qualification | only a trait/sandbox/marketing guarantee exists or no candidate meets the contract |
+| partial immutable registry publication fractures the workspace version line | medium | critical | dependency order, durable journal, authoritative reconciliation, exact-state resume | one package is public while a later package cannot publish |
+| lost upload response or delayed index causes blind retry | medium | critical | `outcome_unknown`, multi-view read-back, bounded operator stop | submission result cannot be proven before retry |
+| ephemeral journal or split-brain local locks repeat publication | medium | critical | protected remote CAS journal, fenced lease, workflow concurrency, read-back | runners have independent locks or journal state disappears |
+| journal restore/clone rolls back head or fencing authority | low if qualified | critical | retained segments, restore epoch, external audit anchor, tamper tests | older head/counter or writable clone is accepted as current |
+| lease expires while provider mutation remains in flight | medium | critical | admitted renewal margin, in-flight barrier, successor reconcile-only rule | higher-fenced runner starts a duplicate mutation |
+| renewable authorization is conflated with transaction identity | medium | critical | stable artifact-derived transaction ID plus per-invocation head/effect-bound grant | expired grant cannot renew safely or old grant authorizes new effects |
+| custom Cargo Registry upload body drifts from sealed Cargo bytes | medium | critical | loopback capture, independent bounded decoder, byte digest, production replay only | metadata/archive/body differs at mutation boundary |
+| pre-existing registry/tag/release/asset identity conflicts | low | critical | read-only preflight and exact checksum/commit/transaction matching | destination exists with different bytes or commit |
+| published crates, tag, assets, SBOMs, provenance, and receipt name different candidates | medium | critical | one sealed identity, private staging, read-back, publicize last, receipt anchor | any public object resolves to a different source or digest |
+| signer creates an unapproved public transparency/attestation record during preparation | low | high | REL-01 offline/private-only contract; enumerate public signer effects in REL-02 grant | preparation produces an externally visible record |
+| release logs/journal/evidence expose credentials | low | critical | purpose-scoped providers, structured redaction, secret canaries | credential material appears outside provider boundary |
 
 ### 30.1 Stop-the-line conditions
 
@@ -31836,14 +34753,59 @@ Implementation must pause the affected track if:
   signals while the pinned cancellation/subscriptions prose still
   gives them incompatible observation semantics;
 - an extension ambiguity changes core behavior;
+- an external extension or test helper can mint trusted ingress,
+  principal, runtime/context, key/provider, unchecked wire, registry, or
+  response authority;
+- `asupersync/test-internals` appears in any default, release,
+  production, ordinary-`testing`, or component-crate graph;
+- operational dimensions can grow from peer/provider values, an
+  exporter affects request completion, structural readiness disagrees
+  with immutable same-generation preconditions, or a one-shot permit
+  does not reserve/release the real admission primitive exactly once;
+- a performance result lacks exact runner/source/config/workload/raw-
+  sample identity, repeatedly crosses noise policy, or requires
+  loosening a threshold without reviewed evidence;
+- the plan/evidence graph encoder, decoder, and oracle cannot be kept
+  independently reviewable and mutation-tested;
 - a Redis backend claim depends on unbounded/hidden resolver, parser,
   setup, retry, socket, routing, ACL, or durability behavior;
 - a security test demonstrates cross-principal data exposure;
+- the historical release workflow ID is enabled, an ambient crates.io
+  token remains usable by old YAML, a pre-quarantine run is undisposed,
+  or any release workflow can mutate external state without REL-02's
+  exact two-step authorization;
+- REL-PREP-01 has no exact production journal/lease, authority/time,
+  audit-anchor, signer/transparency, registry, or GitHub provider set
+  with the required real evidence;
+- the current grant is absent, expired, revoked, replayed, mismatched to
+  the durable journal head/fencing token/remaining effects, or a non-
+  introspectable permission is represented as proved;
+- the publication journal cannot be durably persisted or read back, its
+  CAS head conflicts, store generation/restore epoch/audit anchor drifts,
+  rollback/clone resistance is unproved, its lease/fencing is lost, an upload
+  outcome cannot be authoritatively reconciled, a destination identity
+  conflicts, or any sealed archive/asset/source digest drifts;
+- any mutation may have been dispatched and remains unknown, or a
+  preparation-stage signer would create an unapproved public effect;
+- the explicit release-license decision is absent or any manifest,
+  authoritative/retained license text, archive, README/site/release
+  wording, SBOM conclusion, or registry metadata contradicts it;
+- any publishable crate lacks an exact docs.rs profile/preflight, any
+  exact-version docs.rs result is hidden or misreported, a binary/archive
+  reproducibility claim exceeds its two-run evidence, an SPDX SBOM omits
+  a required subject/dependency/feature/target/license, or provenance is
+  schema-invalid, subject-divergent, mislabeled as DSSE, or asserts an
+  unestablished SLSA level;
+- any recovery proposal requires an automatic retry, yank, deletion,
+  overwrite, replacement, or tag movement;
 - a proposed cleanup requires file deletion without written
   permission.
 
-Pausing one track does not prevent independent DAG branches from
-continuing.
+Ordinary package-local failures pause only affected independent DAG
+branches. REL-QUAR-00's global preclaim/merge barrier, unsafe tracker or
+ownership state, a contaminated release identity, and any active
+publication/credential incident pause every branch covered by that
+global condition until its exact recovery rule is satisfied.
 
 ---
 
@@ -31858,6 +34820,20 @@ continuing.
 - Do not keep duplicate public APIs.
 - Migrate internal call sites in the same change that breaks a type.
 - Use granular Beads dependencies to preserve merge order.
+- Immediately make README/FEATURE_PARITY/CLI output say that aggregate
+  MCP 2026-07-28 support is under implementation and unverified; no
+  partially closed FND or package count may weaken that statement.
+- Quarantine the release workflow before feature implementation so no
+  new tag, dispatch, token, branch, or rerun can publish or publicize;
+  disable the historical workflow ID and remove/rotate its ambient token
+  under separate exact provider-side authorization, because source
+  changes do not neutralize old refs or already queued runs.
+- Keep REL-PREP-01 production-provider work read-only and without
+  publication authority except for its separately authorized,
+  receipt-bearing safety-only disablement of the newly registered
+  credentialless workflow ID; use local sandboxes for mutation rehearsal.
+  Any other production mutation qualification or REL-02 execution
+  requires its own exact authorization.
 
 ### 31.2 Alpha
 
@@ -31888,7 +34864,7 @@ Beta entry criteria:
 
 ### 31.4 Release candidate
 
-Release-candidate entry criteria:
+Entry criteria for the release-candidate qualification phase:
 
 - core feature work complete;
 - dual-era profile complete if included;
@@ -31896,6 +34872,21 @@ Release-candidate entry criteria:
 - security suite passes;
 - official conformance has no unexpected failures;
 - the conformance baseline is zero.
+- OPS-01 readiness/admission and cardinality/privacy matrices pass;
+- DX-TEST-01 packaged downstream and extension-authority negatives
+  pass;
+- PERF-01's pinned reference-runner matrix and full eight-hour soak
+  pass at the exact candidate identity;
+- REL-PREP-01's terminate/resume and ambiguity suite passes against the
+  local registry/GitHub-provider sandbox, and its exact production
+  provider set has passed the separately evidenced read-only feasibility
+  gate.
+
+These criteria start qualification; they do not themselves authorize a
+“release candidate” claim. That claim begins only when
+CI-FINAL-CORE-01 seals the exact post-documentation candidate and REL-01
+completes the 83-member `CoreReleaseCandidateInventory` plus its
+non-authorizing handoff.
 
 ### 31.5 Stable
 
@@ -31903,7 +34894,13 @@ Stable entry criteria:
 
 - CONF-02 passes with an empty baseline;
 - the planned workspace version is `0.4.0`;
-- REL-01 passes;
+- REL-01 seals the exact source/tree/toolchain/lock/docs/package/asset
+  candidate and emits a machine-verifiable non-authorizing handoff;
+- a separate written exact-identity publication authorization and
+  matching rendered-effect confirmation are recorded;
+- REL-02 completes the dependency-ordered registry/GitHub transaction,
+  fresh registry-only consumers pass, and the completion receipt plus
+  receipt anchor independently verify;
 - documentation support claims match exact profiles;
 - migration guide compiles;
 - dependency and security audits pass;
@@ -31911,9 +34908,19 @@ Stable entry criteria:
 
 ### 31.6 Rollback strategy
 
-Because the public API is intentionally breaking, rollback means
-reverting an unreleased integration change or selecting the prior
-published crate version.
+Because the public API is intentionally breaking, rollback before
+publication means reverting an unreleased integration change or
+selecting the prior published crate version.
+
+crates.io publication has no transactional rollback: an uploaded
+version cannot be overwritten or deleted, yanking does not erase it,
+and a partially published nine-crate set cannot be made atomic after
+the fact. REL-02 therefore stops and emits a partial-publication
+incident receipt when exact-state resume is impossible. Corrected bytes
+require a newly sealed version. Any yank or other recovery mutation
+requires its own explicit authorization and is mitigation, not rollback.
+Tags are never force-moved and public release assets are never silently
+replaced.
 
 Do not add compatibility wrappers as rollback machinery.
 
@@ -31938,10 +34945,14 @@ For wire correctness defects:
 
 ### Phase 0 done
 
+- REL-QUAR-00 has made the current workflow source inert, the historical
+  workflow ID is provider-disabled, its ambient crates.io token is
+  absent/rotated, and every pre-quarantine queued/in-progress run has an
+  explicit provider-side disposition;
 - source pins recorded;
 - traceability skeleton complete;
 - era policy approved;
-- runtime Cx migration complete.
+- runtime Cx migration complete;
 - HTTP/TLS/DNS feasibility proven;
 - fail-closed CI foundation active;
 - Cargo profile isolation matrix enforced;
@@ -31997,6 +35008,9 @@ For wire correctness defects:
 - request-policy logging with per-response HTTP routing and
   sole-compatible-candidate stdio handling;
 - exact progress.
+- OPS-01 bounded snapshot/readiness semantics pass fixed-cardinality,
+  privacy, structural-readiness/saturation/one-shot-permit,
+  exporter-failure, and shutdown tests.
 
 ### Phase 6 done
 
@@ -32037,8 +35051,13 @@ For wire correctness defects:
 - core macros, API, CLI, examples, and provisional migration docs
   reflect only the new model;
 - optional Tasks macro/CLI surfaces remain profile-bound.
+- EXT-DEV-01's compile-linked external authoring contract passes
+  packaged positive and authority-escalation compile-fail tests;
+- DX-TEST-01's ordinary and Lab feature graphs, packaged consumers,
+  real transport differential matrix, deterministic faults, and bounded
+  failure logging pass.
 
-### Phase 11 done
+### Phase 11A — release-ready candidate done
 
 - zero conformance baseline;
 - nonempty reviewed scenario inventory;
@@ -32050,9 +35069,48 @@ For wire correctness defects:
   identities;
 - final evidence-backed documentation;
 - byte-exact packaged-artifact identities and consumer smoke tests;
-- every core and explicitly claimed optional-profile release gate
-  passes;
-- support claims are evidence-backed.
+- one explicit approved `ReleaseLicenseDecision` is reflected without
+  contradiction in all nine manifests, authoritative/retained license
+  texts, package archives, README/docs/release wording, SBOMs, and sealed
+  registry metadata;
+- all nine sealed `[package.metadata.docs.rs]` profiles pass their
+  network-isolated docs.rs-equivalent builds; exact post-publish
+  observation remains Phase 11B work;
+- deterministic asset archives reproduce from sealed inputs, every
+  target has an honest true/false binary bit-reproducibility disposition,
+  and SPDX 3.0.1 SBOM plus raw in-toto Statement v1/SLSA v1.2 subject
+  inventories are complete, schema/conformance-valid, and free of an
+  unproved SLSA-level or DSSE-signature claim;
+- OPS-01 operational evidence, PERF-01's pinned capacity matrix and full
+  eight-hour soak, and DX-TEST-01 packaged toolkit evidence pass at the
+  exact candidate identity;
+- REL-PREP-01's no-authority coordinator, exact upload bodies, renewable
+  authorization model, local WAL, protected remote CAS journal/fenced
+  lease, exact selected production provider set with read-only evidence,
+  provider/signer sandboxes, and every-boundary terminate/resume suite
+  are qualified;
+- CI-FINAL-CORE-01 seals the candidate and REL-01 emits the exact
+  machine-verifiable non-authorizing handoff for the exact 83-member
+  `CoreReleaseCandidateInventory`. At this point Phase 11A may be
+  reported `release-ready, unpublished`, with REL-02 still open when
+  publication authorization is absent;
+- every candidate-stage core and explicitly claimed optional-profile
+  gate passes, but none of this text claims the core artifacts are
+  published.
+
+### Phase 11B — published stable done
+
+- only after separate authorization, REL-02 verifies all nine registry
+  packages, fresh registry-only consumers, policy-protected tag,
+  exact-version crates.io metadata and docs.rs status/page/link
+  observations, public assets/SPDX SBOMs/signatures/DSSE-wrapped
+  provenance, public release read-back, completion receipt, and receipt
+  anchor. A docs.rs asynchronous incident is explicit and cannot be
+  disguised as rollback or green documentation evidence. This is the published-stable
+  completion boundary and the exact 84-member
+  `CoreReleaseProfileInventory`;
+- support claims distinguish technical candidate evidence from actual
+  publication state and are evidence-backed.
 
 ---
 
@@ -32071,7 +35129,17 @@ For wire correctness defects:
 - Test baselines may document migration progress but cannot survive the
   stable support claim.
 - File deletion always requires separate written permission.
-- Beads status is the execution source of truth.
+- Beads status becomes the execution source of truth only after Section
+  36.4's clean rematerialization, doctor/sync, exact graph, and checker
+  preconditions pass. Until then, package-local dependencies are planning-
+  order truth only and execution is stopped except for the active owner's
+  checkpoint/handoff and Section 36.1's narrowly human-authorized
+  REL-QUAR-00 emergency safety path.
+- REL-QUAR-00 is a global preclaim/merge barrier, not merely an ordinary
+  DAG prerequisite: after tracker repair, no other package may be claimed
+  or merged until its source and provider-side quarantine evidence
+  closes. Its one CI-BASE-01 edge avoids duplicating this execution policy
+  into every package closure.
 - Agent Mail, when used, is the coordination and reservation source of
   truth.
 - `br sync --flush-only` exports tracker state; it does not perform Git
@@ -32164,6 +35232,19 @@ Release context:
 
 - <https://blog.modelcontextprotocol.io/posts/2026-07-28/>
 - <https://claude.com/blog/bringing-mcp-2026-07-28-to-claude>
+- <https://doc.rust-lang.org/cargo/reference/registry-web-api.html>
+- <https://doc.rust-lang.org/cargo/commands/cargo-publish.html>
+- <https://doc.rust-lang.org/cargo/reference/publishing.html>
+- <https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields>
+- <https://docs.rs/about/metadata>
+- <https://docs.rs/about/builds>
+- <https://spdx.github.io/spdx-spec/v3.0.1/serializations/>
+- <https://spdx.github.io/spdx-spec/v3.0.1/conformance/>
+- <https://spdx.github.io/spdx-spec/v3.0.1/model/Software/Classes/Sbom/>
+- <https://www.rfc-editor.org/rfc/rfc8785>
+- <https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md>
+- <https://slsa.dev/spec/v1.2/build-provenance>
+- <https://github.com/secure-systems-lab/dsse/blob/1d3370f62565bca041e97c8310b873ac340edc2e/envelope.md>
 
 Authorization, URI-template, browser, and JOSE standards:
 
@@ -32260,8 +35341,14 @@ Dependency evidence:
 The earlier “steady state” conclusion is superseded.
 This ledger records both the original review sequence and the
 fresh-eyes audit that found material defects after that conclusion.
-Only the current fingerprints and checks in Section 36.3 are release
-evidence.
+The old materialization fingerprints, mappings, closure counts, and
+checker outputs retained in Sections 36.2–36.3 are timestamped historical
+evidence. Section 36.1's formal-plan and live-tracker counts are current
+diagnostic truth but not release/readiness evidence. No Section 36
+materialization is current until the revised 129-package/662-edge plan is
+rematerialized through `br`, strictly exported, independently decoded,
+and revalidated after the active tracker owner hands off and the stale
+lock/base-anchor repair is explicitly authorized.
 
 Round 1 — normative completeness:
 
@@ -32379,6 +35466,8 @@ Round 8 — graph and tracker rematerialization:
 
 Round 9 — final-source provenance and composed-contract audit:
 
+- historical at that round and superseded by Round 13;
+
 - revalidated the five pinned upstream default-branch heads, the final
   dated core tag, source byte hashes, official conformance revision,
   archived OpenID inputs, and extension artifacts; added the Tasks
@@ -32393,14 +35482,17 @@ Round 9 — final-source provenance and composed-contract audit:
   correlated error profile, uncorrelatable-input disposition,
   forward-open result boundary, and explicit sampling/Tasks/MRTR
   exclusions;
-- reran the package extractor and graph checks over the resulting
-  prose: 122 formal packages, 606 unique resolved prerequisite edges,
-  FND-01 as the sole seed, the seven declared terminal sinks, and no
+- reran the then-current package extractor and graph checks over the
+  resulting historical prose: 122 formal packages, 606 unique resolved
+  prerequisite edges,
+  FND-01 as the sole seed, the seven then-declared terminal sinks, and no
   duplicate IDs, unresolved references, self-edges, or cycles. These
   are pre-materialization plan facts; Section 36 must reproduce them
   from the frozen prose and Beads before its evidence becomes current.
 
 Round 10 — freeze-candidate fresh-eyes audit:
+
+- historical at that round and superseded by Round 13;
 
 - revalidated all five pinned upstream repository heads, the final
   dated core tag, exact source-artifact hashes/integrities, the
@@ -32415,16 +35507,19 @@ Round 10 — freeze-candidate fresh-eyes audit:
   projection, proxy leg-local evidence, modern/legacy root/stdio/HTTP
   policy, and RFC 9110 method, `Allow`, list-element,
   `Content-Encoding`, `Accept`, media-type, and ingress-order rules;
-- reran whole-document static checks and two independent current-byte
-  reviews. Both reviewers returned explicit clean results. The frozen
-  formal graph remains exactly 122 unique packages and 606 unique
+- reran then-current whole-document static checks and two independent
+  reviews. Both reviewers returned explicit clean results at that time.
+  The historical frozen formal graph was exactly 122 unique packages and 606 unique
   resolved prerequisite edges, with `FND-01` as its sole seed, the
-  seven declared terminal sinks, and no duplicate package ID,
+  seven then-declared terminal sinks, and no duplicate package ID,
   unresolved prerequisite, self-edge, or cycle. Section 36 remains
   intentionally non-current until its one post-freeze Beads
   rematerialization below.
 
 Round 11 — FND-01 execution-schema correction:
+
+- historical at that round and superseded for current counts/hashes by
+  Round 13; its procedural lessons remain applicable;
 
 - implementation exposed that a sole integration producer cannot also
   provide independent final attestation without a self-review gap;
@@ -32436,10 +35531,10 @@ Round 11 — FND-01 execution-schema correction:
   predeclared derived-output paths, which are instead bound by
   exact-set, producer, parent-chain, byte-length, and content hashes;
   no attestation recursively hashes itself;
-- this procedural amendment is outside the canonical package region
-  and changes no formal package block or prerequisite. The formal plan
-  therefore remains 122 packages and 606 edges with the graph and
-  corpus fingerprints recorded in Section 36.3;
+- this procedural amendment was outside the then-canonical package
+  region and changed no formal package block or prerequisite at that
+  time. The historical plan therefore remained 122 packages and 606
+  edges with the now-superseded fingerprints recorded in Section 36.3;
 - pinned `br 0.2.16` misclassifies required retained child
   dependencies as dead and can simultaneously report a child as fully
   unblocked without surfacing it through `br ready` because it treats
@@ -32449,6 +35544,9 @@ Round 11 — FND-01 execution-schema correction:
   and every other doctor finding remain hard failures.
 
 Round 12 — FND-01 qualification/production sequencing clarification:
+
+- historical at that round and superseded for current counts/hashes by
+  Round 13; its FND-01/PRT-01 ownership distinction remains applicable;
 
 - FND-01's ring language defines the exact eventual stable
   public-verification profile, but the materialized FND-01 child
@@ -32469,27 +35567,275 @@ Round 12 — FND-01 qualification/production sequencing clarification:
   executes the ordinary verifier through serialized RCH. Any compile,
   parse, oracle, mutation, handoff, or diagnostic defect reopens
   `.1.14`; no external harness or unsupported result may substitute;
-- this clarification is outside the canonical package region. It
-  allocates already-planned FND-01 and PRT-01 responsibilities without
-  changing a formal package block, package ID, prerequisite edge, or
-  the Section 36.3 graph/corpus fingerprints.
+- this clarification was outside the then-canonical package region. It
+  allocated already-planned FND-01 and PRT-01 responsibilities without
+  changing that round's formal package block, ID, prerequisite edge, or
+  now-superseded Section 36.3 fingerprints.
+
+Round 13 — end-to-end project reality check:
+
+- reread the repository instructions, README, architecture/porting/
+  parity/release documents, all formal packages, workspace manifests,
+  public crate surfaces, transport/server/client/auth/proxy/task/test
+  implementations, CI/release workflows, and live tracker state;
+- verified the final dated MCP tag and mutable upstream comparison
+  heads, crates.io publication history, official Cargo Registry upload
+  format, and the distinction between Cargo packaging and exact archive
+  upload;
+- established that the repository contains a substantial older MCP
+  implementation rather than generic stubs, but modern aggregate support
+  is unimplemented/unverified: lifecycle/version/capability/result/
+  transport/auth/task/schema/proxy surfaces remain materially old or
+  partial;
+- found concrete current defects and evidence gaps: timeout metadata is
+  not applied to effective handler deadlines, panic payloads can cross
+  the peer boundary, bound HTTP configuration can be discarded,
+  CLI errors are swallowed, public docs/examples overstate current APIs,
+  the client is effectively single-flight/lossy for unmatched responses,
+  and the FND verifier has grown to roughly 85,519 lines;
+- RCH evidence: workspace check passed with warnings, Clippy failed
+  under `-D warnings`, and workspace tests stopped at a timed-out
+  `fastmcp-cli` hot-reload end-to-end test. Therefore no clean baseline,
+  FND aggregate, or MCP 2026-07-28 claim exists;
+- found the tracker materially out of sync: 416 issues, 944 dependencies
+  (695 `blocks` plus 249 hierarchy), 24 missing FND provenance edges,
+  twelve FND children closed without attached preclose receipts, a stale
+  write lock/base anchor, and one fresh unreclaimable `.1.14` owner.
+  No Beads mutation or lock/anchor repair is authorized while that owner
+  remains active.
+
+Round 14 — ambition pass: operability and downstream usability:
+
+- added OPS-01 so deployers can answer liveness/readiness/saturation and
+  capacity questions with bounded privacy-safe semantics rather than log
+  scraping;
+- added EXT-DEV-01 for safe compile-linked out-of-tree extensions without
+  inventing a dynamic ABI or exposing raw ingress/registry authority;
+- added DX-TEST-01 for packaged production-faithful memory/stdio/HTTP,
+  malformed-wire, cancellation, extension, auth, and deterministic Lab
+  tests with bounded causal logs;
+- revised API/CLI/docs/consumer packages and feature equations so those
+  surfaces are usable from the published facade and cannot silently pull
+  test internals into default builds.
+
+Round 15 — ambition pass: capacity and trustworthy delivery:
+
+- added PERF-01 with prereviewed reference-runner latency/throughput/
+  memory/size/compile budgets, overload behavior, and an eight-hour soak;
+- split release preparation, no-publish sealing, and separately
+  authorized publication into REL-PREP-01, REL-01, and REL-02;
+- made release tooling a non-published Cargo authority boundary with
+  exact sealed Cargo Registry bodies, local provider sandboxes, durable
+  cross-run CAS journal/fencing, renewable head/effect-bound grants,
+  numbered mutation attempts, ambiguous-outcome reconciliation, fresh
+  registry-only consumers, publicize-last, and receipt anchoring;
+- distinguished technical release-candidate evidence from a published
+  stable claim so declining publication does not falsify conformance.
+
+Round 16 — ambition pass: reviewability and institutional memory:
+
+- replaced growth of the monolithic FND verifier with staged module
+  extraction and independent parser/codec/oracle ownership;
+- upgraded plan/tracker fingerprints to bounded fence-aware canonical
+  parsing and domain-separated exact-consumption binary v2 streams;
+- added explicit file/authority/test/security/risk/rollout/DoD ownership
+  for operations, extensions, test support, performance, and release;
+- expanded mandatory aggregate and sequential staged-aggregate rules so
+  oversized shared-file work cannot be falsely parallelized or closed
+  without an integration/attestation chain.
+
+Round 17 — refinement pass: graph and profile consistency:
+
+- this is the then-current pre-quarantine graph result and is superseded
+  by Round 21 for current counts and seeds;
+- independently extracted 128 unique formal packages and 661 unique
+  prerequisite edges with no unresolved ID, duplicate, self-edge, or
+  cycle; sole seed `FND-01`; seven exact terminal sinks; longest formal
+  path 30 packages;
+- corrected the high-level Mermaid projection, split OBS-01/02 before
+  OPS-01 to avoid a projected cycle, made REL-02 the publication sink,
+  and separated Checkpoint H's no-authority candidate from Checkpoint I's
+  authorized publication;
+- recomputed the 66-member gate inventory, 82-member release-candidate
+  closure, 83-member published closure, and every optional closure;
+- added exact `testing`/`testing-lab` Cargo equations and documented the
+  honest Cargo limitation that explicitly selecting a feature makes it
+  visible in that selected normal tree.
+
+Round 18 — refinement pass: security, cancellation, and evidence:
+
+- added fixed-cardinality/privacy/exporter isolation, extension/test-
+  helper authority, Lab-feature, performance-evidence, publication-
+  credential, and exact-byte invariants plus stop-the-line conditions;
+- expanded production-realistic test layers, cancellation points,
+  secret canaries, bounded failure logging, N/N+1 readiness agreement,
+  extension compile-fail consumers, reference performance, soak, and
+  provider-sandbox fault matrices;
+- corrected handler deadline composition, panic sanitation, bound HTTP
+  service identity, and macro timeout ownership in their formal
+  packages and cross-package tests.
+
+Round 19 — refinement pass: adversarial publication recovery:
+
+- separated stable transaction identity from renewable authorization;
+  bound each current grant to actor/time/nonce, durable journal head,
+  fencing, and exact remaining effects;
+- replaced the local-lock-only design with protected cross-run CAS
+  journal/read-back and monotonic fenced lease, and replaced an
+  underdefined package-only state machine with per-object numbered
+  attempts;
+- forbade blind mutation retry after any possibly dispatched byte,
+  required lineage as well as checksum for adoption, moved public signer
+  effects into REL-02, and removed unsupported claims of provider-level
+  immutability or introspectable registry write permission;
+- added partial-publication, split-brain, eventual-consistency, signer,
+  custom-upload-body, secret, and identity-divergence tests/risks.
+
+Round 20 — refinement pass: tracker and fingerprint honesty:
+
+- this is the then-current pre-quarantine unmapped-package result and is
+  superseded by Round 21; its safety conclusions remain applicable;
+- marked every 122/606 fingerprint, mapping, closure, and doctor/`bv`
+  result as timestamped historical evidence rather than current truth;
+- froze current plan authority at package-local dependencies until safe
+  Beads rematerialization, and prohibited invented IDs or partial mapping
+  claims for OPS-01, EXT-DEV-01, DX-TEST-01, PERF-01, REL-PREP-01, and
+  REL-02;
+- replaced the raw `str.index`/regex recipe with the single FND-02
+  outside-fence parser and binary v2 codecs; current hashes remain
+  intentionally absent until the tracker is safely reconciled;
+- Phase 3a Beads regeneration and the frozen Bead-refinement passes are
+  blocked, not skipped, by the fresh `.1.14` ownership claim and stale
+  tracker lock/base anchor. No current tracker readiness claim is made.
+
+Round 21 — emergency release quarantine and final integration audit:
+
+- found that the live release workflow could publish on tags or manual
+  dispatch, granted `contents: write`, exposed the crates.io token, and
+  blindly retried `cargo publish`; added REL-QUAR-00 as an intentionally
+  independent emergency safety seed and made CI-BASE-01 consume it;
+- proved a main-branch source edit cannot neutralize old-ref workflow
+  YAML or already queued runs, so closure now requires separately
+  authorized provider-side disablement of the historical workflow ID,
+  ambient-token removal/rotation, explicit old-run disposition, and a
+  new workflow identity checked in, registered, safety-disabled, and
+  sealed by REL-PREP-01, with only REL-02 allowed to temporarily enable,
+  provision, and dispatch it;
+- corrected the canonical package grammar, moved all package-owned prose
+  before terminal dependencies, specified the concrete non-publishable
+  `tools/xtask` implementation and Cargo alias, and made the checker
+  generate every candidate/published/optional full-closure label;
+- independently recomputed 129 packages, 662 unique prerequisite edges,
+  two intentional seeds (`FND-01`, `REL-QUAR-00`), the same seven exact
+  terminal sinks, no duplicate/unresolved/self edge or cycle, a longest
+  path of 30, 66 direct GATE-CORE dependencies, candidate/published
+  closures 83/84, and optional endpoint closures
+  87/90/93/86/85/86/92/86/88/96/99;
+- added structural-readiness versus linearized one-shot admission
+  semantics, presence-aware test logging, full performance/release
+  cancellation points, exact production release-provider selection,
+  candidate-versus-published phase completion, and the exact frozen
+  Phase 3a/Phase 5 workflow text and stopping rule in Section 36;
+- serialized RCH verification found the pre-existing workspace still
+  unclean: Clippy fails, the CLI hot-reload test times out, and two facade
+  trace serde round-trip tests reject arbitrary-precision number maps.
+  These observations are implementation gaps, not plan/tracker closure
+  evidence.
+
+Round 22 — end-to-end project reality check and release-artifact audit:
+
+- reconfirmed that production still declares MCP `2024-11-05`, not
+  `2026-07-28`, and that the current client/session, server runtime,
+  timeout/panic, CLI error, task/reverse-call, auth/schema, and proxy
+  paths contain material legacy, placeholder, single-flight, loss, or
+  fail-open behavior. Aggregate 2026 support therefore remains
+  unimplemented/unverified regardless of closed historical FND Beads;
+- found current README quickstarts that cannot type-check because
+  `ctx.checkpoint()?` is used in handlers claiming bare returns, plus a
+  nonexistent `cargo run --example server` command. Also rejected current
+  “cancel-correct,” automatic-timeout, and zero-copy marketing as proven
+  facts while macros/server own blocking runtime bridges, timeout metadata
+  is not enforced end to end, production synchronization remains mixed,
+  and JSON decoding owns strings/values. `FEATURE_PARITY.md` likewise
+  contradicts itself about the removed update checker while retaining
+  unsupported “COMPLETE” labels, so it is not current status evidence;
+- found the concrete `MIT`/rider/`LICENSE`/`LICENSE-MIT` contradiction,
+  absent per-crate docs.rs qualification, nondeterministic archive
+  recipes, and underspecified SBOM/provenance/signing semantics. Added an
+  explicit legal decision gate, docs.rs pre/post checks, separate binary
+  versus archive reproducibility claims, SPDX 3.0.1 JSON-LD/JCS coverage,
+  in-toto Statement v1 plus SLSA v1.2 provenance, and exact DSSE wrapping;
+- resolved the release-workflow self-bootstrap cycle with a separately
+  sealed human-invoked bootstrap controller, workload/run-bound
+  credentials, safety-authorized initial disablement, crash-resumable
+  cleanup, and transaction binding of publisher/bootstrap/workflow/
+  environment/operator-host identities. CI-BASE now permits only that
+  exact provider-disabled dormant definition;
+- made REL-QUAR-00 an authority-separated aggregate, raised the planned
+  workspace unsafe lint from warning to forbid, restricted fingerprint
+  JSON to lowercase hex, and marked `safe-icon-rendering` and
+  `jwt-resource-auth` experimental/unclaimed pending their own future
+  gates;
+- read-only provider evidence at `2026-08-01T02:09:45Z` proved historical
+  release workflow ID `224760884` is still active and the Actions secret
+  inventory still includes `CARGO_REGISTRY_TOKEN`; there are no active
+  release runs and no environments. REL-QUAR-00 is therefore unsatisfied,
+  but this audit had no authority to edit workflow source, disable a
+  provider object, or rotate a credential;
+- read-only repository evidence found a dirty/untracked worktree, local
+  `main` 17 commits ahead of `origin/main`, and the legacy compatibility
+  branch 13 commits behind `origin/main`. The latest inspected
+  `origin/main` CI run is red,
+  and its security job cannot prove audit cleanliness while the workflow
+  uses `cargo audit || true`;
+- reconfirmed the fresh BrightStork `.1.14` claim, stale lock/base warnings,
+  zero `br ready` issues, conflicting `bv` actionable output, missing FND
+  provenance edges, unsupported closed receipts, and seven unmapped
+  packages. Phase 3a and Phase 5 Beads mutation/refinement remain blocked,
+  not skipped; no issue, status, edge, label, owner, lock, or merge anchor
+  was mutated.
 
 Canonical fingerprint rules:
 
-- normalize CRLF to LF;
-- identify a package by `^### ([A-Z][A-Z0-9-]+) —`;
-- end its canonical block after the last dependency bullet, before any
-  tracker mapping, thematic section, separator, or next package;
-- strip trailing spaces/tabs from each line, remove outer blank lines,
-  and append exactly one LF;
-- graph bytes are sorted `N<TAB><ID><LF>` records followed by sorted
-  `E<TAB><dependent><TAB><prerequisite><LF>` records;
-- corpus bytes preserve physical package order and encode each block
-  as `P<TAB><ID><TAB><UTF8_LENGTH><LF>` followed by its canonical
-  bytes.
+- Use only FND-02's checked-in bounded CommonMark fence-aware parser.
+  Select the first outside-fence exact `### FND-01 —` heading and stop
+  immediately before the outside-fence exact
+  `## 24. Dependency graph and critical path` heading. Raw substring
+  search, unbounded regex extraction, and a second parser in Section 36
+  are forbidden.
+- Normalize CRLF to LF; reject bare CR, BOM, NUL, invalid UTF-8, tabs in
+  structural headings, ambiguous fence EOF, and input beyond the fixed
+  limits. Recognize only CommonMark backtick/tilde fences indented zero
+  through three spaces, and close only with the same character and at
+  least the opening run length.
+- Recognize package/dependency structure only outside fences. Require
+  canonical ASCII IDs, exactly one final `Dependencies:` section,
+  nonempty canonical bullets, no duplicate/unresolved/self dependency,
+  and no nonblank package-owned text after the last dependency bullet.
+  Between packages permit only blank lines, separators, and outside-
+  fence level-one/two structural headings, all excluded from package
+  bodies; reject every other interstitial line. Strip
+  trailing spaces/tabs per line, remove outer blanks, and append one LF.
+- Graph v2 bytes are ASCII `FMCPGRF\0`, big-endian `u16` version `2`,
+  bounded `u32` node count, sorted `u16 id_len || id` nodes, bounded
+  `u32` edge count, then sorted
+  `u16 dependent_len || dependent || u16 prerequisite_len || prerequisite`
+  edges.
+- Corpus v2 bytes are ASCII `FMCPCOR\0`, big-endian `u16` version `2`,
+  bounded `u32` package count, then physical-order
+  `u16 id_len || id || u64 body_len || canonical_body` records.
+- Enforce 64 MiB plan, 4,096 package, 65,536 edge, 64-byte ID, and
+  2 MiB body ceilings with checked arithmetic and exact-consumption
+  decoding. Reject truncation, trailing bytes, zero/over-limit lengths,
+  unsorted/duplicate records, count mismatch, or non-identical canonical
+  re-encode.
+- Independent encoder, decoder/oracle, simple test oracle, and mutation
+  corpus must agree. One implementation cannot attest its own bytes.
 
-Section 36.3 records the resulting current hashes and the exact command
-recipe. A fingerprint without this byte-level recipe is not evidence.
+Section 36 may record fresh hashes only after the canonical modules,
+plan, Beads projection, strict export, and independent decoder all agree.
+A prose recipe, historical hash, or current package count alone is not
+evidence.
 
 Any material edit to a work package reopens the affected review focus,
 requires the graph checks to be rerun, and requires the corresponding
@@ -32501,100 +35847,191 @@ Beads issue to be synchronized.
 
 ### 36.1 Materialization result
 
-The plan was frozen, fully rematerialized through `br`, and strictly
-exported on 2026-07-29. The pre-materialization document was
-1,720,915 bytes with SHA-256
-`0edaf8d85241867882c7d9430cb865dce7a89b5a9ce84880bf42d460290606f2`.
-This Section 36 evidence update necessarily changes the whole-document
-hash but does not change any canonical package, graph, or corpus byte.
+The Beads materialization/projection is intentionally marked non-current.
+The last complete tracker materialization occurred on 2026-07-29 against an older 122-package,
+606-edge plan. Subsequent implementation activity, formal package edits,
+new packages, missing provenance edges, and an unhealthy lock/base anchor
+mean it cannot authorize a claim, close, schedule, or release decision.
 
-The current materialization is:
+Current formal-plan truth, independently extracted from the package-local
+`Dependencies:` blocks, is:
 
-- implementation epic:
-  `bd-mcp-2026-07-28-support-ahet`;
-- formal plan work packages: 122;
-- generated hierarchical package issues: 121, comprising the original
-  110 plus 11 post-freeze additions;
-- reused work-package issues: one;
-- reused mapping: `FND-04` -> `bd-63l5`;
-- exact formal `blocks` edges: 606;
-- hierarchy-only `parent-child` edges from formal packages to the
-  epic: 122;
-- open plan issues: 123, including the epic;
-- pre-existing closed project issues retained: 278;
-- all formal package estimates: null until the Section 11 preclaim
-  policy is satisfied.
+- 129 unique packages and 662 unique prerequisite edges;
+- no duplicate ID/edge, unresolved ID, self-edge, or cycle;
+- two intentional seeds: implementation-evidence seed `FND-01` and
+  emergency release-safety seed `REL-QUAR-00`;
+- seven terminal sinks: `REL-02`, `CI-APPS-01`,
+  `CI-EMA-BUILTIN-01`, `CI-EXPERIMENTAL-AUTH-01`,
+  `CI-PROXY-DUAL-01`, `CI-PROXY-TASKS-01`, and
+  `CI-REDIS-TASKS-01`;
+- longest formal path: 30 packages;
+- `CoreImplementationInventory`: 66 direct gate dependencies;
+- `CoreReleaseCandidateInventory`: 83 packages through REL-01;
+- `CoreReleaseProfileInventory`: 84 packages through REL-02;
+- optional endpoint closures: dual 87, Tasks 90, Redis Tasks 93,
+  Apps 86, enterprise auth 85, built-in auth 86,
+  enterprise+built-in 92, experimental auth 86, modern proxy 88,
+  proxy+dual 96, and proxy+Tasks 99.
 
-Every formal issue is open, has issue type `task`, has exactly one
-canonical `wp-<lowercase-package-id>` label and external reference,
-is a direct child of the epic, and contains the frozen canonical
-package through its last dependency bullet. Its dedicated Beads
-acceptance field equals the package's Acceptance block byte-for-byte
-after outer-newline removal. Notes carry the current non-reservable
-reconnaissance, decomposition, estimate, ownership-card, reservation,
-and evidence policy. The stable external-reference form is:
+Current live tracker truth, reconfirmed during the volatile read-only
+audit interval `2026-08-01T02:10:01Z–02:10:19Z`, is:
+
+- epic `bd-mcp-2026-07-28-support-ahet`;
+- 416 issues: 290 closed, 125 open, and one in progress;
+- 944 dependencies: 695 `blocks` plus 249 `parent-child`;
+- the 24 FND provenance edges from `.1.1` and `.1.14` to
+  `.1.2` through `.1.13` are absent;
+- `.1.2` through `.1.13` are closed with no attached comments or gate
+  receipts; at least `.1.5`, `.1.6`, `.1.7`, `.1.11`, `.1.12`, and
+  `.1.13` contradict live false/pending evidence, while strict Section
+  36.4 evidence policy requires all twelve to reopen for current-byte
+  revalidation;
+- `.1.14` is actively `in_progress`, assigned to `BrightStork`, and
+  was updated at `2026-08-01T01:56:01.021038Z`; it is therefore
+  fresh/unreclaimable. Its owner and associated lanes have not handed
+  off;
+- `br doctor` reports the DB/JSONL structurally healthy and in sync but
+  warns that `.beads/.write.lock` looks orphaned and that
+  `.beads/beads.base.jsonl` is an older merge anchor. A short
+  process-free interval is not quiescence while the fresh claim remains
+  active;
+- `br ready --json` returns no issue. `bv --robot-triage` for data hash
+  `e308a78bb565aac7` reports 126 nonclosed issues, 125 blocked, one
+  actionable, one in progress, and no top pick; that readiness
+  disagreement and its blocked-parent recommendations are unhealthy
+  projection evidence, not scheduling authority;
+- the seven new formal packages REL-QUAR-00, OPS-01, EXT-DEV-01,
+  DX-TEST-01, PERF-01, REL-PREP-01, and REL-02 have no current Beads
+  mapping, and edited
+  existing formal bodies/dependencies are not synchronized to their
+  historical issues.
+
+Current release-provider/repository truth from the read-only audit at
+`2026-08-01T02:09:45Z` is also unsafe: GitHub workflow ID `224760884`
+for `.github/workflows/release.yml` is `active`; the Actions secret
+inventory still contains `CARGO_REGISTRY_TOKEN`; and the repository has
+no protected environments. There are zero queued, in-progress, waiting,
+requested, or pending runs for that workflow, so no live run currently
+needs disposition, but the ambient workflow/token path remains. Local
+`main` is 17 commits ahead of `origin/main`; the legacy compatibility
+branch is 13 commits behind `origin/main` and 30 behind local `main`; and the worktree
+has modified plus numerous untracked tracker/verifier backup artifacts.
+No push, cleanup, workflow disablement, secret rotation, or other
+provider mutation was authorized or performed by this audit.
+
+Therefore the exact Phase 3a Beads-generation sequence and exact Phase 5
+Bead-refinement sequence below are pending at a hard safety gate. Do not
+move/copy the lock or base anchor, reopen/reassign/decompose issues,
+restore edges, create the seven issues, edit labels/profiles, or
+strictly export until all Beads writers explicitly pause, `.1.14`'s
+owner checkpoints/hands off, a repeated read-only snapshot proves a
+quiescent interval, and the user authorizes the exact filesystem repair
+commands and their effects. A generic “proceed” does not substitute for
+that exact destructive/filesystem authorization.
+
+REL-QUAR-00 is the sole emergency exception to the ordinary tracker stop,
+because waiting to neutralize ambient release authority increases risk.
+It may execute before Beads repair only after an exact written human
+authorization names the source edit and separately names every provider-
+side workflow/credential action and consequence; a read-only check proves
+no live owner/reservation overlaps the exact workflow path; and an
+independent reviewer verifies the source/provider postconditions. This
+exception authorizes no other package, no Beads mutation, no file
+deletion, and no publication. Preserve a content-addressed emergency
+receipt with Section 11's stable source, provider-operations,
+historical-run-disposition, integration, and independent-verification
+child references; separate actors/authorities; exact commands, scopes,
+authorization text, timestamps, handoffs, and evidence digests. After
+rematerialization, create REL-QUAR-00's aggregate and child chain through
+`br`, attach/project that receipt without inventing retroactive ownership,
+and let the checker decide whether it can close; never backdate or infer
+tracker completion. The present reality-check
+turn has no such exact source/provider authorization and therefore does
+not execute the exception.
+
+After the ordinary safety gate clears, use only `br` for issue,
+dependency, status, comment, and label changes. Execute the following
+deterministic sequence against all 129 packages, synchronize every
+changed canonical body and acceptance block, create mappings for the
+seven new packages without inventing IDs in advance, restore exact graph
+equality, and implement the complete Section 11 aggregate/staged-
+aggregate projections. Only the final strict export may refresh the
+merge anchor under separately approved exact commands.
+
+Phase 3a frozen prompt (verbatim):
+
+> OK so please take ALL of that and elaborate on it and use it to create a comprehensive and granular
+> set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed
+> comments so that the whole thing is totally self-contained and self-documenting (including relevant
+> background, reasoning/justification, considerations, etc.-- anything we'd want our "future self" to
+> know about the goals and intentions and thought process and how it serves the over-arching goals of
+> the project.) The beads should be so detailed that we never need to consult back to the original
+> markdown plan document. Remember to ONLY use the `br` tool to create and modify the beads and add
+> the dependencies.
+
+Run that exact Phase 3a prompt once to materialize/reconcile the complete
+formal and child graph. The ambition rounds are already integrated into
+this plan by Rounds 14–16; nevertheless, run the exact Phase 3a prompt a
+second time as the mandatory post-ambition synchronization pass. Each
+pass must independently compare canonical bodies, acceptance, comments,
+labels, estimates, hierarchy, formal edges, child closure, and every
+profile closure; “already exists” is not a skipped comparison.
+
+Phase 5 frozen prompt (verbatim):
+
+> Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change
+> anything to make the system work better for users? If so, revise the beads. It's a lot easier and
+> faster to operate in "plan space" before we start implementing these things! DO NOT OVERSIMPLIFY
+> THINGS! DO NOT LOSE ANY FEATURES OR FUNCTIONALITY! Also make sure that as part of the beads we
+> include comprehensive unit tests and e2e test scripts with great, detailed logging so we can be
+> sure that everything is working perfectly after implementation. Make sure to ONLY use the `br` cli
+> tool for all changes, and you can and should also use the `bv` tool to help diagnose potential
+> problems with the beads.
+
+Run at least four complete Phase 5 rounds, recording the reviewed issue
+set, findings, exact `br` mutations, `bv --robot-*` diagnostics, and a
+round result. Rounds 1–3 never terminate the sequence even if unchanged.
+If round 4 finds no change, stop successfully. If round 4 changes
+anything, run round 5; round 5 must find no further change to complete.
+If round 5 changes anything, refinement is incomplete: return the plan
+and tracker to review and begin a newly recorded refinement cycle rather
+than silently exceeding the five-round skill pass or claiming
+convergence.
+
+The stable external-reference form remains:
 
 ```text
 COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md#<PACKAGE-ID>
 ```
 
-The epic is hierarchy, never an implementation prerequisite. Only the
-606 formal `blocks` pairs determine formal dependency readiness.
-`br ready --epic bd-mcp-2026-07-28-support-ahet --json` returns only
-`FND-01`, the sole formal seed. This is dependency readiness, not
-claim readiness: FND-01 still needs its estimate, ownership card,
-decomposition decision, and reservation proof. Before FND-02 installs
-the checked-in checker, only the manually validated FND-01 and then
-FND-02 lineages may proceed. The final live-disk audit also found the
-time-sensitive doctor warning recorded in Section 36.3, so this
-snapshot is not claim-ready until that exact lock condition is
-explicitly authorized, remediated, and followed by a clean doctor run.
+The epic is hierarchy only, never an implementation prerequisite. The
+mandatory aggregate list and closure-chain schema are exactly Section
+11's current list; no stale shorter list in historical evidence may be
+used. Rematerialization replaces the ambiguous historical `profile-core`
+label with two canonical affinity labels:
 
-The twelve mandatory planning aggregates are `FND-04`, `FND-08`,
-`FND-09`, `AUTH-00`, `LIMIT-01`, `HTTP-02`, `TASK-02`, `TASKP-01`,
-`TASKR-01`, `AUTHX-01`, `AUTHX-03`, and `PXY-02`. They remain
-unestimated and unclaimable until their enforced
-implementation-child -> integration-child -> optional
-verification-child -> aggregate closure chain exists.
+- `profile-core-candidate` on exactly the 83 members of
+  `CoreReleaseCandidateInventory`;
+- `profile-core-published` on exactly the 84 members of
+  `CoreReleaseProfileInventory`.
 
-`profile-core` is the exact 77-package core release closure. Optional
-profile labels are additive affinity deltas, not claims that the
-labelled package alone forms the complete profile. Composition-only
-packages intentionally carry both applicable base labels; Redis Tasks
-packages also carry `profile-redis-tasks`.
+The published label is a superset and therefore appears with the
+candidate label on the 83 shared members; only REL-02 has published
+without candidate. The checker rejects the old unqualified
+`profile-core` label after the one reviewed migration. Labels remain
+affinity/inventory data, never a claim that an issue is complete or
+publication is authorized. Section 25.9 defines every canonical optional
+full-closure label and exact count; rematerialization must reproduce that
+table, not a delta. Until then, Section 25's formal closures are
+authoritative and no live `profile-*` label count is current evidence.
 
-| Label | Exact labelled packages |
-|---|---:|
-| `profile-core` | 77 |
-| `profile-dual-era` | 8 |
-| `profile-tasks` | 14 |
-| `profile-redis-tasks` | 3 |
-| `profile-apps` | 4 |
-| `profile-enterprise-auth` | 6 |
-| `profile-builtin-auth` | 7 |
-| `profile-experimental-auth` | 4 |
-| `profile-proxy` | 12 |
+### 36.2 Historical work-package-to-issue map
 
-Complete profile membership is computed from the named promotion
-terminal's transitive formal prerequisite closure, not by counting one
-label:
-
-| Promotion closure | Exact packages |
-|---|---:|
-| core through `REL-01` | 77 |
-| dual era through `CI-DUAL-01` | 81 |
-| Tasks through `CI-TASKS-01` | 84 |
-| Redis Tasks through `CI-REDIS-TASKS-01` | 87 |
-| Apps through `CI-APPS-01` | 80 |
-| enterprise auth through `CI-EMA-01` | 79 |
-| built-in auth through `CI-BUILTIN-AUTH-01` | 80 |
-| enterprise plus built-in through `CI-EMA-BUILTIN-01` | 86 |
-| experimental auth through `CI-EXPERIMENTAL-AUTH-01` | 80 |
-| modern proxy through `CI-PROXY-01` | 82 |
-| proxy plus dual era through `CI-PROXY-DUAL-01` | 90 |
-| proxy plus Tasks through `CI-PROXY-TASKS-01` | 93 |
-
-### 36.2 Work-package-to-issue map
+The table below is retained only to audit the 122 older mappings. It is
+not a current equality proof: canonical bodies/dependencies have changed,
+some mapped child/status evidence is false or incomplete, and the seven
+new packages are intentionally unmapped. Do not allocate placeholder IDs
+or infer readiness from this table.
 
 | Work package | Beads issue |
 |---|---|
@@ -32721,117 +36158,37 @@ label:
 | `TST-04` | `bd-mcp-2026-07-28-support-ahet.81` |
 | `XPORT-01` | `bd-mcp-2026-07-28-support-ahet.48` |
 
+Current unmapped formal packages:
+
+| Work package | Current status |
+|---|---|
+| `REL-QUAR-00` | not materialized; pending safe tracker reconciliation |
+| `OPS-01` | not materialized; pending safe tracker reconciliation |
+| `EXT-DEV-01` | not materialized; pending safe tracker reconciliation |
+| `DX-TEST-01` | not materialized; pending safe tracker reconciliation |
+| `PERF-01` | not materialized; pending safe tracker reconciliation |
+| `REL-PREP-01` | not materialized; pending safe tracker reconciliation |
+| `REL-02` | not materialized; pending safe tracker reconciliation |
+
 ### 36.3 Independent graph evidence
 
-Evidence was collected at `2026-07-29T17:21:22Z` against repository
-HEAD `921b34a1eaec9028c85ec789bce09c114f4af295`.
-The frozen pre-materialization whole-document identity is the
-1,720,915-byte SHA-256 recorded in Section 36.1. Because recording
-evidence changes Section 36 itself, the stable execution identities
-are the package graph and corpus projections below, not a
-self-referential post-evidence whole-file hash.
+All evidence below this paragraph was collected against older plan and
+tracker bytes beginning at `2026-07-29T17:21:22Z`; it is preserved as an
+audit trail and is not current. In particular, the former raw
+`str.index("## 24. Dependency graph")` plus regex recipe was unsound
+because FND-02's own prose contains that literal before the actual
+outside-fence heading. That recipe is removed and must never be used.
 
-The exact executable fingerprint recipe is:
+Fresh evidence must come only from the checked-in FND-02 bounded
+outside-fence parser and independent `FMCPGRF\0`/`FMCPCOR\0` v2
+encoder/decoder/oracle modules specified in FND-02 and Section 35. The
+same parser instance defines package bodies, graph generation, corpus
+hashing, profile inventories, and Beads comparison; Section 36 embeds no
+second weaker implementation. No current graph/corpus/JSONL/merge-anchor
+hash is recorded while the Beads projection is unhealthy and incomplete.
 
-```bash
-python3 - <<'PY'
-from hashlib import sha256
-from pathlib import Path
-import re
-
-path = Path(
-    "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
-)
-text = path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
-region = text[
-    text.index("## 12. Phase 0"):
-    text.index("## 24. Dependency graph")
-]
-heading = re.compile(r"^### ([A-Z][A-Z0-9-]+) — .+$", re.M)
-matches = list(heading.finditer(region))
-packages = []
-
-for index, match in enumerate(matches):
-    piece = region[
-        match.start():
-        matches[index + 1].start() if index + 1 < len(matches) else len(region)
-    ]
-    marker = "\nDependencies:\n"
-    marker_at = piece.rfind(marker)
-    assert marker_at >= 0
-    lines = piece[marker_at + len(marker):].splitlines()
-    line_index = 0
-    while line_index < len(lines) and lines[line_index] == "":
-        line_index += 1
-    dependency_lines = []
-    while (
-        line_index < len(lines)
-        and re.fullmatch(
-            r"- (?:None|[A-Z][A-Z0-9-]+)\.",
-            lines[line_index],
-        )
-    ):
-        dependency_lines.append(lines[line_index])
-        line_index += 1
-    assert dependency_lines
-    block_end = (
-        marker_at
-        + len(marker)
-        + sum(len(line) + 1 for line in lines[:line_index])
-    )
-    block = (
-        "\n".join(
-            line.rstrip(" \t")
-            for line in piece[:block_end].splitlines()
-        ).strip("\n")
-        + "\n"
-    ).encode("utf-8")
-    dependencies = [
-        line[2:-1]
-        for line in dependency_lines
-        if line != "- None."
-    ]
-    packages.append((match.group(1), block, dependencies))
-
-ids = {package_id for package_id, _, _ in packages}
-assert len(packages) == len(ids) == 122
-assert not {
-    dependency
-    for _, _, dependencies in packages
-    for dependency in dependencies
-    if dependency not in ids
-}
-node_bytes = b"".join(
-    sorted(f"N\t{package_id}\n".encode("utf-8") for package_id in ids)
-)
-edge_bytes = b"".join(
-    sorted(
-        f"E\t{package_id}\t{dependency}\n".encode("utf-8")
-        for package_id, _, dependencies in packages
-        for dependency in dependencies
-    )
-)
-graph = node_bytes + edge_bytes
-corpus = b"".join(
-    f"P\t{package_id}\t{len(block)}\n".encode("utf-8") + block
-    for package_id, block, _ in packages
-)
-edge_count = sum(len(dependencies) for _, _, dependencies in packages)
-print("packages", len(packages), "edges", edge_count)
-print("graph", len(graph), sha256(graph).hexdigest())
-print("corpus", len(corpus), sha256(corpus).hexdigest())
-PY
-```
-
-Its exact output is:
-
-```text
-packages 122 edges 606
-graph 14125 dd957db1d3c554b9cfbdfc11057f86a32f17f17f85a23e2d2e906466f51bbaab
-corpus 1378269 2dd228ede2ee00ad6d8ff9f0be4154e8b3b263015ab9a8980c5a6836f27facd4
-```
-
-An independent database/document reconciliation then proved:
+The historical 2026-07-29 database/document reconciliation then proved,
+for those superseded bytes only:
 
 - 122 unique formal IDs, canonical `wp-*` labels, external references,
   and issue mappings, plus the one distinct epic mapping;
@@ -32843,18 +36200,20 @@ An independent database/document reconciliation then proved:
 - actual plan-scoped `blocks` equality with all 606 documented pairs:
   no missing, extra, duplicate, unresolved, self, or non-`blocks`
   formal dependency;
-- no cycle, `FND-01` as the sole seed, and exactly the seven terminal
-  sinks declared in Section 24;
+- no cycle, `FND-01` as the sole seed, and exactly the then-declared
+  terminal sinks `REL-01`, `CI-APPS-01`, `CI-EMA-BUILTIN-01`,
+  `CI-EXPERIMENTAL-AUTH-01`, `CI-PROXY-DUAL-01`,
+  `CI-PROXY-TASKS-01`, and `CI-REDIS-TASKS-01`;
 - a longest formal path of 27 work packages;
-- 64 direct members in `CoreImplementationInventory`, the exact
-  77-package core release closure, and every optional closure count in
-  Section 36.1.
+- 64 direct members in the then-current `CoreImplementationInventory`,
+  the historical 77-package core release closure, and that round's
+  optional closure counts.
 
-Implementation, integration, and optional verification children and
+In that historical model, implementation, integration, and optional verification children and
 their hierarchy/closure edges are decomposition projections rather
 than formal package nodes or formal prerequisite edges. They never
-alter the 122-package/606-edge graph or canonical package-corpus
-fingerprints above. Their parent, role, labels, ownership cards,
+alter the then-current 122-package/606-edge graph or canonical package-
+corpus fingerprints. Their parent, role, labels, ownership cards,
 estimates, reservations, and exact closure edges are validated
 separately under Section 11. The historical absence of decomposition
 children in this snapshot is not a rule forbidding a later
@@ -32897,13 +36256,13 @@ the strict export with metadata preservation and is byte-identical to
 `.beads/issues.jsonl`. The original zero-byte lock was preserved under
 the timestamped stale name rather than deleted.
 
-At the final live-disk audit, the ignored replacement
+At that historical snapshot's final live-disk audit, the ignored replacement
 `.beads/.write.lock` had itself aged beyond `br doctor`'s 300-second
-mtime threshold while no `br` process was live. The current doctor
+mtime threshold while no `br` process was live. That doctor
 result is therefore `ok: false` solely for `write_lock`; every other
 doctor check, workspace health, sync status, and reliability signal
 remains healthy. This snapshot intentionally fails Section 36.4 step
-1 and permits no implementation claim. Neither the current lock nor
+1 and permitted no implementation claim. Neither that lock nor
 the preserved stale-lock evidence may be deleted, moved, overwritten,
 or timestamp-touched on that basis. A human must explicitly authorize
 the exact remediation operation and consequences; a later doctor must
@@ -32942,8 +36301,8 @@ evidence. After the FND-01 decomposition and the Round 11 procedural
 correction, a fresh read-only reconciliation at
 `2026-07-30T01:00:17Z` found:
 
-- the formal region still contains exactly 122 packages and 606
-  prerequisite edges; its graph remains 14,125 bytes with SHA-256
+- the then-formal region still contained exactly 122 packages and 606
+  prerequisite edges; its historical graph was 14,125 bytes with SHA-256
   `dd957db1d3c554b9cfbdfc11057f86a32f17f17f85a23e2d2e906466f51bbaab`,
   and its corpus remains 1,378,269 bytes with SHA-256
   `2dd228ede2ee00ad6d8ff9f0be4154e8b3b263015ab9a8980c5a6836f27facd4`;
@@ -32983,6 +36342,29 @@ required closure/provenance edges or inventing readiness.
 
 Use the following fail-closed sequence for every implementation turn.
 
+At the current 2026-08-01 state, step 1 fails and no new formal-package
+or child claim/close is authorized by this plan. The already active
+`.1.14` owner may only checkpoint and hand off its work; this text does
+not revoke or overwrite that fresh claim. Before ordinary execution
+resumes, the explicitly authorized reconciliation must produce exact
+129-package/662-edge plan/Beads equality, mappings for all seven new
+packages, synchronized canonical bodies/acceptance, restored FND
+provenance, current evidence status, a completed frozen Bead-refinement
+sequence, strict export, fresh merge anchor, and clean doctor/sync/
+checker/`bv` evidence.
+
+0. Treat REL-QUAR-00 as a global execution/merge safety barrier that is
+   deliberately stronger than package dependency readiness. The formal
+   graph records its CI-BASE-01 consumption without duplicating an edge
+   to every package, but after rematerialization the checker must reject
+   every non-REL-QUAR-00 preclaim and every implementation merge until
+   REL-QUAR-00 is closed with source-quarantine, provider-side workflow-
+   disable/token, historical-run-disposition, and independent-review
+   evidence. Before rematerialization, no ordinary claim is allowed at
+   all; only Section 36.1's exact human-authorized REL-QUAR-00 emergency
+   path may act. This global barrier changes execution admission, not
+   package closure calculations, and grants no publication authority.
+
 1. Run `br doctor --json` and
    `br sync --status --json`. Require doctor `ok: true`, healthy
    workspace state, zero dirty issues, neither DB nor JSONL newer, and
@@ -33003,16 +36385,20 @@ Use the following fail-closed sequence for every implementation turn.
    change in the independently reconstructed edge/ready sets, or any
    failure of that reconciliation remains blocking. Resolve a failure
    without `--force`.
-   A sole stale `.beads/.write.lock` warning is still a failed
+   A sole stale `.beads/.write.lock` warning or stale merge anchor is
+   still a failed
    precondition: do not infer permission from a zero-byte file or the
    absence of a live process, and do not delete, move, overwrite, or
    timestamp-touch it. Stop and obtain explicit written human approval
    naming the exact remediation command and effects, then rerun doctor
-   and require a clean result. The materialization snapshot in Section
-   36.3 is currently paused at this gate.
+   and require a clean result. The current tracker additionally has 24
+   missing provenance edges and seven unmapped packages, neither of which
+   is an allowlisted detector quirk. Historical Section 36.3 snapshots
+   cannot waive this gate.
 2. Run
    `br ready --epic bd-mcp-2026-07-28-support-ahet --json`.
-   This is the sole formal-package dependency-readiness authority.
+   Only after exact rematerialization is this the formal-package
+   dependency-readiness authority.
    Exclude the epic itself from a formal-package projection and
    distinguish dependency-ready from claim-ready. For a decomposed
    child, parent-child hierarchy is ownership only, not a real
@@ -33021,10 +36407,14 @@ Use the following fail-closed sequence for every implementation turn.
    reconciled FND-01 and FND-02 child projections described in this
    section may supplement `br ready`.
 3. After FND-02 has installed it, run
-   `cargo xtask plan-tracker-check all`. Before that point, the frozen
-   Section 36.3 snapshot permits only the manually validated FND-01
-   lineage and then the FND-02 lineage. No third formal lineage,
-   including FND-04, may be claimed.
+   `cargo xtask plan-tracker-check all`. Before that point, a fresh
+   post-rematerialization manual bootstrap may permit only the already-
+   satisfied REL-QUAR-00 global barrier, then the independently validated
+   FND-01 lineage and FND-02 in that order. REL-QUAR-00 does not consume
+   or reorder the FND implementation lineage. The old
+   Section 36.3 snapshot permits neither lineage now. No third formal
+   lineage, including FND-04, may be claimed before a clean checker
+   `all` result.
 4. Optionally run `bv --robot-plan --label work-package` for ranking
    and parallel-track context. Ignore its epic connector and never use
    `--robot-plan`, `--robot-triage`, or `--robot-next` as readiness
@@ -33053,6 +36443,12 @@ Use the following fail-closed sequence for every implementation turn.
    implementation output or integration receipt. Once decomposed, the
    aggregate is intentionally no longer directly ready; the checker
    validates readiness through the contracted child projection.
+   If one implementation child itself needs Section 11's
+   `staged-implementation-aggregate` exception, create its estimated
+   stages as one strict sequential dependency chain, require byte-
+   digested Agent Mail handoff at every overlapping-file boundary, and
+   allow at most one stage in progress. The integration child depends on
+   the implementation aggregate, not directly on its stages.
 7. For a directly executable issue, record a positive integer
    1-through-480-minute estimate, the decomposition-review rationale,
    and exact `Owned`, `Shared`, `Reservation`, and `Integrator` values.
@@ -33092,8 +36488,12 @@ Use the following fail-closed sequence for every implementation turn.
 12. Run the package's named positive, negative, boundary,
     cancellation, feature-isolation, security, conformance, and
     packaging checks plus the required workspace format, compiler,
-    Clippy, test, and changed-file UBS gates. Use RCH only as an
-    execution optimization.
+    Clippy, test, and changed-file UBS gates. Route every agent-operated
+    Cargo build/check/test/Clippy/doc/package/bench command through RCH,
+    serialize same-project build lanes unless their target identities
+    are deliberately disjoint, and record the RCH job identity. A local
+    fail-open fallback is a reported infrastructure condition, not an
+    unrecorded qualification result.
 13. Export the final Agent Mail reservation history and run:
 
     ```bash
@@ -33141,9 +36541,10 @@ verification children. A future `bv` version may become a readiness
 source only after a pinned regression proves all three audited
 hierarchy defects absent.
 
-The epic contains every one of the 122 formal packages, including
-optional profiles. Therefore `br epic close-eligible --json` may close
-it only after all formal children and their validated descendants are
+The epic does not yet contain every one of the 129 formal packages, so
+it is not close-eligible and no current command result may imply that it
+is. After rematerialization, `br epic close-eligible --json` may close it
+only after all 129 formal children and their validated descendants are
 closed. Reaching a selected profile terminal promotes that profile but
 does not close or bypass the umbrella epic; a core-only release leaves
 the umbrella epic open.
