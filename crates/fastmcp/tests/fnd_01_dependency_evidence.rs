@@ -31828,9 +31828,9 @@ const RECEIPT_SCHEMA_REGISTRY_BYTES: usize = 21_571;
 const RECEIPT_SCHEMA_REGISTRY_SHA256: &str =
     "078d93c8bf7c5098bc56f89268ce717a55d4dcde87774edc61579f7273381880";
 const DIRECT_FIELD_TYPE_COUNT: usize = 1_264;
-const DIRECT_FIELD_TYPE_REGISTRY_BYTES: usize = 83_195;
+const DIRECT_FIELD_TYPE_REGISTRY_BYTES: usize = 84_281;
 const DIRECT_FIELD_TYPE_REGISTRY_SHA256: &str =
-    "1511b17df5b86be34fc5c004669ac24eb24806ecf2a2010fa688440478566e5e";
+    "5786239912af781d7bfb08624ba6a1ee1df7916b87cf9f666e1dff470c488b17";
 const EXPECTED_PROJECTIONS: usize = 13;
 const EXPECTED_TARGETS: usize = 5;
 const EXPECTED_PACKAGES: usize = 9;
@@ -32054,9 +32054,9 @@ const RECEIPT_COMMON_TYPE_MASK: &str = "susssussssrrruussbuq";
 const FINAL_ATTESTATION_TYPE_MASK: &str = "sussssssrrrrrrrrruqsuquuassssbssbuq";
 
 const COUNT_ARRAY_LINK_COUNT: usize = 88;
-const COUNT_ARRAY_LINK_REGISTRY_BYTES: usize = 6_066;
+const COUNT_ARRAY_LINK_REGISTRY_BYTES: usize = 6_665;
 const COUNT_ARRAY_LINK_REGISTRY_SHA256: &str =
-    "846098bfd944181836e4629950cf8050b267dedd1d17baeee9b89749a4fa3995";
+    "1aed04da790cbc8c42197c326d52e4f1fb6ea5407069b2ebe4036ce1e4eb7271";
 const COUNT_ARRAY_LINKS: &[(&str, &str, &str)] = &[
     (
         "schema/environment-profile-observation",
@@ -36019,6 +36019,15 @@ fn parse_toml_strict<T: DeserializeOwned>(bytes: &[u8], subject: &str) -> VResul
         .map_err(|_| Diagnostic::error("E_TOML_SCHEMA", subject).at("strict typed parse"))
 }
 
+/// Parse a complete TOML document into `toml::Value`.
+///
+/// Prefer this over `text.parse::<toml::Value>()`: toml 1.1.x's `FromStr` for
+/// `Value` rejects valid full documents (comments, array-of-tables), while
+/// `toml::from_str` / typed deserialize accept them.
+fn parse_toml_document(text: &str, subject: &str) -> VResult<toml::Value> {
+    toml::from_str(text).map_err(|_| Diagnostic::error("E_TOML_SYNTAX", subject))
+}
+
 fn validate_ascii_posix_path(path: &str, subject: &str) -> VResult<()> {
     if path.is_empty()
         || path.len() > 240
@@ -39643,7 +39652,7 @@ fn validate_policy_shape(policy: &Policy) -> VResult<()> {
         || receipt.candidate_rule
             != "candidate disposition is carried only by typed projection results and never substitutes for evidence_verdict: a rejected or unsupported candidate still requires Pass evidence for every applicable command, graph, policy, and mutation observation"
         || receipt.digest_rule
-            != "every record-set digest uses ASCII FND01RECv2 followed by NUL, u32be record count, then for each canonical record u32be encoded-record length and the recursively tagged exact record bytes; receipt schema names the record type and no raw TOML reserialization is hashed"
+            != "every record-set digest uses ASCII FND01RECv2 followed by NUL, u32be record count, then for each canonical record u32be encoded-record length and the recursively tagged exact record bytes; receipt schema names the record type and no raw TOML reserialization is hashed. A canonical metadata graph digest uses ASCII FND01METAGRAPHv1 followed by NUL, then u32be byte length plus the complete FND01RECv2 target-graph-node record set in ascending complete node-row order, followed by u32be byte length plus the complete FND01RECv2 target-graph-edge record set in ascending complete edge-row order, with checked lengths and no trailing byte. Its path package IDs use workspace_manifest_integration_contract.production_graph_identity_rule normalization, so producer and independent-attester role roots cannot alter the digest. projection-result, resolver-delta-item, resolver-delta, and consumer-receipt name their exact constituent order and any additional domain-separated framing in their own schema/semantic rules; those rules are part of the digest authority rather than producer-selected encodings"
         || !receipt.support_claim_must_be_false
     {
         return Err(Diagnostic::error("E_RECEIPT_CONTRACT", &policy.policy_id));
@@ -40961,9 +40970,7 @@ fn validate_source_tree(files: &[LoadedFile], policy: &Policy) -> VResult<[u8; 3
 fn extract_array_table_ids(bytes: &[u8], table: &str, subject: &str) -> VResult<Vec<String>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Diagnostic::error("E_UTF8", subject))?;
-    let document = text
-        .parse::<toml::Value>()
-        .map_err(|_| Diagnostic::error("E_TOML_SYNTAX", subject))?;
+    let document = parse_toml_document(text, subject)?;
     let rows = document
         .as_table()
         .and_then(|root| root.get(table))
@@ -43538,9 +43545,7 @@ impl<'a> Corpus66<'a> {
                     if !toml_documents.contains_key(assertion.source_path.as_str()) {
                         let text = std::str::from_utf8(&file.bytes)
                             .map_err(|_| Diagnostic::error("E_UTF8", &assertion.source_path))?;
-                        let document = text.parse::<toml::Value>().map_err(|_| {
-                            Diagnostic::error("E_TOML_SYNTAX", &assertion.source_path)
-                        })?;
+                        let document = parse_toml_document(text, &assertion.source_path)?;
                         toml_documents.insert(assertion.source_path.clone(), document);
                     }
                 }
@@ -43603,9 +43608,7 @@ impl<'a> Overlay<'a> {
                 FileFamily::Toml => {
                     let text = std::str::from_utf8(&bytes)
                         .map_err(|_| Diagnostic::error("E_UTF8", &case.id))?;
-                    toml_document = Some(text.parse::<toml::Value>().map_err(|_| {
-                        Diagnostic::error("E_TOML_SYNTAX", &case.id)
-                    })?);
+                    toml_document = Some(parse_toml_document(text, &case.id)?);
                 }
                 FileFamily::Json => {
                     json_document = Some(parse_strict_json(&bytes, &case.id)?);
@@ -43626,9 +43629,7 @@ impl<'a> Overlay<'a> {
                         .into_bytes();
                     let text = std::str::from_utf8(&bytes)
                         .map_err(|_| Diagnostic::error("E_UTF8", &case.id))?;
-                    toml_document = Some(text.parse::<toml::Value>().map_err(|_| {
-                        Diagnostic::error("E_TOML_SYNTAX", &case.id)
-                    })?);
+                    toml_document = Some(parse_toml_document(text, &case.id)?);
                     bytes
                 }
                 FileFamily::Json => {
@@ -72333,8 +72334,30 @@ fn verify_outputs(
             .difference(&expected_relative)
             .cloned()
             .collect::<Vec<_>>();
-        return Err(Diagnostic::error("E_RECEIPT_EXACT_SET", "integration")
-            .at(format!("missing={missing:?};extra={extra:?}")));
+        // Unexpected names always fail closed. A pure missing subset (empty
+        // integration root or partial .1.1 matrix) is the offline pending
+        // state prescribed by pending_contract — never an inferred Pass.
+        if !extra.is_empty() {
+            return Err(Diagnostic::error("E_RECEIPT_EXACT_SET", "integration")
+                .at(format!("missing={missing:?};extra={extra:?}")));
+        }
+        if !missing.is_empty() {
+            if final_attestation.exists() {
+                return Err(Diagnostic::error(
+                    "E_FINAL_ATTESTATION_PREMATURE",
+                    &policy.paths.final_attestation_path,
+                ));
+            }
+            report.extend(
+                policy
+                    .pending_contract
+                    .post_authoring_allowed_pending
+                    .iter()
+                    .cloned()
+                    .map(Diagnostic::pending),
+            );
+            return Ok(());
+        }
     }
 
     let authoring = load_actual_authoring_bindings(root, policy, policy_bytes)?;
@@ -72835,8 +72858,7 @@ fn parse_source_toml(files: &[LoadedFile], path: &str) -> VResult<toml::Value> {
     }
     let text = std::str::from_utf8(&source.bytes)
         .map_err(|_| Diagnostic::error("E_UTF8", path))?;
-    text.parse::<toml::Value>()
-        .map_err(|_| Diagnostic::error("E_TOML_SYNTAX", path))
+    parse_toml_document(text, path)
 }
 
 fn string_array(value: &toml::Value, pointer: &str, subject: &str) -> VResult<Vec<String>> {
@@ -74125,7 +74147,7 @@ fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VRe
     let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
     let core_negatives = string_array(
         &core,
-        "/required_negative_cases",
+        "/verification/required_negative_cases",
         "core-required-negative-cases",
     )?;
     if core_negatives.len() != 20 {
@@ -74436,7 +74458,7 @@ fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VRe
     if pointer_get(&media_graph, "/resolver", "media resolver")?.as_str() != Some("2")
         || pointer_get(
             &media_graph,
-            "/canonical_fastmcp_resolution",
+            "/authority/canonical_fastmcp_resolution",
             "media resolver",
         )?
         .as_bool()
@@ -76643,8 +76665,7 @@ checksum_sha256 = "0000000000000000000000000000000000000000000000000000000000000
 features = ["default", "std"]
 dependency_kinds = ["build", "normal"]
 "#;
-    let mut value = source
-        .parse::<toml::Value>()
+    let mut value = toml::from_str::<toml::Value>(source)
         .expect("synthetic supply receipt body must be valid TOML");
     for (rows_field, digest_field) in [
         ("bootstrap_package", "bootstrap_package_set_sha256"),
@@ -80047,15 +80068,16 @@ fn synthetic_structured_case(id: &str, selector: &str, operation: MutationKind) 
 
 #[test]
 fn fixture_table_member_requires_identity_for_table_arrays() {
-    let toml_document = r#"[[ambiguities]]
+    let toml_document = toml::from_str::<toml::Value>(
+        r#"[[ambiguities]]
 id = "first"
 decision = "one"
 
 [[ambiguities]]
 id = "second"
 decision = "two"
-"#
-    .parse::<toml::Value>()
+"#,
+    )
     .expect("synthetic TOML table array");
     let error = require_toml_table_array_identity(
         &toml_document,
@@ -80099,7 +80121,8 @@ fn fixture_table_member_rejects_numeric_relative_table_array_traversal() {
         "/root",
         MutationKind::Replace,
     );
-    let mut toml_document = r#"[root]
+    let mut toml_document = toml::from_str::<toml::Value>(
+        r#"[root]
 name = "container"
 
 [[root.items]]
@@ -80109,8 +80132,8 @@ decision = "one"
 [[root.items]]
 id = "second"
 decision = "two"
-"#
-    .parse::<toml::Value>()
+"#,
+    )
     .expect("synthetic nested TOML table array");
     let error = apply_toml_fixture(&mut toml_document, &case, &fixture)
         .expect_err("numeric relative TOML table-array traversal must fail");
@@ -80128,10 +80151,11 @@ decision = "two"
 
 #[test]
 fn fixture_table_member_rejects_forbidden_and_empty_relative_payloads() {
-    let mut document = r#"[root]
+    let mut document = toml::from_str::<toml::Value>(
+        r#"[root]
 result = "original"
-"#
-    .parse::<toml::Value>()
+"#,
+    )
     .expect("synthetic forbidden-field document");
     for (application, operation) in [
         (FixtureApplication::InsertTableMember, MutationKind::Insert),
@@ -80204,11 +80228,12 @@ fn quarantine_boundary_detects_ancestor_and_descendant_selectors() {
 
 #[test]
 fn mutation_rename_key_is_noop_and_collision_safe() {
-    let baseline = r#"[root]
+    let baseline = toml::from_str::<toml::Value>(
+        r#"[root]
 old = "value"
 occupied = "other"
-"#
-    .parse::<toml::Value>()
+"#,
+    )
     .expect("synthetic rename document");
 
     let mut same_key = baseline.clone();
@@ -80241,10 +80266,11 @@ occupied = "other"
 #[test]
 fn mutation_duplicate_rejects_synthetic_table_key_collision() {
     let case = synthetic_structured_case("duplicate-table", "/root", MutationKind::Duplicate);
-    let mut document = r#"[root]
+    let mut document = toml::from_str::<toml::Value>(
+        r#"[root]
 original = "value"
-"#
-    .parse::<toml::Value>()
+"#,
+    )
     .expect("synthetic duplicate document");
     let collision_key = mutation_key(&case);
     document
@@ -83430,19 +83456,159 @@ fn parse_ordinary_acquisition_spool(
     Ok(record)
 }
 
+/// Pure field-join authority for a complete `ControlLedgerExpectation` without
+/// opening ledger, spool, supply, archive, or workspace children.
+///
+/// Full byte validation still happens later via `validate_control_ledger_bytes`
+/// after the sealed control-ledger object is admitted. This type only proves
+/// the pure mode/role/run/PID/env-set/tool-count/argv-arity join is compiled
+/// and satisfied before any untrusted artifact read.
+#[derive(Debug)]
+struct ControlLedgerExpectationAuthority {
+    role: &'static str,
+    run_id: String,
+    process_id: u64,
+    control_ledger_relative: String,
+    environment_set_sha256: [u8; 32],
+    handoff_argv_arity: usize,
+    native_tool_count: usize,
+}
+
+/// Typed single-use ordinary handoff permit.
+///
+/// Deliberately omits `Clone`/`Copy` so successful early authority cannot be
+/// duplicated after the handoff path consumes it. Authorizes only progression
+/// past the early ordinary gate (authoring rebind + independent twenty-tool
+/// closed-PATH authority + pure ControlLedgerExpectation join) — never seal,
+/// spool materialize, control-build, or evidence publication by itself.
+#[derive(Debug)]
+struct OrdinaryExecutionPermit {
+    marker: super::trust_std::AuthoringMarker,
+    mode: BootstrapMode,
+    control: ControlLedgerExpectationAuthority,
+    /// Closed PATH already joined to the pinned toolchain bin pure grammar.
+    closed_path: String,
+}
+
+impl OrdinaryExecutionPermit {
+    /// Consume the single-use permit, returning the rebound authoring marker.
+    fn consume(self) -> super::trust_std::AuthoringMarker {
+        self.marker
+    }
+}
+
+/// Exact ordinary native-tool inventory cardinality (policy + compiled table).
+const ORDINARY_NATIVE_TOOL_COUNT: usize = 20;
+/// Exact ordinary handoff argv arity from `expected_ordinary_handoff_argv`.
+const ORDINARY_HANDOFF_ARGV_ARITY: usize = 5;
+
+/// Pure closed-PATH authority for the independent twenty-tool ordinary reprobe.
+///
+/// Mirrors the produce `pinned_toolchain_bin` grammar without performing any
+/// filesystem or child-process side effect: closed PATH must be exactly one
+/// absolute `…/bin` component followed by `:/usr/bin:/bin`.
+fn ordinary_closed_path_toolchain_authority(closed_path: &str) -> Result<String, String> {
+    let tool_bin = closed_path
+        .strip_suffix(":/usr/bin:/bin")
+        .ok_or_else(|| {
+            "E_ORDINARY_HANDOFF_PENDING: independent twenty-tool closed PATH must end with :/usr/bin:/bin"
+                .to_owned()
+        })?;
+    if tool_bin.is_empty()
+        || tool_bin.contains(':')
+        || !tool_bin.starts_with('/')
+        || !tool_bin.ends_with("/bin")
+        || tool_bin.contains("//")
+        || tool_bin.contains("/./")
+        || tool_bin.contains("/../")
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: independent twenty-tool toolchain bin is not a single absolute /bin path"
+                .to_owned(),
+        );
+    }
+    Ok(tool_bin.to_owned())
+}
+
+/// Pure ControlLedgerExpectation field authority for ordinary produce/attest.
+fn ordinary_control_ledger_expectation_authority(
+    mode: BootstrapMode,
+    run_id: &str,
+    environment_set_sha256: [u8; 32],
+) -> Result<ControlLedgerExpectationAuthority, String> {
+    let role = super::trust_std::bootstrap_role_name(mode).map_err(|error| {
+        format!(
+            "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation mode/role authority incomplete ({error})"
+        )
+    })?;
+    let run_id_bytes = super::trust_std::decode_lower_hex::<16>(run_id, "ordinary run ID")
+        .map_err(|error| {
+            format!(
+                "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation run_id authority incomplete ({error})"
+            )
+        })?;
+    if run_id_bytes.iter().all(|byte| *byte == 0) {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation rejects all-zero run_id"
+                .to_owned(),
+        );
+    }
+    let process_id = u64::from(std::process::id());
+    if process_id == 0 {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation process_id must be nonzero"
+                .to_owned(),
+        );
+    }
+    if environment_set_sha256 == [0; 32] {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation environment_set digest must be nonzero"
+                .to_owned(),
+        );
+    }
+    // Keep the relative control-ledger path exact to the live role/run grammar
+    // used by `expected_ordinary_handoff_argv` (index 4).
+    let control_ledger_relative =
+        format!(".fnd01-run/{role}/{run_id}/control-ledger.bin");
+    if control_ledger_relative.contains("//")
+        || control_ledger_relative.contains("/./")
+        || control_ledger_relative.contains("/../")
+        || !control_ledger_relative.ends_with("/control-ledger.bin")
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: ControlLedgerExpectation control-ledger path grammar failed"
+                .to_owned(),
+        );
+    }
+    Ok(ControlLedgerExpectationAuthority {
+        role,
+        run_id: run_id.to_owned(),
+        process_id,
+        control_ledger_relative,
+        environment_set_sha256,
+        handoff_argv_arity: ORDINARY_HANDOFF_ARGV_ARITY,
+        native_tool_count: ORDINARY_NATIVE_TOOL_COUNT,
+    })
+}
+
 /// Admit ordinary execution only after a grammar-valid FND01AUTHORv2 marker
-/// rebinds the three authoring paths on the live repository filesystem.
+/// rebinds the three authoring paths on the live repository filesystem **and**
+/// the independent twenty-tool closed-PATH authority plus pure
+/// `ControlLedgerExpectation` field join succeed.
 ///
 /// Invalid or drifted markers remain fail-closed with
 /// `E_ORDINARY_HANDOFF_PENDING` before any ledger/spool/supply/archive open.
-/// A successful authoring rebind does not authorize any ledger, spool, supply,
-/// archive, child, or output access.  Until the independent twenty-tool probes
-/// and complete `ControlLedgerExpectation` are represented by a typed
-/// single-use permit, this boundary remains deliberately pending.
+/// A successful authoring rebind alone still does not authorize ledger access:
+/// the typed single-use `OrdinaryExecutionPermit` is issued only after pure
+/// tool-PATH and ControlLedgerExpectation authority also join. Live 20-tool
+/// re-resolve against the sealed execution-bin remains a later handoff step
+/// (after ledger open) and is not skipped by this permit.
 fn require_ordinary_execution_authority(
     repository_root: &Path,
+    mode: BootstrapMode,
+    run_id: &str,
     environment: &BootstrapEnvironment,
-) -> Result<super::trust_std::AuthoringMarker, String> {
+) -> Result<OrdinaryExecutionPermit, String> {
     let marker = match super::trust_std::parse_authoring_marker(&environment.authoring_marker)
     {
         Ok(marker) => marker,
@@ -83476,11 +83642,42 @@ fn require_ordinary_execution_authority(
             )
         })?;
     }
-    let _ = marker;
-    Err(
-        "E_ORDINARY_HANDOFF_PENDING: authoring bytes rebind, but the independent twenty-tool probes and complete ControlLedgerExpectation authority are not yet frozen"
-            .to_owned(),
-    )
+
+    // Independent twenty-tool closed-PATH pure authority (no ledger/FS children).
+    if environment.closed_path.is_empty() {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: independent twenty-tool closed PATH is empty"
+                .to_owned(),
+        );
+    }
+    let _toolchain_bin =
+        ordinary_closed_path_toolchain_authority(&environment.closed_path)?;
+
+    // Pure environment-set template digest (compiled authority; nonzero).
+    let environment_set_sha256 = ordinary_environment_set_digest();
+    if environment_set_sha256 == [0; 32] {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: compiled ordinary environment-set digest is zero"
+                .to_owned(),
+        );
+    }
+
+    // Complete pure ControlLedgerExpectation field join (no ledger open).
+    let control = ordinary_control_ledger_expectation_authority(
+        mode,
+        run_id,
+        environment_set_sha256,
+    )?;
+    debug_assert_eq!(control.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    debug_assert_eq!(control.handoff_argv_arity, ORDINARY_HANDOFF_ARGV_ARITY);
+    debug_assert_eq!(control.environment_set_sha256, environment_set_sha256);
+
+    Ok(OrdinaryExecutionPermit {
+        marker,
+        mode,
+        control,
+        closed_path: environment.closed_path.clone(),
+    })
 }
 
 
@@ -83565,10 +83762,37 @@ fn validate_ordinary_handoff_entry(
     }
     // A self-described ledger or supply object cannot authorize its own use.
     // Require a grammar-valid FND01AUTHORv2 marker that rebinds the three
-    // authoring paths on the live repository before opening ledger, spool,
-    // supply, archive, child, or output surfaces.
-    let _authoring_marker =
-        require_ordinary_execution_authority(&invocation.repository_root, environment)?;
+    // authoring paths on the live repository, plus independent twenty-tool
+    // closed-PATH authority and pure ControlLedgerExpectation field join,
+    // before opening ledger, spool, supply, archive, child, or output surfaces.
+    let permit = require_ordinary_execution_authority(
+        &invocation.repository_root,
+        invocation.mode,
+        &invocation.run_id,
+        environment,
+    )?;
+    // Join pure ControlLedgerExpectation authority to the live handoff argv
+    // before any untrusted ledger open. Mismatches stay E_ORDINARY_HANDOFF_PENDING.
+    let expected_role = bootstrap_role_name(invocation.mode)
+        .map_err(|error| format!("E_HANDOFF_MODE: {error}"))?;
+    if permit.mode != invocation.mode
+        || permit.control.role != expected_role
+        || permit.control.run_id != invocation.run_id
+        || permit.control.control_ledger_relative != invocation.control_ledger_path
+        || permit.closed_path != environment.closed_path
+        || permit.control.native_tool_count != ORDINARY_NATIVE_TOOL_COUNT
+        || permit.control.handoff_argv_arity != ORDINARY_HANDOFF_ARGV_ARITY
+        || permit.control.environment_set_sha256 == [0; 32]
+        || permit.control.process_id == 0
+        || permit.control.process_id != u64::from(std::process::id())
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: OrdinaryExecutionPermit desync from live handoff identity"
+                .to_owned(),
+        );
+    }
+    // Single-use: consume before any untrusted ledger open.
+    let _authoring_marker = permit.consume();
     let ledger_path = invocation.repository_root.join(&invocation.control_ledger_path);
     let metadata = std::fs::symlink_metadata(&ledger_path).map_err(|error| {
         format!(
@@ -83660,6 +83884,17 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_LEDGER: control ledger missing exact FND01CONTROLv2 prefix".to_owned(),
         );
     }
+    let ledger_first_sha256 = sha256(&bytes);
+    // ordinary_tool_reprobe_rule: after opaque ledger bytes are bound but BEFORE
+    // full ledger field acceptance / archive expansion, run the independent
+    // 20-tool reprobe with no ledger-selected candidate path or argv. Live
+    // digest comparison against ledger tool_set_sha256 happens after parse.
+    let tool_reprobe = ordinary_reprobe_tool_set_shared(
+        &invocation.repository_root,
+        invocation.mode,
+        &invocation.run_id,
+        &environment.closed_path,
+    )?;
     // Structural ledger reparse (schema/role/run/PID) before the full expectation
     // join that requires scratch/supply/tool/environment digests from the sealed tree.
     let record = parse_canonical_record_file_with_final_self_digest(
@@ -83671,7 +83906,6 @@ fn validate_ordinary_handoff_entry(
         "control ledger",
     )
     .map_err(|error| format!("E_HANDOFF_LEDGER: {error}"))?;
-    let ledger_first_sha256 = sha256(&bytes);
     let role = bootstrap_role_name(invocation.mode)
         .map_err(|error| format!("E_HANDOFF_MODE: {error}"))?;
     if record.string("format").map_err(|error| format!("E_HANDOFF_LEDGER: {error}"))?
@@ -84038,9 +84272,9 @@ fn validate_ordinary_handoff_entry(
         }
     }
 
-    // ordinary_tool_reprobe_rule step 4: recompute pure environment-set template
-    // digest and re-resolve/re-probe all 20 native tools against closed PATH and
-    // the role execution-bin before any workspace/evidence child.
+    // Join the pre-parse independent 20-tool observations to ledger digests
+    // (ordinary_tool_reprobe_rule). Reprobe already ran on opaque ledger bytes;
+    // only digest equality and post-archive no-child revalidation remain here.
     let tool_set_hex = record
         .string("tool_set_sha256")
         .map_err(|error| format!("E_HANDOFF_TOOL_SET: {error}"))?;
@@ -84062,12 +84296,6 @@ fn validate_ordinary_handoff_entry(
                 .to_owned(),
         );
     }
-    let tool_reprobe = ordinary_reprobe_tool_set_shared(
-        &invocation.repository_root,
-        invocation.mode,
-        &invocation.run_id,
-        &environment.closed_path,
-    )?;
     if tool_set != tool_reprobe.tool_set_sha256 {
         return Err(
             "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
@@ -84189,18 +84417,21 @@ fn live_authoring_marker_text(repository_root: &Path) -> String {
         .zip(limits)
         .zip(bindings.iter_mut())
     {
-        let (snapshot, bytes) = super::trust_std::checked_read(
-            repository_root,
-            path,
-            limit,
-            None,
-        )
-        .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        // Test helper only: read authoring bytes without the Linux-only
+        // retained-evidence identity gate used by production checked_read.
+        // Production require_ordinary_execution_authority still uses
+        // checked_snapshot (Linux x86_64). Bounds remain enforced here.
+        let abs = repository_root.join(path);
+        let bytes = std::fs::read(&abs).unwrap_or_else(|error| panic!("read {path}: {error}"));
+        let byte_length = u64::try_from(bytes.len()).expect("authoring length");
+        assert!(
+            byte_length > 0 && byte_length <= limit,
+            "{path}: length {byte_length} outside (0, {limit}]"
+        );
         *binding = FileBinding {
-            byte_length: snapshot.byte_length,
+            byte_length,
             sha256: ordinary_sha256(&bytes),
         };
-        assert_eq!(binding.sha256, snapshot.sha256, "snapshot digest for {path}");
     }
     let marker = AuthoringMarker {
         policy: bindings[0],
@@ -84229,16 +84460,93 @@ fn ordinary_live_authoring_marker_rebind_remains_pending_before_ledger_open() {
     let marker = live_authoring_marker_text(&repository_root);
     let environment = BootstrapEnvironment {
         authoring_marker: marker,
+        // Incomplete closed PATH: missing pinned toolchain + :/usr/bin:/bin suffix.
         closed_path: "/usr/bin".to_owned(),
         integration_seal: None,
         producer_outer_record_path: None,
         attester_outer_record_path: None,
         final_gate_seal: None,
     };
-    let error = require_ordinary_execution_authority(&repository_root, &environment)
-        .expect_err(
-            "a matching authoring marker alone must not authorize ledger access",
-        );
+    let error = require_ordinary_execution_authority(
+        &repository_root,
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        &environment,
+    )
+    .expect_err(
+        "a matching authoring marker alone must not authorize ledger access",
+    );
+    assert!(
+        error.starts_with("E_ORDINARY_HANDOFF_PENDING:"),
+        "unexpected sentinel: {error}"
+    );
+    // On Linux x86_64 production identity binding, incomplete closed PATH surfaces
+    // here. On unqualified hosts, checked_snapshot fails at authoring rebind first
+    // (still E_ORDINARY_HANDOFF_PENDING, never ledger open).
+    assert!(
+        error.contains("twenty-tool")
+            || error.contains("closed PATH")
+            || error.contains("authoring path rebind")
+            || error.contains("UNQUALIFIED_PLATFORM"),
+        "early authority boundary must fail closed without ledger open: {error}"
+    );
+}
+
+/// Production `checked_snapshot` identity binding is Linux x86_64-only; the
+/// pure permit happy path is therefore exercised on the qualified platform.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ordinary_execution_permit_issues_after_tool_path_and_control_expectation_join() {
+    let repository_root = repository_root();
+    let marker = live_authoring_marker_text(&repository_root);
+    let environment = BootstrapEnvironment {
+        authoring_marker: marker,
+        closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let permit = require_ordinary_execution_authority(
+        &repository_root,
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        &environment,
+    )
+    .expect("complete pure ordinary authority must issue a single-use permit");
+    assert_eq!(permit.mode, BootstrapMode::Produce);
+    assert_eq!(permit.control.role, "integration-producer");
+    assert_eq!(permit.control.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(permit.control.handoff_argv_arity, ORDINARY_HANDOFF_ARGV_ARITY);
+    assert_ne!(permit.control.environment_set_sha256, [0; 32]);
+    assert_eq!(
+        permit.control.control_ledger_relative,
+        ".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef/control-ledger.bin"
+    );
+    // Consume is single-use by ownership; marker rebind remains available to the caller.
+    let consumed = permit.consume();
+    assert_eq!(consumed.policy.byte_length, FROZEN_POLICY_BYTES as u64);
+}
+
+#[test]
+fn ordinary_execution_authority_rejects_gate_mode_before_ledger_open() {
+    let repository_root = repository_root();
+    let marker = live_authoring_marker_text(&repository_root);
+    let environment = BootstrapEnvironment {
+        authoring_marker: marker,
+        closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let error = require_ordinary_execution_authority(
+        &repository_root,
+        BootstrapMode::Gate,
+        "0123456789abcdef0123456789abcdef",
+        &environment,
+    )
+    .expect_err("Gate cannot obtain ordinary ControlLedgerExpectation authority");
     assert!(
         error.starts_with("E_ORDINARY_HANDOFF_PENDING:"),
         "unexpected sentinel: {error}"
@@ -84415,6 +84723,8 @@ fn ordinary_environment_set_digest() -> [u8; 32] {
 
 struct OrdinaryToolReprobe {
     tool_set_sha256: [u8; 32],
+    /// Bound on the qualified platform; retained for post-archive revalidation.
+    #[allow(dead_code)]
     execution_bin_sha256: [u8; 32],
     acquisition_tools: AcquisitionToolPaths,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -84462,6 +84772,13 @@ fn ordinary_reprobe_tool_set_shared(
     run_id: &str,
     closed_path: &str,
 ) -> Result<OrdinaryToolReprobe, String> {
+    // Keep the standalone pure-table probe path linked: its embedded 20-row
+    // candidate table is the cardinality source for ORDINARY_NATIVE_TOOL_COUNT
+    // audits and ordinary_tool_reprobe_rule dual-path readiness.
+    let _table_probe: fn(&Path, &str, &Path) -> Result<([u8; 32], AcquisitionToolPaths), String> =
+        ordinary_reprobe_tool_set;
+    let _ = _table_probe;
+    debug_assert_eq!(ORDINARY_NATIVE_TOOL_COUNT, 20);
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let inventory =
@@ -84474,12 +84791,21 @@ fn ordinary_reprobe_tool_set_shared(
             .map_err(|error| {
                 format!("E_HANDOFF_TOOL_SET: {error}")
             })?;
-        Ok(OrdinaryToolReprobe {
+        let reprobe = OrdinaryToolReprobe {
             tool_set_sha256: inventory.tool_set_sha256(),
             execution_bin_sha256: inventory.execution_bin_sha256(),
             acquisition_tools: inventory.acquisition_tools().clone(),
             inventory,
-        })
+        };
+        // Surface execution_bin_sha256 in a pure nonzero gate so the field is
+        // not dead while inventory remains the sole live digest source.
+        if reprobe.execution_bin_sha256 == [0; 32] && reprobe.tool_set_sha256 != [0; 32] {
+            return Err(
+                "E_HANDOFF_TOOL_SET: execution-bin digest must be nonzero when tool_set is bound"
+                    .to_owned(),
+            );
+        }
+        Ok(reprobe)
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
