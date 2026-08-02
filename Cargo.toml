@@ -82,6 +82,7 @@ getrandom = "0.4"
 # Cryptography (OAuth PKCE, OIDC signing)
 sha2 = "0.10"
 hmac = "0.12"
+zeroize = { version = "1", features = ["derive"] }
 
 # Regex (JSON Schema `pattern` validation)
 regex = "1"

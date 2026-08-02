@@ -41,6 +41,7 @@
 mod auth;
 pub mod combinator;
 mod context;
+pub mod crypto;
 mod duration;
 mod error;
 pub mod logging;
@@ -48,6 +49,12 @@ pub mod runtime;
 mod state;
 
 pub use auth::{AUTH_STATE_KEY, AccessToken, AuthContext};
+pub use crypto::{
+    CryptoInputTooLongError, EphemeralKeyMaterial, HmacSha256Key, HmacSha256Tag,
+    HmacVerificationError, NonceDomainMaterial, RandomDrawError, SecurityIdentifier, Sha256Digest,
+    WebSocketMask, draw_ephemeral_key_material, draw_hmac_sha256_key, draw_nonce_domain_material,
+    draw_security_identifier, draw_websocket_mask, sha256_bounded,
+};
 pub use context::{
     CancelledError, ClientCapabilityInfo, ElicitationAction, ElicitationMode, ElicitationRequest,
     ElicitationResponse, ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH,
