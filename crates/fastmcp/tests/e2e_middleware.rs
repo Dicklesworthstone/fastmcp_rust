@@ -580,7 +580,9 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
 
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let caching = ResponseCachingMiddleware::new().call_ttl_secs(1);
+    let caching = ResponseCachingMiddleware::new()
+        .call_ttl_secs(1)
+        .include_tools(vec!["echo".to_string()]);
 
     let (transport, server_handle) =
         spawn_middleware_server("mw-caching", Some(Arc::clone(&calls)), |builder| {

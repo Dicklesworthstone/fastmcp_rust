@@ -725,6 +725,15 @@ impl ContentExt for Content {
 // Background Tasks E2E Tests (bd-og1)
 // ============================================================================
 
+// Network Tasks are quarantined pending TASK-01/TASK-02. Keep this historical
+// E2E source compile-inert so it cannot imply a supported or advertised RPC
+// surface while the replacement ownership and structured-concurrency design is
+// implemented.
+#[cfg(any())]
+#[rustfmt::skip]
+mod quarantined_network_tasks_e2e {
+use super::*;
+
 use fastmcp_rust::TaskManager;
 
 /// Helper: build a server with background task support.
@@ -1376,6 +1385,8 @@ fn workflow_task_type_preserved() {
 
         assert_eq!(get_result["task"]["taskType"].as_str().unwrap(), task_type);
     }
+}
+
 }
 
 // ============================================================================

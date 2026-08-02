@@ -9,12 +9,12 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example notes_server
+//! cargo run -p fastmcp-rust --example notes_server
 //! ```
 //!
 //! Test with MCP Inspector:
 //! ```bash
-//! npx @anthropic-ai/mcp-inspector cargo run --example notes_server
+//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --example notes_server
 //! ```
 
 #![allow(clippy::needless_pass_by_value)]

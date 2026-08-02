@@ -1,13 +1,11 @@
-//! FastMCP: Fast, cancel-correct MCP framework for Rust.
+//! FastMCP: cancel-aware MCP framework for Rust.
 //!
 //! FastMCP is a Rust implementation of the Model Context Protocol (MCP),
-//! providing a high-performance, cancel-correct framework for building
-//! MCP servers and clients.
+//! providing explicit cancellation, budget, server, and client surfaces.
 //!
 //! # Features
 //!
-//! - **Fast**: Zero-copy parsing, minimal allocations
-//! - **Cancel-correct**: Built on asupersync for structured concurrency
+//! - **Cancellation-aware**: Built on asupersync contexts and checkpoints
 //! - **Simple**: Familiar API inspired by FastMCP (Python)
 //! - **MCP tools/resources/prompts**: ergonomic macros and handler APIs
 //!
@@ -15,10 +13,14 @@
 //!
 //! **MCP 2026-07-28 support is under implementation and remains unverified.**  
 //! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+//! The current public `PROTOCOL_VERSION` remains `2024-11-05`; newer in-tree
+//! types are not proof of negotiated MCP 2026-07-28 support.
 //! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
 //! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
 //! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
 //! this façade alone.
+//! Release publication remains quarantined; these crate docs do not supply
+//! publication authority or provider-side release-safety evidence.
 //!
 //! # Quick Start
 //!
@@ -26,13 +28,15 @@
 //! use fastmcp_rust::prelude::*;
 //!
 //! #[tool]
-//! async fn greet(ctx: &McpContext, name: String) -> String {
-//!     format!("Hello, {name}!")
+//! async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
+//!     ctx.checkpoint()?;
+//!     Ok(format!("Hello, {name}!"))
 //! }
 //!
 //! fn main() {
 //!     Server::new("my-server", "1.0.0")
-//!         .tool(greet)
+//!         .tool(Greet)
+//!         .build()
 //!         .run_stdio();
 //! }
 //! ```
@@ -77,19 +81,37 @@
 //!
 //! FastMCP uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for:
 //!
-//! - **Structured concurrency**: All tasks belong to regions
-//! - **Cancel-correctness**: Graceful cancellation via checkpoints
-//! - **Budgeted timeouts**: Resource limits for requests
-//! - **Deterministic testing**: Lab runtime for reproducible tests
+//! - **Context propagation**: Requests carry an asupersync capability context
+//! - **Cooperative cancellation**: Explicit checkpoints surface cancellation
+//! - **Request budgets**: Deadline, poll, and cost limits travel with the context
+//! - **Deterministic test support**: Asupersync's lab runtime is available to tests
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+// `proc-macro-crate` reports `FoundCrate::Itself` for every target belonging
+// to this package, including examples and integration tests. Keep one
+// canonical absolute self-name so macro expansion is correct in all of them.
+extern crate self as fastmcp_rust;
+
+/// Implementation paths used by FastMCP's procedural macros.
+///
+/// This is public because macro expansions live in downstream crates. It is
+/// deliberately hidden from the supported application API: users should use
+/// the facade re-exports above rather than couple themselves to these names.
+#[doc(hidden)]
+pub mod __private {
+    pub use fastmcp_core as core;
+    pub use fastmcp_protocol as protocol;
+    pub use fastmcp_server as server;
+    pub use serde_json;
+}
+
 // Re-export core types
 pub use fastmcp_core::{
-    AUTH_STATE_KEY, AccessToken, AuthContext, Budget, CancelledError, Cx, IntoOutcome, LabConfig,
-    LabRuntime, McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt,
-    RegionId, ResultExt, Scope, TaskId, cancelled, err, ok,
+    AccessToken, AuthContext, Budget, CancelledError, Cx, IntoOutcome, LabConfig, LabRuntime,
+    McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt, RegionId,
+    ResultExt, Scope, TaskId, cancelled, err, ok,
 };
 
 // FND-01: sealed crypto + URI primitives live in core (no ambient sha2/hmac/getrandom edges).
@@ -138,19 +160,20 @@ pub use fastmcp_transport::{event_store, http, memory};
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, NotificationSender,
     PendingRequests, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient, RequestSender,
-    ResourceHandler, Router, Server, ServerBuilder, Session, SharedTaskManager,
-    StaticTokenVerifier, TaskManager, TokenAuthProvider, TokenVerifier, ToolHandler,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    ResourceHandler, Router, Server, ServerBuilder, Session, StaticTokenVerifier,
+    TokenAuthProvider, TokenVerifier, ToolHandler, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
 pub use fastmcp_server::bidirectional;
 
 // Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+pub use fastmcp_server::providers;
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
-pub use fastmcp_client::{Client, ClientBuilder, ClientSession};
+pub use fastmcp_client::{BoundedListPage, Client, ClientBuilder, ClientSession, ListPageLimits};
 
 // Re-export client configuration module
 pub use fastmcp_client::mcp_config;
@@ -172,10 +195,12 @@ pub mod prelude {
         AccessToken,
         AuthContext,
         // Client
+        BoundedListPage,
         Client,
         // Protocol types
         Content,
         JsonSchema,
+        ListPageLimits,
         McpContext,
         McpError,
         McpOutcome,
@@ -204,6 +229,7 @@ pub mod prelude {
         ok,
         // Macros
         prompt,
+        providers::FilesystemProvider,
         resource,
         tool,
     };

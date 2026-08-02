@@ -21,15 +21,36 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(dead_code)]
 
+use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
 use fastmcp_rust::{
-    Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceContent,
-    ResourceHandler, Role, ToolHandler, prompt, resource, tool,
+    Content, Cx, JsonSchema, LabConfig, LabRuntime, McpContext, McpOutcome, McpResult, Outcome,
+    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, Role, ToolHandler, prompt,
+    resource, tool,
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::future::Future;
 
 fn test_ctx() -> McpContext {
     McpContext::new(Cx::for_testing(), 1)
+}
+
+fn run_outcome<T, F>(future: F) -> McpOutcome<T>
+where
+    T: Send + 'static,
+    F: Future<Output = McpOutcome<T>> + Send + 'static,
+{
+    let mut runtime = LabRuntime::new(LabConfig::new(0xF45A_5A11).max_steps(2_000));
+    LabRuntimeTarget::block_on(&mut runtime, future)
+}
+
+fn expect_outcome_ok<T>(outcome: McpOutcome<T>) -> T {
+    match outcome {
+        Outcome::Ok(value) => value,
+        Outcome::Err(error) => panic!("expected successful handler outcome, got {error}"),
+        Outcome::Cancelled(_) => panic!("expected successful handler outcome, got cancellation"),
+        Outcome::Panicked(_) => panic!("expected successful handler outcome, got panic"),
+    }
 }
 
 fn expect_text(content: &Content) -> &str {
@@ -452,7 +473,9 @@ fn async_tool_definition() {
 fn async_tool_call() {
     let handler = AsyncGreet;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"name": "Rust"})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"name": "Rust"})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "Hello async, Rust!");
 }
@@ -470,7 +493,9 @@ async fn async_ctx_tool(ctx: &McpContext, val: String) -> String {
 fn async_tool_with_context_call() {
     let handler = AsyncCtxTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"val": "test"})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"val": "test"})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "async:test");
 }
@@ -758,7 +783,9 @@ async fn async_fallible_tool(succeed: bool) -> McpResult<String> {
 fn async_fallible_tool_ok() {
     let handler = AsyncFallibleTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"succeed": true})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"succeed": true})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "async success");
 }
@@ -767,8 +794,9 @@ fn async_fallible_tool_ok() {
 fn async_fallible_tool_err() {
     let handler = AsyncFallibleTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"succeed": false}));
-    assert!(result.is_err());
+    let outcome =
+        run_outcome(async move { handler.call_async(&ctx, json!({"succeed": false})).await });
+    assert!(matches!(outcome, Outcome::Err(_)));
 }
 
 // ============================================================================
@@ -1048,7 +1076,7 @@ fn async_resource_definition() {
 fn async_resource_read() {
     let handler = AsyncResourceResource;
     let ctx = test_ctx();
-    let result = handler.read(&ctx).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move { handler.read_async(&ctx).await }));
     assert_eq!(result[0].text, Some("async data".to_string()));
 }
 
@@ -1207,7 +1235,7 @@ fn async_resource_with_context_definition() {
 fn async_resource_with_context_read() {
     let handler = AsyncCtxResourceResource;
     let ctx = test_ctx();
-    let result = handler.read(&ctx).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move { handler.read_async(&ctx).await }));
     assert_eq!(result[0].text, Some("async_request_id=1".to_string()));
 }
 
@@ -1252,9 +1280,11 @@ fn async_template_resource_read() {
     let ctx = test_ctx();
     let mut params = HashMap::new();
     params.insert("path".to_string(), "data.json".to_string());
-    let result = handler
-        .read_with_uri(&ctx, "async-file://data.json", &params)
-        .unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler
+            .read_async_with_uri(&ctx, "async-file://data.json", &params)
+            .await
+    }));
     assert_eq!(
         result[0].text,
         Some("async contents of data.json".to_string())
@@ -1587,9 +1617,37 @@ fn async_prompt_get() {
     let ctx = test_ctx();
     let mut args = HashMap::new();
     args.insert("text".to_string(), "async hello".to_string());
-    let result = handler.get(&ctx, args).unwrap();
+    let result = expect_outcome_ok(run_outcome(
+        async move { handler.get_async(&ctx, args).await },
+    ));
     let text = expect_text(&result[0].content);
     assert_eq!(text, "async hello");
+}
+
+#[test]
+fn async_generated_handlers_reject_synchronous_trait_entry_points() {
+    let ctx = test_ctx();
+
+    let tool_error = AsyncGreet
+        .call(&ctx, json!({"name": "Rust"}))
+        .expect_err("an async tool has no synchronous execution entry point");
+    assert_eq!(tool_error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert!(tool_error.message.contains("call_async"));
+
+    let resource_error = AsyncResourceResource
+        .read(&ctx)
+        .expect_err("an async resource has no synchronous execution entry point");
+    assert_eq!(
+        resource_error.code,
+        fastmcp_rust::McpErrorCode::InternalError
+    );
+    assert!(resource_error.message.contains("read_async"));
+
+    let prompt_error = AsyncPromptPrompt
+        .get(&ctx, HashMap::new())
+        .expect_err("an async prompt has no synchronous execution entry point");
+    assert_eq!(prompt_error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert!(prompt_error.message.contains("get_async"));
 }
 
 // --- Prompt default trait methods ---
@@ -1718,7 +1776,9 @@ fn async_prompt_with_context_get() {
     let ctx = test_ctx();
     let mut args = HashMap::new();
     args.insert("msg".to_string(), "hello".to_string());
-    let result = handler.get(&ctx, args).unwrap();
+    let result = expect_outcome_ok(run_outcome(
+        async move { handler.get_async(&ctx, args).await },
+    ));
     let text = expect_text(&result[0].content);
     assert_eq!(text, "async_req:1 msg:hello");
 }

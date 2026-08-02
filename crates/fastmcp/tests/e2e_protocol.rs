@@ -77,13 +77,10 @@ fn error_tool_handler() -> McpResult<String> {
 )]
 fn auth_info_tool_handler(ctx: &McpContext) -> String {
     let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
-    let access = auth.token.as_ref();
 
     let payload = json!({
         "subject": auth.subject,
         "scopes": auth.scopes,
-        "scheme": access.map(|t| t.scheme.clone()),
-        "token": access.map(|t| t.token.clone()),
     });
 
     payload.to_string()
@@ -309,7 +306,9 @@ fn e2e_initialize_stores_server_info() {
 #[test]
 fn e2e_auth_static_token_flow_allows_and_denies() {
     let verifier = StaticTokenVerifier::new([("good-token", AuthContext::with_subject("user-1"))])
-        .with_allowed_schemes(["Bearer"]);
+        .expect("valid verifier configuration")
+        .with_allowed_schemes(["Bearer"])
+        .expect("valid scheme configuration");
     let provider = TokenAuthProvider::new(verifier);
 
     let mut client = setup_auth_server_and_client(provider, "e2e-auth-static");
@@ -372,7 +371,7 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     };
     assert_eq!(text, "Hello, Ada!");
 
-    // Verify the server stored auth context into McpContext (subject + token).
+    // Verify handlers receive verified identity facts, never the raw token.
     let params = json!({
         "name": "auth_info",
         "arguments": {},
@@ -395,10 +394,8 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
         auth_json.get("subject").and_then(|v| v.as_str()),
         Some("user-1")
     );
-    assert_eq!(
-        auth_json.get("token").and_then(|v| v.as_str()),
-        Some("good-token")
-    );
+    assert!(auth_json.get("token").is_none());
+    assert!(!text.contains("good-token"));
 }
 
 // FND-01: JWT e2e removed — undeclared cfg(feature="jwt") is fatal under -D warnings,
@@ -413,22 +410,22 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
 
     let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
     let client_def = OAuthClient::builder("test-client")
-        .redirect_uri("http://localhost:3000/callback")
+        .redirect_uri("http://127.0.0.1:3000/callback")
         .scope("read")
         .build()
         .unwrap();
     oauth.register_client(client_def).unwrap();
 
-    // OAuth 2.1 requires PKCE. Use the plain method for a fully deterministic test.
-    let code_verifier = "verifier-verifier-verifier-verifier-verifier-verifier-123";
+    // RFC 7636 Appendix B verifier/challenge pair.
+    let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let auth_request = AuthorizationRequest {
         response_type: "code".to_string(),
         client_id: "test-client".to_string(),
-        redirect_uri: "http://localhost:3000/callback".to_string(),
+        redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
         scopes: vec!["read".to_string()],
         state: None,
-        code_challenge: code_verifier.to_string(),
-        code_challenge_method: CodeChallengeMethod::Plain,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        code_challenge_method: CodeChallengeMethod::S256,
     };
     let (code, _redirect) = oauth
         .authorize(&auth_request, Some("user123".to_string()))
@@ -438,7 +435,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
         .token(&TokenRequest {
             grant_type: "authorization_code".to_string(),
             code: Some(code),
-            redirect_uri: Some("http://localhost:3000/callback".to_string()),
+            redirect_uri: Some("http://127.0.0.1:3000/callback".to_string()),
             client_id: "test-client".to_string(),
             client_secret: None,
             code_verifier: Some(code_verifier.to_string()),

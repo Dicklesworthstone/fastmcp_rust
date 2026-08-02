@@ -4,18 +4,17 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example echo_server
+//! cargo run -p fastmcp-rust --example echo_server
 //! ```
 //!
 //! Test with MCP Inspector:
 //! ```bash
-//! npx @anthropic-ai/mcp-inspector cargo run --example echo_server
+//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --example echo_server
 //! ```
 
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use fastmcp_rust::TaskManager;
 use fastmcp_rust::prelude::*;
 
 // ============================================================================
@@ -139,8 +138,6 @@ fn main() {
         .instructions(
             "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!",
         )
-        // Enable background task capability for CLI task-management E2E tests.
-        .with_task_manager(TaskManager::new().into_shared())
         // Build and run on stdio
         .build()
         .run_stdio();
