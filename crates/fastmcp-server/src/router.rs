@@ -1,27 +1,37 @@
 //! Request router for MCP servers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
+#[cfg(test)]
 use asupersync::time::wall_now;
+use asupersync::types::Time;
 use asupersync::{Budget, Cx, Outcome};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{debug, targets, trace};
 use fastmcp_core::{
-    AuthContext, McpContext, McpError, McpErrorCode, McpResult, OutcomeExt, SessionState, block_on,
+    McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
+    sha256_bounded,
 };
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, CancelTaskParams, CancelTaskResult, Content, GetPromptParams,
-    GetPromptResult, GetTaskParams, GetTaskResult, InitializeParams, InitializeResult,
-    JsonRpcRequest, ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams,
-    ListResourceTemplatesResult, ListResourcesParams, ListResourcesResult, ListTasksParams,
-    ListTasksResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker, Prompt,
-    ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, SubmitTaskParams,
-    SubmitTaskResult, Tool, validate, validate_strict,
+    CallToolParams, CallToolResult, Content, GetPromptParams, GetPromptResult, InitializeParams,
+    InitializeResult, JsonRpcRequest, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
+    Prompt, ReadResourceParams, ReadResourceResult, Resource, ResourceTemplate, Tool, validate,
+    validate_strict,
+};
+#[cfg(test)]
+use fastmcp_protocol::{
+    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, ListTasksParams,
+    ListTasksResult, SubmitTaskParams, SubmitTaskResult,
 };
 
-use crate::handler::{BidirectionalSenders, UriParams, create_context_with_progress_and_senders};
+use crate::handler::{BidirectionalSenders, BoxFuture, ProgressNotificationSender, UriParams};
+#[cfg(test)]
 use crate::tasks::SharedTaskManager;
 
 use crate::Session;
@@ -116,6 +126,204 @@ fn encode_cursor_offset(offset: usize) -> String {
     BASE64_STANDARD.encode(bytes)
 }
 
+const SANITIZED_HANDLER_PANIC_MESSAGE: &str = "Internal server error";
+static NEXT_HANDLER_INCIDENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum number of peer-controlled label bytes admitted to the log-key hash.
+///
+/// Labels longer than this retain their exact byte length in logs, but their
+/// correlation key covers only this bounded prefix. This keeps observability
+/// useful without allowing an attacker to turn debug logging into unbounded
+/// hashing work.
+const LOG_LABEL_HASH_INPUT_LIMIT: usize = 4 * 1024;
+const LOG_LABEL_DIGEST_PREFIX_BYTES: usize = 8;
+
+#[derive(Clone, Copy)]
+struct SafeLogLabel {
+    byte_len: usize,
+    hashed_bytes: usize,
+    digest_prefix: [u8; LOG_LABEL_DIGEST_PREFIX_BYTES],
+}
+
+impl std::fmt::Display for SafeLogLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bytes={},sha256_prefix=", self.byte_len)?;
+        for byte in self.digest_prefix {
+            write!(f, "{byte:02x}")?;
+        }
+        if self.hashed_bytes < self.byte_len {
+            write!(f, ",hashed_prefix_bytes={}", self.hashed_bytes)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SafeLogLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+fn safe_log_label(value: &str) -> SafeLogLabel {
+    let bytes = value.as_bytes();
+    let hashed_bytes = bytes.len().min(LOG_LABEL_HASH_INPUT_LIMIT);
+    let bounded_prefix = &bytes[..hashed_bytes];
+    let mut digest_prefix = [0_u8; LOG_LABEL_DIGEST_PREFIX_BYTES];
+    if let Ok(digest) = sha256_bounded(bounded_prefix, LOG_LABEL_HASH_INPUT_LIMIT) {
+        digest_prefix.copy_from_slice(&digest.as_bytes()[..LOG_LABEL_DIGEST_PREFIX_BYTES]);
+    }
+
+    SafeLogLabel {
+        byte_len: bytes.len(),
+        hashed_bytes,
+        digest_prefix,
+    }
+}
+
+fn duplicate_registration_error(component: &'static str, key: &str) -> McpError {
+    McpError::invalid_request(format!(
+        "{component} already exists; component_key={}",
+        safe_log_label(key)
+    ))
+}
+
+fn compose_handler_budget(
+    ambient: Budget,
+    server_or_request: Budget,
+    handler_timeout: Option<Duration>,
+    now: Time,
+) -> Budget {
+    let inherited = ambient.meet(server_or_request);
+    match handler_timeout {
+        Some(timeout) if !timeout.is_zero() => inherited.tightened_by_timeout(now, timeout),
+        Some(_) | None => inherited,
+    }
+}
+
+fn budget_error(ctx: &McpContext) -> Option<McpError> {
+    if ctx.ensure_live().is_err() {
+        return Some(McpError::request_cancelled());
+    }
+    None
+}
+
+fn sanitized_handler_panic(_request_lifetime: &Cx, handler_class: &'static str) -> McpError {
+    let incident_id = NEXT_HANDLER_INCIDENT_ID.fetch_add(1, Ordering::Relaxed);
+    log::error!(
+        target: "fastmcp_rust::handler",
+        "handler terminated unexpectedly; incident_id={incident_id}; class={handler_class}; detail=panic_payload_redacted"
+    );
+    McpError::internal_error(SANITIZED_HANDLER_PANIC_MESSAGE)
+}
+
+fn sanitized_handler_internal_error(
+    _request_lifetime: &Cx,
+    handler_class: &'static str,
+) -> McpError {
+    let incident_id = NEXT_HANDLER_INCIDENT_ID.fetch_add(1, Ordering::Relaxed);
+    log::error!(
+        target: "fastmcp_rust::handler",
+        "handler returned an opaque internal failure; incident_id={incident_id}; class={handler_class}; detail=internal_error_redacted"
+    );
+    McpError::internal_error(SANITIZED_HANDLER_PANIC_MESSAGE)
+}
+
+fn sanitize_handler_error(cx: &Cx, handler_class: &'static str, error: McpError) -> McpError {
+    if error.code == McpErrorCode::InternalError {
+        sanitized_handler_internal_error(cx, handler_class)
+    } else {
+        error
+    }
+}
+
+const fn is_framework_terminal_tool_error(code: McpErrorCode) -> bool {
+    matches!(
+        code,
+        McpErrorCode::InternalError | McpErrorCode::RequestCancelled
+    )
+}
+
+fn read_handler_timeout(
+    cx: &Cx,
+    handler_class: &'static str,
+    read: impl FnOnce() -> Option<Duration>,
+) -> McpResult<Option<Duration>> {
+    crate::catch_extension_unwind(read)
+        .map_err(|_payload| sanitized_handler_panic(cx, handler_class))
+}
+
+fn run_handler<'a, T>(
+    ctx: &McpContext,
+    budget: Budget,
+    handler_class: &'static str,
+    make_future: impl FnOnce() -> BoxFuture<'a, McpOutcome<T>>,
+) -> McpResult<McpOutcome<T>> {
+    if let Some(error) = budget_error(ctx) {
+        return Err(error);
+    }
+
+    let execution = crate::catch_extension_unwind(|| {
+        let future = make_future();
+        match budget.deadline {
+            Some(deadline) => block_on(async move {
+                asupersync::time::timeout_at(deadline, future)
+                    .await
+                    .map_err(|_elapsed| ())
+            }),
+            None => Ok(block_on(future)),
+        }
+    });
+
+    match execution {
+        Err(_payload) => Err(sanitized_handler_panic(ctx.cx(), handler_class)),
+        Ok(Err(())) => Err(McpError::new(
+            McpErrorCode::RequestCancelled,
+            "Request timeout exceeded",
+        )),
+        Ok(Ok(outcome)) => {
+            if let Some(error) = budget_error(ctx) {
+                Err(error)
+            } else {
+                Ok(outcome)
+            }
+        }
+    }
+}
+
+fn derive_handler_context(
+    request_ctx: &McpContext,
+    progress_marker: Option<ProgressMarker>,
+    notification_sender: Option<&NotificationSender>,
+    bidirectional_senders: Option<&BidirectionalSenders>,
+) -> McpContext {
+    trace!(
+        target: targets::HANDLER,
+        "Deriving handler context for request {}",
+        request_ctx.request_id()
+    );
+    let mut handler_ctx = request_ctx.clone();
+
+    if let (Some(marker), Some(sender)) = (progress_marker, notification_sender) {
+        let sender = sender.clone();
+        let reporter = ProgressNotificationSender::new(marker, move |request| {
+            sender(request);
+        })
+        .into_reporter();
+        handler_ctx = handler_ctx.with_progress_reporter(reporter);
+    }
+
+    if let Some(senders) = bidirectional_senders {
+        if let Some(ref sampling) = senders.sampling {
+            handler_ctx = handler_ctx.with_sampling(sampling.clone());
+        }
+        if let Some(ref elicitation) = senders.elicitation {
+            handler_ctx = handler_ctx.with_elicitation(elicitation.clone());
+        }
+    }
+
+    handler_ctx
+}
+
 /// Routes MCP requests to the appropriate handlers.
 pub struct Router {
     tools: HashMap<String, BoxedToolHandler>,
@@ -159,18 +367,11 @@ impl Router {
 
     /// Sets the list pagination page size.
     ///
-    /// When set, list methods (`tools/list`, `resources/list`, `resources/templates/list`,
-    /// `prompts/list`, `tasks/list`) will page results using opaque base64 cursors.
+    /// When set, list methods (`tools/list`, `resources/list`,
+    /// `resources/templates/list`, and `prompts/list`) will page results using
+    /// opaque base64 cursors.
     pub fn set_list_page_size(&mut self, page_size: Option<usize>) {
         self.list_page_size = page_size.filter(|n| *n > 0);
-    }
-
-    pub(crate) fn tool_is_read_only(&self, name: &str) -> bool {
-        self.tools
-            .get(name)
-            .and_then(|handler| handler.definition().annotations)
-            .and_then(|annotations| annotations.read_only)
-            .unwrap_or(false)
     }
 
     /// Sets whether to use strict input validation.
@@ -237,17 +438,22 @@ impl Router {
         if existed {
             match behavior {
                 crate::DuplicateBehavior::Error => {
-                    return Err(McpError::invalid_request(format!(
-                        "Tool '{}' already exists",
-                        name
-                    )));
+                    return Err(duplicate_registration_error("Tool", name));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp_rust::router", "Tool '{}' already exists, keeping original", name);
+                    log::warn!(
+                        target: "fastmcp_rust::router",
+                        "tool already exists, keeping original; tool_key={}",
+                        safe_log_label(name)
+                    );
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp_rust::router", "Replacing tool '{}'", name);
+                    log::debug!(
+                        target: "fastmcp_rust::router",
+                        "replacing tool; tool_key={}",
+                        safe_log_label(name)
+                    );
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {
@@ -322,17 +528,22 @@ impl Router {
         if exists {
             match behavior {
                 crate::DuplicateBehavior::Error => {
-                    return Err(McpError::invalid_request(format!(
-                        "Resource '{}' already exists",
-                        key
-                    )));
+                    return Err(duplicate_registration_error("Resource", &key));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp_rust::router", "Resource '{}' already exists, keeping original", key);
+                    log::warn!(
+                        target: "fastmcp_rust::router",
+                        "resource already exists, keeping original; resource_key={}",
+                        safe_log_label(&key)
+                    );
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp_rust::router", "Replacing resource '{}'", key);
+                    log::debug!(
+                        target: "fastmcp_rust::router",
+                        "replacing resource; resource_key={}",
+                        safe_log_label(&key)
+                    );
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {
@@ -369,8 +580,53 @@ impl Router {
     }
 
     /// Adds a resource template definition.
+    ///
+    /// If a template with the same URI template already exists, its definition
+    /// is replaced while any registered handler is retained. Use
+    /// [`add_resource_template_with_behavior`](Self::add_resource_template_with_behavior)
+    /// for finer control over duplicate handling.
     pub fn add_resource_template(&mut self, template: ResourceTemplate) {
+        let _ =
+            self.add_resource_template_with_behavior(template, crate::DuplicateBehavior::Replace);
+    }
+
+    /// Adds a resource template definition with specified duplicate behavior.
+    ///
+    /// Replacing a definition retains an existing handler registered for the
+    /// same URI template. Returns `Err` when behavior is
+    /// [`crate::DuplicateBehavior::Error`] and the URI template already exists.
+    pub fn add_resource_template_with_behavior(
+        &mut self,
+        template: ResourceTemplate,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
         let key = template.uri_template.clone();
+        let existed = self.resource_templates.contains_key(&key);
+
+        if existed {
+            match behavior {
+                crate::DuplicateBehavior::Error => {
+                    return Err(duplicate_registration_error("Resource template", &key));
+                }
+                crate::DuplicateBehavior::Warn => {
+                    log::warn!(
+                        target: "fastmcp_rust::router",
+                        "resource template already exists, keeping original; template_key={}",
+                        safe_log_label(&key)
+                    );
+                    return Ok(());
+                }
+                crate::DuplicateBehavior::Replace => {
+                    log::debug!(
+                        target: "fastmcp_rust::router",
+                        "replacing resource template definition; template_key={}",
+                        safe_log_label(&key)
+                    );
+                }
+                crate::DuplicateBehavior::Ignore => return Ok(()),
+            }
+        }
+
         let matcher = UriTemplate::new(&key);
         let entry = ResourceTemplateEntry {
             matcher,
@@ -392,6 +648,7 @@ impl Router {
             self.resource_template_order.push(key);
             self.rebuild_sorted_template_keys();
         }
+        Ok(())
     }
 
     /// Adds a prompt handler.
@@ -424,17 +681,22 @@ impl Router {
         if existed {
             match behavior {
                 crate::DuplicateBehavior::Error => {
-                    return Err(McpError::invalid_request(format!(
-                        "Prompt '{}' already exists",
-                        name
-                    )));
+                    return Err(duplicate_registration_error("Prompt", name));
                 }
                 crate::DuplicateBehavior::Warn => {
-                    log::warn!(target: "fastmcp_rust::router", "Prompt '{}' already exists, keeping original", name);
+                    log::warn!(
+                        target: "fastmcp_rust::router",
+                        "prompt already exists, keeping original; prompt_key={}",
+                        safe_log_label(name)
+                    );
                     return Ok(());
                 }
                 crate::DuplicateBehavior::Replace => {
-                    log::debug!(target: "fastmcp_rust::router", "Replacing prompt '{}'", name);
+                    log::debug!(
+                        target: "fastmcp_rust::router",
+                        "replacing prompt; prompt_key={}",
+                        safe_log_label(name)
+                    );
                     // Fall through to insert
                 }
                 crate::DuplicateBehavior::Ignore => {
@@ -702,15 +964,19 @@ impl Router {
     /// Handles the initialize request.
     pub fn handle_initialize(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         session: &mut Session,
         params: InitializeParams,
         instructions: Option<&str>,
     ) -> McpResult<InitializeResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         debug!(
             target: targets::SESSION,
-            "Initializing session with client: {:?}",
-            params.client_info.name
+            "preparing session initialization; client_key={}",
+            safe_log_label(&params.client_info.name)
         );
 
         // Initialize the session
@@ -734,10 +1000,14 @@ impl Router {
     /// If include_tags/exclude_tags are provided, tools are filtered by tags.
     pub fn handle_tools_list(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: ListToolsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListToolsResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let tag_filters =
             TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
@@ -745,7 +1015,9 @@ impl Router {
         } else {
             None
         };
-        let tools = self.tools_filtered(session_state, tag_filters);
+        let tools =
+            crate::catch_extension_unwind(|| self.tools_filtered(session_state, tag_filters))
+                .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListToolsResult {
                 tools,
@@ -770,44 +1042,32 @@ impl Router {
     ///
     /// # Arguments
     ///
-    /// * `cx` - The asupersync context for cancellation and tracing
-    /// * `request_id` - Internal request ID for tracking
+    /// * `request_ctx` - Request authority for cancellation, identity, auth, and accounting
     /// * `params` - The tool call parameters including tool name and arguments
-    /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_tools_call(
         &self,
-        cx: &Cx,
-        request_id: u64,
+        request_ctx: &McpContext,
         params: CallToolParams,
-        budget: &Budget,
         session_state: SessionState,
-        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
-        debug!(target: targets::HANDLER, "Calling tool: {}", params.name);
-        trace!(target: targets::HANDLER, "Tool arguments: {:?}", params.arguments);
+        debug!(
+            target: targets::HANDLER,
+            "calling tool; tool_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
 
-        // Check cancellation
-        if cx.is_cancel_requested() {
-            return Err(McpError::request_cancelled());
-        }
-
-        // Check budget exhaustion
-        if budget.is_exhausted() {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request budget exhausted",
-            ));
-        }
-        if budget.is_past_deadline(wall_now()) {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request timeout exceeded",
-            ));
+        // Anchor every relative ceiling once at dispatch entry. Definition/schema
+        // work and timeout metadata lookup are part of this operation and must
+        // not reset a handler-declared window by taking a later clock sample.
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
         }
 
         // Check if tool is disabled for this session
@@ -827,7 +1087,8 @@ impl Router {
         // Validate arguments against the tool's input schema
         // Default to empty object since MCP tool arguments are always objects
         let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        let tool_def = handler.definition();
+        let tool_def = crate::catch_extension_unwind(|| handler.definition())
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
         // Use strict or lenient validation based on configuration
         let validation_result = if self.strict_input_validation {
@@ -851,49 +1112,37 @@ impl Router {
         let progress_marker: Option<ProgressMarker> =
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
-        // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let mut ctx = match (progress_marker, notification_sender) {
-            (Some(marker), Some(sender)) => {
-                let sender = sender.clone();
-                create_context_with_progress_and_senders(
-                    cx.clone(),
-                    request_id,
-                    Some(marker),
-                    Some(session_state),
-                    move |req| {
-                        sender(req);
-                    },
-                    bidirectional_senders,
-                )
-            }
-            _ => {
-                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
-                // Attach bidirectional senders even without progress
-                if let Some(senders) = bidirectional_senders {
-                    if let Some(ref sampling) = senders.sampling {
-                        ctx = ctx.with_sampling(sampling.clone());
-                    }
-                    if let Some(ref elicitation) = senders.elicitation {
-                        ctx = ctx.with_elicitation(elicitation.clone());
-                    }
-                }
-                ctx
-            }
-        };
-        if let Some(auth) = auth {
-            ctx = ctx.with_auth(auth);
-        }
+        // Clone the request authority so auth, budget accounting, cancellation,
+        // and mask state remain shared with middleware and nested operations.
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
 
         // Call the handler asynchronously - returns McpOutcome (4-valued)
-        let outcome = block_on(handler.call_async(&ctx, arguments));
+        let outcome = run_handler(&ctx, effective_budget, "tool", || {
+            handler.call_async(&ctx, arguments)
+        })?;
         match outcome {
             Outcome::Ok(content) => Ok(CallToolResult {
                 content,
                 is_error: false,
             }),
             Outcome::Err(e) => {
-                // If the request was cancelled, propagate the error as a JSON-RPC error.
-                if matches!(e.code, McpErrorCode::RequestCancelled) {
+                let e = sanitize_handler_error(request_ctx.cx(), "tool", e);
+                if is_framework_terminal_tool_error(e.code) {
                     return Err(e);
                 }
 
@@ -907,13 +1156,7 @@ impl Router {
                 // Cancelled requests are reported as JSON-RPC errors
                 Err(McpError::request_cancelled())
             }
-            Outcome::Panicked(payload) => {
-                // Panics become internal errors
-                Err(McpError::internal_error(format!(
-                    "Handler panic: {}",
-                    payload.message()
-                )))
-            }
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
         }
     }
 
@@ -923,10 +1166,14 @@ impl Router {
     /// If include_tags/exclude_tags are provided, resources are filtered by tags.
     pub fn handle_resources_list(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: ListResourcesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourcesResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let tag_filters =
             TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
@@ -934,7 +1181,10 @@ impl Router {
         } else {
             None
         };
-        let resources = self.resources_filtered(session_state, tag_filters);
+        let resources = crate::catch_extension_unwind(|| {
+            self.resources_filtered(session_state, tag_filters)
+        })
+        .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "resource_definition"))?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListResourcesResult {
                 resources,
@@ -961,10 +1211,14 @@ impl Router {
     /// If include_tags/exclude_tags are provided, templates are filtered by tags.
     pub fn handle_resource_templates_list(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: ListResourceTemplatesParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListResourceTemplatesResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let tag_filters =
             TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
@@ -997,43 +1251,28 @@ impl Router {
     ///
     /// # Arguments
     ///
-    /// * `cx` - The asupersync context for cancellation and tracing
-    /// * `request_id` - Internal request ID for tracking
+    /// * `request_ctx` - Request authority for cancellation, identity, auth, and accounting
     /// * `params` - The resource read parameters including URI
-    /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_resources_read(
         &self,
-        cx: &Cx,
-        request_id: u64,
+        request_ctx: &McpContext,
         params: &ReadResourceParams,
-        budget: &Budget,
         session_state: SessionState,
-        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ReadResourceResult> {
-        debug!(target: targets::HANDLER, "Reading resource: {}", params.uri);
+        debug!(
+            target: targets::HANDLER,
+            "reading resource; resource_key={}",
+            safe_log_label(&params.uri)
+        );
 
-        // Check cancellation
-        if cx.is_cancel_requested() {
-            return Err(McpError::request_cancelled());
-        }
-
-        // Check budget exhaustion
-        if budget.is_exhausted() {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request budget exhausted",
-            ));
-        }
-        if budget.is_past_deadline(wall_now()) {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request timeout exceeded",
-            ));
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
         }
 
         // Check if resource is disabled for this session
@@ -1052,48 +1291,44 @@ impl Router {
         let progress_marker: Option<ProgressMarker> =
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
-        // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let mut ctx = match (progress_marker, notification_sender) {
-            (Some(marker), Some(sender)) => {
-                let sender = sender.clone();
-                create_context_with_progress_and_senders(
-                    cx.clone(),
-                    request_id,
-                    Some(marker),
-                    Some(session_state),
-                    move |req| {
-                        sender(req);
-                    },
-                    bidirectional_senders,
-                )
-            }
-            _ => {
-                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
-                // Attach bidirectional senders even without progress
-                if let Some(senders) = bidirectional_senders {
-                    if let Some(ref sampling) = senders.sampling {
-                        ctx = ctx.with_sampling(sampling.clone());
-                    }
-                    if let Some(ref elicitation) = senders.elicitation {
-                        ctx = ctx.with_elicitation(elicitation.clone());
-                    }
-                }
-                ctx
-            }
-        };
-        if let Some(auth) = auth {
-            ctx = ctx.with_auth(auth);
-        }
+        // Clone the request authority so auth, budget accounting, cancellation,
+        // and mask state remain shared with middleware and nested operations.
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+
+        let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
+            resolved.handler.timeout()
+        })?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
 
         // Read the resource asynchronously - returns McpOutcome (4-valued)
-        let outcome = block_on(resolved.handler.read_async_with_uri(
-            &ctx,
-            &params.uri,
-            &resolved.params,
-        ));
+        let outcome = run_handler(&ctx, effective_budget, "resource", || {
+            resolved
+                .handler
+                .read_async_with_uri(&ctx, &params.uri, &resolved.params)
+        })?;
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
-        let contents = outcome.into_mcp_result()?;
+        let contents = match outcome {
+            Outcome::Ok(contents) => contents,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(request_ctx.cx(), "resource", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "resource"));
+            }
+        };
 
         Ok(ReadResourceResult { contents })
     }
@@ -1104,10 +1339,14 @@ impl Router {
     /// If include_tags/exclude_tags are provided, prompts are filtered by tags.
     pub fn handle_prompts_list(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: ListPromptsParams,
         session_state: Option<&SessionState>,
     ) -> McpResult<ListPromptsResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let tag_filters =
             TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
         let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
@@ -1115,7 +1354,11 @@ impl Router {
         } else {
             None
         };
-        let prompts = self.prompts_filtered(session_state, tag_filters);
+        let prompts =
+            crate::catch_extension_unwind(|| self.prompts_filtered(session_state, tag_filters))
+                .map_err(|_payload| {
+                    sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
+                })?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListPromptsResult {
                 prompts,
@@ -1140,44 +1383,29 @@ impl Router {
     ///
     /// # Arguments
     ///
-    /// * `cx` - The asupersync context for cancellation and tracing
-    /// * `request_id` - Internal request ID for tracking
+    /// * `request_ctx` - Request authority for cancellation, identity, auth, and accounting
     /// * `params` - The prompt get parameters including name and arguments
-    /// * `budget` - Request budget for timeout enforcement
     /// * `session_state` - Session state for per-session storage
     /// * `notification_sender` - Optional callback for sending progress notifications
     /// * `bidirectional_senders` - Optional senders for sampling/elicitation
     pub fn handle_prompts_get(
         &self,
-        cx: &Cx,
-        request_id: u64,
+        request_ctx: &McpContext,
         params: GetPromptParams,
-        budget: &Budget,
         session_state: SessionState,
-        auth: Option<AuthContext>,
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<GetPromptResult> {
-        debug!(target: targets::HANDLER, "Getting prompt: {}", params.name);
-        trace!(target: targets::HANDLER, "Prompt arguments: {:?}", params.arguments);
+        debug!(
+            target: targets::HANDLER,
+            "getting prompt; prompt_key={}; arguments_present={}",
+            safe_log_label(&params.name),
+            params.arguments.is_some()
+        );
 
-        // Check cancellation
-        if cx.is_cancel_requested() {
-            return Err(McpError::request_cancelled());
-        }
-
-        // Check budget exhaustion
-        if budget.is_exhausted() {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request budget exhausted",
-            ));
-        }
-        if budget.is_past_deadline(wall_now()) {
-            return Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "Request timeout exceeded",
-            ));
+        let dispatch_started_at = request_ctx.cx().now();
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
         }
 
         // Check if prompt is disabled for this session
@@ -1195,53 +1423,52 @@ impl Router {
                 format!("Prompt not found: {}", params.name),
             )
         })?;
+        let description = crate::catch_extension_unwind(|| handler.definition().description)
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
 
         // Extract progress marker from request metadata
         let progress_marker: Option<ProgressMarker> =
             params.meta.as_ref().and_then(|m| m.progress_marker.clone());
 
-        // Create context for the handler with progress reporting, session state, and bidirectional senders
-        let mut ctx = match (progress_marker, notification_sender) {
-            (Some(marker), Some(sender)) => {
-                let sender = sender.clone();
-                create_context_with_progress_and_senders(
-                    cx.clone(),
-                    request_id,
-                    Some(marker),
-                    Some(session_state),
-                    move |req| {
-                        sender(req);
-                    },
-                    bidirectional_senders,
-                )
-            }
-            _ => {
-                let mut ctx = McpContext::with_state(cx.clone(), request_id, session_state);
-                // Attach bidirectional senders even without progress
-                if let Some(senders) = bidirectional_senders {
-                    if let Some(ref sampling) = senders.sampling {
-                        ctx = ctx.with_sampling(sampling.clone());
-                    }
-                    if let Some(ref elicitation) = senders.elicitation {
-                        ctx = ctx.with_elicitation(elicitation.clone());
-                    }
-                }
-                ctx
-            }
-        };
-        if let Some(auth) = auth {
-            ctx = ctx.with_auth(auth);
-        }
+        // Clone the request authority so auth, budget accounting, cancellation,
+        // and mask state remain shared with middleware and nested operations.
+        let ctx = derive_handler_context(
+            request_ctx,
+            progress_marker,
+            notification_sender,
+            bidirectional_senders,
+        );
+
+        let handler_timeout =
+            read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            request_ctx.cx().budget(),
+            request_ctx.budget(),
+            handler_timeout,
+            dispatch_started_at,
+        );
+        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
 
         // Get the prompt asynchronously - returns McpOutcome (4-valued)
         let arguments = params.arguments.unwrap_or_default();
-        let outcome = block_on(handler.get_async(&ctx, arguments));
+        let outcome = run_handler(&ctx, effective_budget, "prompt", || {
+            handler.get_async(&ctx, arguments)
+        })?;
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
-        let messages = outcome.into_mcp_result()?;
+        let messages = match outcome {
+            Outcome::Ok(messages) => messages,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(request_ctx.cx(), "prompt", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(request_ctx.cx(), "prompt"));
+            }
+        };
 
         Ok(GetPromptResult {
-            description: handler.definition().description,
+            description,
             messages,
         })
     }
@@ -1253,12 +1480,17 @@ impl Router {
     /// Handles the tasks/list request.
     ///
     /// Lists all background tasks, optionally filtered by status.
+    #[cfg(test)]
     pub fn handle_tasks_list(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: ListTasksParams,
         task_manager: Option<&SharedTaskManager>,
     ) -> McpResult<ListTasksResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let task_manager = task_manager.ok_or_else(|| {
             McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -1266,7 +1498,11 @@ impl Router {
             )
         })?;
 
-        debug!(target: targets::HANDLER, "Listing tasks (status filter: {:?})", params.status);
+        debug!(
+            target: targets::HANDLER,
+            "listing tasks; status_filter_present={}",
+            params.status.is_some()
+        );
 
         let mut tasks = task_manager.list_tasks(params.status);
         // Stable ordering for pagination: created_at then id.
@@ -1294,12 +1530,17 @@ impl Router {
     /// Handles the tasks/get request.
     ///
     /// Gets information about a specific task, including its result if completed.
+    #[cfg(test)]
     pub fn handle_tasks_get(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: GetTaskParams,
         task_manager: Option<&SharedTaskManager>,
     ) -> McpResult<GetTaskResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let task_manager = task_manager.ok_or_else(|| {
             McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -1307,7 +1548,11 @@ impl Router {
             )
         })?;
 
-        debug!(target: targets::HANDLER, "Getting task: {}", params.id);
+        debug!(
+            target: targets::HANDLER,
+            "getting task; task_key={}",
+            safe_log_label(params.id.as_str())
+        );
 
         let task = task_manager
             .get_info(&params.id)
@@ -1321,12 +1566,17 @@ impl Router {
     /// Handles the tasks/cancel request.
     ///
     /// Requests cancellation of a running or pending task.
+    #[cfg(test)]
     pub fn handle_tasks_cancel(
         &self,
-        _cx: &Cx,
+        request_ctx: &McpContext,
         params: CancelTaskParams,
         task_manager: Option<&SharedTaskManager>,
     ) -> McpResult<CancelTaskResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let task_manager = task_manager.ok_or_else(|| {
             McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -1334,7 +1584,12 @@ impl Router {
             )
         })?;
 
-        debug!(target: targets::HANDLER, "Cancelling task: {}", params.id);
+        debug!(
+            target: targets::HANDLER,
+            "cancelling task; task_key={}; reason_present={}",
+            safe_log_label(params.id.as_str()),
+            params.reason.is_some()
+        );
 
         let task = task_manager.cancel(&params.id, params.reason)?;
 
@@ -1347,12 +1602,17 @@ impl Router {
     /// Handles the tasks/submit request.
     ///
     /// Submits a new background task for execution.
+    #[cfg(test)]
     pub fn handle_tasks_submit(
         &self,
-        cx: &Cx,
+        request_ctx: &McpContext,
         params: SubmitTaskParams,
         task_manager: Option<&SharedTaskManager>,
     ) -> McpResult<SubmitTaskResult> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+
         let task_manager = task_manager.ok_or_else(|| {
             McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -1360,9 +1620,14 @@ impl Router {
             )
         })?;
 
-        debug!(target: targets::HANDLER, "Submitting task: {}", params.task_type);
+        debug!(
+            target: targets::HANDLER,
+            "submitting task; task_type_key={}; params_present={}",
+            safe_log_label(&params.task_type),
+            params.params.is_some()
+        );
 
-        let task_id = task_manager.submit(cx, &params.task_type, params.params)?;
+        let task_id = task_manager.submit(request_ctx.cx(), &params.task_type, params.params)?;
         let task = task_manager
             .get_info(&task_id)
             .ok_or_else(|| McpError::internal_error("Task created but not found"))?;
@@ -1394,6 +1659,10 @@ pub struct MountResult {
     pub prompts: usize,
     /// Any warnings generated during mounting (e.g., name conflicts).
     pub warnings: Vec<String>,
+    /// Errors that caused the mount operation to be rejected.
+    ///
+    /// A rejected mount does not mutate the destination router.
+    pub errors: Vec<String>,
 }
 
 impl MountResult {
@@ -1403,10 +1672,41 @@ impl MountResult {
         self.tools > 0 || self.resources > 0 || self.resource_templates > 0 || self.prompts > 0
     }
 
-    /// Returns true if mounting was successful (currently always true).
+    /// Returns true if mounting was not rejected.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        true
+        self.errors.is_empty()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.tools += other.tools;
+        self.resources += other.resources;
+        self.resource_templates += other.resource_templates;
+        self.prompts += other.prompts;
+        self.warnings.extend(other.warnings);
+        self.errors.extend(other.errors);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MountSelection {
+    All,
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl MountSelection {
+    const fn includes_tools(self) -> bool {
+        matches!(self, Self::All | Self::Tools)
+    }
+
+    const fn includes_resources(self) -> bool {
+        matches!(self, Self::All | Self::Resources)
+    }
+
+    const fn includes_prompts(self) -> bool {
+        matches!(self, Self::All | Self::Prompts)
     }
 }
 
@@ -1428,18 +1728,116 @@ impl Router {
             return Ok(());
         }
         if prefix.contains('/') {
-            return Err(format!("Prefix cannot contain slashes: '{}'", prefix));
+            return Err("Invalid mount prefix: slashes are not permitted".to_string());
         }
         // Allow alphanumeric, underscore, hyphen
         for ch in prefix.chars() {
             if !ch.is_alphanumeric() && ch != '_' && ch != '-' {
-                return Err(format!(
-                    "Prefix contains invalid character '{}': '{}'",
-                    ch, prefix
-                ));
+                return Err(
+                    "Invalid mount prefix: invalid characters are not permitted".to_string()
+                );
             }
         }
         Ok(())
+    }
+
+    fn mount_preflight(
+        &self,
+        other: &Self,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+        selection: MountSelection,
+    ) -> MountResult {
+        let mut result = MountResult::default();
+
+        if let Some(prefix) = prefix {
+            if let Err(error) = Self::validate_prefix(prefix) {
+                // Keep the warning for callers of the original API while also
+                // recording the rejection as a real failure.
+                result.warnings.push(error.clone());
+                result.errors.push(error);
+                return result;
+            }
+        }
+
+        if behavior != crate::DuplicateBehavior::Error {
+            return result;
+        }
+
+        let mut conflicts = Vec::new();
+        if selection.includes_tools() {
+            for name in other.tools.keys() {
+                let mounted_name = Self::apply_prefix(name, prefix);
+                if self.tools.contains_key(&mounted_name) {
+                    conflicts.push(("Tool", mounted_name));
+                }
+            }
+        }
+        if selection.includes_resources() {
+            for uri in other.resources.keys() {
+                let mounted_uri = Self::apply_prefix(uri, prefix);
+                if self.resources.contains_key(&mounted_uri) {
+                    conflicts.push(("Resource", mounted_uri));
+                }
+            }
+            for uri_template in other.resource_templates.keys() {
+                let mounted_uri_template = Self::apply_prefix(uri_template, prefix);
+                if self.resource_templates.contains_key(&mounted_uri_template) {
+                    conflicts.push(("Resource template", mounted_uri_template));
+                }
+            }
+        }
+        if selection.includes_prompts() {
+            for name in other.prompts.keys() {
+                let mounted_name = Self::apply_prefix(name, prefix);
+                if self.prompts.contains_key(&mounted_name) {
+                    conflicts.push(("Prompt", mounted_name));
+                }
+            }
+        }
+
+        conflicts.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+        result
+            .errors
+            .extend(conflicts.into_iter().map(|(kind, key)| {
+                format!(
+                    "Mount rejected because {kind} already exists; component_key={}",
+                    safe_log_label(&key)
+                )
+            }));
+        result
+    }
+
+    fn should_mount_duplicate(
+        behavior: crate::DuplicateBehavior,
+        kind: &'static str,
+        key: &str,
+        result: &mut MountResult,
+    ) -> bool {
+        match behavior {
+            crate::DuplicateBehavior::Error => {
+                result.errors.push(format!(
+                    "Mount rejected because {kind} already exists; component_key={}",
+                    safe_log_label(key)
+                ));
+                false
+            }
+            crate::DuplicateBehavior::Warn => {
+                result.warnings.push(format!(
+                    "{kind} already exists, keeping original; component_key={}",
+                    safe_log_label(key)
+                ));
+                false
+            }
+            crate::DuplicateBehavior::Replace => {
+                result.warnings.push(format!(
+                    "{kind} already exists, replacing original; component_key={}",
+                    safe_log_label(key)
+                ));
+                true
+            }
+            crate::DuplicateBehavior::Ignore => false,
+        }
     }
 
     /// Mounts all handlers from another router with an optional prefix.
@@ -1458,7 +1856,26 @@ impl Router {
     /// // Tool "query" becomes "db/query"
     /// ```
     pub fn mount(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        let mut result = MountResult::default();
+        self.mount_with_behavior(other, prefix, crate::DuplicateBehavior::Replace)
+    }
+
+    /// Mounts all handlers using the specified duplicate behavior.
+    ///
+    /// Prefix validation happens before any destination mutation. With
+    /// [`crate::DuplicateBehavior::Error`], every selected component is
+    /// preflighted and any conflict rejects the entire mount atomically.
+    pub fn mount_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::All);
+        if !preflight.is_success() {
+            return preflight;
+        }
+
+        let mut result = preflight;
 
         let Router {
             tools,
@@ -1472,45 +1889,34 @@ impl Router {
             ..
         } = other;
 
-        // Validate prefix
-        if let Some(p) = prefix {
-            if let Err(e) = Self::validate_prefix(p) {
-                result.warnings.push(e);
-                // Continue anyway, but log the warning
-            }
-        }
-
         // Mount tools
-        let tool_result = self.mount_tools_from(tools, tool_order, prefix);
-        result.tools = tool_result.tools;
-        result.warnings.extend(tool_result.warnings);
+        result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
 
         // Mount resources
-        let resource_result = self.mount_resources_from(resources, resource_order, prefix);
-        result.resources = resource_result.resources;
-        result.warnings.extend(resource_result.warnings);
+        result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
 
         // Mount resource templates
-        let template_result =
-            self.mount_resource_templates_from(resource_templates, resource_template_order, prefix);
-        result.resource_templates = template_result.resource_templates;
-        result.warnings.extend(template_result.warnings);
+        result.merge(self.mount_resource_templates_from(
+            resource_templates,
+            resource_template_order,
+            prefix,
+            behavior,
+        ));
 
         // Mount prompts
-        let prompt_result = self.mount_prompts_from(prompts, prompt_order, prefix);
-        result.prompts = prompt_result.prompts;
-        result.warnings.extend(prompt_result.warnings);
+        result.merge(self.mount_prompts_from(prompts, prompt_order, prefix, behavior));
 
         // Log mount result
         if result.has_components() {
             debug!(
                 target: targets::HANDLER,
-                "Mounted {} tools, {} resources, {} templates, {} prompts (prefix: {:?})",
+                "mounted {} tools, {} resources, {} templates, {} prompts; prefix_present={}; prefix_key={}",
                 result.tools,
                 result.resources,
                 result.resource_templates,
                 result.prompts,
-                prefix
+                prefix.is_some(),
+                safe_log_label(prefix.unwrap_or_default())
             );
         }
 
@@ -1519,7 +1925,21 @@ impl Router {
 
     /// Mounts only tools from a router.
     pub fn mount_tools(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        self.mount_tools_from(other.tools, other.tool_order, prefix)
+        self.mount_tools_with_behavior(other, prefix, crate::DuplicateBehavior::Replace)
+    }
+
+    /// Mounts only tools using the specified duplicate behavior.
+    pub fn mount_tools_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::Tools);
+        if !preflight.is_success() {
+            return preflight;
+        }
+        self.mount_tools_from(other.tools, other.tool_order, prefix, behavior)
     }
 
     /// Internal: mount tools from a HashMap.
@@ -1528,6 +1948,7 @@ impl Router {
         mut tools: HashMap<String, BoxedToolHandler>,
         tool_order: Vec<String>,
         prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
     ) -> MountResult {
         use crate::handler::MountedToolHandler;
 
@@ -1540,18 +1961,17 @@ impl Router {
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
-                "Mounting tool '{}' as '{}'",
-                name,
-                mounted_name
+                "mounting tool; source_key={}; mounted_key={}",
+                safe_log_label(&name),
+                safe_log_label(&mounted_name)
             );
 
             // Check for conflicts
             let existed = self.tools.contains_key(&mounted_name);
-            if existed {
-                result.warnings.push(format!(
-                    "Tool '{}' already exists, will be overwritten",
-                    mounted_name
-                ));
+            if existed
+                && !Self::should_mount_duplicate(behavior, "Tool", &mounted_name, &mut result)
+            {
+                continue;
             }
 
             // Wrap with mounted name and insert
@@ -1573,11 +1993,10 @@ impl Router {
                 let mounted_name = Self::apply_prefix(&name, prefix);
 
                 let existed = self.tools.contains_key(&mounted_name);
-                if existed {
-                    result.warnings.push(format!(
-                        "Tool '{}' already exists, will be overwritten",
-                        mounted_name
-                    ));
+                if existed
+                    && !Self::should_mount_duplicate(behavior, "Tool", &mounted_name, &mut result)
+                {
+                    continue;
                 }
 
                 let mounted = MountedToolHandler::new(handler, mounted_name.clone());
@@ -1594,14 +2013,38 @@ impl Router {
 
     /// Mounts only resources from a router.
     pub fn mount_resources(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        let mut result = self.mount_resources_from(other.resources, other.resource_order, prefix);
+        self.mount_resources_with_behavior(other, prefix, crate::DuplicateBehavior::Replace)
+    }
+
+    /// Mounts resources and resource templates using the specified duplicate
+    /// behavior.
+    pub fn mount_resources_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::Resources);
+        if !preflight.is_success() {
+            return preflight;
+        }
+
+        let Router {
+            resources,
+            resource_order,
+            resource_templates,
+            resource_template_order,
+            ..
+        } = other;
+        let mut result = preflight;
+        result.merge(self.mount_resources_from(resources, resource_order, prefix, behavior));
         let template_result = self.mount_resource_templates_from(
-            other.resource_templates,
-            other.resource_template_order,
+            resource_templates,
+            resource_template_order,
             prefix,
+            behavior,
         );
-        result.resource_templates = template_result.resource_templates;
-        result.warnings.extend(template_result.warnings);
+        result.merge(template_result);
         result
     }
 
@@ -1611,6 +2054,7 @@ impl Router {
         mut resources: HashMap<String, BoxedResourceHandler>,
         resource_order: Vec<String>,
         prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
     ) -> MountResult {
         use crate::handler::MountedResourceHandler;
 
@@ -1623,22 +2067,21 @@ impl Router {
             let mounted_uri = Self::apply_prefix(&uri, prefix);
             trace!(
                 target: targets::HANDLER,
-                "Mounting resource '{}' as '{}'",
-                uri,
-                mounted_uri
+                "mounting resource; source_key={}; mounted_key={}",
+                safe_log_label(&uri),
+                safe_log_label(&mounted_uri)
             );
 
             // Check for conflicts
             let existed = self.resources.contains_key(&mounted_uri);
-            if existed {
-                result.warnings.push(format!(
-                    "Resource '{}' already exists, will be overwritten",
-                    mounted_uri
-                ));
+            if existed
+                && !Self::should_mount_duplicate(behavior, "Resource", &mounted_uri, &mut result)
+            {
+                continue;
             }
 
             // Wrap with mounted URI and insert
-            let mounted = MountedResourceHandler::new(handler, mounted_uri.clone());
+            let mounted = MountedResourceHandler::new(handler, uri.clone(), mounted_uri.clone());
             let needs_order_push =
                 !existed && !self.resource_order.iter().any(|u| u == &mounted_uri);
             self.resources
@@ -1657,14 +2100,18 @@ impl Router {
                 let mounted_uri = Self::apply_prefix(&uri, prefix);
 
                 let existed = self.resources.contains_key(&mounted_uri);
-                if existed {
-                    result.warnings.push(format!(
-                        "Resource '{}' already exists, will be overwritten",
-                        mounted_uri
-                    ));
+                if existed
+                    && !Self::should_mount_duplicate(
+                        behavior,
+                        "Resource",
+                        &mounted_uri,
+                        &mut result,
+                    )
+                {
+                    continue;
                 }
 
-                let mounted = MountedResourceHandler::new(handler, mounted_uri.clone());
+                let mounted = MountedResourceHandler::new(handler, uri, mounted_uri.clone());
                 self.resources
                     .insert(mounted_uri.clone(), Box::new(mounted));
                 if !existed && !self.resource_order.iter().any(|u| u == &mounted_uri) {
@@ -1683,6 +2130,7 @@ impl Router {
         mut templates: HashMap<String, ResourceTemplateEntry>,
         resource_template_order: Vec<String>,
         prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
     ) -> MountResult {
         use crate::handler::MountedResourceHandler;
 
@@ -1695,18 +2143,22 @@ impl Router {
             let mounted_uri_template = Self::apply_prefix(&uri_template, prefix);
             trace!(
                 target: targets::HANDLER,
-                "Mounting resource template '{}' as '{}'",
-                uri_template,
-                mounted_uri_template
+                "mounting resource template; source_key={}; mounted_key={}",
+                safe_log_label(&uri_template),
+                safe_log_label(&mounted_uri_template)
             );
 
             // Check for conflicts
             let existed = self.resource_templates.contains_key(&mounted_uri_template);
-            if existed {
-                result.warnings.push(format!(
-                    "Resource template '{}' already exists, will be overwritten",
-                    mounted_uri_template
-                ));
+            if existed
+                && !Self::should_mount_duplicate(
+                    behavior,
+                    "Resource template",
+                    &mounted_uri_template,
+                    &mut result,
+                )
+            {
+                continue;
             }
 
             // Create new template with mounted URI
@@ -1718,6 +2170,7 @@ impl Router {
                 let wrapped: BoxedResourceHandler =
                     Box::new(MountedResourceHandler::with_template(
                         h,
+                        uri_template.clone(),
                         mounted_uri_template.clone(),
                         mounted_template.clone(),
                     ));
@@ -1752,11 +2205,15 @@ impl Router {
                 let mounted_uri_template = Self::apply_prefix(&uri_template, prefix);
 
                 let existed = self.resource_templates.contains_key(&mounted_uri_template);
-                if existed {
-                    result.warnings.push(format!(
-                        "Resource template '{}' already exists, will be overwritten",
-                        mounted_uri_template
-                    ));
+                if existed
+                    && !Self::should_mount_duplicate(
+                        behavior,
+                        "Resource template",
+                        &mounted_uri_template,
+                        &mut result,
+                    )
+                {
+                    continue;
                 }
 
                 let mut mounted_template = entry.template.clone();
@@ -1766,6 +2223,7 @@ impl Router {
                     let wrapped: BoxedResourceHandler =
                         Box::new(MountedResourceHandler::with_template(
                             h,
+                            uri_template,
                             mounted_uri_template.clone(),
                             mounted_template.clone(),
                         ));
@@ -1803,7 +2261,21 @@ impl Router {
 
     /// Mounts only prompts from a router.
     pub fn mount_prompts(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
-        self.mount_prompts_from(other.prompts, other.prompt_order, prefix)
+        self.mount_prompts_with_behavior(other, prefix, crate::DuplicateBehavior::Replace)
+    }
+
+    /// Mounts only prompts using the specified duplicate behavior.
+    pub fn mount_prompts_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::Prompts);
+        if !preflight.is_success() {
+            return preflight;
+        }
+        self.mount_prompts_from(other.prompts, other.prompt_order, prefix, behavior)
     }
 
     /// Internal: mount prompts from a HashMap.
@@ -1812,6 +2284,7 @@ impl Router {
         mut prompts: HashMap<String, BoxedPromptHandler>,
         prompt_order: Vec<String>,
         prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
     ) -> MountResult {
         use crate::handler::MountedPromptHandler;
 
@@ -1824,18 +2297,17 @@ impl Router {
             let mounted_name = Self::apply_prefix(&name, prefix);
             trace!(
                 target: targets::HANDLER,
-                "Mounting prompt '{}' as '{}'",
-                name,
-                mounted_name
+                "mounting prompt; source_key={}; mounted_key={}",
+                safe_log_label(&name),
+                safe_log_label(&mounted_name)
             );
 
             // Check for conflicts
             let existed = self.prompts.contains_key(&mounted_name);
-            if existed {
-                result.warnings.push(format!(
-                    "Prompt '{}' already exists, will be overwritten",
-                    mounted_name
-                ));
+            if existed
+                && !Self::should_mount_duplicate(behavior, "Prompt", &mounted_name, &mut result)
+            {
+                continue;
             }
 
             // Wrap with mounted name and insert
@@ -1856,11 +2328,10 @@ impl Router {
                 let mounted_name = Self::apply_prefix(&name, prefix);
 
                 let existed = self.prompts.contains_key(&mounted_name);
-                if existed {
-                    result.warnings.push(format!(
-                        "Prompt '{}' already exists, will be overwritten",
-                        mounted_name
-                    ));
+                if existed
+                    && !Self::should_mount_duplicate(behavior, "Prompt", &mounted_name, &mut result)
+                {
+                    continue;
                 }
 
                 let mounted = MountedPromptHandler::new(handler, mounted_name.clone());
@@ -1921,14 +2392,49 @@ enum UriTemplateError {
     UnclosedParam,
     UnmatchedClose,
     EmptyParam,
+    UnsupportedOperator,
+    InvalidParamName,
     DuplicateParam(String),
+    TooComplex,
+}
+
+impl UriTemplateError {
+    const fn log_class(&self) -> &'static str {
+        match self {
+            Self::UnclosedParam => "unclosed_parameter",
+            Self::UnmatchedClose => "unmatched_close",
+            Self::EmptyParam => "empty_parameter",
+            Self::UnsupportedOperator => "unsupported_operator",
+            Self::InvalidParamName => "invalid_parameter_name",
+            Self::DuplicateParam(_) => "duplicate_parameter",
+            Self::TooComplex => "too_complex",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UriExpansion {
+    Simple,
+    Reserved,
 }
 
 #[derive(Debug, Clone)]
 enum UriSegment {
     Literal(String),
-    Param(String),
+    Param {
+        name: String,
+        expansion: UriExpansion,
+    },
 }
+
+// Matching an interior reserved expansion may require trying more than one
+// occurrence of its following literal. Bound recursion, input bytes, literal
+// scans, capture validation, decoding, and aggregate split work so an
+// adversarial URI cannot turn template matching into unbounded work.
+const MAX_URI_TEMPLATE_MATCH_SEGMENTS: usize = 256;
+const MAX_URI_TEMPLATE_INPUT_BYTES: usize = 64 * 1_024;
+const MAX_URI_TEMPLATE_MATCH_WORK_BYTES: usize = 1_024 * 1_024;
+const MAX_URI_TEMPLATE_SPLIT_ATTEMPTS: usize = 4_096;
 
 impl UriTemplate {
     /// Creates a new URI template from a pattern.
@@ -1939,9 +2445,9 @@ impl UriTemplate {
         Self::try_new(pattern).unwrap_or_else(|err| {
             fastmcp_core::logging::warn!(
                 target: targets::HANDLER,
-                "Invalid URI template '{}': {:?}, using non-matching fallback",
-                pattern,
-                err
+                "invalid URI template; template_key={}; error_class={}; using non-matching fallback",
+                safe_log_label(pattern),
+                err.log_class()
             );
             // Return a template with no segments that can never match
             Self {
@@ -1973,29 +2479,54 @@ impl UriTemplate {
 
                     if !literal.is_empty() {
                         segments.push(UriSegment::Literal(std::mem::take(&mut literal)));
+                        if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
+                            return Err(UriTemplateError::TooComplex);
+                        }
                     }
 
-                    let mut name = String::new();
+                    let mut expression = String::new();
                     let mut closed = false;
                     for next in chars.by_ref() {
                         if next == '}' {
                             closed = true;
                             break;
                         }
-                        name.push(next);
+                        expression.push(next);
                     }
 
                     if !closed {
                         return Err(UriTemplateError::UnclosedParam);
                     }
 
+                    if expression.is_empty() {
+                        return Err(UriTemplateError::EmptyParam);
+                    }
+
+                    let (expansion, name) = match expression.as_bytes().first().copied() {
+                        Some(b'+') => (UriExpansion::Reserved, &expression[1..]),
+                        Some(b'#' | b'.' | b'/' | b';' | b'?' | b'&') => {
+                            return Err(UriTemplateError::UnsupportedOperator);
+                        }
+                        Some(_) => (UriExpansion::Simple, expression.as_str()),
+                        None => return Err(UriTemplateError::EmptyParam),
+                    };
+
                     if name.is_empty() {
                         return Err(UriTemplateError::EmptyParam);
                     }
-                    if !seen.insert(name.clone()) {
-                        return Err(UriTemplateError::DuplicateParam(name));
+                    if !is_valid_uri_variable_name(name) {
+                        return Err(UriTemplateError::InvalidParamName);
                     }
-                    segments.push(UriSegment::Param(name));
+                    if !seen.insert(name.to_string()) {
+                        return Err(UriTemplateError::DuplicateParam(name.to_string()));
+                    }
+                    segments.push(UriSegment::Param {
+                        name: name.to_string(),
+                        expansion,
+                    });
+                    if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
+                        return Err(UriTemplateError::TooComplex);
+                    }
                 }
                 '}' => {
                     if matches!(chars.peek(), Some('}')) {
@@ -2011,6 +2542,9 @@ impl UriTemplate {
 
         if !literal.is_empty() {
             segments.push(UriSegment::Literal(literal));
+            if segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS {
+                return Err(UriTemplateError::TooComplex);
+            }
         }
 
         Ok(Self {
@@ -2032,73 +2566,208 @@ impl UriTemplate {
     }
 
     fn matches(&self, uri: &str) -> Option<UriParams> {
+        if self.segments.len() > MAX_URI_TEMPLATE_MATCH_SEGMENTS
+            || uri.len() > MAX_URI_TEMPLATE_INPUT_BYTES
+        {
+            return None;
+        }
+
+        let mut captures = Vec::new();
+        captures.try_reserve(self.segments.len()).ok()?;
+        let mut split_attempts = 0usize;
+        let mut remaining_work = MAX_URI_TEMPLATE_MATCH_WORK_BYTES;
+        match_uri_segments(
+            &self.segments,
+            0,
+            uri,
+            0,
+            &mut captures,
+            &mut split_attempts,
+            &mut remaining_work,
+        )
+    }
+}
+
+fn match_uri_segments<'template, 'uri>(
+    segments: &'template [UriSegment],
+    segment_index: usize,
+    uri: &'uri str,
+    offset: usize,
+    captures: &mut Vec<(&'template str, &'uri str)>,
+    split_attempts: &mut usize,
+    remaining_work: &mut usize,
+) -> Option<UriParams> {
+    let Some(segment) = segments.get(segment_index) else {
+        if offset != uri.len() {
+            return None;
+        }
+
+        // Delay decoding and allocation until a complete structural match is
+        // found. Failed backtracking candidates therefore retain only slices
+        // into the pattern and input URI.
         let mut params = UriParams::new();
-        let mut remainder = uri;
-        let mut iter = self.segments.iter().peekable();
+        params.try_reserve(captures.len()).ok()?;
+        for &(name, raw_value) in captures.iter() {
+            consume_uri_template_match_work(remaining_work, raw_value.len())?;
+            params.insert(name.to_string(), percent_decode(raw_value)?);
+        }
+        return Some(params);
+    };
 
-        while let Some(segment) = iter.next() {
-            match segment {
-                UriSegment::Literal(lit) => {
-                    remainder = remainder.strip_prefix(lit)?;
-                }
-                UriSegment::Param(name) => {
-                    let next_literal = iter.peek().and_then(|next| match next {
-                        UriSegment::Literal(lit) => Some(lit.as_str()),
-                        UriSegment::Param(_) => None,
-                    });
-
-                    if next_literal.is_none() && iter.peek().is_some() {
+    let remainder = uri.get(offset..)?;
+    match segment {
+        UriSegment::Literal(literal) => {
+            consume_uri_template_match_work(remaining_work, literal.len())?;
+            remainder.strip_prefix(literal)?;
+            match_uri_segments(
+                segments,
+                segment_index + 1,
+                uri,
+                offset.checked_add(literal.len())?,
+                captures,
+                split_attempts,
+                remaining_work,
+            )
+        }
+        UriSegment::Param { name, expansion } => match segments.get(segment_index + 1) {
+            Some(UriSegment::Param { .. }) => None,
+            Some(UriSegment::Literal(literal)) => {
+                // Try delimiters from right to left. Reserved expansions are
+                // greedy, but a later delimiter may make the remaining
+                // template impossible, so retain bounded backtracking.
+                consume_uri_template_match_work(remaining_work, remainder.len())?;
+                for (delimiter_offset, _) in remainder.rmatch_indices(literal.as_str()) {
+                    *split_attempts = split_attempts.checked_add(1)?;
+                    if *split_attempts > MAX_URI_TEMPLATE_SPLIT_ATTEMPTS {
                         return None;
                     }
 
-                    if let Some(literal) = next_literal {
-                        let idx = remainder.find(literal)?;
-                        let value = &remainder[..idx];
-                        if value.is_empty() {
-                            return None;
-                        }
-                        let value = percent_decode(value)?;
-                        params.insert(name.clone(), value);
-                        remainder = &remainder[idx..];
-                    } else {
-                        // Last param: only allow "/" when this is the sole param.
-                        // Multi-param templates should not let the tail param
-                        // consume extra path segments.
-                        if remainder.is_empty() {
-                            return None;
-                        }
+                    let raw_value = &remainder[..delimiter_offset];
+                    if raw_value.is_empty() {
+                        continue;
+                    }
+                    consume_uri_template_match_work(remaining_work, raw_value.len())?;
+                    if !raw_capture_is_valid(raw_value, *expansion) {
+                        continue;
+                    }
 
-                        let allow_slash_in_last_param = self
-                            .segments
-                            .iter()
-                            .filter(|seg| matches!(seg, UriSegment::Param(_)))
-                            .count()
-                            == 1;
-
-                        let end_idx = if allow_slash_in_last_param {
-                            remainder.len()
-                        } else {
-                            remainder.find('/').unwrap_or(remainder.len())
-                        };
-
-                        let value = &remainder[..end_idx];
-                        if value.is_empty() {
-                            return None;
-                        }
-                        let value = percent_decode(value)?;
-                        params.insert(name.clone(), value);
-                        remainder = &remainder[end_idx..];
+                    captures.push((name.as_str(), raw_value));
+                    let matched = match_uri_segments(
+                        segments,
+                        segment_index + 1,
+                        uri,
+                        offset.checked_add(delimiter_offset)?,
+                        captures,
+                        split_attempts,
+                        remaining_work,
+                    );
+                    captures.pop();
+                    if matched.is_some() {
+                        return matched;
                     }
                 }
+                None
             }
+            None => {
+                if remainder.is_empty() {
+                    return None;
+                }
+                consume_uri_template_match_work(remaining_work, remainder.len())?;
+                if !raw_capture_is_valid(remainder, *expansion) {
+                    return None;
+                }
+
+                captures.push((name.as_str(), remainder));
+                let matched = match_uri_segments(
+                    segments,
+                    segment_index + 1,
+                    uri,
+                    uri.len(),
+                    captures,
+                    split_attempts,
+                    remaining_work,
+                );
+                captures.pop();
+                matched
+            }
+        },
+    }
+}
+
+fn consume_uri_template_match_work(remaining_work: &mut usize, bytes: usize) -> Option<()> {
+    *remaining_work = (*remaining_work).checked_sub(bytes)?;
+    Some(())
+}
+
+/// Validates the raw character grammar for the supported RFC 6570 expansion
+/// subset. Simple expansions admit only unreserved ASCII or valid `%HH`
+/// triplets; reserved expansions additionally admit RFC 3986 reserved ASCII.
+fn raw_capture_is_valid(raw: &str, expansion: UriExpansion) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || from_hex(bytes[index + 1]).is_none()
+                || from_hex(bytes[index + 2]).is_none()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
         }
 
-        if remainder.is_empty() {
-            Some(params)
-        } else {
-            None
+        if is_uri_unreserved(byte) || (expansion == UriExpansion::Reserved && is_uri_reserved(byte))
+        {
+            index += 1;
+            continue;
         }
+        return false;
     }
+    true
+}
+
+const fn is_uri_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+const fn is_uri_reserved(byte: u8) -> bool {
+    matches!(
+        byte,
+        b':' | b'/'
+            | b'?'
+            | b'#'
+            | b'['
+            | b']'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+    )
+}
+
+/// Validates the unencoded ASCII subset of an RFC 6570 variable name.
+///
+/// A variable name is one or more non-empty dot-separated components made up
+/// of ASCII letters, digits, or `_`. Percent-encoded names, variable lists,
+/// explode modifiers, and prefix modifiers are intentionally outside the
+/// narrow template subset implemented by this matcher.
+fn is_valid_uri_variable_name(name: &str) -> bool {
+    name.split('.').all(|component| {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 fn percent_decode(input: &str) -> Option<String> {
@@ -2151,9 +2820,29 @@ use std::pin::Pin;
 ///
 /// This allows handlers to read resources from within tool/resource/prompt
 /// handlers, enabling cross-component access.
-pub struct RouterResourceReader {
-    /// The shared router.
-    router: Arc<Router>,
+#[derive(Clone)]
+enum RouterAccess {
+    Shared(Arc<Router>),
+    RequestScoped(Weak<Router>),
+}
+
+impl RouterAccess {
+    fn upgrade(&self) -> McpResult<Arc<Router>> {
+        match self {
+            Self::Shared(router) => Ok(Arc::clone(router)),
+            Self::RequestScoped(router) => router.upgrade().ok_or_else(|| {
+                McpError::new(
+                    McpErrorCode::RequestCancelled,
+                    "Request router is no longer available",
+                )
+            }),
+        }
+    }
+}
+
+pub(crate) struct RouterResourceReader {
+    /// Access to the router without extending a server request's lifetime.
+    router: RouterAccess,
     /// Session state for handlers.
     session_state: SessionState,
 }
@@ -2161,7 +2850,21 @@ pub struct RouterResourceReader {
 impl RouterResourceReader {
     /// Creates a new resource reader with the given router and session state.
     #[must_use]
-    pub fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+    pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::Shared(router),
+            session_state,
+        }
+    }
+
+    pub(crate) fn request_scoped(router: Weak<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::RequestScoped(router),
+            session_state,
+        }
+    }
+
+    fn from_access(router: RouterAccess, session_state: SessionState) -> Self {
         Self {
             router,
             session_state,
@@ -2170,17 +2873,16 @@ impl RouterResourceReader {
 }
 
 impl ResourceReader for RouterResourceReader {
-    fn read_resource(
-        &self,
-        cx: &Cx,
-        uri: &str,
-        auth: Option<AuthContext>,
+    fn read_resource<'a>(
+        &'a self,
+        parent_ctx: &'a McpContext,
+        uri: &'a str,
         depth: u32,
     ) -> Pin<
         Box<
             dyn std::future::Future<Output = fastmcp_core::McpResult<ResourceReadResult>>
                 + Send
-                + '_,
+                + 'a,
         >,
     > {
         // Check recursion depth
@@ -2197,13 +2899,30 @@ impl ResourceReader for RouterResourceReader {
         }
 
         // Clone what we need for the async block
-        let cx = cx.clone();
+        let parent_ctx = parent_ctx.clone();
         let uri = uri.to_string();
-        let router = self.router.clone();
+        let router_access = self.router.clone();
         let session_state = self.session_state.clone();
 
         Box::pin(async move {
-            debug!(target: targets::HANDLER, "Cross-component resource read: {} (depth: {})", uri, depth);
+            debug!(
+                target: targets::HANDLER,
+                "cross-component resource read; resource_key={}; depth={}; request={}",
+                safe_log_label(&uri),
+                depth,
+                parent_ctx.request_id()
+            );
+            let router = router_access.upgrade()?;
+            let operation_started_at = parent_ctx.cx().now();
+            if let Some(error) = budget_error(&parent_ctx) {
+                return Err(error);
+            }
+            if !session_state.is_resource_enabled(&uri) {
+                return Err(McpError::new(
+                    McpErrorCode::ResourceNotFound,
+                    format!("Resource '{}' is disabled for this session", uri),
+                ));
+            }
 
             // Resolve the resource
             let resolved = router.resolve_resource(&uri).ok_or_else(|| {
@@ -2212,34 +2931,53 @@ impl ResourceReader for RouterResourceReader {
                     format!("Resource not found: {}", uri),
                 )
             })?;
+            let handler_timeout =
+                read_handler_timeout(parent_ctx.cx(), "resource_timeout", || {
+                    resolved.handler.timeout()
+                })?;
+            let effective_budget = compose_handler_budget(
+                parent_ctx.cx().budget(),
+                parent_ctx.budget(),
+                handler_timeout,
+                operation_started_at,
+            );
 
-            // Create a child context with incremented depth
-            // Clone router again for the nested reader (the original is borrowed by resolved)
-            let nested_router = router.clone();
+            // Derive the child from the parent request authority, preserving
+            // auth, mask state, budget accounting, and request identity.
+            let nested_router = router_access.clone();
             let nested_state = session_state.clone();
-            let mut child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
+            let child_ctx = parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline)
                 .with_resource_read_depth(depth)
-                .with_tool_caller(Arc::new(RouterToolCaller::new(
+                .with_tool_call_depth(depth)
+                .with_tool_caller(Arc::new(RouterToolCaller::from_access(
                     nested_router.clone(),
                     nested_state.clone(),
                 )))
-                .with_resource_reader(Arc::new(RouterResourceReader::new(
+                .with_resource_reader(Arc::new(RouterResourceReader::from_access(
                     nested_router,
                     nested_state,
                 )));
-            if let Some(auth) = auth {
-                child_ctx = child_ctx.with_auth(auth);
-            }
 
             // Read the resource
-            let outcome = block_on(resolved.handler.read_async_with_uri(
-                &child_ctx,
-                &uri,
-                &resolved.params,
-            ));
+            let outcome = run_handler(&child_ctx, effective_budget, "resource", || {
+                resolved
+                    .handler
+                    .read_async_with_uri(&child_ctx, &uri, &resolved.params)
+            })?;
 
             // Convert outcome to result
-            let contents = outcome.into_mcp_result()?;
+            let contents = match outcome {
+                Outcome::Ok(contents) => contents,
+                Outcome::Err(error) => {
+                    return Err(sanitize_handler_error(parent_ctx.cx(), "resource", error));
+                }
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(_payload) => {
+                    return Err(sanitized_handler_panic(parent_ctx.cx(), "resource"));
+                }
+            };
 
             // Convert protocol ResourceContent to core ResourceContentItem
             let items: Vec<ResourceContentItem> = contents
@@ -2267,9 +3005,9 @@ use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCallResult, ToolCaller, ToolContentI
 ///
 /// This allows handlers to call other tools from within tool/resource/prompt
 /// handlers, enabling cross-component access.
-pub struct RouterToolCaller {
-    /// The shared router.
-    router: Arc<Router>,
+pub(crate) struct RouterToolCaller {
+    /// Access to the router without extending a server request's lifetime.
+    router: RouterAccess,
     /// Session state for handlers.
     session_state: SessionState,
 }
@@ -2277,7 +3015,21 @@ pub struct RouterToolCaller {
 impl RouterToolCaller {
     /// Creates a new tool caller with the given router and session state.
     #[must_use]
-    pub fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+    pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::Shared(router),
+            session_state,
+        }
+    }
+
+    pub(crate) fn request_scoped(router: Weak<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::RequestScoped(router),
+            session_state,
+        }
+    }
+
+    fn from_access(router: RouterAccess, session_state: SessionState) -> Self {
         Self {
             router,
             session_state,
@@ -2286,15 +3038,14 @@ impl RouterToolCaller {
 }
 
 impl ToolCaller for RouterToolCaller {
-    fn call_tool(
-        &self,
-        cx: &Cx,
-        name: &str,
+    fn call_tool<'a>(
+        &'a self,
+        parent_ctx: &'a McpContext,
+        name: &'a str,
         args: serde_json::Value,
-        auth: Option<AuthContext>,
         depth: u32,
     ) -> Pin<
-        Box<dyn std::future::Future<Output = fastmcp_core::McpResult<ToolCallResult>> + Send + '_>,
+        Box<dyn std::future::Future<Output = fastmcp_core::McpResult<ToolCallResult>> + Send + 'a>,
     > {
         // Check recursion depth
         if depth > MAX_TOOL_CALL_DEPTH {
@@ -2307,13 +3058,30 @@ impl ToolCaller for RouterToolCaller {
         }
 
         // Clone what we need for the async block
-        let cx = cx.clone();
+        let parent_ctx = parent_ctx.clone();
         let name = name.to_string();
-        let router = self.router.clone();
+        let router_access = self.router.clone();
         let session_state = self.session_state.clone();
 
         Box::pin(async move {
-            debug!(target: targets::HANDLER, "Cross-component tool call: {} (depth: {})", name, depth);
+            debug!(
+                target: targets::HANDLER,
+                "cross-component tool call; tool_key={}; depth={}; request={}",
+                safe_log_label(&name),
+                depth,
+                parent_ctx.request_id()
+            );
+            let router = router_access.upgrade()?;
+            let operation_started_at = parent_ctx.cx().now();
+            if let Some(error) = budget_error(&parent_ctx) {
+                return Err(error);
+            }
+            if !session_state.is_tool_enabled(&name) {
+                return Err(McpError::new(
+                    McpErrorCode::MethodNotFound,
+                    format!("Tool '{}' is disabled for this session", name),
+                ));
+            }
 
             // Find the tool handler
             let handler = router
@@ -2322,7 +3090,8 @@ impl ToolCaller for RouterToolCaller {
                 .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", name)))?;
 
             // Validate arguments against the tool's input schema
-            let tool_def = handler.definition();
+            let tool_def = crate::catch_extension_unwind(|| handler.definition())
+                .map_err(|_payload| sanitized_handler_panic(parent_ctx.cx(), "tool_definition"))?;
 
             // Use strict or lenient validation based on router configuration
             let validation_result = if router.strict_input_validation {
@@ -2341,27 +3110,37 @@ impl ToolCaller for RouterToolCaller {
                     error_messages.join("; ")
                 )));
             }
+            let handler_timeout =
+                read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
+            let effective_budget = compose_handler_budget(
+                parent_ctx.cx().budget(),
+                parent_ctx.budget(),
+                handler_timeout,
+                operation_started_at,
+            );
 
-            // Create a child context with incremented depth
-            // Clone router again for nested calls
-            let nested_router = router.clone();
+            // Derive the child from the parent request authority, preserving
+            // auth, mask state, budget accounting, and request identity.
+            let nested_router = router_access.clone();
             let nested_state = session_state.clone();
-            let mut child_ctx = McpContext::with_state(cx.clone(), 0, session_state)
+            let child_ctx = parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline)
                 .with_tool_call_depth(depth)
-                .with_tool_caller(Arc::new(RouterToolCaller::new(
+                .with_resource_read_depth(depth)
+                .with_tool_caller(Arc::new(RouterToolCaller::from_access(
                     nested_router.clone(),
                     nested_state.clone(),
                 )))
-                .with_resource_reader(Arc::new(RouterResourceReader::new(
+                .with_resource_reader(Arc::new(RouterResourceReader::from_access(
                     nested_router,
                     nested_state,
                 )));
-            if let Some(auth) = auth {
-                child_ctx = child_ctx.with_auth(auth);
-            }
 
             // Call the tool
-            let outcome = block_on(handler.call_async(&child_ctx, args));
+            let outcome = run_handler(&child_ctx, effective_budget, "tool", || {
+                handler.call_async(&child_ctx, args)
+            })?;
 
             // Convert outcome to result
             match outcome {
@@ -2389,22 +3168,85 @@ impl ToolCaller for RouterToolCaller {
                     Ok(ToolCallResult::success(items))
                 }
                 Outcome::Err(e) => {
+                    let e = sanitize_handler_error(parent_ctx.cx(), "tool", e);
+                    if is_framework_terminal_tool_error(e.code) {
+                        return Err(e);
+                    }
                     // Tool errors become error results, not failures
                     Ok(ToolCallResult::error(e.message))
                 }
                 Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-                Outcome::Panicked(payload) => Err(McpError::internal_error(format!(
-                    "Handler panic: {}",
-                    payload.message()
-                ))),
+                Outcome::Panicked(_payload) => {
+                    Err(sanitized_handler_panic(parent_ctx.cx(), "tool"))
+                }
             }
         })
     }
 }
 
 #[cfg(test)]
+mod safe_log_label_tests {
+    use super::{LOG_LABEL_HASH_INPUT_LIMIT, UriTemplateError, safe_log_label};
+
+    #[test]
+    fn safe_label_is_deterministic_non_verbatim_metadata() {
+        let canary = "router-log-canary-secret";
+        let first = format!("{}", safe_log_label(canary));
+        let second = format!("{:?}", safe_log_label(canary));
+
+        assert_eq!(first, second);
+        assert!(first.contains(&format!("bytes={}", canary.len())));
+        assert!(first.contains("sha256_prefix="));
+        assert!(!first.contains(canary));
+        assert_ne!(first, format!("{}", safe_log_label("different-label")));
+    }
+
+    #[test]
+    fn safe_label_hashing_is_bounded_for_oversized_input() {
+        let oversized = "x".repeat(LOG_LABEL_HASH_INPUT_LIMIT + 37);
+        let rendered = format!("{}", safe_log_label(&oversized));
+
+        assert!(rendered.contains(&format!("bytes={}", oversized.len())));
+        assert!(rendered.contains(&format!("hashed_prefix_bytes={LOG_LABEL_HASH_INPUT_LIMIT}")));
+        assert!(!rendered.contains(&oversized));
+    }
+
+    #[test]
+    fn uri_template_error_log_class_never_exposes_parameter() {
+        let canary = "template-parameter-canary-secret";
+        let error = UriTemplateError::DuplicateParam(canary.to_string());
+        let class = error.log_class();
+
+        assert_eq!(class, "duplicate_parameter");
+        assert!(!class.contains(canary));
+    }
+
+    #[test]
+    fn source_has_no_verbatim_argument_or_label_log_formats() {
+        let source = include_str!("router.rs");
+        let forbidden = [
+            concat!("Tool ", "arguments:"),
+            concat!("Prompt ", "arguments:"),
+            concat!("Calling ", "tool: {}"),
+            concat!("Reading ", "resource: {}"),
+            concat!("Getting ", "prompt: {}"),
+            concat!("Cross-component tool ", "call: {}"),
+            concat!("Cross-component resource ", "read: {}"),
+            concat!("Invalid URI template ", "'{}'"),
+        ];
+
+        for format in forbidden {
+            assert!(!source.contains(format), "raw log format remains: {format}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod uri_template_tests {
-    use super::{UriTemplate, UriTemplateError};
+    use super::{
+        MAX_URI_TEMPLATE_INPUT_BYTES, MAX_URI_TEMPLATE_MATCH_SEGMENTS, UriTemplate,
+        UriTemplateError,
+    };
 
     #[test]
     fn uri_template_matches_simple_param() {
@@ -2414,10 +3256,68 @@ mod uri_template_tests {
     }
 
     #[test]
-    fn uri_template_allows_slash_in_trailing_param() {
+    fn uri_template_simple_trailing_param_rejects_raw_slash() {
         let matcher = UriTemplate::new("file://{path}");
-        let params = matcher.matches("file://foo/bar").expect("match");
+        assert!(matcher.matches("file://foo/bar").is_none());
+
+        let params = matcher
+            .matches("file://foo%2Fbar")
+            .expect("percent-encoded slash remains part of a simple expansion");
         assert_eq!(params.get("path").map(String::as_str), Some("foo/bar"));
+    }
+
+    #[test]
+    fn uri_template_simple_capture_enforces_rfc6570_raw_grammar() {
+        let matcher = UriTemplate::new("file://{path}");
+        let params = matcher
+            .matches("file://alpha-._~09%2Ftail")
+            .expect("unreserved ASCII and encoded reserved bytes are valid");
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("alpha-._~09/tail")
+        );
+
+        for raw in [
+            "a:b",
+            "a?b",
+            "a#b",
+            "a@b",
+            "a b",
+            "a\\b",
+            "a\u{0001}b",
+            "café",
+            "%",
+            "%2",
+            "%2G",
+            "%FF",
+        ] {
+            let uri = format!("file://{raw}");
+            assert!(
+                matcher.matches(&uri).is_none(),
+                "invalid simple capture was accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_template_reserved_capture_enforces_rfc6570_raw_grammar() {
+        let matcher = UriTemplate::new("file://{+path}");
+        let raw = "a:/?#[]@!$&'()*+,;=z%2Ftail";
+        let params = matcher
+            .matches(&format!("file://{raw}"))
+            .expect("reserved expansion should admit RFC 3986 reserved ASCII");
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("a:/?#[]@!$&'()*+,;=z/tail")
+        );
+
+        for raw in ["a b", "a\\b", "a\u{007f}b", "café", "%", "%GG"] {
+            let uri = format!("file://{raw}");
+            assert!(
+                matcher.matches(&uri).is_none(),
+                "invalid reserved capture was accepted: {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -2451,6 +3351,76 @@ mod uri_template_tests {
     }
 
     #[test]
+    fn uri_template_reserved_trailing_param_matches_nested_path() {
+        let matcher = UriTemplate::new("asset://{bucket}/{+path}");
+        let params = matcher
+            .matches("asset://public/images/icons/mark.svg")
+            .expect("reserved trailing expansion should consume slashes");
+
+        assert_eq!(params.get("bucket").map(String::as_str), Some("public"));
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("images/icons/mark.svg")
+        );
+        assert!(params.get("+path").is_none());
+    }
+
+    #[test]
+    fn uri_template_simple_trailing_param_preserves_multi_param_slash_rule() {
+        let matcher = UriTemplate::new("asset://{bucket}/{path}");
+
+        assert!(
+            matcher
+                .matches("asset://public/images/icons/mark.svg")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uri_template_simple_interior_param_cannot_cross_path_segments() {
+        let simple = UriTemplate::new("db://{tenant}/items/{id}");
+        assert!(simple.matches("db://a/b/items/1").is_none());
+
+        let encoded = simple
+            .matches("db://a%2Fb/items/1")
+            .expect("an encoded slash remains part of one simple expansion");
+        assert_eq!(encoded.get("tenant").map(String::as_str), Some("a/b"));
+        assert_eq!(encoded.get("id").map(String::as_str), Some("1"));
+
+        let reserved = UriTemplate::new("db://{+tenant}/items/{id}");
+        let params = reserved
+            .matches("db://a/b/items/1")
+            .expect("reserved expansion may consume path separators");
+        assert_eq!(params.get("tenant").map(String::as_str), Some("a/b"));
+        assert_eq!(params.get("id").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn uri_template_reserved_interior_param_backtracks_greedily() {
+        let matcher = UriTemplate::new("db://{+tenant}/items/{id}");
+        let params = matcher
+            .matches("db://a/items/b/items/1")
+            .expect("reserved expansion should use the last viable delimiter");
+
+        assert_eq!(params.get("tenant").map(String::as_str), Some("a/items/b"));
+        assert_eq!(params.get("id").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn uri_template_reserved_param_percent_decodes_exactly_once() {
+        let matcher = UriTemplate::new("file://{+path}");
+        let params = matcher
+            .matches("file://dir%20one/nested%252Fname")
+            .expect("match");
+
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("dir one/nested%2Fname")
+        );
+        assert!(matcher.matches("file://nested%2Gname").is_none());
+    }
+
+    #[test]
     fn uri_template_supports_escaped_braces() {
         let matcher = UriTemplate::new("file://{{literal}}/{id}");
         let params = matcher.matches("file://{literal}/123").expect("match");
@@ -2476,9 +3446,95 @@ mod uri_template_tests {
     }
 
     #[test]
+    fn uri_template_rejects_duplicate_simple_and_reserved_params() {
+        let err = UriTemplate::parse("db://{id}/{+id}").unwrap_err();
+        assert_eq!(err, UriTemplateError::DuplicateParam("id".to_string()));
+    }
+
+    #[test]
+    fn uri_template_rejects_unsupported_operators() {
+        for operator in ['#', '.', '/', ';', '?', '&'] {
+            let pattern = format!("resource://{{{operator}name}}");
+            assert_eq!(
+                UriTemplate::parse(&pattern).unwrap_err(),
+                UriTemplateError::UnsupportedOperator,
+                "operator {operator} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_template_rejects_invalid_parameter_names_and_modifiers() {
+        for pattern in [
+            "resource://{bad-name}",
+            "resource://{bad.}",
+            "resource://{bad..name}",
+            "resource://{name,other}",
+            "resource://{name*}",
+            "resource://{name:3}",
+            "resource://{+bad-name}",
+        ] {
+            assert_eq!(
+                UriTemplate::parse(pattern).unwrap_err(),
+                UriTemplateError::InvalidParamName,
+                "invalid parameter expression should be rejected: {pattern}"
+            );
+        }
+
+        assert_eq!(
+            UriTemplate::parse("resource://{+}").unwrap_err(),
+            UriTemplateError::EmptyParam
+        );
+    }
+
+    #[test]
     fn uri_template_rejects_unclosed_param() {
         let err = UriTemplate::parse("file://{path").unwrap_err();
         assert_eq!(err, UriTemplateError::UnclosedParam);
+    }
+
+    #[test]
+    fn uri_template_parse_rejects_excessive_segment_count() {
+        let mut boundary = String::new();
+        for index in 0..(MAX_URI_TEMPLATE_MATCH_SEGMENTS / 2) {
+            boundary.push('x');
+            boundary.push_str(&format!("{{value_{index}}}"));
+        }
+        let parsed = UriTemplate::parse(&boundary).expect("segment boundary should be accepted");
+        assert_eq!(parsed.segments.len(), MAX_URI_TEMPLATE_MATCH_SEGMENTS);
+
+        boundary.push('x');
+        boundary.push_str("{one_more}");
+        assert_eq!(
+            UriTemplate::parse(&boundary).unwrap_err(),
+            UriTemplateError::TooComplex
+        );
+    }
+
+    #[test]
+    fn uri_template_match_rejects_input_above_byte_limit() {
+        let matcher = UriTemplate::new("{+value}");
+        let boundary = "a".repeat(MAX_URI_TEMPLATE_INPUT_BYTES);
+        let params = matcher
+            .matches(&boundary)
+            .expect("input at the byte boundary should match");
+        assert_eq!(
+            params.get("value").map(String::len),
+            Some(MAX_URI_TEMPLATE_INPUT_BYTES)
+        );
+
+        let oversized = "a".repeat(MAX_URI_TEMPLATE_INPUT_BYTES + 1);
+        assert!(matcher.matches(&oversized).is_none());
+    }
+
+    #[test]
+    fn uri_template_repeated_literal_attack_fails_closed() {
+        let matcher = UriTemplate::new("{+left}x{middle}/END");
+        let mut attack = "x/".repeat((MAX_URI_TEMPLATE_INPUT_BYTES - 3) / 2);
+        attack.push_str("END");
+
+        assert!(attack.len() <= MAX_URI_TEMPLATE_INPUT_BYTES);
+        assert!(matcher.matches(&attack).is_none());
     }
 
     #[test]
@@ -2738,6 +3794,17 @@ mod router_tests {
     use crate::handler::{PromptHandler, ResourceHandler, ToolHandler};
     use fastmcp_core::{McpContext, McpResult, SessionState};
     use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
+    use std::fmt;
+    use std::sync::Mutex;
+
+    fn request_context(
+        cx: &Cx,
+        request_id: u64,
+        budget: Budget,
+        state: &SessionState,
+    ) -> McpContext {
+        McpContext::with_state(cx.clone(), request_id, state.clone()).with_budget_ceiling(budget)
+    }
 
     // ── Stub handlers ──────────────────────────────────────────────────
 
@@ -2776,6 +3843,67 @@ mod router_tests {
         }
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text(format!("called {}", self.name))])
+        }
+    }
+
+    struct ErrorTool {
+        name: &'static str,
+        code: McpErrorCode,
+    }
+
+    impl ToolHandler for ErrorTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::new(self.code, "nested tool error"))
+        }
+    }
+
+    struct AlternatingTool {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl ToolHandler for AlternatingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "alternating_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::internal_error("async alternating tool only"))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                match ctx.read_resource("loop://resource").await {
+                    Ok(_) => Outcome::Ok(vec![Content::text("unexpected completion")]),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
         }
     }
 
@@ -2821,6 +3949,137 @@ mod router_tests {
         }
     }
 
+    struct AlternatingResource {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl ResourceHandler for AlternatingResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "loop://resource".to_string(),
+                name: "alternating-resource".to_string(),
+                description: None,
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Err(McpError::internal_error("async alternating resource only"))
+        }
+
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+        ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                match ctx
+                    .call_tool("alternating_tool", serde_json::json!({}))
+                    .await
+                {
+                    Ok(_) => Outcome::Ok(vec![ResourceContent {
+                        uri: "loop://resource".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("unexpected completion".to_string()),
+                        blob: None,
+                    }]),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    struct CostLedgerTool {
+        remaining_after_parent_debit: Arc<AtomicU64>,
+        remaining_after_nested_read: Arc<AtomicU64>,
+    }
+
+    impl ToolHandler for CostLedgerTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "cost_ledger_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::internal_error("async cost-ledger tool only"))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                if ctx.consume_cost(1).is_err() {
+                    return Outcome::Err(McpError::request_cancelled());
+                }
+                self.remaining_after_parent_debit.store(
+                    ctx.budget()
+                        .cost_quota
+                        .expect("test request has finite cost quota"),
+                    Ordering::Relaxed,
+                );
+
+                if let Err(error) = ctx.read_resource("cost://nested").await {
+                    return Outcome::Err(error);
+                }
+                self.remaining_after_nested_read.store(
+                    ctx.budget()
+                        .cost_quota
+                        .expect("test request has finite cost quota"),
+                    Ordering::Relaxed,
+                );
+                Outcome::Ok(vec![Content::text("shared ledger")])
+            })
+        }
+    }
+
+    struct CostLedgerResource {
+        remaining_after_nested_debit: Arc<AtomicU64>,
+    }
+
+    impl ResourceHandler for CostLedgerResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "cost://nested".to_string(),
+                name: "cost-ledger-resource".to_string(),
+                description: None,
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            ctx.consume_cost(1)
+                .map_err(|_| McpError::request_cancelled())?;
+            self.remaining_after_nested_debit.store(
+                ctx.budget()
+                    .cost_quota
+                    .expect("test request has finite cost quota"),
+                Ordering::Relaxed,
+            );
+            Ok(vec![ResourceContent {
+                uri: "cost://nested".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("nested debit".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
     struct NamedPrompt {
         name: String,
         tags: Vec<String>,
@@ -2852,6 +4111,459 @@ mod router_tests {
                 tags: self.tags.clone(),
             }
         }
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    fn marked_template(uri_template: &str, marker: &str) -> ResourceTemplate {
+        ResourceTemplate {
+            uri_template: uri_template.to_string(),
+            name: marker.to_string(),
+            description: Some(marker.to_string()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![marker.to_string()],
+        }
+    }
+
+    fn marked_router(marker: &str) -> Router {
+        let mut router = Router::new();
+        router.add_tool(NamedTool::with_tags(
+            "duplicate_tool",
+            vec![marker.to_string()],
+        ));
+        router.add_resource(NamedResource::with_tags(
+            "duplicate://resource",
+            vec![marker.to_string()],
+        ));
+        router.add_resource_template(marked_template("duplicate://{item}", marker));
+        router.add_prompt(NamedPrompt::with_tags(
+            "duplicate_prompt",
+            vec![marker.to_string()],
+        ));
+        router
+    }
+
+    fn assert_router_marker(router: &Router, marker: &str) {
+        assert_eq!(
+            router
+                .get_tool("duplicate_tool")
+                .expect("tool exists")
+                .definition()
+                .tags,
+            vec![marker.to_string()]
+        );
+        assert_eq!(
+            router
+                .get_resource("duplicate://resource")
+                .expect("resource exists")
+                .definition()
+                .tags,
+            vec![marker.to_string()]
+        );
+        assert_eq!(
+            router
+                .get_resource_template("duplicate://{item}")
+                .expect("resource template exists")
+                .tags,
+            vec![marker.to_string()]
+        );
+        assert_eq!(
+            router
+                .get_prompt("duplicate_prompt")
+                .expect("prompt exists")
+                .definition()
+                .tags,
+            vec![marker.to_string()]
+        );
+    }
+
+    struct BudgetProbeTool {
+        timeout: Option<Duration>,
+        delay: Duration,
+        observed_deadline: Arc<Mutex<Option<Time>>>,
+        timeout_read: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolHandler for BudgetProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "budget_probe".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            self.timeout_read.store(true, Ordering::Relaxed);
+            self.timeout
+        }
+
+        fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            *self
+                .observed_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ctx.budget().deadline;
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            Ok(vec![Content::text("completed")])
+        }
+    }
+
+    struct SlowDefinitionTool {
+        definition_reads: Arc<AtomicU64>,
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolHandler for SlowDefinitionTool {
+        fn definition(&self) -> Tool {
+            if self.definition_reads.fetch_add(1, Ordering::Relaxed) > 0 {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Tool {
+                name: "slow_definition".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.called.store(true, Ordering::Relaxed);
+            Ok(vec![Content::text("must not run")])
+        }
+    }
+
+    const PANIC_CANARY: &str = "Bearer peer-secret\n\u{001b}[31mred\u{001b}[0m\u{001b}]8;;https://invalid\u{0007}link\u{202e}";
+
+    struct PanickingDisplay(String);
+
+    impl fmt::Display for PanickingDisplay {
+        fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("display-must-not-run: {}", self.0);
+        }
+    }
+
+    struct UnwindingPanicTool {
+        payload: String,
+        non_string: bool,
+    }
+
+    impl ToolHandler for UnwindingPanicTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "panic_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            unreachable!("the async override is the handler boundary under test")
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                if self.non_string {
+                    std::panic::panic_any(PanickingDisplay(self.payload.clone()));
+                }
+                panic!("{}", self.payload);
+            })
+        }
+    }
+
+    struct OutcomePanicTool(String);
+
+    impl ToolHandler for OutcomePanicTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "outcome_panic_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            unreachable!("the async override is the handler boundary under test")
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                Outcome::Panicked(asupersync::types::PanicPayload::new(self.0.clone()))
+            })
+        }
+    }
+
+    struct OpaqueInternalTool;
+
+    impl ToolHandler for OpaqueInternalTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "opaque_internal_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                PANIC_CANARY,
+                serde_json::json!({"secret": PANIC_CANARY}),
+            ))
+        }
+    }
+
+    struct OpaqueInternalResource;
+
+    impl ResourceHandler for OpaqueInternalResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "opaque://internal".to_string(),
+                name: "opaque-internal-resource".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                PANIC_CANARY,
+                serde_json::json!({"secret": PANIC_CANARY}),
+            ))
+        }
+    }
+
+    struct OpaqueInternalPrompt;
+
+    impl PromptHandler for OpaqueInternalPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "opaque_internal_prompt".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                PANIC_CANARY,
+                serde_json::json!({"secret": PANIC_CANARY}),
+            ))
+        }
+    }
+
+    struct PanicResource;
+
+    impl ResourceHandler for PanicResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "panic://resource".to_string(),
+                name: "panic-resource".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            panic!("{PANIC_CANARY}")
+        }
+    }
+
+    struct PanicPrompt;
+
+    impl PromptHandler for PanicPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "panic_prompt".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            panic!("{PANIC_CANARY}")
+        }
+    }
+
+    struct DefinitionPanicTool(std::sync::atomic::AtomicBool);
+
+    impl ToolHandler for DefinitionPanicTool {
+        fn definition(&self) -> Tool {
+            if self.0.swap(true, Ordering::Relaxed) {
+                panic!("{PANIC_CANARY}");
+            }
+            Tool {
+                name: "definition_panic_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+    }
+
+    struct DefinitionPanicResource(std::sync::atomic::AtomicBool);
+
+    impl ResourceHandler for DefinitionPanicResource {
+        fn definition(&self) -> Resource {
+            if self.0.swap(true, Ordering::Relaxed) {
+                panic!("{PANIC_CANARY}");
+            }
+            Resource {
+                uri: "panic://definition".to_string(),
+                name: "definition-panic-resource".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+    }
+
+    struct TemplatePanicResource(std::sync::atomic::AtomicBool);
+
+    impl ResourceHandler for TemplatePanicResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "panic-template://placeholder".to_string(),
+                name: "template-panic-resource".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            if self.0.swap(true, Ordering::Relaxed) {
+                panic!("{PANIC_CANARY}");
+            }
+            Some(ResourceTemplate {
+                uri_template: "panic-template://{id}".to_string(),
+                name: "template-panic-resource".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            })
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            unreachable!("templated reads use read_with_uri")
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            _params: &UriParams,
+        ) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: uri.to_string(),
+                mime_type: None,
+                text: Some("template-content".to_string()),
+                blob: None,
+            }])
+        }
+    }
+
+    struct DefinitionPanicPrompt(std::sync::atomic::AtomicBool);
+
+    impl PromptHandler for DefinitionPanicPrompt {
+        fn definition(&self) -> Prompt {
+            if self.0.swap(true, Ordering::Relaxed) {
+                panic!("{PANIC_CANARY}");
+            }
+            Prompt {
+                name: "definition_panic_prompt".to_string(),
+                description: None,
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
         fn get(
             &self,
             _ctx: &McpContext,
@@ -3047,6 +4759,43 @@ mod router_tests {
         assert_eq!(r.prompts_count(), 1);
     }
 
+    #[test]
+    fn duplicate_registration_errors_do_not_echo_peer_identifiers() {
+        let canary = "raw-peer-identifier-canary";
+
+        let mut tools = Router::new();
+        tools.add_tool(NamedTool::new(canary));
+        let tool_error = tools
+            .add_tool_with_behavior(NamedTool::new(canary), crate::DuplicateBehavior::Error)
+            .unwrap_err();
+
+        let mut resources = Router::new();
+        resources.add_resource(NamedResource::new(canary));
+        let resource_error = resources
+            .add_resource_with_behavior(NamedResource::new(canary), crate::DuplicateBehavior::Error)
+            .unwrap_err();
+
+        let mut templates = Router::new();
+        templates.add_resource_template(marked_template(canary, "original"));
+        let template_error = templates
+            .add_resource_template_with_behavior(
+                marked_template(canary, "incoming"),
+                crate::DuplicateBehavior::Error,
+            )
+            .unwrap_err();
+
+        let mut prompts = Router::new();
+        prompts.add_prompt(NamedPrompt::new(canary));
+        let prompt_error = prompts
+            .add_prompt_with_behavior(NamedPrompt::new(canary), crate::DuplicateBehavior::Error)
+            .unwrap_err();
+
+        for error in [tool_error, resource_error, template_error, prompt_error] {
+            assert!(error.message.contains("already exists"));
+            assert!(!error.message.contains(canary));
+        }
+    }
+
     // ── add_resource_template ──────────────────────────────────────────
 
     #[test]
@@ -3093,6 +4842,55 @@ mod router_tests {
         assert_eq!(r.resource_templates_count(), 1);
         let tmpl = r.get_resource_template("db://{table}").unwrap();
         assert_eq!(tmpl.name, "db2");
+    }
+
+    #[test]
+    fn add_resource_template_with_behavior_preserves_or_replaces_identity() {
+        for behavior in [
+            crate::DuplicateBehavior::Warn,
+            crate::DuplicateBehavior::Ignore,
+            crate::DuplicateBehavior::Error,
+        ] {
+            let mut router = Router::new();
+            router.add_resource_template(marked_template("peer://{secret}", "original"));
+            let result = router.add_resource_template_with_behavior(
+                marked_template("peer://{secret}", "incoming"),
+                behavior,
+            );
+
+            if behavior == crate::DuplicateBehavior::Error {
+                let error = result.expect_err("Error policy rejects the duplicate");
+                assert!(error.message.contains("already exists"));
+                assert!(!error.message.contains("peer://{secret}"));
+            } else {
+                result.expect("Warn and Ignore keep the original");
+            }
+            assert_eq!(router.resource_templates_count(), 1);
+            assert_eq!(
+                router
+                    .get_resource_template("peer://{secret}")
+                    .expect("original template remains")
+                    .name,
+                "original"
+            );
+        }
+
+        let mut router = Router::new();
+        router.add_resource_template(marked_template("peer://{secret}", "original"));
+        router
+            .add_resource_template_with_behavior(
+                marked_template("peer://{secret}", "incoming"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("Replace accepts the duplicate");
+        assert_eq!(router.resource_templates_count(), 1);
+        assert_eq!(
+            router
+                .get_resource_template("peer://{secret}")
+                .expect("replacement template exists")
+                .name,
+            "incoming"
+        );
     }
 
     // ── resource_exists / resolve_resource ──────────────────────────────
@@ -3351,6 +5149,272 @@ mod router_tests {
         let result = main.mount(sub, Some("ns"));
         assert_eq!(result.resources, 1);
         assert!(main.get_resource("ns/file:///a").is_some());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let read = main
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "ns/file:///a".to_string(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("mounted resource is readable through its public URI");
+        assert_eq!(read.contents[0].uri, "ns/file:///a");
+    }
+
+    #[test]
+    fn mounting_resource_does_not_requery_one_shot_definition() {
+        let mut source = Router::new();
+        source.add_resource(DefinitionPanicResource(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let mut destination = Router::new();
+
+        let result = destination.mount_resources(source, Some("ns"));
+
+        assert!(result.is_success());
+        assert_eq!(result.resources, 1);
+        assert!(destination.get_resource("ns/panic://definition").is_some());
+    }
+
+    #[test]
+    fn mounting_resource_template_does_not_requery_one_shot_template() {
+        let mut source = Router::new();
+        source.add_resource(TemplatePanicResource(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let mut destination = Router::new();
+
+        let result = destination.mount_resources(source, Some("ns"));
+
+        assert!(result.is_success());
+        assert_eq!(result.resource_templates, 1);
+        assert!(
+            destination
+                .get_resource_template("ns/panic-template://{id}")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn nested_resource_mounts_translate_both_namespace_layers() {
+        let mut leaf = Router::new();
+        leaf.add_resource(NamedResource::new("file:///a"));
+
+        let mut middle = Router::new();
+        assert!(middle.mount(leaf, Some("ns")).is_success());
+        let mut outer = Router::new();
+        assert!(outer.mount(middle, Some("ns")).is_success());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let read = outer
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "ns/ns/file:///a".to_string(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("nested mounted resource is readable");
+        assert_eq!(read.contents[0].uri, "ns/ns/file:///a");
+    }
+
+    #[test]
+    fn nested_resource_template_mounts_translate_every_namespace_layer() {
+        struct TemplatedResource;
+
+        impl ResourceHandler for TemplatedResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "db://placeholder".to_string(),
+                    name: "database".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "db://{table}".to_string(),
+                    name: "database".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("templated reads use read_with_uri")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: uri.to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: params.get("table").cloned(),
+                    blob: None,
+                }])
+            }
+        }
+
+        let mut source = Router::new();
+        source.add_resource(TemplatedResource);
+        let mut middle = Router::new();
+        assert!(middle.mount_resources(source, Some("peer")).is_success());
+        let mut mounted = Router::new();
+        assert!(mounted.mount_resources(middle, Some("peer")).is_success());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let read = mounted
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "peer/peer/db://users".to_string(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("mounted template is readable through its public URI");
+        assert_eq!(read.contents[0].uri, "peer/peer/db://users");
+        assert_eq!(read.contents[0].text.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn handle_resources_read_resolves_true_async_mounted_template_and_translates_uri() {
+        struct AsyncTemplatedResource {
+            observed: Arc<Mutex<Option<(String, String)>>>,
+        }
+
+        impl ResourceHandler for AsyncTemplatedResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "async-db://placeholder".to_string(),
+                    name: "async-database".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "async-db://{table}".to_string(),
+                    name: "async-database".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("router must dispatch templated resources through the async override")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                _uri: &str,
+                _params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("router must not fall back to the synchronous templated read")
+            }
+
+            fn read_async_with_uri<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                uri: &'a str,
+                params: &'a UriParams,
+            ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+                Box::pin(async move {
+                    let mut first_poll = true;
+                    std::future::poll_fn(move |waker| {
+                        if std::mem::take(&mut first_poll) {
+                            waker.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(())
+                        }
+                    })
+                    .await;
+                    let Some(table) = params.get("table").cloned() else {
+                        return Outcome::Err(McpError::invalid_params(
+                            "mounted template did not resolve its table parameter",
+                        ));
+                    };
+                    *self.observed.lock().expect("observation mutex poisoned") =
+                        Some((uri.to_string(), table.clone()));
+                    Outcome::Ok(vec![ResourceContent {
+                        uri: uri.to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some(format!("async table {table}")),
+                        blob: None,
+                    }])
+                })
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(None));
+        let mut source = Router::new();
+        source.add_resource(AsyncTemplatedResource {
+            observed: Arc::clone(&observed),
+        });
+        let mut mounted = Router::new();
+        let mount_result = mounted.mount_resources(source, Some("peer"));
+        assert!(mount_result.is_success());
+        assert_eq!(mount_result.resource_templates, 1);
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let read = mounted
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "peer/async-db://users".to_string(),
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("true-async mounted template is readable through its public URI");
+
+        assert_eq!(read.contents.len(), 1);
+        assert_eq!(read.contents[0].uri, "peer/async-db://users");
+        assert_eq!(read.contents[0].text.as_deref(), Some("async table users"));
+        assert_eq!(
+            *observed.lock().expect("observation mutex poisoned"),
+            Some(("async-db://users".to_string(), "users".to_string()))
+        );
     }
 
     #[test]
@@ -3376,12 +5440,211 @@ mod router_tests {
     }
 
     #[test]
-    fn mount_warns_on_invalid_prefix() {
+    fn mount_rejects_invalid_prefix_without_mutating() {
         let mut main = Router::new();
-        let sub = Router::new();
+        main.add_tool(NamedTool::new("original"));
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("incoming"));
         let result = main.mount(sub, Some("bad/prefix"));
+        assert!(!result.is_success());
+        assert_eq!(result.tools, 0);
         assert!(!result.warnings.is_empty());
         assert!(result.warnings[0].contains("slashes"));
+        assert!(!result.errors[0].contains("bad/prefix"));
+        assert_eq!(main.tools_count(), 1);
+        assert!(main.get_tool("original").is_some());
+        assert!(main.get_tool("bad/prefix/incoming").is_none());
+    }
+
+    #[test]
+    fn mount_with_behavior_honors_policy_for_every_component_kind() {
+        for behavior in [
+            crate::DuplicateBehavior::Warn,
+            crate::DuplicateBehavior::Ignore,
+            crate::DuplicateBehavior::Replace,
+            crate::DuplicateBehavior::Error,
+        ] {
+            let mut main = marked_router("original");
+            let mut sub = marked_router("incoming");
+            if behavior == crate::DuplicateBehavior::Error {
+                sub.add_tool(NamedTool::new("unique_tool"));
+            }
+
+            let result = main.mount_with_behavior(sub, None, behavior);
+            let replaced = behavior == crate::DuplicateBehavior::Replace;
+            let rejected = behavior == crate::DuplicateBehavior::Error;
+            let expected_mounted = if replaced { 1 } else { 0 };
+
+            assert_eq!(result.is_success(), !rejected);
+            assert_eq!(result.tools, expected_mounted);
+            assert_eq!(result.resources, expected_mounted);
+            assert_eq!(result.resource_templates, expected_mounted);
+            assert_eq!(result.prompts, expected_mounted);
+            assert_eq!(result.errors.len(), if rejected { 4 } else { 0 });
+            assert_eq!(
+                result.warnings.len(),
+                if matches!(
+                    behavior,
+                    crate::DuplicateBehavior::Warn | crate::DuplicateBehavior::Replace
+                ) {
+                    4
+                } else {
+                    0
+                }
+            );
+            assert_router_marker(&main, if replaced { "incoming" } else { "original" });
+            assert!(main.get_tool("unique_tool").is_none());
+
+            for message in result.warnings.iter().chain(&result.errors) {
+                assert!(!message.contains("duplicate_tool"));
+                assert!(!message.contains("duplicate://resource"));
+                assert!(!message.contains("duplicate://{item}"));
+                assert!(!message.contains("duplicate_prompt"));
+            }
+        }
+    }
+
+    #[test]
+    fn behavior_aware_partial_mounts_preflight_error_atomically() {
+        let mut tools = Router::new();
+        tools.add_tool(NamedTool::with_tags("same", vec!["original".to_string()]));
+        let mut tool_source = Router::new();
+        tool_source.add_tool(NamedTool::with_tags("same", vec!["incoming".to_string()]));
+        tool_source.add_tool(NamedTool::new("unique"));
+        let tool_result =
+            tools.mount_tools_with_behavior(tool_source, None, crate::DuplicateBehavior::Error);
+        assert!(!tool_result.is_success());
+        assert_eq!(tool_result.tools, 0);
+        assert_eq!(tools.tools_count(), 1);
+        assert_eq!(
+            tools.get_tool("same").unwrap().definition().tags,
+            vec!["original".to_string()]
+        );
+        assert!(tools.get_tool("unique").is_none());
+
+        let mut resources = Router::new();
+        resources.add_resource(NamedResource::with_tags(
+            "same://resource",
+            vec!["original".to_string()],
+        ));
+        let mut resource_source = Router::new();
+        resource_source.add_resource(NamedResource::with_tags(
+            "same://resource",
+            vec!["incoming".to_string()],
+        ));
+        resource_source.add_resource_template(marked_template("unique://{item}", "incoming"));
+        let resource_result = resources.mount_resources_with_behavior(
+            resource_source,
+            None,
+            crate::DuplicateBehavior::Error,
+        );
+        assert!(!resource_result.is_success());
+        assert_eq!(resource_result.resources, 0);
+        assert_eq!(resource_result.resource_templates, 0);
+        assert_eq!(resources.resources_count(), 1);
+        assert_eq!(resources.resource_templates_count(), 0);
+        assert_eq!(
+            resources
+                .get_resource("same://resource")
+                .unwrap()
+                .definition()
+                .tags,
+            vec!["original".to_string()]
+        );
+
+        let mut prompts = Router::new();
+        prompts.add_prompt(NamedPrompt::with_tags("same", vec!["original".to_string()]));
+        let mut prompt_source = Router::new();
+        prompt_source.add_prompt(NamedPrompt::with_tags("same", vec!["incoming".to_string()]));
+        prompt_source.add_prompt(NamedPrompt::new("unique"));
+        let prompt_result = prompts.mount_prompts_with_behavior(
+            prompt_source,
+            None,
+            crate::DuplicateBehavior::Error,
+        );
+        assert!(!prompt_result.is_success());
+        assert_eq!(prompt_result.prompts, 0);
+        assert_eq!(prompts.prompts_count(), 1);
+        assert_eq!(
+            prompts.get_prompt("same").unwrap().definition().tags,
+            vec!["original".to_string()]
+        );
+        assert!(prompts.get_prompt("unique").is_none());
+    }
+
+    #[test]
+    fn full_error_mount_is_atomic_across_component_kinds() {
+        let mut main = Router::new();
+        main.add_tool(NamedTool::with_tags(
+            "conflict",
+            vec!["original".to_string()],
+        ));
+
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::with_tags(
+            "conflict",
+            vec!["incoming".to_string()],
+        ));
+        sub.add_resource(NamedResource::new("unique://resource"));
+        sub.add_resource_template(marked_template("unique://{item}", "incoming"));
+        sub.add_prompt(NamedPrompt::new("unique_prompt"));
+
+        let result = main.mount_with_behavior(sub, None, crate::DuplicateBehavior::Error);
+        assert!(!result.is_success());
+        assert_eq!(result.errors.len(), 1);
+        assert!(!result.has_components());
+        assert_eq!(main.tools_count(), 1);
+        assert_eq!(main.resources_count(), 0);
+        assert_eq!(main.resource_templates_count(), 0);
+        assert_eq!(main.prompts_count(), 0);
+        assert_eq!(
+            main.get_tool("conflict").unwrap().definition().tags,
+            vec!["original".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_prefix_rejects_every_partial_mount_without_mutation() {
+        let mut tools = Router::new();
+        let mut tool_source = Router::new();
+        tool_source.add_tool(NamedTool::new("tool"));
+        let tool_result = tools.mount_tools_with_behavior(
+            tool_source,
+            Some("peer/secret"),
+            crate::DuplicateBehavior::Replace,
+        );
+        assert!(!tool_result.is_success());
+        assert_eq!(tools.tools_count(), 0);
+
+        let mut resources = Router::new();
+        let mut resource_source = Router::new();
+        resource_source.add_resource(NamedResource::new("resource://value"));
+        resource_source.add_resource_template(marked_template("template://{value}", "incoming"));
+        let resource_result = resources.mount_resources_with_behavior(
+            resource_source,
+            Some("peer/secret"),
+            crate::DuplicateBehavior::Replace,
+        );
+        assert!(!resource_result.is_success());
+        assert_eq!(resources.resources_count(), 0);
+        assert_eq!(resources.resource_templates_count(), 0);
+
+        let mut prompts = Router::new();
+        let mut prompt_source = Router::new();
+        prompt_source.add_prompt(NamedPrompt::new("prompt"));
+        let prompt_result = prompts.mount_prompts_with_behavior(
+            prompt_source,
+            Some("peer/secret"),
+            crate::DuplicateBehavior::Replace,
+        );
+        assert!(!prompt_result.is_success());
+        assert_eq!(prompts.prompts_count(), 0);
+
+        for result in [tool_result, resource_result, prompt_result] {
+            assert_eq!(result.errors.len(), 1);
+            assert!(!result.errors[0].contains("peer/secret"));
+            assert!(!result.has_components());
+        }
     }
 
     // ── mount_tools / mount_resources / mount_prompts ──────────────────
@@ -3423,7 +5686,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 2);
         assert!(result.next_cursor.is_none());
     }
@@ -3435,6 +5699,7 @@ mod router_tests {
         r.add_tool(NamedTool::new("a"));
         r.add_tool(NamedTool::new("b"));
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
 
         // First page
         let params = ListToolsParams {
@@ -3442,7 +5707,7 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "a");
         assert!(result.next_cursor.is_some());
@@ -3453,7 +5718,7 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "b");
         assert!(result.next_cursor.is_none());
@@ -3470,7 +5735,8 @@ mod router_tests {
             include_tags: Some(vec!["db".to_string()]),
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "a");
     }
@@ -3487,7 +5753,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_resources_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert!(result.next_cursor.is_none());
     }
@@ -3504,7 +5771,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_resources_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert!(result.next_cursor.is_some());
     }
@@ -3521,7 +5789,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_prompts_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.prompts.len(), 1);
         assert!(result.next_cursor.is_none());
     }
@@ -3546,7 +5815,10 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r
+            .handle_resource_templates_list(&request_ctx, params, None)
+            .unwrap();
         assert_eq!(result.resource_templates.len(), 1);
         assert!(result.next_cursor.is_none());
     }
@@ -3572,8 +5844,14 @@ mod router_tests {
                 version: "1.0".to_string(),
             },
         };
+        let request_ctx = McpContext::new(cx, 1);
         let result = r
-            .handle_initialize(&cx, &mut session, params, Some("test instructions"))
+            .handle_initialize(
+                &request_ctx,
+                &mut session,
+                params,
+                Some("test instructions"),
+            )
             .unwrap();
         assert_eq!(result.protocol_version, PROTOCOL_VERSION);
         assert_eq!(result.server_info.name, "test");
@@ -3599,8 +5877,9 @@ mod router_tests {
                 version: "0.1".to_string(),
             },
         };
+        let request_ctx = McpContext::new(cx, 1);
         let result = r
-            .handle_initialize(&cx, &mut session, params, None)
+            .handle_initialize(&request_ctx, &mut session, params, None)
             .unwrap();
         assert!(result.instructions.is_none());
     }
@@ -3616,7 +5895,8 @@ mod router_tests {
             status: None,
             limit: None,
         };
-        let err = r.handle_tasks_list(&cx, params, None).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r.handle_tasks_list(&request_ctx, params, None).unwrap_err();
         assert!(err.message.contains("not enabled"));
     }
 
@@ -3627,7 +5907,8 @@ mod router_tests {
         let params = GetTaskParams {
             id: fastmcp_protocol::TaskId("test-id".to_string()),
         };
-        let err = r.handle_tasks_get(&cx, params, None).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r.handle_tasks_get(&request_ctx, params, None).unwrap_err();
         assert!(err.message.contains("not enabled"));
     }
 
@@ -3639,7 +5920,10 @@ mod router_tests {
             id: fastmcp_protocol::TaskId("test-id".to_string()),
             reason: None,
         };
-        let err = r.handle_tasks_cancel(&cx, params, None).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r
+            .handle_tasks_cancel(&request_ctx, params, None)
+            .unwrap_err();
         assert!(err.message.contains("not enabled"));
     }
 
@@ -3651,7 +5935,10 @@ mod router_tests {
             task_type: "test".to_string(),
             params: None,
         };
-        let err = r.handle_tasks_submit(&cx, params, None).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r
+            .handle_tasks_submit(&request_ctx, params, None)
+            .unwrap_err();
         assert!(err.message.contains("not enabled"));
     }
 
@@ -3844,7 +6131,10 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, Some(&state)).unwrap();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let result = r
+            .handle_tools_list(&request_ctx, params, Some(&state))
+            .unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "b");
     }
@@ -3868,7 +6158,8 @@ mod router_tests {
             include_tags: Some(vec!["web".to_string()]),
             exclude_tags: None,
         };
-        let result = r.handle_resources_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_resources_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].uri, "file:///b");
     }
@@ -3887,7 +6178,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_prompts_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.prompts.len(), 1);
         assert_eq!(result.prompts[0].name, "a");
         assert!(result.next_cursor.is_some());
@@ -3897,7 +6189,7 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        let result = r.handle_prompts_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.prompts.len(), 1);
         assert_eq!(result.prompts[0].name, "b");
         assert!(result.next_cursor.is_none());
@@ -3916,7 +6208,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: Some(vec!["internal".to_string()]),
         };
-        let result = r.handle_prompts_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_prompts_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.prompts.len(), 1);
         assert_eq!(result.prompts[0].name, "b");
     }
@@ -3946,12 +6239,15 @@ mod router_tests {
             tags: vec![],
         });
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let params = ListResourceTemplatesParams {
             cursor: None,
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        let result = r
+            .handle_resource_templates_list(&request_ctx, params, None)
+            .unwrap();
         assert_eq!(result.resource_templates.len(), 1);
         assert!(result.next_cursor.is_some());
 
@@ -3960,7 +6256,9 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        let result = r
+            .handle_resource_templates_list(&request_ctx, params, None)
+            .unwrap();
         assert_eq!(result.resource_templates.len(), 1);
         assert!(result.next_cursor.is_none());
     }
@@ -3994,7 +6292,10 @@ mod router_tests {
             include_tags: Some(vec!["public".to_string()]),
             exclude_tags: None,
         };
-        let result = r.handle_resource_templates_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r
+            .handle_resource_templates_list(&request_ctx, params, None)
+            .unwrap();
         assert_eq!(result.resource_templates.len(), 1);
         assert_eq!(result.resource_templates[0].name, "cache");
     }
@@ -4050,7 +6351,15 @@ mod router_tests {
     fn mount_result_is_success_with_warnings() {
         let mut r = MountResult::default();
         r.warnings.push("something".to_string());
-        assert!(r.is_success()); // always true
+        assert!(r.is_success());
+    }
+
+    #[test]
+    fn mount_result_reports_errors_as_failure() {
+        let mut result = MountResult::default();
+        result.errors.push("mount rejected".to_string());
+        assert!(!result.is_success());
+        assert!(!result.has_components());
     }
 
     // ── mount with all component types ──────────────────────────────────
@@ -4127,6 +6436,7 @@ mod router_tests {
         r.add_tool(NamedTool::with_tags("b", vec!["db".to_string()]));
         r.add_tool(NamedTool::with_tags("c", vec!["web".to_string()]));
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
 
         // Only "db" tagged tools, page 1
         let params = ListToolsParams {
@@ -4134,7 +6444,7 @@ mod router_tests {
             include_tags: Some(vec!["db".to_string()]),
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "a");
         assert!(result.next_cursor.is_some());
@@ -4145,7 +6455,7 @@ mod router_tests {
             include_tags: Some(vec!["db".to_string()]),
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         assert_eq!(result.tools.len(), 1);
         assert_eq!(result.tools[0].name, "b");
         assert!(result.next_cursor.is_none());
@@ -4168,7 +6478,10 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_resources_list(&cx, params, Some(&state)).unwrap();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let result = r
+            .handle_resources_list(&request_ctx, params, Some(&state))
+            .unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].uri, "file:///b");
     }
@@ -4189,7 +6502,10 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_prompts_list(&cx, params, Some(&state)).unwrap();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let result = r
+            .handle_prompts_list(&request_ctx, params, Some(&state))
+            .unwrap();
         assert_eq!(result.prompts.len(), 1);
         assert_eq!(result.prompts[0].name, "b");
     }
@@ -4286,8 +6602,9 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_tools_call(&cx, 1, params, &budget, state, None, None, None)
+            .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4305,17 +6622,10 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let result = r
-            .handle_tools_call(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap();
         assert!(!result.is_error);
         assert!(!result.content.is_empty());
@@ -4333,25 +6643,18 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_tools_call(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("missing"));
     }
 
-    // ── handle_tools_call: budget exhausted ──────────────────────────────
+    // ── handle_tools_call: zero poll balance without poll admission ──────
 
     #[test]
-    fn handle_tools_call_budget_exhausted() {
+    fn handle_tools_call_zero_poll_balance_allows_handler_without_checkpoint() {
         let mut r = Router::new();
         r.add_tool(NamedTool::new("t"));
         let cx = Cx::for_testing();
@@ -4361,23 +6664,37 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
-        let err = r
-            .handle_tools_call(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
-            .unwrap_err();
-        assert!(
-            err.message.contains("budget") || err.message.contains("exhausted"),
-            "unexpected error: {}",
-            err.message
-        );
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
+        let result = r
+            .handle_tools_call(&request_ctx, params, state, None, None)
+            .expect("a zero balance is not a retroactive failure");
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn handle_tools_call_defers_pending_cancellation_inside_context_mask() {
+        let mut router = Router::new();
+        router.add_tool(NamedTool::new("t"));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let params = || CallToolParams {
+            name: "t".to_string(),
+            arguments: None,
+            meta: None,
+        };
+
+        let masked_result = request_ctx
+            .masked(|| router.handle_tools_call(&request_ctx, params(), state.clone(), None, None))
+            .expect("mask should be admitted");
+        assert!(masked_result.is_ok());
+
+        let unmasked_error = router
+            .handle_tools_call(&request_ctx, params(), state, None, None)
+            .expect_err("pending cancellation should surface after mask exit");
+        assert_eq!(unmasked_error.code, McpErrorCode::RequestCancelled);
     }
 
     // ── handle_resources_read: resource disabled via session ──────────────
@@ -4396,8 +6713,9 @@ mod router_tests {
             uri: "file:///secret".to_string(),
             meta: None,
         };
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_resources_read(&cx, 1, &params, &budget, state, None, None, None)
+            .handle_resources_read(&request_ctx, &params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4414,17 +6732,10 @@ mod router_tests {
             uri: "file:///a".to_string(),
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let result = r
-            .handle_resources_read(
-                &cx,
-                1,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_resources_read(&request_ctx, &params, state, None, None)
             .unwrap();
         assert_eq!(result.contents.len(), 1);
         assert_eq!(result.contents[0].uri, "file:///a");
@@ -4441,25 +6752,18 @@ mod router_tests {
             uri: "file:///nonexistent".to_string(),
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_resources_read(
-                &cx,
-                1,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_resources_read(&request_ctx, &params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("nonexistent") || err.message.contains("not found"));
     }
 
-    // ── handle_resources_read: budget exhausted ──────────────────────────
+    // ── handle_resources_read: zero poll balance without admission ───────
 
     #[test]
-    fn handle_resources_read_budget_exhausted() {
+    fn handle_resources_read_zero_poll_balance_allows_handler_without_checkpoint() {
         let mut r = Router::new();
         r.add_resource(NamedResource::new("file:///a"));
         let cx = Cx::for_testing();
@@ -4468,23 +6772,12 @@ mod router_tests {
             uri: "file:///a".to_string(),
             meta: None,
         };
-        let err = r
-            .handle_resources_read(
-                &cx,
-                1,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
-            .unwrap_err();
-        assert!(
-            err.message.contains("budget") || err.message.contains("exhausted"),
-            "unexpected error: {}",
-            err.message
-        );
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
+        let result = r
+            .handle_resources_read(&request_ctx, &params, state, None, None)
+            .expect("a zero balance is not a retroactive failure");
+        assert_eq!(result.contents.len(), 1);
     }
 
     // ── handle_prompts_get: prompt disabled via session ───────────────────
@@ -4504,8 +6797,9 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_prompts_get(&cx, 1, params, &budget, state, None, None, None)
+            .handle_prompts_get(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("disabled"));
     }
@@ -4523,17 +6817,10 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let result = r
-            .handle_prompts_get(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_prompts_get(&request_ctx, params, state, None, None)
             .unwrap();
         assert!(result.description.is_some());
     }
@@ -4550,25 +6837,18 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_prompts_get(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_prompts_get(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert!(err.message.contains("missing") || err.message.contains("not found"));
     }
 
-    // ── handle_prompts_get: budget exhausted ─────────────────────────────
+    // ── handle_prompts_get: zero poll balance without admission ──────────
 
     #[test]
-    fn handle_prompts_get_budget_exhausted() {
+    fn handle_prompts_get_zero_poll_balance_allows_handler_without_checkpoint() {
         let mut r = Router::new();
         r.add_prompt(NamedPrompt::new("p"));
         let cx = Cx::for_testing();
@@ -4578,23 +6858,543 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
-        let err = r
-            .handle_prompts_get(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
+        let result = r
+            .handle_prompts_get(&request_ctx, params, state, None, None)
+            .expect("a zero balance is not a retroactive failure");
+        assert!(result.messages.is_empty());
+    }
+
+    #[test]
+    fn handler_budget_composition_uses_exact_earliest_deadline() {
+        let now = Time::from_secs(100);
+        let at = |seconds| Budget::new().with_deadline(Time::from_secs(seconds));
+        let cases = [
+            (Budget::INFINITE, Budget::INFINITE, None, None),
+            (at(110), Budget::INFINITE, None, Some(Time::from_secs(110))),
+            (Budget::INFINITE, at(115), None, Some(Time::from_secs(115))),
+            (
+                at(110),
+                at(115),
+                Some(Duration::from_secs(30)),
+                Some(Time::from_secs(110)),
+            ),
+            (
+                at(140),
+                at(130),
+                Some(Duration::from_secs(5)),
+                Some(Time::from_secs(105)),
+            ),
+            (
+                at(110),
+                at(115),
+                Some(Duration::ZERO),
+                Some(Time::from_secs(110)),
+            ),
+            (
+                at(90),
+                at(115),
+                Some(Duration::from_secs(5)),
+                Some(Time::from_secs(90)),
+            ),
+            (
+                Budget::INFINITE,
+                Budget::new().with_deadline(Time::from_nanos(u64::MAX - 1)),
+                Some(Duration::MAX),
+                Some(Time::from_nanos(u64::MAX - 1)),
+            ),
+        ];
+
+        for (ambient, request, handler, expected) in cases {
+            assert_eq!(
+                compose_handler_budget(ambient, request, handler, now).deadline,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn alternating_tool_resource_recursion_uses_one_effective_depth() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = Router::new();
+        router.add_tool(AlternatingTool {
+            calls: Arc::clone(&calls),
+        });
+        router.add_resource(AlternatingResource {
+            calls: Arc::clone(&calls),
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone())
+            .with_tool_caller(Arc::new(RouterToolCaller::new(
+                Arc::clone(&router),
+                state.clone(),
+            )))
+            .with_resource_reader(Arc::new(RouterResourceReader::new(
+                Arc::clone(&router),
+                state.clone(),
+            )));
+
+        let error = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "alternating_tool".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
                 None,
                 None,
             )
-            .unwrap_err();
+            .expect_err("alternating recursion must stop at the shared depth limit");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert!(error.message.contains("Maximum resource read depth"));
+        assert_eq!(calls.load(Ordering::Relaxed), 11);
+    }
+
+    #[test]
+    fn nested_tool_resource_call_shares_parent_cost_ledger() {
+        let remaining_after_parent_debit = Arc::new(AtomicU64::new(u64::MAX));
+        let remaining_after_nested_debit = Arc::new(AtomicU64::new(u64::MAX));
+        let remaining_after_nested_read = Arc::new(AtomicU64::new(u64::MAX));
+        let mut router = Router::new();
+        router.add_tool(CostLedgerTool {
+            remaining_after_parent_debit: Arc::clone(&remaining_after_parent_debit),
+            remaining_after_nested_read: Arc::clone(&remaining_after_nested_read),
+        });
+        router.add_resource(CostLedgerResource {
+            remaining_after_nested_debit: Arc::clone(&remaining_after_nested_debit),
+        });
+
+        let router = Arc::new(router);
+        let state = SessionState::new();
+        let cx = Cx::for_testing_with_budget(Budget::new().with_cost_quota(3));
+        let request_ctx = McpContext::with_state(cx, 77, state.clone())
+            .with_tool_caller(Arc::new(RouterToolCaller::new(
+                Arc::clone(&router),
+                state.clone(),
+            )))
+            .with_resource_reader(Arc::new(RouterResourceReader::new(router, state)));
+
+        let result = block_on(request_ctx.call_tool("cost_ledger_tool", serde_json::json!({})))
+            .expect("parent and nested debits fit the shared cost quota");
+
+        assert!(!result.is_error);
+        assert_eq!(remaining_after_parent_debit.load(Ordering::Relaxed), 2);
+        assert_eq!(remaining_after_nested_debit.load(Ordering::Relaxed), 1);
+        assert_eq!(remaining_after_nested_read.load(Ordering::Relaxed), 1);
+        assert_eq!(request_ctx.budget().cost_quota, Some(1));
+    }
+
+    #[test]
+    fn nested_tool_calls_preserve_framework_terminal_errors() {
+        let mut router = Router::new();
+        router.add_tool(ErrorTool {
+            name: "nested_cancelled",
+            code: McpErrorCode::RequestCancelled,
+        });
+        router.add_tool(ErrorTool {
+            name: "nested_internal",
+            code: McpErrorCode::InternalError,
+        });
+        router.add_tool(ErrorTool {
+            name: "nested_tool_failure",
+            code: McpErrorCode::ToolExecutionError,
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 88, state.clone())
+            .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::clone(&router), state)));
+
+        for (name, expected) in [
+            ("nested_cancelled", McpErrorCode::RequestCancelled),
+            ("nested_internal", McpErrorCode::InternalError),
+        ] {
+            let error = block_on(request_ctx.call_tool(name, serde_json::json!({})))
+                .expect_err("framework terminal errors must remain outer failures");
+            assert_eq!(error.code, expected);
+        }
+
+        let tool_failure =
+            block_on(request_ctx.call_tool("nested_tool_failure", serde_json::json!({})))
+                .expect("ordinary tool failures remain protocol-level tool results");
+        assert!(tool_failure.is_error);
+    }
+
+    #[test]
+    fn manual_handler_timeout_is_read_exposed_and_enforced() {
+        let observed_deadline = Arc::new(Mutex::new(None));
+        let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut router = Router::new();
+        router.add_tool(BudgetProbeTool {
+            timeout: Some(Duration::from_millis(1)),
+            delay: Duration::from_millis(15),
+            observed_deadline: Arc::clone(&observed_deadline),
+            timeout_read: Arc::clone(&timeout_read),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let error = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "budget_probe".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("the handler deadline must reject a late completion");
+
+        assert!(timeout_read.load(Ordering::Relaxed));
         assert!(
-            err.message.contains("budget") || err.message.contains("exhausted"),
-            "unexpected error: {}",
-            err.message
+            observed_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
         );
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timeout exceeded");
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn handler_timeout_is_anchored_before_definition_and_validation_work() {
+        let definition_reads = Arc::new(AtomicU64::new(0));
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut router = Router::new();
+        router.add_tool(SlowDefinitionTool {
+            definition_reads: Arc::clone(&definition_reads),
+            called: Arc::clone(&called),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+
+        let error = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "slow_definition".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("pre-handler framework work must not reset the handler deadline");
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timeout exceeded");
+        assert!(!called.load(Ordering::Relaxed));
+        assert_eq!(definition_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn zero_handler_timeout_cannot_relax_request_deadline() {
+        let observed_deadline = Arc::new(Mutex::new(None));
+        let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request_deadline = wall_now().saturating_add_nanos(5_000_000_000);
+        let mut router = Router::new();
+        router.add_tool(BudgetProbeTool {
+            timeout: Some(Duration::ZERO),
+            delay: Duration::ZERO,
+            observed_deadline: Arc::clone(&observed_deadline),
+            timeout_read: Arc::clone(&timeout_read),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(
+            &cx,
+            1,
+            Budget::new().with_deadline(request_deadline),
+            &state,
+        );
+        router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "budget_probe".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("zero adds no ceiling but preserves the request deadline");
+
+        assert!(timeout_read.load(Ordering::Relaxed));
+        assert_eq!(
+            *observed_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(request_deadline)
+        );
+    }
+
+    #[test]
+    fn ambient_deadline_remains_visible_when_server_and_handler_are_looser() {
+        let observed_deadline = Arc::new(Mutex::new(None));
+        let timeout_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ambient_deadline = wall_now().saturating_add_nanos(2_000_000_000);
+        let request_deadline = ambient_deadline.saturating_add_nanos(2_000_000_000);
+        let mut router = Router::new();
+        router.add_tool(BudgetProbeTool {
+            timeout: Some(Duration::from_secs(10)),
+            delay: Duration::ZERO,
+            observed_deadline: Arc::clone(&observed_deadline),
+            timeout_read,
+        });
+        let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(ambient_deadline));
+        let state = SessionState::new();
+        let request_ctx = request_context(
+            &cx,
+            1,
+            Budget::new().with_deadline(request_deadline),
+            &state,
+        );
+        router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "budget_probe".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect("looser inner limits must preserve the ambient deadline");
+
+        assert_eq!(
+            *observed_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(ambient_deadline)
+        );
+    }
+
+    fn assert_sanitized_panic_tool(handler: impl ToolHandler + 'static, name: &str) {
+        let mut router = Router::new();
+        router.add_tool(handler);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let error = router
+            .handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: name.to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                state,
+                None,
+                None,
+            )
+            .expect_err("panic must terminate as a sanitized protocol error");
+        let wire = serde_json::to_string(&error).expect("error serializes");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+        assert_eq!(error.data, None);
+        assert!(!wire.contains(PANIC_CANARY));
+        assert!(!wire.contains("Bearer"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("peer-secret"));
+        assert!(!wire.contains("\u{001b}"));
+        assert!(wire.len() < 256);
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn unwinding_string_and_non_string_panics_have_one_fixed_peer_error() {
+        assert_sanitized_panic_tool(
+            UnwindingPanicTool {
+                payload: "Bearer actual-secret".to_string(),
+                non_string: false,
+            },
+            "panic_tool",
+        );
+        assert_sanitized_panic_tool(
+            UnwindingPanicTool {
+                payload: PANIC_CANARY.to_string(),
+                non_string: true,
+            },
+            "panic_tool",
+        );
+    }
+
+    #[test]
+    fn four_valued_panic_payload_is_never_rendered_for_peer() {
+        assert_sanitized_panic_tool(
+            OutcomePanicTool(format!("{PANIC_CANARY}{}", "y".repeat(64 * 1024))),
+            "outcome_panic_tool",
+        );
+    }
+
+    #[test]
+    fn opaque_internal_handler_errors_use_the_fixed_peer_contract() {
+        let cx = Cx::for_testing();
+
+        let mut tool_router = Router::new();
+        tool_router.add_tool(OpaqueInternalTool);
+        let tool_state = SessionState::new();
+        let tool_ctx = request_context(&cx, 1, Budget::INFINITE, &tool_state);
+        let tool_error = tool_router
+            .handle_tools_call(
+                &tool_ctx,
+                CallToolParams {
+                    name: "opaque_internal_tool".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                tool_state,
+                None,
+                None,
+            )
+            .expect_err("opaque internal tool errors must remain protocol failures");
+
+        let mut resource_router = Router::new();
+        resource_router.add_resource(OpaqueInternalResource);
+        let resource_state = SessionState::new();
+        let resource_ctx = request_context(&cx, 2, Budget::INFINITE, &resource_state);
+        let resource_error = resource_router
+            .handle_resources_read(
+                &resource_ctx,
+                &ReadResourceParams {
+                    uri: "opaque://internal".to_string(),
+                    meta: None,
+                },
+                resource_state,
+                None,
+                None,
+            )
+            .expect_err("opaque internal resource errors must be sanitized");
+
+        let mut prompt_router = Router::new();
+        prompt_router.add_prompt(OpaqueInternalPrompt);
+        let prompt_state = SessionState::new();
+        let prompt_ctx = request_context(&cx, 3, Budget::INFINITE, &prompt_state);
+        let prompt_error = prompt_router
+            .handle_prompts_get(
+                &prompt_ctx,
+                GetPromptParams {
+                    name: "opaque_internal_prompt".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                prompt_state,
+                None,
+                None,
+            )
+            .expect_err("opaque internal prompt errors must be sanitized");
+
+        for error in [tool_error, resource_error, prompt_error] {
+            let wire = serde_json::to_string(&error).expect("error serializes");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+            assert_eq!(error.data, None);
+            assert!(!wire.contains(PANIC_CANARY));
+            assert!(wire.len() < 256);
+        }
+    }
+
+    #[test]
+    fn resource_and_prompt_panics_use_same_sanitized_contract() {
+        let mut resource_router = Router::new();
+        resource_router.add_resource(PanicResource);
+        let resource_cx = Cx::for_testing();
+        let resource_state = SessionState::new();
+        let resource_ctx = request_context(&resource_cx, 1, Budget::INFINITE, &resource_state);
+        let resource_error = resource_router
+            .handle_resources_read(
+                &resource_ctx,
+                &ReadResourceParams {
+                    uri: "panic://resource".to_string(),
+                    meta: None,
+                },
+                resource_state,
+                None,
+                None,
+            )
+            .expect_err("resource panic must be sanitized");
+        assert_eq!(resource_error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+
+        let mut prompt_router = Router::new();
+        prompt_router.add_prompt(PanicPrompt);
+        let prompt_cx = Cx::for_testing();
+        let prompt_state = SessionState::new();
+        let prompt_ctx = request_context(&prompt_cx, 1, Budget::INFINITE, &prompt_state);
+        let prompt_error = prompt_router
+            .handle_prompts_get(
+                &prompt_ctx,
+                GetPromptParams {
+                    name: "panic_prompt".to_string(),
+                    arguments: None,
+                    meta: None,
+                },
+                prompt_state,
+                None,
+                None,
+            )
+            .expect_err("prompt panic must be sanitized");
+        assert_eq!(prompt_error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+
+        for error in [resource_error, prompt_error] {
+            let wire = serde_json::to_string(&error).expect("error serializes");
+            assert!(!wire.contains(PANIC_CANARY));
+            assert!(wire.len() < 256);
+        }
+    }
+
+    #[test]
+    fn list_definition_panics_use_the_same_sanitized_contract() {
+        let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
+
+        let mut tool_router = Router::new();
+        tool_router.add_tool(DefinitionPanicTool(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let tool_error = tool_router
+            .handle_tools_list(&request_ctx, ListToolsParams::default(), None)
+            .expect_err("tool definition panic must be sanitized");
+
+        let mut resource_router = Router::new();
+        resource_router.add_resource(DefinitionPanicResource(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let resource_error = resource_router
+            .handle_resources_list(&request_ctx, ListResourcesParams::default(), None)
+            .expect_err("resource definition panic must be sanitized");
+
+        let mut prompt_router = Router::new();
+        prompt_router.add_prompt(DefinitionPanicPrompt(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let prompt_error = prompt_router
+            .handle_prompts_list(&request_ctx, ListPromptsParams::default(), None)
+            .expect_err("prompt definition panic must be sanitized");
+
+        for error in [tool_error, resource_error, prompt_error] {
+            let wire = serde_json::to_string(&error).expect("error serializes");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+            assert_eq!(error.data, None);
+            assert!(!wire.contains(PANIC_CANARY));
+            assert!(wire.len() < 256);
+        }
     }
 
     // ── add_resource_with_behavior: template resource Error ───────────────
@@ -4754,7 +7554,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let err = r.handle_tools_list(&cx, params, None).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r.handle_tools_list(&request_ctx, params, None).unwrap_err();
         assert!(err.message.contains("cursor") || err.message.contains("Invalid"));
     }
 
@@ -4772,7 +7573,8 @@ mod router_tests {
             include_tags: None,
             exclude_tags: None,
         };
-        let result = r.handle_tools_list(&cx, params, None).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r.handle_tools_list(&request_ctx, params, None).unwrap();
         // With page_size = 0, all items returned (no pagination)
         assert_eq!(result.tools.len(), 2);
         assert!(result.next_cursor.is_none());
@@ -4804,17 +7606,10 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_tools_call(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -4830,17 +7625,10 @@ mod router_tests {
             uri: "file:///a.txt".to_string(),
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_resources_read(
-                &cx,
-                1,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_resources_read(&request_ctx, &params, state, None, None)
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -4857,17 +7645,10 @@ mod router_tests {
             arguments: None,
             meta: None,
         };
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, budget, &state);
         let err = r
-            .handle_prompts_get(
-                &cx,
-                1,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            .handle_prompts_get(&request_ctx, params, state, None, None)
             .unwrap_err();
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
@@ -4891,7 +7672,10 @@ mod router_tests {
             status: None,
             limit: None,
         };
-        let result = r.handle_tasks_list(&cx, params, Some(&shared)).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r
+            .handle_tasks_list(&request_ctx, params, Some(&shared))
+            .unwrap();
         assert_eq!(result.tasks.len(), 2);
     }
 
@@ -4905,7 +7689,10 @@ mod router_tests {
         let id = tm.submit(&cx, "t", None).unwrap();
         let shared = tm.into_shared();
         let params = GetTaskParams { id: id.clone() };
-        let result = r.handle_tasks_get(&cx, params, Some(&shared)).unwrap();
+        let request_ctx = McpContext::new(cx, 1);
+        let result = r
+            .handle_tasks_get(&request_ctx, params, Some(&shared))
+            .unwrap();
         assert_eq!(result.task.id, id);
         assert!(result.result.is_none());
     }
@@ -4921,18 +7708,22 @@ mod router_tests {
         let params = GetTaskParams {
             id: TaskId::from_string("nonexistent".to_string()),
         };
-        let err = r.handle_tasks_get(&cx, params, Some(&shared)).unwrap_err();
+        let request_ctx = McpContext::new(cx, 1);
+        let err = r
+            .handle_tasks_get(&request_ctx, params, Some(&shared))
+            .unwrap_err();
         assert!(err.message.contains("not found"));
     }
 
     #[test]
-    fn mount_result_is_success_always_true() {
+    fn mount_result_with_warning_and_no_error_is_successful() {
         let result = MountResult {
             tools: 0,
             resources: 0,
             resource_templates: 0,
             prompts: 0,
             warnings: vec!["something".to_string()],
+            errors: vec![],
         };
         assert!(result.is_success());
         assert!(!result.has_components());

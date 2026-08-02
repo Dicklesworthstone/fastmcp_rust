@@ -20,11 +20,11 @@ use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, S
 use fastmcp_derive::tool;
 use fastmcp_protocol::{
     CallToolParams, CancelTaskParams, CancelledParams, ClientCapabilities, ClientInfo, Content,
-    GetPromptParams, GetTaskParams, InitializeParams, JsonRpcResponse, ListTasksParams, LogLevel,
-    LogMessageParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams, RequestId,
-    Resource, ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams, Role,
-    ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams, TaskId, TaskStatus,
-    TaskStatusNotificationParams, Tool,
+    CreateMessageResult, GetPromptParams, GetTaskParams, InitializeParams, JsonRpcMessage,
+    JsonRpcResponse, ListTasksParams, LogLevel, LogMessageParams, Prompt, PromptArgument,
+    PromptMessage, ReadResourceParams, RequestId, Resource, ResourceContent, ResourceTemplate,
+    ResourceUpdatedNotificationParams, Role, SamplingCapability, ServerCapabilities, ServerInfo,
+    SetLogLevelParams, SubmitTaskParams, TaskStatus, Tool,
 };
 
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
@@ -32,10 +32,12 @@ use crate::caching::ResponseCachingMiddleware;
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
 use crate::rate_limiting::RateLimitingMiddleware;
 use crate::router::Router;
-use crate::session::Session;
+use crate::session::{
+    MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION, Session,
+};
 use crate::{
-    ActiveRequest, ActiveRequestGuard, AuthRequest, NotificationSender, RequestCompletion, Server,
-    StaticTokenVerifier, TaskManager, TokenAuthProvider,
+    ActiveRequest, ActiveRequestGuard, ActiveRequestKey, AuthRequest, NotificationSender,
+    RequestCompletion, Server, StaticTokenVerifier, TaskManager, TokenAuthProvider,
 };
 
 /// Creates a request sender for tests that should not perform server-to-client requests.
@@ -201,6 +203,15 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
         std::thread::yield_now();
     }
     Err(McpError::request_cancelled())
+}
+
+#[tool(
+    name = "sampling_round_trip",
+    description = "Requests one sampling completion"
+)]
+fn sampling_round_trip(ctx: &McpContext) -> McpResult<String> {
+    let response = fastmcp_core::block_on(ctx.sample("reply with a test value", 16))?;
+    Ok(response.text)
 }
 
 struct LoggingBlockingToolState {
@@ -689,15 +700,37 @@ mod router_tests {
 
     #[test]
     fn test_middleware_short_circuit_prevents_late_middleware() {
-        // If caching is registered before rate limiting, cached responses should
-        // not consume rate-limit budget because the rate limiter is never entered.
-        let caching = ResponseCachingMiddleware::new();
-        let rate_limiter = RateLimitingMiddleware::new(0.0).burst_capacity(1).global();
+        struct ImmediateResponse;
+        impl Middleware for ImmediateResponse {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                Ok(crate::MiddlewareDecision::Respond(
+                    serde_json::json!({"short_circuit": true}),
+                ))
+            }
+        }
+
+        struct CountEntry(Arc<Mutex<usize>>);
+        impl Middleware for CountEntry {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                *self.0.lock().expect("entry counter mutex poisoned") += 1;
+                Ok(crate::MiddlewareDecision::Continue)
+            }
+        }
+
+        let late_entries = Arc::new(Mutex::new(0_usize));
 
         let server = Server::new("test-server", "1.0.0")
             .tool(Greet)
-            .middleware(caching)
-            .middleware(rate_limiter)
+            .middleware(ImmediateResponse)
+            .middleware(CountEntry(Arc::clone(&late_entries)))
             .build();
         let cx = Cx::for_testing();
         let mut session = create_test_session();
@@ -722,8 +755,7 @@ mod router_tests {
             1,
         );
 
-        // First call: cache miss, rate limiter consumes its only token.
-        let first = server
+        let response = server
             .handle_request(
                 &cx,
                 &mut session,
@@ -731,49 +763,24 @@ mod router_tests {
                 &sender,
                 &create_test_request_sender(),
             )
-            .expect("first response");
-        assert!(first.error.is_none(), "expected successful first response");
-
-        // Second call: should be served from cache and never reach the rate limiter.
-        let second = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("second response");
-        assert!(second.error.is_none(), "expected cached second response");
+            .expect("short-circuit response");
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({"short_circuit": true}))
+        );
+        assert_eq!(
+            *late_entries.lock().expect("entry counter mutex poisoned"),
+            0
+        );
     }
 
     #[test]
-    fn test_middleware_short_circuit_runs_response_stack_for_entered_middleware() {
-        // If an earlier middleware is entered and a later middleware short-circuits with
-        // Respond, the response still flows through `on_response` for the already-entered
-        // middleware stack in reverse order.
+    fn production_session_cache_hits_within_one_session_and_isolates_sessions() {
         let cache_a = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
         let cache_b = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
 
         let cx = Cx::for_testing();
-        let ctx = McpContext::new(cx.clone(), 1);
-
-        let params = CallToolParams {
-            name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "Ada"})),
-            meta: None,
-        };
-        let request = fastmcp_protocol::JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::to_value(params).expect("params")),
-            2,
-        );
-
-        // Prime cache_b so it will short-circuit in `on_request`.
-        let primed_value = serde_json::json!({"primed": true});
-        let _ = cache_b
-            .on_response(&ctx, &request, primed_value.clone())
-            .expect("prime cache_b");
+        let request = fastmcp_protocol::JsonRpcRequest::new("tools/list", None, 2);
 
         let server = Server::new("test-server", "1.0.0")
             .tool(Greet)
@@ -793,7 +800,6 @@ mod router_tests {
 
         let sender: NotificationSender = Arc::new(|_| {});
 
-        // First call: cache_a miss, cache_b hit -> Respond. cache_a must still see on_response.
         let first = server
             .handle_request(
                 &cx,
@@ -803,26 +809,53 @@ mod router_tests {
                 &create_test_request_sender(),
             )
             .expect("first response");
-        assert_eq!(first.result, Some(primed_value));
-        assert_eq!(cache_a.stats().hits, 0);
-        assert_eq!(cache_a.stats().misses, 1);
-        assert_eq!(cache_b.stats().hits, 1);
-        assert_eq!(cache_b.stats().misses, 0);
+        assert!(first.error.is_none());
 
-        // Second call: cache_a should now hit (because it cached during the response stack)
-        // and cache_b should not be entered.
         let second = server
             .handle_request(
                 &cx,
                 &mut session,
-                request,
+                request.clone(),
                 &sender,
                 &create_test_request_sender(),
             )
             .expect("second response");
         assert!(second.error.is_none());
-        assert_eq!(cache_a.stats().hits, 1);
-        assert_eq!(cache_b.stats().hits, 1);
+        assert_eq!(second.result, first.result);
+
+        let cache_a_same_session = cache_a.stats();
+        let cache_b_same_session = cache_b.stats();
+        assert_eq!(cache_a_same_session.entries, 1);
+        assert_eq!(cache_b_same_session.entries, 1);
+        assert!(cache_a_same_session.hits + cache_b_same_session.hits >= 1);
+
+        let mut isolated_session = create_test_session();
+        isolated_session.initialize(
+            ClientInfo {
+                name: "other-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let isolated = server
+            .handle_request(
+                &cx,
+                &mut isolated_session,
+                request,
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("isolated-session response");
+        assert!(isolated.error.is_none());
+        assert_eq!(isolated.result, first.result);
+
+        let cache_a_isolated = cache_a.stats();
+        let cache_b_isolated = cache_b.stats();
+        assert_eq!(cache_a_isolated.entries, 2);
+        assert_eq!(cache_b_isolated.entries, 2);
+        assert!(cache_a_isolated.misses > cache_a_same_session.misses);
+        assert!(cache_b_isolated.misses > cache_b_same_session.misses);
     }
 
     #[test]
@@ -831,6 +864,7 @@ mod router_tests {
         let request = AuthRequest {
             method: "tools/list",
             params: Some(&params),
+            transport_authorization: None,
             request_id: 10,
         };
         let access = request.access_token().expect("missing access credential");
@@ -841,6 +875,7 @@ mod router_tests {
         let request = AuthRequest {
             method: "tools/list",
             params: Some(&params),
+            transport_authorization: None,
             request_id: 11,
         };
         let access = request.access_token().expect("missing access credential");
@@ -852,7 +887,9 @@ mod router_tests {
     fn test_token_auth_provider_allows_and_denies() {
         let verifier =
             StaticTokenVerifier::new([("good-token", AuthContext::with_subject("user-1"))])
-                .with_allowed_schemes(["Bearer"]);
+                .expect("valid verifier configuration")
+                .with_allowed_schemes(["Bearer"])
+                .expect("valid scheme configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -919,7 +956,8 @@ mod router_tests {
         let verifier = StaticTokenVerifier::new([(
             "resource-token",
             AuthContext::with_subject("resource-user"),
-        )]);
+        )])
+        .expect("valid verifier configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -979,7 +1017,8 @@ mod router_tests {
 
     #[test]
     fn test_e2e_auth_decisions_logged() {
-        let verifier = StaticTokenVerifier::new([("good", AuthContext::with_subject("user-e2e"))]);
+        let verifier = StaticTokenVerifier::new([("good", AuthContext::with_subject("user-e2e"))])
+            .expect("valid verifier configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -1194,7 +1233,8 @@ mod router_tests {
         let cx = Cx::for_testing();
         let params = ListResourceTemplatesParams::default();
 
-        let result = router.handle_resource_templates_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_resource_templates_list(&request_ctx, params, None);
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let templates = result.unwrap().resource_templates;
 
@@ -1221,8 +1261,9 @@ mod router_tests {
         let cx = Cx::for_testing();
         let params = ListResourceTemplatesParams::default();
 
+        let request_ctx = McpContext::new(cx, 1);
         let result = router
-            .handle_resource_templates_list(&cx, params, None)
+            .handle_resource_templates_list(&request_ctx, params, None)
             .expect("resource templates list");
 
         info!(
@@ -1244,10 +1285,11 @@ mod router_tests {
         let shared = manager.into_shared();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
 
         let submit = router
             .handle_tasks_submit(
-                &cx,
+                &request_ctx,
                 SubmitTaskParams {
                     task_type: "demo_task".to_string(),
                     params: None,
@@ -1261,7 +1303,7 @@ mod router_tests {
 
         let list = router
             .handle_tasks_list(
-                &cx,
+                &request_ctx,
                 ListTasksParams {
                     status: None,
                     cursor: None,
@@ -1274,7 +1316,7 @@ mod router_tests {
 
         let get = router
             .handle_tasks_get(
-                &cx,
+                &request_ctx,
                 GetTaskParams {
                     id: task_id.clone(),
                 },
@@ -1286,7 +1328,7 @@ mod router_tests {
 
         let cancel = router
             .handle_tasks_cancel(
-                &cx,
+                &request_ctx,
                 CancelTaskParams {
                     id: task_id.clone(),
                     reason: Some("stop".to_string()),
@@ -1298,7 +1340,7 @@ mod router_tests {
 
         let list_cancelled = router
             .handle_tasks_list(
-                &cx,
+                &request_ctx,
                 ListTasksParams {
                     status: Some(TaskStatus::Cancelled),
                     cursor: None,
@@ -1320,9 +1362,10 @@ mod router_tests {
         let shared = manager.into_shared();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let submit = router
             .handle_tasks_submit(
-                &cx,
+                &request_ctx,
                 SubmitTaskParams {
                     task_type: "log_task".to_string(),
                     params: Some(serde_json::json!({"payload": 1})),
@@ -1359,7 +1402,7 @@ mod router_tests {
 
         let get = router
             .handle_tasks_get(
-                &cx,
+                &request_ctx,
                 GetTaskParams {
                     id: submit.task.id.clone(),
                 },
@@ -1384,9 +1427,10 @@ mod router_tests {
         let shared = manager.into_shared();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let submit = router
             .handle_tasks_submit(
-                &cx,
+                &request_ctx,
                 SubmitTaskParams {
                     task_type: "long_task".to_string(),
                     params: Some(serde_json::json!({"duration": 10})),
@@ -1407,7 +1451,7 @@ mod router_tests {
 
         let list = router
             .handle_tasks_list(
-                &cx,
+                &request_ctx,
                 ListTasksParams {
                     status: None,
                     cursor: None,
@@ -1425,7 +1469,7 @@ mod router_tests {
 
         let get = router
             .handle_tasks_get(
-                &cx,
+                &request_ctx,
                 GetTaskParams {
                     id: submit.task.id.clone(),
                 },
@@ -1441,7 +1485,7 @@ mod router_tests {
 
         let cancel = router
             .handle_tasks_cancel(
-                &cx,
+                &request_ctx,
                 CancelTaskParams {
                     id: submit.task.id.clone(),
                     reason: Some("test cancel".to_string()),
@@ -1460,7 +1504,7 @@ mod router_tests {
     }
 
     #[test]
-    fn test_e2e_task_status_notifications_logged() {
+    fn test_e2e_task_rpc_quarantine_emits_no_status_notifications() {
         let manager = TaskManager::new_for_testing();
         manager.register_handler("notify_task", |_cx, _params| async {
             Ok(serde_json::json!({"ok": true}))
@@ -1481,22 +1525,16 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
 
-        let notifications: Arc<std::sync::Mutex<Vec<TaskStatusNotificationParams>>> =
+        let notifications: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let notifications_clone = Arc::clone(&notifications);
         let sender: NotificationSender = Arc::new(move |request| {
-            if request.method != "notifications/tasks/status" {
-                return;
+            if request.method == "notifications/tasks/status" {
+                notifications_clone
+                    .lock()
+                    .expect("notifications lock poisoned")
+                    .push(request.method.clone());
             }
-            let params: TaskStatusNotificationParams = request
-                .params
-                .as_ref()
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .expect("task status params");
-            notifications_clone
-                .lock()
-                .expect("notifications lock poisoned")
-                .push(params);
         });
 
         let submit = fastmcp_protocol::JsonRpcRequest::new(
@@ -1513,43 +1551,17 @@ mod router_tests {
                 &create_test_request_sender(),
             )
             .expect("submit response");
-        let task_id = response
-            .result
+        let error = response
+            .error
             .as_ref()
-            .and_then(|value| value.get("task"))
-            .and_then(|value| value.get("id"))
-            .and_then(|value| value.as_str())
-            .map(TaskId::from_string)
-            .expect("task id");
-
-        shared.start_task(&task_id).expect("start task");
-        shared.update_progress(&task_id, 0.25, Some("quarter".to_string()));
-        shared.complete_task(&task_id, serde_json::json!({"ok": true}));
+            .expect("quarantined tasks/submit must return an error");
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert!(response.result.is_none());
 
         let recorded = notifications.lock().expect("notifications lock poisoned");
-        info!(
-            target: targets::SESSION,
-            "e2e task notifications ts={} count={}",
-            chrono::Utc::now().to_rfc3339(),
-            recorded.len()
-        );
         assert!(
-            recorded.iter().any(|evt| evt.status == TaskStatus::Pending),
-            "expected pending notification"
-        );
-        assert!(
-            recorded.iter().any(|evt| evt.status == TaskStatus::Running),
-            "expected running notification"
-        );
-        assert!(
-            recorded.iter().any(|evt| evt.progress == Some(0.25)),
-            "expected progress notification"
-        );
-        assert!(
-            recorded
-                .iter()
-                .any(|evt| evt.status == TaskStatus::Completed),
-            "expected completed notification"
+            recorded.is_empty(),
+            "quarantined task RPC emitted status notifications: {recorded:?}"
         );
     }
 
@@ -1601,18 +1613,21 @@ mod router_tests {
     #[test]
     fn test_cancelled_notification_marks_request_cancelled() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(99);
         let cx = Cx::for_testing();
 
         let completion = Arc::new(RequestCompletion::new());
+        let active = ActiveRequest::new(cx.clone(), completion);
+        let cancellation = active.cancellation.clone();
         {
             let mut guard = server
                 .active_requests
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                request_id.clone(),
-                ActiveRequest::new(cx.clone(), completion),
+                ActiveRequestKey::new(session_id, request_id.clone()),
+                active,
             );
         }
 
@@ -1621,17 +1636,21 @@ mod router_tests {
             reason: Some("test cancellation".to_string()),
             await_cleanup: None,
         };
-        server.handle_cancelled_notification(params);
+        server.handle_cancelled_notification(session_id, params);
 
-        assert!(cx.is_cancel_requested());
+        assert!(cancellation.is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
     }
 
     #[test]
     fn test_cancelled_notification_await_cleanup_waits_for_completion() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(100);
         let cx = Cx::for_testing();
         let completion = Arc::new(RequestCompletion::new());
+        let active = ActiveRequest::new(cx.clone(), completion.clone());
+        let cancellation = active.cancellation.clone();
 
         {
             let mut guard = server
@@ -1639,8 +1658,8 @@ mod router_tests {
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                request_id.clone(),
-                ActiveRequest::new(cx.clone(), completion.clone()),
+                ActiveRequestKey::new(session_id, request_id.clone()),
+                active,
             );
         }
 
@@ -1655,27 +1674,34 @@ mod router_tests {
             reason: Some("await cleanup".to_string()),
             await_cleanup: Some(true),
         };
-        server.handle_cancelled_notification(params);
+        server.handle_cancelled_notification(session_id, params);
 
         assert!(completion.is_done());
-        assert!(cx.is_cancel_requested());
+        assert!(cancellation.is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
     }
 
     #[test]
     fn test_active_request_guard_registers_and_cleans_up() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(77);
         let cx = Cx::for_testing();
+        let key = ActiveRequestKey::new(session_id, request_id.clone());
 
-        let guard =
-            ActiveRequestGuard::try_new(&server.active_requests, request_id.clone(), cx.clone())
-                .expect("active request should register");
+        let guard = ActiveRequestGuard::try_new(
+            &server.active_requests,
+            session_id,
+            request_id,
+            cx.clone(),
+        )
+        .expect("active request should register");
         {
             let guard_map = server
                 .active_requests
                 .lock()
                 .expect("active_requests lock poisoned");
-            let entry = guard_map.get(&request_id).expect("active request missing");
+            let entry = guard_map.get(&key).expect("active request missing");
             assert_eq!(entry.region_id, cx.region_id());
             assert!(!entry.completion.is_done());
         }
@@ -1685,7 +1711,7 @@ mod router_tests {
             .active_requests
             .lock()
             .expect("active_requests lock poisoned");
-        assert!(!guard_map.contains_key(&request_id));
+        assert!(!guard_map.contains_key(&key));
     }
 
     #[test]
@@ -1698,6 +1724,7 @@ mod router_tests {
         let mut cxs = Vec::new();
 
         for i in 0..thread_count {
+            let session_id = 1;
             let request_id =
                 RequestId::Number(i64::try_from(i + 1).expect("request id fits in i64"));
             let cx = Cx::for_testing();
@@ -1709,9 +1736,13 @@ mod router_tests {
             let server = Arc::clone(&server);
             let ready = Arc::clone(&ready);
             let handle = thread::spawn(move || {
-                let _guard =
-                    ActiveRequestGuard::try_new(&server.active_requests, request_id, cx.clone())
-                        .expect("active request should register");
+                let _guard = ActiveRequestGuard::try_new(
+                    &server.active_requests,
+                    session_id,
+                    request_id,
+                    cx.clone(),
+                )
+                .expect("active request should register");
                 ready.wait();
                 let _ = release_rx.recv();
             });
@@ -1751,6 +1782,7 @@ mod router_tests {
     #[test]
     fn test_cancel_active_requests_waits_for_guard_drop() {
         let server = Arc::new(Server::new("test-server", "1.0.0").build());
+        let session_id = 1;
         let request_id = RequestId::Number(500);
         let cx = Cx::for_testing();
 
@@ -1761,6 +1793,7 @@ mod router_tests {
         let worker = thread::spawn(move || {
             let _guard = ActiveRequestGuard::try_new(
                 &server_for_worker.active_requests,
+                session_id,
                 request_id,
                 cx_for_worker,
             )
@@ -2085,6 +2118,372 @@ mod router_tests {
     }
 
     #[test]
+    fn resource_subscription_dispatch_reports_capacity_and_preserves_liveness() {
+        const DUPLICATE_URI: &str = "resource://subscription/already-retained";
+        const OVER_LIMIT_URI_CANARY: &str = "resource://subscription/private-capacity-canary-71c9";
+
+        let server = Server::new("subscription-admission-test", "1.0.0")
+            .resource(StaticResource {
+                uri: DUPLICATE_URI.to_string(),
+                content: "duplicate".to_string(),
+            })
+            .resource(StaticResource {
+                uri: OVER_LIMIT_URI_CANARY.to_string(),
+                content: "over-limit".to_string(),
+            })
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-admission-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let admission_ctx = McpContext::new(Cx::for_testing(), 9_000);
+        session
+            .subscribe_resource(&admission_ctx, DUPLICATE_URI.to_string())
+            .expect("first subscription should be admitted");
+        for index in 1..MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION {
+            session
+                .subscribe_resource(&admission_ctx, format!("resource://filler/{index}"))
+                .expect("subscription at the exact count cap should be admitted");
+        }
+
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+        let duplicate = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: DUPLICATE_URI.to_string(),
+                })
+                .expect("serialize duplicate subscription"),
+            ),
+            10_i64,
+        );
+        let duplicate_response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                duplicate,
+                &sender,
+                &request_sender,
+            )
+            .expect("duplicate subscribe request should produce a response");
+        assert!(duplicate_response.error.is_none());
+        assert!(session.is_resource_subscribed(DUPLICATE_URI));
+
+        let over_limit = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: OVER_LIMIT_URI_CANARY.to_string(),
+                })
+                .expect("serialize over-limit subscription"),
+            ),
+            11_i64,
+        );
+        let over_limit_response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                over_limit,
+                &sender,
+                &request_sender,
+            )
+            .expect("over-limit subscribe request should produce a response");
+        let capacity_error = over_limit_response
+            .error
+            .expect("over-limit subscription must fail");
+        assert_eq!(capacity_error.code, crate::RESOURCE_EXHAUSTED_ERROR_CODE);
+        assert_eq!(
+            capacity_error.message,
+            crate::RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
+        );
+        assert!(capacity_error.data.is_none());
+        assert!(!capacity_error.message.contains(OVER_LIMIT_URI_CANARY));
+        let encoded_capacity_error =
+            serde_json::to_string(&capacity_error).expect("serialize capacity error");
+        assert!(!encoded_capacity_error.contains(OVER_LIMIT_URI_CANARY));
+        assert!(!session.is_resource_subscribed(OVER_LIMIT_URI_CANARY));
+
+        let impossible_uri = "x".repeat(MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION + 1);
+        let impossible = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: impossible_uri,
+                })
+                .expect("serialize individually over-limit subscription"),
+            ),
+            12_i64,
+        );
+        let impossible_response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                impossible,
+                &sender,
+                &request_sender,
+            )
+            .expect("individually over-limit subscribe should produce a response");
+        let impossible_error = impossible_response
+            .error
+            .expect("individually over-limit subscription must fail before lookup");
+        assert_eq!(impossible_error.code, crate::RESOURCE_EXHAUSTED_ERROR_CODE);
+        assert_eq!(
+            impossible_error.message,
+            crate::RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
+        );
+
+        let mut cancelled_session = create_test_session();
+        cancelled_session.initialize(
+            ClientInfo {
+                name: "cancelled-subscription-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        cancelled_session
+            .subscribe_resource(&admission_ctx, DUPLICATE_URI.to_string())
+            .expect("cancelled-dispatch fixture subscription should be retained");
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let cancelled_request = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: OVER_LIMIT_URI_CANARY.to_string(),
+                })
+                .expect("serialize cancelled subscription"),
+            ),
+            13_i64,
+        );
+        let cancelled_response = server
+            .handle_request(
+                &cancelled_cx,
+                &mut cancelled_session,
+                cancelled_request,
+                &sender,
+                &request_sender,
+            )
+            .expect("cancelled subscribe request should produce a response");
+        let cancellation = cancelled_response
+            .error
+            .expect("cancelled subscription must fail");
+        assert_eq!(cancellation.code, i32::from(McpErrorCode::RequestCancelled));
+        assert!(!cancelled_session.is_resource_subscribed(OVER_LIMIT_URI_CANARY));
+
+        let cancelled_unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: DUPLICATE_URI.to_string(),
+                })
+                .expect("serialize cancelled unsubscription"),
+            ),
+            14_i64,
+        );
+        let cancelled_unsubscribe_response = server
+            .handle_request(
+                &cancelled_cx,
+                &mut cancelled_session,
+                cancelled_unsubscribe,
+                &sender,
+                &request_sender,
+            )
+            .expect("cancelled unsubscribe request should produce a response");
+        let unsubscribe_cancellation = cancelled_unsubscribe_response
+            .error
+            .expect("cancelled unsubscription must fail");
+        assert_eq!(
+            unsubscribe_cancellation.code,
+            i32::from(McpErrorCode::RequestCancelled)
+        );
+        assert!(cancelled_session.is_resource_subscribed(DUPLICATE_URI));
+    }
+
+    #[test]
+    fn middleware_cannot_forge_subscription_mutation_success() {
+        const URI: &str = "resource://subscription/short-circuit-guard";
+
+        struct ForgedSuccess;
+        impl Middleware for ForgedSuccess {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                Ok(crate::MiddlewareDecision::Respond(serde_json::json!({})))
+            }
+        }
+
+        let server = Server::new("subscription-short-circuit-test", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "guarded".to_string(),
+            })
+            .middleware(ForgedSuccess)
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-short-circuit-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+
+        let subscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize guarded subscription"),
+            ),
+            20_i64,
+        );
+        let subscribe_response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                subscribe,
+                &sender,
+                &request_sender,
+            )
+            .expect("guarded subscribe request should produce a response");
+        assert_eq!(
+            subscribe_response.error.expect("subscribe must fail").code,
+            i32::from(McpErrorCode::InternalError)
+        );
+        assert!(!session.is_resource_subscribed(URI));
+
+        session
+            .subscribe_resource(&McpContext::new(Cx::for_testing(), 21), URI.to_string())
+            .expect("fixture subscription should be admitted");
+        let unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize guarded unsubscription"),
+            ),
+            21_i64,
+        );
+        let unsubscribe_response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                unsubscribe,
+                &sender,
+                &request_sender,
+            )
+            .expect("guarded unsubscribe request should produce a response");
+        assert_eq!(
+            unsubscribe_response
+                .error
+                .expect("unsubscribe must fail")
+                .code,
+            i32::from(McpErrorCode::InternalError)
+        );
+        assert!(session.is_resource_subscribed(URI));
+    }
+
+    #[test]
+    fn subscription_mutations_roll_back_when_response_middleware_fails() {
+        const URI: &str = "resource://subscription/finalization-rollback";
+
+        struct RejectResponse;
+        impl Middleware for RejectResponse {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+                _response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                Err(McpError::internal_error(
+                    "response middleware rejected subscription result",
+                ))
+            }
+        }
+
+        let server = Server::new("subscription-rollback-test", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "guarded".to_string(),
+            })
+            .middleware(RejectResponse)
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-rollback-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+
+        let subscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize subscription"),
+            ),
+            22_i64,
+        );
+        let response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                subscribe,
+                &sender,
+                &request_sender,
+            )
+            .expect("subscribe produces response");
+        assert!(response.error.is_some());
+        assert!(!session.is_resource_subscribed(URI));
+
+        session
+            .subscribe_resource(&McpContext::new(Cx::for_testing(), 23), URI.to_string())
+            .expect("fixture subscription should be admitted");
+        let unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize unsubscription"),
+            ),
+            23_i64,
+        );
+        let response = server
+            .handle_request(
+                &Cx::for_testing(),
+                &mut session,
+                unsubscribe,
+                &sender,
+                &request_sender,
+            )
+            .expect("unsubscribe produces response");
+        assert!(response.error.is_some());
+        assert!(session.is_resource_subscribed(URI));
+    }
+
+    #[test]
     fn test_logging_set_level_emits_notifications() {
         let server = Server::new("test-server", "1.0.0").tool(Greet).build();
         let cx = Cx::for_testing();
@@ -2261,7 +2660,13 @@ mod router_tests {
             },
         };
 
-        let result = router.handle_initialize(&cx, &mut session, params, Some("Test instructions"));
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_initialize(
+            &request_ctx,
+            &mut session,
+            params,
+            Some("Test instructions"),
+        );
 
         assert!(result.is_ok());
         let init_result = result.unwrap();
@@ -2285,16 +2690,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2320,16 +2718,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2348,16 +2739,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -2379,16 +2763,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -2406,21 +2783,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
-        // Request should fail due to exhausted budget
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("budget") || err.message.contains("exhausted"));
+        // The handler explicitly requests a poll checkpoint, so a zero poll
+        // balance rejects that next admission rather than retroactively
+        // invalidating some earlier operation.
+        let err = result.expect_err("checkpoint should require a poll unit");
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
     #[test]
@@ -2434,16 +2805,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -2465,16 +2829,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2495,16 +2852,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2525,16 +2875,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2558,16 +2901,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2593,16 +2929,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
@@ -2635,16 +2964,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         assert!(result.is_err());
     }
@@ -2661,16 +2983,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_resources_read(
-            &cx,
-            1,
-            &params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
         // Should be cancelled
         assert!(result.is_err());
@@ -2692,16 +3007,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_prompts_get(&request_ctx, params, state, None, None);
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -2729,16 +3037,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_prompts_get(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_prompts_get(&request_ctx, params, state, None, None);
 
         assert!(result.is_err());
     }
@@ -2756,16 +3057,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2785,16 +3079,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2814,16 +3101,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2844,16 +3124,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         // Should pass in lenient mode
         assert!(result.is_ok());
@@ -2876,16 +3149,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         // Should fail in strict mode due to extra property
         assert!(result.is_err());
@@ -2908,16 +3174,9 @@ mod router_tests {
             meta: None,
         };
 
-        let result = router.handle_tools_call(
-            &cx,
-            1,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
-            None,
-        );
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
         // Should pass in strict mode with valid input
         assert!(result.is_ok());
@@ -3023,7 +3282,8 @@ mod cancellation_tests {
         // Inside masked section, checkpoint should succeed
         ctx.masked(|| {
             assert!(ctx.checkpoint().is_ok());
-        });
+        })
+        .expect("mask should be admitted");
 
         // Outside masked section, checkpoint should fail
         assert!(ctx.checkpoint().is_err());
@@ -3257,7 +3517,8 @@ mod handler_definition_tests {
             include_tags: Some(vec!["public".to_string()]),
             exclude_tags: None,
         };
-        let result = router.handle_tools_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_tools_list(&request_ctx, params, None);
         let tools = result.unwrap().tools;
         assert_eq!(tools.len(), 2, "Expected search, create");
     }
@@ -3271,7 +3532,8 @@ mod handler_definition_tests {
             include_tags: None,
             exclude_tags: Some(vec!["private".to_string(), "internal".to_string()]),
         };
-        let result = router.handle_tools_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_tools_list(&request_ctx, params, None);
         let tools = result.unwrap().tools;
         assert_eq!(tools.len(), 3, "Expected search, create, untagged");
     }
@@ -3298,33 +3560,33 @@ mod multi_handler_tests {
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
+        let state1 = SessionState::new();
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
         let result1 = router.handle_tools_call(
-            &cx,
-            1,
+            &request_ctx1,
             CallToolParams {
                 name: "greet".to_string(),
                 arguments: Some(serde_json::json!({"name": "Alice"})),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
-            None,
+            state1,
             None,
             None,
         );
         assert!(result1.is_ok());
 
+        let state2 = SessionState::new();
+        let request_ctx2 =
+            McpContext::with_state(cx, 2, state2.clone()).with_budget_ceiling(budget);
         let result2 = router.handle_tools_call(
-            &cx,
-            2,
+            &request_ctx2,
             CallToolParams {
                 name: "formal_greet".to_string(),
                 arguments: Some(serde_json::json!({"name": "Alice"})),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
-            None,
+            state2,
             None,
             None,
         );
@@ -3357,29 +3619,29 @@ mod multi_handler_tests {
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
+        let state_a = SessionState::new();
+        let request_ctx_a =
+            McpContext::with_state(cx.clone(), 1, state_a.clone()).with_budget_ceiling(budget);
         let result_a = router.handle_resources_read(
-            &cx,
-            1,
+            &request_ctx_a,
             &ReadResourceParams {
                 uri: "resource://a".to_string(),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
-            None,
+            state_a,
             None,
             None,
         );
+        let state_b = SessionState::new();
+        let request_ctx_b =
+            McpContext::with_state(cx, 2, state_b.clone()).with_budget_ceiling(budget);
         let result_b = router.handle_resources_read(
-            &cx,
-            2,
+            &request_ctx_b,
             &ReadResourceParams {
                 uri: "resource://b".to_string(),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
-            None,
+            state_b,
             None,
             None,
         );
@@ -3419,40 +3681,28 @@ mod session_state_tests {
             arguments: None,
             meta: None,
         };
-        let result1 = router.handle_tools_call(
-            &cx,
-            1,
-            params.clone(),
-            &budget,
-            state.clone(),
-            None,
-            None,
-            None,
-        );
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state.clone()).with_budget_ceiling(budget);
+        let result1 =
+            router.handle_tools_call(&request_ctx1, params.clone(), state.clone(), None, None);
         assert!(result1.is_ok());
         if let Content::Text { text } = &result1.unwrap().content[0] {
             assert_eq!(text, "Counter: 1");
         }
 
         // Second call with same state - counter should be 2
-        let result2 = router.handle_tools_call(
-            &cx,
-            2,
-            params.clone(),
-            &budget,
-            state.clone(),
-            None,
-            None,
-            None,
-        );
+        let request_ctx2 =
+            McpContext::with_state(cx.clone(), 2, state.clone()).with_budget_ceiling(budget);
+        let result2 =
+            router.handle_tools_call(&request_ctx2, params.clone(), state.clone(), None, None);
         assert!(result2.is_ok());
         if let Content::Text { text } = &result2.unwrap().content[0] {
             assert_eq!(text, "Counter: 2");
         }
 
         // Third call - counter should be 3
-        let result3 =
-            router.handle_tools_call(&cx, 3, params, &budget, state.clone(), None, None, None);
+        let request_ctx3 = McpContext::with_state(cx, 3, state.clone()).with_budget_ceiling(budget);
+        let result3 = router.handle_tools_call(&request_ctx3, params, state.clone(), None, None);
         assert!(result3.is_ok());
         if let Content::Text { text } = &result3.unwrap().content[0] {
             assert_eq!(text, "Counter: 3");
@@ -3478,34 +3728,22 @@ mod session_state_tests {
         };
 
         // Call with state1 twice
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
         router
-            .handle_tools_call(
-                &cx,
-                1,
-                params.clone(),
-                &budget,
-                state1.clone(),
-                None,
-                None,
-                None,
-            )
+            .handle_tools_call(&request_ctx1, params.clone(), state1.clone(), None, None)
             .unwrap();
+        let request_ctx2 =
+            McpContext::with_state(cx.clone(), 2, state1.clone()).with_budget_ceiling(budget);
         let result1 = router
-            .handle_tools_call(
-                &cx,
-                2,
-                params.clone(),
-                &budget,
-                state1.clone(),
-                None,
-                None,
-                None,
-            )
+            .handle_tools_call(&request_ctx2, params.clone(), state1.clone(), None, None)
             .unwrap();
 
         // Call with state2 once
+        let request_ctx3 =
+            McpContext::with_state(cx, 3, state2.clone()).with_budget_ceiling(budget);
         let result2 = router
-            .handle_tools_call(&cx, 3, params, &budget, state2.clone(), None, None, None)
+            .handle_tools_call(&request_ctx3, params, state2.clone(), None, None)
             .unwrap();
 
         // state1 should have counter=2, state2 should have counter=1
@@ -3573,7 +3811,6 @@ mod console_config_tests {
             .with_traffic_logging(TrafficVerbosity::Summary)
             .build();
 
-        assert!(server.console_config().show_request_traffic);
         assert_eq!(
             server.console_config().traffic_verbosity,
             TrafficVerbosity::Summary
@@ -3581,11 +3818,25 @@ mod console_config_tests {
     }
 
     #[test]
-    fn test_server_with_periodic_stats() {
-        let server = Server::new("test", "1.0.0").with_periodic_stats(30).build();
+    fn traffic_verbosity_is_the_single_enablement_source() {
+        let disabled = Server::new("test", "1.0.0").build();
+        assert!(disabled.configured_traffic_renderer().is_none());
 
-        assert!(server.console_config().show_stats_periodic);
-        assert_eq!(server.console_config().stats_interval_secs, 30);
+        let summary = Server::new("test", "1.0.0")
+            .with_traffic_logging(TrafficVerbosity::Summary)
+            .build()
+            .configured_traffic_renderer()
+            .expect("summary traffic should create a renderer");
+        assert!(!summary.show_params);
+        assert!(!summary.show_result);
+
+        let full = Server::new("test", "1.0.0")
+            .with_traffic_logging(TrafficVerbosity::Full)
+            .build()
+            .configured_traffic_renderer()
+            .expect("full traffic should create a renderer");
+        assert!(full.show_params);
+        assert!(full.show_result);
     }
 
     #[test]
@@ -3606,16 +3857,13 @@ mod console_config_tests {
     fn test_console_config_chaining() {
         let server = Server::new("test", "1.0.0")
             .with_banner(BannerStyle::Compact)
-            .with_traffic_logging(TrafficVerbosity::Headers)
-            .with_periodic_stats(60)
+            .with_traffic_logging(TrafficVerbosity::Full)
             .plain_mode()
             .build();
 
         let config = server.console_config();
         assert_eq!(config.banner_style, BannerStyle::Compact);
-        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Headers);
-        assert!(config.show_stats_periodic);
-        assert_eq!(config.stats_interval_secs, 60);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
         assert!(config.force_plain);
     }
 }
@@ -3757,16 +4005,10 @@ mod lab_runtime_tests {
                     arguments: Some(serde_json::json!({})),
                     meta: None,
                 };
-                let result = router.handle_tools_call(
-                    &cx,
-                    1,
-                    params,
-                    &Budget::INFINITE,
-                    SessionState::new(),
-                    None,
-                    None,
-                    None,
-                );
+                let state = SessionState::new();
+                let request_ctx = McpContext::with_state(cx, 1, state.clone())
+                    .with_budget_ceiling(Budget::INFINITE);
+                let result = router.handle_tools_call(&request_ctx, params, state, None, None);
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task
@@ -3807,16 +4049,10 @@ mod lab_runtime_tests {
                     meta: None,
                 };
 
-                let result = router.handle_resources_read(
-                    &cx,
-                    1,
-                    &params,
-                    &budget,
-                    SessionState::new(),
-                    None,
-                    None,
-                    None,
-                );
+                let state = SessionState::new();
+                let request_ctx =
+                    McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+                let result = router.handle_resources_read(&request_ctx, &params, state, None, None);
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task
@@ -3830,7 +4066,10 @@ mod lab_runtime_tests {
                     err
                 );
 
-                assert!(result.is_err());
+                assert!(
+                    result.is_ok(),
+                    "a resource that requests no poll admission may complete at an exact zero balance"
+                );
             });
 
             assert_eq!(events.lock().expect("events lock poisoned").len(), 1);
@@ -4442,7 +4681,8 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://app", None, 0));
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
+        let result = fastmcp_core::block_on(reader.read_resource(&request_ctx, "config://app", 0));
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -4456,7 +4696,9 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://missing", None, 0));
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
+        let result =
+            fastmcp_core::block_on(reader.read_resource(&request_ctx, "config://missing", 0));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4470,11 +4712,11 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Call with depth at limit
         let result = fastmcp_core::block_on(reader.read_resource(
-            &cx,
+            &request_ctx,
             "any://uri",
-            None,
             MAX_RESOURCE_READ_DEPTH + 1,
         ));
 
@@ -4827,11 +5069,11 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "add",
             serde_json::json!({"a": 5, "b": 3}),
-            None,
             0,
         ));
 
@@ -4848,11 +5090,11 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "nonexistent",
             serde_json::json!({}),
-            None,
             0,
         ));
 
@@ -4868,12 +5110,12 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Call with depth at limit
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "any_tool",
             serde_json::json!({}),
-            None,
             MAX_TOOL_CALL_DEPTH + 1,
         ));
 
@@ -5007,12 +5249,12 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Missing required parameters
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "add",
             serde_json::json!({}), // Missing a and b
-            None,
             0,
         ));
 
@@ -5633,7 +5875,11 @@ mod handler_direct_tests {
             uri: "test://orig".to_string(),
             content: "data".to_string(),
         });
-        let mounted = MountedResourceHandler::new(inner, "ns/test://orig".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "test://orig".to_string(),
+            "ns/test://orig".to_string(),
+        );
         let def = mounted.definition();
         assert_eq!(def.uri, "ns/test://orig");
         // Other fields preserved
@@ -5646,11 +5892,17 @@ mod handler_direct_tests {
             uri: "test://data".to_string(),
             content: "mounted_data".to_string(),
         });
-        let mounted = MountedResourceHandler::new(inner, "ns/test://data".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "test://data".to_string(),
+            "ns/test://data".to_string(),
+        );
         let ctx = test_ctx();
         let result = mounted.read(&ctx);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap()[0].text, Some("mounted_data".to_string()));
+        let contents = result.unwrap();
+        assert_eq!(contents[0].text, Some("mounted_data".to_string()));
+        assert_eq!(contents[0].uri, "ns/test://data");
     }
 
     #[test]
@@ -5665,8 +5917,12 @@ mod handler_direct_tests {
             version: None,
             tags: vec![],
         };
-        let mounted =
-            MountedResourceHandler::with_template(inner, "ns/resource://{id}".to_string(), tmpl);
+        let mounted = MountedResourceHandler::with_template(
+            inner,
+            "resource://{id}".to_string(),
+            "ns/resource://{id}".to_string(),
+            tmpl,
+        );
         let template = mounted.template();
         assert!(template.is_some());
         assert_eq!(template.unwrap().uri_template, "ns/resource://{id}");
@@ -6150,7 +6406,7 @@ mod builder_tests {
     }
 
     #[test]
-    fn builder_zero_timeout_disables_enforcement() {
+    fn builder_zero_timeout_omits_only_server_ceiling() {
         let server = ServerBuilder::new("s", "0.1").request_timeout(0).build();
         assert_eq!(server.info().name, "s");
     }
@@ -6255,7 +6511,7 @@ mod builder_tests {
     #[test]
     fn builder_full_logging_config() {
         let config = LoggingConfig {
-            level: Level::Trace,
+            level: log::LevelFilter::Trace,
             timestamps: false,
             targets: false,
             file_line: true,
@@ -6311,14 +6567,6 @@ mod builder_tests {
     #[test]
     fn builder_force_color() {
         let server = ServerBuilder::new("s", "0.1").force_color().build();
-        assert_eq!(server.info().name, "s");
-    }
-
-    #[test]
-    fn builder_periodic_stats() {
-        let server = ServerBuilder::new("s", "0.1")
-            .with_periodic_stats(10)
-            .build();
         assert_eq!(server.info().name, "s");
     }
 
@@ -6413,10 +6661,10 @@ mod builder_tests {
     fn builder_auth_provider_static_token() {
         let ctx = fastmcp_core::AuthContext::with_subject("test-user");
         let server = ServerBuilder::new("s", "0.1")
-            .auth_provider(TokenAuthProvider::new(StaticTokenVerifier::new(vec![(
-                "secret-token".to_string(),
-                ctx,
-            )])))
+            .auth_provider(TokenAuthProvider::new(
+                StaticTokenVerifier::new(vec![("secret-token".to_string(), ctx)])
+                    .expect("valid verifier configuration"),
+            ))
             .build();
         assert_eq!(server.info().name, "s");
     }
@@ -6624,13 +6872,13 @@ mod builder_tests {
     }
 
     #[test]
-    fn builder_with_task_manager_enables_tasks_capability() {
+    fn builder_with_task_manager_keeps_tasks_capability_quarantined() {
         let tm = TaskManager::new();
         let server = ServerBuilder::new("s", "0.1")
             .with_task_manager(tm.into_shared())
             .build();
         assert!(server.task_manager().is_some());
-        assert!(server.capabilities().tasks.is_some());
+        assert!(server.capabilities().tasks.is_none());
     }
 
     // ── List Pagination ─────────────────────────────────────────────
@@ -6646,15 +6894,20 @@ mod builder_tests {
             .into_router();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let first = router
-            .handle_tools_list(&cx, fastmcp_protocol::ListToolsParams::default(), None)
+            .handle_tools_list(
+                &request_ctx,
+                fastmcp_protocol::ListToolsParams::default(),
+                None,
+            )
             .expect("tools/list first page");
         assert_eq!(first.tools.len(), 2);
         let cursor = first.next_cursor.expect("nextCursor present");
 
         let second = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some(cursor),
                     ..Default::default()
@@ -6675,9 +6928,10 @@ mod builder_tests {
             .into_router();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let err = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some("not-base64".to_string()),
                     ..Default::default()
@@ -6701,9 +6955,10 @@ mod builder_tests {
             .encode(serde_json::to_vec(&payload).expect("extreme cursor payload should serialize"));
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let page = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some(cursor),
                     ..Default::default()
@@ -6820,6 +7075,231 @@ mod helper_function_tests {
         }
     }
 
+    #[test]
+    fn receive_pump_cancels_a_running_handler_in_band() {
+        let barrier = Arc::new(Barrier::new(2));
+        let _configuration = configure_blocking_tool(Arc::clone(&barrier));
+        let server = Server::new("receive-pump-cancellation", "1.0.0")
+            .tool(BlockUntilCancelled)
+            .build();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcMessage>::new()));
+        let sent_for_transport = Arc::clone(&sent);
+        let barrier_for_receive = Arc::clone(&barrier);
+        let mut step = 0_u8;
+
+        server.run_loop_returning(
+            &Cx::for_testing(),
+            move |_| {
+                let current = step;
+                step = step.saturating_add(1);
+                match current {
+                    0 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "initialize",
+                            Some(
+                                serde_json::to_value(InitializeParams {
+                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                        .to_string(),
+                                    capabilities: ClientCapabilities::default(),
+                                    client_info: ClientInfo {
+                                        name: "pump-client".to_string(),
+                                        version: "1.0.0".to_string(),
+                                    },
+                                })
+                                .expect("serialize initialize"),
+                            ),
+                            1_i64,
+                        ),
+                    )),
+                    1 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "tools/call",
+                            Some(
+                                serde_json::to_value(CallToolParams {
+                                    name: "block_until_cancelled".to_string(),
+                                    arguments: Some(serde_json::json!({})),
+                                    meta: None,
+                                })
+                                .expect("serialize call"),
+                            ),
+                            2_i64,
+                        ),
+                    )),
+                    2 => {
+                        barrier_for_receive.wait();
+                        Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(
+                                    serde_json::to_value(CancelledParams {
+                                        request_id: RequestId::Number(2),
+                                        reason: Some("test cancellation".to_string()),
+                                        await_cleanup: Some(false),
+                                    })
+                                    .expect("serialize cancellation"),
+                                ),
+                            ),
+                        ))
+                    }
+                    _ => {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while Instant::now() < deadline {
+                            match outbound_rx.recv_timeout(Duration::from_millis(20)) {
+                                Ok(JsonRpcMessage::Response(response))
+                                    if response.id == Some(RequestId::Number(2)) =>
+                                {
+                                    return Err(fastmcp_transport::TransportError::Closed);
+                                }
+                                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        Err(fastmcp_transport::TransportError::Timeout)
+                    }
+                }
+            },
+            move |_, message| {
+                sent_for_transport
+                    .lock()
+                    .expect("sent messages lock")
+                    .push(message.clone());
+                outbound_tx
+                    .send(message.clone())
+                    .map_err(|_| fastmcp_transport::TransportError::Closed)
+            },
+            Arc::new(|_| {}),
+            "test",
+        );
+
+        let sent = sent.lock().expect("sent messages lock");
+        let cancellation_response = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)) => {
+                Some(response)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            cancellation_response
+                .and_then(|response| response.error.as_ref())
+                .map(|error| error.code),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
+    }
+
+    #[test]
+    fn receive_pump_routes_sampling_response_while_handler_waits() {
+        let server = Server::new("receive-pump-sampling", "1.0.0")
+            .tool(SamplingRoundTrip)
+            .build();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcMessage>::new()));
+        let sent_for_transport = Arc::clone(&sent);
+        let mut step = 0_u8;
+
+        server.run_loop_returning(
+            &Cx::for_testing(),
+            move |_| {
+                let current = step;
+                step = step.saturating_add(1);
+                match current {
+                    0 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "initialize",
+                            Some(
+                                serde_json::to_value(InitializeParams {
+                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                        .to_string(),
+                                    capabilities: ClientCapabilities {
+                                        sampling: Some(SamplingCapability::default()),
+                                        ..ClientCapabilities::default()
+                                    },
+                                    client_info: ClientInfo {
+                                        name: "sampling-client".to_string(),
+                                        version: "1.0.0".to_string(),
+                                    },
+                                })
+                                .expect("serialize initialize"),
+                            ),
+                            1_i64,
+                        ),
+                    )),
+                    1 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "tools/call",
+                            Some(
+                                serde_json::to_value(CallToolParams {
+                                    name: "sampling_round_trip".to_string(),
+                                    arguments: Some(serde_json::json!({})),
+                                    meta: None,
+                                })
+                                .expect("serialize call"),
+                            ),
+                            2_i64,
+                        ),
+                    )),
+                    2 => loop {
+                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(JsonRpcMessage::Request(request))
+                                if request.method == "sampling/createMessage" =>
+                            {
+                                let id = request.id.expect("sampling request id");
+                                return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    id,
+                                    serde_json::to_value(CreateMessageResult::text(
+                                        "sampled-value",
+                                        "test-model",
+                                    ))
+                                    .expect("serialize sampling result"),
+                                )));
+                            }
+                            Ok(_) => {}
+                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
+                        }
+                    },
+                    _ => loop {
+                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(JsonRpcMessage::Response(response))
+                                if response.id == Some(RequestId::Number(2)) =>
+                            {
+                                return Err(fastmcp_transport::TransportError::Closed);
+                            }
+                            Ok(_) => {}
+                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
+                        }
+                    },
+                }
+            },
+            move |_, message| {
+                sent_for_transport
+                    .lock()
+                    .expect("sent messages lock")
+                    .push(message.clone());
+                outbound_tx
+                    .send(message.clone())
+                    .map_err(|_| fastmcp_transport::TransportError::Closed)
+            },
+            Arc::new(|_| {}),
+            "test",
+        );
+
+        let sent = sent.lock().expect("sent messages lock");
+        let tool_response = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)) => {
+                Some(response)
+            }
+            _ => None,
+        });
+        let tool_response = tool_response.expect("tool response must be sent");
+        assert!(tool_response.error.is_none());
+        assert!(
+            tool_response
+                .result
+                .as_ref()
+                .is_some_and(|result| result.to_string().contains("sampled-value"))
+        );
+    }
+
     // ── RequestCompletion ───────────────────────────────────────────
 
     #[test]
@@ -6878,7 +7358,7 @@ mod helper_function_tests {
     #[test]
     fn logging_config_default() {
         let cfg = LoggingConfig::default();
-        assert_eq!(cfg.level, log::Level::Info);
+        assert_eq!(cfg.level, log::LevelFilter::Info);
         assert!(cfg.timestamps);
         assert!(cfg.targets);
         assert!(!cfg.file_line);

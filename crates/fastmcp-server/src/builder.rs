@@ -5,13 +5,15 @@ use std::sync::{Arc, Mutex};
 
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 use fastmcp_console::stats::ServerStats;
+use fastmcp_core::McpResult;
 use fastmcp_protocol::{
     LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
-    ServerCapabilities, ServerInfo, TasksCapability, ToolsCapability,
+    ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
 use crate::proxy::{ProxyPromptHandler, ProxyResourceHandler, ProxyToolHandler};
+#[cfg(test)]
 use crate::tasks::SharedTaskManager;
 use crate::{
     AuthProvider, DuplicateBehavior, HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler,
@@ -43,13 +45,17 @@ pub struct ServerBuilder {
     auth_provider: Option<Arc<dyn AuthProvider>>,
     /// Registered middleware.
     middleware: Vec<Box<dyn crate::Middleware>>,
-    /// Optional task manager for background tasks (Docket/SEP-1686).
+    /// Test-only legacy task manager. Production builds have no task-manager
+    /// field or builder edge.
+    #[cfg(test)]
     task_manager: Option<SharedTaskManager>,
     /// Behavior when registering duplicate component names.
     on_duplicate: DuplicateBehavior,
     /// Whether to use strict input validation (reject extra properties).
     strict_input_validation: bool,
-    /// HTTP server configuration (paths, max_connections, CORS).
+    /// Per-connection ceiling for concurrent server-to-client requests.
+    max_bidirectional_requests_per_connection: usize,
+    /// Reserved HTTP configuration for the future qualified listener.
     http_config: HttpServerConfig,
 }
 
@@ -63,6 +69,8 @@ impl ServerBuilder {
     /// [`with_console_config`](Self::with_console_config) for programmatic control.
     #[must_use]
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        let console_config = ConsoleConfig::from_env();
+        let logging = LoggingConfig::from(&console_config);
         Self {
             info: ServerInfo {
                 name: name.into(),
@@ -77,24 +85,29 @@ impl ServerBuilder {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             stats_enabled: true,
             mask_error_details: false, // Disabled by default for development
-            logging: LoggingConfig::from_env(),
-            console_config: ConsoleConfig::from_env(),
+            logging,
+            console_config,
             lifespan: LifespanHooks::default(),
             auth_provider: None,
             middleware: Vec::new(),
+            #[cfg(test)]
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
             strict_input_validation: false,
+            max_bidirectional_requests_per_connection:
+                crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             http_config: HttpServerConfig::default(),
         }
     }
 
     /// Sets the behavior when registering duplicate component names.
     ///
-    /// Controls what happens when a tool, resource, or prompt is registered
-    /// with a name that already exists:
+    /// Controls what happens when a tool, resource, resource template, prompt,
+    /// or mounted component is registered with an identifier that already
+    /// exists:
     ///
-    /// - [`DuplicateBehavior::Error`]: Fail with an error
+    /// - [`DuplicateBehavior::Error`]: Reject the conflicting registration,
+    ///   log the error, and continue constructing the builder
     /// - [`DuplicateBehavior::Warn`]: Log warning, keep original (default)
     /// - [`DuplicateBehavior::Replace`]: Replace with new component
     /// - [`DuplicateBehavior::Ignore`]: Silently keep original
@@ -105,7 +118,7 @@ impl ServerBuilder {
     /// Server::new("demo", "1.0")
     ///     .on_duplicate(DuplicateBehavior::Error)  // Strict mode
     ///     .tool(handler1)
-    ///     .tool(handler2)  // Fails if name conflicts
+    ///     .tool(handler2)  // Rejected and logged if the name conflicts
     ///     .build();
     /// ```
     #[must_use]
@@ -135,12 +148,28 @@ impl ServerBuilder {
 
     /// Sets the request timeout in seconds.
     ///
-    /// Set to 0 to disable timeout enforcement.
-    /// Default is 30 seconds.
+    /// Set to 0 to omit the server-owned ceiling. Ambient/request and handler
+    /// deadlines are still composed into admission checks, cooperative
+    /// checkpoints, and late-result rejection; this setting cannot relax them.
+    /// A deadline does not preempt blocking synchronous code or imply that
+    /// descendant work has been cancelled and drained. Default is 30 seconds.
     #[must_use]
     pub fn request_timeout(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;
         self
+    }
+
+    /// Sets the maximum number of in-flight server-to-client requests for one
+    /// transport connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` when `max` is zero or exceeds the hard safety
+    /// limit enforced by the bidirectional request tracker.
+    pub fn max_bidirectional_requests_per_connection(mut self, max: usize) -> McpResult<Self> {
+        crate::bidirectional::PendingRequests::validate_max_in_flight(max)?;
+        self.max_bidirectional_requests_per_connection = max;
+        Ok(self)
     }
 
     /// Sets the pagination page size for list methods.
@@ -260,10 +289,11 @@ impl ServerBuilder {
         self.strict_input_validation
     }
 
-    /// Sets the HTTP server configuration (paths, max connections, CORS).
+    /// Sets configuration reserved for the future qualified HTTP path.
     ///
-    /// This configuration is used by [`Server::run_http`](crate::Server::run_http)
-    /// and related HTTP methods.
+    /// Public [`Server::run_http`](crate::Server::run_http) entry points
+    /// currently fail closed before binding and do not consume this
+    /// configuration.
     ///
     /// # Example
     ///
@@ -298,7 +328,11 @@ impl ServerBuilder {
             .router
             .add_tool_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp_rust::builder", "Failed to register tool: {}", e);
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register tool; code={:?}",
+                e.code
+            );
         } else {
             self.capabilities.tools = Some(ToolsCapability::default());
         }
@@ -316,7 +350,11 @@ impl ServerBuilder {
             .router
             .add_resource_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp_rust::builder", "Failed to register resource: {}", e);
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register resource; code={:?}",
+                e.code
+            );
         } else {
             self.capabilities.resources = Some(ResourcesCapability::default());
         }
@@ -324,10 +362,24 @@ impl ServerBuilder {
     }
 
     /// Registers a resource template.
+    ///
+    /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
+    /// With [`DuplicateBehavior::Error`], a conflicting template is rejected
+    /// and logged while builder construction continues.
     #[must_use]
     pub fn resource_template(mut self, template: ResourceTemplate) -> Self {
-        self.router.add_resource_template(template);
-        self.capabilities.resources = Some(ResourcesCapability::default());
+        if let Err(error) = self
+            .router
+            .add_resource_template_with_behavior(template, self.on_duplicate)
+        {
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register resource template; code={:?}",
+                error.code
+            );
+        } else {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
         self
     }
 
@@ -342,7 +394,11 @@ impl ServerBuilder {
             .router
             .add_prompt_with_behavior(handler, self.on_duplicate)
         {
-            log::error!(target: "fastmcp_rust::builder", "Failed to register prompt: {}", e);
+            log::error!(
+                target: "fastmcp_rust::builder",
+                "Failed to register prompt; code={:?}",
+                e.code
+            );
         } else {
             self.capabilities.prompts = Some(PromptsCapability::default());
         }
@@ -360,26 +416,55 @@ impl ServerBuilder {
         let has_prompts = !catalog.prompts.is_empty();
 
         for tool in catalog.tools {
-            self.router
-                .add_tool(ProxyToolHandler::new(tool, client.clone()));
+            if let Err(error) = self.router.add_tool_with_behavior(
+                ProxyToolHandler::new(tool, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register proxied tool; code={:?}",
+                    error.code
+                );
+            }
         }
 
         for resource in catalog.resources {
-            self.router
-                .add_resource(ProxyResourceHandler::new(resource, client.clone()));
+            if let Err(error) = self.router.add_resource_with_behavior(
+                ProxyResourceHandler::new(resource, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register proxied resource; code={:?}",
+                    error.code
+                );
+            }
         }
 
         for template in catalog.resource_templates {
-            self.router
-                .add_resource(ProxyResourceHandler::from_template(
-                    template,
-                    client.clone(),
-                ));
+            if let Err(error) = self.router.add_resource_with_behavior(
+                ProxyResourceHandler::from_template(template, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register proxied resource template; code={:?}",
+                    error.code
+                );
+            }
         }
 
         for prompt in catalog.prompts {
-            self.router
-                .add_prompt(ProxyPromptHandler::new(prompt, client.clone()));
+            if let Err(error) = self.router.add_prompt_with_behavior(
+                ProxyPromptHandler::new(prompt, client.clone()),
+                self.on_duplicate,
+            ) {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to register proxied prompt; code={:?}",
+                    error.code
+                );
+            }
         }
 
         if has_tools {
@@ -422,7 +507,8 @@ impl ServerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog fetch fails.
+    /// Returns an error if the catalog fetch fails or the configured duplicate
+    /// policy rejects a proxied component.
     pub fn as_proxy(
         mut self,
         prefix: &str,
@@ -446,53 +532,52 @@ impl ServerBuilder {
         for tool in catalog.tools {
             log::debug!(
                 target: "fastmcp_rust::proxy",
-                "Registering proxied tool: {}/{}", prefix, tool.name
+                "Registering proxied tool with configured prefix"
             );
-            self.router.add_tool(ProxyToolHandler::with_prefix(
-                tool,
-                prefix,
-                proxy_client.clone(),
-            ));
+            self.router.add_tool_with_behavior(
+                ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
         }
 
         // Register resources with prefix
         for resource in catalog.resources {
             log::debug!(
                 target: "fastmcp_rust::proxy",
-                "Registering proxied resource: {}/{}", prefix, resource.uri
+                "Registering proxied resource with configured prefix"
             );
-            self.router.add_resource(ProxyResourceHandler::with_prefix(
-                resource,
-                prefix,
-                proxy_client.clone(),
-            ));
+            self.router.add_resource_with_behavior(
+                ProxyResourceHandler::with_prefix(resource, prefix, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
         }
 
         // Register resource templates with prefix
         for template in catalog.resource_templates {
             log::debug!(
                 target: "fastmcp_rust::proxy",
-                "Registering proxied template: {}/{}", prefix, template.uri_template
+                "Registering proxied resource template with configured prefix"
             );
-            self.router
-                .add_resource(ProxyResourceHandler::from_template_with_prefix(
+            self.router.add_resource_with_behavior(
+                ProxyResourceHandler::from_template_with_prefix(
                     template,
                     prefix,
                     proxy_client.clone(),
-                ));
+                ),
+                self.on_duplicate,
+            )?;
         }
 
         // Register prompts with prefix
         for prompt in catalog.prompts {
             log::debug!(
                 target: "fastmcp_rust::proxy",
-                "Registering proxied prompt: {}/{}", prefix, prompt.name
+                "Registering proxied prompt with configured prefix"
             );
-            self.router.add_prompt(ProxyPromptHandler::with_prefix(
-                prompt,
-                prefix,
-                proxy_client.clone(),
-            ));
+            self.router.add_prompt_with_behavior(
+                ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
         }
 
         // Update capabilities
@@ -508,12 +593,11 @@ impl ServerBuilder {
 
         log::info!(
             target: "fastmcp_rust::proxy",
-            "Proxied {} tools, {} resources, {} templates, {} prompts with prefix '{}'",
+            "Proxied {} tools, {} resources, {} templates, and {} prompts with a configured prefix",
             tool_count,
             resource_count,
             template_count,
-            prompt_count,
-            prefix
+            prompt_count
         );
 
         Ok(self)
@@ -532,13 +616,74 @@ impl ServerBuilder {
     ///     .as_proxy_raw(client)?  // External tools appear with original names
     ///     .build();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if catalog discovery fails or the configured duplicate
+    /// policy rejects any unprefixed proxy component.
     pub fn as_proxy_raw(
         self,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
-        let proxy_client = ProxyClient::from_client(client);
+        self.as_proxy_raw_with_proxy_client(ProxyClient::from_client(client))
+    }
+
+    fn as_proxy_raw_with_proxy_client(
+        self,
+        proxy_client: ProxyClient,
+    ) -> Result<Self, fastmcp_core::McpError> {
         let catalog = proxy_client.catalog()?;
-        Ok(self.proxy(proxy_client, catalog))
+        self.register_raw_proxy_catalog(proxy_client, catalog)
+    }
+
+    fn register_raw_proxy_catalog(
+        mut self,
+        proxy_client: ProxyClient,
+        catalog: ProxyCatalog,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        let has_tools = !catalog.tools.is_empty();
+        let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
+        let has_prompts = !catalog.prompts.is_empty();
+
+        for tool in catalog.tools {
+            self.router.add_tool_with_behavior(
+                ProxyToolHandler::new(tool, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
+        }
+
+        for resource in catalog.resources {
+            self.router.add_resource_with_behavior(
+                ProxyResourceHandler::new(resource, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
+        }
+
+        for template in catalog.resource_templates {
+            self.router.add_resource_with_behavior(
+                ProxyResourceHandler::from_template(template, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
+        }
+
+        for prompt in catalog.prompts {
+            self.router.add_prompt_with_behavior(
+                ProxyPromptHandler::new(prompt, proxy_client.clone()),
+                self.on_duplicate,
+            )?;
+        }
+
+        if has_tools {
+            self.capabilities.tools = Some(ToolsCapability::default());
+        }
+        if has_resources {
+            self.capabilities.resources = Some(ResourcesCapability::default());
+        }
+        if has_prompts {
+            self.capabilities.prompts = Some(PromptsCapability::default());
+        }
+
+        Ok(self)
     }
 
     // ─────────────────────────────────────────────────
@@ -574,6 +719,10 @@ impl ServerBuilder {
     /// - Prefixes cannot contain slashes
     /// - With prefix `"db"`, tool `"query"` becomes `"db/query"`
     /// - Without prefix, names are preserved (may cause conflicts)
+    ///
+    /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate). With
+    /// [`DuplicateBehavior::Error`], any conflict rejects the complete mount;
+    /// the failure is logged and fluent builder construction continues.
     #[must_use]
     pub fn mount(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         let has_tools = server.has_tools();
@@ -581,11 +730,16 @@ impl ServerBuilder {
         let has_prompts = server.has_prompts();
 
         let source_router = server.into_router();
-        let result = self.router.mount(source_router, prefix);
+        let result = self
+            .router
+            .mount_with_behavior(source_router, prefix, self.on_duplicate);
 
         // Log warnings if any
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
+        }
+        for error in &result.errors {
+            log::error!(target: "fastmcp_rust::mount", "{}", error);
         }
 
         // Update capabilities based on what was mounted
@@ -620,14 +774,21 @@ impl ServerBuilder {
     ///     .mount_tools(utils_server, Some("utils"))  // Only tools
     ///     .build();
     /// ```
+    ///
+    /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_tools(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         let source_router = server.into_router();
-        let result = self.router.mount_tools(source_router, prefix);
+        let result =
+            self.router
+                .mount_tools_with_behavior(source_router, prefix, self.on_duplicate);
 
         // Log warnings if any
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
+        }
+        for error in &result.errors {
+            log::error!(target: "fastmcp_rust::mount", "{}", error);
         }
 
         // Update capabilities if tools were mounted
@@ -656,14 +817,22 @@ impl ServerBuilder {
     ///     .mount_resources(data_server, Some("data"))  // Only resources
     ///     .build();
     /// ```
+    ///
+    /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate) for
+    /// both static resources and resource templates.
     #[must_use]
     pub fn mount_resources(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         let source_router = server.into_router();
-        let result = self.router.mount_resources(source_router, prefix);
+        let result =
+            self.router
+                .mount_resources_with_behavior(source_router, prefix, self.on_duplicate);
 
         // Log warnings if any
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
+        }
+        for error in &result.errors {
+            log::error!(target: "fastmcp_rust::mount", "{}", error);
         }
 
         // Update capabilities if resources were mounted
@@ -692,14 +861,21 @@ impl ServerBuilder {
     ///     .mount_prompts(templates_server, Some("tmpl"))  // Only prompts
     ///     .build();
     /// ```
+    ///
+    /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_prompts(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
         let source_router = server.into_router();
-        let result = self.router.mount_prompts(source_router, prefix);
+        let result =
+            self.router
+                .mount_prompts_with_behavior(source_router, prefix, self.on_duplicate);
 
         // Log warnings if any
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
+        }
+        for error in &result.errors {
+            log::error!(target: "fastmcp_rust::mount", "{}", error);
         }
 
         // Update capabilities if prompts were mounted
@@ -722,14 +898,17 @@ impl ServerBuilder {
     /// Default is read from `FASTMCP_LOG` environment variable, or `INFO` if not set.
     #[must_use]
     pub fn log_level(mut self, level: Level) -> Self {
-        self.logging.level = level;
+        let filter = level.to_level_filter();
+        self.logging.level = filter;
+        self.console_config.log_level = filter;
         self
     }
 
-    /// Sets the log level from a filter.
+    /// Sets the log level from a filter, including [`LevelFilter::Off`].
     #[must_use]
     pub fn log_level_filter(mut self, filter: LevelFilter) -> Self {
-        self.logging.level = filter.to_level().unwrap_or(Level::Info);
+        self.logging.level = filter;
+        self.console_config.log_level = filter;
         self
     }
 
@@ -739,6 +918,7 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_timestamps(mut self, show: bool) -> Self {
         self.logging.timestamps = show;
+        self.console_config.log_timestamps = show;
         self
     }
 
@@ -748,12 +928,25 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_targets(mut self, show: bool) -> Self {
         self.logging.targets = show;
+        self.console_config.log_targets = show;
+        self
+    }
+
+    /// Sets whether to show source file and line in logs.
+    #[must_use]
+    pub fn log_file_line(mut self, show: bool) -> Self {
+        self.logging.file_line = show;
+        self.console_config.log_file_line = show;
         self
     }
 
     /// Sets the full logging configuration.
     #[must_use]
     pub fn logging(mut self, config: LoggingConfig) -> Self {
+        self.console_config.log_level = config.level;
+        self.console_config.log_timestamps = config.timestamps;
+        self.console_config.log_targets = config.targets;
+        self.console_config.log_file_line = config.file_line;
         self.logging = config;
         self
     }
@@ -764,8 +957,8 @@ impl ServerBuilder {
 
     /// Sets the complete console configuration.
     ///
-    /// This provides full control over all console output settings including
-    /// banner, traffic logging, periodic stats, and error formatting.
+    /// This controls server-owned console output, including the banner,
+    /// traffic logging, logger formatting, and rich/plain display mode.
     ///
     /// # Example
     ///
@@ -782,6 +975,7 @@ impl ServerBuilder {
     /// ```
     #[must_use]
     pub fn with_console_config(mut self, config: ConsoleConfig) -> Self {
+        self.logging = LoggingConfig::from(&config);
         self.console_config = config;
         self
     }
@@ -808,21 +1002,10 @@ impl ServerBuilder {
     /// Controls the verbosity of traffic logging:
     /// - `None`: No traffic logging (default)
     /// - `Summary`: Method name and timing only
-    /// - `Headers`: Include metadata/headers
     /// - `Full`: Full request/response bodies
     #[must_use]
     pub fn with_traffic_logging(mut self, verbosity: TrafficVerbosity) -> Self {
         self.console_config = self.console_config.with_traffic(verbosity);
-        self
-    }
-
-    /// Enables periodic statistics display.
-    ///
-    /// When enabled, statistics will be printed to stderr at the specified
-    /// interval. Requires stats collection to be enabled (the default).
-    #[must_use]
-    pub fn with_periodic_stats(mut self, interval_secs: u64) -> Self {
-        self.console_config = self.console_config.with_periodic_stats(interval_secs);
         self
     }
 
@@ -913,29 +1096,15 @@ impl ServerBuilder {
         self
     }
 
-    /// Sets a task manager for background tasks (Docket/SEP-1686).
-    ///
-    /// When a task manager is configured, the server will advertise
-    /// task capabilities and handle task-related methods.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use fastmcp_server::TaskManager;
-    ///
-    /// let task_manager = TaskManager::new();
-    /// Server::new("demo", "1.0.0")
-    ///     .with_task_manager(task_manager.into_shared())
-    ///     .run_stdio();
-    /// ```
+    /// Retains the legacy task manager for unit-test archaeology only.
+    /// Production builds expose no task-manager builder edge.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_task_manager(mut self, task_manager: SharedTaskManager) -> Self {
+    pub(crate) fn with_task_manager(mut self, task_manager: SharedTaskManager) -> Self {
         self.task_manager = Some(task_manager);
-        let mut capability = TasksCapability::default();
-        if let Some(manager) = &self.task_manager {
-            capability.list_changed = manager.has_list_changed_notifications();
-        }
-        self.capabilities.tasks = Some(capability);
+        // Fail closed even if future builder composition adds another path
+        // that mutates the capability object before this call.
+        self.capabilities.tasks = None;
         self
     }
 
@@ -951,11 +1120,14 @@ impl ServerBuilder {
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
+        let console = fastmcp_console::console::FastMcpConsole::with_enabled(
+            self.console_config.should_use_rich(),
+        );
 
         Server {
             info: self.info,
             capabilities: self.capabilities,
-            router: self.router,
+            router: Arc::new(self.router),
             instructions: self.instructions,
             request_timeout_secs: self.request_timeout_secs,
             stats: if self.stats_enabled {
@@ -966,12 +1138,15 @@ impl ServerBuilder {
             mask_error_details: self.mask_error_details,
             logging: self.logging,
             console_config: self.console_config,
+            console,
             lifespan: Mutex::new(Some(self.lifespan)),
             auth_provider: self.auth_provider,
             middleware: Arc::new(self.middleware),
             active_requests: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             task_manager: self.task_manager,
-            pending_requests: std::sync::Arc::new(crate::bidirectional::PendingRequests::new()),
+            max_bidirectional_requests_per_connection: self
+                .max_bidirectional_requests_per_connection,
             http_config: self.http_config,
         }
     }
@@ -1048,6 +1223,182 @@ mod tests {
         }
     }
 
+    struct MarkedTool(&'static str);
+
+    impl crate::ToolHandler for MarkedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "duplicate_tool".to_string(),
+                description: Some(self.0.to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![self.0.to_string()],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(self.0)])
+        }
+    }
+
+    struct MarkedResource(&'static str);
+
+    impl crate::ResourceHandler for MarkedResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "duplicate://resource".to_string(),
+                name: self.0.to_string(),
+                description: Some(self.0.to_string()),
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![self.0.to_string()],
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+    }
+
+    struct MarkedPrompt(&'static str);
+
+    impl crate::PromptHandler for MarkedPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "duplicate_prompt".to_string(),
+                description: Some(self.0.to_string()),
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![self.0.to_string()],
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    fn marked_resource_template(marker: &str) -> ResourceTemplate {
+        ResourceTemplate {
+            uri_template: "duplicate://{item}".to_string(),
+            name: marker.to_string(),
+            description: Some(marker.to_string()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![marker.to_string()],
+        }
+    }
+
+    fn marked_builder(marker: &'static str) -> ServerBuilder {
+        ServerBuilder::new("marked", "1.0")
+            .tool(MarkedTool(marker))
+            .resource(MarkedResource(marker))
+            .resource_template(marked_resource_template(marker))
+            .prompt(MarkedPrompt(marker))
+    }
+
+    fn assert_marked_server(server: &crate::Server, marker: &str) {
+        assert_eq!(server.tools().len(), 1);
+        assert_eq!(server.resources().len(), 1);
+        assert_eq!(server.resource_templates().len(), 1);
+        assert_eq!(server.prompts().len(), 1);
+        assert_eq!(server.tools()[0].tags, vec![marker.to_string()]);
+        assert_eq!(server.resources()[0].tags, vec![marker.to_string()]);
+        assert_eq!(
+            server.resource_templates()[0].tags,
+            vec![marker.to_string()]
+        );
+        assert_eq!(server.prompts()[0].tags, vec![marker.to_string()]);
+    }
+
+    struct DuplicatePolicyProxyBackend;
+
+    impl crate::proxy::ProxyBackend for DuplicatePolicyProxyBackend {
+        fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+            Ok(duplicate_policy_proxy_catalog().tools)
+        }
+
+        fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+            Ok(duplicate_policy_proxy_catalog().resources)
+        }
+
+        fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+            Ok(duplicate_policy_proxy_catalog().resource_templates)
+        }
+
+        fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+            Ok(duplicate_policy_proxy_catalog().prompts)
+        }
+
+        fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+            _: crate::proxy::ProgressCallback<'_>,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![])
+        }
+
+        fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![])
+        }
+
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(vec![])
+        }
+    }
+
+    fn duplicate_policy_proxy_catalog() -> ProxyCatalog {
+        ProxyCatalog {
+            tools: vec![Tool {
+                name: "test_tool".to_string(),
+                description: Some("proxied tool".to_string()),
+                input_schema: serde_json::json!({}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }],
+            resources: vec![Resource {
+                uri: "file:///test".to_string(),
+                name: "proxied resource".to_string(),
+                description: Some("proxied resource".to_string()),
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }],
+            prompts: vec![Prompt {
+                name: "test_prompt".to_string(),
+                description: Some("proxied prompt".to_string()),
+                arguments: vec![],
+                icon: None,
+                version: None,
+                tags: vec![],
+            }],
+            ..ProxyCatalog::default()
+        }
+    }
+
     // ── Builder defaults ─────────────────────────────────────────────
 
     #[test]
@@ -1087,6 +1438,36 @@ mod tests {
     }
 
     #[test]
+    fn builder_bidirectional_limit_has_exact_validated_boundaries() {
+        let default = ServerBuilder::new("srv", "1.0");
+        assert_eq!(
+            default.max_bidirectional_requests_per_connection,
+            crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS
+        );
+
+        for valid in [1, crate::bidirectional::HARD_MAX_IN_FLIGHT_REQUESTS] {
+            let server = ServerBuilder::new("srv", "1.0")
+                .max_bidirectional_requests_per_connection(valid)
+                .expect("boundary must be valid")
+                .build();
+            assert_eq!(server.max_bidirectional_requests_per_connection, valid);
+            assert_eq!(
+                server.new_pending_requests_for_connection().max_in_flight(),
+                valid
+            );
+        }
+
+        for invalid in [0, crate::bidirectional::HARD_MAX_IN_FLIGHT_REQUESTS + 1] {
+            let Err(error) =
+                ServerBuilder::new("srv", "1.0").max_bidirectional_requests_per_connection(invalid)
+            else {
+                panic!("out-of-range limit must fail closed");
+            };
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        }
+    }
+
+    #[test]
     fn builder_default_error_masking_disabled() {
         let builder = ServerBuilder::new("srv", "1.0");
         assert!(!builder.is_error_masking_enabled());
@@ -1107,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_request_timeout_zero_disables() {
+    fn builder_request_timeout_zero_omits_server_ceiling() {
         let builder = ServerBuilder::new("srv", "1.0").request_timeout(0);
         assert_eq!(builder.request_timeout_secs(), 0);
     }
@@ -1141,19 +1522,30 @@ mod tests {
 
     #[test]
     fn builder_log_level() {
-        let _builder = ServerBuilder::new("srv", "1.0").log_level(Level::Debug);
+        let builder = ServerBuilder::new("srv", "1.0").log_level(Level::Debug);
+        assert_eq!(builder.logging.level, LevelFilter::Debug);
+        assert_eq!(builder.console_config.log_level, LevelFilter::Debug);
     }
 
     #[test]
     fn builder_log_level_filter() {
-        let _builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Warn);
+        let builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Warn);
+        assert_eq!(builder.logging.level, LevelFilter::Warn);
+        assert_eq!(builder.console_config.log_level, LevelFilter::Warn);
     }
 
     #[test]
     fn builder_log_timestamps_and_targets() {
-        let _builder = ServerBuilder::new("srv", "1.0")
+        let builder = ServerBuilder::new("srv", "1.0")
             .log_timestamps(false)
-            .log_targets(false);
+            .log_targets(false)
+            .log_file_line(true);
+        assert!(!builder.logging.timestamps);
+        assert!(!builder.console_config.log_timestamps);
+        assert!(!builder.logging.targets);
+        assert!(!builder.console_config.log_targets);
+        assert!(builder.logging.file_line);
+        assert!(builder.console_config.log_file_line);
     }
 
     // ── Console configuration ────────────────────────────────────────
@@ -1249,6 +1641,31 @@ mod tests {
         assert!(server.has_tools());
     }
 
+    #[test]
+    fn builder_resource_template_honors_duplicate_policy() {
+        for behavior in [
+            DuplicateBehavior::Warn,
+            DuplicateBehavior::Ignore,
+            DuplicateBehavior::Error,
+        ] {
+            let server = ServerBuilder::new("srv", "1.0")
+                .on_duplicate(behavior)
+                .resource_template(marked_resource_template("original"))
+                .resource_template(marked_resource_template("incoming"))
+                .build();
+            assert_eq!(server.resource_templates().len(), 1);
+            assert_eq!(server.resource_templates()[0].name, "original");
+        }
+
+        let server = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .resource_template(marked_resource_template("original"))
+            .resource_template(marked_resource_template("incoming"))
+            .build();
+        assert_eq!(server.resource_templates().len(), 1);
+        assert_eq!(server.resource_templates()[0].name, "incoming");
+    }
+
     // ── Lifecycle hooks ──────────────────────────────────────────────
 
     #[test]
@@ -1300,9 +1717,31 @@ mod tests {
 
     #[test]
     fn builder_with_console_config() {
-        let config = ConsoleConfig::new().with_banner(BannerStyle::None);
+        let mut config = ConsoleConfig::new().with_banner(BannerStyle::None);
+        config.log_level = LevelFilter::Trace;
+        config.log_timestamps = false;
+        config.log_targets = false;
+        config.log_file_line = true;
         let builder = ServerBuilder::new("srv", "1.0").with_console_config(config);
         assert_eq!(builder.console_config().banner_style, BannerStyle::None);
+        assert_eq!(builder.logging.level, LevelFilter::Trace);
+        assert!(!builder.logging.timestamps);
+        assert!(!builder.logging.targets);
+        assert!(builder.logging.file_line);
+    }
+
+    #[test]
+    fn logging_and_console_setters_keep_one_effective_configuration() {
+        let console = ConsoleConfig::new().with_log_level_filter(LevelFilter::Off);
+        let builder = ServerBuilder::new("srv", "1.0")
+            .log_level(Level::Debug)
+            .with_console_config(console);
+        assert_eq!(builder.logging.level, LevelFilter::Off);
+        assert_eq!(builder.console_config.log_level, LevelFilter::Off);
+
+        let builder = builder.log_level_filter(LevelFilter::Warn);
+        assert_eq!(builder.logging.level, LevelFilter::Warn);
+        assert_eq!(builder.console_config.log_level, LevelFilter::Warn);
     }
 
     #[test]
@@ -1310,13 +1749,6 @@ mod tests {
         let builder = ServerBuilder::new("srv", "1.0").with_traffic_logging(TrafficVerbosity::Full);
         let config = builder.console_config();
         assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
-    }
-
-    #[test]
-    fn builder_with_periodic_stats() {
-        let builder = ServerBuilder::new("srv", "1.0").with_periodic_stats(30);
-        let config = builder.console_config();
-        assert_eq!(config.stats_interval_secs, 30);
     }
 
     #[test]
@@ -1331,7 +1763,7 @@ mod tests {
     #[test]
     fn builder_logging_full_config() {
         let config = LoggingConfig {
-            level: Level::Trace,
+            level: LevelFilter::Trace,
             timestamps: false,
             targets: false,
             file_line: true,
@@ -1550,6 +1982,114 @@ mod tests {
         assert!(!main.has_prompts());
     }
 
+    #[test]
+    fn builder_full_mount_honors_duplicate_policy_for_all_component_kinds() {
+        for behavior in [
+            DuplicateBehavior::Warn,
+            DuplicateBehavior::Ignore,
+            DuplicateBehavior::Replace,
+            DuplicateBehavior::Error,
+        ] {
+            let server = marked_builder("original")
+                .on_duplicate(behavior)
+                .mount(marked_builder("incoming").build(), None)
+                .build();
+            assert_marked_server(
+                &server,
+                if behavior == DuplicateBehavior::Replace {
+                    "incoming"
+                } else {
+                    "original"
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn builder_partial_mounts_honor_duplicate_policy() {
+        for behavior in [
+            DuplicateBehavior::Warn,
+            DuplicateBehavior::Ignore,
+            DuplicateBehavior::Replace,
+            DuplicateBehavior::Error,
+        ] {
+            let replacement_marker = if behavior == DuplicateBehavior::Replace {
+                "incoming"
+            } else {
+                "original"
+            };
+
+            let tools = marked_builder("original")
+                .on_duplicate(behavior)
+                .mount_tools(marked_builder("incoming").build(), None)
+                .build();
+            assert_eq!(tools.tools()[0].tags, vec![replacement_marker.to_string()]);
+            assert_eq!(tools.resources()[0].tags, vec!["original".to_string()]);
+            assert_eq!(
+                tools.resource_templates()[0].tags,
+                vec!["original".to_string()]
+            );
+            assert_eq!(tools.prompts()[0].tags, vec!["original".to_string()]);
+
+            let resources = marked_builder("original")
+                .on_duplicate(behavior)
+                .mount_resources(marked_builder("incoming").build(), None)
+                .build();
+            assert_eq!(resources.tools()[0].tags, vec!["original".to_string()]);
+            assert_eq!(
+                resources.resources()[0].tags,
+                vec![replacement_marker.to_string()]
+            );
+            assert_eq!(
+                resources.resource_templates()[0].tags,
+                vec![replacement_marker.to_string()]
+            );
+            assert_eq!(resources.prompts()[0].tags, vec!["original".to_string()]);
+
+            let prompts = marked_builder("original")
+                .on_duplicate(behavior)
+                .mount_prompts(marked_builder("incoming").build(), None)
+                .build();
+            assert_eq!(prompts.tools()[0].tags, vec!["original".to_string()]);
+            assert_eq!(prompts.resources()[0].tags, vec!["original".to_string()]);
+            assert_eq!(
+                prompts.resource_templates()[0].tags,
+                vec!["original".to_string()]
+            );
+            assert_eq!(
+                prompts.prompts()[0].tags,
+                vec![replacement_marker.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn builder_full_and_partial_mounts_reject_invalid_prefixes() {
+        let full = marked_builder("original")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .mount(marked_builder("incoming").build(), Some("peer/secret"))
+            .build();
+        assert_marked_server(&full, "original");
+
+        let tools = marked_builder("original")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .mount_tools(marked_builder("incoming").build(), Some("peer/secret"))
+            .build();
+        assert_marked_server(&tools, "original");
+
+        let resources = marked_builder("original")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .mount_resources(marked_builder("incoming").build(), Some("peer/secret"))
+            .build();
+        assert_marked_server(&resources, "original");
+
+        let prompts = marked_builder("original")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .mount_prompts(marked_builder("incoming").build(), Some("peer/secret"))
+            .build();
+        assert_marked_server(&prompts, "original");
+    }
+
     // ── Proxy registration ─────────────────────────────────────────
 
     #[test]
@@ -1614,6 +2154,71 @@ mod tests {
         assert!(server.has_tools());
     }
 
+    #[test]
+    fn builder_proxy_honors_duplicate_policy_for_every_component_kind() {
+        for behavior in [
+            DuplicateBehavior::Warn,
+            DuplicateBehavior::Ignore,
+            DuplicateBehavior::Error,
+        ] {
+            let server = ServerBuilder::new("srv", "1.0")
+                .on_duplicate(behavior)
+                .tool(TestTool)
+                .resource(TestResource)
+                .prompt(TestPrompt)
+                .proxy(
+                    ProxyClient::from_backend(DuplicatePolicyProxyBackend),
+                    duplicate_policy_proxy_catalog(),
+                )
+                .build();
+            let router = server.into_router();
+
+            assert_eq!(
+                router.tools()[0].description.as_deref(),
+                Some("a test tool")
+            );
+            assert_eq!(router.resources()[0].name, "test_res");
+            assert_eq!(router.prompts()[0].description, None);
+        }
+
+        let replaced = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .tool(TestTool)
+            .resource(TestResource)
+            .prompt(TestPrompt)
+            .proxy(
+                ProxyClient::from_backend(DuplicatePolicyProxyBackend),
+                duplicate_policy_proxy_catalog(),
+            )
+            .build()
+            .into_router();
+
+        assert_eq!(
+            replaced.tools()[0].description.as_deref(),
+            Some("proxied tool")
+        );
+        assert_eq!(replaced.resources()[0].name, "proxied resource");
+        assert_eq!(
+            replaced.prompts()[0].description.as_deref(),
+            Some("proxied prompt")
+        );
+    }
+
+    #[test]
+    fn as_proxy_raw_propagates_duplicate_registration_errors() {
+        let result = ServerBuilder::new("srv", "1.0")
+            .on_duplicate(DuplicateBehavior::Error)
+            .tool(TestTool)
+            .as_proxy_raw_with_proxy_client(ProxyClient::from_backend(DuplicatePolicyProxyBackend));
+
+        let error = match result {
+            Ok(_) => panic!("raw proxy registration unexpectedly accepted a duplicate tool"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+        assert!(error.message.starts_with("Tool already exists"));
+    }
+
     // ── DEFAULT_REQUEST_TIMEOUT_SECS constant ──────────────────────
 
     #[test]
@@ -1644,35 +2249,36 @@ mod tests {
     // ── Task manager ──────────────────────────────────────────────────
 
     #[test]
-    fn builder_with_task_manager_enables_capability() {
+    fn builder_with_task_manager_retains_manager_without_advertising_capability() {
         use crate::tasks::TaskManager;
         let tm = TaskManager::new().into_shared();
         let server = ServerBuilder::new("srv", "1.0")
             .with_task_manager(tm)
             .build();
-        assert!(server.capabilities().tasks.is_some());
+        assert!(server.task_manager().is_some());
+        assert!(server.capabilities().tasks.is_none());
     }
 
     #[test]
-    fn builder_with_task_manager_list_changed_true() {
+    fn builder_with_notifying_task_manager_keeps_capability_quarantined() {
         use crate::tasks::TaskManager;
         let tm = TaskManager::with_list_changed_notifications().into_shared();
         let server = ServerBuilder::new("srv", "1.0")
             .with_task_manager(tm)
             .build();
-        let cap = server.capabilities().tasks.as_ref().unwrap();
-        assert!(cap.list_changed);
+        assert!(server.task_manager().is_some());
+        assert!(server.capabilities().tasks.is_none());
     }
 
     #[test]
-    fn builder_with_task_manager_list_changed_false() {
+    fn builder_with_non_notifying_task_manager_keeps_capability_quarantined() {
         use crate::tasks::TaskManager;
         let tm = TaskManager::new().into_shared();
         let server = ServerBuilder::new("srv", "1.0")
             .with_task_manager(tm)
             .build();
-        let cap = server.capabilities().tasks.as_ref().unwrap();
-        assert!(!cap.list_changed);
+        assert!(server.task_manager().is_some());
+        assert!(server.capabilities().tasks.is_none());
     }
 
     // ── Duplicate behavior for resources and prompts ─────────────────
@@ -1838,12 +2444,13 @@ mod tests {
         assert!(!router.strict_input_validation());
     }
 
-    // ── log_level_filter with Off defaults to Info ───────────────────
+    // ── log_level_filter with Off ────────────────────────────────────
 
     #[test]
     fn builder_log_level_filter_off() {
-        let _builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Off);
-        // LevelFilter::Off.to_level() is None, so logging.level defaults to Info
+        let builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Off);
+        assert_eq!(builder.logging.level, LevelFilter::Off);
+        assert_eq!(builder.console_config.log_level, LevelFilter::Off);
     }
 
     // ── mount does not update capabilities when nothing mounted ──────

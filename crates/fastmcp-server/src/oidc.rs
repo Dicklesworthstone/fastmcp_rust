@@ -8,6 +8,10 @@
 //! - **Discovery Document**: `.well-known/openid-configuration` metadata
 //! - **Standard Claims**: OpenID Connect standard claim types
 //!
+//! This source inventory is not a promoted production OIDC profile. AUTH and
+//! MCP 2026-07-28 conformance gates remain outstanding; the public protocol
+//! constant is still `2024-11-05`.
+//!
 //! # Architecture
 //!
 //! The OIDC provider builds on top of [`OAuthServer`] by:
@@ -42,7 +46,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::oauth::{OAuthError, OAuthServer, OAuthToken};
+use crate::oauth::{OAuthError, OAuthServer, OAuthServerConfig, OAuthToken, validate_oauth_issuer};
 
 // =============================================================================
 // Configuration
@@ -62,7 +66,7 @@ pub struct OidcProviderConfig {
 impl Default for OidcProviderConfig {
     fn default() -> Self {
         Self {
-            issuer: "fastmcp".to_string(),
+            issuer: OAuthServerConfig::default().issuer,
             supported_claims: vec![
                 "sub".to_string(),
                 "name".to_string(),
@@ -89,7 +93,7 @@ impl Default for OidcProviderConfig {
 ///
 /// These claims describe the authenticated user and are included in
 /// ID tokens and returned from the userinfo endpoint.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserClaims {
     /// Subject identifier (required, unique user ID).
     pub sub: String,
@@ -162,6 +166,44 @@ pub struct UserClaims {
     /// Additional custom claims.
     #[serde(flatten)]
     pub custom: HashMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for UserClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let profile_claim_count = [
+            self.name.is_some(),
+            self.given_name.is_some(),
+            self.family_name.is_some(),
+            self.middle_name.is_some(),
+            self.nickname.is_some(),
+            self.preferred_username.is_some(),
+            self.profile.is_some(),
+            self.picture.is_some(),
+            self.website.is_some(),
+            self.gender.is_some(),
+            self.birthdate.is_some(),
+            self.zoneinfo.is_some(),
+            self.locale.is_some(),
+            self.updated_at.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+        f.debug_struct("UserClaims")
+            .field("subject_len", &self.sub.len())
+            .field("profile_claim_count", &profile_claim_count)
+            .field("email_present", &self.email.is_some())
+            .field("email_verified_present", &self.email_verified.is_some())
+            .field("phone_number_present", &self.phone_number.is_some())
+            .field(
+                "phone_number_verified_present",
+                &self.phone_number_verified.is_some(),
+            )
+            .field("address_present", &self.address.is_some())
+            .field("custom_claim_count", &self.custom.len())
+            .finish()
+    }
 }
 
 impl UserClaims {
@@ -292,7 +334,7 @@ impl UserClaims {
 }
 
 /// Address claim structure per OpenID Connect spec.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressClaim {
     /// Full formatted address.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,12 +356,32 @@ pub struct AddressClaim {
     pub country: Option<String>,
 }
 
+impl std::fmt::Debug for AddressClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let populated_field_count = [
+            self.formatted.is_some(),
+            self.street_address.is_some(),
+            self.locality.is_some(),
+            self.region.is_some(),
+            self.postal_code.is_some(),
+            self.country.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+        f.debug_struct("AddressClaim")
+            .field("populated_field_count", &populated_field_count)
+            .finish()
+    }
+}
+
 // =============================================================================
 // ID Token
 // =============================================================================
 
 /// ID Token claims (JWT payload).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IdTokenClaims {
     /// Issuer identifier.
     pub iss: String,
@@ -357,13 +419,40 @@ pub struct IdTokenClaims {
     pub user_claims: UserClaims,
 }
 
+impl std::fmt::Debug for IdTokenClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdTokenClaims")
+            .field("issuer_len", &self.iss.len())
+            .field("subject_len", &self.sub.len())
+            .field("audience_len", &self.aud.len())
+            .field("auth_time_present", &self.auth_time.is_some())
+            .field("nonce_present", &self.nonce.is_some())
+            .field("acr_present", &self.acr.is_some())
+            .field("amr_count", &self.amr.as_ref().map_or(0, Vec::len))
+            .field("authorized_party_present", &self.azp.is_some())
+            .field("access_token_hash_present", &self.at_hash.is_some())
+            .field("code_hash_present", &self.c_hash.is_some())
+            .field("user_claims", &self.user_claims)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A signed ID token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdToken {
     /// The raw JWT string.
     pub raw: String,
     /// The parsed claims.
     pub claims: IdTokenClaims,
+}
+
+impl std::fmt::Debug for IdToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdToken")
+            .field("raw_len", &self.raw.len())
+            .field("claims", &self.claims)
+            .finish()
+    }
 }
 
 // =============================================================================
@@ -460,7 +549,7 @@ impl DiscoveryDocument {
                 "preferred_username".to_string(),
                 "picture".to_string(),
             ]),
-            code_challenge_methods_supported: Some(vec!["plain".to_string(), "S256".to_string()]),
+            code_challenge_methods_supported: Some(vec!["S256".to_string()]),
         }
     }
 }
@@ -478,9 +567,18 @@ pub trait ClaimsProvider: Send + Sync {
 }
 
 /// Simple in-memory claims provider.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InMemoryClaimsProvider {
     claims: RwLock<HashMap<String, UserClaims>>,
+}
+
+impl std::fmt::Debug for InMemoryClaimsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let claim_count = self.claims.try_read().ok().map(|claims| claims.len());
+        f.debug_struct("InMemoryClaimsProvider")
+            .field("claim_count", &claim_count)
+            .finish()
+    }
 }
 
 impl InMemoryClaimsProvider {
@@ -553,7 +651,7 @@ impl ClaimsProvider for Arc<dyn ClaimsProvider> {
 // =============================================================================
 
 /// OIDC-specific errors.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum OidcError {
     /// Underlying OAuth error.
     OAuth(OAuthError),
@@ -561,10 +659,34 @@ pub enum OidcError {
     MissingOpenIdScope,
     /// User claims not found.
     ClaimsNotFound(String),
+    /// Claims provider returned an identity other than the requested subject.
+    ClaimsSubjectMismatch,
     /// Token signing failed.
     SigningError(String),
     /// Invalid ID token.
     InvalidIdToken(String),
+}
+
+impl std::fmt::Debug for OidcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OAuth(error) => f.debug_tuple("OAuth").field(error).finish(),
+            Self::MissingOpenIdScope => f.write_str("MissingOpenIdScope"),
+            Self::ClaimsNotFound(subject) => f
+                .debug_struct("ClaimsNotFound")
+                .field("subject_len", &subject.len())
+                .finish(),
+            Self::ClaimsSubjectMismatch => f.write_str("ClaimsSubjectMismatch"),
+            Self::SigningError(description) => f
+                .debug_struct("SigningError")
+                .field("description_len", &description.len())
+                .finish(),
+            Self::InvalidIdToken(description) => f
+                .debug_struct("InvalidIdToken")
+                .field("description_len", &description.len())
+                .finish(),
+        }
+    }
 }
 
 impl std::fmt::Display for OidcError {
@@ -572,9 +694,12 @@ impl std::fmt::Display for OidcError {
         match self {
             Self::OAuth(e) => write!(f, "OAuth error: {}", e),
             Self::MissingOpenIdScope => write!(f, "missing 'openid' scope"),
-            Self::ClaimsNotFound(s) => write!(f, "claims not found for subject: {}", s),
-            Self::SigningError(s) => write!(f, "signing error: {}", s),
-            Self::InvalidIdToken(s) => write!(f, "invalid ID token: {}", s),
+            Self::ClaimsNotFound(_) => f.write_str("claims not found for requested subject"),
+            Self::ClaimsSubjectMismatch => {
+                write!(f, "claims provider returned a mismatched subject")
+            }
+            Self::SigningError(_) => f.write_str("ID token signing failed"),
+            Self::InvalidIdToken(_) => f.write_str("invalid ID token"),
         }
     }
 }
@@ -604,17 +729,25 @@ pub struct OidcProvider {
 }
 
 fn validate_oidc_config(config: &OidcProviderConfig) -> Result<(), OidcError> {
-    let _ = config;
-    // Configuration remains parseable for discovery and migration, but no
-    // local JWT signer is admitted. FND-09 must provide externally-custodied
-    // signing before issuance can be enabled.
-    Ok(())
+    // Reuse the OAuth issuer admission policy so OIDC discovery cannot publish
+    // a non-HTTPS, non-canonical, or otherwise unsafe issuer spelling.
+    validate_oauth_issuer(&config.issuer).map_err(OidcError::from)
 }
 
 impl OidcProvider {
     /// Creates a new OIDC provider with the given OAuth server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the OIDC issuer is unsafe or does not exactly
+    /// match the underlying OAuth server issuer.
     pub fn new(oauth: Arc<OAuthServer>, config: OidcProviderConfig) -> Result<Self, OidcError> {
         validate_oidc_config(&config)?;
+        if config.issuer != oauth.config().issuer {
+            return Err(OidcError::OAuth(OAuthError::ServerError(
+                "OIDC issuer must exactly match the OAuth server issuer".to_string(),
+            )));
+        }
         Ok(Self {
             oauth,
             config,
@@ -623,8 +756,16 @@ impl OidcProvider {
     }
 
     /// Creates a new OIDC provider with default configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying OAuth server has an unsafe issuer.
     pub fn with_defaults(oauth: Arc<OAuthServer>) -> Result<Self, OidcError> {
-        Self::new(oauth, OidcProviderConfig::default())
+        let config = OidcProviderConfig {
+            issuer: oauth.config().issuer.clone(),
+            ..OidcProviderConfig::default()
+        };
+        Self::new(oauth, config)
     }
 
     /// Returns the OIDC configuration.
@@ -737,6 +878,13 @@ impl OidcProvider {
             }
         };
 
+        // The validated access token is the authority for user identity. A
+        // custom provider must never be able to substitute another subject's
+        // claims, even when it was queried with the correct key.
+        if claims.sub != subject {
+            return Err(OidcError::ClaimsSubjectMismatch);
+        }
+
         Ok(claims.filter_by_scopes(scopes))
     }
 }
@@ -754,10 +902,53 @@ mod non_signing_tests {
     use super::*;
 
     #[test]
+    fn default_oidc_and_oauth_issuers_match() {
+        assert_eq!(
+            OidcProviderConfig::default().issuer,
+            OAuthServerConfig::default().issuer
+        );
+    }
+
+    #[test]
+    fn provider_requires_exact_safe_oauth_issuer_and_defaults_follow_custom_oauth() {
+        let oauth = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: "https://issuer.example/tenant".to_string(),
+                ..OAuthServerConfig::default()
+            })
+            .unwrap(),
+        );
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).unwrap();
+        assert_eq!(provider.config().issuer, oauth.config().issuer);
+        assert_eq!(
+            provider.discovery_document("https://issuer.example").issuer,
+            oauth.config().issuer
+        );
+
+        assert!(matches!(
+            OidcProvider::new(Arc::clone(&oauth), OidcProviderConfig::default()),
+            Err(OidcError::OAuth(OAuthError::ServerError(_)))
+        ));
+
+        let unsafe_config = OidcProviderConfig {
+            issuer: "http://issuer.example".to_string(),
+            ..OidcProviderConfig::default()
+        };
+        assert!(matches!(
+            OidcProvider::new(oauth, unsafe_config),
+            Err(OidcError::OAuth(OAuthError::ServerError(_)))
+        ));
+    }
+
+    #[test]
     fn discovery_does_not_advertise_signing() {
         let doc = DiscoveryDocument::new("https://issuer.example", "https://issuer.example");
         assert!(doc.id_token_signing_alg_values_supported.is_empty());
         assert!(doc.jwks_uri.is_none());
+        assert_eq!(
+            doc.code_challenge_methods_supported,
+            Some(vec!["S256".to_string()])
+        );
     }
 
     #[test]
@@ -790,5 +981,109 @@ mod non_signing_tests {
         assert_eq!(filtered.sub, "subject");
         assert!(filtered.name.is_none());
         assert!(filtered.email.is_none());
+    }
+
+    #[test]
+    fn claims_provider_cannot_substitute_a_different_subject() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
+        provider.set_claims_fn(|requested_subject| {
+            assert_eq!(requested_subject, "authenticated-subject");
+            Some(UserClaims::new("different-subject").with_email("different-subject@example.test"))
+        });
+
+        let error = provider
+            .get_user_claims(
+                "authenticated-subject",
+                &["openid".to_string(), "email".to_string()],
+            )
+            .expect_err("a claims provider must not substitute another identity");
+
+        assert!(matches!(error, OidcError::ClaimsSubjectMismatch));
+        assert!(!error.to_string().contains("authenticated-subject"));
+        assert!(!error.to_string().contains("different-subject"));
+    }
+
+    #[test]
+    fn oidc_debug_surfaces_redact_token_and_pii_canaries_without_changing_wire_data() {
+        const CANARY: &str = "oidc-debug-token-pii-canary";
+        let address = AddressClaim {
+            formatted: Some(CANARY.to_owned()),
+            street_address: Some(CANARY.to_owned()),
+            locality: Some(CANARY.to_owned()),
+            region: Some(CANARY.to_owned()),
+            postal_code: Some(CANARY.to_owned()),
+            country: Some(CANARY.to_owned()),
+        };
+        let mut user_claims = UserClaims::new(CANARY)
+            .with_name(CANARY)
+            .with_email(CANARY)
+            .with_email_verified(true)
+            .with_phone_number(CANARY)
+            .with_custom(CANARY, serde_json::json!(CANARY));
+        user_claims.preferred_username = Some(CANARY.to_owned());
+        user_claims.address = Some(address.clone());
+        let id_token_claims = IdTokenClaims {
+            iss: CANARY.to_owned(),
+            sub: CANARY.to_owned(),
+            aud: CANARY.to_owned(),
+            exp: 2,
+            iat: 1,
+            auth_time: Some(1),
+            nonce: Some(CANARY.to_owned()),
+            acr: Some(CANARY.to_owned()),
+            amr: Some(vec![CANARY.to_owned()]),
+            azp: Some(CANARY.to_owned()),
+            at_hash: Some(CANARY.to_owned()),
+            c_hash: Some(CANARY.to_owned()),
+            user_claims: user_claims.clone(),
+        };
+
+        let wire = serde_json::to_value(&id_token_claims).unwrap();
+        assert_eq!(wire["nonce"], CANARY);
+        assert_eq!(wire["email"], CANARY);
+        assert_eq!(wire["phone_number"], CANARY);
+        assert_eq!(wire["address"]["formatted"], CANARY);
+        assert_eq!(wire[CANARY], CANARY);
+
+        let id_token = IdToken {
+            raw: CANARY.to_owned(),
+            claims: id_token_claims.clone(),
+        };
+        let provider = InMemoryClaimsProvider::new();
+        provider.set_claims(user_claims.clone());
+        let errors = [
+            OidcError::ClaimsNotFound(CANARY.to_owned()),
+            OidcError::SigningError(CANARY.to_owned()),
+            OidcError::InvalidIdToken(CANARY.to_owned()),
+        ];
+        let debug_outputs = [
+            format!("{address:?}"),
+            format!("{user_claims:?}"),
+            format!("{id_token_claims:?}"),
+            format!("{id_token:?}"),
+            format!("{provider:?}"),
+            format!("{:?}", errors[0]),
+            format!("{:?}", errors[1]),
+            format!("{:?}", errors[2]),
+        ];
+
+        for debug in debug_outputs {
+            assert!(
+                !debug.contains(CANARY),
+                "sensitive canary leaked through Debug: {debug}"
+            );
+            assert!(
+                debug.contains("_len") || debug.contains("_count") || debug.contains("_present"),
+                "Debug output lacked safe structural metadata: {debug}"
+            );
+        }
+
+        for display in errors.map(|error| error.to_string()) {
+            assert!(
+                !display.contains(CANARY),
+                "sensitive canary leaked through Display: {display}"
+            );
+        }
     }
 }
