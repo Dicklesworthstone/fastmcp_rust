@@ -9,10 +9,15 @@
 //! an async API. This allows the codebase to use async patterns that will
 //! benefit from true async I/O when the runtime is upgraded.
 //!
-//! # Cancellation Integration
+//! # Cancellation limitations
 //!
-//! The wrappers check for cancellation via `Cx::is_cancel_requested()` at
-//! appropriate points, enabling cooperative cancellation even with blocking I/O.
+//! Capability-accepting convenience methods run `Cx::checkpoint()` before
+//! entering synchronous I/O and between bounded line-buffer fills. This
+//! observes cancellation masking as well as deadline, poll-quota, and
+//! cost-quota exhaustion. The `AsyncRead`/`AsyncWrite` poll methods themselves
+//! have no `Cx` and perform blocking standard-library I/O. None of these
+//! checkpoints can interrupt an operation once the underlying read, write,
+//! flush, or stdout lock blocks.
 
 use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -20,6 +25,15 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
+
+fn io_checkpoint(cx: &Cx) -> io::Result<()> {
+    cx.checkpoint().map_err(|error| {
+        // This layer exposes std::io traits, which have no cancellation or
+        // budget error type. Preserve the full reason on `Cx` for transport
+        // callers to classify, and use Interrupted for every cooperative stop.
+        io::Error::new(io::ErrorKind::Interrupted, error.to_string())
+    })
+}
 
 /// Async wrapper for stdin.
 ///
@@ -48,24 +62,6 @@ impl AsyncStdin {
         Self {
             inner: BufReader::new(std::io::stdin()),
         }
-    }
-
-    /// Reads a line from stdin, checking for cancellation.
-    ///
-    /// This method integrates with asupersync's capability context to enable
-    /// cooperative cancellation. It checks `cx.is_cancel_requested()` before
-    /// the blocking read.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if cancellation is requested or an I/O error occurs.
-    pub fn read_line_sync(&mut self, cx: &Cx, buf: &mut String) -> io::Result<usize> {
-        // Check cancellation before blocking
-        if cx.is_cancel_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
-
-        self.inner.read_line(buf)
     }
 }
 
@@ -119,19 +115,17 @@ impl AsyncStdout {
         }
     }
 
-    /// Writes data to stdout, checking for cancellation.
+    /// Writes data to stdout after a context checkpoint.
     ///
-    /// This method integrates with asupersync's capability context to enable
-    /// cooperative cancellation before the write.
+    /// This is a preflight check only; it cannot interrupt the write or stdout
+    /// lock acquisition after either operation begins.
     ///
     /// # Errors
     ///
-    /// Returns an error if cancellation is requested or an I/O error occurs.
+    /// Returns [`io::ErrorKind::Interrupted`] if the context checkpoint observes
+    /// cancellation or budget exhaustion, or an I/O error from stdout.
     pub fn write_all_sync(&mut self, cx: &Cx, buf: &[u8]) -> io::Result<()> {
-        // Check cancellation before I/O
-        if cx.is_cancel_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
+        io_checkpoint(cx)?;
 
         let _guard = STDOUT_LOCK
             .lock()
@@ -139,16 +133,17 @@ impl AsyncStdout {
         self.inner.write_all(buf)
     }
 
-    /// Flushes stdout, checking for cancellation.
+    /// Flushes stdout after a context checkpoint.
+    ///
+    /// This is a preflight check only; it cannot interrupt the flush or stdout
+    /// lock acquisition after either operation begins.
     ///
     /// # Errors
     ///
-    /// Returns an error if cancellation is requested or an I/O error occurs.
+    /// Returns [`io::ErrorKind::Interrupted`] if the context checkpoint observes
+    /// cancellation or budget exhaustion, or an I/O error from stdout.
     pub fn flush_sync(&mut self, cx: &Cx) -> io::Result<()> {
-        // Check cancellation before I/O
-        if cx.is_cancel_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
+        io_checkpoint(cx)?;
 
         let _guard = STDOUT_LOCK
             .lock()
@@ -251,10 +246,12 @@ impl AsyncWrite for AsyncStdout {
     }
 }
 
-/// Async line reader with cancellation support.
+/// Async line reader with explicit context checkpoints.
 ///
-/// This struct provides a cancel-aware line reading API that integrates
-/// with asupersync's capability context.
+/// This struct checkpoints the capability context before blocking reads and
+/// between bounded buffer fills. Checkpoints respect masking and observe
+/// cancellation plus deadline and quota exhaustion. They cannot interrupt an
+/// underlying stdin read that is already blocked.
 ///
 /// # Example
 ///
@@ -277,7 +274,25 @@ impl AsyncWrite for AsyncStdout {
 #[derive(Debug)]
 pub struct AsyncLineReader {
     stdin: AsyncStdin,
-    buffer: String,
+    buffer: Vec<u8>,
+}
+
+/// Default bound used by the public line-reading convenience methods.
+///
+/// Transport implementations with their own configured codec limit use the
+/// crate-private bounded byte API instead.
+const DEFAULT_MAX_LINE_SIZE: usize = 10 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum BoundedLineReadError {
+    Io(io::Error),
+    TooLarge(usize),
+}
+
+impl From<io::Error> for BoundedLineReadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl AsyncLineReader {
@@ -286,35 +301,113 @@ impl AsyncLineReader {
     pub fn new() -> Self {
         Self {
             stdin: AsyncStdin::new(),
-            buffer: String::with_capacity(4096),
+            buffer: Vec::with_capacity(4096),
         }
     }
 
-    /// Reads a line from stdin with cancellation checking.
+    fn frame_len(&self) -> usize {
+        let without_lf = self.buffer.strip_suffix(b"\n").unwrap_or(&self.buffer);
+        without_lf.strip_suffix(b"\r").unwrap_or(without_lf).len()
+    }
+
+    /// Reads at most one line without allowing `BufRead::read_line` to grow a
+    /// string past the caller's frame limit.
+    ///
+    /// The two extra wire bytes permit an exact-limit JSON frame followed by
+    /// CRLF. They are removed before the returned frame length is checked.
+    fn read_line_bytes_bounded(
+        &mut self,
+        cx: &Cx,
+        max_frame_size: usize,
+    ) -> Result<Option<usize>, BoundedLineReadError> {
+        self.buffer.clear();
+        let wire_limit = max_frame_size.saturating_add(2);
+
+        loop {
+            io_checkpoint(cx)?;
+
+            let available = self.stdin.inner.fill_buf()?;
+            if available.is_empty() {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                let frame_len = self.frame_len();
+                if frame_len > max_frame_size {
+                    self.buffer.clear();
+                    return Err(BoundedLineReadError::TooLarge(frame_len));
+                }
+                return Ok(Some(frame_len));
+            }
+
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let bytes_to_consume = newline.map_or(available.len(), |position| position + 1);
+            let projected = self.buffer.len().saturating_add(bytes_to_consume);
+            if projected > wire_limit {
+                self.buffer.clear();
+                return Err(BoundedLineReadError::TooLarge(projected));
+            }
+
+            self.buffer
+                .extend_from_slice(&available[..bytes_to_consume]);
+            self.stdin.inner.consume(bytes_to_consume);
+
+            if newline.is_some() {
+                let frame_len = self.frame_len();
+                if frame_len > max_frame_size {
+                    self.buffer.clear();
+                    return Err(BoundedLineReadError::TooLarge(frame_len));
+                }
+                return Ok(Some(frame_len));
+            }
+        }
+    }
+
+    pub(crate) fn read_non_empty_line_bounded(
+        &mut self,
+        cx: &Cx,
+        max_frame_size: usize,
+    ) -> Result<Option<&[u8]>, BoundedLineReadError> {
+        loop {
+            let Some(frame_len) = self.read_line_bytes_bounded(cx, max_frame_size)? else {
+                return Ok(None);
+            };
+            if frame_len != 0 {
+                return Ok(Some(&self.buffer[..frame_len]));
+            }
+        }
+    }
+
+    /// Reads a line from stdin with context checkpoints.
     ///
     /// Returns `Ok(Some(line))` when a line is read, `Ok(None)` on EOF,
-    /// or an error on cancellation/I/O failure.
+    /// or an error on cancellation/I/O failure. Lines are bounded to 10 MiB
+    /// before allocation into the reusable buffer.
     ///
     /// # Errors
     ///
-    /// - Returns `io::ErrorKind::Interrupted` if cancellation is requested.
+    /// - Returns `io::ErrorKind::Interrupted` if cancellation or a context
+    ///   budget is observed at a checkpoint.
     /// - Returns other I/O errors as-is.
+    ///
+    /// A size-limit error is terminal for the current input stream because the
+    /// unread remainder of the oversized line is deliberately not drained.
     pub fn read_line(&mut self, cx: &Cx) -> io::Result<Option<String>> {
-        self.buffer.clear();
+        let Some(frame_len) = self
+            .read_line_bytes_bounded(cx, DEFAULT_MAX_LINE_SIZE)
+            .map_err(|error| match error {
+                BoundedLineReadError::Io(error) => error,
+                BoundedLineReadError::TooLarge(size) => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line exceeds maximum size: {size} bytes"),
+                ),
+            })?
+        else {
+            return Ok(None);
+        };
 
-        let bytes_read = self.stdin.read_line_sync(cx, &mut self.buffer)?;
-
-        if bytes_read == 0 {
-            return Ok(None); // EOF
-        }
-
-        // Trim trailing newline
-        let line = self
-            .buffer
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string();
-
+        let line = std::str::from_utf8(&self.buffer[..frame_len])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .to_owned();
         Ok(Some(line))
     }
 
@@ -323,18 +416,16 @@ impl AsyncLineReader {
     /// Returns `Ok(Some(line))` when a non-empty line is read, `Ok(None)` on EOF,
     /// or an error on cancellation/I/O failure.
     ///
-    /// This method checks for cancellation between each line read.
+    /// This method runs a context checkpoint between each line read.
     ///
     /// # Errors
     ///
-    /// - Returns `io::ErrorKind::Interrupted` if cancellation is requested.
+    /// - Returns `io::ErrorKind::Interrupted` if cancellation or a context
+    ///   budget is observed at a checkpoint.
     /// - Returns other I/O errors as-is.
     pub fn read_non_empty_line(&mut self, cx: &Cx) -> io::Result<Option<String>> {
         loop {
-            // Check cancellation between reads
-            if cx.is_cancel_requested() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-            }
+            io_checkpoint(cx)?;
 
             match self.read_line(cx)? {
                 None => return Ok(None),            // EOF
@@ -372,34 +463,6 @@ mod tests {
         assert!(format!("{stdin:?}").contains("AsyncStdin"));
     }
 
-    #[test]
-    fn async_stdin_read_line_sync_respects_cancellation() {
-        let mut stdin = AsyncStdin::new();
-        let cx = Cx::for_testing();
-        cx.set_cancel_requested(true);
-
-        let mut buf = String::new();
-        let result = stdin.read_line_sync(&cx, &mut buf);
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
-        // Buffer should remain empty since we returned before reading
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn async_stdin_read_line_sync_without_cancellation_does_not_error_on_check() {
-        let stdin = AsyncStdin::new();
-        let cx = Cx::for_testing();
-        // Cancellation NOT requested - the method would block on actual stdin,
-        // but we can at least verify that no error is returned from the
-        // cancellation check path by checking cx state
-        assert!(!cx.is_cancel_requested());
-        // Note: We don't call read_line_sync here because it would block
-        // waiting for actual stdin input
-        drop(stdin);
-    }
-
     // =========================================================================
     // AsyncStdout tests
     // =========================================================================
@@ -426,7 +489,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(err.to_string(), "cancelled");
+        assert!(err.to_string().to_ascii_lowercase().contains("cancel"));
     }
 
     #[test]
@@ -439,7 +502,84 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(err.to_string(), "cancelled");
+        assert!(err.to_string().to_ascii_lowercase().contains("cancel"));
+    }
+
+    #[test]
+    fn io_checkpoint_observes_budgets_cancellation_and_masking() {
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert_eq!(
+            io_checkpoint(&deadline_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(matches!(
+            deadline_cx.cancel_reason().map(|reason| reason.kind),
+            Some(asupersync::CancelKind::Deadline)
+        ));
+
+        let quota_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        assert_eq!(
+            io_checkpoint(&quota_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(matches!(
+            quota_cx.cancel_reason().map(|reason| reason.kind),
+            Some(asupersync::CancelKind::PollQuota)
+        ));
+
+        let masked_deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        masked_deadline_cx.masked(|| {
+            io_checkpoint(&masked_deadline_cx)
+                .expect("masking defers deadline enforcement at the checkpoint");
+        });
+        assert_eq!(
+            io_checkpoint(&masked_deadline_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        let masked_cancel_cx = Cx::for_testing();
+        masked_cancel_cx.set_cancel_requested(true);
+        masked_cancel_cx.masked(|| {
+            io_checkpoint(&masked_cancel_cx)
+                .expect("masking defers explicit cancellation at the checkpoint");
+        });
+        assert_eq!(
+            io_checkpoint(&masked_cancel_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn async_stdout_checkpoint_methods_preserve_masking_and_reject_budgets() {
+        let mut stdout = AsyncStdout::new();
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert_eq!(
+            stdout.write_all_sync(&deadline_cx, b"").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        let quota_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0));
+        assert_eq!(
+            stdout.flush_sync(&quota_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        let masked_cx = Cx::for_testing();
+        masked_cx.set_cancel_requested(true);
+        masked_cx.masked(|| {
+            stdout
+                .write_all_sync(&masked_cx, b"")
+                .expect("masked empty write is admitted");
+            stdout
+                .flush_sync(&masked_cx)
+                .expect("masked flush is admitted");
+        });
     }
 
     #[test]
@@ -547,7 +687,7 @@ mod tests {
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
 
-        // read_line calls read_line_sync which checks cancellation
+        // The bounded reader checks cancellation before touching stdin.
         let result = reader.read_line(&cx);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
@@ -577,6 +717,24 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn async_line_reader_rejects_deadline_and_quota_before_touching_stdin() {
+        let mut reader = AsyncLineReader::new();
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert_eq!(
+            reader.read_line(&deadline_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        let quota_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        assert_eq!(
+            reader.read_non_empty_line(&quota_cx).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     // =========================================================================

@@ -14,9 +14,8 @@
 //! # Architecture
 //!
 //! This implementation provides low-level WebSocket message framing.
-//! It does NOT include HTTP upgrade handling - that should be done by
-//! your HTTP server (e.g., hyper, axum, warp) before handing off the
-//! upgraded connection to this transport.
+//! It does not include HTTP upgrade handling. The caller must provide an
+//! already-upgraded reader and writer.
 //!
 //! # Example
 //!
@@ -33,10 +32,11 @@
 //! transport.send(&cx, &response)?;
 //! ```
 //!
-//! # Cancel-Safety
+//! # Cancellation behavior
 //!
-//! All operations check `cx.checkpoint()` before blocking I/O.
-//! The transport integrates with asupersync's structured concurrency.
+//! Operations check `cx.checkpoint()` before entering their I/O paths. The
+//! caller-provided blocking reader or writer is not made interruptible by that
+//! preflight check.
 
 use std::io::{BufReader, Read, Write};
 
@@ -148,6 +148,105 @@ impl WsFrame {
     }
 }
 
+fn websocket_invalid_data(message: impl Into<String>) -> TransportError {
+    TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
+}
+
+fn validate_close_payload(payload: &[u8]) -> Result<(), TransportError> {
+    if payload.len() == 1 {
+        return Err(websocket_invalid_data(
+            "WebSocket close payload cannot contain a one-byte status code",
+        ));
+    }
+    if payload.len() < 2 {
+        return Ok(());
+    }
+
+    let status = u16::from_be_bytes([payload[0], payload[1]]);
+    let status_is_allowed = matches!(status, 1000..=1003 | 1007..=1014 | 3000..=4999);
+    if !status_is_allowed {
+        return Err(websocket_invalid_data(format!(
+            "Invalid WebSocket close status code: {status}"
+        )));
+    }
+    std::str::from_utf8(&payload[2..])
+        .map_err(|_| websocket_invalid_data("WebSocket close reason must be valid UTF-8"))?;
+    Ok(())
+}
+
+fn validate_outbound_frame(frame: &WsFrame) -> Result<(), TransportError> {
+    if matches!(
+        frame.frame_type,
+        WsFrameType::Close | WsFrameType::Ping | WsFrameType::Pong
+    ) {
+        if !frame.fin {
+            return Err(websocket_invalid_data(
+                "Fragmented WebSocket control frames are not allowed",
+            ));
+        }
+        if frame.payload.len() > 125 {
+            return Err(websocket_invalid_data(
+                "WebSocket control frame payload exceeds 125 bytes",
+            ));
+        }
+    }
+    if frame.frame_type == WsFrameType::Close {
+        validate_close_payload(&frame.payload)?;
+    }
+    // A complete text message must be valid UTF-8 even when callers bypass
+    // WsFrame::text and populate the public fields directly. Fragmented text
+    // is validated by the stateful transport once its final continuation is
+    // assembled; a standalone frame writer cannot validate it in isolation.
+    if frame.frame_type == WsFrameType::Text && frame.fin {
+        std::str::from_utf8(&frame.payload)
+            .map_err(|_| websocket_invalid_data("WebSocket text payload must be valid UTF-8"))?;
+    }
+    Ok(())
+}
+
+fn invalid_utf8_close_frame() -> WsFrame {
+    WsFrame {
+        frame_type: WsFrameType::Close,
+        payload: 1007_u16.to_be_bytes().to_vec(),
+        fin: true,
+    }
+}
+
+/// Local endpoint role used to enforce RFC 6455 mask direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRole {
+    /// A server endpoint receives masked frames from a client.
+    Server,
+    /// A client endpoint receives unmasked frames from a server.
+    Client,
+}
+
+impl EndpointRole {
+    fn validate_peer_mask(self, masked: bool) -> Result<(), TransportError> {
+        let violation = match (self, masked) {
+            (Self::Server, false) => {
+                Some("Client-to-server WebSocket frames MUST be masked per RFC 6455")
+            }
+            (Self::Client, true) => {
+                Some("Server-to-client WebSocket frames MUST NOT be masked per RFC 6455")
+            }
+            _ => None,
+        };
+
+        if let Some(message) = violation {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 /// WebSocket frame reader.
 ///
 /// Reads WebSocket frames from an underlying byte stream.
@@ -155,9 +254,7 @@ impl WsFrame {
 pub struct WsReader<R> {
     reader: BufReader<R>,
     max_frame_size: usize,
-    /// Whether to require masking (true for server-side, false for client-side).
-    /// Per RFC 6455: servers MUST reject unmasked client frames.
-    require_mask: bool,
+    endpoint_role: EndpointRole,
 }
 
 impl<R: Read> WsReader<R> {
@@ -165,22 +262,22 @@ impl<R: Read> WsReader<R> {
     ///
     /// Per RFC 6455, servers MUST reject unmasked frames from clients.
     pub fn new(reader: R) -> Self {
-        Self::with_config(reader, true)
+        Self::with_role(reader, EndpointRole::Server)
     }
 
     /// Creates a new WebSocket reader for client-side use.
     ///
-    /// Clients receive unmasked frames from servers per RFC 6455.
+    /// Per RFC 6455, clients MUST reject masked frames from servers.
     pub fn new_client(reader: R) -> Self {
-        Self::with_config(reader, false)
+        Self::with_role(reader, EndpointRole::Client)
     }
 
-    /// Creates a new WebSocket reader with explicit mask requirement.
-    fn with_config(reader: R, require_mask: bool) -> Self {
+    /// Creates a new WebSocket reader for an explicit endpoint role.
+    fn with_role(reader: R, endpoint_role: EndpointRole) -> Self {
         Self {
             reader: BufReader::new(reader),
             max_frame_size: 10 * 1024 * 1024,
-            require_mask,
+            endpoint_role,
         }
     }
 
@@ -198,7 +295,8 @@ impl<R: Read> WsReader<R> {
         let rsv = header[0] & 0x70;
         let opcode = header[0] & 0x0F;
         let masked = (header[1] & 0x80) != 0;
-        let mut payload_len = (header[1] & 0x7F) as u64;
+        let payload_len_code = header[1] & 0x7F;
+        let mut payload_len = u64::from(payload_len_code);
 
         if rsv != 0 {
             return Err(TransportError::Io(std::io::Error::new(
@@ -207,15 +305,40 @@ impl<R: Read> WsReader<R> {
             )));
         }
 
+        // RFC 6455 Section 5.1 makes mask direction endpoint-specific for every
+        // frame, including control and continuation frames.
+        self.endpoint_role.validate_peer_mask(masked)?;
+
+        // The opcode is fully known from the first header byte. Rejecting it
+        // before extended lengths and payload allocation prevents malformed
+        // reserved frames from forcing a maximum-sized read first.
+        let frame_type = WsFrameType::from_opcode(opcode)
+            .ok_or_else(|| websocket_invalid_data(format!("Unknown WebSocket opcode: {opcode}")))?;
+
         // Extended payload length
-        if payload_len == 126 {
+        if payload_len_code == 126 {
             let mut ext = [0u8; 2];
             self.reader.read_exact(&mut ext)?;
             payload_len = u16::from_be_bytes(ext) as u64;
-        } else if payload_len == 127 {
+            if payload_len < 126 {
+                return Err(websocket_invalid_data(
+                    "Non-minimal WebSocket payload-length encoding",
+                ));
+            }
+        } else if payload_len_code == 127 {
             let mut ext = [0u8; 8];
             self.reader.read_exact(&mut ext)?;
+            if ext[0] & 0x80 != 0 {
+                return Err(websocket_invalid_data(
+                    "WebSocket payload length exceeds the RFC 6455 63-bit range",
+                ));
+            }
             payload_len = u64::from_be_bytes(ext);
+            if payload_len <= u64::from(u16::MAX) {
+                return Err(websocket_invalid_data(
+                    "Non-minimal WebSocket payload-length encoding",
+                ));
+            }
         }
 
         let is_control = matches!(opcode, 0x08..=0x0A);
@@ -246,14 +369,6 @@ impl<R: Read> WsReader<R> {
             )));
         }
 
-        // RFC 6455 Section 5.1: Server MUST close connection if client frame is unmasked
-        if self.require_mask && !masked {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Client frames MUST be masked per RFC 6455",
-            )));
-        }
-
         // Read masking key if present (client -> server frames are masked)
         let mask_key = if masked {
             let mut key = [0u8; 4];
@@ -274,12 +389,9 @@ impl<R: Read> WsReader<R> {
             }
         }
 
-        let frame_type = WsFrameType::from_opcode(opcode).ok_or_else(|| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unknown WebSocket opcode: {opcode}"),
-            ))
-        })?;
+        if frame_type == WsFrameType::Close {
+            validate_close_payload(&payload)?;
+        }
 
         Ok(WsFrame {
             frame_type,
@@ -309,6 +421,8 @@ impl<W: Write> WsWriter<W> {
     ///
     /// Returns an error if I/O fails.
     pub fn write_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
+        validate_outbound_frame(frame)?;
+
         // First byte: FIN + opcode
         let byte1 = if frame.fin { 0x80 } else { 0x00 } | frame.frame_type.opcode();
 
@@ -358,7 +472,9 @@ pub struct WsTransport<R, W> {
     writer: WsWriter<W>,
     codec: Codec,
     fragment_buffer: Vec<u8>,
+    fragmented_text: bool,
     max_message_size: usize,
+    closed: bool,
 }
 
 impl<R: Read, W: Write> WsTransport<R, W> {
@@ -369,7 +485,9 @@ impl<R: Read, W: Write> WsTransport<R, W> {
             writer: WsWriter::new(writer),
             codec: Codec::new(),
             fragment_buffer: Vec::new(),
+            fragmented_text: false,
             max_message_size: 10 * 1024 * 1024,
+            closed: false,
         }
     }
 
@@ -383,7 +501,10 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     ///
     /// Returns an error if cancelled, the connection is closed, or I/O fails.
     pub fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        // Check cancellation
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        // Check cancellation.
         if cx.is_cancel_requested() {
             return Err(TransportError::Cancelled);
         }
@@ -405,7 +526,12 @@ impl<R: Read, W: Write> WsTransport<R, W> {
 
         // Send as text frame
         let frame = WsFrame::text(text);
-        self.writer.write_frame(&frame)?;
+        if let Err(error) = self.writer.write_frame(&frame) {
+            self.closed = true;
+            self.fragment_buffer.clear();
+            self.fragmented_text = false;
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -424,17 +550,31 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     /// Returns an error if cancelled, the connection is closed, or parsing fails.
     pub fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         loop {
-            // Check cancellation
+            if self.closed {
+                return Err(TransportError::Closed);
+            }
+            // Check cancellation.
             if cx.is_cancel_requested() {
                 return Err(TransportError::Cancelled);
             }
 
             // Read next frame
-            let frame = self.reader.read_frame()?;
+            let frame = match self.reader.read_frame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.closed = true;
+                    self.fragment_buffer.clear();
+                    self.fragmented_text = false;
+                    return Err(error);
+                }
+            };
 
             match frame.frame_type {
                 WsFrameType::Text => {
-                    if !self.fragment_buffer.is_empty() {
+                    if self.fragmented_text {
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Received Text frame while inside fragmented message",
@@ -447,12 +587,15 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                     }
 
                     // Start of fragmented message
+                    self.fragmented_text = true;
                     let next_len = self
                         .fragment_buffer
                         .len()
                         .saturating_add(frame.payload.len());
                     if next_len > self.max_message_size {
                         self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fragmented message exceeds size limit",
@@ -462,7 +605,9 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                     continue;
                 }
                 WsFrameType::Continuation => {
-                    if self.fragment_buffer.is_empty() {
+                    if !self.fragmented_text {
+                        self.closed = true;
+                        self.fragment_buffer.clear();
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Received Continuation frame without start frame",
@@ -475,6 +620,8 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                         .saturating_add(frame.payload.len());
                     if next_len > self.max_message_size {
                         self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fragmented message exceeds size limit",
@@ -485,6 +632,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                     if frame.fin {
                         // End of fragmented message
                         let payload = std::mem::take(&mut self.fragment_buffer);
+                        self.fragmented_text = false;
                         return self.decode_message(payload);
                     }
 
@@ -492,24 +640,37 @@ impl<R: Read, W: Write> WsTransport<R, W> {
                     continue;
                 }
                 WsFrameType::Binary => {
-                    // Per RFC 6455 Section 5.4, data frames MUST NOT be interleaved
-                    // during fragmentation. Reject if we're inside a fragmented message.
-                    if !self.fragment_buffer.is_empty() {
-                        return Err(TransportError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Received Binary frame while inside fragmented message",
-                        )));
+                    if self.fragmented_text {
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
                     }
-                    // Binary frames not used by MCP, skip otherwise
-                    continue;
+                    self.closed = true;
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Binary WebSocket messages are not supported by MCP",
+                    )));
                 }
                 WsFrameType::Close => {
+                    self.closed = true;
+                    self.fragment_buffer.clear();
+                    self.fragmented_text = false;
+                    let close_reply = WsFrame {
+                        frame_type: WsFrameType::Close,
+                        payload: frame.payload,
+                        fin: true,
+                    };
+                    self.writer.write_frame(&close_reply)?;
                     return Err(TransportError::Closed);
                 }
                 WsFrameType::Ping => {
                     // Auto-respond with pong
                     let pong = WsFrame::pong(frame.payload);
-                    self.writer.write_frame(&pong)?;
+                    if let Err(error) = self.writer.write_frame(&pong) {
+                        self.closed = true;
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        return Err(error);
+                    }
                     continue;
                 }
                 WsFrameType::Pong => {
@@ -522,28 +683,19 @@ impl<R: Read, W: Write> WsTransport<R, W> {
 
     /// Decodes a payload into a JSON-RPC message.
     fn decode_message(&mut self, payload: Vec<u8>) -> Result<JsonRpcMessage, TransportError> {
-        // Parse JSON-RPC message
-        let text = String::from_utf8(payload).map_err(|e| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid UTF-8: {e}"),
-            ))
-        })?;
-
-        // Add newline for codec and decode
-        let mut input = text.as_bytes().to_vec();
-        input.push(b'\n');
-
-        let messages = self.codec.decode(&input)?;
-        if let Some(msg) = messages.into_iter().next() {
-            return Ok(msg);
+        if let Err(error) = std::str::from_utf8(&payload) {
+            self.closed = true;
+            self.fragment_buffer.clear();
+            self.fragmented_text = false;
+            // RFC 6455 assigns 1007 to inconsistent text data. The close write
+            // is best-effort: the primary error still explains why the peer
+            // connection became terminal.
+            let _close_result = self.writer.write_frame(&invalid_utf8_close_frame());
+            return Err(websocket_invalid_data(format!(
+                "Invalid UTF-8 in WebSocket text message: {error}"
+            )));
         }
-
-        // This shouldn't happen for a complete message unless it was empty or just whitespace
-        Err(TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Received empty message",
-        )))
+        Ok(self.codec.decode_complete_message(&payload)?)
     }
 
     /// Sends a close frame and shuts down the connection.
@@ -552,6 +704,12 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     ///
     /// Returns an error if I/O fails.
     pub fn close(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.fragment_buffer.clear();
+        self.fragmented_text = false;
         let frame = WsFrame::close();
         self.writer.write_frame(&frame)?;
         Ok(())
@@ -585,8 +743,16 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     ///
     /// Returns an error if I/O fails.
     pub fn ping(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
         let frame = WsFrame::ping(Vec::new());
-        self.writer.write_frame(&frame)?;
+        if let Err(error) = self.writer.write_frame(&frame) {
+            self.closed = true;
+            self.fragment_buffer.clear();
+            self.fragmented_text = false;
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -653,6 +819,8 @@ impl<W: Write> WsClientWriter<W> {
     where
         F: FnOnce() -> Result<[u8; 4], TransportError>,
     {
+        validate_outbound_frame(frame)?;
+
         // Draw before emitting any header bytes. RNG failure is terminal and
         // cannot leave a partial frame on the stream.
         let mask = draw_mask()?;
@@ -701,19 +869,23 @@ pub struct WsClientTransport<R, W> {
     writer: WsClientWriter<W>,
     codec: Codec,
     fragment_buffer: Vec<u8>,
+    fragmented_text: bool,
     max_message_size: usize,
+    closed: bool,
 }
 
 impl<R: Read, W: Write> WsClientTransport<R, W> {
     /// Creates a new client WebSocket transport.
     pub fn new(reader: R, writer: W) -> Self {
         Self {
-            // Client receives unmasked frames from server
+            // Client requires unmasked frames from the server.
             reader: WsReader::new_client(reader),
             writer: WsClientWriter::new(writer),
             codec: Codec::new(),
             fragment_buffer: Vec::new(),
+            fragmented_text: false,
             max_message_size: 10 * 1024 * 1024,
+            closed: false,
         }
     }
 
@@ -729,7 +901,10 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
     ///
     /// Returns an error if cancelled, the connection is closed, or I/O fails.
     pub fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        // Check cancellation
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        // Check cancellation.
         if cx.is_cancel_requested() {
             return Err(TransportError::Cancelled);
         }
@@ -751,7 +926,12 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
 
         // Send as text frame (masked)
         let frame = WsFrame::text(text);
-        self.writer.write_frame(&frame)?;
+        if let Err(error) = self.writer.write_frame(&frame) {
+            self.closed = true;
+            self.fragment_buffer.clear();
+            self.fragmented_text = false;
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -769,17 +949,31 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
     /// Returns an error if cancelled, the connection is closed, or parsing fails.
     pub fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         loop {
-            // Check cancellation
+            if self.closed {
+                return Err(TransportError::Closed);
+            }
+            // Check cancellation.
             if cx.is_cancel_requested() {
                 return Err(TransportError::Cancelled);
             }
 
             // Read next frame
-            let frame = self.reader.read_frame()?;
+            let frame = match self.reader.read_frame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.closed = true;
+                    self.fragment_buffer.clear();
+                    self.fragmented_text = false;
+                    return Err(error);
+                }
+            };
 
             match frame.frame_type {
                 WsFrameType::Text => {
-                    if !self.fragment_buffer.is_empty() {
+                    if self.fragmented_text {
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Received Text frame while inside fragmented message",
@@ -792,12 +986,15 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                     }
 
                     // Start of fragmented message
+                    self.fragmented_text = true;
                     let next_len = self
                         .fragment_buffer
                         .len()
                         .saturating_add(frame.payload.len());
                     if next_len > self.max_message_size {
                         self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fragmented message exceeds size limit",
@@ -807,7 +1004,9 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                     continue;
                 }
                 WsFrameType::Continuation => {
-                    if self.fragment_buffer.is_empty() {
+                    if !self.fragmented_text {
+                        self.closed = true;
+                        self.fragment_buffer.clear();
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Received Continuation frame without start frame",
@@ -820,6 +1019,8 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                         .saturating_add(frame.payload.len());
                     if next_len > self.max_message_size {
                         self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        self.closed = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fragmented message exceeds size limit",
@@ -830,6 +1031,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                     if frame.fin {
                         // End of fragmented message
                         let payload = std::mem::take(&mut self.fragment_buffer);
+                        self.fragmented_text = false;
                         return self.decode_message(payload);
                     }
 
@@ -837,24 +1039,37 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
                     continue;
                 }
                 WsFrameType::Binary => {
-                    // Per RFC 6455 Section 5.4, data frames MUST NOT be interleaved
-                    // during fragmentation. Reject if we're inside a fragmented message.
-                    if !self.fragment_buffer.is_empty() {
-                        return Err(TransportError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Received Binary frame while inside fragmented message",
-                        )));
+                    if self.fragmented_text {
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
                     }
-                    // Binary frames not used by MCP, skip otherwise
-                    continue;
+                    self.closed = true;
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Binary WebSocket messages are not supported by MCP",
+                    )));
                 }
                 WsFrameType::Close => {
+                    self.closed = true;
+                    self.fragment_buffer.clear();
+                    self.fragmented_text = false;
+                    let close_reply = WsFrame {
+                        frame_type: WsFrameType::Close,
+                        payload: frame.payload,
+                        fin: true,
+                    };
+                    self.writer.write_frame(&close_reply)?;
                     return Err(TransportError::Closed);
                 }
                 WsFrameType::Ping => {
                     // Respond with pong (masked)
                     let pong = WsFrame::pong(frame.payload);
-                    self.writer.write_frame(&pong)?;
+                    if let Err(error) = self.writer.write_frame(&pong) {
+                        self.closed = true;
+                        self.fragment_buffer.clear();
+                        self.fragmented_text = false;
+                        return Err(error);
+                    }
                     continue;
                 }
                 WsFrameType::Pong => {
@@ -866,25 +1081,16 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
 
     /// Decodes a payload into a JSON-RPC message.
     fn decode_message(&mut self, payload: Vec<u8>) -> Result<JsonRpcMessage, TransportError> {
-        let text = String::from_utf8(payload).map_err(|e| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid UTF-8: {e}"),
-            ))
-        })?;
-
-        let mut input = text.as_bytes().to_vec();
-        input.push(b'\n');
-
-        let messages = self.codec.decode(&input)?;
-        if let Some(msg) = messages.into_iter().next() {
-            return Ok(msg);
+        if let Err(error) = std::str::from_utf8(&payload) {
+            self.closed = true;
+            self.fragment_buffer.clear();
+            self.fragmented_text = false;
+            let _close_result = self.writer.write_frame(&invalid_utf8_close_frame());
+            return Err(websocket_invalid_data(format!(
+                "Invalid UTF-8 in WebSocket text message: {error}"
+            )));
         }
-
-        Err(TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Received empty message",
-        )))
+        Ok(self.codec.decode_complete_message(&payload)?)
     }
 
     /// Sends a close frame.
@@ -893,6 +1099,12 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
     ///
     /// Returns an error if I/O fails.
     pub fn close(&mut self) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.fragment_buffer.clear();
+        self.fragmented_text = false;
         let frame = WsFrame::close();
         self.writer.write_frame(&frame)?;
         Ok(())
@@ -916,6 +1128,7 @@ impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CodecError;
     use std::io::Cursor;
 
     #[test]
@@ -1205,6 +1418,129 @@ mod tests {
     }
 
     #[test]
+    fn reader_rejects_reserved_opcode_before_reading_its_payload() {
+        // The mask bit is direction-correct, but the reserved opcode is known
+        // from these two bytes. No mask key or payload bytes are supplied.
+        let mut reader = WsReader::new(Cursor::new(vec![0x83, 0x80 | 127]));
+
+        let error = reader.read_frame().unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string().contains("Unknown WebSocket opcode")
+        ));
+    }
+
+    #[test]
+    fn reader_rejects_non_minimal_extended_payload_lengths() {
+        let mut sixteen_bit = vec![0x81, 0x80 | 126];
+        sixteen_bit.extend_from_slice(&125_u16.to_be_bytes());
+        let mut reader = WsReader::new(Cursor::new(sixteen_bit));
+        let error = reader.read_frame().unwrap_err();
+        assert!(error.to_string().contains("Non-minimal"));
+
+        let mut sixty_four_bit = vec![0x81, 0x80 | 127];
+        sixty_four_bit.extend_from_slice(&u64::from(u16::MAX).to_be_bytes());
+        let mut reader = WsReader::new(Cursor::new(sixty_four_bit));
+        let error = reader.read_frame().unwrap_err();
+        assert!(error.to_string().contains("Non-minimal"));
+    }
+
+    #[test]
+    fn reader_rejects_invalid_close_payloads() {
+        let one_byte = build_masked_frame(0x08, true, &[0x03]);
+        let mut reader = WsReader::new(Cursor::new(one_byte));
+        assert!(
+            reader
+                .read_frame()
+                .unwrap_err()
+                .to_string()
+                .contains("one-byte")
+        );
+
+        let reserved_status = build_masked_frame(0x08, true, &1005_u16.to_be_bytes());
+        let mut reader = WsReader::new(Cursor::new(reserved_status));
+        assert!(
+            reader
+                .read_frame()
+                .unwrap_err()
+                .to_string()
+                .contains("status code")
+        );
+
+        let mut invalid_reason = 1000_u16.to_be_bytes().to_vec();
+        invalid_reason.push(0xff);
+        let invalid_reason = build_masked_frame(0x08, true, &invalid_reason);
+        let mut reader = WsReader::new(Cursor::new(invalid_reason));
+        assert!(
+            reader
+                .read_frame()
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn writers_reject_invalid_control_frames_before_emitting_bytes_or_drawing_a_mask() {
+        let invalid = WsFrame {
+            frame_type: WsFrameType::Ping,
+            payload: vec![0; 126],
+            fin: true,
+        };
+        let mut server_output = Vec::new();
+        {
+            let mut server_writer = WsWriter::new(&mut server_output);
+            assert!(server_writer.write_frame(&invalid).is_err());
+        }
+        assert!(server_output.is_empty());
+
+        let draw_calls = std::cell::Cell::new(0);
+        let mut client_output = Vec::new();
+        {
+            let mut client_writer = WsClientWriter::new(&mut client_output);
+            let error = client_writer.write_frame_with_mask_draw(&invalid, || {
+                draw_calls.set(draw_calls.get() + 1);
+                Ok([1, 2, 3, 4])
+            });
+            assert!(error.is_err());
+        }
+        assert_eq!(draw_calls.get(), 0);
+        assert!(client_output.is_empty());
+    }
+
+    #[test]
+    fn writers_reject_complete_invalid_utf8_text_before_emitting_bytes_or_drawing_a_mask() {
+        let invalid = WsFrame {
+            frame_type: WsFrameType::Text,
+            payload: vec![0xff],
+            fin: true,
+        };
+
+        let mut server_output = Vec::new();
+        {
+            let mut server_writer = WsWriter::new(&mut server_output);
+            assert!(server_writer.write_frame(&invalid).is_err());
+        }
+        assert!(server_output.is_empty());
+
+        let draw_calls = std::cell::Cell::new(0);
+        let mut client_output = Vec::new();
+        {
+            let mut client_writer = WsClientWriter::new(&mut client_output);
+            let error = client_writer.write_frame_with_mask_draw(&invalid, || {
+                draw_calls.set(draw_calls.get() + 1);
+                Ok([1, 2, 3, 4])
+            });
+            assert!(error.is_err());
+        }
+        assert_eq!(draw_calls.get(), 0);
+        assert!(client_output.is_empty());
+    }
+
+    #[test]
     fn test_reader_rejects_rsv_bits() {
         let mut buffer = Vec::new();
         buffer.push(0xC1); // FIN + RSV1 + Text opcode
@@ -1250,6 +1586,37 @@ mod tests {
         assert_eq!(frame.as_text().unwrap(), "hello");
     }
 
+    #[test]
+    fn test_client_reader_rejects_masked_server_frames_for_every_frame_class() {
+        let cases: [(&str, u8, bool, &[u8]); 7] = [
+            ("text", 0x01, true, b"text"),
+            ("fragmented text", 0x01, false, b"fragment"),
+            ("continuation", 0x00, true, b"continuation"),
+            ("binary", 0x02, true, b"binary"),
+            ("close", 0x08, true, b""),
+            ("ping", 0x09, true, b"ping"),
+            ("pong", 0x0A, true, b"pong"),
+        ];
+
+        for (name, opcode, fin, payload) in cases {
+            let mut reader =
+                WsReader::new_client(Cursor::new(build_masked_frame(opcode, fin, payload)));
+            let error = match reader.read_frame() {
+                Ok(frame) => panic!("client accepted masked {name} frame: {frame:?}"),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(
+                    error,
+                    TransportError::Io(ref source)
+                        if source.kind() == std::io::ErrorKind::InvalidData
+                ),
+                "masked {name} frame did not fail with InvalidData: {error:?}"
+            );
+        }
+    }
+
     /// Helper to build a masked WebSocket frame for testing server-side code.
     ///
     fn build_masked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
@@ -1281,6 +1648,176 @@ mod tests {
         frame
     }
 
+    fn build_unmasked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.push((if fin { 0x80 } else { 0x00 }) | opcode);
+        assert!(
+            payload.len() < 126,
+            "test helper only supports short frames"
+        );
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn client_transport_rejects_masked_server_data_frame() {
+        let input =
+            build_masked_frame(0x01, true, br#"{"jsonrpc":"2.0","method":"masked","id":1}"#);
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn client_transport_rejects_masked_server_fragment_before_buffering() {
+        let input = build_masked_frame(0x01, false, b"fragment");
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(!transport.fragmented_text);
+        assert!(transport.fragment_buffer.is_empty());
+    }
+
+    #[test]
+    fn client_transport_rejects_masked_server_ping_without_replying() {
+        let input = build_masked_frame(0x09, true, b"ping");
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(transport.writer.writer.is_empty());
+    }
+
+    #[test]
+    fn server_accepts_fragmented_text_with_empty_first_fragment() {
+        let payload = br#"{"jsonrpc":"2.0","method":"empty-first","id":1}"#;
+        let mut input = build_masked_frame(0x01, false, b"");
+        input.extend(build_masked_frame(0x00, true, payload));
+        let mut transport = WsTransport::new(Cursor::new(input), Vec::new());
+
+        let message = transport.recv(&Cx::for_testing()).unwrap();
+
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "empty-first");
+    }
+
+    #[test]
+    fn client_accepts_fragmented_text_with_empty_first_fragment() {
+        let payload = br#"{"jsonrpc":"2.0","method":"empty-first","id":1}"#;
+        let mut input = build_unmasked_frame(0x01, false, b"");
+        input.extend(build_unmasked_frame(0x00, true, payload));
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
+
+        let message = transport.recv(&Cx::for_testing()).unwrap();
+
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "empty-first");
+    }
+
+    #[test]
+    fn server_rejects_invalid_utf8_text_with_close_1007_and_latches_closed() {
+        let input = build_masked_frame(0x01, true, &[0xff]);
+        let mut transport = WsTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string().contains("UTF-8")
+        ));
+        assert!(transport.closed);
+        assert!(transport.fragment_buffer.is_empty());
+        assert!(!transport.fragmented_text);
+        assert_eq!(transport.writer.writer, [0x88, 0x02, 0x03, 0xef]);
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            transport.recv(&cancelled),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn client_rejects_invalid_utf8_text_with_masked_close_1007_and_latches_closed() {
+        let input = build_unmasked_frame(0x01, true, &[0xff]);
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string().contains("UTF-8")
+        ));
+        assert!(transport.closed);
+        assert!(transport.fragment_buffer.is_empty());
+        assert!(!transport.fragmented_text);
+
+        let mut close_reader = WsReader::new(Cursor::new(transport.writer.writer.as_slice()));
+        let close = close_reader.read_frame().unwrap();
+        assert_eq!(close.frame_type, WsFrameType::Close);
+        assert_eq!(close.payload, 1007_u16.to_be_bytes());
+    }
+
+    #[test]
+    fn fragmented_invalid_utf8_is_rejected_only_after_complete_message_assembly() {
+        let mut input = build_masked_frame(0x01, false, &[0xf0]);
+        input.extend(build_masked_frame(0x00, true, &[0x28]));
+        let mut transport = WsTransport::new(Cursor::new(input), Vec::new());
+
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Err(TransportError::Io(ref source))
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(transport.closed);
+        assert!(transport.fragment_buffer.is_empty());
+        assert!(!transport.fragmented_text);
+        assert_eq!(transport.writer.writer, [0x88, 0x02, 0x03, 0xef]);
+    }
+
+    #[test]
+    fn terminal_frame_read_error_clears_fragment_state() {
+        let mut input = build_masked_frame(0x01, false, b"prefix");
+        // Reserved opcode is a terminal framing error.
+        input.extend(build_masked_frame(0x03, true, b"bad"));
+        let mut transport = WsTransport::new(Cursor::new(input), Vec::new());
+
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Err(TransportError::Io(_))
+        ));
+        assert!(transport.closed);
+        assert!(transport.fragment_buffer.is_empty());
+        assert!(!transport.fragmented_text);
+    }
+
     #[test]
     fn test_fragmented_message_size_limit() {
         // Build masked frames (client -> server)
@@ -1300,6 +1837,25 @@ mod tests {
             err,
             TransportError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData
         ));
+    }
+
+    #[test]
+    fn test_transport_rejects_escaped_duplicate_object_member() {
+        let payload = br#"{"jsonrpc":"2.0","method":"first","m\u0065thod":"second","id":1}"#;
+        let frame = build_masked_frame(0x01, true, payload);
+        let writer = Vec::new();
+        let mut transport = WsTransport::new(Cursor::new(frame), writer);
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Codec(CodecError::InvalidMessage {
+                kind: crate::InvalidMessageKind::Request,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("duplicate JSON object member"));
     }
 
     #[test]
@@ -1379,6 +1935,41 @@ mod tests {
 
         let result = transport.recv(&cx);
         assert!(matches!(result, Err(TransportError::Closed)));
+        assert_eq!(transport.writer.writer, vec![0x88, 0x00]);
+
+        let request = JsonRpcRequest::new("after-close", None, 1_i64);
+        assert!(matches!(
+            transport.send_request(&cx, &request),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn server_and_client_echo_valid_peer_close_payloads_before_latching_closed() {
+        let mut payload = 1000_u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"done");
+
+        let server_input = build_masked_frame(0x08, true, &payload);
+        let mut server = WsTransport::new(Cursor::new(server_input), Vec::new());
+        assert!(matches!(
+            server.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(server.writer.writer[0], 0x88);
+        assert_eq!(usize::from(server.writer.writer[1]), payload.len());
+        assert_eq!(&server.writer.writer[2..], payload);
+
+        let client_input = build_unmasked_frame(0x08, true, &payload);
+        let mut client = WsClientTransport::new(Cursor::new(client_input), Vec::new());
+        assert!(matches!(
+            client.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+        let mut echoed = WsReader::new(Cursor::new(client.writer.writer.as_slice()));
+        let echoed = echoed.read_frame().expect("client close reply is masked");
+        assert_eq!(echoed.frame_type, WsFrameType::Close);
+        assert_eq!(echoed.payload, payload);
     }
 
     #[test]
@@ -1730,11 +2321,19 @@ mod tests {
         let mut output = Vec::new();
         let mut transport = WsTransport::new(reader, &mut output);
         transport.close().unwrap();
+        transport.close().expect("close is idempotent");
+
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::new("after-close", None, 1_i64);
+        assert!(matches!(
+            transport.send_request(&cx, &request),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(transport.ping(), Err(TransportError::Closed)));
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
 
         // Close frame: FIN + opcode 0x08 = 0x88, payload length 0
-        assert!(output.len() >= 2);
-        assert_eq!(output[0], 0x88);
-        assert_eq!(output[1], 0x00);
+        assert_eq!(output, [0x88, 0x00]);
     }
 
     #[test]
@@ -1766,25 +2365,31 @@ mod tests {
     }
 
     #[test]
-    fn ws_binary_frame_skipped_outside_fragmentation() {
-        // Binary frame (non-fragmented) followed by a text message
-        let mut buffer = Vec::new();
-        buffer.extend(build_masked_frame(0x02, true, b"binary-data"));
-        buffer.extend(build_masked_frame(
-            0x01,
-            true,
-            r#"{"jsonrpc":"2.0","method":"after_binary","id":1}"#.as_bytes(),
+    fn ws_server_rejects_binary_message_outside_fragmentation() {
+        let input = build_masked_frame(0x02, true, b"binary-data");
+        let mut transport = WsTransport::new(Cursor::new(input), Vec::new());
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
         ));
+    }
 
-        let cx = Cx::for_testing();
-        let writer: Vec<u8> = Vec::new();
-        let mut transport = WsTransport::new(Cursor::new(buffer), writer);
+    #[test]
+    fn ws_client_rejects_binary_message_outside_fragmentation() {
+        let input = build_unmasked_frame(0x02, true, b"binary-data");
+        let mut transport = WsClientTransport::new(Cursor::new(input), Vec::new());
 
-        let msg = transport.recv(&cx).unwrap();
-        let JsonRpcMessage::Request(req) = msg else {
-            panic!("expected request");
-        };
-        assert_eq!(req.method, "after_binary");
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[test]

@@ -4,18 +4,24 @@
 //! - **Stdio**: Standard input/output (primary transport)
 //! - **SSE**: Server-Sent Events (HTTP-based streaming)
 //! - **WebSocket**: Bidirectional web sockets
+//! - **HTTP**: Request/response and streamable-HTTP building blocks
+//! - **Memory**: In-process transport for tests and embedding
+//!
+//! MCP 2026-07-28 support is under implementation and remains unverified. The
+//! public protocol constant is still `2024-11-05`; the transport inventory is
+//! not aggregate conformance or release evidence.
 //!
 //! # Transport Design
 //!
-//! Transports are designed around asupersync's principles:
+//! Transport APIs expose asupersync integration points:
 //!
-//! - **Cancel-correctness**: All operations check cancellation via `Cx::checkpoint()`
-//! - **Two-phase sends**: Use reserve/commit pattern to prevent message loss
-//! - **Budget awareness**: Operations respect the request's budget constraints
+//! - **Cancellation context**: Operations receive a caller-provided `Cx`
+//! - **Two-phase-send surface**: Selected transports expose reserve/commit APIs
+//! - **Budget context**: Implementations can inspect the request's budget
 //!
 //! # Wire Format
 //!
-//! MCP uses newline-delimited JSON (NDJSON) for message framing:
+//! The stdio transport uses newline-delimited JSON (NDJSON) framing:
 //! - Each message is a single line of JSON
 //! - Messages are separated by `\n`
 //! - UTF-8 encoding is required
@@ -44,16 +50,16 @@ pub mod websocket;
 
 pub use async_io::{AsyncLineReader, AsyncStdin, AsyncStdout};
 
-pub use codec::{Codec, CodecError};
+pub use codec::{Codec, CodecError, InvalidMessageKind};
 pub use stdio::{AsyncStdioTransport, StdioTransport};
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
-/// Transport trait for cancel-correct message passing.
+/// Transport trait for context-aware message passing.
 ///
-/// All transports must integrate with asupersync's capability context (`Cx`)
-/// for cancellation checking and budget enforcement.
+/// Each operation receives an asupersync capability context (`Cx`). Concrete
+/// implementations document where they check cancellation or budget state.
 ///
 /// # Cancel-Safety
 ///
@@ -188,21 +194,22 @@ impl From<CodecError> for TransportError {
 // Two-Phase Send Protocol
 // =============================================================================
 
-/// A permit for sending a message via two-phase commit.
+/// A permit returned after a send-cancellation preflight.
 ///
-/// This implements the reserve/commit pattern for cancel-safe message sending:
-/// 1. **Reserve**: Allocate the permit (cancellable)
-/// 2. **Commit**: Send the message (infallible after reserve)
+/// `reserve_send` checks cancellation and gives the permit an exclusive borrow
+/// of the transport's writer and codec. Consuming the permit encodes, writes,
+/// and flushes synchronously without another cancellation check.
 ///
-/// # Cancel-Safety
+/// # Delivery behavior
 ///
-/// The reservation phase is the cancellation point. Once you have a permit,
-/// the send will complete. This ensures no message loss on cancellation:
+/// A permit is not a transactional delivery guarantee. Encoding, writing, or
+/// flushing can still fail, and an I/O error can occur after a partial write.
+/// Any commit-phase I/O error latches the originating transport terminal;
+/// encoding failures happen before I/O and leave it reusable.
 ///
 /// ```ignore
-/// // Cancel-safe pattern:
-/// let permit = transport.reserve_send(cx)?;  // Can be cancelled here
-/// permit.send(message);                       // Always succeeds
+/// let permit = transport.reserve_send(cx)?; // Cancellation preflight
+/// permit.send(message)?;                     // Codec/I/O errors remain possible
 /// ```
 ///
 /// # Example
@@ -214,15 +221,16 @@ impl From<CodecError> for TransportError {
 /// let mut transport = AsyncStdioTransport::new();
 /// let cx = Cx::for_testing();
 ///
-/// // Reserve a send slot (cancellable)
+/// // Check cancellation and borrow the send path
 /// let permit = transport.reserve_send(&cx)?;
 ///
-/// // At this point, we're committed - send is infallible
-/// permit.send(&JsonRpcMessage::Request(request));
+/// // No further cancellation check; codec/I/O errors are still returned
+/// permit.send(&JsonRpcMessage::Request(request))?;
 /// ```
 pub struct SendPermit<'a, W: std::io::Write> {
     writer: &'a mut W,
     codec: &'a Codec,
+    terminal: &'a mut bool,
 }
 
 impl<'a, W: std::io::Write> SendPermit<'a, W> {
@@ -230,29 +238,44 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     ///
     /// This is an internal constructor. Use `TwoPhaseTransport::reserve_send()`
     /// to obtain a permit.
-    fn new(writer: &'a mut W, codec: &'a Codec) -> Self {
-        Self { writer, codec }
+    fn new(writer: &'a mut W, codec: &'a Codec, terminal: &'a mut bool) -> Self {
+        Self {
+            writer,
+            codec,
+            terminal,
+        }
     }
 
-    /// Commits the send by writing the message.
+    fn commit(self, bytes: &[u8]) -> Result<(), TransportError> {
+        if let Err(error) = self.writer.write_all(bytes) {
+            *self.terminal = true;
+            return Err(TransportError::Io(error));
+        }
+        if let Err(error) = self.writer.flush() {
+            *self.terminal = true;
+            return Err(TransportError::Io(error));
+        }
+        Ok(())
+    }
+
+    /// Consumes the permit and writes the message.
     ///
-    /// This method is synchronous and, from the protocol's perspective,
-    /// infallible after reservation. I/O errors are returned but the
-    /// reservation is consumed regardless.
+    /// This method is synchronous and performs no additional cancellation
+    /// check after reservation. The permit is consumed whether the operation
+    /// succeeds or fails.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying write fails. However, the permit
-    /// is consumed and the reservation is released.
+    /// Returns an error if encoding, writing, or flushing fails. An I/O error
+    /// does not imply that zero bytes were written and latches the transport
+    /// terminal.
     pub fn send(self, message: &JsonRpcMessage) -> Result<(), TransportError> {
         let bytes = match message {
             JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
             JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
         };
 
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        self.commit(&bytes)
     }
 
     /// Commits the send by writing a request.
@@ -261,12 +284,11 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying write fails.
+    /// Returns an error if encoding, writing, or flushing fails. An I/O error
+    /// can occur after a partial write and latches the transport terminal.
     pub fn send_request(self, request: &JsonRpcRequest) -> Result<(), TransportError> {
         let bytes = self.codec.encode_request(request)?;
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        self.commit(&bytes)
     }
 
     /// Commits the send by writing a response.
@@ -275,42 +297,28 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying write fails.
+    /// Returns an error if encoding, writing, or flushing fails. An I/O error
+    /// can occur after a partial write and latches the transport terminal.
     pub fn send_response(self, response: &JsonRpcResponse) -> Result<(), TransportError> {
         let bytes = self.codec.encode_response(response)?;
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        self.commit(&bytes)
     }
 }
 
 /// Extension trait for two-phase send operations.
 ///
-/// This trait adds the reserve/commit pattern to transports. The pattern
-/// ensures cancel-safety by making the reservation the cancellation point:
+/// This trait splits cancellation preflight from synchronous send work:
 ///
-/// - **Reserve phase**: Check cancellation, allocate resources
-/// - **Commit phase**: Actually send (synchronous, infallible from protocol perspective)
+/// - **Reserve phase**: Check cancellation and borrow the writer/codec
+/// - **Send phase**: Encode, write, and flush without another cancellation check
 ///
-/// # Why Two-Phase?
+/// The API does not make the underlying I/O transactional. Send methods can
+/// return codec or I/O errors, including after a partial write.
 ///
-/// Without two-phase:
 /// ```ignore
-/// // BROKEN: Can lose messages on cancel
-/// async fn bad_send(cx: &Cx, msg: Message) {
-///     let serialized = serialize(&msg);  // Work done
-///     cx.checkpoint()?;                   // Cancel here = lost message!
-///     writer.write(&serialized).await;
-/// }
-/// ```
-///
-/// With two-phase:
-/// ```ignore
-/// // CORRECT: Either fully sent or not started
-/// async fn good_send(cx: &Cx, msg: Message) {
-///     let permit = transport.reserve_send(cx)?;  // Cancel here = no work lost
-///     // After reserve, commit is synchronous and infallible
-///     permit.send(msg);
+/// fn send_after_preflight(cx: &Cx, msg: &JsonRpcMessage) -> Result<(), TransportError> {
+///     let permit = transport.reserve_send(cx)?;
+///     permit.send(msg)
 /// }
 /// ```
 pub trait TwoPhaseTransport: Transport {
@@ -319,8 +327,9 @@ pub trait TwoPhaseTransport: Transport {
 
     /// Reserve a send slot.
     ///
-    /// This is the cancellation point for sends. If this succeeds, the
-    /// subsequent `permit.send()` will complete.
+    /// This is the cancellation preflight for sends. If it succeeds, the
+    /// subsequent permit operation performs no further cancellation check;
+    /// encoding and I/O can still fail.
     ///
     /// # Errors
     ///
@@ -360,6 +369,7 @@ mod tests {
     struct TwoPhaseFixture {
         writer: Vec<u8>,
         codec: Codec,
+        terminal: bool,
     }
 
     impl Default for TwoPhaseFixture {
@@ -367,12 +377,16 @@ mod tests {
             Self {
                 writer: Vec::new(),
                 codec: Codec::new(),
+                terminal: false,
             }
         }
     }
 
     impl Transport for TwoPhaseFixture {
         fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            if self.terminal {
+                return Err(TransportError::Closed);
+            }
             let permit = self.reserve_send(cx)?;
             permit.send(message)
         }
@@ -382,6 +396,7 @@ mod tests {
         }
 
         fn close(&mut self) -> Result<(), TransportError> {
+            self.terminal = true;
             Ok(())
         }
     }
@@ -396,8 +411,15 @@ mod tests {
             if cx.is_cancel_requested() {
                 return Err(TransportError::Cancelled);
             }
+            if self.terminal {
+                return Err(TransportError::Closed);
+            }
 
-            Ok(SendPermit::new(&mut self.writer, &self.codec))
+            Ok(SendPermit::new(
+                &mut self.writer,
+                &self.codec,
+                &mut self.terminal,
+            ))
         }
     }
 

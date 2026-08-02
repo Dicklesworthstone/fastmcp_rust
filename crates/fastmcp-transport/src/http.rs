@@ -48,13 +48,17 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex, TryLockError,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use asupersync::{Cx, channel::mpsc};
+use fastmcp_core::draw_security_identifier;
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 
 use crate::{Codec, CodecError, Transport, TransportError};
 
@@ -140,7 +144,7 @@ impl HttpStatus {
 }
 
 /// Incoming HTTP request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     /// HTTP method.
     pub method: HttpMethod,
@@ -152,6 +156,19 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     /// Query parameters.
     pub query: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path_bytes", &self.path.len())
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .field("query_parameter_count", &self.query.len())
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -192,7 +209,11 @@ impl HttpRequest {
     /// Gets a header value (case-insensitive).
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_lowercase()).map(String::as_str)
+        self.headers.iter().find_map(|(header_name, value)| {
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.as_str())
+        })
     }
 
     /// Gets the Content-Type header.
@@ -223,6 +244,9 @@ pub struct HttpResponse {
     /// Response body.
     pub body: Vec<u8>,
 }
+
+const JSON_ENCODING_ERROR_BODY: &[u8] =
+    br#"{"error":{"code":-32603,"message":"Failed to encode JSON response"}}"#;
 
 impl HttpResponse {
     /// Creates a new HTTP response with the given status.
@@ -271,28 +295,58 @@ impl HttpResponse {
     }
 
     /// Sets the body as JSON.
+    ///
+    /// Serialization failures are converted into a deterministic 500 response
+    /// with a nonempty JSON error body. Use [`Self::try_with_json`] when the
+    /// caller needs the typed serialization error instead.
     #[must_use]
     pub fn with_json<T: serde::Serialize>(mut self, value: &T) -> Self {
-        self.body = serde_json::to_vec(value).unwrap_or_default();
+        match serde_json::to_vec(value) {
+            Ok(body) => self.body = body,
+            Err(_) => {
+                self.status = HttpStatus::INTERNAL_SERVER_ERROR;
+                self.body = JSON_ENCODING_ERROR_BODY.to_vec();
+            }
+        }
         self.headers
             .insert("content-type".to_string(), "application/json".to_string());
         self
     }
 
+    /// Tries to set the body as JSON, preserving serialization failure as a
+    /// typed [`HttpError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::JsonError`] when `value` cannot be serialized.
+    pub fn try_with_json<T: serde::Serialize>(mut self, value: &T) -> Result<Self, HttpError> {
+        self.body = serde_json::to_vec(value)?;
+        self.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        Ok(self)
+    }
+
     /// Sets CORS headers for cross-origin requests.
     #[must_use]
     pub fn with_cors(mut self, origin: &str) -> Self {
+        if !is_valid_http_header_value(origin) {
+            return self;
+        }
         self.headers.insert(
             "access-control-allow-origin".to_string(),
             origin.to_string(),
         );
         self.headers.insert(
             "access-control-allow-methods".to_string(),
-            "GET, POST, OPTIONS".to_string(),
+            "POST, OPTIONS".to_string(),
         );
         self.headers.insert(
             "access-control-allow-headers".to_string(),
             "Content-Type, Authorization".to_string(),
+        );
+        self.headers.insert(
+            "vary".to_string(),
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers".to_string(),
         );
         self
     }
@@ -307,15 +361,23 @@ impl HttpResponse {
 pub enum HttpError {
     /// Invalid HTTP method.
     InvalidMethod(String),
+    /// Invalid HTTP request line.
+    InvalidRequestLine(String),
+    /// Invalid HTTP header syntax or framing.
+    InvalidHeader(String),
     /// Invalid Content-Type.
     InvalidContentType(String),
+    /// Request path does not match the configured MCP endpoint.
+    InvalidPath(String),
+    /// Request Origin is not admitted by the configured policy.
+    OriginNotAllowed(String),
     /// HTTP headers exceeded the maximum allowed size.
     HeadersTooLarge { size: usize, max: usize },
     /// HTTP body exceeded the maximum allowed size.
     BodyTooLarge { size: usize, max: usize },
     /// Unsupported Transfer-Encoding.
     UnsupportedTransferEncoding(String),
-    /// JSON parsing error.
+    /// JSON encoding or decoding error.
     JsonError(serde_json::Error),
     /// Codec error.
     CodecError(CodecError),
@@ -330,15 +392,17 @@ pub enum HttpError {
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidMethod(m) => write!(f, "invalid HTTP method: {}", m),
-            Self::InvalidContentType(ct) => write!(f, "invalid content type: {}", ct),
+            Self::InvalidMethod(_) => write!(f, "invalid HTTP method"),
+            Self::InvalidRequestLine(_) => write!(f, "invalid HTTP request line"),
+            Self::InvalidHeader(_) => write!(f, "invalid HTTP header"),
+            Self::InvalidContentType(_) => write!(f, "invalid content type"),
+            Self::InvalidPath(_) => write!(f, "invalid MCP endpoint path"),
+            Self::OriginNotAllowed(_) => write!(f, "origin is not allowed"),
             Self::HeadersTooLarge { size, max } => {
                 write!(f, "headers too large: {size} > {max} bytes")
             }
             Self::BodyTooLarge { size, max } => write!(f, "body too large: {size} > {max} bytes"),
-            Self::UnsupportedTransferEncoding(te) => {
-                write!(f, "unsupported transfer encoding: {}", te)
-            }
+            Self::UnsupportedTransferEncoding(_) => write!(f, "unsupported transfer encoding"),
             Self::JsonError(e) => write!(f, "JSON error: {}", e),
             Self::CodecError(e) => write!(f, "codec error: {}", e),
             Self::Timeout => write!(f, "request timeout"),
@@ -368,6 +432,111 @@ impl From<TransportError> for HttpError {
     }
 }
 
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_valid_http_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || byte >= b' ' && byte != 0x7f)
+}
+
+/// Validates requests assembled through the public `HttpRequest` fields.
+///
+/// The wire parser normalizes names while parsing, but framework integrations
+/// commonly construct `HttpRequest` directly. HTTP field names remain
+/// case-insensitive on that path, and two differently-cased map keys must not
+/// be allowed to smuggle conflicting security-sensitive values.
+fn validate_http_request_headers(request: &HttpRequest) -> Result<(), HttpError> {
+    let mut normalized_names = HashSet::with_capacity(request.headers.len());
+    for (name, value) in &request.headers {
+        if !is_http_token(name) {
+            return Err(HttpError::InvalidHeader(format!(
+                "invalid request header name: {name}"
+            )));
+        }
+        if !is_valid_http_header_value(value) {
+            return Err(HttpError::InvalidHeader(format!(
+                "invalid value for request header {name}"
+            )));
+        }
+
+        let normalized_name = name.to_ascii_lowercase();
+        if !normalized_names.insert(normalized_name.clone()) {
+            return Err(HttpError::InvalidHeader(format!(
+                "duplicate request header: {normalized_name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_request_metadata(request: &HttpRequest) -> Result<(), HttpError> {
+    if request.method != HttpMethod::Post {
+        return Err(HttpError::InvalidMethod(
+            request.method.as_str().to_string(),
+        ));
+    }
+
+    let content_type = request.content_type().unwrap_or("");
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return Err(HttpError::InvalidContentType(content_type.to_string()));
+    }
+    Ok(())
+}
+
+fn is_origin_allowed(config: &HttpHandlerConfig, origin: &str) -> bool {
+    config.allow_cors
+        && !origin.is_empty()
+        && config.cors_origins.iter().any(|allowed| allowed == origin)
+}
+
+fn validate_mcp_request_policy(
+    request: &HttpRequest,
+    config: &HttpHandlerConfig,
+) -> Result<(), HttpError> {
+    validate_http_request_headers(request)?;
+    if request.path != config.base_path {
+        return Err(HttpError::InvalidPath(request.path.clone()));
+    }
+    if let Some(origin) = request.header("origin") {
+        if !is_origin_allowed(config, origin) {
+            return Err(HttpError::OriginNotAllowed(origin.to_string()));
+        }
+    }
+    validate_mcp_request_metadata(request)?;
+    if request.body.len() > config.max_body_size {
+        return Err(HttpError::BodyTooLarge {
+            size: request.body.len(),
+            max: config.max_body_size,
+        });
+    }
+    Ok(())
+}
+
 // =============================================================================
 // HTTP Request Handler
 // =============================================================================
@@ -379,10 +548,12 @@ pub struct HttpHandlerConfig {
     pub base_path: String,
     /// Whether to allow CORS requests.
     pub allow_cors: bool,
-    /// Allowed CORS origins ("*" for all).
+    /// Exact allowed CORS origins.
+    ///
+    /// Wildcards are deliberately unsupported because MCP requests can carry
+    /// credentials. Each cross-origin deployment must name every trusted
+    /// origin explicitly.
     pub cors_origins: Vec<String>,
-    /// Request timeout.
-    pub timeout: Duration,
     /// Maximum request body size in bytes.
     pub max_body_size: usize,
 }
@@ -391,9 +562,8 @@ impl Default for HttpHandlerConfig {
     fn default() -> Self {
         Self {
             base_path: "/mcp/v1".to_string(),
-            allow_cors: true,
-            cors_origins: vec!["*".to_string()],
-            timeout: Duration::from_secs(30),
+            allow_cors: false,
+            cors_origins: Vec::new(),
             max_body_size: 10 * 1024 * 1024, // 10 MB
         }
     }
@@ -404,6 +574,10 @@ impl Default for HttpHandlerConfig {
 /// This handler is designed to be integrated with any HTTP server framework.
 /// It processes incoming HTTP requests, extracts JSON-RPC messages, and returns
 /// appropriate HTTP responses.
+///
+/// [`HttpRequest`] already owns its body. Integrations must also enforce a
+/// streaming body limit before constructing that value; this handler's size
+/// check prevents parsing but cannot undo allocation performed upstream.
 pub struct HttpRequestHandler {
     config: HttpHandlerConfig,
     codec: Codec,
@@ -419,10 +593,9 @@ impl HttpRequestHandler {
     /// Creates a new HTTP request handler with the given configuration.
     #[must_use]
     pub fn with_config(config: HttpHandlerConfig) -> Self {
-        Self {
-            config,
-            codec: Codec::new(),
-        }
+        let mut codec = Codec::new();
+        codec.set_max_message_size(config.max_body_size);
+        Self { config, codec }
     }
 
     /// Returns the handler configuration.
@@ -434,11 +607,25 @@ impl HttpRequestHandler {
     /// Handles a CORS preflight OPTIONS request.
     #[must_use]
     pub fn handle_options(&self, request: &HttpRequest) -> HttpResponse {
+        if validate_http_request_headers(request).is_err() {
+            return HttpResponse::new(HttpStatus::BAD_REQUEST);
+        }
+        if request.path != self.config.base_path {
+            return HttpResponse::new(HttpStatus::NOT_FOUND);
+        }
+        if request.method != HttpMethod::Options {
+            return HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED);
+        }
         if !self.config.allow_cors {
             return HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED);
         }
 
-        let origin = request.header("origin").unwrap_or("*");
+        let Some(origin) = request.header("origin") else {
+            return HttpResponse::new(HttpStatus::FORBIDDEN);
+        };
+        if request.header("access-control-request-method") != Some("POST") {
+            return HttpResponse::new(HttpStatus::FORBIDDEN);
+        }
         let allowed = self.is_origin_allowed(origin);
 
         if !allowed {
@@ -453,53 +640,79 @@ impl HttpRequestHandler {
     /// Checks if the origin is allowed for CORS.
     #[must_use]
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
-        self.config
-            .cors_origins
-            .iter()
-            .any(|o| o == "*" || o == origin)
+        is_origin_allowed(&self.config, origin)
     }
 
     /// Parses a JSON-RPC request from an HTTP request.
     pub fn parse_request(&self, request: &HttpRequest) -> Result<JsonRpcRequest, HttpError> {
-        // Validate method
-        if request.method != HttpMethod::Post {
-            return Err(HttpError::InvalidMethod(
-                request.method.as_str().to_string(),
-            ));
-        }
+        validate_mcp_request_policy(request, &self.config)?;
 
-        // Validate content type
-        let content_type = request.content_type().unwrap_or("");
-        if !content_type.starts_with("application/json") {
-            return Err(HttpError::InvalidContentType(content_type.to_string()));
-        }
-
-        // Validate body size
-        if request.body.len() > self.config.max_body_size {
-            return Err(HttpError::BodyTooLarge {
-                size: request.body.len(),
-                max: self.config.max_body_size,
-            });
-        }
-
-        // Parse JSON-RPC request
-        let json_rpc: JsonRpcRequest = serde_json::from_slice(&request.body)?;
-        Ok(json_rpc)
+        // HTTP framing already supplies one complete body. Route it through
+        // the shared strict JSON admission boundary before typed decoding.
+        Ok(self.codec.decode_complete_request(&request.body)?)
     }
 
     /// Creates an HTTP response from a JSON-RPC response.
+    ///
+    /// Encoding failures are converted into a deterministic 500 response with
+    /// a nonempty JSON error body. Use [`Self::try_create_response`] when the
+    /// caller needs the typed codec error instead.
     #[must_use]
     pub fn create_response(
         &self,
         response: &JsonRpcResponse,
         origin: Option<&str>,
     ) -> HttpResponse {
-        let body = self.codec.encode_response(response).unwrap_or_default();
+        self.create_response_from_encoding(self.codec.encode_response(response), origin)
+    }
 
-        let mut http_response = HttpResponse::ok()
+    /// Tries to create an HTTP response from a JSON-RPC response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::CodecError`] when the JSON-RPC response cannot be
+    /// encoded.
+    pub fn try_create_response(
+        &self,
+        response: &JsonRpcResponse,
+        origin: Option<&str>,
+    ) -> Result<HttpResponse, HttpError> {
+        self.try_create_response_from_encoding(self.codec.encode_response(response), origin)
+    }
+
+    fn create_response_from_encoding(
+        &self,
+        encoded: Result<Vec<u8>, CodecError>,
+        origin: Option<&str>,
+    ) -> HttpResponse {
+        match self.try_create_response_from_encoding(encoded, origin) {
+            Ok(response) => response,
+            Err(_) => self.with_allowed_origin(
+                HttpResponse::internal_error().with_body(JSON_ENCODING_ERROR_BODY),
+                origin,
+            ),
+        }
+    }
+
+    fn try_create_response_from_encoding(
+        &self,
+        encoded: Result<Vec<u8>, CodecError>,
+        origin: Option<&str>,
+    ) -> Result<HttpResponse, HttpError> {
+        let body = encoded?;
+
+        let http_response = HttpResponse::ok()
             .with_body(body)
             .with_header("content-type", "application/json");
 
+        Ok(self.with_allowed_origin(http_response, origin))
+    }
+
+    fn with_allowed_origin(
+        &self,
+        mut http_response: HttpResponse,
+        origin: Option<&str>,
+    ) -> HttpResponse {
         if self.config.allow_cors {
             if let Some(origin) = origin {
                 if self.is_origin_allowed(origin) {
@@ -544,27 +757,47 @@ pub struct HttpTransport<R, W> {
     reader: R,
     writer: W,
     codec: Codec,
+    config: HttpHandlerConfig,
     closed: bool,
-    pending_responses: Vec<JsonRpcResponse>,
+    /// Exact admitted Origin for the request awaiting its response.
+    response_origin: Option<String>,
+    /// Whether one admitted HTTP request is still awaiting its sole response.
+    response_pending: bool,
 }
 
 impl<R: Read, W: Write> HttpTransport<R, W> {
     /// Creates a new HTTP transport.
     #[must_use]
     pub fn new(reader: R, writer: W) -> Self {
+        Self::with_config(reader, writer, HttpHandlerConfig::default())
+    }
+
+    /// Creates an HTTP transport with an explicit endpoint and Origin policy.
+    #[must_use]
+    pub fn with_config(reader: R, writer: W, config: HttpHandlerConfig) -> Self {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(config.max_body_size);
         Self {
             reader,
             writer,
-            codec: Codec::new(),
+            codec,
+            config,
             closed: false,
-            pending_responses: Vec::new(),
+            response_origin: None,
+            response_pending: false,
         }
+    }
+
+    /// Returns the transport's HTTP admission policy.
+    #[must_use]
+    pub fn config(&self) -> &HttpHandlerConfig {
+        &self.config
     }
 
     /// Reads an HTTP request from the reader.
     pub fn read_request(&mut self) -> Result<HttpRequest, HttpError> {
         const MAX_HEADERS_SIZE: usize = 64 * 1024;
-        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+        let max_body_size = self.config.max_body_size;
 
         let mut buffer = Vec::new();
         let mut byte = [0u8; 1];
@@ -581,36 +814,45 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             }
             buffer.push(byte[0]);
 
-            if buffer.ends_with(b"\r\n\r\n") {
-                break;
-            }
-
-            // Prevent infinite loops
             if buffer.len() > MAX_HEADERS_SIZE {
                 return Err(HttpError::HeadersTooLarge {
                     size: buffer.len(),
                     max: MAX_HEADERS_SIZE,
                 });
             }
+            if buffer.ends_with(b"\r\n\r\n") {
+                break;
+            }
         }
 
-        let header_str = String::from_utf8_lossy(&buffer);
-        let mut lines = header_str.lines();
+        let header_str = std::str::from_utf8(&buffer)
+            .map_err(|_| HttpError::InvalidHeader("headers are not valid UTF-8".to_string()))?;
+        let header_block = header_str.strip_suffix("\r\n\r\n").ok_or_else(|| {
+            HttpError::InvalidHeader("headers are not terminated by CRLF CRLF".to_string())
+        })?;
+        let mut lines = header_block.split("\r\n");
 
         // Parse request line
         let request_line = lines
             .next()
-            .ok_or_else(|| HttpError::InvalidMethod("missing request line".to_string()))?;
-
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(HttpError::InvalidMethod("invalid request line".to_string()));
+            .ok_or_else(|| HttpError::InvalidRequestLine("missing request line".to_string()))?;
+        let mut request_parts = request_line.split(' ');
+        let method_token = request_parts.next().unwrap_or("");
+        let full_path = request_parts.next().unwrap_or("");
+        let version = request_parts.next().unwrap_or("");
+        if method_token.is_empty()
+            || full_path.is_empty()
+            || !full_path.bytes().all(|byte| byte.is_ascii_graphic())
+            || version != "HTTP/1.1"
+            || request_parts.next().is_some()
+        {
+            return Err(HttpError::InvalidRequestLine(request_line.to_string()));
         }
 
-        let method = HttpMethod::parse(parts[0])
-            .ok_or_else(|| HttpError::InvalidMethod(parts[0].to_string()))?;
+        let method = HttpMethod::parse(method_token)
+            .filter(|method| method.as_str() == method_token)
+            .ok_or_else(|| HttpError::InvalidMethod(method_token.to_string()))?;
 
-        let full_path = parts[1];
         let (path, query_str) = full_path
             .split_once('?')
             .map_or((full_path.to_string(), None), |(p, q)| {
@@ -632,11 +874,44 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         let mut headers = HashMap::new();
         for line in lines {
             if line.is_empty() {
-                break;
+                return Err(HttpError::InvalidHeader(
+                    "unexpected empty header line".to_string(),
+                ));
             }
-            if let Some((name, value)) = line.split_once(':') {
-                headers.insert(name.trim().to_lowercase(), value.trim().to_string());
+            if line.starts_with(' ') || line.starts_with('\t') {
+                return Err(HttpError::InvalidHeader(
+                    "obsolete folded header line".to_string(),
+                ));
             }
+            let (name, raw_value) = line.split_once(':').ok_or_else(|| {
+                HttpError::InvalidHeader("header is missing ':' separator".to_string())
+            })?;
+            if !is_http_token(name) {
+                return Err(HttpError::InvalidHeader(format!(
+                    "invalid header name: {name}"
+                )));
+            }
+            let value = raw_value.trim_matches([' ', '\t']);
+            if !is_valid_http_header_value(value) {
+                return Err(HttpError::InvalidHeader(format!(
+                    "invalid value for header {name}"
+                )));
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            if headers
+                .insert(normalized_name.clone(), value.to_string())
+                .is_some()
+            {
+                return Err(HttpError::InvalidHeader(format!(
+                    "duplicate header: {normalized_name}"
+                )));
+            }
+        }
+
+        if headers.contains_key("content-length") && headers.contains_key("transfer-encoding") {
+            return Err(HttpError::InvalidHeader(
+                "content-length and transfer-encoding cannot be combined".to_string(),
+            ));
         }
 
         // Read body.
@@ -646,7 +921,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         let mut body = Vec::new();
 
         if let Some(te) = headers.get("transfer-encoding") {
-            if te.to_ascii_lowercase().contains("chunked") {
+            if te.trim().eq_ignore_ascii_case("chunked") {
                 // Chunked transfer encoding
                 loop {
                     // Read chunk size line (hex), terminated by CRLF.
@@ -661,24 +936,36 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                             return Err(HttpError::Closed);
                         }
                         line.push(byte[0]);
-                        if line.ends_with(b"\r\n") {
-                            break;
-                        }
                         if line.len() > 1024 {
-                            return Err(HttpError::InvalidMethod(
+                            return Err(HttpError::InvalidHeader(
                                 "invalid chunk size line".to_string(),
                             ));
                         }
+                        if line.ends_with(b"\r\n") {
+                            break;
+                        }
                     }
 
-                    let line_str = String::from_utf8_lossy(&line);
-                    let size_str = line_str.trim().split(';').next().unwrap_or("");
+                    let line_str = std::str::from_utf8(&line).map_err(|_| {
+                        HttpError::InvalidHeader("chunk size is not valid UTF-8".to_string())
+                    })?;
+                    let size_str = line_str.strip_suffix("\r\n").ok_or_else(|| {
+                        HttpError::InvalidHeader(
+                            "chunk size line is not CRLF terminated".to_string(),
+                        )
+                    })?;
+                    if size_str.contains(';') {
+                        return Err(HttpError::InvalidHeader(
+                            "chunk extensions are not supported".to_string(),
+                        ));
+                    }
                     let size = usize::from_str_radix(size_str, 16)
-                        .map_err(|_| HttpError::InvalidMethod("invalid chunk size".to_string()))?;
+                        .map_err(|_| HttpError::InvalidHeader("invalid chunk size".to_string()))?;
 
                     if size == 0 {
                         // Read and discard trailer headers until CRLF.
                         let mut trailer = Vec::new();
+                        let mut trailer_bytes = 0_usize;
                         loop {
                             trailer.clear();
                             loop {
@@ -691,34 +978,49 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                                     return Err(HttpError::Closed);
                                 }
                                 trailer.push(byte[0]);
-                                if trailer.ends_with(b"\r\n") {
-                                    break;
-                                }
                                 if trailer.len() > MAX_HEADERS_SIZE {
                                     return Err(HttpError::HeadersTooLarge {
                                         size: trailer.len(),
                                         max: MAX_HEADERS_SIZE,
                                     });
                                 }
+                                if trailer.ends_with(b"\r\n") {
+                                    break;
+                                }
+                            }
+                            trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+                            if trailer_bytes > MAX_HEADERS_SIZE {
+                                return Err(HttpError::HeadersTooLarge {
+                                    size: trailer_bytes,
+                                    max: MAX_HEADERS_SIZE,
+                                });
                             }
                             if trailer == b"\r\n" {
                                 break;
                             }
+                            return Err(HttpError::InvalidHeader(
+                                "HTTP trailer fields are not supported".to_string(),
+                            ));
                         }
                         break;
                     }
 
-                    let mut chunk = vec![0u8; size];
-                    self.reader
-                        .read_exact(&mut chunk)
-                        .map_err(|e| HttpError::Transport(e.into()))?;
-                    body.extend_from_slice(&chunk);
-                    if body.len() > MAX_BODY_SIZE {
+                    // Reject the declared aggregate length before allocating
+                    // the chunk. Allocating `size` first would let an
+                    // attacker trigger an OOM with only a large hexadecimal
+                    // chunk header on the wire.
+                    let body_start = body.len();
+                    let projected_body_size = body_start.saturating_add(size);
+                    if projected_body_size > max_body_size {
                         return Err(HttpError::BodyTooLarge {
-                            size: body.len(),
-                            max: MAX_BODY_SIZE,
+                            size: projected_body_size,
+                            max: max_body_size,
                         });
                     }
+                    body.resize(projected_body_size, 0);
+                    self.reader
+                        .read_exact(&mut body[body_start..])
+                        .map_err(|e| HttpError::Transport(e.into()))?;
 
                     // Consume trailing CRLF after the chunk.
                     let mut crlf = [0u8; 2];
@@ -726,7 +1028,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                         .read_exact(&mut crlf)
                         .map_err(|e| HttpError::Transport(e.into()))?;
                     if &crlf != b"\r\n" {
-                        return Err(HttpError::InvalidMethod(
+                        return Err(HttpError::InvalidHeader(
                             "invalid chunk terminator".to_string(),
                         ));
                     }
@@ -736,15 +1038,24 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             }
         } else {
             // Content-Length (if present)
-            let content_length: usize = headers
-                .get("content-length")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let content_length = match headers.get("content-length") {
+                Some(value) => {
+                    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(HttpError::InvalidHeader(
+                            "invalid content-length".to_string(),
+                        ));
+                    }
+                    value.parse::<usize>().map_err(|_| {
+                        HttpError::InvalidHeader("content-length is out of range".to_string())
+                    })?
+                }
+                None => 0,
+            };
 
-            if content_length > MAX_BODY_SIZE {
+            if content_length > max_body_size {
                 return Err(HttpError::BodyTooLarge {
                     size: content_length,
-                    max: MAX_BODY_SIZE,
+                    max: max_body_size,
                 });
             }
 
@@ -767,13 +1078,55 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
     /// Writes an HTTP response to the writer.
     pub fn write_response(&mut self, response: &HttpResponse) -> Result<(), HttpError> {
+        // Validate the complete header set before emitting the status line so
+        // a rejected field cannot leave a partial response on the wire.
+        let mut normalized_names = HashSet::new();
+        let mut has_content_length = false;
+        for (name, value) in &response.headers {
+            if !is_http_token(name) {
+                return Err(HttpError::InvalidHeader(format!(
+                    "invalid response header name: {name}"
+                )));
+            }
+            if !is_valid_http_header_value(value) {
+                return Err(HttpError::InvalidHeader(format!(
+                    "invalid value for response header {name}"
+                )));
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            if !normalized_names.insert(normalized_name.clone()) {
+                return Err(HttpError::InvalidHeader(format!(
+                    "duplicate response header: {normalized_name}"
+                )));
+            }
+            if normalized_name == "transfer-encoding" {
+                return Err(HttpError::InvalidHeader(
+                    "HttpTransport does not encode transfer-encoding responses".to_string(),
+                ));
+            }
+            if normalized_name == "content-length" {
+                let length = value.parse::<usize>().map_err(|_| {
+                    HttpError::InvalidHeader("invalid response content-length".to_string())
+                })?;
+                if length != response.body.len() {
+                    return Err(HttpError::InvalidHeader(
+                        "response content-length does not match body".to_string(),
+                    ));
+                }
+                has_content_length = true;
+            }
+        }
+
         let status_text = match response.status.0 {
             200 => "OK",
+            202 => "Accepted",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "Unknown",
         };
 
@@ -792,7 +1145,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         }
 
         // Write content-length if not present
-        if !response.headers.contains_key("content-length") {
+        if !has_content_length {
             write!(self.writer, "content-length: {}\r\n", response.body.len())
                 .map_err(|e| HttpError::Transport(e.into()))?;
         }
@@ -810,21 +1163,15 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
         Ok(())
     }
-
-    /// Queues a response to be sent.
-    pub fn queue_response(&mut self, response: JsonRpcResponse) {
-        self.pending_responses.push(response);
-    }
 }
 
 impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
-
         if self.closed {
             return Err(TransportError::Closed);
+        }
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
         }
 
         let response = match message {
@@ -842,38 +1189,100 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
             }
         };
 
-        let http_response = HttpResponse::ok().with_json(&response);
+        if !self.response_pending {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no admitted HTTP request is awaiting a response",
+            )));
+        }
 
-        self.write_response(&http_response)
-            .map_err(|_| TransportError::Io(std::io::Error::other("write error")))?;
+        let encoded = self.codec.encode_response(&response)?;
+        let mut http_response = HttpResponse::ok()
+            .with_body(encoded)
+            .with_header("content-type", "application/json");
+        if let Some(origin) = self.response_origin.as_deref() {
+            http_response = http_response.with_cors(origin);
+        }
+
+        if self.write_response(&http_response).is_err() {
+            // A partially written HTTP response cannot be retried safely on
+            // the same byte stream.
+            self.closed = true;
+            return Err(TransportError::Io(std::io::Error::other("write error")));
+        }
+        self.response_pending = false;
+        self.response_origin = None;
 
         Ok(())
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
-
         if self.closed {
             return Err(TransportError::Closed);
         }
+        if cx.is_cancel_requested() {
+            return Err(TransportError::Cancelled);
+        }
+        if self.response_pending {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "previous HTTP request is still awaiting a response",
+            )));
+        }
 
-        let http_request = self.read_request().map_err(|e| match e {
-            HttpError::Closed => TransportError::Closed,
-            HttpError::Timeout => TransportError::Timeout,
-            _ => TransportError::Io(std::io::Error::other(e.to_string())),
+        let http_request = match self.read_request() {
+            Ok(request) => request,
+            Err(error) => {
+                // The incremental HTTP parser may already have consumed a
+                // request-line, headers, chunk metadata, or body prefix. It is
+                // never safe to treat the remaining suffix as a new request.
+                self.closed = true;
+                self.response_pending = false;
+                self.response_origin = None;
+                return Err(match error {
+                    HttpError::Closed => TransportError::Closed,
+                    HttpError::Timeout => TransportError::Timeout,
+                    _ => TransportError::Io(std::io::Error::other(error.to_string())),
+                });
+            }
+        };
+        validate_mcp_request_policy(&http_request, &self.config).map_err(|error| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
         })?;
+        self.response_origin = http_request.header("origin").map(ToOwned::to_owned);
+        self.response_pending = true;
 
-        // Parse JSON-RPC from body
-        let json_rpc: JsonRpcRequest = serde_json::from_slice(&http_request.body)
-            .map_err(|e| TransportError::Codec(CodecError::Json(e)))?;
+        // Parse JSON-RPC from the complete HTTP body through the same bounded
+        // admission policy used by every other transport.
+        let json_rpc = self.codec.decode_complete_request(&http_request.body)?;
+
+        if json_rpc.is_notification() {
+            // Streamable HTTP acknowledges notification POSTs at the HTTP
+            // layer; JSON-RPC itself does not produce a response. Completing
+            // that exchange here prevents the one-outstanding-request guard
+            // from permanently blocking the next request.
+            let mut accepted = HttpResponse::new(HttpStatus::ACCEPTED);
+            if let Some(origin) = self.response_origin.as_deref() {
+                accepted = accepted.with_cors(origin);
+            }
+            if self.write_response(&accepted).is_err() {
+                self.closed = true;
+                return Err(TransportError::Io(std::io::Error::other("write error")));
+            }
+            self.response_pending = false;
+            self.response_origin = None;
+        }
 
         Ok(JsonRpcMessage::Request(json_rpc))
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
         self.closed = true;
+        self.response_pending = false;
+        self.response_origin = None;
         Ok(())
     }
 }
@@ -882,75 +1291,772 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
 // Streaming HTTP Transport
 // =============================================================================
 
+const DEFAULT_STREAMABLE_QUEUE_CAPACITY: usize = 64;
+const MAX_STREAMABLE_QUEUE_CAPACITY: usize = 1_024;
+const MAX_STREAMABLE_QUEUED_BYTES_PER_DIRECTION: usize = 16 * 1024 * 1024;
+
+struct QueuedRequest {
+    message: JsonRpcRequest,
+    serialized_bytes: usize,
+}
+
+struct QueuedResponse {
+    message: JsonRpcResponse,
+    serialized_bytes: usize,
+}
+
+struct StreamableResponseMailbox {
+    queue: VecDeque<QueuedResponse>,
+    retained_bytes: usize,
+}
+
+struct StreamableAdmissionGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for StreamableAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "streamable admission count underflow");
+    }
+}
+
+fn begin_streamable_admission<'a>(
+    open: &AtomicBool,
+    active: &'a AtomicUsize,
+) -> Result<StreamableAdmissionGuard<'a>, TransportError> {
+    // These two atomics form one admission gate. Sequential consistency is
+    // intentional: with only acquire/release ordering, close could observe the
+    // old active count while an entrant observed the old open flag (the
+    // store-buffering outcome), allowing an admission to outlive close.
+    active.fetch_add(1, Ordering::SeqCst);
+    if !open.load(Ordering::SeqCst) {
+        let previous = active.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "streamable admission count underflow");
+        return Err(TransportError::Closed);
+    }
+    Ok(StreamableAdmissionGuard { active })
+}
+
+fn close_streamable_admissions(open: &AtomicBool, active: &AtomicUsize) {
+    open.store(false, Ordering::SeqCst);
+    while active.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
+}
+
+impl StreamableResponseMailbox {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            retained_bytes: 0,
+        }
+    }
+}
+
+/// Cloneable, accounting-aware ingress for streamable HTTP requests.
+///
+/// This handle is intended for HTTP request-handler threads while the owning
+/// [`StreamableHttpTransport`] is blocked in [`Transport::recv`]. Every clone
+/// shares the transport's count and serialized-byte limits; the raw channel is
+/// deliberately not exposed because sending through it would bypass those
+/// admission checks.
+pub struct StreamableHttpRequestIngress {
+    codec: Codec,
+    sender: mpsc::Sender<QueuedRequest>,
+    retained_bytes: Arc<AtomicUsize>,
+    max_queued_bytes: usize,
+    endpoint_count: Arc<AtomicUsize>,
+    admissions_open: Arc<AtomicBool>,
+    active_admissions: Arc<AtomicUsize>,
+}
+
+impl Clone for StreamableHttpRequestIngress {
+    fn clone(&self) -> Self {
+        self.endpoint_count.fetch_add(1, Ordering::Relaxed);
+        let mut codec = Codec::new();
+        codec.set_max_message_size(self.codec.max_message_size());
+        Self {
+            codec,
+            sender: self.sender.clone(),
+            retained_bytes: Arc::clone(&self.retained_bytes),
+            max_queued_bytes: self.max_queued_bytes,
+            endpoint_count: Arc::clone(&self.endpoint_count),
+            admissions_open: Arc::clone(&self.admissions_open),
+            active_admissions: Arc::clone(&self.active_admissions),
+        }
+    }
+}
+
+impl Drop for StreamableHttpRequestIngress {
+    fn drop(&mut self) {
+        let previous = self.endpoint_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "request-ingress endpoint count underflow");
+        if previous == 1 {
+            close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+        }
+    }
+}
+
+impl StreamableHttpRequestIngress {
+    /// Admits one request to the transport's bounded request queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WouldBlock` when either the count or serialized-byte budget is
+    /// full, and returns [`TransportError::Closed`] after transport shutdown.
+    pub fn push_request(&self, cx: &Cx, request: JsonRpcRequest) -> Result<(), TransportError> {
+        enqueue_streamable_request(
+            &self.codec,
+            &self.sender,
+            &self.retained_bytes,
+            self.max_queued_bytes,
+            &self.admissions_open,
+            &self.active_admissions,
+            cx,
+            request,
+        )
+    }
+
+    /// Returns the hard request-count capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    /// Closes the shared request-admission endpoint.
+    ///
+    /// Dropping the final ingress handle has the same effect. Closing one clone
+    /// is intentionally ingress-wide; all clones stop admitting requests while
+    /// an independent response stream may still drain prior work. This is a
+    /// synchronization barrier: it waits for bounded admissions that already
+    /// entered the gate to commit or abort.
+    pub fn close(&self) {
+        close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+    }
+
+    /// Returns whether request admission or the owning receiver has closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        !self.admissions_open.load(Ordering::Acquire) || self.sender.is_closed()
+    }
+}
+
+/// Cloneable, accounting-aware consumer for streamable HTTP responses.
+///
+/// Every receive operation names its expected JSON-RPC request ID. Clones can
+/// therefore wait for different requests without consuming one another's
+/// responses. Dequeues release the corresponding count and serialized-byte
+/// reservations exactly once.
+pub struct StreamableHttpResponseStream {
+    mailbox: Arc<Mutex<StreamableResponseMailbox>>,
+    pending_count: Arc<AtomicUsize>,
+    endpoint_count: Arc<AtomicUsize>,
+    active_admissions: Arc<AtomicUsize>,
+    capacity: usize,
+    owner_open: Arc<AtomicBool>,
+    admissions_open: Arc<AtomicBool>,
+    poll_interval: Duration,
+    #[cfg(test)]
+    empty_polls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    entered_empty_waits: Arc<AtomicUsize>,
+}
+
+impl Clone for StreamableHttpResponseStream {
+    fn clone(&self) -> Self {
+        self.endpoint_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            mailbox: Arc::clone(&self.mailbox),
+            pending_count: Arc::clone(&self.pending_count),
+            endpoint_count: Arc::clone(&self.endpoint_count),
+            active_admissions: Arc::clone(&self.active_admissions),
+            capacity: self.capacity,
+            owner_open: Arc::clone(&self.owner_open),
+            admissions_open: Arc::clone(&self.admissions_open),
+            poll_interval: self.poll_interval,
+            #[cfg(test)]
+            empty_polls: Arc::clone(&self.empty_polls),
+            #[cfg(test)]
+            entered_empty_waits: Arc::clone(&self.entered_empty_waits),
+        }
+    }
+}
+
+impl Drop for StreamableHttpResponseStream {
+    fn drop(&mut self) {
+        let previous = self.endpoint_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "response-stream endpoint count underflow");
+        if previous == 1 {
+            close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+            let mut mailbox = self
+                .mailbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mailbox.queue.clear();
+            mailbox.retained_bytes = 0;
+            self.pending_count.store(0, Ordering::Release);
+        }
+    }
+}
+
+impl StreamableHttpResponseStream {
+    /// Pops the response for `request_id` without blocking.
+    ///
+    /// A null-ID JSON-RPC error can be selected with `None`. If another clone
+    /// currently owns the mailbox lock, this returns `WouldBlock` rather than
+    /// blocking the calling thread.
+    pub fn pop_response(
+        &self,
+        request_id: Option<&RequestId>,
+    ) -> Result<Option<JsonRpcResponse>, TransportError> {
+        if let Some(response) =
+            try_pop_streamable_response(&self.mailbox, &self.pending_count, |response| {
+                response.id.as_ref() == request_id
+            })?
+        {
+            return Ok(Some(response));
+        }
+        if !self.admissions_open.load(Ordering::Acquire)
+            && self.active_admissions.load(Ordering::SeqCst) == 0
+        {
+            // An admitted producer can commit between the first empty mailbox
+            // check and dropping its admission guard. Once the gate is closed
+            // and the active count reaches zero, recheck under the mailbox
+            // lock before declaring terminal closure.
+            match try_pop_streamable_response(&self.mailbox, &self.pending_count, |response| {
+                response.id.as_ref() == request_id
+            })? {
+                Some(response) => Ok(Some(response)),
+                None => Err(TransportError::Closed),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Waits for the response matching `request_id` while observing the full
+    /// context checkpoint contract, including masking and budget exhaustion.
+    pub fn recv_response(
+        &self,
+        cx: &Cx,
+        request_id: Option<&RequestId>,
+    ) -> Result<JsonRpcResponse, TransportError> {
+        #[cfg(test)]
+        let mut entered_empty_wait = false;
+        loop {
+            streamable_checkpoint(cx)?;
+            match self.pop_response(request_id) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => {}
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(error),
+            }
+            #[cfg(test)]
+            {
+                self.empty_polls.fetch_add(1, Ordering::Release);
+                if !entered_empty_wait {
+                    self.entered_empty_waits.fetch_add(1, Ordering::Release);
+                    entered_empty_wait = true;
+                }
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    /// Returns whether at least one response is awaiting consumption.
+    #[must_use]
+    pub fn has_responses(&self) -> bool {
+        self.pending_count.load(Ordering::Acquire) > 0
+    }
+
+    /// Returns the number of responses awaiting consumption.
+    #[must_use]
+    pub fn pending_responses(&self) -> usize {
+        self.pending_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the hard response-count capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Closes the shared response-admission endpoint.
+    ///
+    /// Already-admitted responses remain available to their matching
+    /// consumers. Closing any clone seals production for every clone. Dropping
+    /// the final response-stream handle additionally discards responses that
+    /// can no longer have a consumer. This is a synchronization barrier for
+    /// bounded response admissions already inside the gate.
+    pub fn close(&self) {
+        close_streamable_admissions(&self.admissions_open, &self.active_admissions);
+    }
+
+    /// Returns whether the owner or shared response producer has closed.
+    ///
+    /// Matching responses admitted before closure remain drainable.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
+    }
+}
+
+fn try_pop_streamable_response(
+    mailbox: &Mutex<StreamableResponseMailbox>,
+    pending_count: &AtomicUsize,
+    matches: impl Fn(&JsonRpcResponse) -> bool,
+) -> Result<Option<JsonRpcResponse>, TransportError> {
+    let mut mailbox = match mailbox.try_lock() {
+        Ok(mailbox) => mailbox,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            return Err(streamable_queue_full_error(
+                "streamable response mailbox is busy",
+            ));
+        }
+    };
+    let Some(position) = mailbox
+        .queue
+        .iter()
+        .position(|response| matches(&response.message))
+    else {
+        return Ok(None);
+    };
+    let response = mailbox
+        .queue
+        .remove(position)
+        .expect("response position was obtained from the same mailbox");
+    debug_assert!(mailbox.retained_bytes >= response.serialized_bytes);
+    mailbox.retained_bytes = mailbox
+        .retained_bytes
+        .saturating_sub(response.serialized_bytes);
+    let previous = pending_count.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "response pending-count underflow");
+    Ok(Some(response.message))
+}
+
+fn release_streamable_bytes(retained_bytes: &AtomicUsize, serialized_bytes: usize) {
+    let _ = retained_bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(serialized_bytes))
+    });
+}
+
+fn streamable_checkpoint(cx: &Cx) -> Result<(), TransportError> {
+    cx.checkpoint().map_err(|error| {
+        use asupersync::{CancelKind, error::ErrorKind};
+
+        match cx.cancel_reason().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
+            Some(_) => TransportError::Cancelled,
+            None => match error.kind() {
+                ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => TransportError::Timeout,
+                ErrorKind::Cancelled
+                | ErrorKind::PollQuotaExhausted
+                | ErrorKind::CostQuotaExhausted => TransportError::Cancelled,
+                _ => TransportError::Cancelled,
+            },
+        }
+    })
+}
+
+fn is_would_block(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn streamable_queue_full_error(message: &'static str) -> TransportError {
+    TransportError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, message))
+}
+
+fn map_streamable_send_error<T>(
+    error: mpsc::SendError<T>,
+    full_message: &'static str,
+) -> TransportError {
+    match error {
+        mpsc::SendError::Disconnected(_) => TransportError::Closed,
+        mpsc::SendError::Cancelled(_) => TransportError::Cancelled,
+        mpsc::SendError::Full(_) => TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            full_message,
+        )),
+    }
+}
+
+fn reserve_streamable_bytes(
+    retained_bytes: &AtomicUsize,
+    max_queued_bytes: usize,
+    serialized_bytes: usize,
+    admissions_open: &AtomicBool,
+    cx: &Cx,
+    full_message: &'static str,
+) -> Result<(), TransportError> {
+    let mut current = retained_bytes.load(Ordering::Acquire);
+    loop {
+        if !admissions_open.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        let prospective = current
+            .checked_add(serialized_bytes)
+            .filter(|bytes| *bytes <= max_queued_bytes)
+            .ok_or_else(|| streamable_queue_full_error(full_message))?;
+        match retained_bytes.compare_exchange_weak(
+            current,
+            prospective,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => {
+                current = observed;
+                streamable_checkpoint(cx)?;
+            }
+        }
+    }
+}
+
+fn enqueue_streamable_request(
+    codec: &Codec,
+    sender: &mpsc::Sender<QueuedRequest>,
+    retained_bytes: &AtomicUsize,
+    max_queued_bytes: usize,
+    admissions_open: &AtomicBool,
+    active_admissions: &AtomicUsize,
+    cx: &Cx,
+    request: JsonRpcRequest,
+) -> Result<(), TransportError> {
+    if !admissions_open.load(Ordering::Acquire) {
+        return Err(TransportError::Closed);
+    }
+    streamable_checkpoint(cx)?;
+    let _admission = begin_streamable_admission(admissions_open, active_admissions)?;
+
+    let serialized_bytes = codec.encode_request(&request)?.len();
+    // Encoding is bounded but can still be substantial. Re-check after that
+    // CPU work so a deadline or cancellation raised during encoding wins
+    // before the request acquires queue reservations.
+    streamable_checkpoint(cx)?;
+    reserve_streamable_bytes(
+        retained_bytes,
+        max_queued_bytes,
+        serialized_bytes,
+        admissions_open,
+        cx,
+        "streamable request byte budget is full",
+    )?;
+    if let Err(error) = sender.try_send(QueuedRequest {
+        message: request,
+        serialized_bytes,
+    }) {
+        release_streamable_bytes(retained_bytes, serialized_bytes);
+        let disconnected = matches!(&error, mpsc::SendError::Disconnected(_));
+        let error = map_streamable_send_error(error, "streamable request queue is full");
+        if disconnected {
+            admissions_open.store(false, Ordering::Release);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Streaming HTTP transport for long-lived MCP connections.
 ///
 /// This transport uses HTTP streaming (chunked transfer encoding) for
 /// server-to-client messages and regular POST requests for client-to-server
 /// messages.
 pub struct StreamableHttpTransport {
-    /// Request queue (from HTTP POST requests).
-    requests: Arc<Mutex<VecDeque<JsonRpcRequest>>>,
-    /// Response queue (to be sent via streaming).
-    responses: Arc<Mutex<VecDeque<JsonRpcResponse>>>,
-    /// Codec for message encoding.
+    /// Shared typed-message validation and serialized-size boundary.
     codec: Codec,
-    /// Whether the transport is closed.
-    closed: bool,
+    /// Bounded request channel (from HTTP POST requests).
+    request_sender: Option<mpsc::Sender<QueuedRequest>>,
+    request_receiver: mpsc::Receiver<QueuedRequest>,
+    request_retained_bytes: Arc<AtomicUsize>,
+    request_endpoint_count: Arc<AtomicUsize>,
+    request_admissions_open: Arc<AtomicBool>,
+    request_active_admissions: Arc<AtomicUsize>,
+    /// Bounded, correlation-aware response mailbox.
+    response_mailbox: Arc<Mutex<StreamableResponseMailbox>>,
+    response_pending_count: Arc<AtomicUsize>,
+    response_endpoint_count: Arc<AtomicUsize>,
+    response_active_admissions: Arc<AtomicUsize>,
+    response_admissions_open: Arc<AtomicBool>,
+    response_externalized: bool,
+    capacity: usize,
+    max_queued_bytes_per_direction: usize,
+    /// Whether the transport owner remains open.
+    owner_open: Arc<AtomicBool>,
     /// Poll interval for checking new messages.
     poll_interval: Duration,
+    #[cfg(test)]
+    request_empty_polls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    response_empty_polls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    response_entered_empty_waits: Arc<AtomicUsize>,
 }
 
 impl StreamableHttpTransport {
     /// Creates a new streaming HTTP transport.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            requests: Arc::new(Mutex::new(VecDeque::new())),
-            responses: Arc::new(Mutex::new(VecDeque::new())),
-            codec: Codec::new(),
-            closed: false,
-            poll_interval: Duration::from_millis(10),
-        }
+        Self::with_capacity(DEFAULT_STREAMABLE_QUEUE_CAPACITY)
+            .expect("the built-in streamable HTTP queue capacity must be valid")
     }
 
-    /// Pushes a request into the queue (from HTTP handler).
-    pub fn push_request(&self, request: JsonRpcRequest) {
-        let mut guard = match self.requests.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.push_back(request);
+    /// Creates a streaming HTTP transport with bounded queues in both directions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error when `capacity` is zero or exceeds the
+    /// hard queue-count limit.
+    pub fn with_capacity(capacity: usize) -> Result<Self, TransportError> {
+        Self::with_queue_limits(capacity, MAX_STREAMABLE_QUEUED_BYTES_PER_DIRECTION)
+    }
+
+    fn with_queue_limits(
+        capacity: usize,
+        max_queued_bytes_per_direction: usize,
+    ) -> Result<Self, TransportError> {
+        if capacity == 0 || capacity > MAX_STREAMABLE_QUEUE_CAPACITY {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP queue capacity is outside the supported range",
+            )));
+        }
+        if max_queued_bytes_per_direction == 0
+            || max_queued_bytes_per_direction > MAX_STREAMABLE_QUEUED_BYTES_PER_DIRECTION
+        {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP queue byte limit is outside the supported range",
+            )));
+        }
+
+        let (request_sender, request_receiver) = mpsc::channel(capacity);
+        Ok(Self {
+            codec: Codec::new(),
+            request_sender: Some(request_sender),
+            request_receiver,
+            request_retained_bytes: Arc::new(AtomicUsize::new(0)),
+            request_endpoint_count: Arc::new(AtomicUsize::new(0)),
+            request_admissions_open: Arc::new(AtomicBool::new(true)),
+            request_active_admissions: Arc::new(AtomicUsize::new(0)),
+            response_mailbox: Arc::new(Mutex::new(StreamableResponseMailbox::new())),
+            response_pending_count: Arc::new(AtomicUsize::new(0)),
+            response_endpoint_count: Arc::new(AtomicUsize::new(0)),
+            response_active_admissions: Arc::new(AtomicUsize::new(0)),
+            response_admissions_open: Arc::new(AtomicBool::new(true)),
+            response_externalized: false,
+            capacity,
+            max_queued_bytes_per_direction,
+            owner_open: Arc::new(AtomicBool::new(true)),
+            poll_interval: Duration::from_millis(10),
+            #[cfg(test)]
+            request_empty_polls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            response_empty_polls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            response_entered_empty_waits: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Returns a cloneable request-ingress handle for HTTP handler threads.
+    ///
+    /// The handle captures the transport's current message-size limit and
+    /// shares its queue count, byte accounting, and close state. Each admission
+    /// observes cancellation through the supplied [`Cx`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `AlreadyExists` after the request endpoint has already been
+    /// externalized, or [`TransportError::Closed`] after owner shutdown.
+    pub fn request_ingress(&mut self) -> Result<StreamableHttpRequestIngress, TransportError> {
+        if !self.owner_open.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        let sender = self.request_sender.take().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "streamable HTTP request ingress has already been externalized",
+            ))
+        })?;
+        self.request_endpoint_count.store(1, Ordering::Release);
+        let mut codec = Codec::new();
+        codec.set_max_message_size(self.codec.max_message_size());
+        Ok(StreamableHttpRequestIngress {
+            codec,
+            sender,
+            retained_bytes: Arc::clone(&self.request_retained_bytes),
+            max_queued_bytes: self.max_queued_bytes_per_direction,
+            endpoint_count: Arc::clone(&self.request_endpoint_count),
+            admissions_open: Arc::clone(&self.request_admissions_open),
+            active_admissions: Arc::clone(&self.request_active_admissions),
+        })
+    }
+
+    /// Returns a cloneable response consumer for HTTP streaming threads.
+    ///
+    /// Multiple clones may wait for different request IDs without consuming
+    /// one another's responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AlreadyExists` after the response endpoint has already been
+    /// externalized, or [`TransportError::Closed`] after owner shutdown.
+    pub fn response_stream(&mut self) -> Result<StreamableHttpResponseStream, TransportError> {
+        if !self.owner_open.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        if self.response_externalized {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "streamable HTTP response stream has already been externalized",
+            )));
+        }
+        self.response_externalized = true;
+        self.response_endpoint_count.store(1, Ordering::Release);
+        Ok(StreamableHttpResponseStream {
+            mailbox: Arc::clone(&self.response_mailbox),
+            pending_count: Arc::clone(&self.response_pending_count),
+            endpoint_count: Arc::clone(&self.response_endpoint_count),
+            active_admissions: Arc::clone(&self.response_active_admissions),
+            capacity: self.capacity(),
+            owner_open: Arc::clone(&self.owner_open),
+            admissions_open: Arc::clone(&self.response_admissions_open),
+            poll_interval: self.poll_interval,
+            #[cfg(test)]
+            empty_polls: Arc::clone(&self.response_empty_polls),
+            #[cfg(test)]
+            entered_empty_waits: Arc::clone(&self.response_entered_empty_waits),
+        })
+    }
+
+    /// Returns the external producer/consumer handles used around a running
+    /// transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AlreadyExists` unless both endpoints remain owner-held, or
+    /// [`TransportError::Closed`] after owner shutdown.
+    pub fn split_handles(
+        &mut self,
+    ) -> Result<(StreamableHttpRequestIngress, StreamableHttpResponseStream), TransportError> {
+        if self.request_sender.is_none() || self.response_externalized {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "streamable HTTP endpoints have already been externalized",
+            )));
+        }
+        let ingress = self.request_ingress()?;
+        let response_stream = self.response_stream()?;
+        Ok((ingress, response_stream))
+    }
+
+    /// Pushes a request into the bounded queue (from an HTTP handler).
+    ///
+    /// The operation rejects overload with `WouldBlock`; it never grows the
+    /// queue beyond the configured capacity.
+    pub fn push_request(&self, cx: &Cx, request: JsonRpcRequest) -> Result<(), TransportError> {
+        let sender = self.request_sender.as_ref().ok_or(TransportError::Closed)?;
+        enqueue_streamable_request(
+            &self.codec,
+            sender,
+            &self.request_retained_bytes,
+            self.max_queued_bytes_per_direction,
+            &self.request_admissions_open,
+            &self.request_active_admissions,
+            cx,
+            request,
+        )
     }
 
     /// Pops a response from the queue (for HTTP streaming).
-    #[must_use]
-    pub fn pop_response(&self) -> Option<JsonRpcResponse> {
-        let mut guard = match self.responses.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.pop_front()
+    pub fn pop_response(&self) -> Result<Option<JsonRpcResponse>, TransportError> {
+        if self.response_externalized {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the response consumer has been externalized",
+            )));
+        }
+        if let Some(response) = try_pop_streamable_response(
+            &self.response_mailbox,
+            &self.response_pending_count,
+            |_| true,
+        )? {
+            return Ok(Some(response));
+        }
+        if !self.response_admissions_open.load(Ordering::Acquire)
+            && self.response_active_admissions.load(Ordering::SeqCst) == 0
+        {
+            // Stabilize the empty observation against a producer that
+            // committed immediately before dropping the final admission.
+            match try_pop_streamable_response(
+                &self.response_mailbox,
+                &self.response_pending_count,
+                |_| true,
+            )? {
+                Some(response) => Ok(Some(response)),
+                None => Err(TransportError::Closed),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Checks if there are pending responses.
     #[must_use]
     pub fn has_responses(&self) -> bool {
-        match self.responses.lock() {
-            Ok(guard) => !guard.is_empty(),
-            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        self.response_pending_count.load(Ordering::Acquire) > 0
+    }
+
+    /// Returns the number of admitted requests awaiting dispatch.
+    #[must_use]
+    pub fn pending_requests(&self) -> usize {
+        self.request_receiver.len()
+    }
+
+    /// Returns the number of admitted responses awaiting streaming.
+    #[must_use]
+    pub fn pending_responses(&self) -> usize {
+        self.response_pending_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the hard queue capacity used in each direction.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn release_request_bytes(&self, serialized_bytes: usize) {
+        release_streamable_bytes(&self.request_retained_bytes, serialized_bytes);
+    }
+
+    fn close_queues(&mut self) {
+        self.owner_open.store(false, Ordering::Release);
+        close_streamable_admissions(
+            &self.request_admissions_open,
+            &self.request_active_admissions,
+        );
+        close_streamable_admissions(
+            &self.response_admissions_open,
+            &self.response_active_admissions,
+        );
+        self.request_sender.take();
+        self.request_receiver.close();
+        while let Ok(request) = self.request_receiver.try_recv() {
+            self.release_request_bytes(request.serialized_bytes);
         }
+        // Outbound responses are deliberately retained. `Transport::close`
+        // first settles bounded in-flight admissions and seals production;
+        // extant response-stream handles can then drain the bounded mailbox.
     }
+}
 
-    /// Returns the request queue for external access.
-    #[must_use]
-    pub fn request_queue(&self) -> Arc<Mutex<VecDeque<JsonRpcRequest>>> {
-        Arc::clone(&self.requests)
-    }
-
-    /// Returns the response queue for external access.
-    #[must_use]
-    pub fn response_queue(&self) -> Arc<Mutex<VecDeque<JsonRpcResponse>>> {
-        Arc::clone(&self.responses)
+impl Drop for StreamableHttpTransport {
+    fn drop(&mut self) {
+        self.close_queues();
     }
 }
 
@@ -962,22 +2068,58 @@ impl Default for StreamableHttpTransport {
 
 impl Transport for StreamableHttpTransport {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
-
-        if self.closed {
+        if !self.owner_open.load(Ordering::Acquire)
+            || !self.response_admissions_open.load(Ordering::Acquire)
+        {
             return Err(TransportError::Closed);
         }
+        streamable_checkpoint(cx)?;
 
         match message {
             JsonRpcMessage::Response(response) => {
-                let mut guard = self.responses.lock().map_err(|_| {
-                    TransportError::Io(std::io::Error::other(
-                        "streamable response queue lock poisoned",
-                    ))
-                })?;
-                guard.push_back(response.clone());
+                // Validate before retaining a clone in the bounded queue. The
+                // codec bounds each message's serialized size, while the
+                // retained-byte counter bounds the aggregate queue footprint.
+                let _admission = begin_streamable_admission(
+                    &self.response_admissions_open,
+                    &self.response_active_admissions,
+                )?;
+                let serialized_bytes = self.codec.encode_response(response)?.len();
+                // Do not commit a response after cancellation or a deadline
+                // that became observable during bounded serialization.
+                streamable_checkpoint(cx)?;
+                let mut mailbox = match self.response_mailbox.try_lock() {
+                    Ok(mailbox) => mailbox,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => {
+                        return Err(streamable_queue_full_error(
+                            "streamable response mailbox is busy",
+                        ));
+                    }
+                };
+                if !self.owner_open.load(Ordering::Acquire)
+                    || !self.response_admissions_open.load(Ordering::Acquire)
+                {
+                    return Err(TransportError::Closed);
+                }
+                if mailbox.queue.len() >= self.capacity {
+                    return Err(streamable_queue_full_error(
+                        "streamable response queue is full",
+                    ));
+                }
+                let prospective = mailbox
+                    .retained_bytes
+                    .checked_add(serialized_bytes)
+                    .filter(|bytes| *bytes <= self.max_queued_bytes_per_direction)
+                    .ok_or_else(|| {
+                        streamable_queue_full_error("streamable response byte budget is full")
+                    })?;
+                mailbox.queue.push_back(QueuedResponse {
+                    message: response.clone(),
+                    serialized_bytes,
+                });
+                mailbox.retained_bytes = prospective;
+                self.response_pending_count.fetch_add(1, Ordering::Release);
             }
             JsonRpcMessage::Request(_) => {
                 // This transport currently streams only JSON-RPC responses.
@@ -994,29 +2136,47 @@ impl Transport for StreamableHttpTransport {
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
-
-        if self.closed {
-            return Err(TransportError::Closed);
-        }
-
         // Poll for requests
         loop {
-            if cx.is_cancel_requested() {
-                return Err(TransportError::Cancelled);
+            if !self.owner_open.load(Ordering::Acquire) {
+                return Err(TransportError::Closed);
+            }
+            streamable_checkpoint(cx)?;
+
+            match self.request_receiver.try_recv() {
+                Ok(request) => {
+                    self.release_request_bytes(request.serialized_bytes);
+                    return Ok(JsonRpcMessage::Request(request.message));
+                }
+                Err(mpsc::RecvError::Empty) => {}
+                Err(mpsc::RecvError::Disconnected) => {
+                    self.request_admissions_open.store(false, Ordering::Release);
+                    return Err(TransportError::Closed);
+                }
+                Err(mpsc::RecvError::Cancelled) => return Err(TransportError::Cancelled),
             }
 
-            let mut guard = self.requests.lock().map_err(|_| {
-                TransportError::Io(std::io::Error::other(
-                    "streamable request queue lock poisoned",
-                ))
-            })?;
-            if let Some(request) = guard.pop_front() {
-                return Ok(JsonRpcMessage::Request(request));
+            if !self.request_admissions_open.load(Ordering::Acquire)
+                && self.request_active_admissions.load(Ordering::SeqCst) == 0
+            {
+                // A producer admitted before closure can enqueue between the
+                // first empty observation and dropping its admission guard.
+                // With the gate closed and no active producers, one final
+                // receive makes the terminal decision stable.
+                return match self.request_receiver.try_recv() {
+                    Ok(request) => {
+                        self.release_request_bytes(request.serialized_bytes);
+                        Ok(JsonRpcMessage::Request(request.message))
+                    }
+                    Err(mpsc::RecvError::Empty | mpsc::RecvError::Disconnected) => {
+                        Err(TransportError::Closed)
+                    }
+                    Err(mpsc::RecvError::Cancelled) => Err(TransportError::Cancelled),
+                };
             }
-            drop(guard);
+
+            #[cfg(test)]
+            self.request_empty_polls.fetch_add(1, Ordering::Release);
 
             // Sleep briefly before polling again
             std::thread::sleep(self.poll_interval);
@@ -1024,7 +2184,7 @@ impl Transport for StreamableHttpTransport {
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
-        self.closed = true;
+        self.close_queues();
         Ok(())
     }
 }
@@ -1033,30 +2193,123 @@ impl Transport for StreamableHttpTransport {
 // Session Support
 // =============================================================================
 
+const MAX_HTTP_SESSIONS: usize = 1_024;
+const MAX_HTTP_SESSION_ID_BYTES: usize = 128;
+const MAX_HTTP_SESSION_ENTRIES: usize = 64;
+const MAX_HTTP_SESSION_KEY_BYTES: usize = 256;
+const MAX_HTTP_SESSION_VALUE_BYTES: usize = 256 * 1024;
+const MAX_HTTP_SESSION_RETAINED_BYTES: usize = 1024 * 1024;
+
+/// Bounded HTTP session admission failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpSessionError {
+    InvalidSessionId,
+    InvalidCapacity,
+    KeyTooLarge,
+    ValueTooLarge,
+    CapacityExceeded,
+    SessionNotFound,
+    RandomnessUnavailable,
+}
+
+impl std::fmt::Display for HttpSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidSessionId => "invalid HTTP session identifier",
+            Self::InvalidCapacity => "HTTP session capacity is outside the supported range",
+            Self::KeyTooLarge => "HTTP session key exceeds byte limit",
+            Self::ValueTooLarge => "HTTP session value exceeds byte limit",
+            Self::CapacityExceeded => "HTTP session capacity exhausted",
+            Self::SessionNotFound => "HTTP session not found",
+            Self::RandomnessUnavailable => "HTTP session identifier generation failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for HttpSessionError {}
+
+#[derive(Debug, Clone)]
+struct HttpSessionEntry {
+    value: serde_json::Value,
+    retained_bytes: usize,
+}
+
+struct SessionValueByteCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl Write for SessionValueByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            return Err(std::io::Error::other("session value byte limit exceeded"));
+        };
+        if next > self.limit {
+            return Err(std::io::Error::other("session value byte limit exceeded"));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_session_value(value: &serde_json::Value) -> Result<usize, HttpSessionError> {
+    let mut counter = SessionValueByteCounter {
+        bytes: 0,
+        limit: MAX_HTTP_SESSION_VALUE_BYTES,
+    };
+    serde_json::to_writer(&mut counter, value).map_err(|_| HttpSessionError::ValueTooLarge)?;
+    Ok(counter.bytes)
+}
+
 /// HTTP session for maintaining state across requests.
 #[derive(Debug, Clone)]
 pub struct HttpSession {
     /// Session ID.
-    pub id: String,
+    id: String,
     /// Session creation time.
-    pub created_at: Instant,
+    created_at: Instant,
     /// Last activity time.
-    pub last_activity: Instant,
+    last_activity: Instant,
     /// Session data.
-    pub data: HashMap<String, serde_json::Value>,
+    data: HashMap<String, HttpSessionEntry>,
+    retained_bytes: usize,
 }
 
 impl HttpSession {
     /// Creates a new session with the given ID.
-    #[must_use]
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Result<Self, HttpSessionError> {
+        let id = id.into();
+        if id.is_empty()
+            || id.len() > MAX_HTTP_SESSION_ID_BYTES
+            || !id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(HttpSessionError::InvalidSessionId);
+        }
         let now = Instant::now();
-        Self {
-            id: id.into(),
+        Ok(Self {
+            id,
             created_at: now,
             last_activity: now,
             data: HashMap::new(),
-        }
+            retained_bytes: 0,
+        })
+    }
+
+    /// Returns this session's immutable identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns when the session was created.
+    #[must_use]
+    pub fn created_at(&self) -> Instant {
+        self.created_at
     }
 
     /// Updates the last activity time.
@@ -1073,37 +2326,95 @@ impl HttpSession {
     /// Gets a session value.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
-        self.data.get(key)
+        self.data.get(key).map(|entry| &entry.value)
     }
 
     /// Sets a session value.
-    pub fn set(&mut self, key: impl Into<String>, value: serde_json::Value) {
-        self.data.insert(key.into(), value);
+    pub fn set(
+        &mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<(), HttpSessionError> {
+        let key = key.into();
+        if key.is_empty() || key.len() > MAX_HTTP_SESSION_KEY_BYTES {
+            return Err(HttpSessionError::KeyTooLarge);
+        }
+        if !self.data.contains_key(&key) && self.data.len() >= MAX_HTTP_SESSION_ENTRIES {
+            return Err(HttpSessionError::CapacityExceeded);
+        }
+        let value_bytes = measure_session_value(&value)?;
+        let retained_bytes = key
+            .len()
+            .checked_add(value_bytes)
+            .ok_or(HttpSessionError::CapacityExceeded)?;
+        let prior_bytes = self.data.get(&key).map_or(0, |entry| entry.retained_bytes);
+        let prospective = self
+            .retained_bytes
+            .checked_sub(prior_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .ok_or(HttpSessionError::CapacityExceeded)?;
+        if prospective > MAX_HTTP_SESSION_RETAINED_BYTES {
+            return Err(HttpSessionError::CapacityExceeded);
+        }
+        self.data.insert(
+            key,
+            HttpSessionEntry {
+                value,
+                retained_bytes,
+            },
+        );
+        self.retained_bytes = prospective;
         self.touch();
+        Ok(())
     }
 
     /// Removes a session value.
     pub fn remove(&mut self, key: &str) -> Option<serde_json::Value> {
         self.touch();
-        self.data.remove(key)
+        self.data.remove(key).map(|entry| {
+            self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+            entry.value
+        })
     }
 }
 
 /// Session store for HTTP sessions.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, HttpSession>>,
     timeout: Duration,
+    max_sessions: usize,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
 }
 
 impl SessionStore {
     /// Creates a new session store with the given timeout.
     #[must_use]
     pub fn new(timeout: Duration) -> Self {
-        Self {
+        Self::with_capacity(timeout, MAX_HTTP_SESSIONS)
+            .expect("the built-in HTTP session capacity must be valid")
+    }
+
+    /// Creates a session store with a hard global session limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpSessionError::InvalidCapacity`] when `max_sessions` is
+    /// zero or exceeds the hard global session limit.
+    pub fn with_capacity(timeout: Duration, max_sessions: usize) -> Result<Self, HttpSessionError> {
+        if max_sessions == 0 || max_sessions > MAX_HTTP_SESSIONS {
+            return Err(HttpSessionError::InvalidCapacity);
+        }
+        Ok(Self {
             sessions: Mutex::new(HashMap::new()),
             timeout,
-        }
+            max_sessions,
+        })
     }
 
     /// Creates a new session store with default 1-hour timeout.
@@ -1113,22 +2424,31 @@ impl SessionStore {
     }
 
     /// Creates a new session.
-    #[must_use]
-    pub fn create(&self) -> String {
-        let id = generate_session_id();
-        let session = HttpSession::new(&id);
-
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.insert(id.clone(), session);
+    pub fn create(&self) -> Result<String, HttpSessionError> {
+        let id = generate_session_id()?;
+        let session = HttpSession::new(&id)?;
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|_, existing| !existing.is_expired(self.timeout));
+        if guard.len() >= self.max_sessions {
+            return Err(HttpSessionError::CapacityExceeded);
         }
-
-        id
+        if guard.contains_key(&id) {
+            return Err(HttpSessionError::CapacityExceeded);
+        }
+        guard.insert(id.clone(), session);
+        Ok(id)
     }
 
     /// Gets a session by ID.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<HttpSession> {
-        let mut guard = self.sessions.lock().ok()?;
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = guard.get_mut(id)?;
 
         if session.is_expired(self.timeout) {
@@ -1141,49 +2461,60 @@ impl SessionStore {
     }
 
     /// Updates a session.
-    pub fn update(&self, session: HttpSession) {
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.insert(session.id.clone(), session);
+    pub fn update(&self, session: HttpSession) -> Result<(), HttpSessionError> {
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|_, existing| !existing.is_expired(self.timeout));
+        if !guard.contains_key(&session.id) {
+            return Err(HttpSessionError::SessionNotFound);
         }
+        guard.insert(session.id.clone(), session);
+        Ok(())
     }
 
     /// Removes a session.
     pub fn remove(&self, id: &str) {
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.remove(id);
-        }
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
     }
 
     /// Removes expired sessions.
     pub fn cleanup(&self) {
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.retain(|_, s| !s.is_expired(self.timeout));
-        }
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, session| !session.is_expired(self.timeout));
     }
 
     /// Returns the number of active sessions.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.sessions.lock().map(|g| g.len()).unwrap_or(0)
+        let mut guard = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|_, session| !session.is_expired(self.timeout));
+        guard.len()
     }
 }
 
-/// Generates a random session ID.
-fn generate_session_id() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// Generates a fresh 256-bit session ID from the process-wide OS randomness
+/// boundary and encodes it as fixed-width lowercase hexadecimal.
+fn generate_session_id() -> Result<String, HttpSessionError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
 
-    let state = RandomState::new();
-    let mut hasher = state.build_hasher();
-    hasher.write_u128(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    );
-
-    format!("{:016x}", hasher.finish())
+    let identifier =
+        draw_security_identifier().map_err(|_| HttpSessionError::RandomnessUnavailable)?;
+    let mut encoded = String::with_capacity(identifier.as_bytes().len() * 2);
+    for byte in identifier.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+    }
+    Ok(encoded)
 }
 
 // =============================================================================
@@ -1193,6 +2524,32 @@ fn generate_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[derive(Debug)]
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(<S::Error as serde::ser::Error>::custom(
+                "intentional HTTP response encoding failure",
+            ))
+        }
+    }
+
+    fn wait_for_counter(counter: &AtomicUsize, expected: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::Acquire) < expected {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
 
     #[test]
     fn test_http_method_parse() {
@@ -1223,6 +2580,70 @@ mod tests {
     }
 
     #[test]
+    fn directly_constructed_request_headers_are_case_insensitive_at_admission() {
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+        let mut request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#);
+        request
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+        request
+            .headers
+            .insert("Origin".to_string(), "https://trusted.example".to_string());
+
+        assert_eq!(request.header("content-type"), Some("application/json"));
+        assert_eq!(request.header("ORIGIN"), Some("https://trusted.example"));
+        assert!(handler.parse_request(&request).is_ok());
+
+        request
+            .headers
+            .insert("Origin".to_string(), "https://denied.example".to_string());
+        assert!(matches!(
+            handler.parse_request(&request),
+            Err(HttpError::OriginNotAllowed(origin)) if origin == "https://denied.example"
+        ));
+    }
+
+    #[test]
+    fn directly_constructed_case_insensitive_duplicate_headers_are_rejected() {
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+        let mut request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#);
+        request
+            .headers
+            .insert("Origin".to_string(), "https://trusted.example".to_string());
+        request
+            .headers
+            .insert("origin".to_string(), "https://denied.example".to_string());
+
+        assert!(matches!(
+            handler.parse_request(&request),
+            Err(HttpError::InvalidHeader(message)) if message.contains("duplicate")
+        ));
+
+        request.method = HttpMethod::Options;
+        request.headers.insert(
+            "Access-Control-Request-Method".to_string(),
+            "POST".to_string(),
+        );
+        assert_eq!(
+            handler.handle_options(&request).status,
+            HttpStatus::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn test_http_response_builder() {
         let response = HttpResponse::ok()
             .with_header("X-Custom", "value")
@@ -1246,6 +2667,36 @@ mod tests {
     }
 
     #[test]
+    fn http_response_json_encoding_failure_is_typed_and_fails_closed() {
+        let error = HttpResponse::ok()
+            .try_with_json(&FailingSerialize)
+            .expect_err("fallible JSON response builder must preserve serializer failure");
+        assert!(matches!(error, HttpError::JsonError(_)));
+
+        let response = HttpResponse::ok()
+            .with_header("x-response-policy", "preserved")
+            .with_json(&FailingSerialize);
+        assert_eq!(response.status, HttpStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.body, JSON_ENCODING_ERROR_BODY);
+        assert!(!response.body.is_empty());
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-response-policy")
+                .map(String::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
     fn test_http_response_cors() {
         let response = HttpResponse::ok().with_cors("https://example.com");
 
@@ -1253,16 +2704,29 @@ mod tests {
             response.headers.get("access-control-allow-origin"),
             Some(&"https://example.com".to_string())
         );
+        assert_eq!(
+            response.headers.get("access-control-allow-methods"),
+            Some(&"POST, OPTIONS".to_string())
+        );
+        assert_eq!(
+            response.headers.get("vary").map(String::as_str),
+            Some("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+        );
+
+        let rejected = HttpResponse::ok().with_cors("https://example.com\r\nx-injected: yes");
+        assert!(!rejected.headers.contains_key("access-control-allow-origin"));
+        assert!(!rejected.headers.contains_key("vary"));
     }
 
     #[test]
-    fn test_http_handler_options() {
+    fn default_http_handler_rejects_cross_origin_preflight() {
         let handler = HttpRequestHandler::new();
         let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
-            .with_header("Origin", "https://example.com");
+            .with_header("Origin", "https://example.com")
+            .with_header("Access-Control-Request-Method", "POST");
 
         let response = handler.handle_options(&request);
-        assert_eq!(response.status, HttpStatus::OK);
+        assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
     }
 
     #[test]
@@ -1290,14 +2754,57 @@ mod tests {
         let request =
             HttpRequest::new(HttpMethod::Post, "/mcp/v1").with_header("Content-Type", "text/plain");
         assert!(handler.parse_request(&request).is_err());
+
+        let request = HttpRequest::new(HttpMethod::Post, "/wrong")
+            .with_header("Content-Type", "application/json")
+            .with_body(serde_json::to_vec(&json_rpc).unwrap());
+        assert!(matches!(
+            handler.parse_request(&request),
+            Err(HttpError::InvalidPath(path)) if path == "/wrong"
+        ));
+    }
+
+    #[test]
+    fn http_handler_response_encoding_failure_is_typed_and_returns_500() {
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://allowed.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let handler = HttpRequestHandler::with_config(config);
+
+        let typed_error = serde_json::to_vec(&FailingSerialize)
+            .expect_err("fixture serializer must fail response encoding");
+        let typed_result = handler.try_create_response_from_encoding(
+            Err(CodecError::from(typed_error)),
+            Some("https://allowed.example"),
+        );
+        assert!(matches!(typed_result, Err(HttpError::CodecError(_))));
+
+        let fallback_error = serde_json::to_vec(&FailingSerialize)
+            .expect_err("fixture serializer must fail response encoding");
+        let response = handler.create_response_from_encoding(
+            Err(CodecError::from(fallback_error)),
+            Some("https://allowed.example"),
+        );
+        assert_eq!(response.status, HttpStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.body, JSON_ENCODING_ERROR_BODY);
+        assert!(!response.body.is_empty());
+        assert_eq!(
+            response
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
+            Some("https://allowed.example")
+        );
     }
 
     #[test]
     fn test_http_session() {
-        let mut session = HttpSession::new("test-session");
-        assert_eq!(session.id, "test-session");
+        let mut session = HttpSession::new("test-session").unwrap();
+        assert_eq!(session.id(), "test-session");
 
-        session.set("key", serde_json::json!("value"));
+        session.set("key", serde_json::json!("value")).unwrap();
         assert_eq!(session.get("key"), Some(&serde_json::json!("value")));
 
         session.remove("key");
@@ -1307,10 +2814,48 @@ mod tests {
     }
 
     #[test]
+    fn http_session_id_requires_visible_ascii() {
+        for invalid in ["", "contains space", "line\nbreak", "nul\0byte", "é"] {
+            assert_eq!(
+                HttpSession::new(invalid).unwrap_err(),
+                HttpSessionError::InvalidSessionId
+            );
+        }
+        assert!(HttpSession::new("!visible-session~").is_ok());
+    }
+
+    #[test]
+    fn http_session_state_is_hard_bounded() {
+        let mut session = HttpSession::new("bounded-session").unwrap();
+        for index in 0..MAX_HTTP_SESSION_ENTRIES {
+            session
+                .set(format!("key-{index}"), serde_json::json!(index))
+                .expect("entry at or below the count limit");
+        }
+        assert_eq!(
+            session.set("one-too-many", serde_json::json!(true)),
+            Err(HttpSessionError::CapacityExceeded)
+        );
+        session
+            .set("key-0", serde_json::json!("replacement"))
+            .expect("replacement does not consume another entry");
+
+        let oversized = "x".repeat(MAX_HTTP_SESSION_VALUE_BYTES);
+        assert_eq!(
+            session.set("key-0", serde_json::Value::String(oversized)),
+            Err(HttpSessionError::ValueTooLarge)
+        );
+        assert!(matches!(
+            HttpSession::new("x".repeat(MAX_HTTP_SESSION_ID_BYTES + 1)),
+            Err(HttpSessionError::InvalidSessionId)
+        ));
+    }
+
+    #[test]
     fn test_session_store() {
         let store = SessionStore::with_defaults();
 
-        let id = store.create();
+        let id = store.create().unwrap();
         assert!(!id.is_empty());
 
         let session = store.get(&id);
@@ -1321,22 +2866,45 @@ mod tests {
     }
 
     #[test]
+    fn session_store_rejects_above_global_capacity() {
+        let store = SessionStore::with_capacity(Duration::from_secs(3600), 1)
+            .expect("capacity one is valid");
+        let first = store.create().expect("first session admitted");
+        assert_eq!(store.count(), 1);
+        assert_eq!(store.create(), Err(HttpSessionError::CapacityExceeded));
+        store.remove(&first);
+        assert!(store.create().is_ok());
+    }
+
+    #[test]
+    fn session_store_rejects_invalid_capacity_without_panicking() {
+        assert!(matches!(
+            SessionStore::with_capacity(Duration::from_secs(3600), 0),
+            Err(HttpSessionError::InvalidCapacity)
+        ));
+        assert!(matches!(
+            SessionStore::with_capacity(Duration::from_secs(3600), MAX_HTTP_SESSIONS + 1),
+            Err(HttpSessionError::InvalidCapacity)
+        ));
+    }
+
+    #[test]
     fn test_streamable_transport() {
         let transport = StreamableHttpTransport::new();
+        let cx = Cx::for_testing();
 
         // Push a request
         let request = JsonRpcRequest::new("test", None, 1i64);
-        transport.push_request(request);
+        transport.push_request(&cx, request).unwrap();
 
         // Should have a request in queue
-        let guard = transport.requests.lock().unwrap();
-        assert_eq!(guard.len(), 1);
+        assert_eq!(transport.pending_requests(), 1);
     }
 
     #[test]
     fn test_http_error_display() {
         let err = HttpError::InvalidMethod("PATCH".to_string());
-        assert!(err.to_string().contains("PATCH"));
+        assert_eq!(err.to_string(), "invalid HTTP method");
 
         let err = HttpError::Timeout;
         assert!(err.to_string().contains("timeout"));
@@ -1344,11 +2912,13 @@ mod tests {
 
     #[test]
     fn test_generate_session_id() {
-        let id1 = generate_session_id();
-        let id2 = generate_session_id();
+        let id1 = generate_session_id().unwrap();
+        let id2 = generate_session_id().unwrap();
 
         assert_ne!(id1, id2);
-        assert_eq!(id1.len(), 16);
+        assert_eq!(id1.len(), 64);
+        assert!(id1.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(id1.bytes().all(|byte| !byte.is_ascii_uppercase()));
     }
 
     #[test]
@@ -1387,6 +2957,234 @@ Transfer-Encoding: chunked\r\n\
         assert_eq!(req.query.get("foo"), Some(&"bar".to_string()));
         assert_eq!(req.query.get("x"), Some(&"y".to_string()));
         assert_eq!(req.body, body);
+    }
+
+    #[test]
+    fn chunked_request_rejects_oversized_declaration_before_body_read() {
+        let declared_size = 10 * 1024 * 1024 + 1;
+        let raw = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{declared_size:x}\r\n"
+        );
+        let mut transport = HttpTransport::new(Cursor::new(raw.into_bytes()), Vec::new());
+
+        let error = transport.read_request().unwrap_err();
+
+        let HttpError::BodyTooLarge { size, max } = error else {
+            panic!("expected body-too-large error");
+        };
+        assert_eq!(size, declared_size);
+        assert_eq!(max, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn chunked_request_rejects_unimplemented_transfer_coding_chain() {
+        let raw = b"POST /mcp/v1 HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let mut transport = HttpTransport::new(Cursor::new(raw.to_vec()), Vec::new());
+
+        let error = transport.read_request().unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpError::UnsupportedTransferEncoding(value) if value == "gzip, chunked"
+        ));
+    }
+
+    #[test]
+    fn http_request_head_is_strict_utf8_and_http_11_three_token_syntax() {
+        let malformed_heads = [
+            b"POST /mcp/v1 HTTP/1.0\r\n\r\n".to_vec(),
+            b"POST /mcp/v1 HTTP/1.1 extra\r\n\r\n".to_vec(),
+            b"POST  /mcp/v1 HTTP/1.1\r\n\r\n".to_vec(),
+        ];
+        for raw in malformed_heads {
+            let mut transport = HttpTransport::new(Cursor::new(raw), Vec::new());
+            assert!(matches!(
+                transport.read_request(),
+                Err(HttpError::InvalidRequestLine(_))
+            ));
+        }
+
+        let mut invalid_utf8 = b"POST /mcp/v1 HTTP/1.1\r\nX-Test: ".to_vec();
+        invalid_utf8.push(0xff);
+        invalid_utf8.extend_from_slice(b"\r\n\r\n");
+        let mut transport = HttpTransport::new(Cursor::new(invalid_utf8), Vec::new());
+        assert!(matches!(
+            transport.read_request(),
+            Err(HttpError::InvalidHeader(_))
+        ));
+    }
+
+    #[test]
+    fn http_request_rejects_malformed_folded_duplicate_and_ambiguous_headers() {
+        let malformed = [
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+            "POST /mcp/v1 HTTP/1.1\r\nHost: one\r\nhost: two\r\n\r\n",
+            "POST /mcp/v1 HTTP/1.1\r\nX-Test: one\r\n two\r\n\r\n",
+            "POST /mcp/v1 HTTP/1.1\r\nBad Name: value\r\n\r\n",
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ];
+
+        for raw in malformed {
+            let mut transport =
+                HttpTransport::new(Cursor::new(raw.as_bytes().to_vec()), Vec::new());
+            assert!(matches!(
+                transport.read_request(),
+                Err(HttpError::InvalidHeader(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn http_response_rejects_header_injection_before_writing() {
+        for (name, value) in [
+            ("x-test", "safe\r\nx-injected: yes"),
+            ("x-test\ninvalid", "safe"),
+        ] {
+            let response = HttpResponse::ok().with_header(name, value);
+            let mut transport = HttpTransport::new(Cursor::new(Vec::<u8>::new()), Vec::new());
+
+            let error = transport.write_response(&response).unwrap_err();
+
+            assert!(matches!(error, HttpError::InvalidHeader(_)));
+            assert!(transport.writer.is_empty());
+        }
+
+        let mut response = HttpResponse::ok();
+        response
+            .headers
+            .insert("X-Duplicate".to_string(), "one".to_string());
+        response
+            .headers
+            .insert("x-duplicate".to_string(), "two".to_string());
+        let mut transport = HttpTransport::new(Cursor::new(Vec::<u8>::new()), Vec::new());
+        assert!(matches!(
+            transport.write_response(&response),
+            Err(HttpError::InvalidHeader(_))
+        ));
+        assert!(transport.writer.is_empty());
+    }
+
+    #[test]
+    fn http_response_writes_reason_phrases_for_every_declared_status() {
+        for (status, expected_line) in [
+            (HttpStatus::OK, "HTTP/1.1 200 OK\r\n"),
+            (HttpStatus::ACCEPTED, "HTTP/1.1 202 Accepted\r\n"),
+            (HttpStatus::BAD_REQUEST, "HTTP/1.1 400 Bad Request\r\n"),
+            (HttpStatus::UNAUTHORIZED, "HTTP/1.1 401 Unauthorized\r\n"),
+            (HttpStatus::FORBIDDEN, "HTTP/1.1 403 Forbidden\r\n"),
+            (HttpStatus::NOT_FOUND, "HTTP/1.1 404 Not Found\r\n"),
+            (
+                HttpStatus::METHOD_NOT_ALLOWED,
+                "HTTP/1.1 405 Method Not Allowed\r\n",
+            ),
+            (
+                HttpStatus::INTERNAL_SERVER_ERROR,
+                "HTTP/1.1 500 Internal Server Error\r\n",
+            ),
+            (
+                HttpStatus::SERVICE_UNAVAILABLE,
+                "HTTP/1.1 503 Service Unavailable\r\n",
+            ),
+        ] {
+            let mut transport = HttpTransport::new(Cursor::new(Vec::<u8>::new()), Vec::new());
+            transport
+                .write_response(&HttpResponse::new(status))
+                .expect("declared status must serialize");
+
+            assert!(transport.writer.starts_with(expected_line.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn http_transport_recv_requires_post_and_json_media_type() {
+        let body = br#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+        for (method, content_type) in [
+            ("GET", "application/json"),
+            ("POST", "application/jsonevil"),
+            ("POST", "text/plain"),
+        ] {
+            let head = format!(
+                "{method} /mcp/v1 HTTP/1.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let mut raw = head.into_bytes();
+            raw.extend_from_slice(body);
+            let mut transport = HttpTransport::new(Cursor::new(raw), Vec::new());
+
+            let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::InvalidData
+            ));
+        }
+    }
+
+    #[test]
+    fn http_transport_enforces_exact_origin_policy_without_reflecting_input() {
+        let body = br#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+        let request = |origin: &str| {
+            let head = format!(
+                "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let mut raw = head.into_bytes();
+            raw.extend_from_slice(body);
+            raw
+        };
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+
+        let mut allowed = HttpTransport::with_config(
+            Cursor::new(request("https://trusted.example")),
+            Vec::new(),
+            config.clone(),
+        );
+        assert!(allowed.recv(&Cx::for_testing()).is_ok());
+
+        let secret_origin = "https://secret-canary.invalid";
+        let mut denied =
+            HttpTransport::with_config(Cursor::new(request(secret_origin)), Vec::new(), config);
+        let error = denied.recv(&Cx::for_testing()).unwrap_err();
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(!error.to_string().contains(secret_origin));
+
+        let wildcard = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["*".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let mut wildcard_transport = HttpTransport::with_config(
+            Cursor::new(request("https://untrusted.example")),
+            Vec::new(),
+            wildcard,
+        );
+        assert!(wildcard_transport.recv(&Cx::for_testing()).is_err());
+    }
+
+    #[test]
+    fn http_transport_config_bounds_body_before_allocation() {
+        let config = HttpHandlerConfig {
+            max_body_size: 8,
+            ..HttpHandlerConfig::default()
+        };
+        let raw =
+            b"POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\n";
+        let mut transport =
+            HttpTransport::with_config(Cursor::new(raw.to_vec()), Vec::new(), config);
+
+        assert!(matches!(
+            transport.read_request(),
+            Err(HttpError::BodyTooLarge { size: 9, max: 8 })
+        ));
     }
 
     // =========================================================================
@@ -1455,6 +3253,260 @@ Transfer-Encoding: chunked\r\n\
         assert!(response_str.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response_str.contains("content-type: application/json"));
         assert!(response_str.contains("\"tools\":[]"));
+    }
+
+    #[test]
+    fn http_transport_response_emits_json_and_exact_admitted_origin_headers() {
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let origin = "https://trusted.example";
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut input = head.into_bytes();
+        input.extend_from_slice(body);
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec![origin.to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let mut output = Vec::new();
+
+        {
+            let mut transport = HttpTransport::with_config(Cursor::new(input), &mut output, config);
+            transport.recv(&Cx::for_testing()).unwrap();
+            transport
+                .send(
+                    &Cx::for_testing(),
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"tools": []}),
+                    )),
+                )
+                .unwrap();
+        }
+
+        let response = String::from_utf8(output).unwrap();
+        assert!(response.contains("content-type: application/json\r\n"));
+        assert!(response.contains(&format!("access-control-allow-origin: {origin}\r\n")));
+        assert!(response.contains(
+            "vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers\r\n"
+        ));
+    }
+
+    #[test]
+    fn http_transport_does_not_overwrite_origin_while_a_response_is_pending() {
+        let first_origin = "https://first.example";
+        let second_origin = "https://second.example";
+        let request = |origin: &str, id: i64| {
+            let body = format!(r#"{{"jsonrpc":"2.0","method":"tools/list","id":{id}}}"#);
+            let head = format!(
+                "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let mut framed = head.into_bytes();
+            framed.extend_from_slice(body.as_bytes());
+            framed
+        };
+        let mut input = request(first_origin, 1);
+        input.extend(request(second_origin, 2));
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec![first_origin.to_string(), second_origin.to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let mut output = Vec::new();
+
+        {
+            let cx = Cx::for_testing();
+            let mut transport = HttpTransport::with_config(Cursor::new(input), &mut output, config);
+            transport.recv(&cx).expect("first request is admitted");
+
+            let pending = transport
+                .recv(&cx)
+                .expect_err("a second request cannot overwrite pending response ownership");
+            assert!(matches!(
+                pending,
+                TransportError::Io(ref error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+
+            transport
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"sequence": 1}),
+                    )),
+                )
+                .expect("first response is written");
+            transport.recv(&cx).expect("second request remains unread");
+            transport
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(2),
+                        serde_json::json!({"sequence": 2}),
+                    )),
+                )
+                .expect("second response is written");
+        }
+
+        let wire = String::from_utf8(output).unwrap();
+        let responses: Vec<_> = wire
+            .split("HTTP/1.1 ")
+            .filter(|response| !response.is_empty())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].contains(first_origin));
+        assert!(!responses[0].contains(second_origin));
+        assert!(responses[0].contains(r#""sequence":1"#));
+        assert!(responses[1].contains(second_origin));
+        assert!(!responses[1].contains(first_origin));
+        assert!(responses[1].contains(r#""sequence":2"#));
+    }
+
+    #[test]
+    fn http_transport_acknowledges_notification_and_releases_origin_slot() {
+        let origin = "https://trusted.example";
+        let body = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut input = head.into_bytes();
+        input.extend_from_slice(body);
+        let config = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec![origin.to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let mut output = Vec::new();
+
+        {
+            let mut transport = HttpTransport::with_config(Cursor::new(input), &mut output, config);
+            let message = transport.recv(&Cx::for_testing()).unwrap();
+            assert!(
+                matches!(message, JsonRpcMessage::Request(ref request) if request.is_notification())
+            );
+            assert!(!transport.response_pending);
+            assert!(transport.response_origin.is_none());
+        }
+
+        let wire = String::from_utf8(output).unwrap();
+        assert!(wire.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        assert!(wire.contains(&format!("access-control-allow-origin: {origin}\r\n")));
+        assert!(wire.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn http_framing_or_eof_failure_latches_terminal_and_closed_wins_over_cancellation() {
+        let body_prefix = br#"{"jsonrpc":"2.0""#;
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body_prefix.len() + 10
+        );
+        let mut input = head.into_bytes();
+        input.extend_from_slice(body_prefix);
+        let mut transport = HttpTransport::new(Cursor::new(input), Vec::new());
+        let cx = Cx::for_testing();
+
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Io(_))));
+        assert!(transport.closed);
+        assert!(!transport.response_pending);
+        assert!(transport.response_origin.is_none());
+
+        cx.set_cancel_requested(true);
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+        assert!(matches!(
+            transport.send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::Value::Null,
+                )),
+            ),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn complete_http_body_codec_error_keeps_response_slot_for_jsonrpc_error() {
+        let body = b"{not-json";
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut input = head.into_bytes();
+        input.extend_from_slice(body);
+        let mut transport = HttpTransport::new(Cursor::new(input), Vec::new());
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            transport.recv(&cx),
+            Err(TransportError::Codec(CodecError::Json(_)))
+        ));
+        assert!(!transport.closed);
+        assert!(transport.response_pending);
+
+        let response = JsonRpcResponse::error(
+            None,
+            fastmcp_protocol::JsonRpcError {
+                code: -32700,
+                message: "Parse error".to_string(),
+                data: None,
+            },
+        );
+        transport
+            .send(&cx, &JsonRpcMessage::Response(response))
+            .unwrap();
+        assert!(!transport.closed);
+        assert!(!transport.response_pending);
+        assert!(transport.writer.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn http_handler_rejects_escaped_duplicate_object_member() {
+        let handler = HttpRequestHandler::new();
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","method":"first","m\u0065thod":"second","id":1}"#);
+
+        let error = handler.parse_request(&request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpError::CodecError(CodecError::InvalidMessage {
+                kind: crate::InvalidMessageKind::Request,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("duplicate JSON object member"));
+    }
+
+    #[test]
+    fn http_transport_rejects_escaped_duplicate_object_member() {
+        let body = br#"{"jsonrpc":"2.0","method":"first","m\u0065thod":"second","id":1}"#;
+        let request_head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut input = request_head.into_bytes();
+        input.extend_from_slice(body);
+        let reader = Cursor::new(input);
+        let writer = Vec::new();
+        let mut transport = HttpTransport::new(reader, writer);
+
+        let error = transport.recv(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Codec(CodecError::InvalidMessage {
+                kind: crate::InvalidMessageKind::Request,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("duplicate JSON object member"));
     }
 
     #[test]
@@ -1527,7 +3579,8 @@ Transfer-Encoding: chunked\r\n\
 
         // OPTIONS request from allowed origin
         let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
-            .with_header("Origin", "https://allowed.com");
+            .with_header("Origin", "https://allowed.com")
+            .with_header("Access-Control-Request-Method", "POST");
         let response = handler.handle_options(&request);
         assert_eq!(response.status, HttpStatus::OK);
         assert_eq!(
@@ -1537,9 +3590,48 @@ Transfer-Encoding: chunked\r\n\
 
         // OPTIONS request from disallowed origin
         let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
-            .with_header("Origin", "https://evil.com");
+            .with_header("Origin", "https://evil.com")
+            .with_header("Access-Control-Request-Method", "POST");
         let response = handler.handle_options(&request);
         assert_eq!(response.status, HttpStatus::FORBIDDEN);
+
+        let wrong_preflight_method = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://allowed.com")
+            .with_header("Access-Control-Request-Method", "GET");
+        assert_eq!(
+            handler.handle_options(&wrong_preflight_method).status,
+            HttpStatus::FORBIDDEN
+        );
+
+        let post = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Content-Type", "application/json")
+            .with_header("Origin", "https://evil.com")
+            .with_body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#);
+        assert!(matches!(
+            handler.parse_request(&post),
+            Err(HttpError::OriginNotAllowed(origin)) if origin == "https://evil.com"
+        ));
+
+        let missing_origin = HttpRequest::new(HttpMethod::Options, "/mcp/v1");
+        assert_eq!(
+            handler.handle_options(&missing_origin).status,
+            HttpStatus::FORBIDDEN
+        );
+
+        let wrong_path = HttpRequest::new(HttpMethod::Options, "/wrong")
+            .with_header("Origin", "https://allowed.com")
+            .with_header("Access-Control-Request-Method", "POST");
+        assert_eq!(
+            handler.handle_options(&wrong_path).status,
+            HttpStatus::NOT_FOUND
+        );
+
+        let wildcard_handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["*".to_string()],
+            ..HttpHandlerConfig::default()
+        });
+        assert!(!wildcard_handler.is_origin_allowed("https://allowed.com"));
     }
 
     #[test]
@@ -1552,8 +3644,8 @@ Transfer-Encoding: chunked\r\n\
         // Simulate multiple requests being pushed (from HTTP handlers)
         let req1 = JsonRpcRequest::new("method1", None, 1i64);
         let req2 = JsonRpcRequest::new("method2", None, 2i64);
-        transport.push_request(req1);
-        transport.push_request(req2);
+        transport.push_request(&cx, req1).unwrap();
+        transport.push_request(&cx, req2).unwrap();
 
         // Transport should receive requests in FIFO order.
         let msg = transport.recv(&cx).unwrap();
@@ -1574,8 +3666,238 @@ Transfer-Encoding: chunked\r\n\
 
         // Response should be available for streaming
         assert!(transport.has_responses());
-        let resp = transport.pop_response().unwrap();
+        let resp = transport.pop_response().unwrap().unwrap();
         assert_eq!(resp.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn streamable_http_request_ingress_feeds_transport_owned_by_recv_thread() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let empty_polls = Arc::clone(&transport.request_empty_polls);
+        let ingress = transport
+            .request_ingress()
+            .expect("request ingress can be externalized once");
+        let receive_cx = Cx::for_testing();
+        let cancel_cx = receive_cx.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let mut transport = transport;
+            let result = transport.recv(&receive_cx);
+            result_sender
+                .send(result)
+                .expect("test result receiver remains available");
+        });
+
+        if !wait_for_counter(&empty_polls, 1) {
+            cancel_cx.set_cancel_requested(true);
+            worker.join().expect("receive thread cancels cleanly");
+            panic!("transport did not enter its empty receive wait");
+        }
+        ingress
+            .push_request(
+                &Cx::for_testing(),
+                JsonRpcRequest::new("concurrent/ingress", None, 17_i64),
+            )
+            .expect("independent ingress can feed the owned transport");
+
+        let received = match result_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.expect("transport receives the concurrent request"),
+            Err(error) => {
+                cancel_cx.set_cancel_requested(true);
+                let _ = worker.join();
+                panic!("transport did not receive concurrent ingress: {error}");
+            }
+        };
+        worker.join().expect("receive thread completes");
+
+        let JsonRpcMessage::Request(request) = received else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "concurrent/ingress");
+    }
+
+    #[test]
+    fn streamable_http_response_stream_consumes_while_transport_is_owned_elsewhere() {
+        use fastmcp_protocol::RequestId;
+
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let entered_empty_waits = Arc::clone(&response_stream.entered_empty_waits);
+        let receive_cx = Cx::for_testing();
+        let cancel_cx = receive_cx.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let request_id = RequestId::Number(23);
+        let worker_request_id = request_id.clone();
+
+        let worker = std::thread::spawn(move || {
+            let result = response_stream.recv_response(&receive_cx, Some(&worker_request_id));
+            result_sender
+                .send(result)
+                .expect("test result receiver remains available");
+        });
+
+        if !wait_for_counter(&entered_empty_waits, 1) {
+            cancel_cx.set_cancel_requested(true);
+            worker.join().expect("response thread cancels cleanly");
+            panic!("response consumer did not enter its empty wait");
+        }
+        transport
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    request_id,
+                    serde_json::json!({"concurrent": true}),
+                )),
+            )
+            .expect("transport can produce for an independent response consumer");
+
+        let response = match result_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.expect("response stream receives the concurrent response"),
+            Err(error) => {
+                cancel_cx.set_cancel_requested(true);
+                let _ = worker.join();
+                panic!("response stream did not receive transport output: {error}");
+            }
+        };
+        worker.join().expect("response thread completes");
+        assert_eq!(response.id, Some(RequestId::Number(23)));
+        assert_eq!(transport.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_correlates_two_concurrent_consumers_exactly_once() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(2).expect("capacity two is valid");
+        let first_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let second_stream = first_stream.clone();
+        let entered_empty_waits = Arc::clone(&first_stream.entered_empty_waits);
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let first_cx = Cx::for_testing();
+        let first_cancel_cx = first_cx.clone();
+        let second_cx = Cx::for_testing();
+        let second_cancel_cx = second_cx.clone();
+
+        let first_sender = result_sender.clone();
+        let first_worker = std::thread::spawn(move || {
+            let id = RequestId::Number(101);
+            first_sender
+                .send((id.clone(), first_stream.recv_response(&first_cx, Some(&id))))
+                .expect("test result receiver remains available");
+        });
+        let second_worker = std::thread::spawn(move || {
+            let id = RequestId::Number(202);
+            result_sender
+                .send((
+                    id.clone(),
+                    second_stream.recv_response(&second_cx, Some(&id)),
+                ))
+                .expect("test result receiver remains available");
+        });
+
+        if !wait_for_counter(&entered_empty_waits, 2) {
+            first_cancel_cx.set_cancel_requested(true);
+            second_cancel_cx.set_cancel_requested(true);
+            first_worker.join().expect("first consumer cancels cleanly");
+            second_worker
+                .join()
+                .expect("second consumer cancels cleanly");
+            panic!("both correlated consumers did not enter empty waits");
+        }
+        for (id, marker) in [(RequestId::Number(202), 2), (RequestId::Number(101), 1)] {
+            transport
+                .send(
+                    &Cx::for_testing(),
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({"consumer": marker}),
+                    )),
+                )
+                .expect("each correlated response is admitted");
+        }
+
+        let received = (0..2)
+            .map(|_| result_receiver.recv_timeout(Duration::from_secs(1)))
+            .collect::<Result<Vec<_>, _>>();
+        if received.is_err() {
+            first_cancel_cx.set_cancel_requested(true);
+            second_cancel_cx.set_cancel_requested(true);
+        }
+        first_worker.join().expect("first consumer completes");
+        second_worker.join().expect("second consumer completes");
+
+        let mut observed = HashSet::new();
+        for (expected_id, result) in received.expect("both consumers complete") {
+            let response = result.expect("correlated receive succeeds");
+            assert_eq!(response.id.as_ref(), Some(&expected_id));
+            assert!(
+                observed.insert(expected_id),
+                "response delivered more than once"
+            );
+        }
+        assert_eq!(observed.len(), 2);
+        assert_eq!(transport.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_unmatched_pop_retains_response_and_byte_reservation() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let expected_id = RequestId::Number(303);
+        transport
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    expected_id.clone(),
+                    serde_json::json!({"retained": true}),
+                )),
+            )
+            .expect("response is admitted");
+        let retained_before = transport
+            .response_mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_bytes;
+        assert!(retained_before > 0);
+
+        assert!(
+            response_stream
+                .pop_response(Some(&RequestId::Number(404)))
+                .expect("unmatched pop is not terminal")
+                .is_none()
+        );
+        assert_eq!(transport.pending_responses(), 1);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retained_bytes,
+            retained_before
+        );
+
+        let response = response_stream
+            .pop_response(Some(&expected_id))
+            .expect("matching pop succeeds")
+            .expect("matching response is still retained");
+        assert_eq!(response.id, Some(expected_id));
+        assert_eq!(transport.pending_responses(), 0);
+        assert_eq!(
+            transport
+                .response_mailbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retained_bytes,
+            0
+        );
     }
 
     #[test]
@@ -1605,8 +3927,14 @@ Transfer-Encoding: chunked\r\n\
             .send(&cx, &JsonRpcMessage::Response(second))
             .unwrap();
 
-        let first_out = transport.pop_response().expect("first response");
-        let second_out = transport.pop_response().expect("second response");
+        let first_out = transport
+            .pop_response()
+            .expect("response channel remains open")
+            .expect("first response");
+        let second_out = transport
+            .pop_response()
+            .expect("response channel remains open")
+            .expect("second response");
         assert_eq!(first_out.id, Some(RequestId::Number(1)));
         assert_eq!(second_out.id, Some(RequestId::Number(2)));
     }
@@ -1625,103 +3953,738 @@ Transfer-Encoding: chunked\r\n\
     }
 
     #[test]
-    fn e2e_http_streaming_send_fails_when_response_queue_poisoned() {
+    fn e2e_http_streaming_response_queue_is_hard_bounded() {
         use fastmcp_protocol::RequestId;
-        use std::thread;
 
-        let mut transport = StreamableHttpTransport::new();
-        let queue = transport.response_queue();
-        let poison = thread::spawn(move || {
-            let _guard = queue.lock().expect("lock response queue");
-            std::panic::panic_any("poison response queue");
-        });
-        assert!(poison.join().is_err());
-
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
         let cx = Cx::for_testing();
-        let response = JsonRpcResponse {
+        let first = JsonRpcResponse {
             jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
             result: Some(serde_json::json!({"ok": true})),
             error: None,
             id: Some(RequestId::Number(1)),
         };
+        let second = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            id: Some(RequestId::Number(2)),
+        };
+
+        transport
+            .send(&cx, &JsonRpcMessage::Response(first))
+            .unwrap();
 
         let err = transport
-            .send(&cx, &JsonRpcMessage::Response(response))
-            .expect_err("poisoned response queue must fail send");
-        assert!(matches!(err, TransportError::Io(_)));
+            .send(&cx, &JsonRpcMessage::Response(second))
+            .expect_err("a second queued response must exceed capacity one");
+        assert!(matches!(
+            err,
+            TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(transport.pending_responses(), 1);
     }
 
     #[test]
-    fn e2e_http_streaming_recv_fails_when_request_queue_poisoned() {
-        use std::thread;
+    fn e2e_http_streaming_request_queue_is_hard_bounded_and_fifo() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let cx = Cx::for_testing();
+        transport
+            .push_request(&cx, JsonRpcRequest::new("first", None, 1i64))
+            .unwrap();
+        let error = transport
+            .push_request(&cx, JsonRpcRequest::new("rejected", None, 2i64))
+            .expect_err("a second queued request must exceed capacity one");
+        assert!(matches!(
+            error,
+            TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
 
-        let mut transport = StreamableHttpTransport::new();
-        let queue = transport.request_queue();
-        let poison = thread::spawn(move || {
-            let _guard = queue.lock().expect("lock request queue");
-            std::panic::panic_any("poison request queue");
-        });
-        assert!(poison.join().is_err());
+        let JsonRpcMessage::Request(request) = transport.recv(&cx).unwrap() else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "first");
+        assert_eq!(transport.pending_requests(), 0);
+    }
+
+    #[test]
+    fn streamable_http_rejects_invalid_or_oversized_typed_messages_before_queueing() {
+        let cx = Cx::for_testing();
+        let mut transport =
+            StreamableHttpTransport::with_capacity(2).expect("capacity two is valid");
+        transport.codec.set_max_message_size(64);
+
+        let oversized = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"payload": "x".repeat(128)})),
+            1_i64,
+        );
+        assert!(matches!(
+            transport.push_request(&cx, oversized),
+            Err(TransportError::Codec(CodecError::MessageTooLarge(_)))
+        ));
+        assert_eq!(transport.pending_requests(), 0);
+
+        let invalid_response = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        };
+        assert!(matches!(
+            transport.send(&cx, &JsonRpcMessage::Response(invalid_response)),
+            Err(TransportError::Codec(CodecError::Json(_)))
+        ));
+        assert_eq!(transport.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_enforces_aggregate_byte_budgets_in_both_directions() {
+        const TEST_BYTE_BUDGET: usize = 512;
 
         let cx = Cx::for_testing();
-        let err = transport
-            .recv(&cx)
-            .expect_err("poisoned request queue must fail recv");
-        assert!(matches!(err, TransportError::Io(_)));
+        let mut transport = StreamableHttpTransport::with_queue_limits(4, TEST_BYTE_BUDGET)
+            .expect("test limits are valid");
+        let (request_ingress, response_stream) = transport
+            .split_handles()
+            .expect("endpoints can be externalized once");
+        let request = JsonRpcRequest::new(
+            "budget/request",
+            Some(serde_json::json!({"payload": "x".repeat(320)})),
+            1_i64,
+        );
+        let request_bytes = transport
+            .codec
+            .encode_request(&request)
+            .expect("request is encodable")
+            .len();
+        assert!(request_bytes <= TEST_BYTE_BUDGET);
+        assert!(request_bytes * 2 > TEST_BYTE_BUDGET);
+
+        request_ingress.push_request(&cx, request.clone()).unwrap();
+        let request_error = request_ingress
+            .push_request(&cx, request.clone())
+            .expect_err("aggregate request bytes must be bounded");
+        assert!(matches!(
+            request_error,
+            TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            transport.recv(&cx).unwrap(),
+            JsonRpcMessage::Request(_)
+        ));
+        request_ingress
+            .push_request(&cx, request)
+            .expect("dequeue releases the request byte budget");
+
+        let response = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::json!({"payload": "x".repeat(320)}),
+        );
+        let response_bytes = transport
+            .codec
+            .encode_response(&response)
+            .expect("response is encodable")
+            .len();
+        assert!(response_bytes <= TEST_BYTE_BUDGET);
+        assert!(response_bytes * 2 > TEST_BYTE_BUDGET);
+
+        transport
+            .send(&cx, &JsonRpcMessage::Response(response.clone()))
+            .unwrap();
+        let response_error = transport
+            .send(&cx, &JsonRpcMessage::Response(response.clone()))
+            .expect_err("aggregate response bytes must be bounded");
+        assert!(matches!(
+            response_error,
+            TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        response_stream
+            .pop_response(Some(&fastmcp_protocol::RequestId::Number(1)))
+            .expect("response queue remains open")
+            .expect("one response was queued");
+        transport
+            .send(&cx, &JsonRpcMessage::Response(response))
+            .expect("dequeue releases the response byte budget");
     }
 
     #[test]
-    fn e2e_http_streaming_push_request_recovers_from_poisoned_queue() {
-        use std::thread;
-
-        let transport = StreamableHttpTransport::new();
-        let queue = transport.request_queue();
-        let poison_queue = Arc::clone(&queue);
-        let poison = thread::spawn(move || {
-            let _guard = poison_queue.lock().expect("lock request queue");
-            std::panic::panic_any("poison request queue");
-        });
-        assert!(poison.join().is_err());
-
-        transport.push_request(JsonRpcRequest::new("recovered-method", None, 7i64));
-
-        let guard = match queue.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        assert_eq!(guard.len(), 1);
-        assert_eq!(guard[0].method, "recovered-method");
+    fn e2e_http_streaming_rejects_zero_capacity() {
+        assert!(matches!(
+            StreamableHttpTransport::with_capacity(0),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            StreamableHttpTransport::with_capacity(MAX_STREAMABLE_QUEUE_CAPACITY + 1),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
-    fn e2e_http_streaming_response_helpers_recover_from_poisoned_queue() {
-        use fastmcp_protocol::RequestId;
-        use std::thread;
+    fn streamable_http_close_is_terminal_for_public_queue_operations() {
+        let cx = Cx::for_testing();
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let (request_ingress, response_stream) = transport
+            .split_handles()
+            .expect("endpoints can be externalized once");
+        let response_id = fastmcp_protocol::RequestId::Number(1);
+        transport
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    response_id.clone(),
+                    serde_json::Value::Null,
+                )),
+            )
+            .unwrap();
+        request_ingress
+            .push_request(&cx, JsonRpcRequest::new("queued", None, 1_i64))
+            .unwrap();
+        assert!(transport.has_responses());
+        assert_eq!(transport.pending_requests(), 1);
+        assert_eq!(transport.pending_responses(), 1);
 
-        let transport = StreamableHttpTransport::new();
-        let queue = transport.response_queue();
-        {
-            let mut guard = queue.lock().expect("lock response queue");
-            guard.push_back(JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"seq": 9})),
-                error: None,
-                id: Some(RequestId::Number(9)),
-            });
-        }
-
-        let poison_queue = Arc::clone(&queue);
-        let poison = thread::spawn(move || {
-            let _guard = poison_queue.lock().expect("lock response queue");
-            std::panic::panic_any("poison response queue");
-        });
-        assert!(poison.join().is_err());
+        transport.close().unwrap();
 
         assert!(transport.has_responses());
-        let response = transport
-            .pop_response()
-            .expect("poisoned queue should still yield response");
-        assert_eq!(response.id, Some(RequestId::Number(9)));
+        assert_eq!(transport.pending_requests(), 0);
+        assert_eq!(transport.pending_responses(), 1);
+        assert!(request_ingress.is_closed());
+        assert!(response_stream.is_closed());
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            transport.push_request(&cx, JsonRpcRequest::new("after-close", None, 2_i64)),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            request_ingress
+                .push_request(&cx, JsonRpcRequest::new("after-close-handle", None, 3_i64)),
+            Err(TransportError::Closed)
+        ));
+        let drained = response_stream
+            .pop_response(Some(&response_id))
+            .expect("already-admitted response remains drainable")
+            .expect("queued response is retained across graceful close");
+        assert_eq!(drained.id, Some(response_id.clone()));
+        assert_eq!(transport.pending_responses(), 0);
+        assert!(matches!(
+            response_stream.pop_response(Some(&response_id)),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            transport.send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(2),
+                    serde_json::Value::Null,
+                )),
+            ),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn streamable_http_owner_drop_closes_external_handles() {
+        let (request_ingress, response_stream) = {
+            let mut transport = StreamableHttpTransport::new();
+            transport
+                .split_handles()
+                .expect("endpoints can be externalized once")
+        };
+
+        assert!(request_ingress.is_closed());
+        assert!(response_stream.is_closed());
+        assert!(matches!(
+            request_ingress.push_request(
+                &Cx::for_testing(),
+                JsonRpcRequest::new("after-owner-drop", None, 1_i64)
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            response_stream.pop_response(Some(&fastmcp_protocol::RequestId::Number(1))),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn streamable_http_owner_drop_preserves_admitted_response_for_external_drain() {
+        let response_id = fastmcp_protocol::RequestId::Number(77);
+        let response_stream = {
+            let mut transport = StreamableHttpTransport::new();
+            let response_stream = transport
+                .response_stream()
+                .expect("response stream can be externalized once");
+            transport
+                .send(
+                    &Cx::for_testing(),
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        response_id.clone(),
+                        serde_json::json!({"drain": true}),
+                    )),
+                )
+                .expect("response is admitted before owner drop");
+            response_stream
+        };
+
+        let response = response_stream
+            .pop_response(Some(&response_id))
+            .expect("owner drop still permits an admitted response to drain")
+            .expect("the admitted response remains present");
+        assert_eq!(response.id, Some(response_id.clone()));
+        assert!(matches!(
+            response_stream.pop_response(Some(&response_id)),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn streamable_http_externalizes_each_endpoint_exactly_once() {
+        let mut request_transport = StreamableHttpTransport::new();
+        let request_ingress = request_transport
+            .request_ingress()
+            .expect("request ingress can be externalized once");
+        assert!(request_transport.request_sender.is_none());
+        assert!(matches!(
+            request_transport.request_ingress(),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        drop(request_ingress);
+        assert!(matches!(
+            request_transport.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+
+        let mut response_transport = StreamableHttpTransport::new();
+        let response_stream = response_transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        assert!(matches!(
+            response_transport.response_stream(),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(matches!(
+            response_transport.pop_response(),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        response_transport
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::Value::Null,
+                )),
+            )
+            .expect("response is admitted while the external consumer lives");
+        assert_eq!(response_transport.pending_responses(), 1);
+        drop(response_stream);
+        assert_eq!(response_transport.pending_responses(), 0);
+        assert_eq!(
+            response_transport
+                .response_mailbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retained_bytes,
+            0
+        );
+        assert!(matches!(
+            response_transport.send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(2),
+                    serde_json::Value::Null,
+                )),
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(response_transport.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_response_pop_and_admission_are_nonblocking_under_contention() {
+        let mut transport = StreamableHttpTransport::new();
+        let response_stream = transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let mailbox = Arc::clone(&transport.response_mailbox);
+        let mailbox_guard = mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(matches!(
+            response_stream.pop_response(Some(&fastmcp_protocol::RequestId::Number(1))),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            transport.send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::Value::Null,
+                )),
+            ),
+            Err(TransportError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(transport.pending_responses(), 0);
+        drop(mailbox_guard);
+    }
+
+    #[test]
+    fn streamable_http_observes_deadline_budget_and_masked_checkpoint_semantics() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(2).expect("capacity two is valid");
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            transport.push_request(&deadline_cx, JsonRpcRequest::new("expired", None, 1_i64),),
+            Err(TransportError::Timeout)
+        ));
+        assert_eq!(transport.pending_requests(), 0);
+
+        let exhausted_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        assert!(matches!(
+            transport.push_request(
+                &exhausted_cx,
+                JsonRpcRequest::new("budget-exhausted", None, 2_i64),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+
+        let masked_deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        masked_deadline_cx.masked(|| {
+            transport
+                .push_request(
+                    &masked_deadline_cx,
+                    JsonRpcRequest::new("masked", None, 3_i64),
+                )
+                .expect("masking defers deadline enforcement at the checkpoint");
+        });
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Ok(JsonRpcMessage::Request(ref request)) if request.method == "masked"
+        ));
+        assert!(matches!(
+            transport.push_request(
+                &masked_deadline_cx,
+                JsonRpcRequest::new("after-mask", None, 4_i64),
+            ),
+            Err(TransportError::Timeout)
+        ));
+
+        let mut response_transport = StreamableHttpTransport::new();
+        let response_stream = response_transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let response_id = fastmcp_protocol::RequestId::Number(5);
+        response_transport
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    response_id.clone(),
+                    serde_json::Value::Null,
+                )),
+            )
+            .expect("response is admitted");
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let masked_response = cancelled_cx
+            .masked(|| response_stream.recv_response(&cancelled_cx, Some(&response_id)));
+        assert_eq!(
+            masked_response.expect("masking defers cancellation").id,
+            Some(response_id)
+        );
+
+        let mut empty_transport = StreamableHttpTransport::new();
+        let empty_stream = empty_transport
+            .response_stream()
+            .expect("response stream can be externalized once");
+        let expired_wait_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            empty_stream.recv_response(
+                &expired_wait_cx,
+                Some(&fastmcp_protocol::RequestId::Number(6)),
+            ),
+            Err(TransportError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn streamable_http_transport_send_and_recv_use_checkpoint_not_raw_cancel_flag() {
+        let mut send_transport = StreamableHttpTransport::new();
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            send_transport.send(
+                &deadline_cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::Value::Null,
+                )),
+            ),
+            Err(TransportError::Timeout)
+        ));
+        assert_eq!(send_transport.pending_responses(), 0);
+
+        let masked_cx = Cx::for_testing();
+        masked_cx.set_cancel_requested(true);
+        masked_cx.masked(|| {
+            send_transport
+                .send(
+                    &masked_cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(2),
+                        serde_json::Value::Null,
+                    )),
+                )
+                .expect("masking defers cancellation during send admission");
+        });
+        assert_eq!(
+            send_transport
+                .pop_response()
+                .expect("direct response consumer remains open")
+                .expect("masked send admitted one response")
+                .id,
+            Some(fastmcp_protocol::RequestId::Number(2))
+        );
+
+        let mut receive_transport = StreamableHttpTransport::new();
+        let expired_receive_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            receive_transport.recv(&expired_receive_cx),
+            Err(TransportError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn streamable_http_recv_drains_admission_that_finishes_during_ingress_close() {
+        let mut transport =
+            StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+        let empty_polls = Arc::clone(&transport.request_empty_polls);
+        let ingress = transport
+            .request_ingress()
+            .expect("request ingress can be externalized once");
+        let request = JsonRpcRequest::new("close/drain", None, 909_i64);
+        let serialized_bytes = ingress
+            .codec
+            .encode_request(&request)
+            .expect("test request is encodable")
+            .len();
+        let sender = ingress.sender.clone();
+        let retained_bytes = Arc::clone(&ingress.retained_bytes);
+        let retained_bytes_observer = Arc::clone(&ingress.retained_bytes);
+        let admissions_open = Arc::clone(&ingress.admissions_open);
+        let active_admissions = Arc::clone(&ingress.active_admissions);
+        let active_admissions_observer = Arc::clone(&ingress.active_admissions);
+        let max_queued_bytes = ingress.max_queued_bytes;
+        let (admitted_sender, admitted_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        let producer = std::thread::spawn(move || {
+            let admission = begin_streamable_admission(&admissions_open, &active_admissions)
+                .expect("producer enters before close");
+            reserve_streamable_bytes(
+                &retained_bytes,
+                max_queued_bytes,
+                serialized_bytes,
+                &admissions_open,
+                &Cx::for_testing(),
+                "test request byte budget is full",
+            )
+            .expect("producer reserves bytes before close");
+            admitted_sender
+                .send(())
+                .expect("test admission receiver remains available");
+            release_receiver
+                .recv()
+                .expect("test releases the admitted producer");
+            assert!(
+                sender
+                    .try_send(QueuedRequest {
+                        message: request,
+                        serialized_bytes,
+                    })
+                    .is_ok(),
+                "the pre-close admission commits to the bounded queue"
+            );
+            drop(admission);
+        });
+        admitted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer reaches the admitted pre-commit state");
+
+        let close_open = Arc::clone(&ingress.admissions_open);
+        let closer = std::thread::spawn(move || ingress.close());
+        let close_deadline = Instant::now() + Duration::from_secs(1);
+        while close_open.load(Ordering::SeqCst) {
+            if Instant::now() >= close_deadline {
+                release_sender
+                    .send(())
+                    .expect("release producer during test cleanup");
+                producer.join().expect("producer cleanup succeeds");
+                closer.join().expect("closer cleanup succeeds");
+                panic!("ingress close did not seal the admission gate");
+            }
+            std::thread::yield_now();
+        }
+
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let receive_cx = Cx::for_testing();
+        let cancel_receive_cx = receive_cx.clone();
+        let receiver = std::thread::spawn(move || {
+            result_sender
+                .send(transport.recv(&receive_cx))
+                .expect("test result receiver remains available");
+        });
+        if !wait_for_counter(&empty_polls, 1) {
+            release_sender
+                .send(())
+                .expect("release producer during test cleanup");
+            producer.join().expect("producer cleanup succeeds");
+            closer.join().expect("closer cleanup succeeds");
+            cancel_receive_cx.set_cancel_requested(true);
+            receiver.join().expect("receiver cleanup succeeds");
+            panic!("receiver reported closure instead of waiting for the active admission");
+        }
+
+        release_sender
+            .send(())
+            .expect("release the admitted producer");
+        producer.join().expect("producer completes");
+        closer.join().expect("ingress close completes");
+        let received = match result_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.expect("pre-close admission remains receivable"),
+            Err(error) => {
+                cancel_receive_cx.set_cancel_requested(true);
+                receiver.join().expect("receiver cleanup succeeds");
+                panic!("receiver did not drain the admitted request: {error}");
+            }
+        };
+        receiver.join().expect("receiver completes");
+        assert!(matches!(
+            received,
+            JsonRpcMessage::Request(ref request) if request.method == "close/drain"
+        ));
+        assert_eq!(retained_bytes_observer.load(Ordering::Acquire), 0);
+        assert_eq!(active_admissions_observer.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn streamable_http_request_close_race_preserves_accounting() {
+        for sequence in 0..32_i64 {
+            let mut transport =
+                StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+            let ingress = transport
+                .request_ingress()
+                .expect("request ingress can be externalized once");
+            let worker_ingress = ingress.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let worker_barrier = Arc::clone(&barrier);
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_ingress.push_request(
+                    &Cx::for_testing(),
+                    JsonRpcRequest::new("race", None, sequence),
+                )
+            });
+
+            barrier.wait();
+            ingress.close();
+            match worker.join().expect("request producer completes") {
+                Ok(()) => assert!(matches!(
+                    transport.recv(&Cx::for_testing()),
+                    Ok(JsonRpcMessage::Request(_))
+                )),
+                Err(TransportError::Closed) => {
+                    assert_eq!(transport.pending_requests(), 0);
+                }
+                Err(error) => panic!("unexpected request race result: {error}"),
+            }
+            assert_eq!(transport.pending_requests(), 0);
+            assert_eq!(transport.request_retained_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(
+                transport.request_active_admissions.load(Ordering::Acquire),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn streamable_http_response_close_race_preserves_accounting_and_drain() {
+        for sequence in 0..32_i64 {
+            let mut transport =
+                StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
+            let response_stream = transport
+                .response_stream()
+                .expect("response stream can be externalized once");
+            let response_id = fastmcp_protocol::RequestId::Number(sequence);
+            let worker_id = response_id.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let worker_barrier = Arc::clone(&barrier);
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                let result = transport.send(
+                    &Cx::for_testing(),
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        worker_id,
+                        serde_json::Value::Null,
+                    )),
+                );
+                (transport, result)
+            });
+
+            barrier.wait();
+            response_stream.close();
+            let (transport, result) = worker.join().expect("response producer completes");
+            match result {
+                Ok(()) => {
+                    let drained = response_stream
+                        .pop_response(Some(&response_id))
+                        .expect("pre-close admission remains drainable")
+                        .expect("successful admission has exactly one response");
+                    assert_eq!(drained.id, Some(response_id.clone()));
+                }
+                Err(TransportError::Closed) => {
+                    assert_eq!(transport.pending_responses(), 0);
+                }
+                Err(error) => panic!("unexpected response race result: {error}"),
+            }
+            assert_eq!(transport.pending_responses(), 0);
+            assert_eq!(
+                transport
+                    .response_mailbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retained_bytes,
+                0
+            );
+            assert_eq!(
+                transport.response_active_admissions.load(Ordering::Acquire),
+                0
+            );
+            assert!(matches!(
+                response_stream.pop_response(Some(&response_id)),
+                Err(TransportError::Closed)
+            ));
+        }
     }
 
     #[test]
@@ -1729,13 +4692,13 @@ Transfer-Encoding: chunked\r\n\
         let store = SessionStore::new(Duration::from_millis(100));
 
         // Create session
-        let id = store.create();
+        let id = store.create().unwrap();
         assert_eq!(store.count(), 1);
 
         // Get and modify session
         let mut session = store.get(&id).unwrap();
-        session.set("user_id", serde_json::json!(42));
-        store.update(session);
+        session.set("user_id", serde_json::json!(42)).unwrap();
+        store.update(session).unwrap();
 
         // Retrieve and verify
         let session = store.get(&id).unwrap();
@@ -1746,6 +4709,24 @@ Transfer-Encoding: chunked\r\n\
 
         // Session should be expired
         assert!(store.get(&id).is_none());
+    }
+
+    #[test]
+    fn http_session_count_excludes_expired_sessions_without_prior_lookup() {
+        let timeout = Duration::from_secs(60);
+        let store = SessionStore::new(timeout);
+        let id = store.create().unwrap();
+        assert_eq!(store.count(), 1);
+
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_activity = Instant::now() - timeout - Duration::from_secs(1);
+
+        assert_eq!(store.count(), 0);
     }
 
     #[test]
@@ -1817,6 +4798,17 @@ Transfer-Encoding: chunked\r\n\
     }
 
     #[test]
+    fn handler_body_limit_configures_the_strict_codec_boundary() {
+        let configured_limit = 12 * 1024 * 1024;
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            max_body_size: configured_limit,
+            ..Default::default()
+        });
+
+        assert_eq!(handler.codec.max_message_size(), configured_limit);
+    }
+
+    #[test]
     fn http_method_as_str_round_trips() {
         let methods = [
             HttpMethod::Get,
@@ -1854,6 +4846,22 @@ Transfer-Encoding: chunked\r\n\
     }
 
     #[test]
+    fn http_request_debug_redacts_headers_body_path_and_query_values() {
+        let canary = "HTTP-REQUEST-SECRET-CANARY";
+        let req = HttpRequest::new(HttpMethod::Post, format!("/mcp/{canary}"))
+            .with_header("Authorization", format!("Bearer {canary}"))
+            .with_body(format!("{{\"secret\":\"{canary}\"}}"))
+            .with_query("token", canary);
+
+        let debug = format!("{req:?}");
+        assert!(debug.contains("HttpRequest"));
+        assert!(debug.contains("header_count: 1"));
+        assert!(!debug.contains(canary));
+        assert!(!debug.contains("Authorization"));
+        assert!(!debug.contains("token"));
+    }
+
+    #[test]
     fn http_request_json_parse() {
         let body = serde_json::json!({"key": "value"});
         let req =
@@ -1874,9 +4882,8 @@ Transfer-Encoding: chunked\r\n\
     fn http_handler_config_defaults() {
         let config = HttpHandlerConfig::default();
         assert_eq!(config.base_path, "/mcp/v1");
-        assert!(config.allow_cors);
-        assert_eq!(config.cors_origins, vec!["*".to_string()]);
-        assert_eq!(config.timeout, Duration::from_secs(30));
+        assert!(!config.allow_cors);
+        assert!(config.cors_origins.is_empty());
         assert_eq!(config.max_body_size, 10 * 1024 * 1024);
     }
 
@@ -1889,13 +4896,26 @@ Transfer-Encoding: chunked\r\n\
     #[test]
     fn http_error_display_all_variants() {
         let cases: Vec<(HttpError, &str)> = vec![
+            (HttpError::InvalidMethod("X".into()), "invalid HTTP method"),
             (
-                HttpError::InvalidMethod("X".into()),
-                "invalid HTTP method: X",
+                HttpError::InvalidRequestLine("bad".into()),
+                "invalid HTTP request line",
+            ),
+            (
+                HttpError::InvalidHeader("bad".into()),
+                "invalid HTTP header",
             ),
             (
                 HttpError::InvalidContentType("text/xml".into()),
-                "invalid content type: text/xml",
+                "invalid content type",
+            ),
+            (
+                HttpError::InvalidPath("/wrong".into()),
+                "invalid MCP endpoint path",
+            ),
+            (
+                HttpError::OriginNotAllowed("https://denied.example".into()),
+                "origin is not allowed",
             ),
             (
                 HttpError::HeadersTooLarge { size: 100, max: 50 },
@@ -1910,7 +4930,7 @@ Transfer-Encoding: chunked\r\n\
             ),
             (
                 HttpError::UnsupportedTransferEncoding("gzip".into()),
-                "unsupported transfer encoding: gzip",
+                "unsupported transfer encoding",
             ),
             (HttpError::Timeout, "request timeout"),
             (HttpError::Closed, "connection closed"),
@@ -1958,8 +4978,8 @@ Transfer-Encoding: chunked\r\n\
     #[test]
     fn session_store_cleanup_removes_expired() {
         let store = SessionStore::new(Duration::from_millis(50));
-        let _id1 = store.create();
-        let _id2 = store.create();
+        let _id1 = store.create().unwrap();
+        let _id2 = store.create().unwrap();
         assert_eq!(store.count(), 2);
 
         std::thread::sleep(Duration::from_millis(100));
