@@ -2006,7 +2006,7 @@ impl Server {
 
                 let start_time = Instant::now();
                 if let Some(renderer) = &worker_renderer {
-                    renderer.render_request(&request, &self.console);
+                    renderer.render_request(&request, &worker_server.console);
                 }
 
                 let request_id = request.id.clone();
@@ -2039,7 +2039,7 @@ impl Server {
                 drop(send_guard);
                 if let Ok(response) = &send_result {
                     if let Some(renderer) = &worker_renderer {
-                        renderer.render_response(response, Some(duration), &self.console);
+                        renderer.render_response(response, Some(duration), &worker_server.console);
                     }
                     if let Some(ref stats) = worker_server.stats
                         && let Ok(json) = serde_json::to_string(response)
