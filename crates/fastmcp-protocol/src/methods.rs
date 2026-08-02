@@ -11,10 +11,6 @@ pub const INITIALIZE: &str = "initialize";
 /// Lifecycle `initialized` notification (spec-correct name).
 pub const NOTIFICATIONS_INITIALIZED: &str = "notifications/initialized";
 
-/// Legacy bare `initialized` spelling, still accepted on the server for
-/// backwards compatibility with older clients.
-pub const LEGACY_INITIALIZED: &str = "initialized";
-
 /// Tools list request.
 pub const TOOLS_LIST: &str = "tools/list";
 
@@ -58,7 +54,6 @@ mod tests {
         // NOT bare `initialized`. https://modelcontextprotocol.io/specification
         assert_eq!(INITIALIZE, "initialize");
         assert_eq!(NOTIFICATIONS_INITIALIZED, "notifications/initialized");
-        assert_eq!(LEGACY_INITIALIZED, "initialized");
 
         assert_eq!(TOOLS_LIST, "tools/list");
         assert_eq!(TOOLS_CALL, "tools/call");

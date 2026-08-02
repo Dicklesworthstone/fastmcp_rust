@@ -6,6 +6,10 @@
 //! - Protocol version negotiation
 //! - Message serialization/deserialization
 //!
+//! MCP 2026-07-28 support is under implementation and remains unverified. The
+//! public `PROTOCOL_VERSION` is still `2024-11-05`; newer source types are not
+//! aggregate conformance or release evidence.
+//!
 //! # MCP Protocol Overview
 //!
 //! MCP (Model Context Protocol) uses JSON-RPC 2.0 over various transports.
@@ -17,7 +21,8 @@
 //!
 //! # Wire Format
 //!
-//! All messages are newline-delimited JSON (NDJSON).
+//! Protocol values serialize as JSON-RPC. Framing is transport-specific; the
+//! stdio transport uses newline-delimited JSON (NDJSON).
 //!
 //! # Role in the System
 //!
@@ -27,8 +32,8 @@
 //! - Transports carry these messages without needing to know business logic.
 //!
 //! If you are integrating FastMCP with a custom runtime or embedding it into
-//! another system, depend on this crate to get the canonical JSON-RPC and MCP
-//! data models.
+//! another system, depend on this crate to use FastMCP's current JSON-RPC and
+//! MCP data models. The modernization disclaimer above still applies.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -40,7 +45,8 @@ pub mod schema;
 mod types;
 
 pub use jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, RequestId,
 };
 pub use messages::*;
 pub use schema::{ValidationError, ValidationResult, validate, validate_strict};

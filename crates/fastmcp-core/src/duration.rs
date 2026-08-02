@@ -43,10 +43,10 @@ impl std::error::Error for ParseDurationError {}
 /// use std::time::Duration;
 ///
 /// assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-/// assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_mins(5));
+/// assert_eq!(parse_duration("1h").unwrap(), Duration::from_hours(1));
 /// assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-/// assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+/// assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_mins(90));
 /// ```
 pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
     let s = s.trim();
@@ -96,15 +96,26 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
                 }
             };
 
-            let millis = match unit {
-                "ms" => num,
-                "s" => num * 1000,
-                "m" => num * 60 * 1000,
-                "h" => num * 60 * 60 * 1000,
+            let millis_per_unit = match unit {
+                "ms" => 1,
+                "s" => 1_000,
+                "m" => 60_000,
+                "h" => 3_600_000,
                 _ => unreachable!(),
             };
+            let millis = num
+                .checked_mul(millis_per_unit)
+                .ok_or_else(|| ParseDurationError {
+                    input: s.to_string(),
+                    message: format!("duration component overflows: {num}{unit}"),
+                })?;
 
-            total_millis = total_millis.saturating_add(millis);
+            total_millis = total_millis
+                .checked_add(millis)
+                .ok_or_else(|| ParseDurationError {
+                    input: s.to_string(),
+                    message: "combined duration overflows".to_string(),
+                })?;
             current_num.clear();
         } else if c.is_whitespace() {
             // Allow whitespace between components
@@ -150,14 +161,14 @@ mod tests {
     fn test_parse_minutes() {
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
-        assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("90m").unwrap(), Duration::from_mins(90));
     }
 
     #[test]
     fn test_parse_hours() {
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
-        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
     }
 
     #[test]
@@ -173,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_parse_combined() {
-        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_mins(90));
         assert_eq!(parse_duration("2m30s").unwrap(), Duration::from_secs(150));
         assert_eq!(
             parse_duration("1h30m45s").unwrap(),
@@ -188,7 +199,21 @@ mod tests {
     #[test]
     fn test_parse_with_whitespace() {
         assert_eq!(parse_duration("  30s  ").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_mins(90));
+    }
+
+    #[test]
+    fn rejects_component_and_combined_overflow() {
+        let component = parse_duration("18446744073709551615s")
+            .expect_err("seconds-to-milliseconds conversion must be checked");
+        assert_eq!(
+            component.message,
+            "duration component overflows: 18446744073709551615s"
+        );
+
+        let combined = parse_duration("18446744073709551615ms1ms")
+            .expect_err("adding duration components must be checked");
+        assert_eq!(combined.message, "combined duration overflows");
     }
 
     #[test]
@@ -272,11 +297,15 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn saturating_add_overflow() {
-        // u64::MAX millis would overflow without saturating_add
-        let result = parse_duration(&format!("{}ms {}ms", u64::MAX, 1));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Duration::from_millis(u64::MAX));
+    fn maximum_milliseconds_is_exact_and_one_more_is_rejected() {
+        assert_eq!(
+            parse_duration(&format!("{}ms", u64::MAX)).unwrap(),
+            Duration::from_millis(u64::MAX)
+        );
+
+        let err = parse_duration(&format!("{}ms 1ms", u64::MAX))
+            .expect_err("duration parsing must not silently saturate overflow");
+        assert_eq!(err.message, "combined duration overflows");
     }
 
     #[test]

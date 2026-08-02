@@ -5,6 +5,12 @@
 //! - `#[resource]` - Define a resource handler
 //! - `#[prompt]` - Define a prompt handler
 //!
+//! MCP 2026-07-28 support is under implementation and remains unverified. The
+//! public protocol constant is still `2024-11-05`, and macro source presence
+//! is not aggregate conformance or release evidence. Async handler forms await
+//! the caller-owned request future directly and do not create or re-enter a
+//! runtime. Their synchronous trait entry points report explicit misuse.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -16,14 +22,17 @@
 //!     ctx: &McpContext,
 //!     /// The name to greet
 //!     name: String,
-//! ) -> String {
-//!     format!("Hello, {name}!")
+//! ) -> McpResult<String> {
+//!     ctx.checkpoint()?;
+//!     Ok(format!("Hello, {name}!"))
 //! }
 //!
 //! /// A configuration file resource.
 //! #[resource(uri = "config://app")]
-//! async fn app_config(ctx: &McpContext) -> String {
-//!     std::fs::read_to_string("config.json").unwrap()
+//! fn app_config(ctx: &McpContext) -> McpResult<String> {
+//!     ctx.checkpoint()?;
+//!     std::fs::read_to_string("config.json")
+//!         .map_err(|error| McpError::internal_error(error.to_string()))
 //! }
 //!
 //! /// A code review prompt.
@@ -32,11 +41,12 @@
 //!     ctx: &McpContext,
 //!     /// The code to review
 //!     code: String,
-//! ) -> Vec<PromptMessage> {
-//!     vec![PromptMessage {
+//! ) -> McpResult<Vec<PromptMessage>> {
+//!     ctx.checkpoint()?;
+//!     Ok(vec![PromptMessage {
 //!         role: Role::User,
 //!         content: Content::Text { text: format!("Review this code:\n\n{code}") },
-//!     }]
+//!     }])
 //! }
 //! ```
 //!
@@ -55,13 +65,88 @@
 use std::collections::HashMap;
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro_crate::{FoundCrate, crate_name};
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned as _;
 use syn::{
     Attribute, FnArg, Ident, ItemFn, Lit, LitStr, Meta, Pat, Token, Type, parse::Parse,
     parse::ParseStream, parse_macro_input,
 };
+
+/// Crate paths used by handler macro expansions.
+///
+/// When the consumer depends on the `fastmcp-rust` facade, every generated
+/// path goes through its private re-export namespace. Otherwise, direct
+/// `fastmcp-derive` consumers retain the narrower subcrate arrangement used by
+/// this workspace. Both routes honor Cargo dependency renames.
+struct HandlerCratePaths {
+    core: TokenStream2,
+    protocol: TokenStream2,
+    server: TokenStream2,
+}
+
+struct ToolCratePaths {
+    handler: HandlerCratePaths,
+    serde_json: TokenStream2,
+}
+
+fn found_crate_path(found: FoundCrate, package: &str) -> TokenStream2 {
+    match found {
+        FoundCrate::Itself if package == "fastmcp-rust" => quote!(::fastmcp_rust),
+        FoundCrate::Itself => quote!(crate),
+        FoundCrate::Name(name) => {
+            let ident = Ident::new(&name.replace('-', "_"), Span::call_site());
+            quote!(::#ident)
+        }
+    }
+}
+
+fn direct_crate_path(package: &str) -> syn::Result<TokenStream2> {
+    crate_name(package)
+        .map(|found| found_crate_path(found, package))
+        .map_err(|error| {
+            syn::Error::new(
+                Span::call_site(),
+                format!(
+                    "FastMCP macro expansion requires either the `fastmcp-rust` facade or a direct `{package}` dependency: {error}"
+                ),
+            )
+        })
+}
+
+fn handler_crate_paths() -> syn::Result<HandlerCratePaths> {
+    if let Ok(found) = crate_name("fastmcp-rust") {
+        let facade = found_crate_path(found, "fastmcp-rust");
+        return Ok(HandlerCratePaths {
+            core: quote!(#facade::__private::core),
+            protocol: quote!(#facade::__private::protocol),
+            server: quote!(#facade::__private::server),
+        });
+    }
+
+    Ok(HandlerCratePaths {
+        core: direct_crate_path("fastmcp-core")?,
+        protocol: direct_crate_path("fastmcp-protocol")?,
+        server: direct_crate_path("fastmcp-server")?,
+    })
+}
+
+fn tool_crate_paths() -> syn::Result<ToolCratePaths> {
+    Ok(ToolCratePaths {
+        handler: handler_crate_paths()?,
+        serde_json: serde_json_crate_path()?,
+    })
+}
+
+fn serde_json_crate_path() -> syn::Result<TokenStream2> {
+    if let Ok(found) = crate_name("fastmcp-rust") {
+        let facade = found_crate_path(found, "fastmcp-rust");
+        Ok(quote!(#facade::__private::serde_json))
+    } else {
+        direct_crate_path("serde_json")
+    }
+}
 
 /// Extracts documentation from attributes.
 fn extract_doc_comments(attrs: &[Attribute]) -> Option<String> {
@@ -550,6 +635,85 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
     }
 }
 
+fn generate_tool_execution_methods(
+    is_async: bool,
+    expects_context: bool,
+    fn_name: &Ident,
+    param_names: &[&Ident],
+    param_extractions: &[TokenStream2],
+    result_conversion: &TokenStream2,
+) -> TokenStream2 {
+    let sync_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*) }
+    } else {
+        quote! { #fn_name(#(#param_names),*) }
+    };
+
+    if !is_async {
+        return quote! {
+            fn call(
+                &self,
+                ctx: &fastmcp_core::McpContext,
+                arguments: serde_json::Value,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
+                let arguments = arguments.as_object()
+                    .cloned()
+                    .unwrap_or_default();
+
+                #(#param_extractions)*
+
+                let result = #sync_invocation;
+                #result_conversion
+            }
+        };
+    }
+
+    let async_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*).await }
+    } else {
+        quote! { #fn_name(#(#param_names),*).await }
+    };
+
+    quote! {
+        fn call(
+            &self,
+            _ctx: &fastmcp_core::McpContext,
+            _arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "async #[tool] handlers must be invoked through ToolHandler::call_async",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            arguments: serde_json::Value,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::Content>>,
+        > {
+            Box::pin(async move {
+                let result: fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> = async move {
+                    let arguments = arguments.as_object()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    #(#param_extractions)*
+
+                    let result = #async_invocation;
+                    #result_conversion
+                }.await;
+
+                match result {
+                    Ok(value) => fastmcp_core::Outcome::Ok(value),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+    }
+}
+
 // ============================================================================
 // Prompt Return Type Analysis
 // ============================================================================
@@ -641,6 +805,77 @@ fn generate_prompt_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
             // Fallback: assume the result is Vec<PromptMessage>
             Ok(result)
         },
+    }
+}
+
+fn generate_prompt_execution_methods(
+    is_async: bool,
+    expects_context: bool,
+    fn_name: &Ident,
+    param_names: &[Ident],
+    param_extractions: &[TokenStream2],
+    result_conversion: &TokenStream2,
+) -> TokenStream2 {
+    let sync_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*) }
+    } else {
+        quote! { #fn_name(#(#param_names),*) }
+    };
+
+    if !is_async {
+        return quote! {
+            fn get(
+                &self,
+                ctx: &fastmcp_core::McpContext,
+                arguments: std::collections::HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                #(#param_extractions)*
+                let result = #sync_invocation;
+                #result_conversion
+            }
+        };
+    }
+
+    let async_invocation = if expects_context {
+        quote! { #fn_name(ctx, #(#param_names),*).await }
+    } else {
+        quote! { #fn_name(#(#param_names),*).await }
+    };
+
+    quote! {
+        fn get(
+            &self,
+            _ctx: &fastmcp_core::McpContext,
+            _arguments: std::collections::HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "async #[prompt] handlers must be invoked through PromptHandler::get_async",
+            ))
+        }
+
+        fn get_async<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::PromptMessage>>,
+        > {
+            Box::pin(async move {
+                let result: fastmcp_core::McpResult<
+                    Vec<fastmcp_protocol::PromptMessage>,
+                > = async move {
+                    #(#param_extractions)*
+                    let result = #async_invocation;
+                    #result_conversion
+                }.await;
+
+                match result {
+                    Ok(value) => fastmcp_core::Outcome::Ok(value),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
     }
 }
 
@@ -790,6 +1025,200 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
                 blob: None,
             }])
         },
+    }
+}
+
+fn generate_resource_execution_methods(
+    is_async: bool,
+    fn_name: &Ident,
+    call_args: &TokenStream2,
+    uri: &str,
+    param_extractions: &[TokenStream2],
+    result_conversion: &TokenStream2,
+) -> TokenStream2 {
+    if !is_async {
+        return quote! {
+            fn read(
+                &self,
+                ctx: &fastmcp_core::McpContext,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                let uri_params = std::collections::HashMap::new();
+                self.read_with_uri(ctx, #uri, &uri_params)
+            }
+
+            fn read_with_uri(
+                &self,
+                ctx: &fastmcp_core::McpContext,
+                uri: &str,
+                uri_params: &std::collections::HashMap<String, String>,
+            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                #(#param_extractions)*
+                let result = #fn_name(#call_args);
+                #result_conversion
+            }
+
+            fn read_async_with_uri<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                uri: &'a str,
+                uri_params: &'a std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+            > {
+                Box::pin(async move {
+                    match self.read_with_uri(ctx, uri, uri_params) {
+                        Ok(value) => fastmcp_core::Outcome::Ok(value),
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        };
+    }
+
+    quote! {
+        fn read(
+            &self,
+            _ctx: &fastmcp_core::McpContext,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "async #[resource] handlers must be invoked through ResourceHandler::read_async",
+            ))
+        }
+
+        fn read_async_with_uri<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+        > {
+            Box::pin(async move {
+                let result: fastmcp_core::McpResult<
+                    Vec<fastmcp_protocol::ResourceContent>,
+                > = async move {
+                    #(#param_extractions)*
+                    let result = #fn_name(#call_args).await;
+                    #result_conversion
+                }.await;
+
+                match result {
+                    Ok(value) => fastmcp_core::Outcome::Ok(value),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+        ) -> fastmcp_server::BoxFuture<
+            'a,
+            fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+        > {
+            Box::pin(async move {
+                let uri_params = std::collections::HashMap::new();
+                self.read_async_with_uri(ctx, #uri, &uri_params).await
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod async_handler_expansion_tests {
+    use super::{
+        found_crate_path, generate_prompt_execution_methods, generate_resource_execution_methods,
+        generate_tool_execution_methods,
+    };
+    use proc_macro_crate::FoundCrate;
+    use quote::{format_ident, quote};
+
+    fn assert_direct_async_expansion(tokens: proc_macro2::TokenStream, async_method: &str) {
+        let expansion = tokens.to_string();
+        assert!(expansion.contains(async_method), "{expansion}");
+        assert!(expansion.contains(". await"), "{expansion}");
+        assert!(!expansion.contains("block_on"), "{expansion}");
+        assert!(!expansion.contains("runtime ::"), "{expansion}");
+    }
+
+    #[test]
+    fn async_tool_expansion_awaits_without_runtime_reentry() {
+        let fn_name = format_ident!("example_tool");
+        let param = format_ident!("value");
+        let tokens = generate_tool_execution_methods(
+            true,
+            true,
+            &fn_name,
+            &[&param],
+            &[quote! { let value: String = String::new(); }],
+            &quote! { Ok(vec![]) },
+        );
+
+        assert_direct_async_expansion(tokens, "fn call_async");
+    }
+
+    #[test]
+    fn async_resource_expansion_awaits_without_runtime_reentry() {
+        let fn_name = format_ident!("example_resource");
+        let tokens = generate_resource_execution_methods(
+            true,
+            &fn_name,
+            &quote! { ctx },
+            "example://resource",
+            &[],
+            &quote! { Ok(vec![]) },
+        );
+
+        assert_direct_async_expansion(tokens, "fn read_async_with_uri");
+    }
+
+    #[test]
+    fn async_prompt_expansion_awaits_without_runtime_reentry() {
+        let fn_name = format_ident!("example_prompt");
+        let param = format_ident!("value");
+        let tokens = generate_prompt_execution_methods(
+            true,
+            true,
+            &fn_name,
+            &[param],
+            &[quote! { let value: String = String::new(); }],
+            &quote! { Ok(vec![]) },
+        );
+
+        assert_direct_async_expansion(tokens, "fn get_async");
+    }
+
+    #[test]
+    fn sync_tool_expansion_keeps_the_synchronous_entry_point() {
+        let fn_name = format_ident!("sync_tool");
+        let tokens = generate_tool_execution_methods(
+            false,
+            false,
+            &fn_name,
+            &[],
+            &[],
+            &quote! { Ok(vec![]) },
+        )
+        .to_string();
+
+        assert!(tokens.contains("fn call"), "{tokens}");
+        assert!(!tokens.contains("fn call_async"), "{tokens}");
+        assert!(!tokens.contains(". await"), "{tokens}");
+    }
+
+    #[test]
+    fn macro_source_contains_no_private_runtime_bridge() {
+        let forbidden = ["runtime", "::", "block_on"].concat();
+        assert!(!include_str!("lib.rs").contains(&forbidden));
+    }
+
+    #[test]
+    fn renamed_facade_dependency_becomes_an_absolute_rust_path() {
+        let path = found_crate_path(FoundCrate::Name("my_fastmcp".to_string()), "fastmcp-rust");
+        assert_eq!(path.to_string(), ":: my_fastmcp");
     }
 }
 
@@ -1086,12 +1515,25 @@ fn parse_annotation_bool(input: ParseStream<'_>) -> syn::Result<bool> {
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = parse_macro_input!(attr as ToolAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let ToolCratePaths {
+        handler:
+            HandlerCratePaths {
+                core,
+                protocol,
+                server,
+            },
+        serde_json,
+    } = match tool_crate_paths() {
+        Ok(paths) => paths,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
 
     // Generate handler struct name (PascalCase)
     let handler_name = format_ident!("{}", to_pascal_case(&fn_name_str));
+    let impl_module = format_ident!("__fastmcp_tool_{}", fn_name);
 
     // Get tool name (from attr or function name)
     let tool_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
@@ -1328,32 +1770,14 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = &input_fn.sig.output;
     let result_conversion = generate_result_conversion(return_type);
 
-    // Generate the call expression (async functions are executed via block_on)
-    let call_expr = if is_async {
-        if expects_context {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name(ctx, #(#param_names),*).await
-                })
-            }
-        } else {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name(#(#param_names),*).await
-                })
-            }
-        }
-    } else {
-        if expects_context {
-            quote! {
-                #fn_name(ctx, #(#param_names),*)
-            }
-        } else {
-            quote! {
-                #fn_name(#(#param_names),*)
-            }
-        }
-    };
+    let execution_methods = generate_tool_execution_methods(
+        is_async,
+        expects_context,
+        fn_name,
+        &param_names,
+        &param_extractions,
+        &result_conversion,
+    );
 
     // Generate the handler implementation
     let expanded = quote! {
@@ -1364,52 +1788,43 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Clone)]
         pub struct #handler_name;
 
-        impl fastmcp_server::ToolHandler for #handler_name {
-            fn definition(&self) -> fastmcp_protocol::Tool {
-                let properties: std::collections::HashMap<String, serde_json::Value> = vec![
-                    #(#property_entries),*
-                ].into_iter().collect();
+        #[doc(hidden)]
+        mod #impl_module {
+            use super::*;
+            use #core as fastmcp_core;
+            use #protocol as fastmcp_protocol;
+            use #server as fastmcp_server;
+            use #serde_json as serde_json;
 
-                let required: Vec<String> = vec![#(#required_params.to_string()),*];
+            impl fastmcp_server::ToolHandler for #handler_name {
+                fn definition(&self) -> fastmcp_protocol::Tool {
+                    let properties: std::collections::HashMap<String, serde_json::Value> = vec![
+                        #(#property_entries),*
+                    ].into_iter().collect();
 
-                fastmcp_protocol::Tool {
-                    name: #tool_name.to_string(),
-                    description: #description_tokens,
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    }),
-                    output_schema: #output_schema_field,
-                    icon: None,
-                    version: #version_tokens,
-                    tags: vec![#(#tag_entries),*],
-                    annotations: #annotations_tokens,
+                    let required: Vec<String> = vec![#(#required_params.to_string()),*];
+
+                    fastmcp_protocol::Tool {
+                        name: #tool_name.to_string(),
+                        description: #description_tokens,
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": properties,
+                            "required": required,
+                        }),
+                        output_schema: #output_schema_field,
+                        icon: None,
+                        version: #version_tokens,
+                        tags: vec![#(#tag_entries),*],
+                        annotations: #annotations_tokens,
+                    }
                 }
-            }
 
-            #timeout_tokens
+                #timeout_tokens
 
-            #output_schema_method
+                #output_schema_method
 
-            fn call(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                arguments: serde_json::Value,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
-                // Parse arguments as object
-                let arguments = arguments.as_object()
-                    .cloned()
-                    .unwrap_or_default();
-
-                // Extract parameters
-                #(#param_extractions)*
-
-                // Call the function
-                let result = #call_expr;
-
-                // Convert result to Vec<Content> based on return type
-                #result_conversion
+                #execution_methods
             }
         }
     };
@@ -1527,12 +1942,21 @@ impl Parse for ResourceAttrs {
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = parse_macro_input!(attr as ResourceAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let HandlerCratePaths {
+        core,
+        protocol,
+        server,
+    } = match handler_crate_paths() {
+        Ok(paths) => paths,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
 
     // Generate handler struct name
     let handler_name = format_ident!("{}Resource", to_pascal_case(&fn_name_str));
+    let impl_module = format_ident!("__fastmcp_resource_{}", fn_name);
 
     // Get resource URI (required)
     let Some(uri) = attrs.uri else {
@@ -1693,17 +2117,6 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let is_async = input_fn.sig.asyncness.is_some();
-    let call_expr = if is_async {
-        quote! {
-            fastmcp_core::runtime::block_on(async move {
-                #fn_name(#call_args).await
-            })
-        }
-    } else {
-        quote! {
-            #fn_name(#call_args)
-        }
-    };
 
     let template_tokens = if is_template {
         quote! {
@@ -1724,6 +2137,14 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate result conversion based on return type (supports Result<String, E>)
     let return_type = &input_fn.sig.output;
     let resource_result_conversion = generate_resource_result_conversion(return_type, &mime_type);
+    let execution_methods = generate_resource_execution_methods(
+        is_async,
+        fn_name,
+        &call_args,
+        &uri,
+        &param_extractions,
+        &resource_result_conversion,
+    );
 
     let expanded = quote! {
         // Keep the original function
@@ -1733,56 +2154,33 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Clone)]
         pub struct #handler_name;
 
-        impl fastmcp_server::ResourceHandler for #handler_name {
-            fn definition(&self) -> fastmcp_protocol::Resource {
-                fastmcp_protocol::Resource {
-                    uri: #uri.to_string(),
-                    name: #resource_name.to_string(),
-                    description: #description_tokens,
-                    mime_type: Some(#mime_type.to_string()),
-                    icon: None,
-                    version: #version_tokens,
-                    tags: vec![#(#tag_entries),*],
-                }
-            }
+        #[doc(hidden)]
+        mod #impl_module {
+            use super::*;
+            use #core as fastmcp_core;
+            use #protocol as fastmcp_protocol;
+            use #server as fastmcp_server;
 
-            fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
-                #template_tokens
-            }
-
-            #timeout_tokens
-
-            fn read(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-                let uri_params = std::collections::HashMap::new();
-                self.read_with_uri(ctx, #uri, &uri_params)
-            }
-
-            fn read_with_uri(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                uri: &str,
-                uri_params: &std::collections::HashMap<String, String>,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-                #(#param_extractions)*
-                let result = #call_expr;
-                #resource_result_conversion
-            }
-
-            fn read_async_with_uri<'a>(
-                &'a self,
-                ctx: &'a fastmcp_core::McpContext,
-                uri: &'a str,
-                uri_params: &'a std::collections::HashMap<String, String>,
-            ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>> {
-                Box::pin(async move {
-                    match self.read_with_uri(ctx, uri, uri_params) {
-                        Ok(value) => fastmcp_core::Outcome::Ok(value),
-                        Err(error) => fastmcp_core::Outcome::Err(error),
+            impl fastmcp_server::ResourceHandler for #handler_name {
+                fn definition(&self) -> fastmcp_protocol::Resource {
+                    fastmcp_protocol::Resource {
+                        uri: #uri.to_string(),
+                        name: #resource_name.to_string(),
+                        description: #description_tokens,
+                        mime_type: Some(#mime_type.to_string()),
+                        icon: None,
+                        version: #version_tokens,
+                        tags: vec![#(#tag_entries),*],
                     }
-                })
+                }
+
+                fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+                    #template_tokens
+                }
+
+                #timeout_tokens
+
+                #execution_methods
             }
         }
     };
@@ -1911,12 +2309,21 @@ impl Parse for PromptAttrs {
 pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = parse_macro_input!(attr as PromptAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
+    let HandlerCratePaths {
+        core,
+        protocol,
+        server,
+    } = match handler_crate_paths() {
+        Ok(paths) => paths,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
 
     // Generate handler struct name
     let handler_name = format_ident!("{}Prompt", to_pascal_case(&fn_name_str));
+    let impl_module = format_ident!("__fastmcp_prompt_{}", fn_name);
 
     // Get prompt name
     let prompt_name = attrs.name.unwrap_or_else(|| fn_name_str.clone());
@@ -2055,35 +2462,18 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let is_async = input_fn.sig.asyncness.is_some();
-    let call_expr = if is_async {
-        if expects_context {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name(ctx, #(#param_names),*).await
-                })
-            }
-        } else {
-            quote! {
-                fastmcp_core::runtime::block_on(async move {
-                    #fn_name(#(#param_names),*).await
-                })
-            }
-        }
-    } else {
-        if expects_context {
-            quote! {
-                #fn_name(ctx, #(#param_names),*)
-            }
-        } else {
-            quote! {
-                #fn_name(#(#param_names),*)
-            }
-        }
-    };
 
     // Generate result conversion based on return type (supports Result<Vec<PromptMessage>, E>)
     let return_type = &input_fn.sig.output;
     let prompt_result_conversion = generate_prompt_result_conversion(return_type);
+    let execution_methods = generate_prompt_execution_methods(
+        is_async,
+        expects_context,
+        fn_name,
+        &param_names,
+        &param_extractions,
+        &prompt_result_conversion,
+    );
 
     // Generate version token
     let version_tokens = attrs
@@ -2106,28 +2496,28 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Clone)]
         pub struct #handler_name;
 
-        impl fastmcp_server::PromptHandler for #handler_name {
-            fn definition(&self) -> fastmcp_protocol::Prompt {
-                fastmcp_protocol::Prompt {
-                    name: #prompt_name.to_string(),
-                    description: #description_tokens,
-                    arguments: vec![#(#prompt_args),*],
-                    icon: None,
-                    version: #version_tokens,
-                    tags: vec![#(#tag_entries),*],
+        #[doc(hidden)]
+        mod #impl_module {
+            use super::*;
+            use #core as fastmcp_core;
+            use #protocol as fastmcp_protocol;
+            use #server as fastmcp_server;
+
+            impl fastmcp_server::PromptHandler for #handler_name {
+                fn definition(&self) -> fastmcp_protocol::Prompt {
+                    fastmcp_protocol::Prompt {
+                        name: #prompt_name.to_string(),
+                        description: #description_tokens,
+                        arguments: vec![#(#prompt_args),*],
+                        icon: None,
+                        version: #version_tokens,
+                        tags: vec![#(#tag_entries),*],
+                    }
                 }
-            }
 
-            #timeout_tokens
+                #timeout_tokens
 
-            fn get(
-                &self,
-                ctx: &fastmcp_core::McpContext,
-                arguments: std::collections::HashMap<String, String>,
-            ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::PromptMessage>> {
-                #(#param_extractions)*
-                let result = #call_expr;
-                #prompt_result_conversion
+                #execution_methods
             }
         }
     };
@@ -2186,8 +2576,13 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_derive(JsonSchema, attributes(json_schema))]
 pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
+    let serde_json = match serde_json_crate_path() {
+        Ok(path) => path,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let name = &input.ident;
+    let impl_module = format_ident!("__fastmcp_json_schema_{}", name);
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Extract type-level doc comments for schema description
@@ -2208,10 +2603,17 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        impl #impl_generics #name #ty_generics #where_clause {
-            /// Returns the JSON Schema for this type.
-            pub fn json_schema() -> serde_json::Value {
-                #schema_impl
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod #impl_module {
+            use super::*;
+            use #serde_json as serde_json;
+
+            impl #impl_generics #name #ty_generics #where_clause {
+                /// Returns the JSON Schema for this type.
+                pub fn json_schema() -> serde_json::Value {
+                    #schema_impl
+                }
             }
         }
     };

@@ -1,7 +1,7 @@
 //! Parallel combinator helpers for MCP handlers.
 //!
-//! This module provides ergonomic wrappers around asupersync's structured
-//! concurrency combinators, adapted for MCP's error model.
+//! This module provides combinators adapted for MCP's error model. They poll
+//! caller-owned futures directly and do not spawn independent tasks.
 //!
 //! # Available Combinators
 //!
@@ -15,10 +15,11 @@
 //! | [`quorum_timeout`] | M-of-N | Quorum with timeout |
 //! | [`first_ok`] | 1-of-N | Return first successful result |
 //!
-//! # Cancel-Correctness
+//! # Cancellation behavior
 //!
-//! All combinators properly drain cancelled/losing futures to ensure
-//! structured concurrency invariants are maintained. No orphan tasks.
+//! Losing futures are either retained until the documented completion
+//! condition or dropped in the same combinator future. Callers remain
+//! responsible for the cancellation behavior of work spawned elsewhere.
 //!
 //! # Example
 //!
@@ -41,9 +42,10 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use asupersync::Cx;
+use asupersync::time::{BudgetTimeExt, Sleep};
 
 use crate::error::{McpError, McpErrorCode, McpResult};
 
@@ -71,6 +73,20 @@ fn poll_slot<T>(slot: &mut Option<BoxFuture<'_, T>>, cx: &mut Context<'_>) -> Op
     }
 }
 
+/// Creates a native asupersync timer bounded by both the requested timeout and
+/// the caller's remaining deadline budget.
+fn timeout_sleep(cx: &Cx, requested: Duration) -> Sleep {
+    let now = cx.now();
+    let remaining = BudgetTimeExt::remaining_duration(&cx.budget(), now);
+    let effective = if let Some(remaining) = remaining {
+        requested.min(remaining)
+    } else {
+        requested
+    };
+
+    Sleep::after(now, effective)
+}
+
 // ============================================================================
 // Join Combinator
 // ============================================================================
@@ -83,10 +99,11 @@ fn poll_slot<T>(slot: &mut Option<BoxFuture<'_, T>>, cx: &mut Context<'_>) -> Op
 /// Futures are polled concurrently — each poll cycle round-robins
 /// through all incomplete futures, ensuring fair progress.
 ///
-/// # Cancel-Correctness
+/// # Cancellation behavior
 ///
-/// If any future is cancelled or panics, the combinator will still
-/// await all remaining futures to completion before returning.
+/// This function awaits each supplied future to completion. A panic from a
+/// supplied future unwinds normally; this function does not catch panics or
+/// continue polling after an unwind.
 ///
 /// # Example
 ///
@@ -176,11 +193,13 @@ pub async fn join_all_results<T: Send + 'static>(
 /// Races multiple futures, returning the first to complete.
 ///
 /// This is the 1-of-N combinator: the first future to complete wins,
-/// and all others are cancelled (dropped).
+/// and all other supplied futures are dropped.
 ///
 /// Futures are polled concurrently — each poll cycle round-robins
 /// through all futures. The first to resolve wins; remaining futures
-/// are dropped immediately, triggering cancellation.
+/// are dropped immediately. Dropping a future does not cancel or drain
+/// work that it spawned independently; callers that spawn work must keep
+/// that work in an explicitly cancelled and joined structured scope.
 ///
 /// # Errors
 ///
@@ -240,7 +259,11 @@ impl<T> RaceAllState<'_, T> {
 /// Races multiple futures with a timeout.
 ///
 /// Like `race`, but returns an error if no future completes within
-/// the specified duration.
+/// the specified duration. The effective deadline is the earlier of the
+/// requested timeout and the caller context's budget deadline. Cancellation
+/// and budget exhaustion are checked before polling supplied futures. After
+/// that checkpoint, an otherwise-ready supplied future wins over a local timer
+/// that becomes ready in the same poll.
 ///
 /// # Example
 ///
@@ -252,7 +275,7 @@ impl<T> RaceAllState<'_, T> {
 /// let result = race_timeout(ctx.cx(), Duration::from_secs(5), futures).await?;
 /// ```
 pub async fn race_timeout<T: Send + 'static>(
-    _cx: &Cx,
+    cx: &Cx,
     timeout: Duration,
     futures: Vec<BoxFuture<'_, T>>,
 ) -> McpResult<T> {
@@ -262,29 +285,29 @@ pub async fn race_timeout<T: Send + 'static>(
             "race requires at least one future",
         ));
     }
-    let deadline = Instant::now() + timeout;
+
     let mut state = RaceTimeoutState {
         futures: futures.into_iter().map(Some).collect(),
-        deadline,
+        timeout: timeout_sleep(cx, timeout),
+        request_cx: cx,
     };
-    std::future::poll_fn(move |cx| state.poll(cx)).await
+    std::future::poll_fn(move |task_cx| state.poll(task_cx)).await
 }
 
 /// Internal state for race with timeout enforcement.
-struct RaceTimeoutState<'a, T> {
-    futures: Vec<Option<BoxFuture<'a, T>>>,
-    deadline: Instant,
+struct RaceTimeoutState<'future, 'cx, T> {
+    futures: Vec<Option<BoxFuture<'future, T>>>,
+    timeout: Sleep,
+    request_cx: &'cx Cx,
 }
 
-impl<T> RaceTimeoutState<'_, T> {
+impl<T> RaceTimeoutState<'_, '_, T> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
-        // Check timeout first.
-        if Instant::now() >= self.deadline {
+        // Caller cancellation and every budget dimension take precedence over
+        // both a ready child and the local timeout.
+        if self.request_cx.checkpoint().is_err() {
             self.futures.clear();
-            return Poll::Ready(Err(McpError::new(
-                McpErrorCode::RequestCancelled,
-                "operation timed out",
-            )));
+            return Poll::Ready(Err(McpError::request_cancelled()));
         }
 
         for i in 0..self.futures.len() {
@@ -294,9 +317,17 @@ impl<T> RaceTimeoutState<'_, T> {
             }
         }
 
-        // Schedule a wakeup so we can re-check the deadline.
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        // Polling the native timer registers this task's waker with the
+        // asupersync timer driver. It does not self-wake or busy-spin.
+        if Pin::new(&mut self.timeout).poll(cx).is_ready() {
+            self.futures.clear();
+            Poll::Ready(Err(McpError::new(
+                McpErrorCode::RequestCancelled,
+                "operation timed out",
+            )))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -348,10 +379,11 @@ impl<T> QuorumResult<T> {
 /// * `required` - Number of successes required (M)
 /// * `futures` - The futures to run (N total)
 ///
-/// # Cancel-Correctness
+/// # Cancellation behavior
 ///
-/// Once quorum is reached (or impossible), remaining futures are
-/// dropped immediately, triggering cancellation. No orphan tasks.
+/// Once quorum is reached (or impossible), remaining supplied futures are
+/// dropped. Dropping them does not cancel work they may have spawned
+/// independently.
 ///
 /// # Special Cases
 ///
@@ -472,7 +504,10 @@ impl<T> QuorumState<'_, T> {
 ///
 /// Like `quorum`, but if the timeout fires before quorum is reached,
 /// the result reflects whatever successes have accumulated so far
-/// (with `quorum_met` likely `false`).
+/// (with `quorum_met` likely `false`). The effective deadline is the earlier
+/// of the requested timeout and the caller context's budget deadline. Caller
+/// cancellation or budget exhaustion returns `RequestCancelled` instead of a
+/// partial timeout result.
 ///
 /// # Example
 ///
@@ -485,7 +520,7 @@ impl<T> QuorumState<'_, T> {
 /// ).await?;
 /// ```
 pub async fn quorum_timeout<T: Send + 'static>(
-    _cx: &Cx,
+    cx: &Cx,
     required: usize,
     timeout: Duration,
     futures: Vec<BoxFuture<'_, McpResult<T>>>,
@@ -508,40 +543,34 @@ pub async fn quorum_timeout<T: Send + 'static>(
         });
     }
 
-    let deadline = Instant::now() + timeout;
     let mut state = QuorumTimeoutState {
         futures: futures.into_iter().map(Some).collect(),
         successes: Vec::with_capacity(required),
         failures: 0,
         required,
         total,
-        deadline,
+        timeout: timeout_sleep(cx, timeout),
+        request_cx: cx,
     };
-    std::future::poll_fn(move |cx| state.poll(cx)).await
+    std::future::poll_fn(move |task_cx| state.poll(task_cx)).await
 }
 
 /// Internal state for quorum with timeout enforcement.
-struct QuorumTimeoutState<'a, T> {
-    futures: Vec<Option<BoxFuture<'a, McpResult<T>>>>,
+struct QuorumTimeoutState<'future, 'cx, T> {
+    futures: Vec<Option<BoxFuture<'future, McpResult<T>>>>,
     successes: Vec<T>,
     failures: usize,
     required: usize,
     total: usize,
-    deadline: Instant,
+    timeout: Sleep,
+    request_cx: &'cx Cx,
 }
 
-impl<T> QuorumTimeoutState<'_, T> {
+impl<T> QuorumTimeoutState<'_, '_, T> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
-        // Check timeout first.
-        if Instant::now() >= self.deadline {
+        if self.request_cx.checkpoint().is_err() {
             self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            let quorum_met = successes.len() >= self.required;
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met,
-                failure_count: self.failures,
-            }));
+            return Poll::Ready(Err(McpError::request_cancelled()));
         }
 
         for i in 0..self.futures.len() {
@@ -585,9 +614,17 @@ impl<T> QuorumTimeoutState<'_, T> {
             }));
         }
 
-        // Schedule wakeup for timeout checking.
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        if Pin::new(&mut self.timeout).poll(cx).is_ready() {
+            self.futures.clear();
+            let successes = std::mem::take(&mut self.successes);
+            Poll::Ready(Ok(QuorumResult {
+                quorum_met: successes.len() >= self.required,
+                successes,
+                failure_count: self.failures,
+            }))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -602,7 +639,9 @@ impl<T> QuorumTimeoutState<'_, T> {
 /// `Err`, the last error is returned.
 ///
 /// Use this for fallback patterns where you want to try multiple sources
-/// and take the first success.
+/// and take the first success. After a success, the remaining supplied
+/// futures are dropped. Work those futures spawned independently is not
+/// cancelled or drained by this combinator.
 ///
 /// # Example
 ///
@@ -675,6 +714,24 @@ impl<T> FirstOkState<'_, T> {
 mod tests {
     use super::*;
     use crate::block_on;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCounter {
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            let _ = self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn make_cx() -> Cx {
         Cx::for_testing()
@@ -875,6 +932,99 @@ mod tests {
     }
 
     #[test]
+    fn race_timeout_expires_pending_future_at_zero_duration() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(std::future::pending())];
+
+        let error = block_on(race_timeout(&cx, Duration::ZERO, futures)).unwrap_err();
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "operation timed out");
+
+        let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(async { 42 })];
+        let result = block_on(race_timeout(&cx, Duration::ZERO, futures));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn timeout_combinators_observe_caller_cancellation_after_start() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(std::future::pending())];
+        let mut future = Box::pin(race_timeout(&cx, Duration::MAX, futures));
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+
+        assert!(future.as_mut().poll(&mut task_cx).is_pending());
+        cx.set_cancel_requested(true);
+
+        let Poll::Ready(result) = future.as_mut().poll(&mut task_cx) else {
+            panic!("cancelled timeout race remained pending");
+        };
+        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+            vec![Box::pin(async { Ok(7) }), Box::pin(std::future::pending())];
+        let mut future = Box::pin(quorum_timeout(&cx, 2, Duration::MAX, futures));
+        assert!(future.as_mut().poll(&mut task_cx).is_pending());
+        cx.set_cancel_requested(true);
+
+        let Poll::Ready(result) = future.as_mut().poll(&mut task_cx) else {
+            panic!("cancelled timeout quorum remained pending");
+        };
+        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn timeout_combinators_honor_exhausted_caller_budget() {
+        let cx = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        let race_futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(async { 42 })];
+        let race_error = block_on(race_timeout(&cx, Duration::MAX, race_futures)).unwrap_err();
+        assert_eq!(race_error.code, McpErrorCode::RequestCancelled);
+
+        let cx = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        let quorum_futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async { Ok(42) })];
+        let quorum_error =
+            block_on(quorum_timeout(&cx, 1, Duration::MAX, quorum_futures)).unwrap_err();
+        assert_eq!(quorum_error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn timeout_combinators_accept_duration_max_without_panicking() {
+        let cx = make_cx();
+        let race_futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(async { 42 })];
+        let race_result = block_on(race_timeout(&cx, Duration::MAX, race_futures));
+        assert_eq!(race_result.unwrap(), 42);
+
+        let quorum_futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async { Ok(42) })];
+        let quorum_result = block_on(quorum_timeout(&cx, 1, Duration::MAX, quorum_futures));
+        assert!(quorum_result.unwrap().quorum_met);
+    }
+
+    #[test]
+    fn timeout_combinators_do_not_self_wake_while_pending() {
+        let cx = make_cx();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task_cx = Context::from_waker(&waker);
+
+        {
+            let futures: Vec<BoxFuture<'_, i32>> = vec![Box::pin(std::future::pending())];
+            let mut future = Box::pin(race_timeout(&cx, Duration::from_secs(60), futures));
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(counter.wakes.load(Ordering::Relaxed), 0);
+        }
+
+        {
+            let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+                vec![Box::pin(std::future::pending())];
+            let mut future = Box::pin(quorum_timeout(&cx, 1, Duration::from_secs(60), futures));
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(counter.wakes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
     fn quorum_timeout_succeeds_within_deadline() {
         let cx = make_cx();
         let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
@@ -883,6 +1033,19 @@ mod tests {
         let qr = result.unwrap();
         assert!(qr.quorum_met);
         assert_eq!(qr.successes.len(), 2);
+    }
+
+    #[test]
+    fn quorum_timeout_returns_partial_result_at_zero_duration() {
+        let cx = make_cx();
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+            vec![Box::pin(async { Ok(7) }), Box::pin(std::future::pending())];
+
+        let result = block_on(quorum_timeout(&cx, 2, Duration::ZERO, futures)).unwrap();
+
+        assert!(!result.quorum_met);
+        assert_eq!(result.successes, vec![7]);
+        assert_eq!(result.failure_count, 0);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! MCP protocol messages.
 //!
-//! Request and response types for all MCP methods.
+//! Request and response types for the MCP methods currently implemented here.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::jsonrpc::RequestId;
 use crate::types::{
@@ -346,20 +347,105 @@ pub struct SetLogLevelParams {
 // Notifications
 // ============================================================================
 
+/// Maximum admitted UTF-8 bytes in a cancellation-notification reason.
+pub const MAX_CANCELLATION_REASON_BYTES: usize = 4 * 1024;
+
 /// Cancelled notification params.
 ///
 /// Sent by either party to request cancellation of an in-progress request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelledParams {
     /// The ID of the request to cancel.
     #[serde(rename = "requestId")]
     pub request_id: RequestId,
     /// Optional reason for cancellation.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_cancellation_reason",
+        deserialize_with = "deserialize_cancellation_reason"
+    )]
     pub reason: Option<String>,
     /// Whether the sender wants to await cleanup completion.
-    #[serde(rename = "awaitCleanup", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "awaitCleanup",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_await_cleanup"
+    )]
     pub await_cleanup: Option<bool>,
+}
+
+fn deserialize_await_cleanup<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
+}
+
+fn serialize_cancellation_reason<S>(
+    reason: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match reason {
+        Some(reason) if reason.len() <= MAX_CANCELLATION_REASON_BYTES => {
+            serializer.serialize_str(reason)
+        }
+        Some(_) => Err(serde::ser::Error::custom(
+            "cancellation reason exceeds byte limit",
+        )),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_cancellation_reason<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CancellationReasonVisitor;
+
+    impl<'de> Visitor<'de> for CancellationReasonVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded, non-null cancellation reason string")
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAX_CANCELLATION_REASON_BYTES {
+                return Err(E::custom("cancellation reason exceeds byte limit"));
+            }
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAX_CANCELLATION_REASON_BYTES {
+                return Err(E::custom("cancellation reason exceeds byte limit"));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer
+        .deserialize_str(CancellationReasonVisitor)
+        .map(Some)
 }
 
 /// Progress notification params.
@@ -1493,6 +1579,52 @@ mod tests {
         assert_eq!(value["requestId"], "req-7");
         assert_eq!(value["reason"], "User cancelled");
         assert_eq!(value["awaitCleanup"], true);
+    }
+
+    #[test]
+    fn cancelled_params_reason_is_bounded_and_shape_is_closed() {
+        let exact = "x".repeat(MAX_CANCELLATION_REASON_BYTES);
+        let too_long = "x".repeat(MAX_CANCELLATION_REASON_BYTES + 1);
+        let exact_json = serde_json::json!({
+            "requestId": 1,
+            "reason": exact,
+        });
+        assert!(serde_json::from_value::<CancelledParams>(exact_json).is_ok());
+
+        let too_long_json = serde_json::json!({
+            "requestId": 1,
+            "reason": too_long,
+        });
+        assert!(serde_json::from_value::<CancelledParams>(too_long_json).is_err());
+        assert!(
+            serde_json::from_value::<CancelledParams>(serde_json::json!({
+                "requestId": 1,
+                "reason": null,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CancelledParams>(serde_json::json!({
+                "requestId": 1,
+                "awaitCleanup": null,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CancelledParams>(serde_json::json!({
+                "requestId": 1,
+                "reason": "ok",
+                "unknown": true,
+            }))
+            .is_err()
+        );
+
+        let outbound = CancelledParams {
+            request_id: RequestId::Number(1),
+            reason: Some("x".repeat(MAX_CANCELLATION_REASON_BYTES + 1)),
+            await_cleanup: None,
+        };
+        assert!(serde_json::to_value(outbound).is_err());
     }
 
     // ========================================================================

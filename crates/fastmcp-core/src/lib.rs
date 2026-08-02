@@ -3,14 +3,18 @@
 //! This crate provides the fundamental building blocks:
 //! - [`McpContext`] wrapping asupersync's [`Cx`]
 //! - Error types for MCP operations
-//! - Core traits for tool, resource, and prompt handlers
+//! - Capability traits for progress, sampling, elicitation, and nested calls
+//!
+//! MCP 2026-07-28 support is under implementation and remains unverified. The
+//! public protocol constant is still `2024-11-05`; this crate's primitives are
+//! not aggregate conformance or release evidence.
 //!
 //! # Design Principles
 //!
-//! - Zero-copy where possible
+//! - Serde-backed protocol and context types
 //! - No runtime reflection (compile-time via macros)
-//! - All types support `Send + Sync`
-//! - Cancel-correct via asupersync integration
+//! - `Send + Sync` bounds on concurrency-facing APIs where required
+//! - Explicit cancellation and budget surfaces through asupersync
 //!
 //! # Role in the System
 //!
@@ -18,7 +22,7 @@
 //! It defines:
 //! - `McpContext`, the capability-carrying handle that wraps asupersync's `Cx`
 //! - The FastMCP error model (`McpError`, `McpErrorCode`, `McpResult`)
-//! - Budget/cancellation semantics that handlers and transports must obey
+//! - Budget and cancellation primitives used by handlers and transports
 //! - Outcome bridging utilities so server/client code can stay 4-valued
 //!
 //! If you are implementing a new transport, handler, or runtime adapter, this
@@ -29,10 +33,10 @@
 //! This crate uses [asupersync](https://github.com/Dicklesworthstone/asupersync) as its async
 //! runtime foundation, providing:
 //!
-//! - **Structured concurrency**: Tool handlers run in regions
-//! - **Cancel-correctness**: Graceful cancellation via checkpoints
-//! - **Budgeted timeouts**: Request timeouts via budget exhaustion
-//! - **Deterministic testing**: Lab runtime for reproducible tests
+//! - **Context propagation**: `McpContext` carries an asupersync `Cx`
+//! - **Cooperative cancellation**: Explicit checkpoints surface cancellation
+//! - **Budgets**: Deadline, poll, and cost dimensions travel with contexts
+//! - **Deterministic test support**: The lab runtime is available to tests
 
 #![forbid(unsafe_code)]
 // Allow dead code during Phase 0 development
@@ -49,15 +53,15 @@ pub mod runtime;
 mod state;
 pub mod uri;
 
-pub use auth::{AUTH_STATE_KEY, AccessToken, AuthContext};
+pub use auth::{AccessToken, AuthContext, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES};
 pub use context::{
     CancelledError, ClientCapabilityInfo, ElicitationAction, ElicitationMode, ElicitationRequest,
     ElicitationResponse, ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH,
-    MAX_TOOL_CALL_DEPTH, McpContext, NoOpElicitationSender, NoOpNotificationSender,
-    NoOpSamplingSender, NotificationSender, ProgressReporter, ResourceContentItem,
-    ResourceReadResult, ResourceReader, SamplingRequest, SamplingRequestMessage, SamplingResponse,
-    SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo, ToolCallResult,
-    ToolCaller, ToolContentItem,
+    MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpRequestCancellation,
+    NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NotificationSender,
+    ProgressReporter, ResourceContentItem, ResourceReadResult, ResourceReader, SamplingRequest,
+    SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+    ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
 };
 pub use crypto::{
     CryptoInputTooLongError, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,

@@ -502,8 +502,6 @@ mod tests {
     use std::cell::Cell;
     use std::mem::{size_of, size_of_val};
 
-    use zeroize::Zeroize as _;
-
     use super::*;
 
     const SHA256_EMPTY: [u8; SHA256_DIGEST_BYTES] = [
