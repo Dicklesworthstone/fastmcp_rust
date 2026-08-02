@@ -8,13 +8,16 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 901_379;
+const FROZEN_POLICY_BYTES: usize = 902_214;
 const FROZEN_POLICY_SHA256: &str =
-    "852f9c435992a7f58af161bb132aae47e14b21910d61d6c0a37c503757e34b16";
+    "66e8722ecd65f31567219b95063514cb3e55aa617fc3a5b7b025874558b09d58";
+const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
+const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod trust_std {
+    use super::RECORD_SET_PREFIX;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
     use std::fmt;
@@ -54,6 +57,13 @@ mod trust_std {
     const MAX_GATE_OBSERVATION_TEXT_BYTES: usize = 1024;
     pub const MAX_CONTROL_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
     pub const MAX_ACQUISITION_SPOOL_BYTES: u64 = 128 * 1024 * 1024;
+    pub const CONTROL_SCRATCH_MAXIMA: [u64; 5] = [
+        1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
+        256 * 1024,
+        4 * 1024 * 1024,
+    ];
     const MAX_OUTER_ARGV_ITEMS: usize = 64;
     const MAX_OUTER_ASSIGNMENTS: usize = 16;
     const MAX_OUTER_ARGUMENT_BYTES: usize = 4096;
@@ -168,6 +178,12 @@ mod trust_std {
             "bootstrap" => "bootstrap",
             "ordinary" => "ordinary",
             "controller" => "controller",
+            "authority" => "authority",
+            "reprobe" => "reprobe",
+            "ledger" => "ledger",
+            "archive" => "archive",
+            "bookend" => "bookend",
+            "evidence" => "evidence",
             _ => "ordinary",
         }
     }
@@ -832,6 +848,114 @@ mod trust_std {
         let mut hasher = StreamingSha256::new();
         hasher.update(bytes)?;
         hasher.finalize()
+    }
+
+    /// One row in the frozen native-tool descriptor registry shared by the
+    /// dependency-free bootstrap image and the ordinary verifier image.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NativeToolDescriptor {
+        pub id: &'static str,
+        pub candidates: &'static [&'static str],
+        pub version_argv: &'static [&'static str],
+        pub stream: &'static str,
+        pub parser: &'static str,
+    }
+
+    /// The single compiled twenty-tool descriptor authority. Keeping this in
+    /// the always-compiled trust module prevents platform cfgs from silently
+    /// removing the pure half of ordinary pre-ledger admission.
+    pub const NATIVE_TOOL_DESCRIPTORS: &[NativeToolDescriptor] = &[
+        NativeToolDescriptor { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", parser:"rustc-vv-pinned-1.99" },
+        NativeToolDescriptor { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", parser:"cargo-vv-pinned-1.99" },
+        NativeToolDescriptor { id:"rustdoc", candidates:&["{pinned-toolchain-bin}/rustdoc"], version_argv:&["--version"], stream:"stdout", parser:"rustdoc-pinned-1.99" },
+        NativeToolDescriptor { id:"rustfmt", candidates:&["{pinned-toolchain-bin}/rustfmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
+        NativeToolDescriptor { id:"cargo-fmt", candidates:&["{pinned-toolchain-bin}/cargo-fmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
+        NativeToolDescriptor { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
+        NativeToolDescriptor { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
+        NativeToolDescriptor { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", parser:"lld-gnu-version" },
+        NativeToolDescriptor { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeToolDescriptor { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", parser:"openssl-version-a" },
+        NativeToolDescriptor { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
+        NativeToolDescriptor { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeToolDescriptor { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeToolDescriptor { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", parser:"aarch64-c-compiler-v" },
+        NativeToolDescriptor { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeToolDescriptor { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
+        NativeToolDescriptor { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeToolDescriptor { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
+        NativeToolDescriptor { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
+        NativeToolDescriptor { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
+    ];
+
+    /// Pure identity of the one compiled twenty-tool descriptor registry.
+    /// This performs no filesystem access and starts no child process.
+    pub fn compiled_native_tool_registry_identity(
+    ) -> TrustResult<(usize, usize, [u8; 32])> {
+        const PREFIX: &[u8] = b"FND01BOOTSTRAPNATIVETOOLSv1\0";
+
+        fn append_u32_bytes(
+            output: &mut Vec<u8>,
+            bytes: &[u8],
+            subject: &'static str,
+        ) -> TrustResult<()> {
+            let length = u32::try_from(bytes.len()).map_err(|_| {
+                TrustError::new(
+                    "E_NATIVE_TOOL_REGISTRY",
+                    format!("{subject} length exceeds u32"),
+                )
+            })?;
+            output
+                .try_reserve(4usize.saturating_add(bytes.len()))
+                .map_err(|_| {
+                    TrustError::new(
+                        "E_NATIVE_TOOL_REGISTRY",
+                        format!("cannot reserve {subject} bytes"),
+                    )
+                })?;
+            output.extend_from_slice(&length.to_be_bytes());
+            output.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        let count = u32::try_from(NATIVE_TOOL_DESCRIPTORS.len()).map_err(|_| {
+            TrustError::new("E_NATIVE_TOOL_REGISTRY", "tool count exceeds u32")
+        })?;
+        let mut registry = Vec::new();
+        registry.extend_from_slice(PREFIX);
+        registry.extend_from_slice(&count.to_be_bytes());
+        for (ordinal, row) in NATIVE_TOOL_DESCRIPTORS.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                TrustError::new("E_NATIVE_TOOL_REGISTRY", "tool ordinal exceeds u32")
+            })?;
+            registry.extend_from_slice(&ordinal.to_be_bytes());
+            append_u32_bytes(&mut registry, row.id.as_bytes(), "native tool id")?;
+            let candidate_count = u32::try_from(row.candidates.len()).map_err(|_| {
+                TrustError::new("E_NATIVE_TOOL_REGISTRY", "candidate count exceeds u32")
+            })?;
+            registry.extend_from_slice(&candidate_count.to_be_bytes());
+            for candidate in row.candidates {
+                append_u32_bytes(&mut registry, candidate.as_bytes(), "tool candidate")?;
+            }
+            let argv_count = u32::try_from(row.version_argv.len()).map_err(|_| {
+                TrustError::new("E_NATIVE_TOOL_REGISTRY", "argv count exceeds u32")
+            })?;
+            registry.extend_from_slice(&argv_count.to_be_bytes());
+            for argument in row.version_argv {
+                append_u32_bytes(&mut registry, argument.as_bytes(), "version argv")?;
+            }
+            append_u32_bytes(&mut registry, row.stream.as_bytes(), "version stream")?;
+            append_u32_bytes(&mut registry, row.parser.as_bytes(), "version parser")?;
+            append_u32_bytes(
+                &mut registry,
+                b"selected-executable-and-raw-version",
+                "tool identity",
+            )?;
+        }
+        Ok((
+            NATIVE_TOOL_DESCRIPTORS.len(),
+            registry.len(),
+            sha256(&registry)?,
+        ))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2415,7 +2539,7 @@ mod trust_std {
             );
 
             let missing = PathBuf::from(format!(
-                "/proc/self/fnd01-space-missing-{}",
+                "/proc/{}/fnd01-space-missing",
                 std::process::id(),
             ));
             assert!(snapshot_usage_roots_nofollow(
@@ -8324,17 +8448,10 @@ mod trust_std {
         repository_root: &Path,
         ledger: &ValidatedControlLedger,
     ) -> TrustResult<()> {
-        const SCRATCH_MAXIMA: [u64; 5] = [
-            1024 * 1024,
-            1024 * 1024,
-            1024 * 1024,
-            256 * 1024,
-            4 * 1024 * 1024,
-        ];
         for (ordinal, (binding, maximum)) in ledger
             .scratch_bindings
             .iter()
-            .zip(SCRATCH_MAXIMA)
+            .zip(CONTROL_SCRATCH_MAXIMA)
             .enumerate()
         {
             rebind_absolute_file(
@@ -11366,7 +11483,7 @@ mod trust_std {
         run_id: &str,
     ) -> TrustResult<[u8; 32]> {
         const PREFIX_COUNT: usize = 22;
-        let mut set = b"FND01RECv2\0".to_vec();
+        let mut set = RECORD_SET_PREFIX.to_vec();
         append_closed_u32(&mut set, 4, "staging record set")?;
         let mut cursor = PREFIX_COUNT;
         let mut first_files = None::<Vec<BTreeMap<String, String>>>;
@@ -12729,7 +12846,7 @@ mod trust_std {
             "command_results.postcommand_lock",
         );
         let mut ids = BTreeSet::new();
-        let mut record_set = b"FND01RECv2\0".to_vec();
+        let mut record_set = RECORD_SET_PREFIX.to_vec();
         append_closed_u32(
             &mut record_set,
             locks.len(),
@@ -17319,23 +17436,30 @@ mod trust_std {
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod phase_b_std {
-    use super::{FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256};
+    use super::{
+        FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX,
+        RECORD_SET_PREFIX,
+    };
     use super::trust_std::{
         AcquisitionCommandExpectation, AcquisitionCommandPreimageInput,
         AcquisitionCommandStreamPreimage,
         AcquisitionToolPaths, AuthoringMarker, BootstrapArguments,
         BootstrapEnvironment, BootstrapMode, FileBinding, FilesystemUsage,
         IntegrationSeal, PhaseBSpaceBudget,
+        NativeToolDescriptor as NativeTool, NATIVE_TOOL_DESCRIPTORS as NATIVE_TOOLS,
         RetainedSnapshotSet, SparseDependencyKind,
         SparseDependencySemantic, TrustError, TrustResult,
         StreamingSha256, TypedAcquisitionResult,
-        ValidatedFileBinding,
+        ValidatedDirectoryTreeBinding, ValidatedFileBinding,
+        ValidatedTargetSnapshot,
         ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
         MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES,
         MAX_SPARSE_CACHE_INPUT_BYTES, MAX_SUPPLY_BUNDLE_BYTES,
-        acquisition_command_preimage, acquisition_plan, checked_disjoint_usage,
+        acquisition_command_preimage, acquisition_plan,
+        authoring_closure_preimage, checked_disjoint_usage,
         checked_read,
-        encode_lower_hex, parse_canonical_record_file_with_final_self_digest,
+        decode_lower_hex, encode_lower_hex, parse_authoring_marker,
+        parse_canonical_record_file_with_final_self_digest,
         finalize_acquisition_spool, parse_acquisition_spool_structure, sha256,
         validate_bootstrap_cargo_lock_v4_lexical,
         validate_cargo_config_discovery,
@@ -17370,7 +17494,6 @@ mod phase_b_std {
         b"FND01BOOTSTRAPMATERIALIZEDv1\0";
     const BOOTSTRAP_AUTHORITY_PREFIX: &[u8] =
         b"FND01BOOTSTRAPAUTHORITYv1\0";
-    const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
     const LOCK_PACKAGE_SET_PREFIX: &[u8] = b"FND01LOCKPACKAGESETv1\0";
     const CARGO_REGISTRY_NAME: &str = "index.crates.io-1949cf8c6b5b557f";
     const ACQUISITION_CRATE_CACHE_PREFIX: &str =
@@ -17500,6 +17623,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     const MAX_CONTROL_PLANE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
     const MAX_BOOTSTRAP_SCRATCH_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     const MAX_MATERIALIZATION_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    const PRODUCE_POLICY_JOIN_PREFIX: &[u8] =
+        b"FND01PHASEBPOLICYJOINv1\0";
+    const PRODUCE_POLICY_JOIN_BYTES: usize = 3698;
+    const PRODUCE_POLICY_JOIN_SHA256: [u8; 32] = [
+        0x49, 0x9f, 0x3c, 0xfa, 0xb7, 0x5c, 0x52, 0x05, 0xd3, 0xcb, 0x18, 0x61, 0x41, 0xf3,
+        0xd8, 0x43, 0xaf, 0xb0, 0xc7, 0xe3, 0x98, 0xef, 0xcd, 0xa9, 0x7b, 0x4b, 0x0f, 0x72,
+        0xda, 0xf5, 0x4c, 0xbc,
+    ];
 
     #[derive(Clone, Copy)]
     struct Direct {
@@ -17559,38 +17690,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Direct { package:"zeroize", version:"1.9.0", default_features:false, features:&["alloc","derive"], verifier:false, alias:"fnd01_union_d82a11d71f953bd4862293a7" },
     ];
 
-    #[derive(Clone, Copy)]
-    struct NativeTool {
-        id: &'static str,
-        candidates: &'static [&'static str],
-        version_argv: &'static [&'static str],
-        stream: &'static str,
-        parser: &'static str,
-    }
-
-    const NATIVE_TOOLS: &[NativeTool] = &[
-        NativeTool { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", parser:"rustc-vv-pinned-1.99" },
-        NativeTool { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", parser:"cargo-vv-pinned-1.99" },
-        NativeTool { id:"rustdoc", candidates:&["{pinned-toolchain-bin}/rustdoc"], version_argv:&["--version"], stream:"stdout", parser:"rustdoc-pinned-1.99" },
-        NativeTool { id:"rustfmt", candidates:&["{pinned-toolchain-bin}/rustfmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
-        NativeTool { id:"cargo-fmt", candidates:&["{pinned-toolchain-bin}/cargo-fmt"], version_argv:&["--version"], stream:"stdout", parser:"rustfmt-pinned-nightly" },
-        NativeTool { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
-        NativeTool { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
-        NativeTool { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", parser:"lld-gnu-version" },
-        NativeTool { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
-        NativeTool { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", parser:"openssl-version-a" },
-        NativeTool { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
-        NativeTool { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", parser:"aarch64-c-compiler-v" },
-        NativeTool { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeTool { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
-        NativeTool { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
-        NativeTool { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
-        NativeTool { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
-        NativeTool { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
-    ];
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct StaticChildAuthority {
         id: &'static str,
@@ -17628,6 +17727,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         acquisition_spool_path_formula: &'static str,
         materialization_root_formula: &'static str,
         tool_probe_working_directory: &'static str,
+        /// Digest of the canonical typed join over every acquisition-authority
+        /// value and exact policy block used before the dynamic input barrier.
+        full_policy_join_sha256: [u8; 32],
     }
 
     const fn compiled_produce_acquisition_authority(
@@ -17693,7 +17795,149 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             materialization_root_formula:
                 ".fnd01-run/<role>/<run-id>/local-registry",
             tool_probe_working_directory: "/",
+            full_policy_join_sha256: PRODUCE_POLICY_JOIN_SHA256,
         }
+    }
+
+    fn append_policy_join_usize(
+        output: &mut Vec<u8>,
+        value: usize,
+        subject: &str,
+    ) -> TrustResult<()> {
+        output.extend_from_slice(&usize_u64(value, subject)?.to_be_bytes());
+        Ok(())
+    }
+
+    fn append_static_child_authority(
+        output: &mut Vec<u8>,
+        child: StaticChildAuthority,
+        policy_block: &[u8],
+        subject: &str,
+    ) -> TrustResult<()> {
+        append_u32_bytes(output, child.id.as_bytes(), subject)?;
+        output.extend_from_slice(&child.ordinal.to_be_bytes());
+        append_u32_bytes(output, child.typed_result_kind.as_bytes(), subject)?;
+        output.extend_from_slice(&child.timeout_seconds.to_be_bytes());
+        append_policy_join_usize(output, child.stdout_limit, subject)?;
+        append_policy_join_usize(output, child.stderr_limit, subject)?;
+        append_u32_bytes(output, policy_block, subject)
+    }
+
+    fn encode_produce_acquisition_policy_join(
+        authority: &ProduceAcquisitionAuthority,
+    ) -> TrustResult<Vec<u8>> {
+        let mut output = PRODUCE_POLICY_JOIN_PREFIX.to_vec();
+        append_static_child_authority(
+            &mut output,
+            authority.resolve,
+            RESOLVE_COMMAND_POLICY,
+            "Produce resolve policy join",
+        )?;
+        append_static_child_authority(
+            &mut output,
+            authority.fetch,
+            FETCH_COMMAND_POLICY,
+            "Produce fetch policy join",
+        )?;
+        append_u32_bytes(
+            &mut output,
+            ACQUISITION_ENVIRONMENT_POLICY,
+            "Produce environment policy join",
+        )?;
+        for (count, byte_length, digest) in [
+            (DIRECT.len(), DIRECT_BYTES, DIRECT_SHA256),
+            (DIRECT.len() - 7, UNION_BYTES, UNION_SHA256),
+            (NATIVE_TOOLS.len(), NATIVE_TOOL_BYTES, NATIVE_TOOL_SHA256),
+            (1, MANIFEST_BYTES, MANIFEST_SHA256),
+        ] {
+            append_policy_join_usize(
+                &mut output,
+                count,
+                "Produce registry count",
+            )?;
+            append_policy_join_usize(
+                &mut output,
+                byte_length,
+                "Produce registry byte length",
+            )?;
+            append_u32_bytes(
+                &mut output,
+                digest.as_bytes(),
+                "Produce registry digest",
+            )?;
+        }
+        append_policy_join_usize(
+            &mut output,
+            EXECUTION_BIN_NAMES.len(),
+            "Produce execution-bin count",
+        )?;
+        for name in EXECUTION_BIN_NAMES {
+            append_u32_bytes(
+                &mut output,
+                name.as_bytes(),
+                "Produce execution-bin name",
+            )?;
+        }
+        for value in [
+            authority.tool_probe_timeout_seconds,
+            authority.child_poll_interval_milliseconds,
+            authority.direct_child_kill_wait_seconds,
+            authority.max_source_file_bytes,
+            authority.max_verifier_test_bytes,
+            authority.max_bootstrap_harness_bytes,
+            authority.max_bootstrap_lock_bytes,
+            authority.max_archive_compressed_bytes,
+            authority.max_derived_index_bytes,
+            authority.max_sparse_config_bytes,
+            authority.max_sparse_cache_input_bytes,
+            authority.max_supply_bundle_bytes,
+            authority.max_tree_regular_file_bytes,
+            authority.max_tree_member_bytes,
+            authority.space_budget.max_tree_entry_count,
+            authority.space_budget.max_run_scratch_total_bytes,
+            authority.space_budget.max_fallback_target_total_bytes,
+            authority.space_budget.max_execution_footprint_total_bytes,
+            authority.space_budget.max_control_plane_total_bytes,
+            authority.space_budget.max_bootstrap_scratch_total_bytes,
+            authority.space_budget.max_materialization_total_bytes,
+        ] {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [
+            authority.tool_probe_stdout_limit,
+            authority.tool_probe_stderr_limit,
+            authority.max_tree_entries,
+            MAX_JSON_DEPTH,
+            MAX_JSON_NODES,
+            MAX_JSON_STRING_BYTES,
+            MAX_SPARSE_VALIDATOR_BYTES,
+        ] {
+            append_policy_join_usize(
+                &mut output,
+                value,
+                "Produce usize policy bound",
+            )?;
+        }
+        for value in [
+            authority.scratch_root_formula,
+            authority.control_ledger_path_formula,
+            authority.acquisition_spool_path_formula,
+            authority.materialization_root_formula,
+            authority.tool_probe_working_directory,
+            "resolve_typed_result",
+            "fetch_typed_result",
+            "parse_supply_bundle",
+            "validate_supply_bundle_value",
+            "bootstrap_control_input_authority_contract",
+            "ProduceAcquisitionPermit:pre-barrier-only",
+        ] {
+            append_u32_bytes(
+                &mut output,
+                value.as_bytes(),
+                "Produce policy rule dispatch",
+            )?;
+        }
+        Ok(output)
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -18055,6 +18299,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "Produce role or seal boundary mismatch",
             ));
         }
+        let parsed_marker = parse_authoring_marker(&environment.authoring_marker)
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_ACQUISITION_AUTHORITY",
+                    format!("Produce authoring marker: {error}"),
+                )
+            })?;
+        let decoded_run_id = decode_lower_hex::<16>(
+            &arguments.run_id,
+            "Produce acquisition run ID",
+        )
+        .map_err(|error| {
+            phase_b_error(
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+                error.to_string(),
+            )
+        })?;
         let expected_run_root = arguments
             .repository_root
             .join(".fnd01-run")
@@ -18062,7 +18323,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             .join(&arguments.run_id);
         if arguments.run_root != expected_run_root
             || arguments.run_id_bytes.iter().all(|byte| *byte == 0)
-            || environment.authoring_marker.is_empty()
+            || decoded_run_id != arguments.run_id_bytes
+            || authoring_marker.closure_sha256 == [0; 32]
+            || &parsed_marker != authoring_marker
             || pinned_toolchain_bin(&environment.closed_path).is_err()
         {
             return Err(phase_b_error(
@@ -18135,6 +18398,27 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             execution_bin: format!("{role_root}/execution-bin"),
             role_root,
         })
+    }
+
+    /// Final pre-effect barrier for Produce acquisition. Re-encoding the typed
+    /// authority here prevents a copied digest, partially joined policy, or
+    /// mutated capability from creating scratch or starting Cargo.
+    fn require_complete_produce_acquisition_policy_join(
+        permit: &ProduceAcquisitionPermit,
+    ) -> TrustResult<[u8; 32]> {
+        let preimage = encode_produce_acquisition_policy_join(&permit.authority)?;
+        let digest = sha256(&preimage)?;
+        if preimage.len() != PRODUCE_POLICY_JOIN_BYTES
+            || digest != PRODUCE_POLICY_JOIN_SHA256
+            || permit.authority.full_policy_join_sha256 != digest
+            || digest == [0; 32]
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+                "full compiled acquisition argv/environment/path/bound/rule join drifted; no Produce filesystem mutation or child is authorized",
+            ));
+        }
+        Ok(digest)
     }
 
     fn io_error(code: &'static str, subject: &str, error: &io::Error) -> TrustError {
@@ -18488,8 +18772,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "max_fallback_target_total_bytes = 8589934592",
             "max_materialization_total_bytes = 4294967296",
             "shape_row_count = 104",
-            "registry_bytes = 41905",
-            "registry_sha256 = \"8cd7250d32344e8b572649e061d036e788d5d68e4a3971c52b8c0eb1503bd28f\"",
+            "registry_bytes = 42659",
+            "registry_sha256 = \"fbbd20fcc1f1bff40354ff0f3a7755870b98f9c6fe1b64d5395cb73d77c464c7\"",
             "materialized_kinds = [\"crate-archive\", \"derived-local-index-file\"]",
             "excluded_evidence_only_kinds = [\"sparse-cache-input\"]",
             "entry_kinds = [\"crate-archive\", \"derived-local-index-file\", \"sparse-cache-input\"]",
@@ -18575,12 +18859,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         find_once(
             policy,
-            b"0x03 sparse-cache-input is evidence-only and excluded from materialization authority",
+            b"Kind 0x03 sparse-cache-input remains evidence-only and excluded from materialization authority",
             "0x03 non-materialization claim",
         )?;
         find_once(
             policy,
-            b"SummariesCache",
+            b"Pinned implementation authority is Cargo commit 59800466c5c41c444d264b1010b4d57e85a7117f for SummariesCache, IndexPackage and RegistryDependency deserialization and recovery",
             "sparse-cache SummariesCache authority",
         )?;
         find_once(
@@ -18599,6 +18883,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     error.to_string(),
                 )
             })?;
+        let policy_join =
+            encode_produce_acquisition_policy_join(&produce_acquisition)?;
+        let policy_join_sha256 = sha256(&policy_join)?;
+        if policy_join.len() != PRODUCE_POLICY_JOIN_BYTES
+            || policy_join_sha256 != PRODUCE_POLICY_JOIN_SHA256
+            || produce_acquisition.full_policy_join_sha256
+                != policy_join_sha256
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_POLICY_AUTHORITY",
+                format!(
+                    "Produce policy join pin drift: bytes={} sha256={}",
+                    policy_join.len(),
+                    encode_lower_hex(&policy_join_sha256),
+                ),
+            ));
+        }
         Ok(PhaseBAuthority {
             policy_binding,
             manifest,
@@ -21788,6 +22089,156 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             registry_root,
             &expectation,
         )
+    }
+
+    /// Independently reobserve the two directory trees carried by an ordinary
+    /// control ledger. Paths are derived only from the admitted role/run pair;
+    /// the supply bytes are reparsed and validated before they may describe the
+    /// exact materialized local-registry tree.
+    pub(super) fn observe_ordinary_control_trees(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        supply_bytes: &[u8],
+    ) -> TrustResult<(ValidatedDirectoryTreeBinding, ValidatedTargetSnapshot)> {
+        let run_id_bytes = decode_lower_hex::<16>(run_id, "ordinary run ID")?;
+        if run_id_bytes.iter().all(|byte| *byte == 0) {
+            return Err(phase_b_error(
+                "E_PHASE_B_RUN_ID",
+                "ordinary run ID must be nonzero",
+            ));
+        }
+        let role = role_name(mode)?;
+        let run_root = repository_root
+            .join(".fnd01-run")
+            .join(role)
+            .join(run_id);
+        let local_registry_path = run_root.join("local-registry");
+        let target_path = run_root.join("bootstrap-control-target");
+        let supply = parse_supply_bundle(supply_bytes)?;
+        let validated = validate_supply_bundle_value(&supply)?;
+        let local_registry =
+            snapshot_materialized_supply_tree(&local_registry_path, validated.supply)?;
+        let target_snapshot = snapshot_tree(&target_path, "control-target")?;
+        Ok((
+            ValidatedDirectoryTreeBinding {
+                id: local_registry.id,
+                path: local_registry.path,
+                device: local_registry.device,
+                inode: local_registry.inode,
+                mode: local_registry.mode,
+                nlink: local_registry.nlink,
+                entry_count: local_registry.entry_count,
+                total_regular_file_bytes: local_registry
+                    .total_regular_file_bytes,
+                tree_sha256: local_registry.tree_sha256,
+            },
+            ValidatedTargetSnapshot {
+                path: target_snapshot.path,
+                entry_count: target_snapshot.entry_count,
+                total_regular_file_bytes: target_snapshot
+                    .total_regular_file_bytes,
+                tree_sha256: target_snapshot.tree_sha256,
+            },
+        ))
+    }
+
+    /// Recompute the producer acquisition typed results from retained raw
+    /// command streams and the still-live acquisition CARGO_HOME after archive
+    /// validation. No child is launched: every path comes from the role/run
+    /// acquisition plan or a previously validated ledger binding.
+    pub(super) fn revalidate_ordinary_producer_acquisition(
+        repository_root: &Path,
+        run_id: &str,
+        supply_bytes: &[u8],
+        spool_bytes: &[u8],
+        tools: &AcquisitionToolPaths,
+        manifest_binding: &ValidatedFileBinding,
+        lock_binding: &ValidatedFileBinding,
+        supply_binding: &ValidatedFileBinding,
+    ) -> TrustResult<()> {
+        let plan = acquisition_plan(repository_root, run_id, tools)?;
+        let expected_lock_path = Path::new(&plan.package_root).join("Cargo.lock");
+        let expected_lock_path = expected_lock_path.to_str().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_ORDINARY_ACQUISITION",
+                "exact producer Cargo.lock path must be UTF-8",
+            )
+        })?;
+        if manifest_binding.path != plan.manifest_path
+            || lock_binding.path != expected_lock_path
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_ORDINARY_ACQUISITION",
+                "manifest or lock binding differs from the producer role/run plan",
+            ));
+        }
+        let manifest_relative = Path::new(&manifest_binding.path)
+            .strip_prefix(repository_root)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_ORDINARY_ACQUISITION",
+                    "producer manifest binding escapes the repository",
+                )
+            })?;
+        let lock_relative = Path::new(&lock_binding.path)
+            .strip_prefix(repository_root)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_ORDINARY_ACQUISITION",
+                    "producer lock binding escapes the repository",
+                )
+            })?;
+        let manifest_maximum = u64::try_from(MANIFEST_BYTES).map_err(|_| {
+            phase_b_error(
+                "E_PHASE_B_ORDINARY_ACQUISITION",
+                "manifest bound conversion failed",
+            )
+        })?;
+        let (_, manifest) = checked_read(
+            repository_root,
+            manifest_relative,
+            manifest_maximum,
+            Some(manifest_binding.binding),
+        )?;
+        let (_, bootstrap_lock) = checked_read(
+            repository_root,
+            lock_relative,
+            MAX_BOOTSTRAP_LOCK_BYTES,
+            Some(lock_binding.binding),
+        )?;
+        let supply = parse_supply_bundle(supply_bytes)?;
+        let validated = validate_supply_bundle_value(&supply)?;
+        if bootstrap_lock != validated.supply.bootstrap_lock {
+            return Err(phase_b_error(
+                "E_PHASE_B_ORDINARY_ACQUISITION",
+                "live producer Cargo.lock differs from the supply bootstrap lock",
+            ));
+        }
+        let structural = parse_acquisition_spool_structure(
+            spool_bytes,
+            run_id,
+            &plan.commands,
+            supply_binding,
+        )?;
+        let resolve = resolve_typed_result(
+            &manifest,
+            &structural.commands[0].stdout.bytes,
+            &bootstrap_lock,
+            Path::new(&plan.package_root),
+        )?;
+        let fetch = fetch_typed_result(
+            Path::new(&plan.cargo_home),
+            &bootstrap_lock,
+            supply_bytes,
+            validated.supply,
+        )?;
+        let _ = finalize_acquisition_spool(structural, &[resolve, fetch])?;
+        Ok(())
     }
 
     fn snapshot_materialized_tree_with_expectation(
@@ -25263,7 +25714,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
     fn record_set_sha256_preimage(records: &[Vec<u8>]) -> TrustResult<Vec<u8>> {
         let mut preimage = Vec::new();
-        preimage.extend_from_slice(b"FND01RECv2\0");
+        preimage.extend_from_slice(RECORD_SET_PREFIX);
         preimage.extend_from_slice(&usize_u32(records.len(), "record set")?.to_be_bytes());
         for record in records {
             append_u32_bytes(&mut preimage, record, "record set row")?;
@@ -27024,6 +27475,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &self.acquisition_tools
         }
 
+        /// Live dual-path cardinality: selected inventory rows must stay
+        /// bijective with the pure 20-row compiled descriptor table.
+        pub(super) fn native_tool_count(&self) -> usize {
+            self.selected_tools.len()
+        }
+
         pub(super) fn require_unchanged(&self) -> TrustResult<()> {
             let actual = revalidate_native_tool_surface(
                 &self.repository_root,
@@ -28167,6 +28624,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             integration_digest,
             authoring_bytes,
         )?;
+        let _full_policy_join_sha256 =
+            require_complete_produce_acquisition_policy_join(&permit)?;
         let role = role_name(arguments.mode)?;
         let role_root = permit.role_root.as_str();
         let package_root = permit.package_root.as_str();
@@ -29497,7 +29956,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         #[test]
-        fn produce_acquisition_authority_is_pure_and_role_exact() {
+        fn produce_acquisition_authority_is_complete_pure_and_mutation_closed() {
             let policy = b"policy".to_vec();
             let verifier = b"verifier".to_vec();
             let harness = b"harness".to_vec();
@@ -29505,14 +29964,29 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 bootstrap_manifest().expect("compiled bootstrap manifest");
             let authoring_bytes =
                 [policy.clone(), verifier.clone(), harness.clone()];
-            let marker = AuthoringMarker {
+            let mut marker = AuthoringMarker {
                 policy: binding_for_bytes(&policy).expect("policy binding"),
                 verifier: binding_for_bytes(&verifier)
                     .expect("verifier binding"),
                 harness: binding_for_bytes(&harness)
                     .expect("harness binding"),
-                closure_sha256: [0x44; 32],
+                closure_sha256: [0; 32],
             };
+            marker.closure_sha256 = sha256(
+                &authoring_closure_preimage(&marker)
+                    .expect("authoring marker preimage"),
+            )
+            .expect("authoring marker digest");
+            let marker_text = format!(
+                "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
+                marker.policy.byte_length,
+                encode_lower_hex(&marker.policy.sha256),
+                marker.verifier.byte_length,
+                encode_lower_hex(&marker.verifier.sha256),
+                marker.harness.byte_length,
+                encode_lower_hex(&marker.harness.sha256),
+                encode_lower_hex(&marker.closure_sha256),
+            );
             let run_id = "11".repeat(16);
             let repository_root = PathBuf::from("/repository");
             let arguments = BootstrapArguments {
@@ -29530,7 +30004,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 gate_input_record_path: None,
             };
             let environment = BootstrapEnvironment {
-                authoring_marker: "marker".to_owned(),
+                authoring_marker: marker_text,
                 closed_path:
                     "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin"
                         .to_owned(),
@@ -29539,7 +30013,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 attester_outer_record_path: None,
                 final_gate_seal: None,
             };
-            let permit = require_produce_acquisition_authority(
+            let mut permit = require_produce_acquisition_authority(
                 synthetic_phase_b_authority(&policy, &manifest),
                 &arguments,
                 &environment,
@@ -29556,6 +30030,64 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 permit.authority,
                 compiled_produce_acquisition_authority()
             );
+            let joined = require_complete_produce_acquisition_policy_join(&permit)
+                .expect("complete typed policy join must authorize bounded acquisition");
+            assert_eq!(joined, PRODUCE_POLICY_JOIN_SHA256);
+            permit.authority.resolve.timeout_seconds -= 1;
+            let drift = require_complete_produce_acquisition_policy_join(&permit)
+                .expect_err("a mutated permit must stop before the first Produce effect");
+            assert_eq!(drift.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
+            assert_eq!(
+                drift.detail(),
+                "full compiled acquisition argv/environment/path/bound/rule join drifted; no Produce filesystem mutation or child is authorized",
+            );
+            let compiled_authority = compiled_produce_acquisition_authority();
+
+            permit.authority = compiled_authority;
+            permit.authority.fetch.typed_result_kind = "untyped-fetch";
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect_err("fetch typed-result drift must fail closed")
+                    .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            permit.authority = compiled_authority;
+            permit.authority.tool_probe_stdout_limit -= 1;
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect_err("tool-probe bound drift must fail closed")
+                    .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            permit.authority = compiled_authority;
+            permit.authority.space_budget.max_control_plane_total_bytes -= 1;
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect_err("aggregate space-bound drift must fail closed")
+                    .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            permit.authority = compiled_authority;
+            permit.authority.scratch_root_formula = ".fnd01-run/<run-id>/wrong-role";
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect_err("path-formula drift must fail closed")
+                    .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            permit.authority = compiled_authority;
+            permit.authority.full_policy_join_sha256[0] ^= 1;
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect_err("stored policy-join digest drift must fail closed")
+                    .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+            permit.authority = compiled_authority;
 
             let mut wrong_direct =
                 synthetic_phase_b_authority(&policy, &manifest);
@@ -29669,6 +30201,55 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
+            let mut wrong_run_bytes = arguments.clone();
+            wrong_run_bytes.run_id_bytes[0] ^= 1;
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    synthetic_phase_b_authority(&policy, &manifest),
+                    &wrong_run_bytes,
+                    &environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err("run-id text/byte drift cannot obtain authority")
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            let mut wrong_marker_environment = environment.clone();
+            wrong_marker_environment.authoring_marker =
+                environment.authoring_marker.replacen("FND01AUTHORv2", "FND01AUTHORv1", 1);
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    synthetic_phase_b_authority(&policy, &manifest),
+                    &arguments,
+                    &wrong_marker_environment,
+                    &marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err("external authoring-marker drift cannot obtain authority")
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
+            let mut zero_closure_marker = marker.clone();
+            zero_closure_marker.closure_sha256 = [0; 32];
+            assert_eq!(
+                require_produce_acquisition_authority(
+                    synthetic_phase_b_authority(&policy, &manifest),
+                    &arguments,
+                    &environment,
+                    &zero_closure_marker,
+                    [0; 32],
+                    &authoring_bytes,
+                )
+                .expect_err("zero authoring closure cannot obtain authority")
+                .code(),
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+            );
+
             assert_eq!(
                 require_produce_acquisition_authority(
                     synthetic_phase_b_authority(&policy, &manifest),
@@ -29718,7 +30299,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         #[test]
-        fn lock_union_is_order_independent_and_checksum_bound() {
+        fn lock_union_requires_pinned_package_order_and_checksum_binding() {
             let first = concat!(
                 "# This file is automatically @generated by Cargo.\n",
                 "# It is not intended for manual editing.\n",
@@ -29752,8 +30333,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "]\n",
             );
             let first = bootstrap_lock_union(first.as_bytes()).expect("first lock union");
-            let second = bootstrap_lock_union(second.as_bytes()).expect("second lock union");
-            assert_eq!(first, second);
+            assert_eq!(
+                bootstrap_lock_union(second.as_bytes())
+                    .expect_err("out-of-order package blocks must fail")
+                    .code(),
+                "E_PHASE_B_LOCK_SCHEMA",
+            );
             let changed = first
                 .packages
                 .iter()
@@ -30054,6 +30639,42 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
+        fn synthetic_valid_supply(archive: &[u8]) -> SupplyBundle {
+            let checksum = encode_lower_hex(
+                &sha256(archive).expect("archive digest"),
+            );
+            let selected = format!(
+                r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
+            );
+            let entries = vec![
+                synthetic_supply_entry(
+                    0x01,
+                    "sample-1.2.3.crate",
+                    archive.to_vec(),
+                ),
+                synthetic_supply_entry(
+                    0x02,
+                    "index/sa/mp/sample",
+                    format!("{selected}\n").into_bytes(),
+                ),
+                synthetic_supply_entry(
+                    0x03,
+                    "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
+                    synthetic_summaries_cache(&[(
+                        "1.2.3",
+                        selected.as_bytes(),
+                    )]),
+                ),
+            ];
+            let encoded = encode_supply_bundle(
+                &synthetic_supply_lock(&checksum),
+                &synthetic_supply_acquisition(),
+                entries,
+            )
+            .expect("canonical synthetic supply");
+            parse_supply_bundle(&encoded).expect("validated synthetic supply")
+        }
+
         fn synthetic_summaries_cache_with_validator(
             validator: &[u8],
             rows: &[(&str, &[u8])],
@@ -30277,26 +30898,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             package_name: &str,
             checksum: &str,
         ) -> Vec<u8> {
+            const ROOT_PACKAGE: &str = "fastmcp-fnd01-bootstrap-control";
+            let root = format!(
+                "[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n \"{package_name}\",\n]\n",
+            );
+            let registry = format!(
+                "[[package]]\nname = \"{package_name}\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n",
+            );
+            let (first, second) = if package_name.as_bytes() < ROOT_PACKAGE.as_bytes() {
+                (&registry, &root)
+            } else {
+                (&root, &registry)
+            };
             format!(
-                concat!(
-                    "# This file is automatically @generated by Cargo.\n",
-                    "# It is not intended for manual editing.\n",
-                    "version = 4\n\n",
-                    "[[package]]\n",
-                    "name = \"fastmcp-fnd01-bootstrap-control\"\n",
-                    "version = \"0.0.0\"\n",
-                    "dependencies = [\n",
-                    " \"{}\",\n",
-                    "]\n\n",
-                    "[[package]]\n",
-                    "name = \"{}\"\n",
-                    "version = \"1.2.3\"\n",
-                    "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
-                    "checksum = \"{}\"\n",
-                ),
-                package_name,
-                package_name,
-                checksum,
+                "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n{first}\n{second}",
             )
             .into_bytes()
         }
@@ -30861,44 +31476,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         #[test]
         fn bootstrap_input_authority_excludes_sparse_evidence_and_binds_materialized_rows() {
-            fn valid_supply(archive: &[u8]) -> SupplyBundle {
-                let checksum = encode_lower_hex(
-                    &sha256(archive).expect("archive digest"),
-                );
-                let selected = format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
-                );
-                let entries = vec![
-                    synthetic_supply_entry(
-                        0x01,
-                        "sample-1.2.3.crate",
-                        archive.to_vec(),
-                    ),
-                    synthetic_supply_entry(
-                        0x02,
-                        "index/sa/mp/sample",
-                        format!("{selected}\n").into_bytes(),
-                    ),
-                    synthetic_supply_entry(
-                        0x03,
-                        "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
-                        synthetic_summaries_cache(&[(
-                            "1.2.3",
-                            selected.as_bytes(),
-                        )]),
-                    ),
-                ];
-                let encoded = encode_supply_bundle(
-                    &synthetic_supply_lock(&checksum),
-                    &synthetic_supply_acquisition(),
-                    entries,
-                )
-                .expect("canonical synthetic supply");
-                parse_supply_bundle(&encoded)
-                    .expect("validated synthetic supply")
-            }
-
-            let supply = valid_supply(b"archive");
+            let supply = synthetic_valid_supply(b"archive");
             let validated = validate_supply_bundle_value(&supply)
                 .expect("canonical in-memory supply witness");
             let authority =
@@ -30974,7 +31552,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
             );
 
-            let materialized_changed = valid_supply(b"changed archive");
+            let materialized_changed =
+                synthetic_valid_supply(b"changed archive");
             let materialized_validated =
                 validate_supply_bundle_value(&materialized_changed)
                     .expect("coherently changed materialized witness");
@@ -31012,6 +31591,154 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .expect_err("independent manifest binding drift must fail")
                 .code(),
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+            );
+        }
+
+        #[test]
+        fn attest_archive_prefix_failures_use_the_archive_diagnostic() {
+            let mut prefix_valid = vec![
+                0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0,
+            ];
+            prefix_valid.push(0x03);
+            prefix_valid.extend_from_slice(&[0; 8]);
+            validate_gzip_crate_prefix(
+                &prefix_valid,
+                "sample-1.2.3.crate",
+            )
+            .expect("prefix-valid framed gzip member");
+
+            let mut bad_magic = prefix_valid.clone();
+            bad_magic[0] = 0;
+            let mut reserved_flags = prefix_valid.clone();
+            reserved_flags[3] = 0xe0;
+            let empty_deflate = prefix_valid[..18].to_vec();
+            let mut extra_overrun = prefix_valid.clone();
+            extra_overrun[3] = 0x04;
+            extra_overrun[10] = 1;
+            extra_overrun[11] = 0;
+            let mut name_without_nul = prefix_valid.clone();
+            name_without_nul[3] = 0x08;
+            name_without_nul[10] = 1;
+            let mut comment_without_nul = prefix_valid.clone();
+            comment_without_nul[3] = 0x10;
+            comment_without_nul[10] = 1;
+            let mut header_crc_consumes_stream = prefix_valid.clone();
+            header_crc_consumes_stream[3] = 0x02;
+            for payload in [
+                vec![],
+                bad_magic,
+                reserved_flags,
+                empty_deflate,
+                extra_overrun,
+                name_without_nul,
+                comment_without_nul,
+                header_crc_consumes_stream,
+            ] {
+                assert_eq!(
+                    validate_gzip_crate_prefix(
+                        &payload,
+                        "sample-1.2.3.crate",
+                    )
+                    .expect_err("malformed gzip framing must fail in Phase B")
+                    .code(),
+                    "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
+                );
+            }
+        }
+
+        #[test]
+        fn attest_prefix_valid_supply_stops_at_input_authority_not_inflation() {
+            let mut archive = vec![
+                0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0,
+            ];
+            archive.push(0x03);
+            archive.extend_from_slice(&[0; 8]);
+            let supply = synthetic_valid_supply(&archive);
+            let policy = b"policy".to_vec();
+            let verifier = b"verifier".to_vec();
+            let harness = b"harness".to_vec();
+            let authoring_bytes = [policy.clone(), verifier, harness];
+            let mut marker = AuthoringMarker {
+                policy: binding_for_bytes(&authoring_bytes[0])
+                    .expect("policy binding"),
+                verifier: binding_for_bytes(&authoring_bytes[1])
+                    .expect("verifier binding"),
+                harness: binding_for_bytes(&authoring_bytes[2])
+                    .expect("harness binding"),
+                closure_sha256: [0; 32],
+            };
+            marker.closure_sha256 = sha256(
+                &authoring_closure_preimage(&marker)
+                    .expect("authoring preimage"),
+            )
+            .expect("authoring digest");
+            let marker_text = format!(
+                "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
+                marker.policy.byte_length,
+                encode_lower_hex(&marker.policy.sha256),
+                marker.verifier.byte_length,
+                encode_lower_hex(&marker.verifier.sha256),
+                marker.harness.byte_length,
+                encode_lower_hex(&marker.harness.sha256),
+                encode_lower_hex(&marker.closure_sha256),
+            );
+            let run_id = "22".repeat(16);
+            let repository_root = PathBuf::from("/repository");
+            let arguments = BootstrapArguments {
+                mode: BootstrapMode::Attest,
+                repository_root: repository_root.clone(),
+                run_root: repository_root
+                    .join(".fnd01-run")
+                    .join("independent-attester")
+                    .join(&run_id),
+                run_id,
+                run_id_bytes: [0x22; 16],
+                producer_outer_record_path: None,
+                final_attestation_path: None,
+                attester_outer_record_path: None,
+                gate_input_record_path: None,
+            };
+            let environment = BootstrapEnvironment {
+                authoring_marker: marker_text,
+                closed_path:
+                    "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin"
+                        .to_owned(),
+                integration_seal: None,
+                producer_outer_record_path: None,
+                attester_outer_record_path: None,
+                final_gate_seal: None,
+            };
+            let manifest = bootstrap_manifest().expect("compiled manifest");
+            let error = attest_phase_b_supply_validation(
+                &arguments,
+                &environment,
+                &marker,
+                [0x33; 32],
+                &authoring_bytes,
+                synthetic_phase_b_authority(&policy, &manifest),
+                &supply,
+            )
+            .expect_err(
+                "std-only Attest must stop before materialization authority",
+            );
+            assert_eq!(error.code(), "E_PHASE_B_ATTEST_INPUT_AUTHORITY");
+            assert!(error.detail().contains("validated 1 crate archive framings"));
+
+            let mut no_archive = supply;
+            no_archive.entries.retain(|entry| entry.kind != 0x01);
+            let no_archive_error = attest_phase_b_supply_validation(
+                &arguments,
+                &environment,
+                &marker,
+                [0x33; 32],
+                &authoring_bytes,
+                synthetic_phase_b_authority(&policy, &manifest),
+                &no_archive,
+            )
+            .expect_err("Attest requires at least one crate archive framing");
+            assert_eq!(
+                no_archive_error.code(),
+                "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
             );
         }
 
@@ -31330,7 +32057,7 @@ mod bootstrap {
     use super::phase_b_std::run_phase_b;
     use super::trust_std::{
         BootstrapMode, TrustError, TrustResult, build_gate_handshake,
-        emit_gate_handshake, has_exact_gate_intent, parse_authoring_marker,
+        emit_gate_handshake, parse_authoring_marker,
         parse_bootstrap_arguments,
         parse_canonical_record_file_with_final_self_digest,
         parse_final_gate_seal,
@@ -31348,7 +32075,9 @@ mod bootstrap {
         MAX_SUPPLY_BUNDLE_BYTES,
     };
     #[cfg(fnd01_bootstrap)]
-    use super::trust_std::{emit_entry_diagnostic, parse_integration_seal};
+    use super::trust_std::{
+        emit_entry_diagnostic, has_exact_gate_intent, parse_integration_seal,
+    };
     #[cfg(fnd01_bootstrap)]
     use std::cell::Cell;
     use std::ffi::OsString;
@@ -31745,21 +32474,36 @@ mod bootstrap {
 #[rustfmt::skip]
 mod ordinary {
 
-use super::{FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256};
+use super::{
+    FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX,
+    RECORD_SET_PREFIX,
+};
 use super::trust_std::{
     AcquisitionToolPaths, BootstrapEnvironment, BootstrapMode,
-    CanonicalRecord, FileBinding, OrdinaryHandoffArguments,
-    SparseDependencyKind, SparseDependencySemantic, ValidatedFileBinding,
-    ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX, acquisition_plan,
-    bootstrap_role_name,
+    CanonicalRecord, CanonicalValue, CheckedSnapshot, ControlLedgerExpectation,
+    FileBinding, IntegrationSeal, OrdinaryHandoffArguments, RetainedSnapshotSet,
+    SparseDependencyKind, SparseDependencySemantic, ValidatedControlLedger,
+    ValidatedDirectoryTreeBinding, ValidatedFileBinding,
+    ValidatedTargetSnapshot, ACQUISITION_SPOOL_PREFIX,
+    CONTROL_LEDGER_PREFIX, CONTROL_SCRATCH_MAXIMA,
+    MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES,
+    MAX_GATE_EXECUTABLE_BYTES, MAX_SUPPLY_BUNDLE_BYTES,
+    bootstrap_role_name, checked_read, checked_snapshot,
     emit_entry_diagnostic, emit_entry_diagnostic_parts,
+    encode_canonical_record, encode_lower_hex,
     entry_diagnostic_code_is_valid,
-    expected_ordinary_handoff_environment,
+    expected_ordinary_handoff_argv, expected_ordinary_handoff_environment,
+    expected_ordinary_supply_relative_path,
     has_exact_gate_intent,
+    join_control_build_stream,
     MAX_SPARSE_CACHE_INPUT_BYTES,
-    parse_acquisition_spool_structure,
+    parse_canonical_record_file,
+    parse_integration_seal,
+    parse_outer_transport_record,
     parse_canonical_record_file_with_final_self_digest,
     parse_ordinary_handoff_arguments, read_ordinary_handoff_environment,
+    rebind_control_ledger_regular_files, retain_integration_and_outer_files,
+    sha256, validate_control_ledger_bytes, validate_outer_role_record,
     validate_sparse_index_semantics,
 };
 use flate2::bufread::GzDecoder;
@@ -31827,6 +32571,10 @@ const RECEIPT_SCHEMA_REGISTRY_COUNT: usize = 10;
 const RECEIPT_SCHEMA_REGISTRY_BYTES: usize = 21_571;
 const RECEIPT_SCHEMA_REGISTRY_SHA256: &str =
     "078d93c8bf7c5098bc56f89268ce717a55d4dcde87774edc61579f7273381880";
+const RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT: usize = 18;
+const RECEIPT_CONTRACT_REGISTRY_BYTES: usize = 5_602;
+const RECEIPT_CONTRACT_REGISTRY_SHA256: &str =
+    "500bf217820845648e847810a72e4324d3c44ed628bd26856e5739dab5fdcdc1";
 const DIRECT_FIELD_TYPE_COUNT: usize = 1_264;
 const DIRECT_FIELD_TYPE_REGISTRY_BYTES: usize = 84_281;
 const DIRECT_FIELD_TYPE_REGISTRY_SHA256: &str =
@@ -37297,7 +38045,7 @@ fn encode_record_set(
     subject: &str,
 ) -> VResult<Vec<u8>> {
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"FND01RECv2\0");
+    encoded.extend_from_slice(RECORD_SET_PREFIX);
     append_registry_count(&mut encoded, values.len(), subject)?;
     for value in values {
         let table = value
@@ -37405,7 +38153,7 @@ fn variant_record_set_sha256(
 ) -> VResult<String> {
     let authority = build_variant_authority(policy)?;
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"FND01RECv2\0");
+    encoded.extend_from_slice(RECORD_SET_PREFIX);
     append_registry_count(&mut encoded, values.len(), subject)?;
     for (index, value) in values.iter().enumerate() {
         let logical = format!("{subject}[{index}]");
@@ -38778,6 +39526,91 @@ fn validate_schema_registries(policy: &Policy) -> VResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiptContractMirrorPin {
+    field_count: usize,
+    byte_length: usize,
+    sha256: &'static str,
+}
+
+const RECEIPT_CONTRACT_MIRROR_PIN: ReceiptContractMirrorPin =
+    ReceiptContractMirrorPin {
+        field_count: RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT,
+        byte_length: RECEIPT_CONTRACT_REGISTRY_BYTES,
+        sha256: RECEIPT_CONTRACT_REGISTRY_SHA256,
+    };
+
+/// Canonically encode the complete raw `receipt_contract` table without using
+/// TOML serialization or any policy-declared mirror identity.
+fn encode_receipt_contract_registry_unpinned(
+    root: &toml::value::Table,
+) -> VResult<(usize, Vec<u8>)> {
+    const PREFIX: &[u8] = b"FND01RECEIPTCONTRACTv1\0";
+    let receipt = root.get("receipt_contract").ok_or_else(|| {
+        Diagnostic::error(
+            "E_RECEIPT_CONTRACT_REGISTRY",
+            "complete receipt_contract mirror",
+        )
+        .at("missing receipt_contract")
+    })?;
+    let field_count = receipt.as_table().map(toml::Table::len).ok_or_else(|| {
+        Diagnostic::error(
+            "E_RECEIPT_CONTRACT_REGISTRY",
+            "complete receipt_contract mirror",
+        )
+        .at("receipt_contract must be a table")
+    })?;
+    let limit = u64::try_from(MAX_POLICY_SHAPE_REGISTRY_BYTES).map_err(|_| {
+        Diagnostic::error(
+            "E_RECEIPT_CONTRACT_REGISTRY",
+            "complete receipt_contract mirror",
+        )
+        .at("compiled output bound exceeds u64")
+    })?;
+    let mut encoded = ObservationEncoder::new(limit, "complete receipt_contract mirror")?;
+    encoded.extend(PREFIX)?;
+    encode_toml_observation(Some(receipt), &mut encoded)?;
+    Ok((field_count, encoded.bytes))
+}
+
+fn validate_receipt_contract_registry_with_pin(
+    root: &toml::value::Table,
+    pin: ReceiptContractMirrorPin,
+) -> VResult<()> {
+    let (field_count, encoded) =
+        encode_receipt_contract_registry_unpinned(root).map_err(|error| {
+            Diagnostic::error(
+                "E_RECEIPT_CONTRACT_REGISTRY",
+                "complete receipt_contract mirror",
+            )
+            .at(error.stable())
+        })?;
+    let observed_sha256 = lower_hex(&sha256(&encoded));
+    if field_count != pin.field_count
+        || encoded.len() != pin.byte_length
+        || observed_sha256 != pin.sha256
+    {
+        return Err(Diagnostic::error(
+            "E_RECEIPT_CONTRACT_REGISTRY",
+            "complete receipt_contract mirror",
+        )
+        .at(format!(
+            "expected={}/{}/{} observed={}/{}/{}",
+            pin.field_count,
+            pin.byte_length,
+            pin.sha256,
+            field_count,
+            encoded.len(),
+            observed_sha256,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_receipt_contract_registry(root: &toml::value::Table) -> VResult<()> {
+    validate_receipt_contract_registry_with_pin(root, RECEIPT_CONTRACT_MIRROR_PIN)
+}
+
 fn validate_raw_policy_shape(raw: &toml::Value) -> VResult<()> {
     let root = raw
         .as_table()
@@ -38955,6 +39788,7 @@ fn validate_raw_policy_shape(raw: &toml::Value) -> VResult<()> {
     validate_raw_fixture_values(root)?;
     let type_registry = encode_policy_type_registry(root, &rules)?;
     validate_policy_type_registry(&type_registry)?;
+    validate_receipt_contract_registry(root)?;
     Ok(())
 }
 
@@ -39617,7 +40451,8 @@ fn validate_policy_shape(policy: &Policy) -> VResult<()> {
             > policy.bounds.max_receipt_schema_registry_bytes
         || receipt.schema_registry_sha256.len() != 64
         || receipt.schema_registry_bound_rule.is_empty()
-        || receipt.schema_registry_verifier_authority_rule.is_empty()
+        || receipt.schema_registry_verifier_authority_rule
+            != "the verifier pins the literal FND01RECEIPTSCHEMAv1 encoding, all ten rows including ordered fields and optional ownership branch, exact canonical byte length, and SHA-256 in compiled Rust. Policy mirror values never authorize a changed receipt kind, table, field, cardinality rule, semantic rule, or optional field. Separately, the verifier encodes the complete receipt_contract table as ASCII FND01RECEIPTCONTRACTv1 followed by NUL and exactly one recursively tagged TOML table using assertion_contract value tags: tag 0x07, u64be exact member count, members sorted by raw UTF-8 key bytes, each key as u32be length and bytes, booleans as tag 0x02 plus one 0-or-1 byte, integers as tag 0x03 plus i64be, strings as tag 0x05 plus u64be length and bytes, and arrays as tag 0x06 plus u64be item count and recursively tagged items in declared order. The complete encoding, including digest_rule and its FND01METAGRAPHv1 family, has independently compiled exact field-count, byte-length, and SHA-256 pins; no policy-declared mirror value, per-field check, TOML serialization, missing field, extra field, alternate order, or trailing byte authorizes drift."
         || !string_sequence_is(
             &receipt.common_required_fields,
             &[
@@ -40549,12 +41384,20 @@ fn validate_gzip_tar(
             format!("{prefix}/{name}")
         };
         validate_archive_path(&path, subject)?;
-        if records
-            .last()
-            .is_some_and(|(prior, _, _, _)| prior.as_bytes() >= path.as_bytes())
-        {
-            return Err(Diagnostic::error("E_TAR_ORDER", subject)
-                .at(format!("previous={:?};current={path:?}", records.last().map(|row| &row.0))));
+        if let Some((prior, _, _, _)) = records.last() {
+            if prior == &path {
+                return Err(
+                    Diagnostic::error("E_INVENTORY_DUPLICATE", subject).at(path)
+                );
+            }
+            if prior.eq_ignore_ascii_case(&path) {
+                return Err(Diagnostic::error("E_CASE_COLLISION", subject)
+                    .at(format!("{prior} vs {path}")));
+            }
+            if prior.as_bytes() > path.as_bytes() {
+                return Err(Diagnostic::error("E_TAR_ORDER", subject)
+                    .at(format!("previous={prior:?};current={path:?}")));
+            }
         }
         let size = parse_tar_octal(&header[124..136], subject)?;
         if size > bounds.max_archive_member_bytes {
@@ -46238,6 +47081,9 @@ fn validate_runtime_absolute_path(
         || path.as_bytes().iter().any(|byte| byte.is_ascii_control())
     {
         return Err(Diagnostic::error("E_RUNTIME_PATH", subject).at(path));
+    }
+    if path == "/" {
+        return Ok(());
     }
     let mut depth = 0usize;
     for component in path.split('/').skip(1) {
@@ -63864,7 +64710,7 @@ fn canonical_metadata_graph_sha256(
         policy,
         subject,
     )?;
-    let total_length = b"FND01METAGRAPHv1\0"
+    let total_length = METADATA_GRAPH_PREFIX
         .len()
         .checked_add(4)
         .and_then(|length| length.checked_add(node_set.len()))
@@ -63877,7 +64723,7 @@ fn canonical_metadata_graph_sha256(
         return Err(metadata_error(subject, "canonical graph byte bound"));
     }
     let mut canonical = Vec::with_capacity(total_length);
-    canonical.extend_from_slice(b"FND01METAGRAPHv1\0");
+    canonical.extend_from_slice(METADATA_GRAPH_PREFIX);
     append_registry_count(&mut canonical, node_set.len(), subject)?;
     canonical.extend_from_slice(&node_set);
     append_registry_count(&mut canonical, edge_set.len(), subject)?;
@@ -64326,8 +65172,14 @@ fn expected_projection_manifest_utf8(
         )?;
         let version = record_string(row, "version", &logical)?;
         validate_semver_text(version, &policy.bounds, &logical)?;
-        let requirement =
-            projection_manifest_literal(&format!("={version}"), &logical)?;
+        let requirement = format!("={version}");
+        if requirement.len() > 255 {
+            return Err(
+                Diagnostic::error("E_PROJECTION_SOURCE_BYTES", &logical)
+                    .at("noncanonical generated-manifest requirement"),
+            );
+        }
+        let requirement = format!("\"{requirement}\"");
         manifest.push_str(&format!(
             "{alias} = {{ package = {package_id}, version = {requirement}"
         ));
@@ -70125,7 +70977,11 @@ fn parse_cargo_compile_stream(
     let payload = stdout
         .strip_suffix(b"\n")
         .ok_or_else(|| Diagnostic::error("E_COMPILE_STREAM_FRAMING", subject))?;
-    if payload.is_empty() {
+    if payload.is_empty()
+        || payload
+            .split(|byte| *byte == b'\n')
+            .any(<[u8]>::is_empty)
+    {
         return Err(Diagnostic::error("E_COMPILE_STREAM_FRAMING", subject));
     }
     std::str::from_utf8(stdout)
@@ -74587,7 +75443,6 @@ struct TestOrdinarySupplyPackage {
 }
 
 fn test_ordinary_supply_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut registry_lock_rows = String::new();
     let mut packages = Vec::new();
     for (path, payload) in entries {
         let root = path
@@ -74597,10 +75452,6 @@ fn test_ordinary_supply_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
             .rsplit_once('-')
             .expect("test archive root has name-version form");
         let checksum = lower_hex(&sha256(payload));
-        registry_lock_rows.push_str(&format!(
-            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{CRATES_IO_SOURCE}\"\nchecksum = \"{}\"\n",
-            checksum,
-        ));
         let index_path =
             crates_io_index_path(name, "synthetic ordinary supply").expect("test index path");
         let index_json = format!(
@@ -74654,20 +75505,51 @@ fn test_ordinary_supply_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
         packages.len(),
         "synthetic root dependency identities must be unique",
     );
+    const ROOT_PACKAGE: &str = "fastmcp-fnd01-bootstrap-control";
+    let mut root_block = format!(
+        "[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n",
+    );
+    for dependency in root_dependencies {
+        root_block.push_str(&format!(" \"{dependency}\",\n"));
+    }
+    root_block.push_str("]\n");
+    let mut lock_blocks = vec![(
+        ROOT_PACKAGE.to_owned(),
+        SemverVersion::parse("0.0.0").expect("synthetic root version"),
+        None::<String>,
+        root_block,
+    )];
+    for package in &packages {
+        lock_blocks.push((
+            package.name.clone(),
+            SemverVersion::parse(&package.version)
+                .expect("synthetic registry version"),
+            Some(CRATES_IO_SOURCE.to_owned()),
+            format!(
+                "[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO_SOURCE}\"\nchecksum = \"{}\"\n",
+                package.name, package.version, package.checksum,
+            ),
+        ));
+    }
+    lock_blocks.sort_by(|left, right| {
+        left.0
+            .as_bytes()
+            .cmp(right.0.as_bytes())
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
     let mut bootstrap_lock = concat!(
-        "version = 4\n",
-        "\n",
-        "[[package]]\n",
-        "name = \"fastmcp-fnd01-bootstrap-control\"\n",
-        "version = \"0.0.0\"\n",
-        "dependencies = [\n",
+        "# This file is automatically @generated by Cargo.\n",
+        "# It is not intended for manual editing.\n",
+        "version = 4\n\n",
     )
     .to_owned();
-    for dependency in root_dependencies {
-        bootstrap_lock.push_str(&format!(" \"{dependency}\",\n"));
+    for (index, (_, _, _, block)) in lock_blocks.into_iter().enumerate() {
+        if index > 0 {
+            bootstrap_lock.push('\n');
+        }
+        bootstrap_lock.push_str(&block);
     }
-    bootstrap_lock.push_str("]\n");
-    bootstrap_lock.push_str(&registry_lock_rows);
 
     let mut package_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, package) in packages.iter().enumerate() {
@@ -75202,7 +76084,7 @@ fn fnd_01_optional_claim_qualifier_is_same_unit_and_normalized() {
         &pattern,
     ));
     assert!(optional_claim_unit_is_violation(
-        &normalize("| JWT and icons | Available, metadata only |"),
+        &normalize("| JWT support and icons | Available, metadata only |"),
         &pattern,
     ));
     assert!(optional_claim_unit_is_violation(
@@ -76471,14 +77353,6 @@ fn fnd_01_cargo_lock_semver_and_graph_rules_fail_closed() {
 version = 4
 
 [[package]]
-name = "root"
-version = "0.0.0"
-dependencies = [
- "demo 1.0.0",
- "demo 1.0.0+rebuilt",
-]
-
-[[package]]
 name = "demo"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -76489,6 +77363,14 @@ name = "demo"
 version = "1.0.0+rebuilt"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[package]]
+name = "root"
+version = "0.0.0"
+dependencies = [
+ "demo 1.0.0",
+ "demo 1.0.0+rebuilt",
+]
 "#;
     let parsed = parse_cargo_lock_strict(
         build_metadata_collision,
@@ -76512,15 +77394,15 @@ checksum = "1111111111111111111111111111111111111111111111111111111111111111"
 version = 4
 
 [[package]]
-name = "root"
-version = "0.0.0"
-dependencies = ["demo (registry+https://github.com/rust-lang/crates.io-index)"]
-
-[[package]]
 name = "demo"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "root"
+version = "0.0.0"
+dependencies = ["demo (registry+https://github.com/rust-lang/crates.io-index)"]
 "#;
     let parsed = parse_cargo_lock_strict(
         source_without_version,
@@ -76544,14 +77426,6 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 version = 4
 
 [[package]]
-name = "root"
-version = "0.0.0"
-dependencies = [
- "demo 1.0.0",
- "demo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "demo"
 version = "1.0.0"
 
@@ -76560,6 +77434,14 @@ name = "demo"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "root"
+version = "0.0.0"
+dependencies = [
+ "demo 1.0.0",
+ "demo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 "#;
     let parsed = parse_cargo_lock_strict(
         local_and_registry_same_identity,
@@ -76586,14 +77468,14 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 version = 4
 
 [[package]]
-name = "root"
-version = "0.0.0"
-
-[[package]]
 name = "demo"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "root"
+version = "0.0.0"
 "#;
     let parsed = parse_cargo_lock_strict(
         unreachable_registry_package,
@@ -81355,6 +82237,12 @@ fn fnd_01_registry_characterization_matches_compiled_authority() {
         "receipt-schema",
         encode_receipt_schema_registry_unpinned(&policy.receipt_schema),
     );
+    capture_registry_identity(
+        &mut actual,
+        &mut errors,
+        "receipt-contract",
+        encode_receipt_contract_registry_unpinned(root_table),
+    );
     let direct_type_registry = build_direct_field_type_specs_unpinned(&policy).and_then(|specs| {
         let count = specs.len();
         encode_direct_field_type_specs(&specs).map(|encoded| (count, encoded))
@@ -81400,6 +82288,9 @@ fn fnd_01_registry_characterization_matches_compiled_authority() {
             "receipt-schema|{RECEIPT_SCHEMA_REGISTRY_COUNT}|{RECEIPT_SCHEMA_REGISTRY_BYTES}|{RECEIPT_SCHEMA_REGISTRY_SHA256}"
         ),
         format!(
+            "receipt-contract|{RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT}|{RECEIPT_CONTRACT_REGISTRY_BYTES}|{RECEIPT_CONTRACT_REGISTRY_SHA256}"
+        ),
+        format!(
             "direct-field-type|{DIRECT_FIELD_TYPE_COUNT}|{DIRECT_FIELD_TYPE_REGISTRY_BYTES}|{DIRECT_FIELD_TYPE_REGISTRY_SHA256}"
         ),
         format!(
@@ -81421,6 +82312,215 @@ fn fnd_01_registry_characterization_matches_compiled_authority() {
         errors.is_empty() && actual == expected,
         "canonical registry identities drifted; update policy mirrors and compiled constants only after reviewing every changed row\nencoder errors:\n{errors_text}\nactual:\n{actual_text}\nexpected:\n{expected_text}"
     );
+}
+
+#[cfg(test)]
+fn raw_policy_for_receipt_contract_tests() -> toml::Value {
+    let path = repository_root().join("evidence/fnd-01/dependency-verification.toml");
+    let bytes = fs::read(path).expect("read dependency-verification policy");
+    parse_toml_strict(&bytes, "receipt-contract registry test policy")
+        .expect("strict raw policy")
+}
+
+#[test]
+fn receipt_contract_registry_baseline_is_complete_and_pinned() {
+    const PREFIX: &[u8] = b"FND01RECEIPTCONTRACTv1\0";
+    let raw = raw_policy_for_receipt_contract_tests();
+    let root = raw.as_table().expect("policy root table");
+    validate_receipt_contract_registry(root).expect("compiled receipt-contract pin");
+    let (field_count, encoded) =
+        encode_receipt_contract_registry_unpinned(root).expect("canonical receipt contract");
+    assert_eq!(field_count, RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT);
+    assert_eq!(encoded.len(), RECEIPT_CONTRACT_REGISTRY_BYTES);
+    assert_eq!(lower_hex(&sha256(&encoded)), RECEIPT_CONTRACT_REGISTRY_SHA256);
+    assert!(encoded.starts_with(PREFIX));
+    assert_eq!(encoded[PREFIX.len()], 0x07, "one tagged TOML table");
+    let encoded_count = u64::from_be_bytes(
+        encoded[PREFIX.len() + 1..PREFIX.len() + 9]
+            .try_into()
+            .expect("table member count"),
+    );
+    assert_eq!(
+        encoded_count,
+        u64::try_from(RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT)
+            .expect("receipt-contract field count fits u64")
+    );
+    let digest_rule = root["receipt_contract"]
+        .as_table()
+        .and_then(|table| table.get("digest_rule"))
+        .and_then(toml::Value::as_str)
+        .expect("receipt digest_rule");
+    assert!(digest_rule.contains("FND01RECv2"));
+    assert!(digest_rule.contains("FND01METAGRAPHv1"));
+}
+
+#[test]
+fn receipt_contract_registry_covers_every_field_and_digest_family() {
+    let raw = raw_policy_for_receipt_contract_tests();
+    let field_names = raw["receipt_contract"]
+        .as_table()
+        .expect("receipt_contract table")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        field_names,
+        [
+            "binary_output_count",
+            "binary_rule",
+            "candidate_rule",
+            "common_field_rule",
+            "common_required_fields",
+            "digest_rule",
+            "exact_field_union_rule",
+            "format_literal",
+            "schema_dispatch",
+            "schema_registry_bound_rule",
+            "schema_registry_bytes",
+            "schema_registry_count",
+            "schema_registry_encoding",
+            "schema_registry_sha256",
+            "schema_registry_verifier_authority_rule",
+            "schema_version_literal",
+            "support_claim_must_be_false",
+            "toml_receipt_count",
+        ]
+    );
+    assert_eq!(field_names.len(), RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT);
+    for field in field_names {
+        let mut mutated = raw.clone();
+        let root = mutated.as_table_mut().expect("mutable policy root");
+        let value = root
+            .get_mut("receipt_contract")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|table| table.get_mut(&field))
+            .expect("receipt-contract field");
+        match value {
+            toml::Value::Boolean(boolean) => *boolean = !*boolean,
+            toml::Value::Integer(integer) => {
+                *integer = integer.checked_add(1).expect("test integer increment");
+            }
+            toml::Value::String(text) => text.push('!'),
+            toml::Value::Array(values) if values.len() >= 2 => values.swap(0, 1),
+            toml::Value::Array(values) => {
+                let extra = values
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| toml::Value::String("drift".to_owned()));
+                values.push(extra);
+            }
+            other => panic!("unexpected receipt-contract value type: {other:?}"),
+        }
+        let error = validate_receipt_contract_registry(root)
+            .expect_err("every type-preserving field mutation must invalidate the pin");
+        assert_eq!(
+            error.code, "E_RECEIPT_CONTRACT_REGISTRY",
+            "field {field}: {}",
+            error.stable()
+        );
+    }
+
+    for (from, to) in [
+        ("FND01RECv2", "FND01RECv3"),
+        ("FND01METAGRAPHv1", "FND01METAGRAPHv2"),
+    ] {
+        let mut digest_drift = raw.clone();
+        let root = digest_drift.as_table_mut().expect("mutable policy root");
+        let digest_rule = root
+            .get_mut("receipt_contract")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|table| table.get_mut("digest_rule"))
+            .and_then(|value| value.as_str())
+            .expect("digest_rule")
+            .replace(from, to);
+        *root
+            .get_mut("receipt_contract")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|table| table.get_mut("digest_rule"))
+            .expect("mutable digest_rule") = toml::Value::String(digest_rule);
+        let error = validate_receipt_contract_registry(root)
+            .expect_err("digest-family drift must invalidate the pin");
+        assert_eq!(error.code, "E_RECEIPT_CONTRACT_REGISTRY");
+    }
+}
+
+#[test]
+fn receipt_contract_registry_rejects_each_compiled_pin_desync_and_bound() {
+    let raw = raw_policy_for_receipt_contract_tests();
+    let root = raw.as_table().expect("policy root");
+    let pins = [
+        ReceiptContractMirrorPin {
+            field_count: RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT + 1,
+            ..RECEIPT_CONTRACT_MIRROR_PIN
+        },
+        ReceiptContractMirrorPin {
+            byte_length: RECEIPT_CONTRACT_REGISTRY_BYTES + 1,
+            ..RECEIPT_CONTRACT_MIRROR_PIN
+        },
+        ReceiptContractMirrorPin {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..RECEIPT_CONTRACT_MIRROR_PIN
+        },
+    ];
+    for pin in pins {
+        let error = validate_receipt_contract_registry_with_pin(root, pin)
+            .expect_err("compiled pin drift must fail closed");
+        assert_eq!(error.code, "E_RECEIPT_CONTRACT_REGISTRY");
+    }
+
+    let mut oversized = raw.clone();
+    let root = oversized.as_table_mut().expect("mutable policy root");
+    *root
+        .get_mut("receipt_contract")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|table| table.get_mut("digest_rule"))
+        .expect("mutable digest_rule") =
+        toml::Value::String("x".repeat(MAX_POLICY_SHAPE_REGISTRY_BYTES));
+    let error = validate_receipt_contract_registry(root)
+        .expect_err("canonical output above the compiled bound must fail closed");
+    assert_eq!(error.code, "E_RECEIPT_CONTRACT_REGISTRY");
+    assert!(
+        error.stable().contains("E_OBSERVATION_BOUND"),
+        "oversized canonical output did not fail at the pre-hash bound: {}",
+        error.stable()
+    );
+}
+
+#[test]
+fn receipt_contract_shape_and_type_failures_keep_earlier_precedence() {
+    let raw = raw_policy_for_receipt_contract_tests();
+    for (mutation, expected_code) in [
+        ("missing", "E_POLICY_SHAPE_FIELDS"),
+        ("extra", "E_POLICY_SHAPE_FIELDS"),
+        ("wrong-type", "E_POLICY_TYPE_REGISTRY"),
+    ] {
+        let mut mutated = raw.clone();
+        let receipt = mutated
+            .as_table_mut()
+            .and_then(|root| root.get_mut("receipt_contract"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("mutable receipt contract");
+        match mutation {
+            "missing" => {
+                receipt.remove("digest_rule");
+            }
+            "extra" => {
+                receipt.insert("unexpected_field".to_owned(), toml::Value::Boolean(false));
+            }
+            "wrong-type" => {
+                receipt.insert("digest_rule".to_owned(), toml::Value::Integer(1));
+            }
+            _ => unreachable!(),
+        }
+        let error = validate_raw_policy_shape(&mutated)
+            .expect_err("shape/type drift must fail before the mirror pin");
+        assert_eq!(
+            error.code,
+            expected_code,
+            "mutation {mutation}: {}",
+            error.stable()
+        );
+    }
 }
 
 
@@ -81511,6 +82611,7 @@ struct OrdinarySupplyFraming {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrdinarySpoolBinding {
     relative_path: String,
+    snapshot: CheckedSnapshot,
     byte_length: u64,
     sha256: [u8; 32],
     bytes: Vec<u8>,
@@ -83333,33 +84434,6 @@ fn validate_ordinary_supply_archives(
     Ok(())
 }
 
-fn reopen_ordinary_bound_file(
-    repository_root: &Path,
-    relative_path: &str,
-    maximum: u64,
-    expected_byte_length: u64,
-    expected_sha256: [u8; 32],
-    subject: &str,
-) -> VResult<Vec<u8>> {
-    if expected_byte_length == 0 || expected_byte_length > maximum {
-        return Err(Diagnostic::error("E_ORDINARY_RECHECK_BOUND", subject));
-    }
-    let (_, bytes) = super::trust_std::checked_read(
-        repository_root,
-        relative_path,
-        maximum,
-        Some(super::trust_std::FileBinding {
-            byte_length: expected_byte_length,
-            sha256: expected_sha256,
-        }),
-    )
-    .map_err(|error| {
-        Diagnostic::error("E_ORDINARY_RECHECK_BINDING", subject)
-            .at(error.to_string())
-    })?;
-    Ok(bytes)
-}
-
 fn parse_ordinary_acquisition_spool(
     bytes: &[u8],
     run_id: &str,
@@ -83481,26 +84555,208 @@ struct ControlLedgerExpectationAuthority {
 /// past the early ordinary gate (authoring rebind + independent twenty-tool
 /// closed-PATH authority + pure ControlLedgerExpectation join) — never seal,
 /// spool materialize, control-build, or evidence publication by itself.
-#[derive(Debug)]
-struct OrdinaryExecutionPermit {
+struct OrdinaryAttestAuthority {
+    seal: IntegrationSeal,
+    retained: RetainedSnapshotSet<6>,
+}
+
+struct OrdinaryPreLedgerAuthority {
     marker: super::trust_std::AuthoringMarker,
+    integration: Option<OrdinaryAttestAuthority>,
+    repository_root: PathBuf,
     mode: BootstrapMode,
     control: ControlLedgerExpectationAuthority,
     /// Closed PATH already joined to the pinned toolchain bin pure grammar.
     closed_path: String,
 }
 
-impl OrdinaryExecutionPermit {
-    /// Consume the single-use permit, returning the rebound authoring marker.
-    fn consume(self) -> super::trust_std::AuthoringMarker {
-        self.marker
+impl fmt::Debug for OrdinaryPreLedgerAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrdinaryPreLedgerAuthority")
+            .field("repository_root", &self.repository_root)
+            .field("mode", &self.mode)
+            .field("control", &self.control)
+            .field("closed_path", &self.closed_path)
+            .field("has_integration_authority", &self.integration.is_some())
+            .finish_non_exhaustive()
     }
+}
+
+struct OrdinaryNonToolExpectation {
+    scratch_bindings: [ValidatedFileBinding; 5],
+    local_registry: ValidatedDirectoryTreeBinding,
+    supply_bundle: ValidatedFileBinding,
+    supply_relative: String,
+    supply_snapshot: CheckedSnapshot,
+    supply_bytes: Vec<u8>,
+    target_snapshot: ValidatedTargetSnapshot,
+    selected_executable: ValidatedFileBinding,
+    selected_snapshot: CheckedSnapshot,
+    control_build_environment: OrdinaryControlBuildEnvironmentAuthority,
+    handoff_argv: Vec<String>,
+    handoff_environment: Vec<(String, String)>,
+    spool_relative: Option<String>,
+    spool_snapshot: Option<CheckedSnapshot>,
+    acquisition_spool_binding: Option<FileBinding>,
+}
+
+/// Single-use capability for the exactly-20 live probes. It can be issued only
+/// after every non-tool input and the opaque ledger byte stream are retained.
+struct OrdinaryProbePermit {
+    authority: OrdinaryPreLedgerAuthority,
+    non_tool: OrdinaryNonToolExpectation,
+    ledger_snapshot: CheckedSnapshot,
+    ledger_bytes: Vec<u8>,
+}
+
+struct OrdinaryProbedAuthority {
+    authority: OrdinaryPreLedgerAuthority,
+    non_tool: OrdinaryNonToolExpectation,
+    ledger_snapshot: CheckedSnapshot,
+    ledger_bytes: Vec<u8>,
+    tool_reprobe: OrdinaryToolReprobe,
+}
+
+impl OrdinaryProbePermit {
+    fn consume(self) -> Result<OrdinaryProbedAuthority, String> {
+        let tool_reprobe = ordinary_reprobe_tool_set_shared(
+            &self.authority.repository_root,
+            self.authority.mode,
+            &self.authority.control.run_id,
+            &self.authority.closed_path,
+        )?;
+        Ok(OrdinaryProbedAuthority {
+            authority: self.authority,
+            non_tool: self.non_tool,
+            ledger_snapshot: self.ledger_snapshot,
+            ledger_bytes: self.ledger_bytes,
+            tool_reprobe,
+        })
+    }
+}
+
+/// Capability issued only after the complete strict ledger validator and all
+/// immediate regular-file/tree rebinds succeed.
+struct OrdinaryArchivePermit {
+    expectation: ControlLedgerExpectation,
+    ledger_snapshot: CheckedSnapshot,
+    ledger_bytes: Vec<u8>,
+    ledger: ValidatedControlLedger,
+    non_tool: OrdinaryNonToolExpectation,
+    tool_reprobe: OrdinaryToolReprobe,
+    integration: Option<OrdinaryAttestAuthority>,
 }
 
 /// Exact ordinary native-tool inventory cardinality (policy + compiled table).
 const ORDINARY_NATIVE_TOOL_COUNT: usize = 20;
+const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 3795;
+const ORDINARY_NATIVE_TOOL_REGISTRY_SHA256: &str =
+    "befae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f";
 /// Exact ordinary handoff argv arity from `expected_ordinary_handoff_argv`.
 const ORDINARY_HANDOFF_ARGV_ARITY: usize = 5;
+
+/// Pure side of ordinary native-tool authority.  The frozen identity is
+/// repeated in the ordinary image so a cardinality or descriptor-registry
+/// drift cannot be hidden by exercising only the live inventory function.
+fn validate_ordinary_native_tool_descriptor_authority(
+    expected_count: usize,
+    expected_byte_length: usize,
+    expected_sha256_text: &str,
+) -> Result<(), String> {
+    let (count, byte_length, sha256) =
+        super::trust_std::compiled_native_tool_registry_identity()
+            .map_err(|error| format!("E_HANDOFF_TOOL_SET: {error}"))?;
+    let expected_sha256 = super::trust_std::decode_lower_hex::<32>(
+        expected_sha256_text,
+        "ordinary native-tool registry SHA-256",
+    )
+    .map_err(|error| format!("E_HANDOFF_TOOL_SET: {error}"))?;
+    if count != expected_count
+        || byte_length != expected_byte_length
+        || sha256 != expected_sha256
+    {
+        return Err(
+            "E_HANDOFF_TOOL_SET: pure twenty-tool descriptor registry drift"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn ordinary_native_tool_descriptor_authority() -> Result<(), String> {
+    validate_ordinary_native_tool_descriptor_authority(
+        ORDINARY_NATIVE_TOOL_COUNT,
+        ORDINARY_NATIVE_TOOL_REGISTRY_BYTES,
+        ORDINARY_NATIVE_TOOL_REGISTRY_SHA256,
+    )
+}
+
+/// Pure dual-path readiness for ordinary reprobe (B-R1 pure half).
+///
+/// Proves the always-compiled 20-row descriptor table is cardinality-aligned,
+/// id-unique, and digest-pinned before any live `inventory_existing_native_tools`
+/// call. This has no ledger-selected inputs, filesystem access, or children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrdinaryDualPathPureAuthority {
+    native_tool_count: usize,
+    registry_byte_length: usize,
+    registry_sha256: [u8; 32],
+}
+
+fn ordinary_reprobe_dual_path_pure_authority(
+) -> Result<OrdinaryDualPathPureAuthority, String> {
+    ordinary_native_tool_descriptor_authority()?;
+    let descriptors = super::trust_std::NATIVE_TOOL_DESCRIPTORS;
+    if descriptors.len() != ORDINARY_NATIVE_TOOL_COUNT {
+        return Err(format!(
+            "E_HANDOFF_TOOL_SET: pure table cardinality {} != ORDINARY_NATIVE_TOOL_COUNT {ORDINARY_NATIVE_TOOL_COUNT}",
+            descriptors.len(),
+        ));
+    }
+    let mut seen_ids = std::collections::BTreeSet::new();
+    for (ordinal, row) in descriptors.iter().enumerate() {
+        if row.id.is_empty() {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: pure table row {ordinal} has empty id"
+            ));
+        }
+        if !seen_ids.insert(row.id) {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: pure table duplicate tool id {}",
+                row.id
+            ));
+        }
+        if row.candidates.is_empty() || row.version_argv.is_empty() {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: pure table row {} missing candidates or version argv",
+                row.id
+            ));
+        }
+    }
+    if seen_ids.len() != ORDINARY_NATIVE_TOOL_COUNT {
+        return Err(format!(
+            "E_HANDOFF_TOOL_SET: pure table unique-id cardinality {} != {ORDINARY_NATIVE_TOOL_COUNT}",
+            seen_ids.len(),
+        ));
+    }
+    let (count, byte_length, sha256) =
+        super::trust_std::compiled_native_tool_registry_identity()
+            .map_err(|error| format!("E_HANDOFF_TOOL_SET: {error}"))?;
+    if count != ORDINARY_NATIVE_TOOL_COUNT
+        || byte_length != ORDINARY_NATIVE_TOOL_REGISTRY_BYTES
+        || lower_hex(&sha256) != ORDINARY_NATIVE_TOOL_REGISTRY_SHA256
+    {
+        return Err(
+            "E_HANDOFF_TOOL_SET: pure dual-path registry identity drift".to_owned(),
+        );
+    }
+    Ok(OrdinaryDualPathPureAuthority {
+        native_tool_count: count,
+        registry_byte_length: byte_length,
+        registry_sha256: sha256,
+    })
+}
 
 /// Pure closed-PATH authority for the independent twenty-tool ordinary reprobe.
 ///
@@ -83591,6 +84847,1149 @@ fn ordinary_control_ledger_expectation_authority(
     })
 }
 
+/// Nonzero synthetic sealed digest — distinct per field class, never all-zero.
+fn ordinary_sealed_nonzero_digest(tag: u8) -> [u8; 32] {
+    let mut digest = [tag; 32];
+    digest[0] = tag.wrapping_add(1);
+    digest[31] = tag.wrapping_add(0x5a);
+    digest
+}
+
+fn ordinary_sealed_file_binding(path: String, tag: u8) -> ValidatedFileBinding {
+    ValidatedFileBinding {
+        path,
+        binding: FileBinding {
+            byte_length: 64 + u64::from(tag),
+            sha256: ordinary_sealed_nonzero_digest(tag),
+        },
+    }
+}
+
+/// Absolute role path formula matching production `expected_absolute_role_path`
+/// without reaching into the private helper (keeps ordinary pure).
+fn ordinary_role_absolute_path(
+    repository_root: &Path,
+    role: &str,
+    run_id: &str,
+    suffix: &str,
+) -> Result<String, String> {
+    let root = ordinary_utf8_path(repository_root, "repository root")?;
+    if !root.starts_with('/') {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation repository root must be absolute"
+                .to_owned(),
+        );
+    }
+    let relative = if suffix.is_empty() {
+        format!(".fnd01-run/{role}/{run_id}")
+    } else {
+        format!(".fnd01-run/{role}/{run_id}/{suffix}")
+    };
+    if relative.contains("//") || relative.contains("/./") || relative.contains("/../") {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation role path grammar failed"
+                .to_owned(),
+        );
+    }
+    ordinary_utf8_path(&repository_root.join(relative), "role path")
+}
+
+/// B-R2 sealed full-field join: pure ControlLedgerExpectationAuthority plus
+/// sealed synthetic bindings produce a complete `ControlLedgerExpectation`
+/// covering every live struct field without ledger/FS/network children.
+///
+/// Pure pre-open authority alone is insufficient for B-R2 Done-when; this
+/// join proves layout-derived paths, mode-specific seal/spool rules, tool-set
+/// digests, cargo executable, build environment, target snapshot, selected
+/// executable, and bootstrap environment are all admitted together.
+fn ordinary_sealed_control_ledger_expectation_join(
+    mode: BootstrapMode,
+    repository_root: &Path,
+    control: &ControlLedgerExpectationAuthority,
+    authoring_closure_sha256: [u8; 32],
+    integration_seal_sha256: [u8; 32],
+    tool_set_sha256: [u8; 32],
+    cargo_executable: &str,
+    bootstrap_environment: BootstrapEnvironment,
+) -> Result<ControlLedgerExpectation, String> {
+    if control.run_id.is_empty()
+        || control.process_id == 0
+        || control.environment_set_sha256 == [0; 32]
+        || control.native_tool_count != ORDINARY_NATIVE_TOOL_COUNT
+        || control.handoff_argv_arity != ORDINARY_HANDOFF_ARGV_ARITY
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation pure authority incomplete"
+                .to_owned(),
+        );
+    }
+    let role = bootstrap_role_name(mode).map_err(|error| {
+        format!(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation mode/role incomplete ({error})"
+        )
+    })?;
+    if control.role != role {
+        return Err(format!(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation role desync (expected {role}, observed {})",
+            control.role
+        ));
+    }
+    if control.control_ledger_relative
+        != format!(".fnd01-run/{role}/{}/control-ledger.bin", control.run_id)
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation control-ledger relative desync"
+                .to_owned(),
+        );
+    }
+    if authoring_closure_sha256 == [0; 32] {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed authoring_closure_sha256 must be nonzero"
+                .to_owned(),
+        );
+    }
+    if tool_set_sha256 == [0; 32] {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed tool_set_sha256 must be nonzero"
+                .to_owned(),
+        );
+    }
+    if cargo_executable.is_empty() || !cargo_executable.starts_with('/') {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed cargo_executable must be absolute and nonempty"
+                .to_owned(),
+        );
+    }
+    if bootstrap_environment.authoring_marker.is_empty()
+        || bootstrap_environment.closed_path.is_empty()
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed bootstrap environment incomplete"
+                .to_owned(),
+        );
+    }
+
+    match mode {
+        BootstrapMode::Produce => {
+            if integration_seal_sha256 != [0; 32]
+                || bootstrap_environment.integration_seal.is_some()
+                || bootstrap_environment.producer_outer_record_path.is_some()
+            {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: Produce sealed expectation rejects Attest seal/spool authority"
+                        .to_owned(),
+                );
+            }
+        }
+        BootstrapMode::Attest => {
+            if integration_seal_sha256 == [0; 32]
+                || bootstrap_environment.integration_seal.is_none()
+            {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: Attest sealed expectation requires nonzero integration seal"
+                        .to_owned(),
+                );
+            }
+        }
+        BootstrapMode::Gate => {
+            return Err(
+                "E_ORDINARY_HANDOFF_PENDING: Gate cannot carry a sealed ControlLedgerExpectation"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let package_root =
+        ordinary_role_absolute_path(repository_root, role, &control.run_id, "bootstrap-control-package")?;
+    let target_root =
+        ordinary_role_absolute_path(repository_root, role, &control.run_id, "bootstrap-control-target")?;
+    let local_registry_path =
+        ordinary_role_absolute_path(repository_root, role, &control.run_id, "local-registry")?;
+    let supply_path =
+        ordinary_role_absolute_path(repository_root, role, &control.run_id, "supply-bundle.bin")?;
+
+    let scratch_suffixes = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "cargo-config.toml",
+        "src/main.rs",
+        "tests/fnd_01_dependency_evidence.rs",
+    ];
+    let mut scratch_bindings = [
+        ordinary_sealed_file_binding(String::new(), 1),
+        ordinary_sealed_file_binding(String::new(), 2),
+        ordinary_sealed_file_binding(String::new(), 3),
+        ordinary_sealed_file_binding(String::new(), 4),
+        ordinary_sealed_file_binding(String::new(), 5),
+    ];
+    for (index, suffix) in scratch_suffixes.iter().enumerate() {
+        scratch_bindings[index] = ordinary_sealed_file_binding(
+            format!("{package_root}/{suffix}"),
+            (index as u8).wrapping_add(0x10),
+        );
+    }
+
+    let local_registry = ValidatedDirectoryTreeBinding {
+        id: "sealed-local-registry".to_owned(),
+        path: local_registry_path,
+        device: 1,
+        inode: 2,
+        mode: 0o40755,
+        nlink: 2,
+        entry_count: 1,
+        total_regular_file_bytes: 128,
+        tree_sha256: ordinary_sealed_nonzero_digest(0x20),
+    };
+    let supply_bundle = ordinary_sealed_file_binding(supply_path, 0x30);
+    let selected_executable = ordinary_sealed_file_binding(
+        format!("{target_root}/debug/fnd_01_evidence_harness"),
+        0x40,
+    );
+    let target_snapshot = ValidatedTargetSnapshot {
+        path: target_root,
+        entry_count: 3,
+        total_regular_file_bytes: selected_executable.binding.byte_length,
+        tree_sha256: ordinary_sealed_nonzero_digest(0x41),
+    };
+    let build_environment = vec![
+        ("CARGO_HOME".to_owned(), format!(
+            "{}/.fnd01-run/{role}/{}/cargo-home/offline",
+            ordinary_utf8_path(repository_root, "repository root")?,
+            control.run_id
+        )),
+        ("PATH".to_owned(), bootstrap_environment.closed_path.clone()),
+        ("TZ".to_owned(), "UTC".to_owned()),
+    ];
+    let acquisition_spool_binding = match mode {
+        BootstrapMode::Produce => Some(FileBinding {
+            byte_length: 256,
+            sha256: ordinary_sealed_nonzero_digest(0x50),
+        }),
+        BootstrapMode::Attest => None,
+        BootstrapMode::Gate => unreachable!("Gate rejected above"),
+    };
+
+    // Layout and mode rules mirror the production validator's early expectation
+    // checks (paths, sealed-local-registry id, selected executable, spool rules).
+    if scratch_bindings
+        .iter()
+        .map(|binding| binding.path.as_str())
+        .ne([
+            format!("{package_root}/Cargo.toml"),
+            format!("{package_root}/Cargo.lock"),
+            format!("{package_root}/cargo-config.toml"),
+            format!("{package_root}/src/main.rs"),
+            format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+        ]
+        .iter()
+        .map(String::as_str))
+        || local_registry.id != "sealed-local-registry"
+        || selected_executable.binding.byte_length == 0
+        || target_snapshot.path.is_empty()
+        || supply_bundle.binding.byte_length == 0
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation layout-derived field mismatch"
+                .to_owned(),
+        );
+    }
+    match mode {
+        BootstrapMode::Produce => {
+            if integration_seal_sha256 != [0; 32] || acquisition_spool_binding.is_none() {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: Produce sealed integration/spool expectation mismatch"
+                        .to_owned(),
+                );
+            }
+        }
+        BootstrapMode::Attest => {
+            if integration_seal_sha256 == [0; 32] || acquisition_spool_binding.is_some() {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: Attest sealed integration/spool expectation mismatch"
+                        .to_owned(),
+                );
+            }
+        }
+        BootstrapMode::Gate => unreachable!("Gate rejected above"),
+    }
+
+    Ok(ControlLedgerExpectation {
+        mode,
+        repository_root: repository_root.to_path_buf(),
+        run_id: control.run_id.clone(),
+        process_id: control.process_id,
+        authoring_closure_sha256,
+        integration_seal_sha256,
+        scratch_bindings,
+        local_registry,
+        supply_bundle,
+        tool_set_sha256,
+        environment_set_sha256: control.environment_set_sha256,
+        cargo_executable: cargo_executable.to_owned(),
+        build_environment,
+        target_snapshot,
+        selected_executable,
+        bootstrap_environment,
+        acquisition_spool_binding,
+    })
+}
+
+/// B-R2 sealed fixture: synthetic Cargo JSON stream that `join_control_build_stream`
+/// accepts as penultimate matching compiler-artifact + terminal build-finished.
+fn ordinary_sealed_control_build_stdout(
+    package_root: &str,
+    target_root: &str,
+    selected_executable: &str,
+) -> String {
+    let package_id =
+        format!("path+file://{package_root}#fastmcp-fnd01-bootstrap-control@0.0.0");
+    let artifact = format!(
+        concat!(
+            r#"{{"reason":"compiler-artifact","package_id":"{package_id}","manifest_path":"{package_root}/Cargo.toml","target":{{"kind":["bin"],"crate_types":["bin"],"name":"fnd_01_evidence_harness","src_path":"{package_root}/src/main.rs","edition":"2024","doc":false,"doctest":false,"test":false}},"profile":{{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false}},"features":[],"filenames":["{selected_executable}"],"executable":"{selected_executable}","fresh":false}}"#,
+            "\n",
+            r#"{{"reason":"build-finished","success":true}}"#,
+            "\n",
+        ),
+        package_id = package_id,
+        package_root = package_root,
+        selected_executable = selected_executable,
+    );
+    // Silence unused when format expands without target_root in the template;
+    // filenames still must stay under target_root for join validation.
+    let _ = target_root;
+    artifact
+}
+
+fn ordinary_sealed_file_binding_record(binding: &ValidatedFileBinding) -> CanonicalRecord {
+    CanonicalRecord {
+        schema_id: "file-binding",
+        fields: vec![
+            CanonicalValue::String(binding.path.clone()),
+            CanonicalValue::Unsigned(binding.binding.byte_length),
+            CanonicalValue::String(encode_lower_hex(&binding.binding.sha256)),
+        ],
+        field_offsets: Vec::new(),
+    }
+}
+
+fn ordinary_sealed_raw_stream_record(bytes: &[u8]) -> Result<CanonicalRecord, String> {
+    let digest = sha256(bytes).map_err(|error| format!("E_CONTROL_RAW_DIGEST: {error}"))?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| "E_CONTROL_RAW_LENGTH: stream length".to_owned())?;
+    Ok(CanonicalRecord {
+        schema_id: "raw-stream-blob",
+        fields: vec![
+            CanonicalValue::Unsigned(length),
+            CanonicalValue::String(encode_lower_hex(&digest)),
+            CanonicalValue::RawBytes(bytes.to_vec()),
+        ],
+        field_offsets: Vec::new(),
+    })
+}
+
+/// Encode a complete FND01CONTROLv2 ledger that matches a sealed expectation and
+/// a synthetic build stream. Used by B-R2 production-validator sealed e2e only.
+fn ordinary_sealed_encode_control_ledger_bytes(
+    expected: &ControlLedgerExpectation,
+    build_stdout: &[u8],
+) -> Result<Vec<u8>, String> {
+    let role = bootstrap_role_name(expected.mode)
+        .map_err(|error| format!("E_CONTROL_MODE: {error}"))?;
+    let package_root = ordinary_role_absolute_path(
+        &expected.repository_root,
+        role,
+        &expected.run_id,
+        "bootstrap-control-package",
+    )?;
+    let target_root = ordinary_role_absolute_path(
+        &expected.repository_root,
+        role,
+        &expected.run_id,
+        "bootstrap-control-target",
+    )?;
+    let selected = expected.selected_executable.path.as_str();
+    let joined = join_control_build_stream(
+        build_stdout,
+        &package_root,
+        &target_root,
+        selected,
+    )
+    .map_err(|error| format!("E_CONTROL_BUILD_STREAM_JOIN: {error}"))?;
+    let build_argv = vec![
+        expected.cargo_executable.clone(),
+        "build".to_owned(),
+        "--manifest-path".to_owned(),
+        format!("{package_root}/Cargo.toml"),
+        "--bin".to_owned(),
+        "fnd_01_evidence_harness".to_owned(),
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+        "--message-format=json".to_owned(),
+        "--target-dir".to_owned(),
+        target_root.clone(),
+        "--config".to_owned(),
+        format!("{package_root}/cargo-config.toml"),
+    ];
+    let handoff_argv = expected_ordinary_handoff_argv(
+        expected.mode,
+        selected,
+        &expected.run_id,
+    )
+    .map_err(|error| format!("E_CONTROL_HANDOFF: {error}"))?;
+    let handoff_environment = expected_ordinary_handoff_environment(
+        expected.mode,
+        &expected.run_id,
+        &expected.bootstrap_environment,
+    )
+    .map_err(|error| format!("E_CONTROL_HANDOFF_ENVIRONMENT: {error}"))?;
+    let stderr_record = ordinary_sealed_raw_stream_record(b"")?;
+    let stdout_record = ordinary_sealed_raw_stream_record(build_stdout)?;
+    let local_registry = CanonicalRecord {
+        schema_id: "directory-tree-binding",
+        fields: vec![
+            CanonicalValue::String(expected.local_registry.id.clone()),
+            CanonicalValue::String(expected.local_registry.path.clone()),
+            CanonicalValue::Unsigned(expected.local_registry.device),
+            CanonicalValue::Unsigned(expected.local_registry.inode),
+            CanonicalValue::Unsigned(u64::from(expected.local_registry.mode)),
+            CanonicalValue::Unsigned(expected.local_registry.nlink),
+            CanonicalValue::Unsigned(expected.local_registry.entry_count),
+            CanonicalValue::Unsigned(expected.local_registry.total_regular_file_bytes),
+            CanonicalValue::String(encode_lower_hex(&expected.local_registry.tree_sha256)),
+        ],
+        field_offsets: Vec::new(),
+    };
+    let supply_bundle = ordinary_sealed_file_binding_record(&expected.supply_bundle);
+    let compiler_artifact = CanonicalRecord {
+        schema_id: "cargo-compiler-artifact",
+        fields: vec![
+            CanonicalValue::String(joined.artifact.reason.clone()),
+            CanonicalValue::String(joined.artifact.package_id.clone()),
+            CanonicalValue::String(joined.artifact.manifest_path.clone()),
+            CanonicalValue::String(joined.artifact.target_name.clone()),
+            CanonicalValue::StringArray(joined.artifact.target_kind.clone()),
+            CanonicalValue::StringArray(joined.artifact.crate_types.clone()),
+            CanonicalValue::String(joined.artifact.src_path.clone()),
+            CanonicalValue::String(joined.artifact.edition.clone()),
+            CanonicalValue::StringArray(joined.artifact.features.clone()),
+            CanonicalValue::Boolean(joined.artifact.profile_test),
+            CanonicalValue::Boolean(joined.artifact.fresh),
+            CanonicalValue::StringArray(joined.artifact.filenames.clone()),
+            CanonicalValue::String(joined.artifact.executable.clone()),
+        ],
+        field_offsets: Vec::new(),
+    };
+    let build_finished = CanonicalRecord {
+        schema_id: "cargo-build-finished",
+        fields: vec![
+            CanonicalValue::String(joined.finished.reason.clone()),
+            CanonicalValue::Boolean(joined.finished.success),
+            CanonicalValue::Unsigned(joined.finished.line_ordinal),
+        ],
+        field_offsets: Vec::new(),
+    };
+    let target_snapshot = CanonicalRecord {
+        schema_id: "target-snapshot",
+        fields: vec![
+            CanonicalValue::String(expected.target_snapshot.path.clone()),
+            CanonicalValue::Unsigned(expected.target_snapshot.entry_count),
+            CanonicalValue::Unsigned(expected.target_snapshot.total_regular_file_bytes),
+            CanonicalValue::String(encode_lower_hex(&expected.target_snapshot.tree_sha256)),
+        ],
+        field_offsets: Vec::new(),
+    };
+    let selected_executable =
+        ordinary_sealed_file_binding_record(&expected.selected_executable);
+    let acquisition_spool = match expected.acquisition_spool_binding {
+        Some(binding) => {
+            let spool_path = expected
+                .repository_root
+                .join(".fnd01-run")
+                .join("integration-producer")
+                .join(&expected.run_id)
+                .join("acquisition-spool.bin");
+            let spool_path = ordinary_utf8_path(&spool_path, "acquisition spool")?;
+            CanonicalRecord {
+                schema_id: "optional-file-binding",
+                fields: vec![
+                    CanonicalValue::Boolean(true),
+                    CanonicalValue::OptionalString(Some(spool_path)),
+                    CanonicalValue::OptionalUnsigned(Some(binding.byte_length)),
+                    CanonicalValue::OptionalString(Some(encode_lower_hex(&binding.sha256))),
+                ],
+                field_offsets: Vec::new(),
+            }
+        }
+        None => CanonicalRecord {
+            schema_id: "optional-file-binding",
+            fields: vec![
+                CanonicalValue::Boolean(false),
+                CanonicalValue::OptionalString(None),
+                CanonicalValue::OptionalUnsigned(None),
+                CanonicalValue::OptionalString(None),
+            ],
+            field_offsets: Vec::new(),
+        },
+    };
+    let scratch_records = expected
+        .scratch_bindings
+        .iter()
+        .map(ordinary_sealed_file_binding_record)
+        .collect::<Vec<_>>();
+    let build_control_ledger_record = |ledger_set_sha256: &str| CanonicalRecord {
+        schema_id: "control-ledger",
+        fields: vec![
+            CanonicalValue::String("FND01CONTROLv2".to_owned()),
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::String(role.to_owned()),
+            CanonicalValue::String(expected.run_id.clone()),
+            CanonicalValue::Unsigned(expected.process_id),
+            CanonicalValue::String(encode_lower_hex(&expected.authoring_closure_sha256)),
+            CanonicalValue::String(encode_lower_hex(&expected.integration_seal_sha256)),
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::RecordArray(scratch_records.clone()),
+            CanonicalValue::Record(Box::new(local_registry.clone())),
+            CanonicalValue::Record(Box::new(supply_bundle.clone())),
+            CanonicalValue::String(encode_lower_hex(&expected.tool_set_sha256)),
+            CanonicalValue::String(encode_lower_hex(&expected.environment_set_sha256)),
+            CanonicalValue::StringArray(build_argv.clone()),
+            CanonicalValue::EnvironmentPairs(expected.build_environment.clone()),
+            CanonicalValue::String(package_root.clone()),
+            CanonicalValue::Signed(0),
+            CanonicalValue::Record(Box::new(stdout_record.clone())),
+            CanonicalValue::Record(Box::new(stderr_record.clone())),
+            CanonicalValue::Unsigned(joined.message_count),
+            CanonicalValue::String(encode_lower_hex(&joined.message_set_sha256)),
+            CanonicalValue::Record(Box::new(compiler_artifact.clone())),
+            CanonicalValue::Record(Box::new(build_finished.clone())),
+            CanonicalValue::Record(Box::new(target_snapshot.clone())),
+            CanonicalValue::Record(Box::new(selected_executable.clone())),
+            CanonicalValue::StringArray(handoff_argv.clone()),
+            CanonicalValue::EnvironmentPairs(handoff_environment.clone()),
+            CanonicalValue::Record(Box::new(acquisition_spool.clone())),
+            CanonicalValue::String(ledger_set_sha256.to_owned()),
+        ],
+        field_offsets: Vec::new(),
+    };
+    let placeholder = "0".repeat(64);
+    let provisional = build_control_ledger_record(&placeholder);
+    let body = encode_canonical_record(&provisional, "sealed control ledger")
+        .map_err(|error| format!("E_CONTROL_LEDGER: encode failed ({error})"))?;
+    let mut bytes = CONTROL_LEDGER_PREFIX.to_vec();
+    bytes.extend_from_slice(&body);
+    let parsed = parse_canonical_record_file(
+        &bytes,
+        CONTROL_LEDGER_PREFIX,
+        "control-ledger",
+        MAX_CONTROL_LEDGER_BYTES,
+        "sealed control ledger provisional",
+    )
+    .map_err(|error| format!("E_CONTROL_LEDGER: provisional parse failed ({error})"))?;
+    let digest_index = parsed
+        .fields
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "E_CONTROL_LEDGER: empty control ledger fields".to_owned())?;
+    let preimage_end = *parsed
+        .field_offsets
+        .get(digest_index)
+        .ok_or_else(|| "E_CONTROL_LEDGER: missing ledger_set_sha256 offset".to_owned())?;
+    let digest = sha256(
+        bytes
+            .get(..preimage_end)
+            .ok_or_else(|| "E_CONTROL_LEDGER: digest preimage bounds".to_owned())?,
+    )
+    .map_err(|error| format!("E_CONTROL_LEDGER: self-digest failed ({error})"))?;
+    let sealed = build_control_ledger_record(&encode_lower_hex(&digest));
+    let sealed_body = encode_canonical_record(&sealed, "sealed control ledger final")
+        .map_err(|error| format!("E_CONTROL_LEDGER: final encode failed ({error})"))?;
+    let mut sealed_bytes = CONTROL_LEDGER_PREFIX.to_vec();
+    sealed_bytes.extend_from_slice(&sealed_body);
+    parse_canonical_record_file_with_final_self_digest(
+        &sealed_bytes,
+        CONTROL_LEDGER_PREFIX,
+        "control-ledger",
+        "ledger_set_sha256",
+        MAX_CONTROL_LEDGER_BYTES,
+        "sealed control ledger self-digest",
+    )
+    .map_err(|error| format!("E_CONTROL_LEDGER: self-digest join failed ({error})"))?;
+    Ok(sealed_bytes)
+}
+
+/// Shared sealed Produce fixture for B-R2/B-R3 (pure expectation + encoded ledger).
+fn ordinary_sealed_produce_control_fixture()
+-> Result<(ControlLedgerExpectation, Vec<u8>, String, String), String> {
+    let run_id = "0123456789abcdef0123456789abcdef";
+    let env_digest = ordinary_environment_set_digest();
+    let control = ordinary_control_ledger_expectation_authority(
+        BootstrapMode::Produce,
+        run_id,
+        env_digest,
+    )?;
+    let repository_root = PathBuf::from("/repo/fastmcp_rust");
+    let bootstrap_environment = BootstrapEnvironment {
+        authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
+        closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let expectation = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Produce,
+        &repository_root,
+        &control,
+        ordinary_sealed_nonzero_digest(0x61),
+        [0; 32],
+        ordinary_sealed_nonzero_digest(0x62),
+        "/toolchains/nightly-2026-07-11/bin/cargo",
+        bootstrap_environment,
+    )?;
+    let package_root = ordinary_role_absolute_path(
+        &repository_root,
+        "integration-producer",
+        run_id,
+        "bootstrap-control-package",
+    )?;
+    let target_root = ordinary_role_absolute_path(
+        &repository_root,
+        "integration-producer",
+        run_id,
+        "bootstrap-control-target",
+    )?;
+    let selected = expectation.selected_executable.path.clone();
+    let stdout = ordinary_sealed_control_build_stdout(
+        &package_root,
+        &target_root,
+        &selected,
+    );
+    let ledger_bytes =
+        ordinary_sealed_encode_control_ledger_bytes(&expectation, stdout.as_bytes())?;
+    Ok((expectation, ledger_bytes, package_root, target_root))
+}
+
+fn ordinary_utf8_path(path: &Path, subject: &str) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("E_ORDINARY_HANDOFF_PENDING: {subject} must be UTF-8"))
+}
+
+fn ordinary_checked_file_binding(
+    repository_root: &Path,
+    relative: &str,
+    maximum: u64,
+    expected: Option<FileBinding>,
+    subject: &str,
+) -> Result<(CheckedSnapshot, ValidatedFileBinding), String> {
+    let snapshot = checked_snapshot(
+        repository_root,
+        relative,
+        maximum,
+        expected,
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: {subject}: {error}"))?;
+    if snapshot.byte_length == 0 {
+        return Err(format!(
+            "E_ORDINARY_HANDOFF_PENDING: {subject} must be nonempty"
+        ));
+    }
+    let path = ordinary_utf8_path(&repository_root.join(relative), subject)?;
+    let binding = ValidatedFileBinding {
+        path,
+        binding: FileBinding {
+            byte_length: snapshot.byte_length,
+            sha256: snapshot.sha256,
+        },
+    };
+    Ok((snapshot, binding))
+}
+
+struct OrdinaryControlBuildEnvironmentAuthority {
+    cargo_home: String,
+    target: String,
+    execution_bin: String,
+}
+
+fn derive_ordinary_control_build_environment(
+    invocation: &OrdinaryHandoffArguments,
+) -> Result<OrdinaryControlBuildEnvironmentAuthority, String> {
+    let cargo_home = ordinary_utf8_path(
+        &invocation.run_root.join("cargo-home/offline"),
+        "ordinary control CARGO_HOME",
+    )?;
+    let target = ordinary_utf8_path(
+        &invocation.run_root.join("bootstrap-control-target"),
+        "ordinary control target",
+    )?;
+    let execution_bin = ordinary_utf8_path(
+        &invocation.run_root.join("execution-bin"),
+        "ordinary execution-bin",
+    )?;
+    Ok(OrdinaryControlBuildEnvironmentAuthority {
+        cargo_home,
+        target,
+        execution_bin,
+    })
+}
+
+fn complete_ordinary_control_build_environment(
+    authority: &OrdinaryControlBuildEnvironmentAuthority,
+    tools: &AcquisitionToolPaths,
+) -> Vec<(String, String)> {
+    vec![
+        ("AR".to_owned(), tools.host_ar.clone()),
+        ("CARGO_HOME".to_owned(), authority.cargo_home.clone()),
+        ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+        ("CARGO_TARGET_DIR".to_owned(), authority.target.clone()),
+        ("CC".to_owned(), tools.host_cc.clone()),
+        ("CLIPPY_DRIVER".to_owned(), tools.clippy_driver.clone()),
+        ("LANG".to_owned(), "C".to_owned()),
+        ("LC_ALL".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), authority.execution_bin.clone()),
+        ("RANLIB".to_owned(), tools.host_ranlib.clone()),
+        ("RUSTC".to_owned(), tools.rustc.clone()),
+        ("RUSTDOC".to_owned(), tools.rustdoc.clone()),
+        ("RUSTFMT".to_owned(), tools.rustfmt.clone()),
+        (
+            "RUSTUP_TOOLCHAIN".to_owned(),
+            "nightly-2026-07-11".to_owned(),
+        ),
+        ("SOURCE_DATE_EPOCH".to_owned(), "0".to_owned()),
+        ("TZ".to_owned(), "UTC".to_owned()),
+    ]
+}
+
+fn derive_ordinary_non_tool_expectation(
+    authority: &mut OrdinaryPreLedgerAuthority,
+    invocation: &OrdinaryHandoffArguments,
+    environment: &BootstrapEnvironment,
+    current_executable: &Path,
+) -> Result<OrdinaryNonToolExpectation, String> {
+    if authority.repository_root != invocation.repository_root
+        || authority.mode != invocation.mode
+        || authority.control.run_id != invocation.run_id
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: pre-ledger authority identity drift"
+                .to_owned(),
+        );
+    }
+    let role = authority.control.role;
+    let package_root = format!(
+        ".fnd01-run/{role}/{}/bootstrap-control-package",
+        invocation.run_id
+    );
+    let scratch_paths = [
+        format!("{package_root}/Cargo.toml"),
+        format!("{package_root}/Cargo.lock"),
+        format!("{package_root}/cargo-config.toml"),
+        format!("{package_root}/src/main.rs"),
+        format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+    ];
+    let scratch_bindings = scratch_paths
+        .iter()
+        .zip(CONTROL_SCRATCH_MAXIMA)
+        .enumerate()
+        .map(|(ordinal, (relative, maximum))| {
+            ordinary_checked_file_binding(
+                &invocation.repository_root,
+                relative,
+                maximum,
+                None,
+                &format!("ordinary scratch binding {ordinal}"),
+            )
+            .map(|(_, binding)| binding)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|values: Vec<ValidatedFileBinding>| {
+            format!(
+                "E_ORDINARY_HANDOFF_PENDING: expected five scratch bindings, observed {}",
+                values.len()
+            )
+        })?;
+
+    let selected_relative = format!(
+        ".fnd01-run/{role}/{}/bootstrap-control-target/debug/fnd_01_evidence_harness",
+        invocation.run_id
+    );
+    let selected_path = invocation.repository_root.join(&selected_relative);
+    if selected_path != invocation.executable_path
+        || selected_path != current_executable
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: argv[0]/current executable differs from the exact role/run target formula"
+                .to_owned(),
+        );
+    }
+    let (selected_snapshot, selected_executable) = ordinary_checked_file_binding(
+        &invocation.repository_root,
+        &selected_relative,
+        MAX_GATE_EXECUTABLE_BYTES,
+        None,
+        "ordinary selected executable",
+    )?;
+    if selected_snapshot.identity.file_type != 0o100_000
+        || selected_snapshot.identity.link_count != 1
+        || selected_snapshot.identity.mode & 0o100 == 0
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: selected executable must be regular, nlink-one, and owner-executable"
+                .to_owned(),
+        );
+    }
+    let control_build_environment =
+        derive_ordinary_control_build_environment(invocation)?;
+    let handoff_argv = expected_ordinary_handoff_argv(
+        invocation.mode,
+        &selected_executable.path,
+        &invocation.run_id,
+    )
+    .map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: exact handoff argv: {error}")
+    })?;
+    if handoff_argv.len() != ORDINARY_HANDOFF_ARGV_ARITY
+        || handoff_argv.first().map(String::as_str)
+            != Some(selected_executable.path.as_str())
+        || handoff_argv.get(4).map(String::as_str)
+            != Some(invocation.control_ledger_path.as_str())
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: independently derived handoff argv differs from the live invocation"
+                .to_owned(),
+        );
+    }
+    let handoff_environment = expected_ordinary_handoff_environment(
+        invocation.mode,
+        &invocation.run_id,
+        environment,
+    )
+    .map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: exact handoff environment: {error}")
+    })?;
+
+    let supply_relative = expected_ordinary_supply_relative_path(
+        invocation.mode,
+        &invocation.run_id,
+    )
+    .map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: exact supply path: {error}")
+    })?;
+    let (supply_snapshot, supply_bytes) = match invocation.mode {
+        BootstrapMode::Produce => checked_read(
+            &invocation.repository_root,
+            &supply_relative,
+            MAX_SUPPLY_BUNDLE_BYTES,
+            None,
+        )
+        .map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: producer supply binding: {error}")
+        })?,
+        BootstrapMode::Attest => {
+            let integration = authority.integration.as_mut().ok_or_else(|| {
+                "E_ORDINARY_HANDOFF_PENDING: Attest retained seal authority is missing"
+                    .to_owned()
+            })?;
+            let retained_bytes = integration.retained.consume().map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: retained integration set consumption failed ({error})"
+                )
+            })?;
+            let expected_bindings = [
+                integration.seal.records[0],
+                integration.seal.records[1],
+                integration.seal.records[2],
+                integration.seal.records[3],
+                integration.seal.records[4],
+                integration.seal.outer_transport,
+            ];
+            for (ordinal, (bytes, binding)) in retained_bytes
+                .iter()
+                .zip(expected_bindings)
+                .enumerate()
+            {
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                    != binding.byte_length
+                    || sha256(bytes) != binding.sha256
+                {
+                    return Err(format!(
+                        "E_ORDINARY_HANDOFF_PENDING: retained integration member {ordinal} binding drift"
+                    ));
+                }
+            }
+            let [_, _, supply_bytes, _, _, outer_bytes] = retained_bytes;
+            let outer = parse_outer_transport_record(
+                &outer_bytes,
+                "ordinary retained producer outer record",
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: producer outer-record parse failed ({error})"
+                )
+            })?;
+            validate_outer_role_record(
+                &outer,
+                BootstrapMode::Produce,
+                &invocation.run_id,
+                &environment.authoring_marker,
+                None,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: producer outer-record semantics failed ({error})"
+                )
+            })?;
+            integration
+                .retained
+                .revalidate_after_consumption()
+                .map_err(|error| {
+                    format!(
+                        "E_ORDINARY_HANDOFF_PENDING: retained integration set changed ({error})"
+                    )
+                })?;
+            let snapshot = checked_snapshot(
+                &invocation.repository_root,
+                &supply_relative,
+                MAX_SUPPLY_BUNDLE_BYTES,
+                Some(integration.seal.records[2]),
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: attested supply path rebind failed ({error})"
+                )
+            })?;
+            (snapshot, supply_bytes)
+        }
+        BootstrapMode::Gate => {
+            return Err(
+                "E_ORDINARY_HANDOFF_PENDING: Gate has no ordinary supply"
+                    .to_owned(),
+            );
+        }
+    };
+    if supply_snapshot.byte_length == 0 || supply_bytes.is_empty() {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: independently bound supply is empty"
+                .to_owned(),
+        );
+    }
+    let supply_bundle = ValidatedFileBinding {
+        path: ordinary_utf8_path(
+            &invocation.repository_root.join(&supply_relative),
+            "ordinary supply path",
+        )?,
+        binding: FileBinding {
+            byte_length: supply_snapshot.byte_length,
+            sha256: supply_snapshot.sha256,
+        },
+    };
+
+    let (local_registry, target_snapshot): (
+        ValidatedDirectoryTreeBinding,
+        ValidatedTargetSnapshot,
+    ) = {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            super::phase_b_std::observe_ordinary_control_trees(
+                &invocation.repository_root,
+                invocation.mode,
+                &invocation.run_id,
+                &supply_bytes,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: independent control-tree observation failed ({error})"
+                )
+            })?
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            return Err(
+                "E_UNQUALIFIED_PLATFORM: ordinary control-tree observation requires Linux x86_64"
+                    .to_owned(),
+            );
+        }
+    };
+
+    let (spool_relative, spool_snapshot, acquisition_spool_binding) =
+        match invocation.mode {
+            BootstrapMode::Produce => {
+                let relative = format!(
+                    ".fnd01-run/integration-producer/{}/acquisition-spool.bin",
+                    invocation.run_id
+                );
+                let snapshot = checked_snapshot(
+                    &invocation.repository_root,
+                    &relative,
+                    MAX_ACQUISITION_SPOOL_BYTES,
+                    None,
+                )
+                .map_err(|error| {
+                    format!(
+                        "E_ORDINARY_HANDOFF_PENDING: producer acquisition-spool binding failed ({error})"
+                    )
+                })?;
+                if snapshot.byte_length == 0 {
+                    return Err(
+                        "E_ORDINARY_HANDOFF_PENDING: producer acquisition spool is empty"
+                            .to_owned(),
+                    );
+                }
+                let binding = FileBinding {
+                    byte_length: snapshot.byte_length,
+                    sha256: snapshot.sha256,
+                };
+                (Some(relative), Some(snapshot), Some(binding))
+            }
+            BootstrapMode::Attest => (None, None, None),
+            BootstrapMode::Gate => unreachable!("Gate rejected before non-tool derivation"),
+        };
+
+    Ok(OrdinaryNonToolExpectation {
+        scratch_bindings,
+        local_registry,
+        supply_bundle,
+        supply_relative,
+        supply_snapshot,
+        supply_bytes,
+        target_snapshot,
+        selected_executable,
+        selected_snapshot,
+        control_build_environment,
+        handoff_argv,
+        handoff_environment,
+        spool_relative,
+        spool_snapshot,
+        acquisition_spool_binding,
+    })
+}
+
+fn validate_probed_ordinary_ledger(
+    mut probed: OrdinaryProbedAuthority,
+    invocation: &OrdinaryHandoffArguments,
+    environment: &BootstrapEnvironment,
+) -> Result<OrdinaryArchivePermit, String> {
+    let ledger_binding = FileBinding {
+        byte_length: probed.ledger_snapshot.byte_length,
+        sha256: probed.ledger_snapshot.sha256,
+    };
+    let ledger_recheck = checked_snapshot(
+        &invocation.repository_root,
+        &invocation.control_ledger_path,
+        MAX_CONTROL_LEDGER_BYTES,
+        Some(ledger_binding),
+    )
+    .map_err(|error| {
+        format!("E_HANDOFF_LEDGER_RECHECK: opaque post-probe binding failed ({error})")
+    })?;
+    if ledger_recheck != probed.ledger_snapshot {
+        return Err(
+            "E_HANDOFF_LEDGER_RECHECK: opaque ledger identity changed during the tool reprobe"
+                .to_owned(),
+        );
+    }
+
+    let integration_seal_sha256 = probed
+        .authority
+        .integration
+        .as_ref()
+        .map_or([0; 32], |integration| integration.seal.seal_sha256);
+    let build_environment = complete_ordinary_control_build_environment(
+        &probed.non_tool.control_build_environment,
+        &probed.tool_reprobe.acquisition_tools,
+    );
+    let expectation = ControlLedgerExpectation {
+        mode: invocation.mode,
+        repository_root: invocation.repository_root.clone(),
+        run_id: invocation.run_id.clone(),
+        process_id: probed.authority.control.process_id,
+        authoring_closure_sha256: probed.authority.marker.closure_sha256,
+        integration_seal_sha256,
+        scratch_bindings: probed.non_tool.scratch_bindings.clone(),
+        local_registry: probed.non_tool.local_registry.clone(),
+        supply_bundle: probed.non_tool.supply_bundle.clone(),
+        tool_set_sha256: probed.tool_reprobe.tool_set_sha256,
+        environment_set_sha256: probed.authority.control.environment_set_sha256,
+        cargo_executable: probed.tool_reprobe.acquisition_tools.cargo.clone(),
+        build_environment,
+        target_snapshot: probed.non_tool.target_snapshot.clone(),
+        selected_executable: probed.non_tool.selected_executable.clone(),
+        bootstrap_environment: environment.clone(),
+        acquisition_spool_binding: probed.non_tool.acquisition_spool_binding,
+    };
+    let ledger = validate_control_ledger_bytes(
+        &probed.ledger_bytes,
+        &expectation,
+    )
+    .map_err(|error| format!("E_HANDOFF_LEDGER: complete validator failed ({error})"))?;
+    if ledger.handoff_argv != probed.non_tool.handoff_argv
+        || ledger.handoff_environment != probed.non_tool.handoff_environment
+    {
+        return Err(
+            "E_HANDOFF_LEDGER: validated handoff argv/environment differ from independent pre-probe authority"
+                .to_owned(),
+        );
+    }
+    rebind_control_ledger_regular_files(&invocation.repository_root, &ledger)
+        .map_err(|error| {
+            format!("E_HANDOFF_LEDGER_REBIND: regular-file rebind failed ({error})")
+        })?;
+    let (registry_recheck, target_recheck): (
+        ValidatedDirectoryTreeBinding,
+        ValidatedTargetSnapshot,
+    ) = {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            super::phase_b_std::observe_ordinary_control_trees(
+                &invocation.repository_root,
+                invocation.mode,
+                &invocation.run_id,
+                &probed.non_tool.supply_bytes,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_HANDOFF_LEDGER_REBIND: control-tree reobservation failed ({error})"
+                )
+            })?
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            return Err(
+                "E_UNQUALIFIED_PLATFORM: ordinary control-tree rebind requires Linux x86_64"
+                    .to_owned(),
+            );
+        }
+    };
+    if registry_recheck != ledger.local_registry
+        || target_recheck != ledger.target_snapshot
+    {
+        return Err(
+            "E_HANDOFF_LEDGER_REBIND: local-registry or target tree changed after ledger validation"
+                .to_owned(),
+        );
+    }
+    if let Some(integration) = probed.authority.integration.as_mut() {
+        integration
+            .retained
+            .revalidate_after_consumption()
+            .map_err(|error| {
+                format!(
+                    "E_HANDOFF_LEDGER_REBIND: retained integration authority changed ({error})"
+                )
+            })?;
+    }
+    Ok(OrdinaryArchivePermit {
+        expectation,
+        ledger_snapshot: probed.ledger_snapshot,
+        ledger_bytes: probed.ledger_bytes,
+        ledger,
+        non_tool: probed.non_tool,
+        tool_reprobe: probed.tool_reprobe,
+        integration: probed.authority.integration,
+    })
+}
+
 /// Admit ordinary execution only after a grammar-valid FND01AUTHORv2 marker
 /// rebinds the three authoring paths on the live repository filesystem **and**
 /// the independent twenty-tool closed-PATH authority plus pure
@@ -83599,16 +85998,16 @@ fn ordinary_control_ledger_expectation_authority(
 /// Invalid or drifted markers remain fail-closed with
 /// `E_ORDINARY_HANDOFF_PENDING` before any ledger/spool/supply/archive open.
 /// A successful authoring rebind alone still does not authorize ledger access:
-/// the typed single-use `OrdinaryExecutionPermit` is issued only after pure
-/// tool-PATH and ControlLedgerExpectation authority also join. Live 20-tool
-/// re-resolve against the sealed execution-bin remains a later handoff step
-/// (after ledger open) and is not skipped by this permit.
+/// the typed `OrdinaryPreLedgerAuthority` is issued only after pure tool-PATH
+/// and ControlLedgerExpectation authority also join. The separate non-Clone
+/// `OrdinaryProbePermit` is issued only after non-tool bindings and opaque
+/// ledger retention, and consumes the live 20-tool re-resolve exactly once.
 fn require_ordinary_execution_authority(
     repository_root: &Path,
     mode: BootstrapMode,
     run_id: &str,
     environment: &BootstrapEnvironment,
-) -> Result<OrdinaryExecutionPermit, String> {
+) -> Result<OrdinaryPreLedgerAuthority, String> {
     let marker = match super::trust_std::parse_authoring_marker(&environment.authoring_marker)
     {
         Ok(marker) => marker,
@@ -83653,6 +86052,11 @@ fn require_ordinary_execution_authority(
     let _toolchain_bin =
         ordinary_closed_path_toolchain_authority(&environment.closed_path)?;
 
+    // Pure dual-path readiness (20-row table + registry pin) is part of
+    // pre-ledger authority, not deferred until after the opaque ledger opens.
+    let pure_tools = ordinary_reprobe_dual_path_pure_authority()?;
+    debug_assert_eq!(pure_tools.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+
     // Pure environment-set template digest (compiled authority; nonzero).
     let environment_set_sha256 = ordinary_environment_set_digest();
     if environment_set_sha256 == [0; 32] {
@@ -83672,12 +86076,155 @@ fn require_ordinary_execution_authority(
     debug_assert_eq!(control.handoff_argv_arity, ORDINARY_HANDOFF_ARGV_ARITY);
     debug_assert_eq!(control.environment_set_sha256, environment_set_sha256);
 
-    Ok(OrdinaryExecutionPermit {
+    let integration = match mode {
+        BootstrapMode::Produce => {
+            if environment.integration_seal.is_some()
+                || environment.producer_outer_record_path.is_some()
+            {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: Produce received Attest-only seal authority"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        BootstrapMode::Attest => {
+            let seal_text = environment.integration_seal.as_deref().ok_or_else(|| {
+                "E_ORDINARY_HANDOFF_PENDING: Attest integration seal is missing"
+                    .to_owned()
+            })?;
+            let seal = parse_integration_seal(
+                seal_text,
+                &marker.closure_sha256,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: Attest integration seal authority failed ({error})"
+                )
+            })?;
+            let expected_run_id = super::trust_std::decode_lower_hex::<16>(
+                run_id,
+                "ordinary Attest run ID",
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: Attest run ID authority failed ({error})"
+                )
+            })?;
+            if seal.run_id != expected_run_id {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: integration seal run ID differs from the ordinary handoff"
+                        .to_owned(),
+                );
+            }
+            let expected_outer =
+                format!(".fnd01-run/controller/{run_id}/producer-outer.bin");
+            let outer_path = environment
+                .producer_outer_record_path
+                .as_deref()
+                .filter(|path| *path == expected_outer)
+                .ok_or_else(|| {
+                    "E_ORDINARY_HANDOFF_PENDING: producer outer-record path differs from the exact role/run formula"
+                        .to_owned()
+                })?;
+            let retained = retain_integration_and_outer_files(
+                repository_root,
+                &seal,
+                outer_path,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_ORDINARY_HANDOFF_PENDING: integration seal file rebind failed ({error})"
+                )
+            })?;
+            Some(OrdinaryAttestAuthority { seal, retained })
+        }
+        BootstrapMode::Gate => {
+            return Err(
+                "E_ORDINARY_HANDOFF_PENDING: Gate cannot obtain ordinary pre-ledger authority"
+                    .to_owned(),
+            );
+        }
+    };
+
+    Ok(OrdinaryPreLedgerAuthority {
         marker,
+        integration,
+        repository_root: repository_root.to_path_buf(),
         mode,
         control,
         closed_path: environment.closed_path.clone(),
     })
+}
+
+/// Map each stable ordinary-entry failure code to the product stage that owns
+/// the failed invariant.  This mapping is deliberately independent of the
+/// untrusted diagnostic detail, except for the one shared executable code:
+/// pre-ledger current-executable admission is `authority`, while a parsed
+/// `selected_executable` mismatch is a `ledger` failure.
+fn ordinary_entry_diagnostic_stage(code: &str, detail: &str) -> &'static str {
+    if code == "E_ORDINARY_EVIDENCE" {
+        "evidence"
+    } else if code == "E_ENTRY_ARGUMENTS" || code == "E_ENTRY_PANIC" {
+        // Harness-boundary product failures stay first-class `authority` stages
+        // (B-R4): never collapse known ordinary entry failures to stage=ordinary.
+        "authority"
+    } else if code == "E_UNQUALIFIED_PLATFORM" {
+        if detail.contains("post-archive") || detail.contains("revalidation") {
+            "bookend"
+        } else if detail.contains("native-tool probes") {
+            "reprobe"
+        } else if detail.contains("control-tree rebind") {
+            "ledger"
+        } else {
+            "authority"
+        }
+    } else if code == "E_HANDOFF_LEDGER_RECHECK" {
+        if detail.contains("post-archive") {
+            "bookend"
+        } else {
+            "ledger"
+        }
+    } else if code.contains("RECHECK") || code == "E_HANDOFF_SPOOL_PLAN" {
+        "bookend"
+    } else if code == "E_HANDOFF_ARCHIVE"
+        || code == "E_HANDOFF_SUPPLY_PARSE"
+    {
+        "archive"
+    } else if code.starts_with("E_HANDOFF_TOOL_SET") {
+        "reprobe"
+    } else if code.starts_with("E_HANDOFF_LEDGER")
+        || code == "E_HANDOFF_ARGV"
+        || code == "E_HANDOFF_ENVIRONMENT"
+        || code == "E_HANDOFF_SUPPLY"
+        || code == "E_HANDOFF_SPOOL"
+        || (code == "E_HANDOFF_EXECUTABLE"
+            && detail.contains("selected_executable"))
+    {
+        "ledger"
+    } else {
+        "authority"
+    }
+}
+
+fn emit_ordinary_entry_failure(
+    stage: &str,
+    mode: &str,
+    run_id: &str,
+    code: &str,
+    expected: &str,
+    observed: &str,
+) {
+    let role = format!("role={mode}");
+    let run = format!("run_id={run_id}");
+    let expected = format!("expected={expected}");
+    let observed = format!("observed={observed}");
+    emit_entry_diagnostic_parts(
+        stage,
+        mode,
+        code,
+        &[&role, &run, &expected, &observed],
+    );
 }
 
 
@@ -83702,10 +86249,12 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
     let invocation = match parse_ordinary_handoff_arguments(arguments) {
         Ok(invocation) => invocation,
         Err(error) => {
-            emit_entry_diagnostic(
-                "ordinary",
+            emit_ordinary_entry_failure(
+                "authority",
                 mode,
+                "unavailable",
                 error.code(),
+                "valid ordinary handoff argv",
                 error.detail(),
             );
             return 3;
@@ -83714,10 +86263,12 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
     let environment = match read_ordinary_handoff_environment(&invocation) {
         Ok(environment) => environment,
         Err(error) => {
-            emit_entry_diagnostic(
-                "ordinary",
+            emit_ordinary_entry_failure(
+                "authority",
                 mode,
+                &invocation.run_id,
                 error.code(),
+                "closed role-specific environment",
                 error.detail(),
             );
             return 3;
@@ -83731,7 +86282,15 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
                 .split_once(": ")
                 .filter(|(code, _)| entry_diagnostic_code_is_valid(code))
                 .unwrap_or(("E_ORDINARY_HANDOFF", error.as_str()));
-            emit_entry_diagnostic("ordinary", mode, code, detail);
+            let stage = ordinary_entry_diagnostic_stage(code, detail);
+            emit_ordinary_entry_failure(
+                stage,
+                mode,
+                &invocation.run_id,
+                code,
+                "stage contract satisfied",
+                detail,
+            );
             3
         }
     }
@@ -83765,7 +86324,7 @@ fn validate_ordinary_handoff_entry(
     // authoring paths on the live repository, plus independent twenty-tool
     // closed-PATH authority and pure ControlLedgerExpectation field join,
     // before opening ledger, spool, supply, archive, child, or output surfaces.
-    let permit = require_ordinary_execution_authority(
+    let mut authority = require_ordinary_execution_authority(
         &invocation.repository_root,
         invocation.mode,
         &invocation.run_id,
@@ -83775,24 +86334,63 @@ fn validate_ordinary_handoff_entry(
     // before any untrusted ledger open. Mismatches stay E_ORDINARY_HANDOFF_PENDING.
     let expected_role = bootstrap_role_name(invocation.mode)
         .map_err(|error| format!("E_HANDOFF_MODE: {error}"))?;
-    if permit.mode != invocation.mode
-        || permit.control.role != expected_role
-        || permit.control.run_id != invocation.run_id
-        || permit.control.control_ledger_relative != invocation.control_ledger_path
-        || permit.closed_path != environment.closed_path
-        || permit.control.native_tool_count != ORDINARY_NATIVE_TOOL_COUNT
-        || permit.control.handoff_argv_arity != ORDINARY_HANDOFF_ARGV_ARITY
-        || permit.control.environment_set_sha256 == [0; 32]
-        || permit.control.process_id == 0
-        || permit.control.process_id != u64::from(std::process::id())
+    if authority.mode != invocation.mode
+        || authority.control.role != expected_role
+        || authority.control.run_id != invocation.run_id
+        || authority.control.control_ledger_relative != invocation.control_ledger_path
+        || authority.closed_path != environment.closed_path
+        || authority.control.native_tool_count != ORDINARY_NATIVE_TOOL_COUNT
+        || authority.control.handoff_argv_arity != ORDINARY_HANDOFF_ARGV_ARITY
+        || authority.control.environment_set_sha256 == [0; 32]
+        || authority.control.process_id == 0
+        || authority.control.process_id != u64::from(std::process::id())
     {
         return Err(
-            "E_ORDINARY_HANDOFF_PENDING: OrdinaryExecutionPermit desync from live handoff identity"
+            "E_ORDINARY_HANDOFF_PENDING: pre-ledger authority desync from live handoff identity"
                 .to_owned(),
         );
     }
-    // Single-use: consume before any untrusted ledger open.
-    let _authoring_marker = permit.consume();
+    // Derive and retain every non-tool expectation without consulting the
+    // ledger. Only then may the ledger be opened, and its bytes stay opaque
+    // until the single-use twenty-tool probe permit has been consumed.
+    let non_tool = derive_ordinary_non_tool_expectation(
+        &mut authority,
+        invocation,
+        environment,
+        &current_executable,
+    )?;
+    let (opaque_ledger_snapshot, opaque_ledger_bytes) = checked_read(
+        &invocation.repository_root,
+        &invocation.control_ledger_path,
+        MAX_CONTROL_LEDGER_BYTES,
+        None,
+    )
+    .map_err(|error| format!("E_HANDOFF_LEDGER: opaque checked-read failed ({error})"))?;
+    if opaque_ledger_snapshot.byte_length == 0 || opaque_ledger_bytes.is_empty() {
+        return Err("E_HANDOFF_LEDGER: opaque control ledger is empty".to_owned());
+    }
+    let probed = OrdinaryProbePermit {
+        authority,
+        non_tool,
+        ledger_snapshot: opaque_ledger_snapshot,
+        ledger_bytes: opaque_ledger_bytes,
+    }
+    .consume()?;
+    let archive_permit = validate_probed_ordinary_ledger(probed, invocation, environment)?;
+    let OrdinaryArchivePermit {
+        expectation,
+        ledger_snapshot,
+        ledger_bytes: admitted_ledger_bytes,
+        ledger: validated_ledger,
+        non_tool,
+        tool_reprobe,
+        mut integration,
+    } = archive_permit;
+
+    // This second direct read is deliberately redundant: the complete ledger
+    // validator and immediate file/tree rebinds have already issued archive
+    // authority. It preserves the existing retained-open race checks and must
+    // match the admitted opaque object exactly.
     let ledger_path = invocation.repository_root.join(&invocation.control_ledger_path);
     let metadata = std::fs::symlink_metadata(&ledger_path).map_err(|error| {
         format!(
@@ -83803,7 +86401,6 @@ fn validate_ordinary_handoff_entry(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("E_HANDOFF_LEDGER: control ledger must be a regular non-symlink file".to_owned());
     }
-    const MAX_CONTROL_LEDGER_BYTES: u64 = 67_108_864;
     let declared_len = metadata.len();
     if declared_len == 0 || declared_len > MAX_CONTROL_LEDGER_BYTES {
         return Err(format!(
@@ -83879,24 +86476,23 @@ fn validate_ordinary_handoff_entry(
         }
     }
     drop(file);
+    if declared_len != ledger_snapshot.byte_length
+        || sha256(&bytes) != ledger_snapshot.sha256
+        || bytes != admitted_ledger_bytes
+    {
+        return Err(
+            "E_HANDOFF_LEDGER_RECHECK: direct ledger read differs from the admitted opaque binding"
+                .to_owned(),
+        );
+    }
     if !bytes.starts_with(CONTROL_LEDGER_PREFIX) {
         return Err(
             "E_HANDOFF_LEDGER: control ledger missing exact FND01CONTROLv2 prefix".to_owned(),
         );
     }
     let ledger_first_sha256 = sha256(&bytes);
-    // ordinary_tool_reprobe_rule: after opaque ledger bytes are bound but BEFORE
-    // full ledger field acceptance / archive expansion, run the independent
-    // 20-tool reprobe with no ledger-selected candidate path or argv. Live
-    // digest comparison against ledger tool_set_sha256 happens after parse.
-    let tool_reprobe = ordinary_reprobe_tool_set_shared(
-        &invocation.repository_root,
-        invocation.mode,
-        &invocation.run_id,
-        &environment.closed_path,
-    )?;
-    // Structural ledger reparse (schema/role/run/PID) before the full expectation
-    // join that requires scratch/supply/tool/environment digests from the sealed tree.
+    // Structural reparse is now downstream of complete expectation validation,
+    // immediate regular-file/tree rebinding, and archive-permit issuance.
     let record = parse_canonical_record_file_with_final_self_digest(
         &bytes,
         CONTROL_LEDGER_PREFIX,
@@ -83969,6 +86565,15 @@ fn validate_ordinary_handoff_entry(
     if selected_len == 0 {
         return Err("E_HANDOFF_EXECUTABLE: selected_executable empty".to_owned());
     }
+    if selected_path_text != non_tool.selected_executable.path
+        || selected_len != non_tool.selected_executable.binding.byte_length
+        || selected_sha256 != non_tool.selected_executable.binding.sha256
+    {
+        return Err(
+            "E_HANDOFF_EXECUTABLE: validated ledger differs from the independent executable binding"
+                .to_owned(),
+        );
+    }
     let exe_meta = std::fs::symlink_metadata(&current_executable)
         .map_err(|error| format!("E_HANDOFF_EXECUTABLE: metadata: {error}"))?;
     if exe_meta.file_type().is_symlink()
@@ -84001,7 +86606,7 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_EXECUTABLE: repository-relative executable path must be UTF-8"
                 .to_owned()
         })?;
-    super::trust_std::checked_snapshot(
+    let selected_recheck = super::trust_std::checked_snapshot(
         &invocation.repository_root,
         executable_relative,
         selected_len,
@@ -84011,6 +86616,12 @@ fn validate_ordinary_handoff_entry(
         }),
     )
     .map_err(|error| format!("E_HANDOFF_EXECUTABLE: {error}"))?;
+    if selected_recheck != non_tool.selected_snapshot {
+        return Err(
+            "E_HANDOFF_EXECUTABLE: executable identity changed after independent binding"
+                .to_owned(),
+        );
+    }
     // Control-ledger encodes the top-level handoff_argv string array (not a
     // nested record). Recompute all five values from the live role, executable,
     // run, and parser-admitted control-ledger argument before opening the
@@ -84071,7 +86682,17 @@ fn validate_ordinary_handoff_entry(
         "ordinary supply bundle SHA-256",
     )
     .map_err(|error| format!("E_HANDOFF_SUPPLY: {error}"))?;
-    let (_, supply_bytes) = super::trust_std::checked_read(
+    if supply_path != non_tool.supply_bundle.path
+        || supply_relative != non_tool.supply_relative
+        || supply_len != non_tool.supply_bundle.binding.byte_length
+        || expected_supply_sha256 != non_tool.supply_bundle.binding.sha256
+    {
+        return Err(
+            "E_HANDOFF_SUPPLY: validated ledger differs from the independent supply binding"
+                .to_owned(),
+        );
+    }
+    let (supply_read_snapshot, supply_bytes) = super::trust_std::checked_read(
         &invocation.repository_root,
         &supply_relative,
         ORDINARY_MAX_SUPPLY_BUNDLE_BYTES,
@@ -84082,8 +86703,14 @@ fn validate_ordinary_handoff_entry(
     )
     .map_err(|error| format!("E_HANDOFF_SUPPLY: {error}"))?;
     let supply_first_sha256 = sha256(&supply_bytes);
-    if supply_first_sha256 != expected_supply_sha256 {
-        return Err("E_HANDOFF_SUPPLY: supply SHA-256 desync from ledger".to_owned());
+    if supply_read_snapshot != non_tool.supply_snapshot
+        || supply_bytes != non_tool.supply_bytes
+        || supply_first_sha256 != expected_supply_sha256
+    {
+        return Err(
+            "E_HANDOFF_SUPPLY: supply bytes or complete identity changed after independent binding"
+                .to_owned(),
+        );
     }
     if !supply_bytes.starts_with(b"FND01SUPPLYv4\0") {
         return Err("E_HANDOFF_SUPPLY: missing FND01SUPPLYv4 prefix".to_owned());
@@ -84144,15 +86771,41 @@ fn validate_ordinary_handoff_entry(
                 "ordinary acquisition spool SHA-256",
             )
             .map_err(|error| format!("E_HANDOFF_SPOOL: {error}"))?;
-            let spool_bytes = reopen_ordinary_bound_file(
+            let independent_relative = non_tool.spool_relative.as_deref().ok_or_else(|| {
+                "E_HANDOFF_SPOOL: independent Produce spool path is absent".to_owned()
+            })?;
+            let independent_snapshot = non_tool.spool_snapshot.as_ref().ok_or_else(|| {
+                "E_HANDOFF_SPOOL: independent Produce spool snapshot is absent".to_owned()
+            })?;
+            let independent_binding = non_tool
+                .acquisition_spool_binding
+                .ok_or_else(|| {
+                    "E_HANDOFF_SPOOL: independent Produce spool binding is absent".to_owned()
+                })?;
+            if expected_spool_relative != independent_relative
+                || spool_byte_length != independent_binding.byte_length
+                || spool_sha256 != independent_binding.sha256
+            {
+                return Err(
+                    "E_HANDOFF_SPOOL: validated ledger differs from the independent spool binding"
+                        .to_owned(),
+                );
+            }
+            let (spool_snapshot, spool_bytes) = checked_read(
                 &invocation.repository_root,
                 &expected_spool_relative,
                 ORDINARY_MAX_ACQUISITION_SPOOL_BYTES,
-                spool_byte_length,
-                spool_sha256,
-                "ordinary acquisition spool first binding",
+                Some(independent_binding),
             )
-            .map_err(|error| format!("E_HANDOFF_SPOOL: {}", error.stable()))?;
+            .map_err(|error| {
+                format!("E_HANDOFF_SPOOL: independent spool read failed ({error})")
+            })?;
+            if &spool_snapshot != independent_snapshot {
+                return Err(
+                    "E_HANDOFF_SPOOL: spool identity changed after independent binding"
+                        .to_owned(),
+                );
+            }
             let spool_record = parse_ordinary_acquisition_spool(
                 &spool_bytes,
                 &invocation.run_id,
@@ -84162,6 +86815,7 @@ fn validate_ordinary_handoff_entry(
             )?;
             Some(OrdinarySpoolBinding {
                 relative_path: expected_spool_relative,
+                snapshot: spool_snapshot,
                 byte_length: spool_byte_length,
                 sha256: spool_sha256,
                 bytes: spool_bytes,
@@ -84176,6 +86830,15 @@ fn validate_ordinary_handoff_entry(
             {
                 return Err(
                     "E_HANDOFF_SPOOL: Attest requires the exact absent option".to_owned(),
+                );
+            }
+            if non_tool.spool_relative.is_some()
+                || non_tool.spool_snapshot.is_some()
+                || non_tool.acquisition_spool_binding.is_some()
+            {
+                return Err(
+                    "E_HANDOFF_SPOOL: independent Attest expectation must omit the spool"
+                        .to_owned(),
                 );
             }
             None
@@ -84200,40 +86863,61 @@ fn validate_ordinary_handoff_entry(
 
     // ordinary_archive_validation_rule step 3: after the final archive, reopen
     // and independently strict-reparse/re-hash every first-bound handoff object.
-    let ledger_recheck_bytes = reopen_ordinary_bound_file(
+    let (ledger_recheck_snapshot, ledger_recheck_bytes) = checked_read(
         &invocation.repository_root,
         &invocation.control_ledger_path,
         MAX_CONTROL_LEDGER_BYTES,
-        declared_len,
-        ledger_first_sha256,
-        "ordinary control ledger post-archive recheck",
+        Some(FileBinding {
+            byte_length: declared_len,
+            sha256: ledger_first_sha256,
+        }),
     )
-    .map_err(|error| format!("E_HANDOFF_LEDGER_RECHECK: {}", error.stable()))?;
-    let ledger_recheck = parse_canonical_record_file_with_final_self_digest(
-        &ledger_recheck_bytes,
-        CONTROL_LEDGER_PREFIX,
-        "control-ledger",
-        "ledger_set_sha256",
-        MAX_CONTROL_LEDGER_BYTES,
-        "ordinary control ledger post-archive recheck",
-    )
-    .map_err(|error| format!("E_HANDOFF_LEDGER_RECHECK: {error}"))?;
-    if ledger_recheck != record {
+    .map_err(|error| {
+        format!("E_HANDOFF_LEDGER_RECHECK: post-archive checked-read failed ({error})")
+    })?;
+    if ledger_recheck_snapshot != ledger_snapshot
+        || ledger_recheck_bytes != admitted_ledger_bytes
+    {
         return Err(
-            "E_HANDOFF_LEDGER_RECHECK: canonical ledger differs from first binding"
+            "E_HANDOFF_LEDGER_RECHECK: post-archive bytes or complete identity differ from admission"
                 .to_owned(),
         );
     }
+    let ledger_recheck = validate_control_ledger_bytes(
+        &ledger_recheck_bytes,
+        &expectation,
+    )
+    .map_err(|error| {
+        format!("E_HANDOFF_LEDGER_RECHECK: complete validator failed ({error})")
+    })?;
+    if ledger_recheck != validated_ledger {
+        return Err(
+            "E_HANDOFF_LEDGER_RECHECK: complete validated ledger differs from admission"
+                .to_owned(),
+        );
+    }
+    rebind_control_ledger_regular_files(&invocation.repository_root, &ledger_recheck)
+        .map_err(|error| {
+            format!("E_HANDOFF_LEDGER_RECHECK: regular-file rebind failed ({error})")
+        })?;
 
-    let supply_recheck_bytes = reopen_ordinary_bound_file(
+    let (supply_recheck_snapshot, supply_recheck_bytes) = checked_read(
         &invocation.repository_root,
         &supply_relative,
         ORDINARY_MAX_SUPPLY_BUNDLE_BYTES,
-        supply_len,
-        supply_first_sha256,
-        "ordinary supply bundle post-archive recheck",
+        Some(non_tool.supply_bundle.binding),
     )
-    .map_err(|error| format!("E_HANDOFF_SUPPLY_RECHECK: {}", error.stable()))?;
+    .map_err(|error| {
+        format!("E_HANDOFF_SUPPLY_RECHECK: post-archive checked-read failed ({error})")
+    })?;
+    if supply_recheck_snapshot != non_tool.supply_snapshot
+        || supply_recheck_bytes != non_tool.supply_bytes
+    {
+        return Err(
+            "E_HANDOFF_SUPPLY_RECHECK: post-archive bytes or complete identity differ from admission"
+                .to_owned(),
+        );
+    }
     let supply_recheck_framing = parse_ordinary_supply_framing(
         &supply_recheck_bytes,
         "ordinary supply bundle post-archive recheck",
@@ -84245,16 +86929,56 @@ fn validate_ordinary_handoff_entry(
         );
     }
 
+    let (registry_recheck, target_recheck): (
+        ValidatedDirectoryTreeBinding,
+        ValidatedTargetSnapshot,
+    ) = {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            super::phase_b_std::observe_ordinary_control_trees(
+                &invocation.repository_root,
+                invocation.mode,
+                &invocation.run_id,
+                &supply_recheck_bytes,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_HANDOFF_LEDGER_RECHECK: post-archive tree observation failed ({error})"
+                )
+            })?
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            return Err(
+                "E_UNQUALIFIED_PLATFORM: ordinary post-archive tree rebind requires Linux x86_64"
+                    .to_owned(),
+            );
+        }
+    };
+    if registry_recheck != non_tool.local_registry
+        || registry_recheck != ledger_recheck.local_registry
+        || target_recheck != non_tool.target_snapshot
+        || target_recheck != ledger_recheck.target_snapshot
+    {
+        return Err(
+            "E_HANDOFF_LEDGER_RECHECK: post-archive local-registry or target tree changed"
+                .to_owned(),
+        );
+    }
+
     if let Some(first_spool) = &first_spool {
-        let spool_recheck_bytes = reopen_ordinary_bound_file(
+        let (spool_recheck_snapshot, spool_recheck_bytes) = checked_read(
             &invocation.repository_root,
             &first_spool.relative_path,
             ORDINARY_MAX_ACQUISITION_SPOOL_BYTES,
-            first_spool.byte_length,
-            first_spool.sha256,
-            "ordinary acquisition spool post-archive recheck",
+            Some(FileBinding {
+                byte_length: first_spool.byte_length,
+                sha256: first_spool.sha256,
+            }),
         )
-        .map_err(|error| format!("E_HANDOFF_SPOOL_RECHECK: {}", error.stable()))?;
+        .map_err(|error| {
+            format!("E_HANDOFF_SPOOL_RECHECK: post-archive checked-read failed ({error})")
+        })?;
         let spool_recheck = parse_ordinary_acquisition_spool(
             &spool_recheck_bytes,
             &invocation.run_id,
@@ -84262,14 +86986,58 @@ fn validate_ordinary_handoff_entry(
             supply_len,
             supply_first_sha256,
         )?;
-        if spool_recheck_bytes != first_spool.bytes
+        if spool_recheck_snapshot != first_spool.snapshot
+            || spool_recheck_bytes != first_spool.bytes
             || spool_recheck != first_spool.record
         {
             return Err(
                 "E_HANDOFF_SPOOL_RECHECK: spool bytes or canonical record differ from first binding"
+                .to_owned(),
+            );
+        }
+        // phase_b_std producer acquisition revalidation is Linux x86_64 only
+        // (same gate as the dual-path inventory / control-tree observers).
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            super::phase_b_std::revalidate_ordinary_producer_acquisition(
+                &invocation.repository_root,
+                &invocation.run_id,
+                &supply_recheck_bytes,
+                &spool_recheck_bytes,
+                &tool_reprobe.acquisition_tools,
+                &ledger_recheck.scratch_bindings[0],
+                &ledger_recheck.scratch_bindings[1],
+                &non_tool.supply_bundle,
+            )
+            .map_err(|error| {
+                format!(
+                    "E_HANDOFF_SPOOL_RECHECK: producer acquisition typed-result revalidation failed ({error})"
+                )
+            })?;
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = (
+                &supply_recheck_bytes,
+                &spool_recheck_bytes,
+                &tool_reprobe,
+                &ledger_recheck,
+            );
+            return Err(
+                "E_UNQUALIFIED_PLATFORM: ordinary producer acquisition revalidation requires Linux x86_64"
                     .to_owned(),
             );
         }
+    }
+    if let Some(authority) = integration.as_mut() {
+        authority
+            .retained
+            .revalidate_after_consumption()
+            .map_err(|error| {
+                format!(
+                    "E_HANDOFF_LEDGER_RECHECK: retained integration authority changed ({error})"
+                )
+            })?;
     }
 
     // Join the pre-parse independent 20-tool observations to ledger digests
@@ -84301,47 +87069,48 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_TOOL_SET: live 20-tool reprobe digest desync from ledger".to_owned(),
         );
     }
-    if let Some(first_spool) = &first_spool {
-        let compiled_acquisition = acquisition_plan(
-            &invocation.repository_root,
-            &invocation.run_id,
-            &tool_reprobe.acquisition_tools,
-        )
-        .map_err(|error| format!("E_HANDOFF_SPOOL_PLAN: {error}"))?;
-        if Path::new(&compiled_acquisition.role_root)
-            != invocation.run_root.as_path()
-        {
-            return Err(
-                "E_HANDOFF_SPOOL_PLAN: regenerated role root differs from the handoff run root"
-                    .to_owned(),
-            );
-        }
-        let structural_spool = parse_acquisition_spool_structure(
-            &first_spool.bytes,
-            &invocation.run_id,
-            &compiled_acquisition.commands,
-            &ValidatedFileBinding {
-                path: supply_path.to_owned(),
-                binding: FileBinding {
-                    byte_length: supply_len,
-                    sha256: supply_first_sha256,
-                },
-            },
-        )
-        .map_err(|error| format!("E_HANDOFF_SPOOL_PLAN: {error}"))?;
-        if structural_spool
-            .commands
-            .iter()
-            .any(|command| command.claimed_preimage.is_empty())
-        {
-            return Err(
-                "E_HANDOFF_SPOOL_PLAN: structurally reconstructed claimed command preimage is empty"
-                    .to_owned(),
-            );
-        }
-        let _ = structural_spool;
-    }
     tool_reprobe.require_unchanged()?;
+    let final_current_executable = std::env::current_exe()
+        .map_err(|error| format!("E_HANDOFF_EXECUTABLE_RECHECK: current_exe: {error}"))?;
+    let expected_executable = Path::new(&expectation.selected_executable.path);
+    if final_current_executable != invocation.executable_path
+        || final_current_executable != expected_executable
+    {
+        return Err(
+            "E_HANDOFF_EXECUTABLE_RECHECK: current executable differs from the exact admitted role/run target"
+                .to_owned(),
+        );
+    }
+    let final_executable_relative = final_current_executable
+        .strip_prefix(&invocation.repository_root)
+        .map_err(|_| {
+            "E_HANDOFF_EXECUTABLE_RECHECK: current executable escapes the physical repository"
+                .to_owned()
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            "E_HANDOFF_EXECUTABLE_RECHECK: repository-relative executable path must be UTF-8"
+                .to_owned()
+        })?;
+    let final_executable_snapshot = checked_snapshot(
+        &invocation.repository_root,
+        final_executable_relative,
+        MAX_GATE_EXECUTABLE_BYTES,
+        Some(expectation.selected_executable.binding),
+    )
+    .map_err(|error| {
+        format!("E_HANDOFF_EXECUTABLE_RECHECK: final binding failed ({error})")
+    })?;
+    if final_executable_snapshot != non_tool.selected_snapshot
+        || final_executable_snapshot.identity.file_type != 0o100_000
+        || final_executable_snapshot.identity.link_count != 1
+        || final_executable_snapshot.identity.mode & 0o100 == 0
+    {
+        return Err(
+            "E_HANDOFF_EXECUTABLE_RECHECK: executable identity or owner-executable mode changed"
+                .to_owned(),
+        );
+    }
     // harness_entry_rule step 6: workspace snapshot + evidence-matrix dispatch.
     // Integration receipts remain Severity::Pending (E_PENDING_GATE); only
     // Severity::Error fails closed as E_ORDINARY_EVIDENCE. This is not a
@@ -84399,6 +87168,45 @@ fn ordinary_authority_sentinel_precedes_untrusted_artifact_reads() {
         !error.contains("does-not-exist"),
         "the ledger path must not be opened before external authority"
     );
+}
+
+#[test]
+fn ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
+    // This deliberately characterizes the security-relevant sequencing in the
+    // production entry function.  The sealed fixture cannot manufacture live
+    // native-tool observations, so a lexical guard complements the pure and
+    // live fault tests by making an accidental effect reordering conspicuous.
+    let source = include_str!("fnd_01_dependency_evidence.rs");
+    let start = source
+        .find("fn validate_ordinary_handoff_entry(")
+        .expect("ordinary handoff entry must exist");
+    let remainder = &source[start..];
+    let end = remainder
+        .find("\n#[test]\nfn ordinary_authority_sentinel_precedes_untrusted_artifact_reads()")
+        .expect("ordinary handoff entry must end before its first test");
+    let body = &remainder[..end];
+
+    let ordered_tokens = [
+        "let mut authority = require_ordinary_execution_authority(",
+        "let non_tool = derive_ordinary_non_tool_expectation(",
+        "let (opaque_ledger_snapshot, opaque_ledger_bytes) = checked_read(",
+        "let probed = OrdinaryProbePermit {",
+        ".consume()?;",
+        "let archive_permit = validate_probed_ordinary_ledger(",
+        "validate_ordinary_supply_archives(",
+        "let (ledger_recheck_snapshot, ledger_recheck_bytes) = checked_read(",
+        "let ledger_recheck = validate_control_ledger_bytes(",
+        "revalidate_ordinary_producer_acquisition(",
+        "tool_reprobe.require_unchanged()?;",
+        "match run_verifier()",
+    ];
+    let mut cursor = 0;
+    for token in ordered_tokens {
+        let relative = body[cursor..]
+            .find(token)
+            .unwrap_or_else(|| panic!("missing or reordered ordinary authority token: {token}"));
+        cursor += relative + token.len();
+    }
 }
 
 fn live_authoring_marker_text(repository_root: &Path) -> String {
@@ -84496,7 +87304,7 @@ fn ordinary_live_authoring_marker_rebind_remains_pending_before_ledger_open() {
 /// pure permit happy path is therefore exercised on the qualified platform.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn ordinary_execution_permit_issues_after_tool_path_and_control_expectation_join() {
+fn ordinary_preledger_authority_issues_after_path_and_control_join() {
     let repository_root = repository_root();
     let marker = live_authoring_marker_text(&repository_root);
     let environment = BootstrapEnvironment {
@@ -84513,7 +87321,7 @@ fn ordinary_execution_permit_issues_after_tool_path_and_control_expectation_join
         "0123456789abcdef0123456789abcdef",
         &environment,
     )
-    .expect("complete pure ordinary authority must issue a single-use permit");
+    .expect("complete pure ordinary authority must issue pre-ledger authority");
     assert_eq!(permit.mode, BootstrapMode::Produce);
     assert_eq!(permit.control.role, "integration-producer");
     assert_eq!(permit.control.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
@@ -84523,9 +87331,7 @@ fn ordinary_execution_permit_issues_after_tool_path_and_control_expectation_join
         permit.control.control_ledger_relative,
         ".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef/control-ledger.bin"
     );
-    // Consume is single-use by ownership; marker rebind remains available to the caller.
-    let consumed = permit.consume();
-    assert_eq!(consumed.policy.byte_length, FROZEN_POLICY_BYTES as u64);
+    assert_eq!(permit.marker.policy.byte_length, FROZEN_POLICY_BYTES as u64);
 }
 
 #[test]
@@ -84560,6 +87366,722 @@ fn ordinary_evidence_dispatch_code_is_named_and_stable() {
     let code = "E_ORDINARY_EVIDENCE";
     assert!(entry_diagnostic_code_is_valid(code) || code.starts_with("E_ORDINARY_"));
     assert_ne!(code, "E_ORDINARY_HANDOFF_PENDING");
+}
+
+#[test]
+fn ordinary_entry_failures_map_to_first_class_product_stages() {
+    let cases = [
+        (
+            "E_ORDINARY_HANDOFF_PENDING",
+            "authoring authority incomplete",
+            "authority",
+        ),
+        (
+            "E_HANDOFF_TOOL_SET",
+            "twenty-tool digest mismatch",
+            "reprobe",
+        ),
+        (
+            "E_HANDOFF_LEDGER",
+            "canonical ledger mismatch",
+            "ledger",
+        ),
+        (
+            "E_HANDOFF_LEDGER_RECHECK",
+            "opaque post-probe binding failed",
+            "ledger",
+        ),
+        (
+            "E_HANDOFF_EXECUTABLE",
+            "selected_executable differs from current executable",
+            "ledger",
+        ),
+        (
+            "E_HANDOFF_ARCHIVE",
+            "archive member mismatch",
+            "archive",
+        ),
+        (
+            "E_HANDOFF_SUPPLY_RECHECK",
+            "post-archive binding mismatch",
+            "bookend",
+        ),
+        (
+            "E_HANDOFF_LEDGER_RECHECK",
+            "post-archive complete validator failed",
+            "bookend",
+        ),
+        (
+            "E_UNQUALIFIED_PLATFORM",
+            "ordinary control-tree observation requires Linux x86_64",
+            "authority",
+        ),
+        (
+            "E_UNQUALIFIED_PLATFORM",
+            "ordinary native-tool probes require Linux x86_64",
+            "reprobe",
+        ),
+        (
+            "E_UNQUALIFIED_PLATFORM",
+            "ordinary control-tree rebind requires Linux x86_64",
+            "ledger",
+        ),
+        (
+            "E_UNQUALIFIED_PLATFORM",
+            "ordinary post-archive tree rebind requires Linux x86_64",
+            "bookend",
+        ),
+        (
+            "E_UNQUALIFIED_PLATFORM",
+            "ordinary native-tool revalidation requires Linux x86_64",
+            "bookend",
+        ),
+        (
+            "E_ORDINARY_EVIDENCE",
+            "offline matrix failed",
+            "evidence",
+        ),
+        (
+            "E_ENTRY_ARGUMENTS",
+            "invalid argument count",
+            "authority",
+        ),
+        (
+            "E_ENTRY_PANIC",
+            "panic payload suppressed",
+            "authority",
+        ),
+    ];
+    for (code, detail, expected) in cases {
+        assert_eq!(ordinary_entry_diagnostic_stage(code, detail), expected);
+    }
+    assert_eq!(
+        ordinary_entry_diagnostic_stage(
+            "E_HANDOFF_EXECUTABLE",
+            "current executable differs from argv[0]",
+        ),
+        "authority",
+    );
+}
+
+#[test]
+fn ordinary_native_tool_descriptor_authority_is_exact_and_pure() {
+    ordinary_native_tool_descriptor_authority()
+        .expect("compiled twenty-tool descriptor authority");
+    for result in [
+        validate_ordinary_native_tool_descriptor_authority(
+            ORDINARY_NATIVE_TOOL_COUNT - 1,
+            ORDINARY_NATIVE_TOOL_REGISTRY_BYTES,
+            ORDINARY_NATIVE_TOOL_REGISTRY_SHA256,
+        ),
+        validate_ordinary_native_tool_descriptor_authority(
+            ORDINARY_NATIVE_TOOL_COUNT,
+            ORDINARY_NATIVE_TOOL_REGISTRY_BYTES - 1,
+            ORDINARY_NATIVE_TOOL_REGISTRY_SHA256,
+        ),
+        validate_ordinary_native_tool_descriptor_authority(
+            ORDINARY_NATIVE_TOOL_COUNT,
+            ORDINARY_NATIVE_TOOL_REGISTRY_BYTES,
+            "afae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f",
+        ),
+    ] {
+        let error = result.expect_err("descriptor pin drift must fail closed");
+        assert!(error.starts_with("E_HANDOFF_TOOL_SET:"));
+    }
+}
+
+/// B-R1 pure half: 20-row compiled table + registry pin join without live I/O.
+#[test]
+fn ordinary_reprobe_dual_path_pure_authority_aligns_table_and_registry() {
+    let pure = ordinary_reprobe_dual_path_pure_authority()
+        .expect("pure dual-path readiness must pass offline");
+    assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(pure.registry_byte_length, ORDINARY_NATIVE_TOOL_REGISTRY_BYTES);
+    assert_eq!(
+        lower_hex(&pure.registry_sha256),
+        ORDINARY_NATIVE_TOOL_REGISTRY_SHA256,
+    );
+    assert_eq!(
+        super::trust_std::NATIVE_TOOL_DESCRIPTORS.len(),
+        ORDINARY_NATIVE_TOOL_COUNT,
+    );
+    // Closed-PATH pure grammar remains independent of live inventory.
+    ordinary_closed_path_toolchain_authority(
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    )
+    .expect("pure closed PATH grammar");
+    let env_digest = ordinary_environment_set_digest();
+    assert_ne!(env_digest, [0; 32], "environment_set digest must be nonzero");
+    let control = ordinary_control_ledger_expectation_authority(
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        env_digest,
+    )
+    .expect("pure ControlLedgerExpectation field join");
+    assert_eq!(control.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(control.handoff_argv_arity, ORDINARY_HANDOFF_ARGV_ARITY);
+    assert_eq!(control.role, "integration-producer");
+    assert_ne!(control.environment_set_sha256, [0; 32]);
+    assert_ne!(control.process_id, 0);
+}
+
+/// B-R2 sealed full-field ControlLedgerExpectation join (pure tier, no ledger/FS).
+#[test]
+fn ordinary_sealed_control_ledger_expectation_joins_all_live_fields() {
+    let run_id = "0123456789abcdef0123456789abcdef";
+    let env_digest = ordinary_environment_set_digest();
+    let control = ordinary_control_ledger_expectation_authority(
+        BootstrapMode::Produce,
+        run_id,
+        env_digest,
+    )
+    .expect("pure control authority");
+    let repository_root = PathBuf::from("/repo/fastmcp_rust");
+    let bootstrap_environment = BootstrapEnvironment {
+        authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
+        closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let expectation = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Produce,
+        &repository_root,
+        &control,
+        ordinary_sealed_nonzero_digest(0x61),
+        [0; 32],
+        ordinary_sealed_nonzero_digest(0x62),
+        "/toolchains/nightly-2026-07-11/bin/cargo",
+        bootstrap_environment.clone(),
+    )
+    .expect("Produce sealed full-field join");
+    // Every live ControlLedgerExpectation field is populated and layout-joined.
+    assert_eq!(expectation.mode, BootstrapMode::Produce);
+    assert_eq!(expectation.repository_root, repository_root);
+    assert_eq!(expectation.run_id, run_id);
+    assert_eq!(expectation.process_id, control.process_id);
+    assert_ne!(expectation.authoring_closure_sha256, [0; 32]);
+    assert_eq!(expectation.integration_seal_sha256, [0; 32]);
+    assert_eq!(expectation.scratch_bindings.len(), 5);
+    assert!(expectation.scratch_bindings[0].path.ends_with("/Cargo.toml"));
+    assert_eq!(expectation.local_registry.id, "sealed-local-registry");
+    assert!(expectation
+        .local_registry
+        .path
+        .contains("/.fnd01-run/integration-producer/"));
+    assert!(expectation.supply_bundle.path.ends_with("/supply-bundle.bin"));
+    assert_ne!(expectation.tool_set_sha256, [0; 32]);
+    assert_eq!(expectation.environment_set_sha256, env_digest);
+    assert_eq!(
+        expectation.cargo_executable,
+        "/toolchains/nightly-2026-07-11/bin/cargo"
+    );
+    assert!(!expectation.build_environment.is_empty());
+    assert!(expectation
+        .selected_executable
+        .path
+        .ends_with("/debug/fnd_01_evidence_harness"));
+    assert_eq!(
+        expectation.target_snapshot.path,
+        expectation
+            .selected_executable
+            .path
+            .rsplit_once("/debug/")
+            .expect("selected under target")
+            .0
+    );
+    assert_eq!(expectation.bootstrap_environment, bootstrap_environment);
+    assert!(expectation.acquisition_spool_binding.is_some());
+    // Mode matrix: Attest requires nonzero seal and no spool.
+    let attest_control = ordinary_control_ledger_expectation_authority(
+        BootstrapMode::Attest,
+        run_id,
+        env_digest,
+    )
+    .expect("attest pure control");
+    let attest_env = BootstrapEnvironment {
+        authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
+        closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+        integration_seal: Some("FND01SEALv1:fixture".to_owned()),
+        producer_outer_record_path: Some(format!(
+            ".fnd01-run/controller/{run_id}/producer-outer.bin"
+        )),
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let attest = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Attest,
+        &repository_root,
+        &attest_control,
+        ordinary_sealed_nonzero_digest(0x71),
+        ordinary_sealed_nonzero_digest(0x72),
+        ordinary_sealed_nonzero_digest(0x73),
+        "/toolchains/nightly-2026-07-11/bin/cargo",
+        attest_env,
+    )
+    .expect("Attest sealed full-field join");
+    assert_ne!(attest.integration_seal_sha256, [0; 32]);
+    assert!(attest.acquisition_spool_binding.is_none());
+    assert_eq!(attest.local_registry.id, "sealed-local-registry");
+    // Fail-closed: Gate, zero digests, incomplete env, relative cargo.
+    let gate_err = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Gate,
+        &repository_root,
+        &control,
+        ordinary_sealed_nonzero_digest(1),
+        [0; 32],
+        ordinary_sealed_nonzero_digest(2),
+        "/toolchains/nightly-2026-07-11/bin/cargo",
+        bootstrap_environment.clone(),
+    )
+    .expect_err("Gate cannot seal ordinary expectation");
+    assert!(
+        gate_err.starts_with("E_ORDINARY_HANDOFF_PENDING:"),
+        "{gate_err}"
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_ORDINARY_HANDOFF_PENDING", &gate_err),
+        "authority",
+    );
+    let zero_tool = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Produce,
+        &repository_root,
+        &control,
+        ordinary_sealed_nonzero_digest(1),
+        [0; 32],
+        [0; 32],
+        "/toolchains/nightly-2026-07-11/bin/cargo",
+        bootstrap_environment.clone(),
+    )
+    .expect_err("zero tool_set must fail closed");
+    assert!(zero_tool.contains("tool_set_sha256"), "{zero_tool}");
+    let relative_cargo = ordinary_sealed_control_ledger_expectation_join(
+        BootstrapMode::Produce,
+        &repository_root,
+        &control,
+        ordinary_sealed_nonzero_digest(1),
+        [0; 32],
+        ordinary_sealed_nonzero_digest(2),
+        "cargo",
+        bootstrap_environment,
+    )
+    .expect_err("relative cargo must fail closed");
+    assert!(relative_cargo.contains("cargo_executable"), "{relative_cargo}");
+}
+
+/// B-R2 sealed production e2e: encode a synthetic FND01CONTROLv2 ledger from a
+/// sealed expectation, join the Cargo build stream via production
+/// `join_control_build_stream`, and fully validate with
+/// `validate_control_ledger_bytes` → `ValidatedControlLedger`.
+/// // B-R2-SEALED
+#[test]
+fn ordinary_b_r2_sealed_production_control_ledger_e2e() {
+    let (expectation, ledger_bytes, package_root, target_root) =
+        ordinary_sealed_produce_control_fixture()
+            .expect("sealed produce control fixture must encode");
+    assert!(!ledger_bytes.is_empty());
+    assert!(ledger_bytes.starts_with(CONTROL_LEDGER_PREFIX));
+    let joined = join_control_build_stream(
+        // Re-derive the same synthetic stdout that the fixture encoded.
+        ordinary_sealed_control_build_stdout(
+            &package_root,
+            &target_root,
+            &expectation.selected_executable.path,
+        )
+        .as_bytes(),
+        &package_root,
+        &target_root,
+        &expectation.selected_executable.path,
+    )
+    .expect("production join_control_build_stream must accept sealed cargo stdout");
+    assert_eq!(joined.message_count, 2);
+    assert_eq!(
+        joined.artifact.executable,
+        expectation.selected_executable.path
+    );
+    assert!(joined.finished.success);
+    assert_eq!(joined.finished.line_ordinal, 2);
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_LEDGER", "complete validator"),
+        "ledger",
+    );
+    let validated = validate_control_ledger_bytes(&ledger_bytes, &expectation)
+        .expect("production validate_control_ledger_bytes must accept sealed ledger");
+    assert_eq!(validated.role, "integration-producer");
+    assert_eq!(validated.run_id, expectation.run_id);
+    assert_eq!(validated.process_id, expectation.process_id);
+    assert_eq!(
+        validated.authoring_closure_sha256,
+        expectation.authoring_closure_sha256
+    );
+    assert_eq!(validated.tool_set_sha256, expectation.tool_set_sha256);
+    assert_eq!(
+        validated.environment_set_sha256,
+        expectation.environment_set_sha256
+    );
+    assert_eq!(validated.cargo_message_count, joined.message_count);
+    assert_eq!(
+        validated.cargo_message_set_sha256,
+        joined.message_set_sha256
+    );
+    assert_eq!(validated.compiler_artifact, joined.artifact);
+    assert_eq!(validated.build_finished, joined.finished);
+    assert_eq!(validated.selected_executable, expectation.selected_executable);
+    assert_eq!(validated.target_snapshot, expectation.target_snapshot);
+    assert_eq!(validated.local_registry, expectation.local_registry);
+    assert_eq!(validated.supply_bundle, expectation.supply_bundle);
+    assert_eq!(validated.build_exit_code, 0);
+    assert_eq!(
+        validated.build_working_directory,
+        package_root
+    );
+    assert_eq!(
+        validated.handoff_argv,
+        expected_ordinary_handoff_argv(
+            BootstrapMode::Produce,
+            &expectation.selected_executable.path,
+            &expectation.run_id,
+        )
+        .expect("handoff argv")
+    );
+    // Fail-closed: empty / wrong-prefix / truncated ledgers never pass.
+    let empty_err = validate_control_ledger_bytes(b"", &expectation)
+        .expect_err("empty ledger must fail closed");
+    assert!(
+        empty_err.to_string().contains("E_")
+            || format!("{empty_err}").contains("control"),
+        "{empty_err}"
+    );
+    let mut wrong_prefix = ledger_bytes.clone();
+    wrong_prefix[0] = b'X';
+    assert!(
+        validate_control_ledger_bytes(&wrong_prefix, &expectation).is_err(),
+        "wrong prefix must fail closed"
+    );
+    // ordinary_archive_validation_rule surface stays production-wired in the
+    // handoff path (validate_ordinary_supply_archives after ledger admit). Empty
+    // archive sets validate with zero members; non-empty wrong digests fail closed
+    // (covered by existing ordinary supply archive unit tests).
+    let empty_archives = OrdinarySupplyFraming {
+        bootstrap_lock_payload_offset: 0,
+        bootstrap_lock_byte_length: 0,
+        bootstrap_lock_sha256: [0; 32],
+        acquisition_root_entry_count: 0,
+        acquisition_root_total_regular_file_bytes: 0,
+        acquisition_root_set_sha256: [0; 32],
+        sparse_config_path: String::new(),
+        sparse_config_payload_offset: 0,
+        sparse_config_byte_length: 0,
+        sparse_config_sha256: [0; 32],
+        lock_triples: Vec::new(),
+        entry_count: 0,
+        total_payload_bytes: 0,
+        inner_entry_set_sha256: [0; 32],
+        closure_bijection_sha256: [0; 32],
+        entries: Vec::new(),
+        closure_rows: Vec::new(),
+        archives: Vec::new(),
+    };
+    validate_ordinary_supply_archives(&[], &empty_archives)
+        .expect("empty supply archive set must validate with zero members");
+}
+
+/// B-R3 pure tier: compose dual-path pure authority + pure ControlLedgerExpectation
+/// field join + environment digest without ledger/FS/network children.
+/// // B-R3-PURE
+#[test]
+fn ordinary_b_r3_pure_matrix_composes_dual_path_and_control_join() {
+    let pure = ordinary_reprobe_dual_path_pure_authority()
+        .expect("B-R3 pure dual-path");
+    assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    let env_digest = ordinary_environment_set_digest();
+    assert_ne!(env_digest, [0; 32]);
+    let control = ordinary_control_ledger_expectation_authority(
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        env_digest,
+    )
+    .expect("B-R3 pure control join");
+    assert_eq!(control.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(control.handoff_argv_arity, ORDINARY_HANDOFF_ARGV_ARITY);
+    assert_eq!(control.role, "integration-producer");
+    assert_ne!(control.process_id, 0);
+    ordinary_closed_path_toolchain_authority(
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    )
+    .expect("B-R3 pure closed PATH");
+    assert_eq!(
+        ordinary_entry_diagnostic_stage(
+            "E_ORDINARY_HANDOFF_PENDING",
+            "pure authority incomplete",
+        ),
+        "authority",
+    );
+}
+
+/// B-R3 sealed tier: reuse sealed ControlLedgerExpectation tables and production
+/// validate_control_ledger_bytes on the encoded sealed fixture.
+/// // B-R3-SEALED
+#[test]
+fn ordinary_b_r3_sealed_matrix_reuses_sealed_tables_and_production_validator() {
+    let (expectation, ledger_bytes, _package_root, _target_root) =
+        ordinary_sealed_produce_control_fixture()
+            .expect("B-R3 sealed fixture");
+    assert_eq!(expectation.mode, BootstrapMode::Produce);
+    assert_eq!(expectation.local_registry.id, "sealed-local-registry");
+    assert!(expectation.acquisition_spool_binding.is_some());
+    assert_ne!(expectation.tool_set_sha256, [0; 32]);
+    assert_ne!(expectation.authoring_closure_sha256, [0; 32]);
+    let validated = validate_control_ledger_bytes(&ledger_bytes, &expectation)
+        .expect("B-R3 sealed production validator");
+    assert_eq!(validated.role, "integration-producer");
+    assert_eq!(validated.scratch_bindings.len(), 5);
+    assert!(validated.acquisition_spool.present);
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_LEDGER", "sealed join"),
+        "ledger",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_ARCHIVE", "archive member"),
+        "archive",
+    );
+}
+
+/// B-R3 live tier: pure dual-path readiness then live reprobe residual that is
+/// either Ok(nonzero digests) on qualified hosts or fail-closed platform/tool codes.
+/// // B-R3-LIVE
+#[test]
+fn ordinary_b_r3_live_matrix_dual_path_then_reprobe_residual() {
+    let pure = ordinary_reprobe_dual_path_pure_authority()
+        .expect("B-R3 live pure half first");
+    assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    let repository_root = repository_root();
+    let result = ordinary_reprobe_tool_set_shared(
+        &repository_root,
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    );
+    match result {
+        Ok(reprobe) => {
+            assert_ne!(reprobe.tool_set_sha256, [0; 32]);
+            assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
+            assert_eq!(
+                ordinary_entry_diagnostic_stage("E_HANDOFF_TOOL_SET", "digest"),
+                "reprobe",
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.starts_with("E_UNQUALIFIED_PLATFORM:")
+                    || error.starts_with("E_HANDOFF_TOOL_SET:"),
+                "B-R3 live residual unexpected: {error}",
+            );
+            let code = if error.starts_with("E_UNQUALIFIED_PLATFORM:") {
+                "E_UNQUALIFIED_PLATFORM"
+            } else {
+                "E_HANDOFF_TOOL_SET"
+            };
+            let stage = ordinary_entry_diagnostic_stage(
+                code,
+                "ordinary native-tool probes require Linux x86_64",
+            );
+            assert!(
+                stage == "reprobe" || stage == "authority",
+                "live residual stage={stage} error={error}",
+            );
+        }
+    }
+}
+
+/// B-R1 live half: unqualified hosts must fail closed at reprobe stage with
+/// E_UNQUALIFIED_PLATFORM after pure dual-path readiness succeeds. On Linux
+/// x86_64 the live inventory path may proceed (execution-bin may still fail).
+#[test]
+fn ordinary_reprobe_live_half_unqualified_or_execution_bin_fail_closed() {
+    let pure = ordinary_reprobe_dual_path_pure_authority()
+        .expect("pure dual-path must pass before live half");
+    assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
+    let repository_root = repository_root();
+    let result = ordinary_reprobe_tool_set_shared(
+        &repository_root,
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    );
+    match result {
+        Ok(reprobe) => {
+            // Qualified platform with a complete execution-bin surface.
+            assert_ne!(reprobe.tool_set_sha256, [0; 32]);
+            assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                assert_eq!(
+                    reprobe.inventory.native_tool_count(),
+                    ORDINARY_NATIVE_TOOL_COUNT,
+                );
+            }
+        }
+        Err(error) => {
+            // Pure half already joined; residual must be live inventory /
+            // platform / execution-bin, never a silent pure-table skip.
+            assert!(
+                error.starts_with("E_UNQUALIFIED_PLATFORM:")
+                    || error.starts_with("E_HANDOFF_TOOL_SET:"),
+                "unexpected live dual-path residual: {error}",
+            );
+            if error.starts_with("E_UNQUALIFIED_PLATFORM:") {
+                assert_eq!(
+                    ordinary_entry_diagnostic_stage(
+                        "E_UNQUALIFIED_PLATFORM",
+                        "ordinary native-tool probes require Linux x86_64",
+                    ),
+                    "reprobe",
+                );
+            }
+        }
+    }
+}
+
+/// B-R4 product stages remain first-class entry_diagnostic_stage tokens and
+/// must not collapse ordinary fail-closed codes to the legacy "ordinary" stage.
+#[test]
+fn ordinary_product_stages_are_first_class_entry_tokens() {
+    for stage in [
+        "authority",
+        "reprobe",
+        "ledger",
+        "archive",
+        "bookend",
+        "evidence",
+    ] {
+        // entry_diagnostic_stage is private to trust_std; ordinary mapping is
+        // the product surface.  Unknown codes still default via the ordinary
+        // handoff stage mapper, but product stages themselves must be distinct.
+        assert_ne!(stage, "ordinary");
+        assert_ne!(stage, "bootstrap");
+        assert_ne!(stage, "controller");
+    }
+    // Unknown / collapsed detail must not rewrite a named product stage code
+    // into a different product stage.
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_ORDINARY_EVIDENCE", "anything"),
+        "evidence",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_TOOL_SET", "anything"),
+        "reprobe",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_ARCHIVE", "anything"),
+        "archive",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage(
+            "E_ORDINARY_HANDOFF_PENDING",
+            "authoring authority incomplete",
+        ),
+        "authority",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_ENTRY_ARGUMENTS", "invalid argument count"),
+        "authority",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_ENTRY_PANIC", "panic payload suppressed"),
+        "authority",
+    );
+}
+
+/// B-R4 residual: production harness_main ordinary product branches must emit
+/// product stages via the mapper — never hard-code stage=ordinary for known
+/// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures. Unknown codes may still default
+/// to ordinary inside entry_diagnostic_stage itself.
+#[test]
+fn ordinary_harness_main_product_failures_emit_authority_stage() {
+    let source = include_str!("fnd_01_dependency_evidence.rs");
+    let start = source
+        .find("pub fn harness_main<I>(arguments: I) -> i32")
+        .expect("harness_main must exist");
+    let body = &source[start..];
+    let end = body
+        .find("} // mod ordinary")
+        .expect("harness_main must end inside ordinary module");
+    let body = &body[..end];
+    // Known product failures route through the product-stage mapper.
+    assert!(
+        body.contains("ordinary_entry_diagnostic_stage(code, detail)"),
+        "harness_main must use ordinary_entry_diagnostic_stage for product failures",
+    );
+    assert!(
+        body.contains("\"E_ENTRY_ARGUMENTS\""),
+        "malformed arity must emit E_ENTRY_ARGUMENTS",
+    );
+    assert!(
+        body.contains("\"E_ENTRY_PANIC\""),
+        "panic path must emit E_ENTRY_PANIC",
+    );
+    // No hard-coded stage=ordinary at ordinary product call sites (branches 3/4).
+    assert!(
+        !body.contains("emit_entry_diagnostic(\n                    \"ordinary\","),
+        "harness_main must not hard-code stage=ordinary for ordinary product failures",
+    );
+    // Runtime fail-closed: wrong arity is never success (exit 3).
+    let code = harness_main([
+        std::ffi::OsString::from("/tmp/fnd01-harness"),
+        std::ffi::OsString::from("produce"),
+    ]);
+    assert_eq!(code, 3);
+}
+
+/// B-R5 residual: after OrdinaryProbePermit.consume and archive validation,
+/// happy-path terminal failures use E_ORDINARY_EVIDENCE — never reintroduce a
+/// permanent E_ORDINARY_HANDOFF_PENDING stub past consume.
+#[test]
+fn ordinary_post_consume_terminal_uses_evidence_not_permanent_handoff() {
+    let source = include_str!("fnd_01_dependency_evidence.rs");
+    let start = source
+        .find("fn validate_ordinary_handoff_entry(")
+        .expect("ordinary handoff entry must exist");
+    let remainder = &source[start..];
+    let end = remainder
+        .find("\n#[test]\nfn ordinary_authority_sentinel_precedes_untrusted_artifact_reads()")
+        .expect("ordinary handoff entry must end before its first test");
+    let body = &remainder[..end];
+    let consume = body
+        .find(".consume()?;")
+        .expect("probe permit consume must exist");
+    let after_consume = &body[consume..];
+    // Evidence dispatch is the terminal happy-path failure surface after consume.
+    assert!(
+        after_consume.contains("match run_verifier()"),
+        "post-consume path must dispatch evidence matrix",
+    );
+    assert!(
+        after_consume.contains("E_ORDINARY_EVIDENCE"),
+        "post-consume evidence failures must use E_ORDINARY_EVIDENCE",
+    );
+    // Permanent HANDOFF_PENDING stubs must not appear as hard returns after consume
+    // on the happy path. Pre-consume HANDOFF_PENDING strings may still appear earlier.
+    let permanent_stub = after_consume
+        .lines()
+        .any(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with("return Err(")
+                || trimmed.starts_with("Err(")
+                || trimmed.contains("return Err(format!"))
+                && line.contains("E_ORDINARY_HANDOFF_PENDING")
+                && !line.trim_start().starts_with("//")
+        });
+    assert!(
+        !permanent_stub,
+        "post-consume path must not reintroduce permanent E_ORDINARY_HANDOFF_PENDING returns",
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_ORDINARY_EVIDENCE", "offline matrix failed"),
+        "evidence",
+    );
 }
 
 fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
@@ -84772,13 +88294,10 @@ fn ordinary_reprobe_tool_set_shared(
     run_id: &str,
     closed_path: &str,
 ) -> Result<OrdinaryToolReprobe, String> {
-    // Keep the standalone pure-table probe path linked: its embedded 20-row
-    // candidate table is the cardinality source for ORDINARY_NATIVE_TOOL_COUNT
-    // audits and ordinary_tool_reprobe_rule dual-path readiness.
-    let _table_probe: fn(&Path, &str, &Path) -> Result<([u8; 32], AcquisitionToolPaths), String> =
-        ordinary_reprobe_tool_set;
-    let _ = _table_probe;
-    debug_assert_eq!(ORDINARY_NATIVE_TOOL_COUNT, 20);
+    // Pure dual-path readiness (20-row table + registry pin) runs before the
+    // live inventory. No ledger-selected inputs, filesystem access, or children.
+    let pure = ordinary_reprobe_dual_path_pure_authority()?;
+    debug_assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let inventory =
@@ -84791,6 +88310,16 @@ fn ordinary_reprobe_tool_set_shared(
             .map_err(|error| {
                 format!("E_HANDOFF_TOOL_SET: {error}")
             })?;
+        // Live dual-path cardinality must join the pure 20-row table exactly.
+        if inventory.native_tool_count() != pure.native_tool_count
+            || inventory.native_tool_count() != ORDINARY_NATIVE_TOOL_COUNT
+        {
+            return Err(format!(
+                "E_HANDOFF_TOOL_SET: live inventory cardinality {} != pure dual-path count {}",
+                inventory.native_tool_count(),
+                pure.native_tool_count,
+            ));
+        }
         let reprobe = OrdinaryToolReprobe {
             tool_set_sha256: inventory.tool_set_sha256(),
             execution_bin_sha256: inventory.execution_bin_sha256(),
@@ -84799,9 +88328,11 @@ fn ordinary_reprobe_tool_set_shared(
         };
         // Surface execution_bin_sha256 in a pure nonzero gate so the field is
         // not dead while inventory remains the sole live digest source.
-        if reprobe.execution_bin_sha256 == [0; 32] && reprobe.tool_set_sha256 != [0; 32] {
+        if reprobe.execution_bin_sha256 == [0; 32]
+            || reprobe.tool_set_sha256 == [0; 32]
+        {
             return Err(
-                "E_HANDOFF_TOOL_SET: execution-bin digest must be nonzero when tool_set is bound"
+                "E_HANDOFF_TOOL_SET: execution-bin and tool-set digests must both be nonzero"
                     .to_owned(),
             );
         }
@@ -84809,7 +88340,7 @@ fn ordinary_reprobe_tool_set_shared(
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (repository_root, mode, run_id, closed_path);
+        let _ = (repository_root, mode, run_id, closed_path, pure);
         Err(
             "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
                 .to_owned(),
@@ -84817,10 +88348,13 @@ fn ordinary_reprobe_tool_set_shared(
     }
 }
 
-/// Re-resolve and re-probe all 20 native tools; return tool_set_sha256 and the
-/// selected lexical paths needed to regenerate the acquisition plan. Mirrors
-/// produce inventory_native_tools without creating a fresh execution-bin
-/// (produce already sealed it; ordinary revalidates the existing set).
+/// Historical duplicate probe retained only as noncompiled audit context.
+///
+/// It used unbounded whole-file reads and `Command::output` without the
+/// production timeout/stream caps, so it must never become a callable fallback.
+/// `ordinary_native_tool_descriptor_authority` plus
+/// `inventory_existing_native_tools` are the only admitted pure/live paths.
+#[cfg(any())]
 fn ordinary_reprobe_tool_set(
     repository_root: &Path,
     closed_path: &str,
@@ -85765,13 +89299,17 @@ where
                 run_ordinary_handoff_entry(arguments)
             }
             // Malformed arity is never conflated with role handoff or local verifier.
+            // B-R4: known ordinary product failure → stage=authority (not collapsed
+            // stage=ordinary). Unknown codes may still default to ordinary elsewhere.
             _ => {
                 branch.set(4);
+                let code = "E_ENTRY_ARGUMENTS";
+                let detail = "invalid argument count";
                 emit_entry_diagnostic(
-                    "ordinary",
+                    ordinary_entry_diagnostic_stage(code, detail),
                     "unknown",
-                    "E_ENTRY_ARGUMENTS",
-                    "invalid argument count",
+                    code,
+                    detail,
                 );
                 3
             }
@@ -85788,18 +89326,28 @@ where
                     "E_ENTRY_PANIC",
                     "panic payload suppressed",
                 ),
-                3 => emit_entry_diagnostic(
-                    "ordinary",
-                    mode.get(),
-                    "E_ENTRY_PANIC",
-                    "panic payload suppressed",
-                ),
-                4 => emit_entry_diagnostic(
-                    "ordinary",
-                    "unknown",
-                    "E_ENTRY_PANIC",
-                    "panic payload suppressed",
-                ),
+                // Ordinary produce/attest handoff panic: product stage via mapper.
+                3 => {
+                    let code = "E_ENTRY_PANIC";
+                    let detail = "panic payload suppressed";
+                    emit_entry_diagnostic(
+                        ordinary_entry_diagnostic_stage(code, detail),
+                        mode.get(),
+                        code,
+                        detail,
+                    );
+                }
+                // Malformed-arity panic: product stage authority, not stage=ordinary.
+                4 => {
+                    let code = "E_ENTRY_PANIC";
+                    let detail = "panic payload suppressed";
+                    emit_entry_diagnostic(
+                        ordinary_entry_diagnostic_stage(code, detail),
+                        "unknown",
+                        code,
+                        detail,
+                    );
+                }
                 _ => {}
             }
             3

@@ -11,11 +11,34 @@
   `921b34a1eaec9028c85ec789bce09c114f4af295` and
   `a609b68170ea99b2ab74b3c103f56dca02ddd62e` on `main`.
 - Fresh implementation snapshot assessed:
-  `ad451a842a79624dd54811e6db9fd9afa1f764ef` on `main`, in a shared
-  dirty worktree 17 commits ahead of `origin/main`. Uncommitted FND-01
-  verifier and Beads changes were inspected in place and were not
-  treated as sealed evidence.
+  `ce5e926c55f50309708e1c0faddff9a6b5b4f1b6` on `main`, in a shared
+  dirty worktree 19 commits ahead of `origin/main`. The intervening
+  committed plan/FND-01 verifier changes and the later uncommitted plan/
+  live-Beads changes were inspected in place; none is treated as sealed
+  release or aggregate-support evidence.
 - Workspace version at audit time: `0.3.2`
+- Reality-check implementation delta (unverified shared-worktree state,
+  2026-08-01): the advisory read-only HTTP dispatch optimization has
+  been disabled. The remaining direct shared-session dispatch helper
+  holds its mutex through the handler. This closes the unsafe metadata-based
+  concurrency boundary but does not implement the target architecture.
+  The old shared-`Session` listener is now private and unreachable;
+  public `run_http*` entry points fail closed before binding. Modern
+  `LatestOnly` still needs immutable stateless per-request dispatch with
+  an independently owned request execution and child context. A bounded,
+  owner-bound Session registry belongs only to the feature-gated LEG-02
+  MCP 2025-11-25 adapter and is not a modern remedy.
+  Multi-client isolation, sibling-isolated cancellation, and
+  `await_cleanup` therefore remain partial/blocked work. The public
+  client remains subprocess-stdio-only; lower-level SSE and WebSocket
+  transport types are not public `Client` integrations.
+- Frozen dependency evidence is not current for the live dependency
+  graph: the renamed-facade macro work introduces
+  `proc-macro-crate = 3.5.0`, which is absent from the sealed FND-01
+  dependency evidence. Those sealed files must not be hand-edited.
+  Their designated producer must regenerate and independently
+  re-attest the complete evidence set before any dependency-freeze,
+  FND-01, release, or aggregate-support gate can pass.
 - Primary owner: FastMCP Rust maintainers
 - Execution tracker: the existing Beads projection is a historical,
   incomplete projection of this document. It is unsafe to mutate at the
@@ -2917,7 +2940,7 @@ tests, and CI.
 
 The repository contains approximately 131,000 lines of Rust code as of
 the 2026-07-31 reality-check pass. One FND-01 integration verifier alone
-is 85,519 physical lines, so raw test volume is no longer a useful proxy
+is 85,819 physical lines, so raw test volume is no longer a useful proxy
 for reviewability or independent evidence quality.
 
 The test inventory is substantial, but it verifies the existing
@@ -3261,14 +3284,19 @@ They must never be reachable from a modern transport policy.
 - The HTTP server constructs or uses defaults that bypass configured
   handler policy on part of the path, and the CLI can collapse failures
   into successful-looking/default output.
-- The 85,519-line FND verifier is a review, compile-time, mutation-test,
+- The 85,819-line FND verifier is a review, compile-time, mutation-test,
   and package-size concentration risk. Its normative evidence corpus,
   parser, independent negative oracles, and integration wiring must be
   decomposed into reviewable bounded units without weakening the gate.
+- Current `ce5e926` FND-harness work does add a typed non-Clone/Copy
+  ordinary-execution permit, closed-path/tool and control-ledger joins,
+  and a twenty-tool reprobe path that can reach the verifier. That is
+  genuine partial `.1.14` evidence-harness progress, not FND-01 closure,
+  runtime migration, or aggregate MCP 2026-07-28 support.
 
 ### 7.22 Tracker and release-control gaps found on 2026-07-31
 
-- The revised formal MCP plan contains 129 packages and 662 package
+- The revised formal MCP plan contains 129 packages and 663 package
   dependencies, but the historical tracker maps only the older 122-
   package/606-edge revision; none of the 129 has current synchronized
   completion evidence.
@@ -3294,6 +3322,56 @@ They must never be reachable from a modern transport policy.
   accidentally treat a tag/manual dispatch as release authorization.
   Main-branch edits cannot disable historical-ref YAML or disposition a
   pre-quarantine queued/in-progress run.
+
+### 7.23 Reality-check vision checklist
+
+This checklist applies the reality-check status vocabulary to the
+observable 2026-07-31/2026-08-01 repository, not to intended work or
+Bead labels. `WORKING` means usable evidence exists for that narrow
+item; it never implies aggregate MCP 2026-07-28 support.
+
+| Vision item | Status | Observable reality | Bridge owner |
+|---|---|---|---|
+| Workspace crate boundaries and basic legacy registration/dispatch primitives | `WORKING` | Nine coherent crates, substantial handlers/transports/tests, and reusable insertion-order/catalog machinery exist | preserve through FND/SRV/API packages |
+| MCP 2026-07-28 version, stateless lifecycle, discovery, and per-request negotiation | `NOT_STARTED` | production constant is `2024-11-05`; initialize/session is mandatory; `server/discover` is absent | FND-03, PRT-02/03, SRV-01/02, CLT-02 |
+| Strict directional JSON-RPC unions and final official schema fidelity | `WRONG_APPROACH` | optional IDs and permissive envelope/result combinations encode invalid states; schema validator is explicitly partial | PRT-01 through PRT-05, SCH-01 through SCH-03 |
+| Consumer-owned asupersync structured concurrency and cancel correctness | `WRONG_APPROACH` | ambient global runtime/block-on, synchronous transports, OS-thread-per-connection paths, and runtime-minting task code violate the target authority model | FND-04/05, LIMIT-01, STD-01, HTTP-01/03, TASK-02 |
+| Modern server plus stdio/Streamable-HTTP behavior | `PARTIAL` | substantial legacy server/framing code exists, but lifecycle, request-scoped SSE, routing headers, cancellation, auth ingress, and configured-policy propagation are wrong or absent; production paths block on async handlers and HTTP JSON serialization can silently become an empty body | SRV-01 through SRV-04, SRV-MW-01, STD-01, HTTP-01 through HTTP-06, XPORT-01 |
+| Modern concurrent client, era discovery, HTTP client, MRTR, and subscriptions | `STUB` | current child-stdio client initializes through temporary/placeholder sessions, is not a safe concurrent modern dispatcher, and has no `server/discover`, `subscriptions/listen`, modern HTTP, or MRTR implementation | CLT-01/02, MRTR-01 through MRTR-03, SUB-01 through SUB-03 |
+| Tool/resource/prompt/completion ergonomics and facade-only macros | `PARTIAL` | legacy registration is useful, but final result/schema/cache shapes are absent; macros block on ambient runtime and name component crates directly; README handler examples do not type-check as written | TOOL/RES/PRM/CMP, MAC-01, API-01, DX-TEST-01 |
+| Authorization, token custody, OAuth/OIDC, and cache partitioning | `PARTIAL` | useful primitives exist, but credentials cross synthetic JSON/state boundaries and issuer/resource/audience, SSRF, RFC metadata, custody, and cache invariants are incomplete | AUTH-00 through AUTH-07, CACHE-01 through CACHE-03, FND-06/09 |
+| Tasks, proxy, and optional extension profiles | `PARTIAL` | legacy/custom implementations exist but use obsolete core Tasks/reverse-call/session semantics and cannot support the planned claim boundaries | EXT-01; TASK-01, TASK-02, TASK-03, TASKP-01, and TASKR-01; PXY-01 through PXY-04; and the independent optional gates |
+| Facade/downstream usability and production-faithful public testing | `REGRESSED` | facade exports runtime/test authority, generated macro paths undermine a renamed facade-only consumer, and current facade trace round trips fail | API-01, EXT-DEV-01, DX-TEST-01, MAC-01 |
+| CLI run/dev/install/inspect behavior | `PARTIAL` | substantial parsing/rendering exists, but inspect converts list failures to empty catalogs, the current dev hot-reload E2E times out, and the advertised example command does not exist | CLI-01, DX-TEST-01, TST-03, DOC-01/02 |
+| Workspace CI, conformance, interoperability, and clean test evidence | `REGRESSED` | local RCH sweeps have check warnings, clippy failures, CLI e2e failure, and facade trace failures; latest observed origin/main CI is red and its audit job masks failure | TST-01 through TST-04, CONF-01/02, INTEROP-01, CI-BASE-01, CI-CORE-01, and CI-FINAL-CORE-01 |
+| Bounded operations, capacity, performance, and soak evidence | `NOT_STARTED` | no modern-profile health/readiness/metrics contract or reproducible capacity/saturation/soak baseline exists | OPS-01, PERF-01 |
+| Truthful documentation and support claims | `REGRESSED` | README advertises cancel correctness, automatic timeout, zero-copy, and examples that current code/evidence do not establish; feature-parity text is internally inconsistent | DOC-01/02 plus all prerequisite gates |
+| Safe, licensed, resumable, independently verified publication | `WRONG_APPROACH` | active historical tag/manual publisher has ambient mutation reach; current license representations conflict; immutable `0.3.2` artifacts already expose a metadata/README/missing-file contradiction | REL-QUAR-00, REL-PREP-01, REL-01, REL-02 |
+| Current tracker representation of the revised plan | `NO_BEAD` | seven formal packages are absent, 24 FND provenance edges are missing, and multiple evidence-bearing children are closed without the required receipts | Section 36 rematerialization/refinement ceremony |
+| Published stable MCP 2026-07-28 product | `NOT_STARTED` | crates.io remains the old `0.3.2` family and neither the local tree nor provider evidence satisfies the modern stable profile | complete the self-inclusive 84-package profile and separately authorize/read back the exact `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)` success pair |
+
+### 7.24 Gap classification and bridge plan
+
+The rest of this document is the executable bridge plan. Its major
+tracks close the checklist gaps in this order:
+
+| Gap class | Formal bridge | Required exit evidence |
+|---|---|---|
+| Runtime, custody, limits, filesystem, crypto | FND-01 through FND-09 and LIMIT-01 | consumer-owned `&Cx`, bounded admission, dependency/custody receipts, no prohibited graph |
+| Wire model and schema | PRT-01 through PRT-05, HDR-01, SCH-01 through SCH-03 | byte-pinned official-schema parity, strict unions, bounded validators and mutation oracles |
+| Server/client/transports | SRV, CLT, STD, HTTP, XPORT, MRTR, SUB | raw-wire, cancellation, concurrency, era, and request-stream matrices |
+| User-facing MCP domains | TOOL, RES, PRM, CMP, OBS | final discriminated results, MRTR/cache/metadata behavior, handler and catalog evidence |
+| Authorization and cache safety | AUTH-00 through AUTH-07, CACHE-01 through CACHE-03 | issuer/resource/principal binding, custody/SSRF/step-up tests, partitioned invalidation |
+| Extensions, macros, facade, CLI, downstream DX | EXT-01, EXT-DEV-01, MAC-01, API-01, CLI-01, DX-TEST-01 | facade-only and renamed-dependency packaged consumers, safe out-of-tree extension and public test contracts |
+| Qualification | TST, GATE-CORE-READY, CONF, INTEROP, OPS, PERF, CI packages | zero baseline, nonempty exact scenario inventories, supported-platform/docs/security/capacity/soak evidence |
+| Claims and delivery | DOC-01/02, REL-QUAR-00, REL-PREP-01, REL-01, REL-02 | evidence-derived docs, quarantined ambient publisher, sealed candidate, separately authorized transaction, independent cleanup/docs observation, terminal rollback anchor |
+
+Completing every issue that is merely open in the current tracker would
+not close the vision gap. That tracker is a stale projection of an older
+122-package graph, omits seven packages and required edges, and contains
+unsupported closed evidence states. Only a safely reconciled,
+deterministically rematerialized and refinement-verified projection of
+the current 129-package formal graph can become scheduling authority.
 
 ---
 
@@ -4339,7 +4417,7 @@ ownership:
   permanent integration point merely to evade reviewable ownership.
 
 FND-01's current verifier-authoring child requires this exception: its
-85,519-line integration verifier and exact shared policy/evidence inputs
+85,819-line integration verifier and exact shared policy/evidence inputs
 cannot honestly fit a 1,440-minute direct claim. Before rematerializing
 it, the current owner must checkpoint and hand back the fresh claim.
 Then split it into sequential, independently testable parser/corpus,
@@ -4873,8 +4951,9 @@ Dependencies:
 
 Outcome:
 
-Make the checked-in release workflow default-inert before any further
-implementation so that a tag, manual dispatch, rerun, token, ref shape,
+Make the checked-in release workflow default-inert and quarantine public
+support claims before any further implementation so that a tag, manual
+dispatch, rerun, token, ref shape,
 or new workflow invocation cannot publish crates, create a public GitHub
 release, upload public assets, create or move tags, or otherwise mutate
 an external release surface. A pre-quarantine queued or in-progress run
@@ -4893,6 +4972,12 @@ CI-BASE-01 depends on the foundational packages, making quarantine wait
 for CI-BASE-01 would leave the repository dangerous throughout early
 implementation. This package is therefore an intentional second seed
 with a narrow safety-only scope and no authority to publish.
+The README, feature-parity document, and CLI-facing descriptions also
+overstate cancel correctness, structured concurrency, timeout/zero-copy
+behavior, executable examples, and aggregate readiness while production
+still targets `2024-11-05` and qualification is red. Leaving those claims
+live until Phase 10 is a user-facing safety defect, so this seed owns only
+the immediate truthful disclaimer; DOC-01/02 still own the full rewrite.
 
 Implementation:
 
@@ -4945,6 +5030,17 @@ Implementation:
   authorization grant may temporarily enable/provision the new protected
   identity, transaction, and in-flight barrier to reach a production
   provider, followed by verified disablement/credential revocation.
+- In the same bounded seed, revise the existing `README.md`,
+  `FEATURE_PARITY.md`, and any CLI `about`/inspect/version-support text in
+  place so their first relevant support statement says aggregate MCP
+  2026-07-28 support is under implementation and unverified, production
+  still exposes the older protocol, and examples/claims are not release
+  evidence. Remove or relabel `COMPLETE`, cancel-correct, structured-
+  concurrency, automatic-timeout, zero-copy, facade-only macro, and
+  runnable-example assertions that current code/tests do not prove. Do
+  not design the final docs here, add compatibility prose, or claim a
+  future package complete; DOC-01/02 replace the quarantine wording only
+  after their evidence prerequisites pass.
 
 Acceptance:
 
@@ -4968,6 +5064,11 @@ Acceptance:
   prior successful run, or already-published-version response.
 - CI-BASE-01 consumes and continuously verifies this quarantine, and no
   later package can weaken it before REL-02.
+- README, feature-parity, crate-page inputs, and CLI-visible support text
+  contain the exact under-implementation/unverified disclaimer and no
+  claim contradicted by Section 7's observable repository state. The
+  current non-compiling README handler/example shapes are removed or
+  explicitly non-executable until tested replacements land.
 
 Tests:
 
@@ -4989,6 +5090,11 @@ Tests:
 - Historical-run inventory test reports any queued/in-progress run from
   a pre-quarantine workflow as blocking manual evidence rather than
   claiming the source change neutralized it.
+- Claim-quarantine snapshot/grep and compile-link tests reject the old
+  aggregate/zero-copy/cancel-correct/automatic-timeout/facade-only/
+  runnable-example wording, a `COMPLETE` target row without evidence, or
+  inconsistent README/FEATURE_PARITY/CLI status. A mutation that removes
+  the disclaimer or makes it conditional fails.
 
 Dependencies:
 
@@ -5136,7 +5242,7 @@ Implementation:
   Beads projection, ownership/reservation validation, profile closure,
   mutation fixtures, CLI/reporting, and end-to-end snapshot integration
   into bounded modules with their own tests and ownership. FND-02 must not
-  append another monolithic verifier to the existing 85,519-line FND-01
+  append another monolithic verifier to the existing 85,819-line FND-01
   integration test; the staged FND-01 remediation extracts its own
   parser/corpus/oracle/integration units before FND-01 closes.
 - Define the reservation snapshot schema as exact project key,
@@ -5230,6 +5336,7 @@ Tests:
 Dependencies:
 
 - FND-01.
+- REL-QUAR-00.
 
 ### FND-03 — Define protocol-era policy
 
@@ -27499,7 +27606,8 @@ Implementation:
   exactly one exception: the sealed new-path
   `.github/workflows/publish-authorized.yml` definition, whose immutable
   provider workflow ID remains disabled, trigger-bounded,
-  credentialless, environmentless, wrong-ref rejecting, and unable to
+  without a mutation-capable credential, environmentless, protected-
+  ref/actor/event restricted, and unable to
   pass coordinator authorization. CI-BASE-01 only verifies this
   exception; it never enables, provisions, dispatches, or weakens it,
   and every other dormant or reachable mutation path remains forbidden.
@@ -27517,6 +27625,15 @@ Implementation:
   substitute for required pull-request gates.
 - Use RCH only as an execution optimization; a worker outage falls
   back without changing pass criteria.
+- Enforce repository branch policy read-only: `main`, `origin/main`, and
+  the legacy URL-compatibility branch must resolve to the same exact
+  commit after every authorized main push. The actor authorized to push
+  main performs the required second fast-forward-only compatibility-
+  branch update in that same operation and reads both provider refs back.
+  CI receives no ambient write permission. Divergence, a non-fast-forward
+  shape, missing read-back, or an attempted force update blocks merges and
+  release until a maintainer supplies an explicit audited resolution;
+  this diagnostic plan/audit itself authorizes no push.
 
 Acceptance:
 
@@ -27532,12 +27649,16 @@ Acceptance:
   external mutation job, production secret, release environment, dormant
   publisher, or ambient fallback. After REL-PREP-01, its exact sealed
   new-path identity is the sole permitted dormant publisher definition
-  and remains provider-disabled, trigger-bounded, credentialless,
-  environmentless, wrong-ref rejecting, and coordinator-denied until
+  and remains provider-disabled, trigger-bounded, without a mutation-
+  capable credential, environmentless, provider-protected-ref/actor/
+  event restricted, and coordinator-denied until
   REL-02. No other workflow may contain or reach a mutation job. The old
   workflow ID remains disabled forever.
 - Required-artifact, pinned-advisory, job-inventory, time,
   concurrency, and cost limits fail closed.
+- Provider read-back proves `main`, `origin/main`, and the legacy
+  compatibility branch are commit-identical; CI only diagnoses and never
+  repairs them with ambient credentials.
 
 Tests:
 
@@ -27563,6 +27684,9 @@ Tests:
 - CI inventory mutation tests for undeclared jobs, missing prerequisite,
   excessive timeout/retry/concurrency/compute/artifact retention, and a
   scheduled-only substitute for required pull-request/release evidence.
+- Branch-policy fixtures for behind/ahead/diverged/missing refs, stale
+  provider views, force-update attempts, main-only push, and exact
+  fast-forward equality/read-back.
 
 Dependencies:
 
@@ -27575,8 +27699,11 @@ Dependencies:
 Outcome:
 
 Check in and qualify the exact registry/GitHub coordinator, sealed-upload
-format, durable journal, supply-chain signer boundary, and provider
-sandboxes that REL-01 can seal and REL-02 can use only after separate
+format, durable journal, supply-chain signer boundary, observer,
+  finalizer, publication- and evidence-authorization controllers,
+  evidence-maintenance controller,
+append-only evidence store/capture authority, and provider sandboxes
+that REL-01 can seal and REL-02 can use only after separate
 authorization.
 
 Reason:
@@ -27596,22 +27723,33 @@ Implementation:
   blocking executor. It creates no runtime/thread, uses no Tokio-family
   client, invokes no ambient `curl`, and never shells out to Cargo on the
   production mutation path.
-- Keep the coordinator library strictly `&Cx`-first. Its non-published
-  process entry point owns exactly one bounded top-level asupersync
-  runtime, enters one structured root region, passes that `Cx` downward,
-  and performs bounded structured shutdown. It enables no
+- Keep the coordinator library strictly `&Cx`-first. Each of its seven
+  non-published process entry points—publisher, `release-bootstrap`,
+  `release-verify`, `release-finalize`, `release-authorize`,
+  `release-evidence-authorize`, and `release-evidence-maintain`—owns
+  exactly one bounded top-level
+  asupersync runtime, enters one structured root region, passes that
+  `Cx` downward, and performs bounded structured shutdown. It enables no
   `test-internals`, secondary runtime, detached thread/task, or orphan
   blocking/network work.
 - Put `#![forbid(unsafe_code)]` at every library, publisher, bootstrap,
-  and sandbox crate root in `tools/release-coordinator`; inherit the
+  verifier, finalizer, publication-authorizer, evidence-authorizer,
+  evidence-maintainer, and sandbox crate/binary-target root in
+  `tools/release-coordinator`; inherit the
   workspace `unsafe_code = "forbid"` lint without an override. The
   release tooling cannot qualify if a target omits or weakens either
   layer.
 - Define a non-Clone, non-serializable `ReleaseCredentialProvider` that
   borrows short-lived crates.io, GitHub, signer, protected remote-
-  journal/lease, and authorization-status credentials from the protected
-  execution environment, scopes each to one provider/action, returns
-  redacted error classes, and zeroizes framework-owned buffers.
+  journal/lease, `JournalRollbackAnchor`, and purpose-typed grant-claim/
+  authorization-read credentials from the protected execution
+  environment, plus a
+  read-only trusted-time credential only when the selected service
+  requires one. Scope each credential to one provider/action, return
+  redacted error classes, and zeroize framework-owned buffers. The
+  coordinator has no operation that mutates the trusted-time authority.
+  It cannot load publication-authority issue/renew/revoke/audit-admin or
+  evidence-capture-authority admin credentials.
   Credential presence conveys capability to authenticate, not authority
   to publish; the exact REL-02 authorization receipt is separate.
 - Resolve registry API base and download/index endpoints only from the
@@ -27647,7 +27785,32 @@ Implementation:
   Align all nine manifests, packaged archives, root/crate READMEs,
   license links, and release notes before CI-CORE-01. A conflicting,
   missing, dual, or silently inherited representation fails closed; no
-  file deletion is required or authorized by this plan.
+  file deletion is required or authorized by this plan. Separately
+  inventory every already published FastMCP crate/version, downloaded
+  immutable archive, registry license field, and included license/README
+  text. Preserve the observed `fastmcp-rust 0.3.2` contradiction as a
+  required case: registry metadata says plain MIT, its packaged README
+  claims an additional rider and links `LICENSE-MIT`, yet the archive
+  contains neither `LICENSE` nor `LICENSE-MIT`. The reviewed decision
+  records the historical disposition and
+  exact public correction/disclosure wording without pretending `0.4.0`
+  metadata rewrites old artifacts. Any registry advisory, yank, or other
+  historical-version mutation requires its own explicit authorization
+  and is never automatic remediation.
+- Materialize that choice as a versioned, content-addressed
+  `ReleaseLicenseDecision` record, not an unstructured conversation or
+  inferred repository state. Bind authorized reviewer identities/roles,
+  approval/signature and protected commit evidence, trusted timestamp,
+  exact input `LICENSE`/`LICENSE-MIT`/README/manifest/archive digests,
+  selected Cargo field and exact value, authoritative and retained-file
+  disposition, the nine affected package identities, required public/
+  registry/README/release wording, and historical-version inventory and
+  disclosure. Check it into protected source or store it in the protected
+  decision authority under its digest. CI-FINAL-CORE-01, REL-01's handoff,
+  SBOM/provenance inputs, and REL-02's receipt all bind the same digest.
+  Reject an unsigned, stale, wrong-role, wrong-scope, post-seal, or input-
+  mismatched record. This schema records an approved decision; it does
+  not select or recommend the license.
 - Freeze a per-crate `DocsRsBuildProfile` and check it into each of the
   nine publishable manifests under `[package.metadata.docs.rs]`: exact
   feature set, `all-features`/`no-default-features` disposition, default
@@ -27681,11 +27844,292 @@ Implementation:
   of store, CAS, lease, fencing, renewal, or read-back causes zero
   further mutation. Journal/lease writes are themselves rendered,
   authorized external effects.
+- Seal a versioned `ReleaseEvidenceRetentionPolicyTemplate` before
+  REL-01 with exact trusted-time basis, signed `support_end_at`, object
+  inventory, migration rules, and two fixed nonnegative durations:
+  `minimum_retention_seconds = 315_576_000` and
+  `post_support_seconds = 63_115_200`. The handoff also fixes a trusted
+  `publication_deadline` and requires `support_end_at >=
+  publication_deadline`. Before the first external mutation, each
+  selected retention-controlled journal, rollback-anchor, evidence-
+  store, and authority-record provider must prove a retention reservation through
+  `provisional_retain_until = max(publication_deadline +
+  minimum_retention_seconds, support_end_at + post_support_seconds)`.
+  The first successfully reconciled irreversible public effect (normally
+  the first crates.io version acceptance) fixes trusted
+  `published_at <= publication_deadline`. Before any successor effect,
+  derive, journal, and read back a canonical
+  `ReleaseEvidenceRetentionInstance` with checked arithmetic:
+  `retain_until = max(published_at + minimum_retention_seconds,
+  support_end_at + post_support_seconds)`. The template covers the remote
+  journal and lease audit history, every rollback-anchor checkpoint,
+  authorization/audit record, handoff, intermediate publication receipt/
+  anchor/observation, cleanup/docs/quiescence observation, aggregate
+  bundle, capture grant/attempt/receipt, and provider read-back metadata.
+  Its closed transitive `EvidenceVerificationManifest` also retains the
+  template/instance and successors; canonical schemas; exact authority,
+  observer, store, controller, and signer profile bytes; public keys,
+  trust roots, and time-scoped revocation evidence; and verifier/tool
+  source, configuration, executable, and dependency-lock artifacts needed
+  to resolve and independently recheck every referenced digest.
+  The retained inventory explicitly includes every
+  `EvidenceMaintenanceJournal` segment/head; maintenance-authority
+  state, audit, grant, claim, transition, and failure receipt;
+  maintenance-observer profile/key/revocation evidence and signed
+  receipt; `EvidenceCaptureStorageIncident`; destination-qualification
+  request/probe/receipt; and every predecessor/successor store profile,
+  fence, claim ticket, capture envelope/receipt, and recovery lineage.
+  For any maintenance artifact created at or after the current horizon,
+  derive with checked arithmetic and bind
+  `maintenance_record_retain_until = max(effective_successor_horizon,
+  trusted_created_at + post_support_seconds)`; this gives an expiry-
+  disposition record a nonexpired audit horizon even though the disposed
+  basis has elapsed. No disposition may remove the verification
+  dependencies needed to validate its own retained record.
+  Bind the template digest and provisional horizon into the handoff and
+  provider profiles; bind the resulting instance digest and exact
+  `retain_until` into every later head, partial-publication incident,
+  `PublicationArtifactsReceipt`, aggregate bundle, and terminal capture
+  receipt. A crash between the first effect and instance append can only
+  reconcile that provider observation and deterministically materialize
+  the same instance; it cannot dispatch another public effect. Seal the template with
+  a domain-separated `ReleaseRetentionPolicySigner` key/profile held only
+  by the purpose-typed `retention-policy` mode of `release-authorize`;
+  that invocation cannot issue grants or perform provider effects. A
+  support extension may only increase `support_end_at` and
+  `retain_until` through a signed, append-only, read-back-verified
+  template/instance successor before the old deadline; shortening or
+  clock rollback is invalid. Migration requires byte/digest-complete
+  copy plus destination read-back and a signed lineage receipt while the
+  source remains retained through the later of its old deadline and
+  migration verification. At expiry no support claim may rely on a
+  missing object; any retention disposition is a separately authorized
+  provider action and cannot rewrite history. crates.io, GitHub, docs.rs,
+  signer/transparency, and time-provider state is not claimed immutable
+  for that horizon; retain the exact signed/API read-back observations
+  and verification dependencies instead.
+- Define a disjoint `ReleaseEvidenceMaintenanceAuthorityProfileDigest`,
+  `ReleaseEvidenceMaintenanceGrant::{ExtendRetention, MigrateEvidence,
+  RecoverCaptureStore, ExpiryDisposition}`, and human-invoked `release-evidence-maintain`
+  controller. Seal the exact controller executable/configuration/
+  workload/credential profile, maintenance-authority endpoint/API/trust
+  roots, and `EvidenceMaintenanceJournalProfileDigest`; bind them into
+  the handoff, retention template, evidence-store profile, closed
+  verification manifest, every grant, and every receipt. The
+  `release-evidence-authorize` controller's mutually exclusive
+  `maintenance-admin` mode may issue the grant only after exact two-step
+  approval; its `capture-admin` credential is unavailable in that
+  invocation. The maintenance controller can claim but cannot issue a
+  grant. Define a protected, single-writer
+  `MaintenanceAuthorityState` with tagged genesis and canonical
+  `(generation, current_receipt_digest, in_flight_claim,
+  successful_generation_count, migration_count,
+  operation_attempt_count_by_kind, capture_recovery_attempt_count,
+  expiry_count,
+  cumulative_copied_bytes, last_success_at)` fields. Grant issue, claim,
+  terminal reconciliation, and successful finalization are
+  compare-and-set transitions from the exact predecessor state; the
+  authority returns and retains a provider-signed transition receipt,
+  and every caller reads it back. Two issuers/controllers cannot consume
+  the same predecessor, create concurrent in-flight operations, or fork
+  the maintenance lineage. Each grant binds those profiles, the exact
+  predecessor authority-state/receipt digest, exact tagged
+  `RetentionBasis` generation (instance absent for a pre-publication
+  abandonment), exact closed object/digest set, source and permitted
+  destination, operation, current head/kind/capture state and successor
+  set, trusted time, expiry, finite effect/read-back
+  ordinals, byte/count/deadline/backoff bounds, and predecessor
+  maintenance-receipt digest. The sealed lifetime budget permits at most
+  16 successful maintenance generations, four migrations, one expiry
+  disposition, two capture-store recovery attempts including failed or
+  ambiguously dispatched attempts, no more than one successful transition per 3,600 trusted
+  seconds, and no more than 24 issued or ambiguously issued operation
+  grants total: 16 `ExtendRetention`, four `MigrateEvidence`, two
+  `RecoverCaptureStore`, and two `ExpiryDisposition`. Each parent
+  operation admits at most one destination-qualification claim and one
+  maintenance-receipt-capture claim, so those lifetime counts are each
+  at most 24. Every issuance/claim counts before its result; failed-
+  before-dispatch, reconciled-no-effect, observation/receipt failure, and
+  ambiguous outcomes never refund a count. Define canonical
+  `B = checked_sum(encoded_len(object))` over the exact closed logical
+  source `EvidenceVerificationManifest` object inventory, including all
+  bundle, envelope/receipt, authority, journal, qualification, profile,
+  key, and verification-dependency bytes but excluding destination
+  replicas; reject duplicate inventory entries and arithmetic overflow.
+  Cumulative copied bytes are no greater than `6 * B` with checked
+  multiplication; every
+  exact-copy or recovery request that may have committed counts its full
+  byte length even after a lost response. Define
+  `K = logical_evidence_key_count <= 3` and
+  `G = 1 + possibly_committed_capture_recovery_attempts +
+  possibly_committed_migration_attempts <= 7`; selected source/destination profiles and
+  the closed manifest must therefore admit at least `K * G <= 21`
+  physical bundle copies plus the separately bounded authority,
+  qualification, journal, envelope, and receipt objects. These are
+  conservative capacity bounds, not permission to duplicate an object.
+  `ExtendRetention` may bind an open or terminal lineage; issuance
+  requires the exact current `RetentionBasis`/head/successor state, a
+  strictly later signed `support_end_at`/horizon, and a provider-signed
+  conditional reservation or quote. It can change only the horizon, and
+  the actual new horizon must be read back after the effect.
+  Define canonical `EvidenceStoreDestinationQualification` bytes and a
+  provider-generated, signed, read-back-verified qualification receipt
+  covering the exact
+  endpoint/namespace, TLS roots, service/API generation, administrative
+  separation, retention reservation, conditional-create/CAS and
+  read-back semantics, consistency, limits, bounded probe ordinals and
+  cleanup/disposition, credential scope, and failure behavior. Seal its
+  distinct schema/signature domain, provider signer/key/custody/trust-
+  root/revocation generation, request binding, retention, and verification
+  rules into the maintenance/store profiles; a maintainer signature is
+  never destination-admission evidence. The
+  destination and exact bounded qualification effects require the same
+  two-step maintenance approval and must be derived under the presealed
+  successor policy; an arbitrary endpoint or a trait/sandbox assertion
+  is not admissible. `MigrateEvidence` requires one such distinct
+  admitted destination, exact manifest/digest inventory, and source
+  retention through the later of its old deadline and verified
+  destination cutover.
+  `RecoverCaptureStore` is admissible for a stable or failure-terminal
+  head after outer quiescence; either initial documentation disposition
+  at `H_incident_final` with its exact quiescence/successor set
+  (`TransientRecoverable` nonempty, `TerminalIdentityMismatch` empty);
+  or the later terminalized documentation head. It is not admissible for
+  a live unresolved publication-failure snapshot: a failed unresolved
+  capture instead contributes its capture-authority claim/ticket audit
+  and provider-signed `CaptureStoreAttemptObservation` lineage to
+  `FailureAuthorityManifest`; it does not create the terminal-only
+  `EvidenceCaptureStorageIncident`. The authorized cleanup/finalization
+  path may continue without inventing an unresolved receipt, and the
+  later terminal bundle binds that failed lineage. The original exact
+  store-independent aggregate-bundle bytes and logical content digest
+  must be deterministically reassembled from retained constituents. The
+  recovery cannot proceed until the old claim ticket's recovery deadline
+  and every dispatch/poll deadline have elapsed, the capture authority
+  and old provider prove zero in-flight request, all old-store views are
+  reconciled, and an administrative fence/read-back proves that the old
+  ticket can never dispatch again. A merely negative object/receipt read
+  is insufficient. Any ambiguous old conditional put that cannot be
+  resolved leaves recovery blocked. The operation consumes one recovery-
+  attempt budget, appends the complete predecessor profile/grant/claim/
+  ticket/incident/maintenance lineage, qualifies exactly one successor
+  store generation, and does not itself write evidence. A fresh
+  separately admitted capture grant may put only the identical original
+  bundle bytes under the identical logical digest-qualified key; the
+  new-store profile and recovery lineage live in the grant, capture
+  receipt, and recovery envelope, never by mutating or self-referencing
+  the bundle. A second permitted recovery chains and counts both prior
+  attempts and receipts; no attempt resets the lifetime budget.
+  `ExpiryDisposition` requires `trusted_now >= RetentionBasis.horizon`, no legal
+  hold, live support claim, unexpired policy successor, or in-flight
+  extension/migration, plus a complete final read-back manifest.
+  Migrate/Expiry additionally require the exact terminal head/kind,
+  terminal capture receipt, and empty successor state; issuance is
+  forbidden while any stable, recovery, capture,
+  terminalization, or failure-closeout successor remains admissible.
+  Claim-before-effect, identical conditional bytes, ambiguous-result
+  reconciliation, append-only `EvidenceMaintenanceJournal`, and provider
+  read-back are mandatory. The authority state machine has closed
+  attempt outcomes
+  `FailedBeforeDispatch`, `ReconciledNoEffect`,
+  `ReconciledEffectFailure`, `ObservationPending`,
+  `ReceiptCapturePending`, `Succeeded`, and
+  `PermanentlyAmbiguousBlocked`. Each outcome atomically clears or
+  preserves the exact in-flight identity, advances an attempt generation,
+  and records consumed budgets; only a proven no-effect or fully
+  reconciled safe failure may admit a fresh bounded two-step grant.
+  `PermanentlyAmbiguousBlocked` and any unexpired in-flight state admit
+  no successor, while a possibly dispatched recovery consumes its
+  recovery-attempt budget even if no receipt is obtained.
+  A grant prebinds a non-self-referential
+  `MaintenanceSuccessorProfileCoreDigest`. After the effect and exact
+  provider/journal read-back, `release-verify` independently signs the
+  resulting canonical `ReleaseEvidenceMaintenanceReceipt` under a
+  distinct `ReleaseEvidenceMaintenanceObserverProfileDigest`, whose
+  signature domain/key/profile binds exact
+  provider observations, signer/key/custodian/trust-root generation, and
+  maintenance-journal head plus that core digest and predecessor
+  authority state. Signing binds a unique
+  `MaintenanceObserverSignatureAttemptId` and is either deterministic or
+  performed by an idempotent signer that durably returns the same exact
+  bytes for that attempt. The already approved automaton validates the
+  signature/digest and atomically CASes `ObservationPending` to
+  `ReceiptCapturePending` while retaining those exact signed bytes/digest
+  and deriving a separate actor-bound, purpose-typed
+  `MaintenanceReceiptCaptureGrant`; a crash or lost response is recovered
+  by authority read-back and never by re-signing. In a
+  purpose-limited maintenance-observer invocation, `release-verify`
+  claims that grant, conditionally appends only those exact signed bytes
+  once to the retained maintenance-receipt namespace, and reads them
+  back with read-back-first crash/ambiguous-outcome reconciliation; it
+  cannot perform the maintenance effect or authority transition. The
+  grant cannot be claimed by the maintainer, is exhausted before
+  dispatch, and has finite bytes/attempt/poll/deadline bounds. The maintainer then
+  finalizes the in-flight authority CAS against that receipt/read-back,
+  and the finalized successor profile/state is derived from the core,
+  receipt digest, and authority transition receipt. No receipt or
+  profile includes its own future digest. Seal the observer profile over the exact
+  `release-verify` executable/configuration and bounded read set for the
+  maintenance authority/journal, source/destination object inventories,
+  retention horizons, trust roots, and provider generations. A separate
+  non-Clone maintenance-observer credential/key provider is available
+  only in this observation mode; it has no release, maintenance-effect,
+  generic evidence-store write, or ordinary capture capability. The
+  maintenance controller cannot use that key. Seal the receipt provider,
+  conditional key, maximum bytes/count, retention horizon, trust roots,
+  and read-back semantics into the profile and closed verification
+  manifest. The receipt, authority transition receipt, and complete
+  predecessor chain are retained and become the sole successor for the
+  next maintenance generation.
+  This path has no crates.io, GitHub-release, signer/transparency,
+  publication-authority claim, bootstrap, publication-journal,
+  or rollback-anchor rewrite capability. It has no ability to alter,
+  overwrite, reinterpret, or replace evidence content or a historical
+  bundle; only `MigrateEvidence` may conditional-create byte/digest-exact
+  copies, `RecoverCaptureStore` may authorize a later identical bundle
+  put, and `ExpiryDisposition` may perform its exact grant-bound provider
+  disposition after all predicates hold. It cannot change
+  `PublicationTransactionId` or any terminal head. Budget exhaustion or a failed issuance predicate
+  is terminally fail-closed, never reset by migration. It is an explicitly disjoint post-transaction
+  evidence-retention operation, not a successor that reopens REL-02.
+- Define `JournalRollbackAnchor` as a versioned, append-only external
+  checkpoint type distinct in name, schema, provider, credential, and
+  purpose from the public `ReleaseReceiptAnchor`. It binds transaction,
+  store generation/restore epoch, monotonically numbered checkpoint,
+  fenced lease ownership, the exact remote journal head being
+  checkpointed, previous anchor digest, retention deadline, and
+  authority-profile digest. Select an anchor provider outside the
+  mutable journal's administrative/restore domain. Use an immutable
+  numbered-attempt update/read-back state machine, and anchor at every
+  segment seal, lease-owner handoff, before each irreversible registry/
+  GitHub/signer/bootstrap effect, and at each terminal branch: checkpoint
+  `H_stable_observed` to derive stable `H_final`, or checkpoint the exact
+  cleanup/documentation-incident head to derive `H_incident_final`. A
+  later docs.rs recovery checkpoints its new `H_stable_observed` or
+  `H_incident_terminal_observed`; an authorized publication-abandonment
+  path checkpoints its exact quiesced failure-observation head to derive
+  `H_publication_failure_final`. The terminal anchor update/read-back observation, not
+  the checkpointed head itself, derives the corresponding final head.
+  Every anchor update's own pre-effect/observation records advance the
+  journal after the head it checkpoints; the next checkpoint must prove
+  that exact authorized suffix, so no object claims its own future
+  append. Freeze minimum retention through `provisional_retain_until`
+  before the publication receipt and through the exact
+  `ReleaseEvidenceRetentionInstance.retain_until` thereafter. A timeout or
+  ambiguous anchor update permits read-only reconciliation only; stale,
+  conflicting, missing, prematurely expired, or independently writable
+  anchor history stops all later mutations.
 - Time-box production-provider feasibility and selection to ten working
   days before this package may close. Select and freeze exactly one
   production remote CAS journal/lease store, authorization-status and
-  trusted-time authority, immutable external rollback/audit anchor,
-  signer/transparency provider, crates.io trust configuration, and
+  trusted-time authority, distinct evidence-capture authority/time
+  namespace, immutable external `JournalRollbackAnchor`,
+  append-only `ReleaseEvidenceStore` plus its attempt-audit/capture-
+  receipt signer, maintenance authority, `EvidenceMaintenanceJournal`,
+  maintenance-observer receipt store/signer, and the presealed
+  destination-qualification policy/provider set for migration and
+  capture recovery; signer/transparency provider,
+  crates.io trust configuration, and
   GitHub API/repository/workload-identity configuration. For each,
   record the exact service/API/action version or commit, endpoint and
   namespace, TLS/trust roots, consistency and CAS semantics, retention,
@@ -27699,10 +28143,11 @@ Implementation:
   authorization, rendered effect list, bounded test identity/namespace,
   and retained receipt; no sandbox result is relabeled production
   evidence. If no candidate can prove the journal rollback/clone,
-  fencing, retention, time, signer/transparency, trust, and read-back
-  contracts by the deadline, record the failed candidates and leave
-  REL-PREP-01, REL-01, and REL-02 closed/blocked rather than choosing an
-  underspecified service.
+  fencing, retention, time, evidence-store immutability/read-back,
+  signer/transparency, trust, and read-back
+  contracts by the deadline, record the failed candidates, fail the gate
+  closed, and leave REL-PREP-01, REL-01, and REL-02 open/blocked rather
+  than choosing an underspecified service.
 - Require write-once/version-retained remote segments, explicit store-
   generation and restore/clone epochs, immutable audit history, and
   rollback detection anchored outside the mutable head/fencing counter.
@@ -27739,32 +28184,73 @@ Implementation:
   sealed inputs twice in disjoint clean directories and require
   byte-identical archives. This proves deterministic archive packaging,
   not automatically deterministic compilation.
-- Give each target a sealed `BinaryReproducibilityDisposition`. Two
+- Give each target a sealed `BinaryRepeatabilityDisposition`. Two
   independent clean builds with fresh Cargo homes/targets, the same
   source/toolchain/runner/profile, and a normalized environment may set
-  `binary_bit_reproducible=true` only when binary bytes and explanatory
-  build records match. Otherwise set it to `false`, publish at most the
+  `sealed_environment_bit_repeatable=true` only when binary bytes and
+  explanatory build records match. This is same-environment
+  repeatability, not cross-builder reproducibility. Otherwise set it to
+  `false`, publish at most the
   one content-addressed provenance-bound binary selected by
   CI-FINAL-CORE-01, and make every document/receipt explicitly disclaim
-  binary bit reproducibility. Never use a reproducibly repackaged
+  cross-builder binary bit reproducibility. Never use a deterministically
+  repackaged
   nonreproducible binary to imply a reproducible compiler output.
 - Define the release SBOM profile as SPDX 3.0.1 JSON-LD using exactly the
-  Core and Software profiles, with the 3.0.1 context/model/conformance
-  artifacts vendored or checksum-pinned and no network context fetch.
-  Freeze a project JSON-LD compaction plus RFC 8785 JCS byte profile,
-  generator name/version/executable digest, deterministic identifier and
-  ordering rules, and an explicit trusted creation-time input. Cover
+  Core, Software, Licensing, and SimpleLicensing profiles. Every document
+  has the exact top-level
+  `"@context":"https://spdx.org/rdf/3.0.1/spdx-context.jsonld"`.
+  Vendor or checksum-pin the 3.0.1 global context, JSON Schema, OWL model,
+  SHACL shapes, profile/conformance text, and validation tools; perform
+  no network context fetch. Emit the official SPDX 3.0.1 canonical JSON
+  serialization (unique ASCII object names ordered by name, exact number/
+  string/literal/whitespace rules), not RFC 8785 JCS. If JCS is ever used
+  as an additional project signing layer, label it separately and prove
+  byte equality for the emitted constrained subset; never call JCS the
+  SPDX canonical form. Validate both structure against the pinned JSON
+  Schema and RDF semantics against the pinned OWL/SHACL model.
+  Freeze generator name/version/executable digest, deterministic
+  identifiers/order, and an explicit trusted creation-time input. Cover
   every `.crate`, standalone binary, and archive as a named SHA-256
   subject and enumerate contained workspace/third-party packages,
   resolved normal/build/dev dependencies, enabled features, targets,
-  source/checksum identities, and license conclusions from the approved
-  `ReleaseLicenseDecision`. Validate both SPDX conformance and exact
-  subject/inventory completeness; an omitted dependency, feature,
+  and source/checksum identities. Workspace declared/concluded licenses
+  come from the sealed `ReleaseLicenseDecision`. Third-party declared and
+  concluded licenses come from a separately sealed exact Cargo.lock/
+  registry/archive/license-text evidence inventory; the project license
+  decision cannot silently conclude a dependency's license. A third-
+  party `NOASSERTION`, unknown, conflicting, malformed, or unreviewed
+  dual-license expression blocks release unless a separate maintainer/
+  legal decision names that exact package/version, evidence, conclusion,
+  and distribution treatment. Validate SPDX profile conformance and
+  exact subject/inventory completeness; an omitted dependency, feature,
   license, target, or asset is fatal.
 - Define unsigned build-provenance inputs as raw in-toto Statement v1
   JSON with exact `_type=https://in-toto.io/Statement/v1` and SLSA
   Provenance predicate type `https://slsa.dev/provenance/v1`, interpreted
-  against the approved SLSA v1.2 Build Provenance text. Freeze a
+  against SLSA v1.2 Build Provenance frozen at
+  `slsa-framework/slsa@ae7fc76215004e8fae250c877eff8919bf048e3b`.
+  Vendor/checksum the exact source set:
+  `spec/build-provenance.md`
+  (`182ab5cf823c374874136371466ba43f99f0a9ba87a8046757d26a2ed74854a0`),
+  `spec/build-track-basics.md`
+  (`34b57d8975d02fde8519f857da3fb61bc184d110800d257e4228e0072547ff8f`),
+  `spec/distributing-provenance.md`
+  (`6543e9e2167a0d024cc3d0267d262547df69001041379c8c3ee2c436d5945643`),
+  `spec/provenance.md`
+  (`89cae36d81bdd593b728ca09ff6804e87b07a762a36704c591ab784da5c9395e`),
+  `spec/schema/provenance.cue`
+  (`0ddd00372622d1c04f71d1fb2666579af089eb733c9c5d838d158489b2ea6145`),
+  and `spec/schema/provenance.proto`
+  (`ea548207a78bd81b809a449edd5ed36a011a665ca7d15831d1133fe674fc41de`).
+  Offline validators
+  consume only those exact bytes; revision or digest drift fails closed.
+  The `predicateType` URL is the wire identifier, not source-freeze
+  evidence. Pin the in-toto
+  Statement specification/schema to commit
+  `6fad7157dfb216034e28223c6b5c6b0f9c41bf28` plus content digest and
+  vendor/checksum its validation artifacts; a mutable v1 URL or schema
+  drift cannot satisfy the seal. Freeze a
   project-owned versioned `buildType` definition and exact
   `externalParameters`, `internalParameters`, `resolvedDependencies`,
   `runDetails.builder`/version/dependencies, invocation/timestamps,
@@ -27773,23 +28259,485 @@ Implementation:
   implementation. REL-01 stages these unsigned statements; REL-02's
   authorized signer wraps the exact raw bytes in DSSE 1.0.2 JSON
   envelopes with `payloadType=application/vnd.in-toto+json`, base64
-  payload/signature, signer identity, and verified subject binding.
+  payload/signature, signer identity, and verified subject binding. The
+  signature input is the exact DSSE v1 pre-authentication encoding
+  `PAE(payloadType, payload)`, not the raw statement alone: freeze the
+  `DSSEv1` domain separator, ASCII spaces, canonical unsigned decimal
+  byte lengths, and the exact UTF-8 payload-type bytes plus raw payload
+  bytes. Reject a non-canonical length, overflow, invalid payload-type
+  encoding, duplicate signer/key ID, an empty signature set, an
+  unapproved signer, or a signature-count/byte-limit excess. The project
+  profile permits exactly RFC 4648 standard-alphabet Base64 with required
+  `=` padding, no whitespace, and shortest canonical encoding for both
+  payload and signatures; URL-safe, unpadded, overpadded, or otherwise
+  non-canonical spellings are rejected. Reject duplicate JSON object
+  members before ordinary decoding. In accordance with DSSE, bounded
+  unknown envelope/signature fields are ignored rather than signed or
+  interpreted; freeze count/depth/name/value byte limits and prove they
+  cannot shadow known members. JSON member order is irrelevant. Retain
+  the one decoded payload byte buffer used for PAE verification and pass
+  those exact verified bytes onward; never reparse or re-fetch the
+  envelope payload after verification. The envelope payload remains the
+  exact staged raw statement, while the approved signature binds it
+  through this exact PAE construction.
   Never call an unsigned statement a DSSE envelope or claim a SLSA build
   level that the selected builder/signer pair has not independently
   established.
 - Implement versioned `ReleasePublicationHandoff`, authorization plan,
   transaction identity, renewable `PublicationAuthorizationGrant`,
   per-object mutation-attempt state machines, precommit manifest,
-  completion receipt, and receipt-anchor schemas with checked bounds,
-  exact identity references, redaction, and no self-reference.
-- Define a sealed `ExecutionAuthorityProfileDigest` covering both
-  publisher and bootstrap executable/configuration digests; the exact
+  `PublicationArtifactsReceipt`, `ReleaseReceiptAnchor`,
+  `PublicationArtifactsObserved`, `JournalRollbackAnchorCheckpoint`,
+  `JournalRollbackAnchorObserved`,
+  `BootstrapCleanupReceipt`, `BootstrapCleanupObserved`,
+  `DocsRsStableObserved`,
+  `DocsRsIncidentObserved::{TransientRecoverable,
+  TerminalIdentityMismatch}`,
+  `PublicationFailureObserved::{UnresolvedLiveAuthority,
+  QuiescedAbandoned}`, `FinalizerQuiescedObserved`,
+  `ReleaseStateTuple`, `IncidentStateTuple`,
+  `IncidentAggregateEvidenceBundle::{Initial, Terminalization}`,
+  `StableAggregateEvidenceBundle`,
+  `IncidentEvidenceCaptureReceipt::{Initial, Terminalization}`,
+  `StableEvidenceCaptureReceipt`,
+  `PublicationFailureIncidentBundle::{Unresolved, Terminal}`,
+  `PublicationFailureEvidenceCaptureReceipt::{Unresolved, Terminal}`,
+  `CaptureGrantIssuanceReceipt`, `CaptureClaimTicket`,
+  `ReleaseEvidenceCaptureEnvelope`,
+  `CaptureStoreAttemptObservation`,
+  `ReleaseEvidenceCaptureClaimCapability`,
+  `EvidenceCaptureStorageIncident`,
+  `ReleaseEvidenceRetentionPolicyTemplate`,
+  `ReleaseEvidenceRetentionInstance`, `RetentionBasis`,
+  `MaintenanceAuthorityState`,
+  `ReleaseEvidenceMaintenanceGrant`, `ReleaseEvidenceMaintenanceReceipt`,
+  `MaintenanceReceiptCaptureGrant`,
+  `EvidenceStoreDestinationQualification`,
+  `MaintenanceSuccessorProfileCoreDigest`,
+  `ReleaseEvidenceMaintenanceObserverProfileDigest`,
+  and incident/failure-state schemas with
+  checked bounds, exact identity references, redaction, and no
+  self-reference. Seal a disjoint `release-verify` executable/profile
+  that has read-only release-provider/journal access and an attestation
+  key but no bootstrap, publisher, signer, journal-write, or release-
+  provider mutation capability; it is the independent release-state
+  observer. Its invocation modes are mutually exclusive: ordinary
+  release observation has no write surface; capture mode has only the
+  one-purpose capture claim/ticket CAS plus bound content-addressed
+  evidence-sink put/read-back; capture-incident-observer mode has only
+  read access to the durable capture-authority ticket/audit and provider-
+  signed attempt observations plus the storage-incident attestation key;
+  maintenance-observer mode has only the one-purpose exact signed-
+  maintenance-receipt conditional append/read-back. No process can load credentials for two modes, and none has
+  authority-admin or release-transaction/provider mutation ability.
+- Define a sealed `ReleaseObserverProfileDigest` over the exact
+  `release-verify` executable/configuration/source/target digests,
+  GitHub/crates.io/docs.rs/authority/lease/credential/anchor/journal
+  read-set, workload/operator identity, and a closed map of canonical
+  observation schema to distinct signature domain/encoding for
+  `BootstrapCleanupObserved`, `DocsRsStableObserved`, both
+  `DocsRsIncidentObserved` variants and incident terminalization,
+  both `PublicationFailureObserved` variants,
+  `EvidenceCaptureStorageIncident`,
+  and the separately domained
+  `FinalizerQuiescedObserved::{Stable, DocumentationIncident,
+  PublicationFailure}` variants,
+  plus signature algorithm,
+  key ID/public key/trust-root generation, custody/revocation/expiry
+  policy, and a role-separation policy. The storage-incident variant has
+  its own exact canonical schema, domain, encoding, and key-purpose
+  entry and cannot substitute for any release-state observation. The verifier's non-Clone,
+  non-serializable attestation-key capability can sign only that bounded
+  canonical observation; it cannot load publisher/bootstrap/journal-
+  writer credentials. Its actor, workload, key custodian, and provider
+  administration are disjoint from publisher, bootstrap, cleanup-
+  receipt appender, and finalizer identities. The handoff,
+  transaction identity, grants, and final verification bind this digest.
+- Define canonical, domain-separated signed
+  `DocsRsIncidentObserved::{TransientRecoverable,
+  TerminalIdentityMismatch}`. Each value binds the transaction and
+  observer/profile identities, trusted observation/deadline times,
+  `H_cleanup_observed` or the exact prior `H_incident_final`, all nine
+  expected crate/version/page/target/feature/link identities, their exact
+  observed provider statuses/generations, bounded error classes, and the
+  disposition-specific successor set. A finalizer appends those signed
+  bytes unchanged to derive `H_incident_observed` for the initial
+  incident or `H_incident_terminal_observed` for a later terminalization.
+  Define exact ordered `IncidentStateTuple::{Initial,
+  Terminalization}` schemas. `Initial` contains
+  `(PublicationArtifactsReceipt, ReleaseReceiptAnchor,
+  PublicationArtifactsObserved, H_publish_done,
+  BootstrapCleanupReceipt, BootstrapCleanupObserved,
+  H_cleanup_observed, DocsRsIncidentObserved, H_incident_observed,
+  JournalRollbackAnchorCheckpoint, JournalRollbackAnchorObserved,
+  H_incident_final,
+  FinalizerQuiescedObserved::DocumentationIncident)`. `Terminalization`
+  contains the prior incident-bundle/capture-receipt digests followed by
+  `(DocsRsIncidentObserved::TerminalIdentityMismatch,
+  H_incident_terminal_observed, JournalRollbackAnchorCheckpoint,
+  JournalRollbackAnchorObserved, H_incident_terminalized,
+  FinalizerQuiescedObserved::DocumentationIncident)`. Tuple variants,
+  heads, dispositions, and signature domains cannot cross-substitute.
+- Define a closed `PublicationFailureStage` for every registry,
+  consumer, signer, GitHub draft/publicize/checkpoint, bootstrap-cleanup,
+  journal, anchor, and credential transition, and distinguish
+  `resumable`, `outcome_unknown`, and `exact_resume_impossible` from
+  documentation incidents. Resumable/unknown work remains blocked in the
+  ordinary journal reconciliation automaton and is not a terminal
+  receipt. Every failure record carries exactly one
+  `RetentionBasis::{ProvisionalTemplate(template_digest,
+  provisional_retain_until), Instance(instance_digest, retain_until)}`;
+  pre-first-public-effect failures use the former, while any reconciled
+  public effect requires the latter. Closed tagged
+  `FailurePublicArtifactState`, `FailureCleanupState`, and
+  `FailureAnchorState::{NotAttempted(last_verified_anchor_digest),
+  Verified(JournalRollbackAnchorCheckpoint,
+  JournalRollbackAnchorObserved, resulting_head),
+  OutcomeUnknown(attempt_id, last_verified_anchor_digest,
+  exact_provider_observations)}` unions prevent a
+  missing public checkpoint, never-provisioned bootstrap, completed
+  cleanup receipt/observation/head, or unresolved live cleanup from being
+  encoded as the same state. The anchor variant is stage-checked against
+  the journal head/attempt set; unknown cannot masquerade as absent or
+  verified, and terminal failure requires the later exact terminal
+  checkpoint/observation fields rather than this unresolved summary.
+
+  Only a fresh two-step `PublicationAbandonmentAuthorization`, rendered
+  by `release-authorize` after authoritative reconciliation proves exact
+  resume impossible, may enter abandonment. It derives disjoint actor-
+  typed `FailureCleanupGrant` for `release-bootstrap`, read-only/sign-only
+  `PublicationFailureObservationCapability` for `release-verify`, and
+  two fresh closed-purpose
+  `FailureFinalizerGrant::{AppendObservation, TerminalAnchor}` grants for
+  `release-finalize`; no one grant crosses actors or purposes, and the
+  append grant has no anchor capability while the anchor grant cannot
+  append a different observation. Evidence capture still requires the separate
+  evidence-capture authority/grant/claim ticket. These grants authorize
+  only bounded credential/workflow cleanup, observation, and terminal
+  anchoring—never evidence capture, yank, overwrite, delete, tag
+  movement, new upload, publicize, or stable completion.
+
+  Define a closed `FailureAuthorityManifest` that binds the exact
+  `ReleasePublicationHandoff`, `ExecutionAuthorityProfileDigest`,
+  transaction, authorization/confirmation audit, abandonment
+  authorization, every purpose grant/claim/expiry, retained journal
+  range/head, rollback-anchor state, and `RetentionBasis`. Its referenced
+  bytes are included in the retained verification manifest so a failure
+  before `PublicationArtifactsReceipt` remains independently provable.
+  Define exact ordered `PublicationFailureStateTuple::{Unresolved,
+  Terminal}` schemas. `Unresolved` contains
+  `(PublicationTransactionId, FailureAuthorityManifest,
+  PublicationFailureStage,
+  FailurePublicArtifactState, RetentionBasis, current journal head,
+  FailureAnchorState, exact unknown-attempt set,
+  active grant/lease/workflow/credential state,
+  PublicationFailureObserved::UnresolvedLiveAuthority,
+  cleanup/terminalization successor set)`. This out-of-band signed
+  snapshot has no quiescence claim or terminal journal head and is
+  retained as `PublicationFailureIncidentBundle::Unresolved` under
+  `ReleaseEvidenceCaptureGrant::PublicationFailureUnresolved`.
+  `Terminal` contains
+  `(optional prior unresolved bundle/receipt tagged union,
+  FailureAuthorityManifest, PublicationFailureStage,
+  FailurePublicArtifactState, RetentionBasis,
+  FailureCleanupState::{NotProvisioned, Completed},
+  PublicationFailureObserved::QuiescedAbandoned,
+  H_publication_failure_observed,
+  JournalRollbackAnchorCheckpoint, JournalRollbackAnchorObserved,
+  H_publication_failure_final,
+  FinalizerQuiescedObserved::PublicationFailure)`.
+
+  The inner `QuiescedAbandoned` observation proves zero publisher,
+  bootstrap, workflow-credential, and public-provider mutation authority
+  while naming only the exact bounded closeout-finalizer successor. The
+  finalizer appends those bytes, terminally anchors/read-backs them to
+  derive `H_publication_failure_final`, exhausts and expires its own
+  grant/lease/credentials, and only then may the outer
+  `FinalizerQuiescedObserved::PublicationFailure` prove the truly empty
+  successor set. `PublicationFailureIncidentBundle::Terminal` contains
+  the exact terminal tuple and prior unresolved lineage when one exists;
+  capture under `ReleaseEvidenceCaptureGrant::PublicationFailureTerminal`
+  yields the only durable abandoned disposition. Neither failure variant
+  is a release-success or rollback claim.
+- Define a sealed `ReleaseEvidenceStoreProfileDigest` for a protected,
+  append-only/content-addressed sink outside every registry, GitHub,
+  journal, anchor, authority, signer, bootstrap, and finalizer
+  administrative domain. Freeze endpoint/namespace, TLS/trust roots,
+  object schema, maximum count/bytes, digest-qualified key, write-once/
+  exact-idempotent conflict rules, read-back API, and retention through
+  the exact tagged `RetentionBasis` horizon (provisional template for a
+  pre-publication failure, retention instance otherwise). Seal the
+  provider's automatic atomic capture-receipt/envelope generation,
+  receipt schema/signature domain, signer/key ID/custody/trust-root and
+  revocation generations, verification rules, conditional-put binding,
+  and receipt read-back API. Also require a provider-retained, signed,
+  attempt-ID-addressable `CaptureStoreAttemptObservation` for every
+  dispatched conditional put and authoritative read-back poll within the
+  capture grant's finite ordinals, including rejection, timeout/unknown,
+  and absence. Seal its distinct canonical schema/signature domain,
+  exact request/attempt/ordinal binding, provider signer/key/custody/
+  trust-root/revocation generation, retention horizon, and verification
+  rules; reuse of the envelope signer key is valid only under a provably
+  non-substitutable domain. Attempt-ID audit retrieval is side-effect-
+  free and creates no recursive observation. A lost client response is
+  recoverable through that bounded audit API. One accepted or exactly reconciled put
+  atomically retains the bundle and its signed envelope/receipt; no
+  second client receipt write exists. A maintenance-
+  authorized successor store profile must bind the exact
+  predecessor profile, failed claim/ticket and negative receipt read-back,
+  `RecoverCaptureStore` maintenance receipt, and a fence that terminates
+  all old-store dispatch authority; it is not an unlinked replacement.
+  Aggregate-bundle bytes and their logical digest-qualified keys are
+  store-independent and immutable: they bind the terminal/incident
+  tuple, transaction, authority/observer identities, canonical schema,
+  and generator digest, but never its own current destination store
+  generation, capture grant/attempt, recovery incident, or future
+  receipt. A successor bundle may and, where specified, must bind the
+  immutable digest of an already captured predecessor receipt/envelope;
+  that historical lineage does not make its own capture bytes depend on
+  their future destination. The provider-retained capture
+  receipt is the canonical `ReleaseEvidenceCaptureEnvelope`: it binds
+  those unchanged bundle bytes/digest/key to the selected store profile/
+  generation, capture grant/claim/ticket, complete applicable recovery
+  lineage, provider observation, and retention basis under the capture-
+  receipt signature domain. It is generated only by the already granted
+  put/read-back operation; there is no second envelope write or circular
+  expected-receipt field.
+  `IncidentEvidenceCaptureReceipt::{Initial, Terminalization}`,
+  `PublicationFailureEvidenceCaptureReceipt::{Unresolved, Terminal}`,
+  and `StableEvidenceCaptureReceipt` are closed kind-specific tagged
+  variants of this single envelope schema, not separately writable
+  objects; variant domain, bundle kind, and bundle digest must agree.
+  A non-Clone
+  `ReleaseEvidenceCaptureCapability` can put/read back only the bounded
+  `IncidentAggregateEvidenceBundle::{Initial, Terminalization}` and
+  `PublicationFailureIncidentBundle::{Unresolved, Terminal}` and
+  `StableAggregateEvidenceBundle` schemas. Each documentation-incident form contains one exact
+  `IncidentStateTuple::{Initial, Terminalization}`, state sequence,
+  disposition, and required predecessor digest/receipt lineage. The
+  stable form contains the
+  canonical independently verified `ReleaseStateTuple` after
+  `FinalizerQuiescedObserved::Stable` plus transaction, authority/observer
+  profile, schema, and bundle-generator digests; a post-incident stable
+  bundle also binds the complete immutable prior incident-bundle/capture-
+  receipt lineage. At most one initial incident logical bundle and one
+  mutually exclusive successor branch exist for a documentation-incident
+  transaction. The branch is stable recovery, terminal-identity-mismatch
+  terminalization, or—only for a bounded recovery/closeout infrastructure
+  failure—publication failure with at most its unresolved and terminal
+  logical bundles, never more than one branch;
+  direct stable completion uses only one object. Recovery and
+  terminalization never overwrite a predecessor. A publication-failure
+  lineage contains at most one unresolved snapshot and one terminal
+  successor. When it follows an initial documentation incident, both
+  failure objects bind that initial bundle/receipt and the transaction
+  has at most three logical evidence keys total; otherwise failure uses at most
+  two. The global `K * G <= 21` maintenance-capacity formula above
+  bounds physical copies across the initial, recovery, and migration
+  generations; every possibly committed copy after an ambiguous response
+  counts toward both object and byte budgets. Failure capture is mutually exclusive with stable or docs-
+  terminalization successors, not with its required initial predecessor.
+  It cannot alter release state
+  or overwrite a digest. Ambiguous capture is reconciled by exact digest
+  read-back. Capability is not authority: after the exact bundle digest
+  exists, require a separate narrow two-step
+  purpose-typed `ReleaseEvidenceCaptureGrant::{IncidentInitial,
+  IncidentTerminalization, PublicationFailureUnresolved,
+  PublicationFailureTerminal, Stable}` binding
+  store/profile/key, bundle kind/digest, actor, expiry, and exactly one
+  numbered exact-idempotent logical put/read-back attempt. That attempt
+  binds a finite maximum request-dispatch count, read-back-poll count,
+  deadline, and backoff schedule. Every permitted redispatch uses the
+  identical conditional-create key and exact bytes; only proven
+  zero-dispatch or same-key/same-bytes exact-idempotent response-loss
+  reconciliation is allowed. A new ordinal, widened budget, changed key,
+  changed bytes, or unconditional overwrite is not a retry. Its
+  immutable approval/attempt/reconciliation receipt enters
+  corresponding provider-retained
+  `IncidentEvidenceCaptureReceipt::{Initial, Terminalization}` or
+  `PublicationFailureEvidenceCaptureReceipt::{Unresolved, Terminal}` or
+  `StableEvidenceCaptureReceipt`. It cannot authorize any publication,
+  journal, lease, anchor, authority, GitHub, registry, or signer effect
+  and does not change `PublicationTransactionId` or any journal head. Refusal or
+  expiry leaves the underlying transaction state unchanged and its
+  incident/stable disposition open. Each durable incident disposition and stable closure require
+  their content-addressed capture receipt. This post-transaction evidence-retention write does
+  not reopen or extend the publication automaton or journal head.
+- Seal a distinct `ReleaseEvidenceCaptureAuthorityProfileDigest` and
+  protected authority namespace with trusted nondecreasing time. It can
+  issue/revoke only the exact purpose-typed initial-incident,
+  incident-terminalization, failure-unresolved, failure-terminal, or
+  stable capture grant
+  after a two-step human approval whose immutable CAS/read-back audit
+  binds bundle/store/profile/key/digest, actor, expiry, and one attempt.
+  Claim-before-put atomically exhausts the sole ordinal; response loss is
+  read-back reconciled and no post-put authority write is required. This
+  authority cannot issue publication grants, evaluate publication
+  effects, or call a release/journal/anchor provider. Bind its profile
+  digest into the observer/store profiles, execution-authority profile,
+  capture bundle, grant, and provider receipt. An unsigned, stale,
+  revoked, wrong-kind/digest/store, wrong-generation, or ambiguously
+  issued grant is invalid. `IncidentInitial` admission requires the
+  verified current `H_incident_final`, matching
+  `FinalizerQuiescedObserved::DocumentationIncident`, sequence zero, and
+  no prior incident or stable capture. `IncidentTerminalization`
+  admission requires current `H_incident_terminalized`, the empty-
+  successor terminal quiescence proof, and exact sequence-one binding to
+  a previously captured `TransientRecoverable` initial bundle/receipt.
+  Stable admission requires the verified current `H_final`, matching
+  `FinalizerQuiescedObserved::Stable`, and no terminalization receipt;
+  when an initial incident receipt exists it also requires the stable
+  bundle to bind that exact immutable lineage. After terminalization,
+  deny every recovery/stable grant. `PublicationFailureUnresolved`
+  admission requires an authorized abandonment state and a valid signed
+  `UnresolvedLiveAuthority` snapshot; its predecessor is either absent
+  or exactly one captured initial documentation-incident bundle/receipt,
+  and it is mutually exclusive with stable/docs-terminalization capture.
+  `PublicationFailureTerminal` requires
+  `H_publication_failure_final`, matching publication-failure
+  quiescence with the empty successor set, exact binding to the prior
+  unresolved receipt when present, and the same initial-incident
+  predecessor when applicable. After either terminal failure or
+  stable capture, deny every new incident/recovery grant and every
+  different terminal/stable digest. Retry admission is
+  exact-idempotent only for the same transaction, kind, sequence,
+  predecessor, bundle digest, store key, and numbered attempt;
+  cross-kind, reordered, or replayed admission is denied. The sole
+  cross-store exception is a fresh grant after a verified
+  `RecoverCaptureStore` maintenance receipt: require the same terminal
+  tuple, kind, immutable bundle bytes/digest/key, exact
+  `EvidenceCaptureStorageIncident` plus complete failed profile/grant/
+  claim/ticket/maintenance lineage, qualified successor store/profile,
+  and deadline/in-flight/fence read-backs proving the old ticket cannot
+  dispatch and no old-store object or receipt exists. This is a new
+  successor-store generation, not a retry. Chain and count every
+  recovery attempt; deny old/new concurrent claims, a third recovery
+  attempt, changed bundle bytes, or cross-store ticket/envelope/receipt
+  replay.
+- Seal the human-invoked `release-evidence-authorize` controller/API mode
+  into that capture-authority profile by exact executable, configuration,
+  operator/workload identity, credential source, trust roots, and
+  command schema. It may submit the two approvals and perform only the
+  bounded issue/revoke/admin-read-back authority transitions above. A
+  successful issue returns an immutable signed
+  `CaptureGrantIssuanceReceipt` binding the verifier actor/workload, exact
+  grant/attempt/key/bytes digest, authority generation, and expiry. It
+  has no evidence-store data-write credential and no publication,
+  registry, GitHub, signer, journal, anchor, lease, bootstrap, or
+  finalizer capability. `release-verify` alone receives a non-Clone
+  `ReleaseEvidenceCaptureClaimCapability` matching that issuance receipt;
+  it performs the sole exact claim-before-put CAS, consumes the claimed
+  capability, and the capture authority atomically emits, signs,
+  persists, and returns a read-back-verifiable `CaptureClaimTicket`
+  under a distinct capture-claim domain/key bound to
+  `ReleaseEvidenceCaptureAuthorityProfileDigest`. The ticket binds the
+  same actor/grant/attempt/key/bytes,
+  dispatch/poll budget, and recovery deadline. It then performs the bound
+  evidence-store put/read-back. After a crash or lost claim response, the
+  same verifier workload must read the authority state and store first;
+  it may reconstruct only that ticket and continue the remaining
+  identical conditional dispatch/poll budget. A verifier observation
+  signature cannot substitute for the authority's ticket signature, nor
+  can either signature validate under a release-state or maintenance
+  domain. The ticket is never a
+  bearer store credential and cannot change kind/key/bytes; it terminates
+  on capture receipt, revocation, budget exhaustion, or its recovery
+  deadline, with no post-put authority write. It
+  cannot issue, renew, revoke, change, or otherwise administer a grant.
+  Publisher, bootstrap, and finalizer identities cannot invoke this
+  controller or receive the claim capability.
+- If a terminal head/quiescence proof exists but capture cannot complete,
+  construct `EvidenceCaptureStorageIncident` from the immutable claim/
+  ticket audit, provider-retained signed
+  `CaptureStoreAttemptObservation` records and authoritative read-backs,
+  intended bundle digest, and terminal tuple identity. The capture
+  invocation passes no unsealed in-process facts: a later read-only
+  capture-incident-observer invocation rereads those durable records and
+  signs the deterministic incident bytes without writing authority/store
+  state; the two-step recovery
+  approval binds that exact digest. The first
+  `RecoverCaptureStore` maintenance ordinal appends/read-backs the signed
+  incident in `EvidenceMaintenanceJournal` before any store-qualification
+  effect. Bind that exact record into the maintenance receipt and
+  successor capture envelope/receipt while preserving the original
+  bundle bytes; the failing evidence store is never its authority.
+  It reports
+  `release_state_terminal_evidence_capture_blocked`; it is not a stable,
+  incident-disposition, or failure-terminal receipt and never reopens the
+  terminal head. Recovery uses only the bounded
+  `RecoverCaptureStore` maintenance path and a fresh capture grant as
+  defined above.
+- Define a separate non-Clone, non-serializable
+  `ReleaseObserverCredentialProvider` for exact read-only GitHub,
+  crates.io, docs.rs, authority, lease, journal, and anchor calls; the
+  purpose-typed local attestation key; the one-digest evidence-store
+  capture claim capability/credential per capture invocation/grant; or
+  the read-only capture-incident observer key plus durable capture-audit/
+  attempt-observation read set; or the disjoint maintenance-observer key/read set and exact
+  `MaintenanceReceiptCaptureGrant`. Process entry selects exactly one of
+  ordinary-observer, capture, capture-incident-observer, or maintenance-observer mode and cannot
+  load the other modes' credentials. The logical evidence lineage is
+  bounded to at most three immutable logical evidence keys: direct
+  stable alone; initial incident followed by stable or terminalization;
+  direct unresolved failure followed by terminal abandonment; or initial
+  incident followed by unresolved and terminal failure.
+  It
+  cannot load publisher/bootstrap/finalizer/signer or generic
+  store credentials. Evidence-store operator/admin, verifier actor/key
+  custodian, finalizer, authorization authority, and release-provider
+  administrators are distinct roles. Each provider-derived capture
+  receipt/envelope is immutable signed read-back metadata retained atomically alongside its bundle:
+  object generation, kind, size/digest, retention, actor/grant/attempt,
+  complete recovery predecessor when present, and timestamp—not merely
+  an ephemeral client response. Compile-fail, process-entry, and runtime
+  capability tests reject mixed observer/capture/capture-incident/
+  maintenance credentials, domains, keys, read sets, claims, and write
+  surfaces.
+- Seal a separate human-invoked `PublicationFinalizer` as an explicit
+  `release-finalize` binary/profile. It has only authorization/time read,
+  exact remote-journal append/read-back, and exact external
+  `JournalRollbackAnchor` checkpoint/read-back capabilities; it cannot
+  load or call bootstrap administration, crates.io, GitHub tag/release/
+  asset, signer/transparency, or cleanup-observer signing surfaces. A
+  finalizer grant selects exactly one closed purpose-typed automaton:
+  `append_signed_observation` binds one canonical signed observation and
+  the required direct journal append/CAS ordinal(s), with no anchor
+  capability; `terminal_anchor` binds one exact checkpoint plus the
+  finite pre-effect/anchor-update/read-back/observation ordinals, with no
+  observation-signing or unrelated append. Cleanup and docs observations
+  use separate fresh append grants; terminal stable/incident anchoring
+  uses a fresh anchor grant. Unused or widened capability is invalid.
+  Numbered attempts, ambiguous-outcome reconciliation, crash/resume,
+  fencing, and provider read-back apply without reviving the publisher.
+  The terminal-anchor grant's final
+  direct journal-observation append is the last automaton ordinal: the
+  authority CAS enters `exhausted_claimed` before that dispatch. The
+  finalizer lease and credentials have fixed, nonrenewable expiry after
+  the admitted operation deadline, and the finalizer cannot issue a new
+  grant. It performs no release/revoke/completion/journal/provider write
+  after the terminal head; later proof is read-only.
+- Define a sealed `ExecutionAuthorityProfileDigest` covering publisher,
+  bootstrap, verifier, finalizer, `release-authorize`, and
+  `release-evidence-authorize` and `release-evidence-maintain`
+  executable/configuration digests plus the
+  exact `ReleaseObserverProfileDigest` and
+  `ReleaseEvidenceStoreProfileDigest` plus
+  `ReleaseEvidenceCaptureAuthorityProfileDigest` and
+  `PublicationAuthorizationControllerProfileDigest` plus
+  `ReleaseEvidenceMaintenanceAuthorityProfileDigest` and
+  `ReleaseEvidenceMaintenanceObserverProfileDigest`; the exact
+  `ReleaseEvidenceRetentionPolicyTemplate` digest and
+  `provisional_retain_until`; the exact
+  `TransactionSuccessorPolicy` digest; the exact
   `publish-authorized.yml` path/bytes/provider workflow ID, sealed ref/
   commit/tree/definition digest, protected environment identity/policy,
   workload/run credential-binding policy, and bootstrap operator-host
   trust profile; registry API/index/download identities; GitHub API/
   repository; remote journal/lease endpoint/namespace plus store
-  generation/restore epoch/trust roots; signer action/transparency
+  generation/restore epoch/trust roots; the distinct external
+  `JournalRollbackAnchor` provider, endpoint, namespace, schema,
+  retention, trust roots, credential/capability policy, and
+  administrative-separation evidence; signer action/transparency
   identity; authorization authority; and trusted time authority.
 - Define transaction identity independently of renewable grants with a
   domain-separated SHA-256 over an exact versioned, length-prefixed,
@@ -27803,18 +28751,117 @@ Implementation:
   Every invocation/resume needs a fresh current two-step grant; renewal
   does not change transaction identity.
 - Define a protected `PublicationAuthorizationAuthority` and trusted
-  nondecreasing `AuthorizationTimeAuthority`. The authority records
-  CAS/read-back revocation/completion state; clock rollback, uncertain
-  time, expired/revoked/completed grants, or authority unavailability
-  prevents new writes. Expiry/revocation after dispatch permits bounded
-  read-only reconciliation only; any later journal/provider write needs
-  a fresh grant.
+  nondecreasing `AuthorizationTimeAuthority`. Freeze the grant automaton:
+  `issued(owner,next_ordinal=0,last_claim=none)`; then one CAS
+  `claim(ordinal,attempt_id,pre_effect_head,fence)` per effect. A claim
+  requires the exact next ordinal and authoritative reconciliation of
+  the previous claim, atomically advances `next_ordinal`, and records the
+  one permitted attempt before dispatch. The next claim both proves the
+  preceding journal/provider observation and claims its successor; there
+  is no separate post-effect authority write. Claiming the last ordinal
+  atomically enters `exhausted_claimed(last)` before that final dispatch,
+  so no later ordinal or completion write exists. A failed-before-
+  dispatch or unknown claimed ordinal is consumed and reconciled or
+  abandoned under a fresh grant; it never returns to unclaimed. Explicit
+  revocation/expiry prevents a new claim but preserves read-only
+  reconciliation. Grant issue/renew, per-ordinal claim, revoke, and
+  authorization-audit-record CAS writes are immutable, numbered, and
+  read-back reconciled; `exhausted_claimed` is terminal completion, not a
+  later CAS operation. The first authority write uses a separately
+  rendered two-step authorization-bootstrap transition rather than the
+  grant being created; no grant authorizes its own issuance. An ambiguous
+  authority write cannot be repeated or treated as absent until exact
+  authority state is reconciled. Clock rollback, uncertain time,
+  expired/revoked/exhausted grants, or authority unavailability prevents
+  new claims. Time-authority sampling is read-only in the selected core
+  profile.
+- Seal a distinct `PublicationAuthorizationControllerProfileDigest` and
+  human-invoked `release-authorize` controller/API mode by exact
+  executable, configuration, operator/workload identity, admin-
+  credential source, authority endpoint/namespace/API version, trust
+  roots, bounded grant/abandonment command schemas, and the separate retention-policy
+  signature domain/key ID/public key/custody profile. Its mutually
+  exclusive invocations are `grant-admin`, `abandonment-admin`, and
+  non-grant `retention-policy`; a process cannot hold two capabilities.
+  `grant-admin` alone may run the finite two-step
+  issue/renew/revoke/authorization-audit admin automaton and reconcile
+  those numbered CAS results. `abandonment-admin` alone may render/read
+  back `PublicationAbandonmentAuthorization` and its exact actor-typed
+  cleanup/observation/finalizer grants after the mandatory failure-state
+  predicates pass; it cannot issue an ordinary publication successor.
+  Publisher, bootstrap, verifier, and
+  finalizer receive only purpose-typed claim/read capabilities for an
+  already issued grant; they cannot mint, renew, revoke, or widen one.
+  `release-authorize` cannot claim an effect ordinal and has no registry,
+  GitHub, artifact/transparency signer, journal, lease, rollback-anchor, bootstrap,
+  evidence-store, or evidence-capture-authority capability. Its
+  `retention-policy` mode can use only the distinct
+  `ReleaseRetentionPolicySigner` key and cannot run either admin mode. Its
+  crash/resume path is read-back-first and cannot repeat an ambiguous
+  admin mutation.
+- Seal a `TransactionSuccessorPolicy` into the handoff and authority
+  profile. Before issuing or renewing any grant, the authority derives
+  eligibility from the exact verified journal/rollback-anchor head and
+  transaction ID. Stable `H_final` has an empty mutation-successor set:
+  no new/renew/reopen publication-transaction grant is valid under the
+  sealed authority/policy/store generation. The only admissible post-
+  terminal authority objects are (a) the disjoint purpose-typed evidence-
+  capture grant admitted by the kind/state/ordering rules above for the
+  exact prebound documentation-incident, publication-failure, or stable
+  bundle digest/store—or the bounded first-or-second
+  `RecoverCaptureStore` lineage that binds the same terminal tuple/kind,
+  complete failed-claim predecessors, fences, and signed maintenance
+  receipts—and (b) a disjoint
+  `ReleaseEvidenceMaintenanceGrant` admitted by the monotonic retention
+  policy above. Neither has a publication-transaction successor/effect
+  or changes a terminal head. Otherwise only read-
+  only drift verification remains. A different-generation or privileged bypass is
+  unauthorized out-of-band tamper detectable by drift audit, not claimed
+  impossible. A `TransientRecoverable` `H_incident_final` permits only
+  after exact initial bundle/receipt read-back the closed same-bytes docs
+  sequence—read-only docs observation, append
+  its signed result, and terminal re-anchoring/quiescence—ending either
+  at stable `H_final` or mismatch `H_incident_terminalized`; it never
+  permits publisher/bootstrap/registry/GitHub/signer work. An initially
+  authorized exact-resume-impossible failure within that bounded
+  observation/finalization path may instead enter only the typed
+  publication-failure abandonment branch that binds the initial incident
+  receipt; it still cannot resume publisher/publication effects. An initially
+  terminal source/metadata/docs identity mismatch and every
+  `H_incident_terminalized` have an empty successor set. An authorized
+  `PublicationFailureObserved::UnresolvedLiveAuthority` state permits
+  only the exact reconciliation, credential/workflow cleanup,
+  observation, terminal-anchor, and failure-evidence transitions bound
+  by its `PublicationAbandonmentAuthorization` and applicable actor-
+  typed cleanup/observation/finalizer grants; evidence capture remains
+  separately authorized. `H_publication_failure_final` has an empty
+  successor set and can never reach publication or stable recovery. This
+  is a pure mandatory admission rule over the already verified head, not
+  a post-`H_final` authority write. `FinalizerQuiescedObserved` binds the
+  authority/policy generation, applicable successor set, trusted
+  observation time, and nonrenewable expiry state; it does not claim
+  eternal control of provider administrators. It also proves that any
+  remaining admissible capture or evidence-maintenance grant is the
+  disjoint non-release type, never a publication successor.
+- Keep the authority layer nonrecursive. A per-ordinal `claim` CAS is the
+  grant-authenticated admission/control transition paired with its one
+  provider/journal/lease/anchor effect; it is not another target that
+  needs a claim from the same grant. Grant issue/renew/revoke and audit-
+  record mutations instead use a separate finite human/admin authority
+  automaton, credential, two-step approval, numbered attempts, and exact
+  read-back reconciliation; that meta-authority cannot perform release
+  provider effects. Neither layer authorizes itself.
 - Replace a prose “remaining effects” list with a canonical bounded
   effect automaton: exact irreversible targets and input/subject digests,
   preallocated effect/attempt ordinals, allowed conditional transitions,
   maximum provider/journal/signer/lease mutations and read-only polls,
   byte/deadline ceilings, and no wildcard target or unbounded retry. A
-  bound exhaustion requires a newly rendered two-step grant.
+  bound exhaustion requires a newly rendered two-step grant. Enumerate
+  each `JournalRollbackAnchor` update/read-back as an explicit target
+  with its own attempt ordinal and bounds. Record the paired claim CAS in
+  the receipt, while the separately authorized authority-admin automaton
+  inventories issue/renew/revoke/audit mutations outside the grant's own
+  target set.
 - Seal a `derived_output_policy_digest` for signer identity, exact
   subject digest, algorithm/profile, transparency endpoint, output
   schema, and byte/count bounds. Derived signatures/provenance are
@@ -27827,8 +28874,25 @@ Implementation:
   state machines to registry uploads, tag creation, draft creation,
   each asset/signer/publicize action, receipt upload, anchor upload,
   remote segment append, CAS-head advance, and lease acquire/renew/
-  handoff/release. A timed-out journal/lease mutation is read back before
-  retry. An unknown attempt never returns to pending.
+  handoff/release; separately authorized authority-admin transition; and
+  `JournalRollbackAnchor` update. A timed-out authority, journal, lease,
+  or rollback-anchor mutation is read back before any retry. An unknown
+  attempt never returns to pending.
+- Define the remote-journal control-plane exception so authorization does
+  not recurse. For a journal segment append or CAS-head advance, the
+  paired authority `claim` plus exact expected old head directly admits
+  one numbered append; that record describes its own bounded control
+  attempt and is reconciled by segment/head read-back and the external
+  rollback-anchor cadence, not by another pre-effect journal record. A
+  non-journal provider effect still uses a separately claimed direct
+  journal append for `PreEffectRecord`, then its own claimed provider
+  ordinal, then a separately claimed direct observation append. Lease
+  acquire/renew/handoff/release uses the same finite three-stage shape:
+  direct claimed pre-record append, claimed lease CAS/read-back, direct
+  claimed observation append. Response loss at any control append or
+  lease CAS is reconciled against exact store/lease identity before a
+  fresh grant can continue. No rule requires a journal record about the
+  act of writing that journal record.
 - Persist an `in_flight_attempt` barrier before provider dispatch. A new
   lease holder may reconcile that unresolved attempt but cannot begin
   another mutation for the object; handoff stays blocked until verified
@@ -27840,18 +28904,60 @@ Implementation:
   protected coordinator workflow identity, absent from historical refs
   and included in CI-FINAL-CORE-01's sealed source. It has no tag/branch/
   reusable trigger, no trusted declared shell/version/ref input, and
-  only a pinned manual entry point. `workflow_dispatch` nevertheless
-  carries a caller-selected ref: the authorized bootstrap dispatches the
-  sealed full commit, and the workflow compares its resolved full commit,
-  tree, definition digest, and workflow identity with the handoff/grant
-  before any credential access or effect. Arbitrary-ref dispatch fails
-  closed. Once the provider assigns the new workflow ID, a separate
+  only a pinned manual entry point. GitHub's dispatch API accepts a
+  branch or tag name, not a raw commit: freeze
+  `sealed_dispatch_ref=refs/heads/main`, require provider read-back that
+  its protected tip is the sealed full commit immediately before and
+  after dispatch, and prevent ref updates for the bounded enable/run
+  window. The returned run's `head_sha`, event ref, workflow SHA/path/ID,
+  tree, definition digest, actor, and transaction nonce must equal the
+  handoff/grant before publication admission. Because GitHub executes
+  YAML from the selected event ref, checks inside arbitrary attacker-
+  edited YAML are not a security boundary. Select and read back a
+  provider-enforced Workflow Execution Protection rule that permits only
+  the sealed bootstrap app/identity and `workflow_dispatch` event. That
+  current provider control does not itself select a workflow or ref:
+  protected-main rules plus the bounded ref freeze/read-back protect the
+  ref; bootstrap's exact dispatch target and unique run inventory protect
+  workflow ID/path/run; and an exact custom deployment-protection App at
+  the environment gate independently admits only the sealed workflow/
+  ref/source/run. Freeze each provider/API/preview/App version, rule ID,
+  configuration digest, and fallback. If the repository/account cannot
+  prove the combined actor/event, protected-ref, exact-run-inventory, and
+  deployment-gate controls, publication stays blocked or moves to a
+  separately sealed execution substrate; default token permissions are
+  not a substitute. Once the provider assigns the new workflow ID, a separate
   exact safety-only human authorization disables it and records the
   command, actor, ID, state read-back, absence of environment/secrets,
-  and receipt. The definition is credentialless and coordinator-denied
-  even during the registration-to-disable interval. This safety action
+  and receipt. The definition grants only `contents: read` at the exact
+  checkout/preflight job and `{}` everywhere else. Its pinned
+  `actions/checkout` invocation explicitly uses the implicit read-only
+  `${{ github.token }}` and `persist-credentials: false`; every other
+  action/step and the publisher itself are forbidden from reading that
+  token or persisted checkout credentials. GitHub issues that implicit
+  token, so the claim is precisely “no mutation-capable
+  credential,” not “credentialless.” It is coordinator-denied even
+  during the registration-to-disable interval. This safety action
   grants no publication authority. Add no mutation job to CI-BASE-01 or
   the permanently disabled historical workflow.
+- Make enablement/dispatch a two-phase admission. First create an empty
+  protected environment with the exact custom deployment-protection App
+  rule and no
+  publisher credential. Dispatch with a grant-bound transaction nonce;
+  reconcile response loss against a bounded provider run inventory keyed
+  by workflow ID, enable epoch, ref, actor, nonce, and creation window.
+  Require exactly one authorized run and zero other queued, waiting,
+  in-progress, or completed candidates at dispatch, before every
+  publication mutation, and during cleanup. The run executes only a
+  no-mutation-capable-token/credential preflight job, then waits at the
+  protected environment/deployment gate. Only after unique run-ID and
+  `head_sha` read-back may bootstrap bind/issue the short-lived publisher
+  credential to that exact workflow/ref/source/run, re-read the policy,
+  and approve the mutation job. An extra or ambiguous run triggers only
+  preauthorized disable/revoke safety effects, blocks publication and
+  stable success, and requires separate authorization for cancellation
+  or other disposition; disabling a workflow does not prove a queued run
+  disappeared.
 - Implement a separately sealed, human-invoked
   `PublicationBootstrapController` as an explicit
   `release-bootstrap` binary/mode in the same non-publishable tool
@@ -27860,7 +28966,10 @@ Implementation:
   credential type/API surface limited to the authorization/time
   authority, remote journal/lease, and exact GitHub workflow/environment
   administration needed to enable, provision, dispatch, observe,
-  disable, and revoke. Compile-time and capability tests prove it cannot
+  disable, and revoke, plus a purpose-typed
+  `BootstrapRollbackCheckpointCapability` that can only update/read back
+  the exact `JournalRollbackAnchor` before its next granted bootstrap
+  mutation. Compile-time and capability tests prove it cannot
   call crates.io upload, tag/release/asset, or signer/transparency APIs
   and cannot load their credentials. It applies the same exact two-step
   grant, numbered attempt, in-flight, CAS/fencing, read-back,
@@ -27882,7 +28991,9 @@ Implementation:
   provisioning, sealed-ref dispatch, run binding, post-run disablement,
   and credential/environment revocation/read-back.
 - Provide a hermetic local registry with delayed index/download views and
-  GitHub-provider, signer, and durable remote-journal/lease sandboxes
+  GitHub-provider, signer, durable remote-journal/lease,
+  `JournalRollbackAnchor`, authorization, and `ReleaseEvidenceStore`
+  sandboxes
   capable of fault injection before/after every side effect. Sandbox
   state and credentials are synthetic, bounded, and isolated from
   production DNS/routes.
@@ -27893,8 +29004,10 @@ Acceptance:
   source identity before CI-FINAL-CORE-01, while its default execution
   has zero external mutation authority.
 - The new-path workflow identity is sealed, safety-authorized and
-  provider-read-back as disabled, trigger-bounded, credentialless,
-  environmentless, arbitrary-ref rejecting, and coordinator-denied; the
+  provider-read-back as disabled, trigger-bounded, stripped of every
+  mutation-capable token/permission, environmentless, provider-enforced
+  to the exact actor/event plus protected-ref, exact-run-inventory, and
+  custom deployment-gate controls, and coordinator-denied; the
   historical workflow ID remains disabled. The registration-to-disable
   interval has no credentials or authorization path. Neither
   REL-PREP-01 nor REL-01 can enable or provision it for publication.
@@ -27905,10 +29018,14 @@ Acceptance:
   credential issuance is bound to the exact authorized workflow,
   source/ref, environment, and run or closure remains blocked with the
   residual trust stated explicitly.
-- One exact production provider set is selected, immutable inputs and
-  operational guarantees are frozen, and real read-only evidence matches
-  every required contract. Missing, marketing-only, sandbox-only,
-  version-floating, or failed provider evidence prevents closure.
+- One exact production provider set is selected and immutable inputs and
+  operational guarantees are frozen. Credential-free/public and
+  authenticated read-only evidence is used wherever sufficient; any
+  guarantee that cannot be established read-only requires its own
+  separately authorized, exactly bounded, retained non-publication
+  qualification receipt. Missing, marketing-only, sandbox-only,
+  version-floating, unauthorized, or failed provider evidence prevents
+  closure.
 - The production registry path sends the exact sealed archive/body and
   cannot repackage, use an alternate registry, follow an unapproved
   redirect, or fall back to Cargo/curl/another HTTP stack.
@@ -27917,15 +29034,36 @@ Acceptance:
 - Local-WAL and protected cross-run journal recovery is monotonic,
   exactly decodable, bounded, fenced, CAS/read-back verified, and cannot
   repeat a verified side effect or hide an unknown outcome.
+- The selected release-evidence store is content-addressed, write-once,
+  version/retention protected, provider-read-back verified, and
+  administratively separate. Incident and stable bundle/receipt pairs
+  survive verifier loss, cannot overwrite one another, and expose no
+  release mutation authority.
+- Capture-store attempt observations and kind-specific capture envelopes
+  are provider-signed, atomically retained/read back with the immutable
+  bundle where applicable, attempt-ID addressable after response loss,
+  and bounded by the closed logical/physical object and retention model.
+- The selected maintenance authority/journal, observer receipt store,
+  retention policy, and destination-qualification path implement the
+  single-writer state machine, disjoint actor/mode/key boundaries, closed
+  outcomes, `24/16/4/2/2` attempt/effect limits, 3,600-second success
+  spacing, 16-success ceiling, six-times-manifest byte ceiling, and
+  `K <= 3`, `G <= 7`, `K*G <= 21` capacity. Extension, migration,
+  capture-store recovery, and expiry variants satisfy their exact
+  admission/read-back/retention rules before REL-01 can seal them.
 - GitHub support has no delete/replace/force-move surface; provider and
   signer outputs are independently read back/verified.
 - The approved license representation is unambiguous and identical
   across all nine manifests, package archives, license texts, README/
   release wording, SBOM conclusions, and registry metadata. Every
   `DocsRsBuildProfile` passes its sealed network-isolated preflight.
+- Previously published versions have a complete immutable archive/
+  registry/text inventory and reviewed historical-disposition wording;
+  no result implies those artifacts were rewritten or silently yanked.
 - Asset packaging is byte-reproducible from sealed inputs; binary
-  reproducibility is claimed only for target rows with two matching
-  clean builds. SPDX 3.0.1 SBOMs and raw in-toto/SLSA statements are
+  same-environment bit repeatability is claimed only for target rows with
+  two matching clean builds, never as cross-builder reproducibility.
+  SPDX 3.0.1 SBOMs and raw in-toto/SLSA statements are
   schema/conformance-valid and cover every required subject exactly.
 - Every external request, response, retry, reconciliation poll, upload,
   artifact, log, and receipt has a configured byte/count/time bound and
@@ -27934,11 +29072,17 @@ Acceptance:
 Tests:
 
 - No-Tokio/runtime/thread/curl/production-`cargo publish` dependency and
-  call-site gates; cancellation at DNS/TLS/write/read/retry/journal/
-  provider boundaries with no orphan work.
-- Process-entry tests proving exactly one top-level asupersync runtime/
-  root region, no `test-internals` or nested runtime, bounded shutdown,
-  and complete child-work ownership.
+  call-site gates for publisher, bootstrap, verifier, finalizer,
+  `release-authorize`, `release-evidence-authorize`,
+  `release-evidence-maintain`, and sandboxes;
+  cancellation at DNS/TLS/write/read/retry/journal/provider boundaries
+  with no orphan work. Build every supported release-tool target.
+- Process-entry tests for publisher, bootstrap, verifier, finalizer,
+  `release-authorize`, `release-evidence-authorize`, and
+  `release-evidence-maintain` proving each
+  invocation owns exactly one top-level asupersync runtime/root region,
+  passes `&Cx` downward, enables no `test-internals` or nested runtime,
+  and has bounded shutdown and complete child-work ownership.
 - Crate-root/workspace-lint mutations proving every release-tool target
   has `#![forbid(unsafe_code)]` and cannot weaken the inherited forbid.
 - Capture-registry known answers and malformed/oversize/truncated/
@@ -27951,12 +29095,22 @@ Tests:
   ordering/length/bound/no-normalization mutations; effect-automaton
   ordinal/transition/count/byte/deadline exhaustion; authorization audit
   verbatim/digest/redaction; grant renewal/base-head/prefix; authority
-  revocation; and trusted-time rollback/jump tests.
+  revocation; authorization-authority first-write/issue/renew/per-
+  ordinal-claim/revoke/audit CAS timeout/read-back reconciliation;
+  crashes at claim-before-dispatch, prior-claim reconciliation, last-
+  effect claim, and `exhausted_claimed` with no post-final completion
+  write; and
+  trusted-time rollback/jump tests proving the coordinator cannot mutate
+  that authority.
 - Local-WAL partial-write/fsync/rename/lock/contention/truncation/hash-
   chain/recovery/size-limit and capability-root escape tests; remote
   journal segment/CAS/read-back/retention, split-brain runner, lease
   expiry/renewal/loss, stale fencing token, and protected-workflow-
-  concurrency tests.
+  concurrency tests. `JournalRollbackAnchor` tests cover provider/
+  endpoint/namespace/trust-root/credential substitution, privilege
+  separation, checkpoint cadence and retention, stale/rollback/clone/
+  forked history, ambiguous update/read-back, and the distinction from
+  `ReleaseReceiptAnchor`.
 - Registry delayed/stale/conflicting index, download/checksum/yank,
   upload-response loss, timeout, ownership/token rejection, dependency-
   lag, and multi-view reconciliation tests.
@@ -27968,8 +29122,14 @@ Tests:
   missing-provider fail-closed behavior.
 - License-decision fixtures for current contradictory inputs, SPDX versus
   `license-file` exclusivity, rider/link/README drift, per-crate manifest
-  drift, packaged-file omission, SBOM mismatch, and missing explicit
-  approval. No test “chooses” a license by heuristic.
+  drift, packaged-file omission, SBOM mismatch, missing historical
+  version/archive/metadata/text, the exact `0.3.2` missing-license-file /
+  broken-packaged-link case, false retroactive-correction claims,
+  unauthorized yank/advisory mutation, and missing explicit approval. No
+  test “chooses” a license by heuristic. Decision-record tests reject
+  wrong reviewer/role/signature/commit/timestamp/scope, stale or changed
+  input digests, post-seal substitution, omitted package/public wording,
+  and a receipt/SBOM/provenance/handoff bound to another decision digest.
 - docs.rs metadata matrix tests for all nine crates, unsupported-feature
   claim leakage, target-count/resource-limit drift, network access, exact
   `--cfg docsrs`/toolchain/container identity, and sealed-archive
@@ -27978,16 +29138,27 @@ Tests:
   link, mode, uid/gid/name, timestamp, extra-field/comment, compressor,
   locale/time-zone, and clean-directory differential mutations. Separate
   two-clean-build binary comparisons prove a `false` disposition cannot
-  be rendered or documented as bit-reproducible.
-- SPDX 3.0.1 context/model/conformance and JCS known answers, plus
+  be rendered as repeatable and a same-runner pass cannot be rendered as
+  cross-builder reproducible when an independent-builder differential
+  fails.
+- SPDX 3.0.1 global-context, official canonical-JSON, structural-Schema,
+  and semantic OWL/SHACL known answers, including a document that passes
+  JSON Schema but fails SHACL and a case where RFC 8785 JCS bytes differ
+  from the official SPDX canonical bytes. Also test
   omitted/extra subject, package, dependency-kind, feature, target,
-  source/checksum, license, generator, timestamp, and ordering mutations.
+  source/checksum, license, generator, timestamp, and ordering mutations;
+  third-party declared/concluded-license drift, unknown/`NOASSERTION`,
+  conflicting metadata/text, and unreviewed dual-license expressions.
   in-toto Statement/SLSA v1.2 schema and subject-completeness tests mutate
   `_type`, `predicateType`, build type, builder, parameters, resolved
-  dependencies, timestamps, byproducts, and subject digest. DSSE tests
-  prove the signature covers the exact raw statement bytes and reject an
-  empty/unsigned envelope, payload-type/base64 drift, or an unproved SLSA
-  level claim.
+  dependencies, timestamps, byproducts, and subject digest; wrong SLSA
+  source commit/file digest, mutable web-text substitution, or online-
+  only validation fails closed. DSSE tests
+  prove the signature covers the exact raw statement bytes through exact
+  DSSE v1 PAE and reject raw-payload signing, wrong domain/type/decimal
+  byte length, byte-versus-character length, overflow, altered PAE,
+  empty/duplicate/unapproved signers, non-canonical base64, or an
+  unproved SLSA level claim.
 - Production-provider selection matrix and deadline test; exact API/
   action/version drift, TLS/trust-root drift, weak consistency, retention
   expiry, restore/clone rollback, stale time, credential revocation,
@@ -27996,19 +29167,80 @@ Tests:
   against the selected production identities; keep separately authorized
   bounded mutation evidence distinct and fail if it is absent where a
   guarantee cannot be established read-only.
+- Release-evidence-store sandbox and selected-provider tests cover lost
+  put response, exact idempotent replay, digest/kind/generation conflict,
+  overwrite attempt, incident-capture refusal/ambiguity, repeated non-
+  green polling with zero extra mutation, later-green recovery bound to
+  the immutable incident bundle/receipt, cross-kind substitution, missing retained
+  receipt, early retention expiry, store rollback/clone/admin tamper,
+  verifier/store-admin role collision, quota/outage, secret canaries, and
+  authoritative read-back. Capture-authority tests cover two-step audit,
+  CAS issue/revoke/sole-ordinal claim, trusted-time/generation drift,
+  claim-before-put crash, ambiguous issuance, wrong kind/store/digest,
+  and attempted publication-grant issuance. A store result is never relabeled registry/
+  GitHub/journal success.
+- Capture-store trust-boundary tests mutate
+  `CaptureStoreAttemptObservation` and
+  `ReleaseEvidenceCaptureEnvelope` signer, domain, key, trust root,
+  revocation, provider/store generation, attempt ID, grant/ticket,
+  bundle kind/digest/key, and retention basis. Prove atomic
+  bundle-plus-envelope creation, durable attempt-audit lookup after a
+  lost response, exact-idempotent reconciliation, and rejection of
+  cross-variant envelope substitution or a separately writable receipt.
+- Maintenance-authority unit/property/fault tests enforce the canonical
+  single-writer CAS, predecessor receipt, closed outcome variants,
+  split-brain/concurrent-runner denial, and exact 24-total/16-extension/
+  four-migration/two-recovery/two-expiry attempt limits, 16 successful
+  generations, 3,600-second spacing, six-times-manifest byte budget, and
+  `K <= 3`, `G <= 7`, `K*G <= 21` capacity. Every issued, claimed,
+  failed, partially effective, ambiguous, qualification, and observer-
+  receipt attempt consumes its declared counter and cannot be reset.
+- Maintenance variant tests cover template-versus-instance and open-
+  versus-terminal extension; signed conditional quote versus actual
+  monotonic horizon read-back; independently provider-signed destination
+  qualification; exact-copy migration, destination verification,
+  authority cutover, and source retention; capture-store recovery across
+  both initial docs dispositions plus terminalized/stable/failure heads
+  with deadline, zero-in-flight, old-store fence, identical bundle, full
+  predecessor chain, and at-most-two attempts; and expiry rejection for
+  early time, legal hold, live support, newer policy, in-flight work, or
+  incomplete inventory. Maintenance-observer tests enforce its distinct
+  actor/mode/key/domain/read set, exact
+  `MaintenanceReceiptCaptureGrant`, conditional receipt append/read-back,
+  non-self-referential profile-core/receipt/final-state order, retained
+  post-expiry audit horizon, and denial of maintainer self-attestation,
+  mixed credentials, effect authority, replay, substitution, or a
+  successor before durable finalization.
 - Full local registry/provider-sandbox termination and resume after every
   durable transition, including grant renewal at the current journal
   head and competing runners, proving default/no-authorization runs make
   no production DNS request or external mutation.
 - New-workflow identity/path/trigger/action/permission checks, historical-
   ref absence, safety-authorized initial-disable receipt,
-  provider-disabled/no-environment/no-secret read-back, arbitrary-ref
-  dispatch, and attempted dispatch/enablement without a REL-02 effect
-  grant. Bootstrap tests kill/restart before and after every
-  enable/provision/dispatch/run-observation/disable/revoke effect, reject
-  wrong workflow/source/ref/run identity and a credential usable by a
-  second workflow, and statically/dynamically prove the bootstrap has no
-  registry/tag/release/asset/signer capability.
+  provider-disabled/no-environment/no-secret read-back, exact checkout-
+  only `contents: read` plus `{}` for every other implicit permission,
+  checkout `persist-credentials: false`, and absence of
+  `${{ github.token }}`/checkout-credential use outside that exact step;
+  exact provider actor/event rule,
+  protected-main freeze, workflow-ID/run inventory, and custom
+  deployment-protection App rule,
+  and attempted dispatch/enablement without a REL-02 effect grant. Test
+  repository-default write permissions and an attacker-edited arbitrary-
+  ref; provider policy must prevent execution rather than trusting its
+  YAML. Bootstrap tests kill/restart before and after every enable/
+  empty-environment/dispatch/run-observation/credential-bind/approval/
+  disable/revoke effect; cover dispatch-response loss, duplicate or
+  competing dispatch before/after the authorized dispatch, a queued run
+  surviving disablement, wrong run waiting on the same environment, job
+  start or approval before binding, run-ID/nonce ambiguity, and reject
+  wrong workflow/source/ref/run identity or a credential usable by a
+  second workflow. Statically/dynamically prove the bootstrap has no
+  registry/tag/release/asset/signer capability. Verifier tests reject a
+  substituted executable/config/provider read-set, same-actor or write/
+  admin-capable verifier, wrong key/algorithm/trust generation, expired/
+  revoked key, forged or altered canonical observation, and observation
+  bytes changed by the journal appender. Credential/redaction/custody
+  tests cover the verifier without exposing its attestation capability.
 
 Dependencies:
 
@@ -30201,6 +31433,23 @@ Implementation:
   inventory. Production endpoint access and mutation remain disabled.
 - Add `cargo package --list`, `cargo package`, and packaged-artifact
   consumer smoke tests for every publishable crate in dependency order.
+- Execute those commands through one sealed
+  `HermeticWorkspacePackageChain`: start with an empty Cargo home, target,
+  cache, and source-replacement registry; seed that registry only with
+  the exact registry `config.json`, sparse/git index entries (version,
+  dependency metadata, features, yank state, checksum), and checksum-
+  verified `.crate` archives for the full locked normal/build/dev and
+  selected-feature third-party graph from the sealed dependency mirror;
+  read all of them back, then run ordinary verified `cargo package --locked` for
+  the first internal crate; insert its exact `.crate`, generated index
+  entry, version, and checksum into the registry and read them back; then
+  repeat in topological order so each later crate resolves every earlier
+  `0.4.0` internal dependency from that registry. Use no workspace/path/
+  Git patch, ambient crates.io cache/network, alternate internal source,
+  or `--no-verify`. Record the published-manifest rewrite inside each
+  archive, verification build, registry insertion/read-back, and exact
+  archive bytes. The source-replacement configuration changes resolution
+  only; it must not change the archive that REL-01 seals or REL-02 sends.
 - Validate workspace version/dependency alignment for planned
   `0.4.0`.
 - Upload redacted wire captures, test reports, dependency graphs,
@@ -30264,7 +31513,10 @@ Tests:
   result with an unknown discriminator, and require failure.
 - Feature-matrix completeness.
 - Evidence-manifest schema and redaction tests.
-- Packaged consumer smoke test.
+- Packaged consumer smoke test. Package-chain negatives remove or alter
+  one internal prerequisite, select the wrong source/checksum/version,
+  inject a path/Git patch or ambient-cache hit, leak network access, or
+  pass `--no-verify`; each must fail before a green archive inventory.
 - DX inventory mutation tests that remove a transport/fault/auth/
   extension/operator category, introduce a private import, enable a
   legacy initialization default, or replace production admission with a
@@ -30330,7 +31582,9 @@ Implementation:
   examples, schema/fixture checks, security checks, all shipped-code
   feature-safety checks, and required platform jobs. A result from
   the qualification checkout cannot be substituted.
-- Build every publishable crate again in dependency order. Bind each
+- Recreate CI-CORE-01's exact `HermeticWorkspacePackageChain` from empty
+  storage and build every publishable crate again in dependency order.
+  Bind each
   `cargo package --list` inventory, package source-tree digest,
   byte-exact `.crate` archive SHA-256 digest, unpacked archive file
   inventory/digests, and packaged-consumer result to the final source
@@ -30347,7 +31601,7 @@ Implementation:
   `publication_state="unpublished"` and a checker-derived
   `final_evidence_membership` equal to CI-FINAL-CORE-01's exact
   82-member self-inclusive transitive closure (81 prerequisites plus
-  CI-FINAL-CORE-01). This is neither named release inventory; REL-01
+  CI-FINAL-CORE-01). This is not a named release inventory; REL-01
   separately establishes the 83-member candidate inventory. The artifact identity contains the
   source/lock/toolchain/documentation/package bindings above and the
   manifest contains their digests, not merely a digest of the earlier
@@ -30399,6 +31653,10 @@ Tests:
   fixtures.
 - Reproducible clean-checkout rebuild with byte-exact package and
   evidence cross-reference verification.
+- Hermetic package-chain replay rejects a missing/wrong-order internal
+  prerequisite, rewritten-manifest drift, archive change caused by
+  source replacement, workspace/path/patch resolution, or cache/network
+  leakage.
 - Root/stdio/HTTP era-policy digest and row-evidence substitution,
   omission, stale-qualification, and mixed-artifact rejection.
 - Reject a manifest assembled from individually green results that
@@ -31350,6 +32608,11 @@ Implementation:
   support-claim documents, and release-note digests exactly equal the
   sealed identity. Recheck the clean-state predicates immediately
   before packaging and immediately before the no-publish handoff.
+- Require provider read-back that `main`, `origin/main`, and the legacy
+  URL-compatibility branch resolve to this same sealed commit. Behind,
+  ahead, divergence, missing/stale read-back, or any proposed force move
+  invalidates the handoff; branch repair is a separately authorized
+  maintainer push, not a release-coordinator side effect.
 - Prepare one breaking `0.4.0` release line for all nine publishable
   workspace crates; none is called published before REL-02 verifies it.
 - Run `cargo fmt --check`.
@@ -31412,15 +32675,18 @@ Implementation:
   cancellation/progress descriptors cannot satisfy or weaken final-
   core subscription/cancellation checks merely because method strings
   overlap.
-- Run `cargo package --list` and `cargo package` for every publishable
-  crate in dependency order.
+- Run `cargo package --list` and ordinary verified `cargo package
+  --locked` for every publishable crate through a third fresh instance of
+  the exact `HermeticWorkspacePackageChain`, inserting and reading back
+  each sealed prerequisite before verifying its dependent.
 - Compare every newly built package inventory, source-tree digest,
   unpacked inventory, and byte-exact `.crate` digest with
   CI-FINAL-CORE-01. A mismatch invalidates the candidate; REL-01
   cannot replace the sealed archive or patch its manifest in place.
 - Run `cargo publish --dry-run` when registry/network policy permits;
-  otherwise retain `cargo package` plus an equivalent local-registry
-  install check as evidence.
+  otherwise retain the fully verified package chain plus an equivalent
+  local-registry install check as evidence. `--no-verify`, a path/patch,
+  or a preloaded ambient cache can never substitute.
 - Build fresh consumer projects from the packaged artifacts, not the
   workspace path, for minimal server, stdio client, HTTP client/server,
   macro, and facade.
@@ -31437,6 +32703,10 @@ Implementation:
   excludes ambiguity, and README/docs/release notes/SBOM conclusions
   agree. Any residual `MIT` versus rider contradiction invalidates the
   candidate and returns to a new CI-FINAL-CORE-01 identity.
+- Include the reviewed immutable historical-version license inventory and
+  correction/disclosure wording in the release evidence; verify it makes
+  no claim that prior registry archives changed and requests no automatic
+  yank/advisory mutation.
 - Generate a release-publication handoff manifest that references the exact
   CI-FINAL-CORE-01 source/lock/documentation/package identity and
   repeats the sealed archive digests. It cannot assemble green
@@ -31470,14 +32740,16 @@ Implementation:
   production mutation remains disabled.
 - Build each standalone binary twice in the declared independent clean
   environments, record its per-target
-  `BinaryReproducibilityDisposition`, and select exactly one
+  `BinaryRepeatabilityDisposition`, and select exactly one
   content-addressed CI-FINAL-CORE-01 binary as the release input. Package
   that same input twice with the sealed deterministic ustar/zstd or ZIP
   profile and require archive-byte equality. A target with unequal binary
-  builds is explicitly non-bit-reproducible; archive equality cannot
-  promote the claim.
+  builds is explicitly not bit-repeatable in the sealed environment;
+  matching same-runner builds establish no cross-builder reproducibility,
+  and archive equality cannot promote either claim.
 - Stage cross-platform binaries, deterministic archives, checksums, SPDX
-  3.0.1 Core+Software JSON-LD SBOMs, raw unsigned in-toto Statement v1 /
+  3.0.1 Core+Software+Licensing+SimpleLicensing JSON-LD SBOMs in official
+  SPDX canonical JSON, raw unsigned in-toto Statement v1 /
   SLSA v1.2 provenance statements, signature/provenance subject
   manifests, release
   notes, and only offline/private detached signatures whose provider
@@ -31508,6 +32780,8 @@ Acceptance:
   rejection/ignore behavior and never initialize, fallback, receipt
   construction, or legacy state.
 - The release candidate can reproduce its evidence bundle.
+- Main and the legacy compatibility branch are provider-read-back at the
+  exact sealed commit, with no force update or release-tool repair.
 - Packaged artifacts, not merely workspace builds, pass consumer
   smoke tests.
 - The approved license representation and all docs.rs profiles are
@@ -31557,8 +32831,11 @@ Tests:
 - Mixed-commit, dirty-tree, wrong-lockfile, stale-documentation,
   mismatching-package, repackaged-archive, and cross-manifest
   identity-splice rejection.
+- Main/compatibility-branch behind, ahead, diverged, stale-read-back,
+  wrong-commit, and force-update rejection.
 - License-decision, docs.rs-profile, binary-disposition, deterministic-
-  archive, SPDX/JCS, in-toto/SLSA raw-statement, exact-subject, and
+  archive, SPDX canonical-JSON/structural/semantic, in-toto/SLSA raw-
+  statement JCS, exact-subject, and
   unproved-SLSA-level mutation suites from REL-PREP-01 run against the
   final sealed bytes rather than fixtures alone.
 
@@ -31577,7 +32854,11 @@ Outcome:
 
 Publish the exact REL-01-sealed core `0.4.0` candidate to crates.io and
 GitHub through one explicitly authorized, identity-bound, resumable
-transaction, then emit a complete publication receipt.
+transaction; emit an intermediate public-artifacts receipt/anchor; then
+prove independent cleanup, all-nine docs.rs success, terminal rollback
+anchoring, and finalizer quiescence; finally capture and read back the
+separately authorized content-addressed stable evidence bundle/receipt
+before the stable aggregate closes.
 
 Reason:
 
@@ -31620,8 +32901,10 @@ Implementation:
 - Persist a protected authorization audit record containing the verbatim
   initial user authorization and second confirmation, actor, trusted
   timestamps, exact rendered command/effect automaton, affected targets,
-  and plan digest. Its digest and safe metadata enter the final receipt;
-  credentials and secret provider material never enter this record.
+  and plan digest. Its digest and safe metadata enter the intermediate
+  `PublicationArtifactsReceipt`, whose later inclusion in
+  `ReleaseStateTuple` carries it into stable evidence; credentials and
+  secret provider material never enter this record.
 - Never infer authorization from a tag, branch, token, protected-
   environment access, workflow-dispatch event, previous publication,
   REL-01 completion, or workflow rerun.
@@ -31629,11 +32912,17 @@ Implementation:
   provider object in the effect automaton. Invoke the independently
   sealed `PublicationBootstrapController` from its protected operator
   host with a bootstrap-only grant. That grant separately names temporary
-  enablement of the exact workflow ID, creation/attachment of one
-  protected environment and workflow/source/run-bound short-lived
-  credentials, dispatch at the sealed full commit, run-ID/read-back
-  verification, post-run disablement, credential/environment revocation,
-  and each reconciliation call. The bootstrap can administer those
+  enablement of the exact workflow ID; creation of one empty protected
+  environment; provider enforcement of the exact bootstrap actor,
+  workflow ID, manual event, and `refs/heads/main`; dispatch of that ref
+  only after its provider-read-back tip equals the sealed full commit;
+  unique nonce/run-ID/`head_sha`/workflow-SHA read-back; issuance and
+  attachment of workflow/source/ref/run-bound short-lived credentials
+  only while that unique run waits at the environment gate; deployment
+  approval; post-run disablement; credential/environment revocation; and
+  each reconciliation call. Before every mutation, inventory the bounded
+  enable-epoch run set and require exactly the authorized run and no
+  competing or ambiguous candidate. The bootstrap can administer those
   objects but cannot publish crates, tags, releases, assets, signatures,
   or attestations. The historical workflow ID remains disabled
   throughout. A fresh bootstrap invocation resumes cleanup after a
@@ -31643,8 +32932,13 @@ Implementation:
   the sealed commit, after both bootstrap and publisher verify their
   executable/configuration/workflow/ref/tree/run/credential-binding
   identities against `ExecutionAuthorityProfileDigest`. Require
-  protected-workflow concurrency plus REL-
-  PREP-01's remote repository/registry/version/transaction lease and
+  exact checkout-only `contents: read`, `{}` for other implicit-token
+  permissions, `persist-credentials: false`, and zero mutation-capable
+  credential in the preflight job; only the separately
+  bound credential becomes visible after unique-run admission and the
+  protected environment gate. Require
+  protected-workflow concurrency plus REL-PREP-01's remote
+  repository/registry/version/transaction lease and
   monotonic fencing token. A local lock or workflow concurrency label
   alone is insufficient. Persist/read back the current remote journal
   head before every provider mutation; loss of CAS, lease, fencing,
@@ -31665,21 +32959,29 @@ Implementation:
   automaton digest, and second confirmation. A renewed grant keeps the
   transaction ID. No credential, signer secret, or bearer material enters
   either identity, journal, logs, artifacts, or receipts.
-- To authorize an effect, CAS-append its `PreEffectRecord(grant_id,
-  effect_ordinal, previous_head)` from `grant_base_head` or an exact
-  authorized descendant; then require the live head to equal the
-  resulting `pre_effect_head` immediately before dispatch. Prove the
+- For a non-journal provider effect, first claim a dedicated journal-
+  append ordinal and CAS-append
+  `PreEffectRecord(grant_id, provider_effect_ordinal, previous_head)`
+  from `grant_base_head` or an exact authorized descendant; then claim
+  the named provider-effect ordinal and require the live head to equal
+  the resulting `pre_effect_head` immediately before dispatch. Journal/
+  CAS-head and lease control effects use REL-PREP-01's direct claimed
+  finite control-plane shape and never recursively pre-record
+  themselves. Prove the
   chain from `grant_base_head` contains only the grant-authorized prefix.
   A resume grant binds the latest reconciled head. Bootstrap the first
   remote lease/journal records through a separately enumerated
   authorization-bootstrap transition; ambient storage access is not
   authority.
 - Validate the protected authorization authority, trusted nondecreasing
-  time, unexpired/unrevoked/unconsumed grant, store generation/restore
-  epoch, fencing token, authorized prefix, and exact next effect before
-  every write. Expiry/revocation during dispatch permits read-only
-  reconciliation, never another write. Exhausting any effect/poll/byte/
-  deadline bound requires a newly rendered two-step grant.
+  time, exact active owner, unexpired/unrevoked grant, expected next
+  ordinal, authoritatively reconciled previous claim, store generation/
+  restore epoch, fencing token, authorized prefix, and live
+  `pre_effect_head` before the paired claim/write. `exhausted_claimed`
+  permits only read-only reconciliation of its final attempt; expiry or
+  revocation during dispatch likewise permits no new claim. Exhausting
+  any effect/poll/byte/deadline bound requires a newly rendered two-step
+  grant.
 - Before mutation, revalidate commit/tree/clean state, `Cargo.lock`,
   toolchain, manifests, documentation, release notes, package inventories,
   archives, and staged assets. Verify destination, token identity and
@@ -31721,7 +33023,7 @@ Implementation:
 - Immediately before each upload, exact-consume and independently decode
   REL-01's sealed `SealedRegistryUploadBody`; rehash its complete body,
   metadata, embedded archive, and package/handoff identities, then send
-  those exact bytes with the narrow publisher. REL-01/CI-FINAL owns Cargo
+  those exact bytes with the narrow publisher. REL-01/CI-FINAL-CORE-01 owns Cargo
   packaging reproducibility; REL-02 invokes no pre-upload Cargo packaging
   or reproduction step. Do not invoke `cargo publish` against the
   production registry, because it repackages before upload and exposes no
@@ -31740,11 +33042,32 @@ Implementation:
   repository, documentation link, rust-version, and feature metadata to
   match the seal. Poll the exact-version docs.rs build status within a
   bounded deadline, then read back the versioned crate page, rustdoc
-  target/feature inventory, and crates.io-to-docs.rs link. A docs.rs
-  outage or failed/mismatched build is an asynchronous publication
-  incident recorded in the journal and receipt; it never triggers yank,
-  overwrite, tag movement, or a claim that registry publication rolled
-  back. A source or metadata correction requires a newly sealed version.
+  target/feature inventory, and crates.io-to-docs.rs link. These
+  per-crate pre-checkpoint polls are diagnostic only: freeze their exact
+  observations in the journal/precommit state, but do not branch or
+  begin cleanup while later sealed package/GitHub/public-artifact
+  checkpoint effects remain. If no non-documentation publication failure
+  occurs, complete only those already authorized exact-candidate effects
+  through `H_publish_done`; then bootstrap cleanup begins immediately,
+  and the post-cleanup verifier makes the authoritative stable-versus-
+  documentation-incident decision. Failure to reach `H_publish_done`
+  takes the typed publication-failure path instead. A docs.rs outage or
+  failed/mismatched build is an asynchronous publication incident
+  recorded in the journal and receipt. The public registry/GitHub
+  artifacts are irreversible; the durable status is
+  `published-with-documentation-incident`, but REL-02 and the stable
+  aggregate remain open/blocked: recording the incident is not stable
+  success. A bounded later
+  read-only observation may prove that the exact same version's build,
+  page, targets/features, and link all pass and feed the terminal stable-
+  observation path below only for transient delay/outage on those exact
+  unchanged bytes. A source, metadata, page/link identity, target, or
+  feature mismatch is terminal for this candidate and requires a new
+  version; re-observation cannot cure it. The recovery path cannot
+  rebuild, mutate, or substitute a version. Failure never triggers yank,
+  overwrite, tag movement, or a
+  claim that registry publication rolled back. A source or metadata
+  correction requires a newly sealed version.
 - Never treat `already uploaded`, exit zero, HTTP/API success, or one
   registry view as proof. Read-only polls alone may use bounded retries.
   A mutation can start another attempt automatically only when the
@@ -31787,43 +33110,193 @@ Implementation:
 - After every draft asset and the precommit manifest verifies, make the
   release public and read back its tag target, release ID, public state,
   notes, and asset inventory. Then emit a content-addressed, policy-
-  protected, read-back-verified `PublicationTransactionReceipt` with
+  protected, read-back-verified `PublicationArtifactsReceipt` with
   the ordered digests/ranges of every authorization/confirmation record
   and
   handoff digests; source/tree/lock/toolchain; package states, index
   records, registry checksums and downloaded archives; consumer results;
   tag/release identities; asset/SBOM/signature/provenance digests;
   per-crate registry metadata plus exact-version docs.rs status/page/link
-  observations; and final support-profile inventory. Redact credentials.
+  observations; and checker-derived intended profile membership plus the
+  current nonclosing per-member/status snapshot
+  (`published_pending_cleanup` or documentation incident). It cannot
+  attest the completed 84-member stable closure; only the later retained
+  stable aggregate bundle can do that. Redact credentials.
   Upload the receipt
   once under its fixed digest-qualified asset name and read it back.
   Treat the journal head through publicize as `H_public`; receipt upload/
-  read-back produces `H_receipt`. Append a separately attested
-  `ReleaseReceiptAnchor` payload binding the receipt digest, asset
-  identity, public release ID, and `H_receipt`; anchor upload/read-back
-  then produces terminal `CompletionObserved` at `H_done`. Final success
-  evidence is exactly `(receipt, anchor, CompletionObserved, H_done)`.
-  No object claims its own upload, and `H_receipt` is not called the
-  completed head. Final and periodic drift detection may
+  read-back produces `H_receipt`. Render the canonical, grant-authorized,
+  journaled `ReleaseReceiptAnchor` payload binding the receipt digest,
+  asset identity, public release ID, and `H_receipt`; upload it under its
+  fixed digest-qualified asset name, read those exact bytes back, and
+  append the provider observation. Then perform one authoritative full
+  GitHub release/tag/asset inventory read: require the exact public
+  state, release/tag/commit/transaction/profile identities and provider
+  generations; the exact staged candidate asset name/size/digest set;
+  exactly the two fixed digest-qualified post-publicize checkpoint assets
+  (`PublicationArtifactsReceipt` and `ReleaseReceiptAnchor`) with their
+  continued bytes/identities; and no extra, missing, replaced, or stale
+  asset. Canonical `PublicationArtifactsObserved` binds that inventory,
+  `H_receipt`, the transaction/profile, trusted observation time, and all
+  provider read-back generations; appending it produces
+  `H_publish_done`. No separate anchor signature or undefined attester is
+  implied. The bounded interval after publicize and before this exact
+  observation is `published_checkpoint_incomplete`: only identical
+  receipt/anchor reconciliation under the preauthorized ordinals may
+  resume it, and any irreconcilable state takes the typed publication-
+  failure incident path below rather than claiming success.
+  This is an intermediate public-artifact checkpoint, never final
+  success. From `H_publish_done`, a fresh cleanup-only bootstrap grant
+  drives numbered, journaled, read-back-reconciled effects that disable
+  the exact new workflow, revoke/detach its one-run credential and
+  environment, verify the terminal authorized run identity/state, and
+  reverify that the historical workflow remains disabled. It appends a
+  secret-free `BootstrapCleanupReceipt` at `H_cleanup`. The disjoint
+  read-only `release-verify` executable independently rereads the
+  provider objects, run, journal prefix, receipt, and exact cleanup
+  state. Its canonical signed `BootstrapCleanupObserved` payload binds
+  `PublicationTransactionId`, `ExecutionAuthorityProfileDigest`,
+  `ReleaseObserverProfileDigest`, `H_publish_done`, the cleanup-receipt
+  digest, exact `H_cleanup`, workflow/environment/credential/run object
+  identities and provider generations/read-back states, terminal run
+  state, trusted observation time and nonce, and verifier key ID. A
+  fresh exact finalizer grant appends those signed bytes unchanged to
+  derive `H_cleanup_observed`.
+
+  The same read-only verifier also signs `DocsRsStableObserved` only
+  after all nine exact-version build statuses, pages, target/feature
+  inventories, and crates.io links pass; it binds those read-back
+  digests, the same transaction/profile/verifier identities, and
+  `H_cleanup_observed` (or the later incident-final head). Appending it
+  unchanged derives `H_stable_observed`. The separately sealed
+  `PublicationFinalizer` then updates and reads back the external
+  `JournalRollbackAnchor` checkpointing exactly `H_stable_observed`; its
+  numbered pre-effect and observation records derive `H_final` without
+  the checkpoint claiming its own future append. The last authority
+  claim is already `exhausted_claimed`; after deriving `H_final`, the
+  finalizer performs no further transaction write. Wait through the
+  sealed nonrenewable grant, lease, and credential expiry bounds, then
+  have `release-verify` read back the exhausted grant/last ordinal,
+  terminal journal head and zero in-flight attempt, inactive lease and
+  finalizer credentials, exact rollback-anchor observation, and trusted
+  time, plus the authority's read-only `TransactionSuccessorPolicy`
+  decision denying every stable-head mutation grant. It signs a domain-
+  separated `FinalizerQuiescedObserved::Stable` binding
+  `terminal_kind=stable`, those identities/states,
+  `PublicationTransactionId`, `ReleaseObserverProfileDigest`, exact
+  terminal head `H_final`, and the stable successor-set decision. This signed value is a
+  nonrecursive outer proof returned to the stable-aggregate verifier; it
+  is not appended, uploaded to a release provider, anchored, or followed
+  by any release-transaction mutation. Assemble the exact thirteen-item
+  `ReleaseStateTuple` below into `StableAggregateEvidenceBundle`, select
+  `ReleaseEvidenceCaptureCapability` plus an admitted
+  `ReleaseEvidenceCaptureGrant::Stable`, put it once under its
+  digest-qualified key, and
+  read it back to obtain `StableEvidenceCaptureReceipt`. Failure or
+  ambiguity in that separate evidence-retention step blocks the stable
+  claim but cannot reopen or mutate the release transaction. Exact
+  retries use the durable claim ticket; provider loss creates only
+  `EvidenceCaptureStorageIncident` and may use the bounded successor-
+  store recovery path, with `H_final` unchanged. If docs.rs
+  is not yet green, `release-verify` instead signs the applicable
+  `DocsRsIncidentObserved::{TransientRecoverable,
+  TerminalIdentityMismatch}` and a fresh finalizer grant appends those
+  bytes to derive `H_incident_observed`. The finalizer checkpoints that
+  exact head and its anchor read-back derives `H_incident_final`.
+  Publication remains `published-with-documentation-incident`; the
+  distinct-domain
+  `FinalizerQuiescedObserved::DocumentationIncident` binds
+  `terminal_kind=documentation_incident`, exact `H_incident_final`, the
+  disposition, and its actual successor set. `TransientRecoverable`
+  binds only the sealed same-bytes read-only docs recovery/terminalization
+  set; an initially known `TerminalIdentityMismatch` binds the empty set
+  and cannot recover under this transaction/version. Stable/head/
+  disposition variants cannot cross-substitute. Assemble the exact
+  `IncidentStateTuple::Initial` into
+  `IncidentAggregateEvidenceBundle::Initial`; select an admitted
+  `ReleaseEvidenceCaptureGrant::IncidentInitial`, put/read it back, and
+  require `IncidentEvidenceCaptureReceipt::Initial` before reporting the
+  durable incident disposition. That receipt is also a hard predecessor
+  to every later docs re-observation, observation-append, stable,
+  terminalization, or publication-failure grant. If its capture is
+  blocked, the only admissible successor is the bounded capture-store
+  recovery path; a concurrently green docs poll cannot race past it or
+  strand the initial lineage. No stable tuple exists.
+
+  Only a later bounded `TransientRecoverable` read-only docs.rs pass can
+  resume from that same head with fresh journal/finalizer grants. If all
+  nine observations become green, it follows the stable chain above and
+  its stable bundle binds the initial incident bundle/receipt digests
+  without overwriting them. If the later observation instead discovers
+  `TerminalIdentityMismatch`, the verifier signs that exact variant
+  against the prior `H_incident_final`; the finalizer appends it to
+  derive `H_incident_terminal_observed`, checkpoints/read-backs that head
+  to derive `H_incident_terminalized`, and the outer incident-quiescence
+  proof binds the empty successor set. Assemble
+  `IncidentStateTuple::Terminalization` into
+  `IncidentAggregateEvidenceBundle::Terminalization`, capture it only
+  under `ReleaseEvidenceCaptureGrant::IncidentTerminalization`, and
+  require `IncidentEvidenceCaptureReceipt::Terminalization`. That
+  terminalization permanently denies stable/recovery grants and requires
+  a corrected new version/transaction. Neither path reenables the
+  publisher.
+
+  The observer has no cleanup, journal-write, or anchor-write capability,
+  the finalizer cannot alter signed observations, and the bootstrap and
+  publisher cannot mint either observation. The exact
+  `ReleaseStateTuple` inside `StableAggregateEvidenceBundle` is
+  `(PublicationArtifactsReceipt, ReleaseReceiptAnchor,
+  PublicationArtifactsObserved, H_publish_done,
+  BootstrapCleanupReceipt, BootstrapCleanupObserved,
+  H_cleanup_observed, DocsRsStableObserved, H_stable_observed,
+  JournalRollbackAnchorCheckpoint, JournalRollbackAnchorObserved,
+  H_final, FinalizerQuiescedObserved::Stable)`.
+  Final stable-success evidence is exactly
+  `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)` after
+  content-addressed sink read-back.
+  No object claims its own upload or future cleanup, no earlier head is
+  called completed, and no final success or stable-release claim exists
+  before exact cleanup read-back, independent cleanup and docs.rs
+  observation, final rollback-anchor read-back, `H_final`, and the outer
+  finalizer-quiescence proof. A cleanup
+  or finalization crash is resumed only with a fresh bootstrap, journal,
+  or finalizer grant whose fixed `grant_base_head`, authorized
+  descendant prefix, next effect ordinal, and resulting
+  `pre_effect_head` pass the ordinary reconciliation rules. Final and
+  periodic drift detection may
   detect privileged out-of-band tag/asset changes; the plan does not
   claim provider-level immutability that repository settings cannot
   prove.
 - Never automatically yank a crate, delete/replace an asset or draft,
-  move a tag, or claim rollback. If exact resume is impossible, stop with
-  a partial-publication incident receipt. A fix requires a newly sealed
-  candidate/version; any recovery mutation needs separate authorization.
+  move a tag, or claim rollback. If exact resume is impossible but
+  abandonment is not separately authorized, remain blocked in the exact
+  `outcome_unknown`/failed state with no invented terminal receipt. Once
+  a `PublicationAbandonmentAuthorization` and the applicable actor-typed
+  cleanup/observation/finalizer grants exist, a separately admitted
+  failure-capture grant may capture
+  `PublicationFailureIncidentBundle::Unresolved` when residual workflow,
+  credential, lease, grant, journal, or provider state is still live;
+  this explicitly cannot claim quiescence. Continue only the grant's
+  bounded cleanup/reconciliation path. If it reaches
+  `H_publication_failure_final` and publication-failure quiescence,
+  capture `PublicationFailureIncidentBundle::Terminal` and its terminal
+  receipt, binding the unresolved receipt when present. A fix requires a
+  newly sealed candidate/version; any recovery mutation needs separate
+  authorization.
 
 Acceptance:
 
 - The checker-generated `CoreReleaseProfileInventory` is exactly the
-  84-member transitive closure of REL-02 plus REL-02 itself; every other
+  84-member self-inclusive prerequisite closure (83 prerequisites plus
+  REL-02); every other
   member is closed/passed before REL-02 executes, and neither a hand-
   edited inventory nor an 83-member candidate inventory can satisfy the
   published-stable boundary.
 - The exact-identity two-step publication authorization ceremony is
-  complete before the first external mutation, and a current grant bound
-  to the durable journal head and remaining effects is revalidated before
-  every mutation.
+  complete before the first external mutation. Every mutation uses a
+  current grant whose fixed `grant_base_head`, exact authorized
+  descendant prefix, next effect ordinal, and live `pre_effect_head`
+  satisfy the REL-PREP-01 rules immediately before dispatch.
 - Only the sealed new workflow identity is temporarily enabled and
   provisioned by exact bootstrap-only granted effects; its run resolves
   to the sealed definition/source/ref/run identity, its publication
@@ -31842,8 +33315,25 @@ Acceptance:
 - All nine crates.io metadata records match the approved license,
   README/repository/documentation/rust-version/feature seal. Their
   exact-version docs.rs build/page/link observations are recorded;
-  failure or bounded-timeout is reported as an asynchronous incident,
-  never hidden as success or treated as rollback.
+  failure or bounded-timeout is reported as an asynchronous
+  `published-with-documentation-incident`, never hidden as success or
+  treated as rollback, and cannot close REL-02 or the stable aggregate.
+  Only a signed exact-version `DocsRsStableObserved` for all nine can
+  enter the final stable tuple.
+- A non-green docs.rs branch is durably represented only after its
+  immutable `IncidentAggregateEvidenceBundle::Initial` and
+  `IncidentEvidenceCaptureReceipt::Initial` read back. Repeated
+  non-green polls make no mutation. A later result normally creates one
+  second digest-qualified logical bundle/envelope: stable recovery or
+  terminal-identity-mismatch terminalization. An exact-resume-impossible
+  failure in that bounded recovery/finalization infrastructure may,
+  only after separate abandonment authorization, instead create an
+  unresolved publication-failure bundle/envelope and then one terminal
+  failure successor, for at most three logical keys including the
+  initial incident. Every successor binds the initial lineage; stable,
+  docs-terminalization, failure-unresolved, and failure-terminal kinds/
+  orders/cardinalities cannot overwrite, omit, reorder, replay, or cross-
+  substitute one another.
 - Ambiguous outcomes cannot cause blind retry, false success, or skip;
   interrupted execution resumes from authoritative state and the durable
   journal without repeating a verified effect.
@@ -31857,16 +33347,27 @@ Acceptance:
 - `v0.4.0` resolves to the exact sealed commit, is policy-protected and
   read-back-verified, and is never moved by the coordinator.
 - Every public GitHub artifact and its checksum, SBOM, signature,
-  provenance, notes, precommit manifest, completion receipt, and receipt
+  provenance, notes, precommit manifest, publication-artifacts receipt,
+  and receipt
   anchor resolves to the same transaction. Every provenance signature is
   a verified DSSE envelope over the exact REL-01 raw in-toto/SLSA bytes,
   and every SBOM/provenance subject covers the exact public asset digest.
 - The release remains draft until registry, consumers, staged assets,
   and precommit-manifest read-back verify; the post-publication receipt
-  and separate anchor are independently verifiable and secret-free, and
-  no completion claim precedes the anchor.
+  and separate anchor are independently verifiable and secret-free.
+  They are only the public-artifact checkpoint: no completion claim
+  precedes independently observed bootstrap cleanup, exact-version
+  docs.rs success, final rollback-anchor read-back, `H_final`, and a
+  valid outer `FinalizerQuiescedObserved` proving no finalizer authority
+  remains live. The thirteen-item tuple, its stable bundle, and content-addressed
+  `StableEvidenceCaptureReceipt` are read back from the sealed evidence
+  store before stable closure.
 - A mismatch or unrecoverable partial publication fails closed and
-  produces no aggregate core release-success claim.
+  produces no aggregate core release-success claim. It remains
+  resumable/unknown until separately authorized abandonment; any
+  unresolved failure bundle names live residual authority without a
+  quiescence claim, and only the terminal failure bundle/receipt can
+  report quiesced abandonment.
 - No yank, deletion, replacement, or tag rewrite occurs without a new
   explicit authorization.
 
@@ -31875,9 +33376,10 @@ Tests:
 - Canonical transaction identity, authorization binding, journal hash-
   chain, monotonic numbered-attempt state, idempotent reconciliation,
   package-order, and identity-conflict unit/property tests. Prove grant
-  renewal changes grant ID but not transaction ID, binds the current
-  journal head/remaining effects, and cannot reuse an expired/revoked/
-  completed grant.
+  renewal changes grant ID but not transaction ID, binds a fixed
+  `grant_base_head` plus only its authorized descendant prefix and next
+  effect, rechecks the live `pre_effect_head`, and cannot reuse an
+  expired/revoked/exhausted grant.
 - Authorization negatives for absent/expired/replayed/wrong-actor,
   handoff/registry/repository/version/tag/package/order/asset mismatch,
   widened scope, wrong `grant_base_head`/authorized prefix/effect ordinal,
@@ -31901,33 +33403,187 @@ Tests:
   delayed/stale index/API, missing download, checksum conflict, exact or
   conflicting pre-existing version, yank, dependency lag, token failure,
   and ownership failure.
+- Every-stage publication-failure tests cover registry identity conflict,
+  irreconcilable `outcome_unknown`, consumer failure after immutable
+  acceptance, signer failure/public residue, GitHub draft/publicize/
+  receipt/anchor/final-inventory failure, and cleanup/credential/
+  journal/anchor failure. They distinguish resumable, unauthorized-
+  abandonment, captured `UnresolvedLiveAuthority`, and quiesced terminal
+  abandonment; reject a quiescence or stable claim while any authority
+  remains; and prove a terminal failure binds any prior unresolved
+  receipt and has no publication successor.
+- Ordered publication-failure known-answer/property chains cover every
+  `PublicationFailureStage`, use `RetentionBasis::ProvisionalTemplate`
+  before any reconciled public effect and `RetentionBasis::Instance`
+  afterward, and verify the closed `FailureAuthorityManifest` plus exact
+  `PublicationFailureStateTuple::{Unresolved, Terminal}` field order.
+  Tests separate `PublicationAbandonmentAuthorization`,
+  `FailureCleanupGrant`, `PublicationFailureObservationCapability`, both
+  `FailureFinalizerGrant` purposes, and capture grants; derive inner
+  `QuiescedAbandoned`, observation append,
+  `H_publication_failure_observed`, terminal-anchor read-back,
+  `H_publication_failure_final`, outer empty-successor quiescence, and
+  terminal envelope in order. Direct failure permits at most unresolved
+  plus terminal keys; failure after an initial docs incident permits at
+  most three total and binds that predecessor. Missing/reordered/cross-
+  kind predecessor, purpose/domain substitution, false quiescence,
+  unauthorized abandonment, unresolved-capture failure followed by a
+  fabricated receipt, and stable/docs successor after entering failure
+  all fail closed.
+  The positive failed-unresolved-capture case binds the capture-authority
+  ticket/audit and provider-signed failed attempt observations into
+  `FailureAuthorityManifest`, issues no unresolved receipt or
+  `RecoverCaptureStore` grant, permits only the authorized cleanup/
+  finalization chain, and requires the terminal bundle/envelope to bind
+  that complete failed lineage.
+  An explicit three-key fault chain starts with a captured
+  `TransientRecoverable` initial incident, injects exact-resume-impossible
+  docs-recovery/finalizer infrastructure failure, then requires separately
+  authorized failure `Unresolved` followed by `Terminal`; it requires
+  the initial envelope, denies stable/docs-terminalization, enforces
+  cardinality three, and rejects every alternate order/kind replay.
 - Reproducible-package and fresh-Cargo-home resolution tests at each
   prerequisite layer and after all nine packages.
 - Registry-metadata and docs.rs exact-version build-status/page/target/
   feature/link read-back tests, including delayed build, external outage,
   failed rustdoc, wrong version/features/target/license/link, bounded
   timeout, incident-receipt creation, and proof that no automatic yank or
-  other recovery mutation follows.
+  other recovery mutation follows. A recorded failure/timeout cannot
+  satisfy stable closure; a later exact-version read-only recovery must
+  bind the same transaction and all nine passing observations.
 - GitHub sandbox tests for wrong/moved tag, missing/duplicate/altered
   asset, changed notes, checksum/SBOM/signature/provenance mismatch,
   partial upload, provider timeout, interrupted publicize transition,
   receipt self-reference, missing/mismatched receipt anchor, and a false
   completion claim before anchor verification.
 - DSSE envelope tests bind payload type/base64/signature/signer to the
-  exact sealed raw statement bytes and reject regeneration, whitespace/
-  canonicalization substitution, subject drift, empty signatures, and
-  an unproved SLSA-level claim.
-- Ordered `H_public -> H_receipt -> anchor -> H_done` known-answer and
-  interruption tests proving no receipt/anchor/journal object binds its
-  own future upload and final success requires the complete four-item
-  tuple.
+  exact sealed raw statement bytes through exact DSSE v1
+  `PAE(payloadType, payload)`. Include pinned known-answer vectors and
+  reject raw-payload signing, wrong domain separator/type/decimal byte
+  length, UTF-8 byte-versus-character length confusion, length overflow,
+  altered PAE, alternate/non-canonical base64, duplicate key IDs,
+  unapproved or empty signers, regeneration, whitespace/canonicalization
+  substitution, duplicate JSON keys, known/unknown-field shadowing,
+  member-order variation, bounded ignored unknown fields, reparse-
+  payload substitution, subject drift, and an unproved SLSA-level claim.
+- Separate ordered known-answer/interruption chains cover stable
+  `H_public -> H_receipt -> ReleaseReceiptAnchor ->
+  PublicationArtifactsObserved -> H_publish_done -> cleanup effects ->
+  H_cleanup -> signed BootstrapCleanupObserved -> H_cleanup_observed ->
+  signed DocsRsStableObserved -> H_stable_observed -> external
+  JournalRollbackAnchor checkpoint/read-back -> H_final -> read-only
+  FinalizerQuiescedObserved::Stable`, initial incident
+  `H_cleanup_observed -> signed DocsRsIncidentObserved ->
+  H_incident_observed -> anchor/read-back -> H_incident_final ->
+  FinalizerQuiescedObserved::DocumentationIncident`, and later
+  terminalization `H_incident_final -> signed
+  DocsRsIncidentObserved::TerminalIdentityMismatch ->
+  H_incident_terminal_observed -> anchor/read-back ->
+  H_incident_terminalized -> empty-successor quiescence`. They prove no
+  receipt/anchor/cleanup/journal object binds its own
+  future upload or mutation and final success requires the complete
+  thirteen-item tuple. Crash after every cleanup/finalization transition,
+  missing/ambiguous final rollback-anchor update, a false `H_final`
+  before that update, independent-
+  observer substitution, signed-observation alteration, stale provider
+  read-back, docs incident represented as stable, and a false stable
+  claim at `H_publish_done`, `H_cleanup_observed`, or
+  `H_incident_final` must fail closed. Quiescence negatives keep a grant,
+  effect ordinal, in-flight attempt, lease, or finalizer credential
+  active; use a wrong/expired/revoked observer key; replay another head;
+  or attempt to append/upload the outer observation to a release
+  provider. Cross-kind/domain/head tests reject stable versus
+  documentation-incident quiescence substitution and a successor-set or
+  terminal-kind mismatch. They also reject transient/terminal incident-
+  disposition substitution, a docs-stable/re-observation recovery grant
+  for `TerminalIdentityMismatch`, or an empty/widened/wrong same-bytes
+  successor set. Fault tests begin with a captured delay/outage, then
+  reveal a source/page/link/target/feature mismatch and require the exact
+  terminalization chain while rejecting stable recovery. Capture-authority tests also reject an
+  incident grant after stable capture, a stable grant before `H_final`,
+  an initial-incident grant before `H_incident_final`, terminalization
+  before `H_incident_terminalized`, missing prior-incident
+  lineage on recovery, cross-kind or cross-digest retries, reordered
+  grants, and transaction/store-key/attempt replay. Admission permits
+  only (a) same-store, same-kind, same-digest exact-idempotent
+  reconciliation or (b) a fresh cross-store grant for identical bundle
+  bytes/key with the complete failed lineage, qualified/fenced successor,
+  and verified `RecoverCaptureStore` receipt; ordinary cross-store replay
+  remains denied. Successor-policy tests reject every post-stable issue/renew/
+  reopen request, restrict incident recovery to the exact same-bytes docs
+  path, and reject publisher/bootstrap/provider effects or a terminal
+  mismatch docs-stable recovery while still permitting only the separate
+  capture-store recovery automaton for an uncaptured immutable terminal
+  incident bundle. They also require the initial incident envelope/read-
+  back before any docs recovery, terminalization, or failure grant and
+  race a newly green docs poll against a blocked/failed initial capture.
+  Evidence-store tests cover wrong endpoint/namespace/
+  trust root, overwrite, wrong digest/bundle, missing tuple member,
+  absent/expired/replayed/widened capture grant or missing second
+  confirmation, ambiguous numbered put/read-back, early expiry, and loss before the retention
+  boundary; none may mutate or reopen release state. Controller-profile
+  negatives reject a wrong executable/configuration/operator/credential,
+  verifier authority mutation other than the exact receipt-bound sole
+  claim CAS, wrong verifier actor/workload, issuance-receipt/capability
+  substitution or replay, store-data writes by
+  `release-evidence-authorize`, and any inherited release-provider,
+  journal, anchor, lease, signer, bootstrap, or finalizer capability.
+- Maintenance unit/property/fault/E2E tests exercise the single-writer
+  `MaintenanceAuthorityState` CAS and reject split-brain or concurrent
+  same-predecessor issue/claim/finalization. Cover every closed attempt
+  outcome, crash before/after every CAS/provider/observer-receipt
+  transition, read-back-first ambiguity reconciliation, and exact
+  lifetime enforcement of 24 total issued/ambiguous operation grants,
+  16 extension, four migration, two recovery, two expiry, one successful
+  transition per 3,600 trusted seconds, 16 successful generations, the
+  six-times-manifest byte budget, and `K <= 3`, `G <= 7`, `K*G <= 21`
+  capacity. Failed-before-dispatch, no-effect, partially effective,
+  qualification, observation, and receipt failures consume the declared
+  counters and never reset on migration.
+- Maintenance extension tests distinguish provisional template from
+  instance bases, open from terminal lineages, provider quote from
+  post-effect horizon read-back, strictly monotonic checked arithmetic,
+  and clock rollback. Migration tests require independently provider-
+  signed destination qualification, byte/digest-complete copies,
+  conditional creation, destination read-back, atomic authority cutover,
+  and source retention through the later deadline. Expiry tests reject
+  early time, legal hold, live support, a newer policy, in-flight work,
+  incomplete final inventory, missing post-disposition receipt horizon,
+  or a nonempty terminal successor set.
+- `RecoverCaptureStore` tests cover both initial docs dispositions,
+  terminalized docs, stable, and publication-failure terminal heads;
+  reject a live unresolved-failure snapshot; wait through the old claim/
+  dispatch/recovery deadlines; prove zero in-flight requests and an old-
+  store fence across every view; and reject negative-read-only races,
+  ambiguous old commits, arbitrary/unqualified destinations, mutated
+  bundle bytes/key, old/new concurrent claims, a third recovery, or
+  cross-store ticket/envelope replay. Two recoveries chain every profile,
+  grant, ticket, attempt observation, incident, qualification, authority,
+  maintenance receipt, and predecessor digest without altering the
+  terminal head.
+- Maintenance-observer tests enforce its separate executable mode, key,
+  schema/domain/read set, actor-bound
+  `MaintenanceReceiptCaptureGrant`, exact one-purpose conditional append,
+  retained provider/read-back horizon, and non-self-referential profile-
+  core -> signed receipt -> authority-transition/final-profile order.
+  They reject maintainer self-attestation, observer effect execution,
+  ordinary/capture/storage-incident credential mixing, wrong signer/
+  domain/provider generation, receipt substitution, multiple appends,
+  and a successor grant before the prior receipt/authority transition is
+  durably read back.
+- Journal-control recursion tests cover first append, expected-head CAS,
+  pre-effect/provider/observation finite ordering, lease sequencing,
+  append/lease response loss, and reject any attempt to require or create
+  a pre-record for the act of writing that same pre-record.
 - Mutation-attempt tests for registry upload, tag, draft, each asset,
   public signer effect, publicize, receipt, and anchor, proving automatic
   retry occurs only after transport proof that zero request-body bytes
   were handed off and every possibly dispatched attempt stays unknown
   until exact provider reconciliation.
 - Full terminate/resume rehearsal after every durable state transition,
-  with structured logs and final-receipt replay verification.
+  with structured logs and replay verification for the intermediate
+  `PublicationArtifactsReceipt` plus every applicable incident/stable
+  aggregate bundle and capture receipt.
 - Secret canaries across command output, Cargo errors, provider replies,
   environment capture, journal, evidence, and failure reports.
 - Recovery tests proving exact-state resume succeeds and any identity
@@ -32010,6 +33666,7 @@ flowchart TD
 
     SEED --> TRACE
     SEED --> ERA
+    QUAR --> TRACE
     QUAR --> CIBASE
     TRACE --> CIBASE
     TRACE --> RUNTIME
@@ -32238,10 +33895,23 @@ The likely critical path is:
 18. CI-CORE-01 qualification, DOC-02 claim materialization,
     CI-FINAL-CORE-01's clean post-documentation rebuild/seal, and then
     REL-01's non-authorizing `0.4.0` handoff.
-19. REL-02 is the sole publication endpoint. It remains closed until a
-    separate exact-identity two-step authorization permits the sealed
-    resumable crates.io/GitHub transaction and its receipt anchor
-    verifies.
+19. REL-02 is the sole publication endpoint. It remains open and blocked
+    until a separate exact-identity two-step authorization permits the
+    sealed resumable crates.io/GitHub transaction and independent
+    bootstrap cleanup. The green branch then requires exact-version
+    docs.rs success, `H_final`,
+    `FinalizerQuiescedObserved::Stable`, and read-back of exactly
+    `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)`.
+    A non-green docs branch instead derives `H_incident_final`, proves
+    `FinalizerQuiescedObserved::DocumentationIncident`, and captures the
+    exact `IncidentAggregateEvidenceBundle::Initial`/
+    `IncidentEvidenceCaptureReceipt::Initial` pair; it leaves REL-02
+    open and permits only the closed same-bytes recovery or
+    terminalization successors. A non-documentation exact-resume-
+    impossible state cannot use either path: it stays blocked absent a
+    separate `PublicationAbandonmentAuthorization`, after which only the
+    typed unresolved/terminal publication-failure chain is admissible
+    and no stable closure is possible for that transaction.
 
 This is a planning spine, not a substitute for the graph-computed
 critical path. Until the post-revision Beads rematerialization and fresh
@@ -32451,8 +34121,11 @@ Checkpoint H:
 
 Checkpoint I:
 
-- separately authorized REL-02 registry/GitHub transaction, completion
-  receipt, and receipt anchor.
+- separately authorized REL-02 registry/GitHub transaction,
+  publication-artifacts receipt/anchor, independent bootstrap cleanup,
+  exact-version docs.rs success observation, terminal external rollback-
+  anchor read-back, `H_final`, `FinalizerQuiescedObserved::Stable`, and retained
+  `StableAggregateEvidenceBundle`/`StableEvidenceCaptureReceipt`.
 
 Optional checkpoints are the named dual-era, Tasks, Redis Tasks
 backend, Apps, enterprise authorization, built-in authorization-
@@ -32500,11 +34173,16 @@ Required:
 - CI-BASE-01, CI-CORE-01 qualification evidence, and
   CI-FINAL-CORE-01 sealed post-documentation core evidence.
 - REL-PREP-01's no-authority coordinator, selected-production-provider
-  feasibility/read-only evidence, and provider-sandbox evidence.
+  credential-free/read-only-first feasibility evidence, separately
+  authorized retained bounded qualification receipts where read-only
+  proof is impossible, and provider-sandbox evidence.
 - DOC-01 and DOC-02 core documentation.
 - REL-01's sealed non-authorizing handoff.
-- REL-02's separately authorized resumable publication transaction and
-  completion receipt anchor.
+- REL-02's separately authorized resumable publication transaction,
+  public-artifact receipt/anchor, independently observed cleanup and
+  docs.rs success, terminal rollback-anchor read-back, `H_final`, and
+  `FinalizerQuiescedObserved::Stable`, retained under the exact stable-evidence
+  bundle/capture receipt.
 
 This inventory is the minimum for claiming a published stable core
 `0.4.0` release. CI-FINAL-CORE-01 and REL-01 may establish an evidence-
@@ -32987,7 +34665,7 @@ formal issue may therefore carry multiple labels when it belongs to
 multiple closures. The checker derives membership from package edges and
 rejects an omitted/extra label or a delta-only projection.
 
-The formal graph has exactly 129 work packages and 662 prerequisite
+The formal graph has exactly 129 work packages and 663 prerequisite
 edges in this plan revision, two intentional seeds (`FND-01` and
 `REL-QUAR-00`), no unresolved package IDs, no cycles, and the seven
 terminal sinks named in Section 24.1.
@@ -33021,8 +34699,8 @@ Every row below is optional and defaults off.
 | `redis-tasks` | — | — | `tasks` + optional Redis backend | — | — | backend diagnostics | backend config | S/O | Redis graph remains Tokio-free |
 | `jwt-resource-auth` | shared JOSE admission/RS256 | — | direct ring verifier | — | — | redacted rendering | auth config | P/S/O | experimental/unclaimed resource-server verification only; no process-global JWT provider or stable support inference |
 | `safe-icon-rendering` | — | — | — | credentialless bounded PNG/JPEG/static-WebP/static-SVG fetch/decode | — | metadata only | explicit opt-in | C | experimental/unclaimed; metadata-only remains default; exact same-origin HTTPS or data only; no redirects, animation, external SVG resources, or stable support inference |
-| `testing` | — | — | — | — | — | — | — | public production-faithful test kit | F | non-default downstream ergonomics; no `test-internals`, trusted-ingress constructor, hidden runtime, or protocol/profile activation |
-| `testing-lab` | — | — | — | — | — | — | — | LabRuntime/virtual-time/DPOR test helpers | F | implies `testing`; the sole feature allowed to activate `asupersync/test-internals`; intended only on a consumer's dev-dependency graph |
+| `testing` | — | — | — | — | — | — | — | public production-faithful test kit | non-default downstream ergonomics; no `test-internals`, trusted-ingress constructor, hidden runtime, or protocol/profile activation |
+| `testing-lab` | — | — | — | — | — | — | — | LabRuntime/virtual-time/DPOR test helpers | implies `testing`; the sole feature allowed to activate `asupersync/test-internals`; intended only on a consumer's dev-dependency graph |
 
 `safe-icon-rendering` and `jwt-resource-auth` are public opt-ins but are
 deliberately experimental and unclaimed in the `0.4.0` profile graph.
@@ -33396,8 +35074,9 @@ and sealed before REL-01
 
 - use a new path/workflow identity absent from historical refs;
 - after a separately authorized safety-only initial disable, remain
-  provider-disabled, manual-only, credentialless, environmentless,
-  arbitrary-ref rejecting, and unable to pass coordinator authorization
+  provider-disabled, manual-only, without a mutation-capable token or
+  credential, environmentless, protected-ref/actor/event gated, and
+  unable to pass coordinator authorization
   throughout preparation/sealing;
 - invoke the sealed REL-PREP-01 publisher only after REL-02's exact
   protected two-step authorization, provider selection, remote journal/
@@ -33427,7 +35106,7 @@ FND-01/FND-02 checker and evidence sources:
 
 - retain `crates/fastmcp/tests/fnd_01_dependency_evidence.rs` as a thin
   integration entry point instead of extending the current roughly
-  85,519-line concentration;
+  85,819-line concentration;
 - move cohesive parser, acquisition/supply, policy, graph-codec,
   mutation-oracle, and evidence-receipt responsibilities into reviewed
   modules under one declared test-support module tree, with a stable
@@ -33469,17 +35148,49 @@ REL-PREP-01/REL-02 is justified by its separate authority boundary:
   and GitHub mutation paths and refuses to start without the sealed
   identity and REL-02 authorization receipt;
 - a disjoint human-invoked `release-bootstrap` binary owns only exact
-  workflow/environment administration plus authority/journal access,
+  workflow/environment administration, its purpose-typed
+  `BootstrapRollbackCheckpointCapability`, plus authority/journal access,
   cannot load or call publication/signer capabilities, and can resume
   post-run disable/revocation after a crash;
-- every crate root has `#![forbid(unsafe_code)]`; a checked-in Cargo
+- a disjoint `release-verify` binary has four mutually exclusive
+  process-entry modes: bounded read-only release observation and its
+  observation-signing key; one-purpose claim-before-put plus evidence-
+  store capture under an admitted grant; read-only storage-incident
+  attestation over durable authority/provider attempt records; or
+  maintenance observation with its distinct key/read set and exact
+  `MaintenanceReceiptCaptureGrant`.
+  No mode can load another mode's credential or write surface;
+- a disjoint `release-finalize` binary owns only the closed
+  observation-append or terminal-anchor automaton selected by its grant;
+- a human-invoked `release-authorize` binary/API mode owns only the
+  bounded publication-authority issue/renew/revoke/audit-admin automaton,
+  the mutually exclusive failure-abandonment authorization/actor-grant
+  mode, and its mutually exclusive non-grant `retention-policy` mode with the
+  `ReleaseRetentionPolicySigner`; it cannot claim or dispatch a release
+  effect or load the artifact/transparency signer;
+- a human-invoked `release-evidence-authorize` binary/API mode owns only
+  two-step capture-authority issue/revoke/admin-read-back transitions and
+  the mutually exclusive maintenance-authority issue/revoke/admin-read-
+  back mode; it cannot hold both credentials, write evidence-store data,
+  or invoke any release effect;
+- a disjoint `release-evidence-maintain` binary owns only the exact
+  granted monotonic retention-extension/migration/capture-store-recovery/
+  expiry-disposition automaton, the single-writer maintenance-authority
+  claim/finalization path, and separate maintenance journal, never
+  release state;
+- each binary target root and the library crate root has
+  `#![forbid(unsafe_code)]`; a checked-in Cargo
   implementation also owns the deterministic ustar/zstd and ZIP asset
-  profiles, SPDX 3.0.1 JSON-LD/JCS generation/validation, raw in-toto /
+  profiles, SPDX 3.0.1 official canonical JSON-LD plus structural/
+  semantic validation, raw in-toto /
   SLSA statement generation, and DSSE wrapping/verification boundaries;
 - local registry/provider sandbox binaries and tests cannot select a
   production endpoint or load production credentials; include the real
-  local registry protocol service, GitHub provider, signer, and remote
-  CAS journal/fenced-lease sandboxes;
+  local registry protocol service, GitHub provider, signer, remote CAS
+  journal/fenced-lease, rollback-anchor, evidence-capture and maintenance
+  authorities, maintenance journal/observer-receipt store, append-only
+  evidence store, and migration/recovery destination qualification
+  sandboxes;
 - its source, feature graph, executable digest, configuration, and
   exact upload bodies are sealed by REL-01 and cannot be rebuilt or
   substituted during REL-02.
@@ -34714,10 +36425,13 @@ The following invariants are release blockers.
 | raw transport credentials reach middleware | low | critical | transport-private `TransportRequestParts`, borrowed authenticator view, safe crate seam, compile tests | Authorization becomes handler-visible |
 | hidden stale legacy method remains modern | medium | high | union/schema scan; forbidden-string gate | modern wire emits old method |
 | current or historical tag/token/workflow event bypasses publication authorization | high with current workflow | critical | REL-QUAR-00 source quarantine, permanently disabled historical workflow ID, token removal/rotation, REL-PREP-01-sealed/provider-disabled new identity, REL-02 bootstrap and protected exact two-step authorization | any current/old-ref push, dispatch, rerun, queued run, or token can mutate crates.io or public GitHub state |
+| public artifacts succeed but workflow/credential/environment cleanup, docs.rs stable observation, terminal rollback anchoring, or finalizer quiescence fails | medium | critical | independent `BootstrapCleanupObserved`; all-nine `DocsRsStableObserved`; disjoint finalizer; terminal `JournalRollbackAnchor` read-back; outer `FinalizerQuiescedObserved`; incident branch | any cleanup/finalizer authority remains active/ambiguous, docs.rs is nonpassing, observer identity/signature mismatches, or `H_final`/quiescence proof is absent |
+| terminal incident/stable evidence is ephemeral, overwritten, rolled back, or captured without authority | medium | critical | disjoint content-addressed `ReleaseEvidenceStore`, purpose-typed two-step capture grant, immutable provider receipt/read-back, incident-to-stable lineage and retention | bundle/receipt is missing, mutable, wrong-digest, ambiguous, expired early, admin-coincident, or not read back |
+| legacy URL-compatibility branch drifts from main | high now | high | CI-BASE-01 read-only equality gate; same-operation fast-forward-only maintainer sync after authorized main push; provider read-back; REL-01 exact-commit check | refs differ, diverge, require force, or only main was pushed |
 | release license metadata/text is contradictory or inferred | high now | critical | explicit maintainer/legal `ReleaseLicenseDecision`; one Cargo representation; nine-manifest/archive/README/SBOM/registry parity | `MIT`, rider, `LICENSE`, `LICENSE-MIT`, Cargo metadata, or public wording disagree |
 | docs.rs advertises a profile that was not built or the exact version fails asynchronously | medium | high | sealed per-crate metadata, network-isolated docs.rs-equivalent preflight, bounded post-publish exact-version status/page/link read-back and incident receipt | unsupported feature/target is enabled, docs link is wrong, or exact-version rustdoc fails/times out |
-| deterministic archive is misrepresented as reproducible compiler output | medium | high | separate per-target binary reproducibility disposition, two clean builds, two archive-packaging runs, explicit false claims | repackaged bytes match but clean binary builds differ or documentation says reproducible anyway |
-| SBOM/provenance omits a subject/input or overclaims attestation guarantees | medium | critical | pinned SPDX 3.0.1 Core+Software JSON-LD/JCS profile, in-toto Statement v1/SLSA v1.2 schema, exact subjects, DSSE byte binding, no unproved SLSA level | asset/dependency/feature/target/license absent, unsigned statement called DSSE, subject drifts, or level is unsupported |
+| deterministic archive is misrepresented as reproducible compiler output | medium | high | separate per-target sealed-environment repeatability disposition, two clean builds, two archive-packaging runs, explicit cross-builder disclaimer | repackaged bytes match but clean binary builds differ or documentation says reproducible anyway |
+| SBOM/provenance omits a subject/input or overclaims attestation guarantees | medium | critical | pinned SPDX 3.0.1 Core+Software+Licensing+SimpleLicensing official canonical JSON-LD with Schema+OWL/SHACL validation; in-toto Statement v1/SLSA v1.2 schema/JCS; exact subjects; DSSE PAE binding; no unproved SLSA level | asset/dependency/feature/target/license absent, unsigned statement called DSSE, subject drifts, semantic validation fails, or level is unsupported |
 | production release provider remains hypothetical or lacks rollback/consistency evidence | medium | critical | time-boxed REL-PREP-01 exact provider selection, immutable versions/config, real read-only probes, separately authorized bounded qualification | only a trait/sandbox/marketing guarantee exists or no candidate meets the contract |
 | partial immutable registry publication fractures the workspace version line | medium | critical | dependency order, durable journal, authoritative reconciliation, exact-state resume | one package is public while a later package cannot publish |
 | lost upload response or delayed index causes blind retry | medium | critical | `outcome_unknown`, multi-view read-back, bounded operator stop | submission result cannot be proven before retry |
@@ -34727,7 +36441,7 @@ The following invariants are release blockers.
 | renewable authorization is conflated with transaction identity | medium | critical | stable artifact-derived transaction ID plus per-invocation head/effect-bound grant | expired grant cannot renew safely or old grant authorizes new effects |
 | custom Cargo Registry upload body drifts from sealed Cargo bytes | medium | critical | loopback capture, independent bounded decoder, byte digest, production replay only | metadata/archive/body differs at mutation boundary |
 | pre-existing registry/tag/release/asset identity conflicts | low | critical | read-only preflight and exact checksum/commit/transaction matching | destination exists with different bytes or commit |
-| published crates, tag, assets, SBOMs, provenance, and receipt name different candidates | medium | critical | one sealed identity, private staging, read-back, publicize last, receipt anchor | any public object resolves to a different source or digest |
+| published crates, tag, assets, SBOMs, provenance, and receipt name different candidates | medium | critical | one sealed identity; every candidate asset staged and read back before publicize; afterward only the two fixed digest-qualified receipt/anchor checkpoint assets and their bounded `published_checkpoint_incomplete` reconciliation may follow | any public object resolves to a different source or digest |
 | signer creates an unapproved public transparency/attestation record during preparation | low | high | REL-01 offline/private-only contract; enumerate public signer effects in REL-02 grant | preparation produces an externally visible record |
 | release logs/journal/evidence expose credentials | low | critical | purpose-scoped providers, structured redaction, secret canaries | credential material appears outside provider boundary |
 
@@ -34774,12 +36488,32 @@ Implementation must pause the affected track if:
   token remains usable by old YAML, a pre-quarantine run is undisposed,
   or any release workflow can mutate external state without REL-02's
   exact two-step authorization;
-- REL-PREP-01 has no exact production journal/lease, authority/time,
-  audit-anchor, signer/transparency, registry, or GitHub provider set
-  with the required real evidence;
+- publication artifacts exist but the authorized run inventory is not
+  unique, bootstrap disable/revoke/provider read-back is incomplete,
+  `BootstrapCleanupObserved` is absent/invalid, any exact-version docs.rs
+  surface is nonpassing, the terminal `JournalRollbackAnchor` checkpoint
+  is missing/ambiguous, `H_final` is absent, or finalizer grant/lease/
+  credentials remain active or lack `FinalizerQuiescedObserved`; no stable aggregate may
+  close on `H_publish_done`, `H_cleanup_observed`, or
+  `H_incident_final`;
+- the exact incident or stable aggregate bundle lacks its purpose-typed
+  capture grant/second confirmation, provider-retained capture receipt,
+  content-addressed read-back, administrative separation, required
+  retention, or immutable incident-to-stable lineage;
+- main and the legacy URL-compatibility branch are not provider-read-back
+  at the same commit or repair would require an unapproved/non-fast-
+  forward update;
+- REL-PREP-01 has no exact production journal/lease, publication
+  authority/time, audit anchor, evidence store and envelope/attempt
+  signer, capture authority/time, maintenance authority/journal,
+  maintenance observer/receipt store, destination-qualification,
+  signer/transparency, registry, or GitHub provider set with the required
+  credential-free/read-only-first and separately authorized retained
+  bounded qualification evidence;
 - the current grant is absent, expired, revoked, replayed, mismatched to
-  the durable journal head/fencing token/remaining effects, or a non-
-  introspectable permission is represented as proved;
+  its fixed `grant_base_head`, authorized descendant prefix, exact next
+  effect/fencing token, or live `pre_effect_head`, or a non-introspectable
+  permission is represented as proved;
 - the publication journal cannot be durably persisted or read back, its
   CAS head conflicts, store generation/restore epoch/audit anchor drifts,
   rollback/clone resistance is unproved, its lease/fencing is lost, an upload
@@ -34831,7 +36565,8 @@ global condition until its exact recovery rule is satisfied.
 - Keep REL-PREP-01 production-provider work read-only and without
   publication authority except for its separately authorized,
   receipt-bearing safety-only disablement of the newly registered
-  credentialless workflow ID; use local sandboxes for mutation rehearsal.
+  workflow ID with no mutation-capable credential; use local sandboxes
+  for mutation rehearsal.
   Any other production mutation qualification or REL-02 execution
   requires its own exact authorization.
 
@@ -34879,8 +36614,9 @@ Entry criteria for the release-candidate qualification phase:
   pass at the exact candidate identity;
 - REL-PREP-01's terminate/resume and ambiguity suite passes against the
   local registry/GitHub-provider sandbox, and its exact production
-  provider set has passed the separately evidenced read-only feasibility
-  gate.
+  provider set has passed credential-free/read-only-first feasibility
+  checks plus separately authorized, exactly bounded, retained
+  qualification where a guarantee cannot be established read-only.
 
 These criteria start qualification; they do not themselves authorize a
 “release candidate” claim. That claim begins only when
@@ -34899,8 +36635,12 @@ Stable entry criteria:
 - a separate written exact-identity publication authorization and
   matching rendered-effect confirmation are recorded;
 - REL-02 completes the dependency-ordered registry/GitHub transaction,
-  fresh registry-only consumers pass, and the completion receipt plus
-  receipt anchor independently verify;
+  fresh registry-only consumers pass, all nine exact-version docs.rs
+  surfaces pass, and the publication receipt/anchor, independent cleanup
+  and docs observations, terminal rollback-anchor checkpoint, and
+  `H_final` and the outer finalizer-quiescence proof independently
+  verify; the exact bundle and separately authorized content-addressed
+  capture receipt are retained/read back;
 - documentation support claims match exact profiles;
 - migration guide compiles;
 - dependency and security audits pass;
@@ -34915,10 +36655,16 @@ selecting the prior published crate version.
 crates.io publication has no transactional rollback: an uploaded
 version cannot be overwritten or deleted, yanking does not erase it,
 and a partially published nine-crate set cannot be made atomic after
-the fact. REL-02 therefore stops and emits a partial-publication
-incident receipt when exact-state resume is impossible. Corrected bytes
-require a newly sealed version. Any yank or other recovery mutation
-requires its own explicit authorization and is mitigation, not rollback.
+the fact. REL-02 therefore stops in a partial-publication state when
+exact-state resume is impossible; it emits no invented
+incident or terminal receipt. Without a separate exact
+`PublicationAbandonmentAuthorization`, it remains blocked. With that
+authorization and the actor-typed cleanup/observation/finalizer grants,
+it may follow only the bounded unresolved/terminal publication-failure
+chain and separately authorized evidence capture defined in REL-02.
+Corrected bytes require a newly sealed version. Any yank or other
+recovery mutation requires its own explicit authorization and is
+mitigation, not rollback.
 Tags are never force-moved and public release assets are never silently
 replaced.
 
@@ -35086,8 +36832,13 @@ For wire correctness defects:
   exact candidate identity;
 - REL-PREP-01's no-authority coordinator, exact upload bodies, renewable
   authorization model, local WAL, protected remote CAS journal/fenced
-  lease, exact selected production provider set with read-only evidence,
-  provider/signer sandboxes, and every-boundary terminate/resume suite
+  lease, exact selected production provider set with credential-free/
+  read-only-first evidence plus separately authorized retained bounded
+  qualification receipts where required—including the journal/lease,
+  rollback anchor, evidence store and receipt signer, capture authority/
+  time, maintenance authority/journal, maintenance observer/receipt
+  store, and migration/recovery destination qualification—provider/
+  signer sandboxes, and every-boundary terminate/resume suite
   are qualified;
 - CI-FINAL-CORE-01 seals the candidate and REL-01 emits the exact
   machine-verifiable non-authorizing handoff for the exact 83-member
@@ -35104,9 +36855,18 @@ For wire correctness defects:
   packages, fresh registry-only consumers, policy-protected tag,
   exact-version crates.io metadata and docs.rs status/page/link
   observations, public assets/SPDX SBOMs/signatures/DSSE-wrapped
-  provenance, public release read-back, completion receipt, and receipt
-  anchor. A docs.rs asynchronous incident is explicit and cannot be
-  disguised as rollback or green documentation evidence. This is the published-stable
+  provenance, public release read-back, publication-artifacts receipt/
+  anchor, independent bootstrap cleanup, signed all-nine docs.rs stable
+  observation, terminal rollback-anchor read-back at `H_final`, and the
+  outer `FinalizerQuiescedObserved::Stable`; the exact stable bundle and
+  separately authorized content-addressed capture receipt are read back.
+  A docs.rs asynchronous incident is explicit, leaves REL-02 and stable
+  closure open/blocked as `published-with-documentation-incident`, and
+  becomes a durable reportable disposition only after its admitted
+  `IncidentAggregateEvidenceBundle::Initial` and
+  `IncidentEvidenceCaptureReceipt::Initial` are read back; it
+  cannot be disguised as rollback or green documentation evidence. Only
+  the all-pass branch is the published-stable
   completion boundary and the exact 84-member
   `CoreReleaseProfileInventory`;
 - support claims distinguish technical candidate evidence from actual
@@ -35238,11 +36998,16 @@ Release context:
 - <https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields>
 - <https://docs.rs/about/metadata>
 - <https://docs.rs/about/builds>
+- <https://docs.github.com/en/rest/actions/workflows?apiVersion=2026-03-10>
+- <https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows>
+- <https://docs.github.com/en/organizations/managing-organization-settings/actions-policies/workflow-execution-protections>
+- <https://docs.github.com/en/actions/concepts/security/github_token>
+- <https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments>
 - <https://spdx.github.io/spdx-spec/v3.0.1/serializations/>
 - <https://spdx.github.io/spdx-spec/v3.0.1/conformance/>
 - <https://spdx.github.io/spdx-spec/v3.0.1/model/Software/Classes/Sbom/>
 - <https://www.rfc-editor.org/rfc/rfc8785>
-- <https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md>
+- <https://github.com/in-toto/attestation/blob/6fad7157dfb216034e28223c6b5c6b0f9c41bf28/spec/v1/statement.md>
 - <https://slsa.dev/spec/v1.2/build-provenance>
 - <https://github.com/secure-systems-lab/dsse/blob/1d3370f62565bca041e97c8310b873ac340edc2e/envelope.md>
 
@@ -35345,7 +37110,7 @@ The old materialization fingerprints, mappings, closure counts, and
 checker outputs retained in Sections 36.2–36.3 are timestamped historical
 evidence. Section 36.1's formal-plan and live-tracker counts are current
 diagnostic truth but not release/readiness evidence. No Section 36
-materialization is current until the revised 129-package/662-edge plan is
+materialization is current until the revised 129-package/663-edge plan is
 rematerialized through `br`, strictly exported, independently decoded,
 and revalidated after the active tracker owner hands off and the stale
 lock/base-anchor repair is explicitly authorized.
@@ -35592,7 +37357,7 @@ Round 13 — end-to-end project reality check:
   the peer boundary, bound HTTP configuration can be discarded,
   CLI errors are swallowed, public docs/examples overstate current APIs,
   the client is effectively single-flight/lossy for unmatched responses,
-  and the FND verifier has grown to roughly 85,519 lines;
+  and the FND verifier has grown to exactly 85,819 physical lines;
 - RCH evidence: workspace check passed with warnings, Clippy failed
   under `-D warnings`, and workspace tests stopped at a timed-out
   `fastmcp-cli` hot-reload end-to-end test. Therefore no clean baseline,
@@ -35628,7 +37393,9 @@ Round 15 — ambition pass: capacity and trustworthy delivery:
   exact sealed Cargo Registry bodies, local provider sandboxes, durable
   cross-run CAS journal/fencing, renewable head/effect-bound grants,
   numbered mutation attempts, ambiguous-outcome reconciliation, fresh
-  registry-only consumers, publicize-last, and receipt anchoring;
+  registry-only consumers, complete candidate-asset staging/read-back
+  before publicize, and the bounded post-publicize receipt/anchor
+  checkpoint plus `published_checkpoint_incomplete` recovery;
 - distinguished technical release-candidate evidence from a published
   stable claim so declining publication does not falsify conformance.
 
@@ -35725,10 +37492,12 @@ Round 21 — emergency release quarantine and final integration audit:
   before terminal dependencies, specified the concrete non-publishable
   `tools/xtask` implementation and Cargo alias, and made the checker
   generate every candidate/published/optional full-closure label;
-- independently recomputed 129 packages, 662 unique prerequisite edges,
+- independently recomputed the then-current 129 packages and 662 unique
+  prerequisite edges (superseded by Round 22's additional
+  `REL-QUAR-00 -> FND-02` claim-quarantine edge),
   two intentional seeds (`FND-01`, `REL-QUAR-00`), the same seven exact
   terminal sinks, no duplicate/unresolved/self edge or cycle, a longest
-  path of 30, 66 direct GATE-CORE dependencies, candidate/published
+  path of 30, 66 direct GATE-CORE-READY dependencies, candidate/published
   closures 83/84, and optional endpoint closures
   87/90/93/86/85/86/92/86/88/96/99;
 - added structural-readiness versus linearized one-shot admission
@@ -35756,26 +37525,37 @@ Round 22 — end-to-end project reality check and release-artifact audit:
   “cancel-correct,” automatic-timeout, and zero-copy marketing as proven
   facts while macros/server own blocking runtime bridges, timeout metadata
   is not enforced end to end, production synchronization remains mixed,
-  and JSON decoding owns strings/values. `FEATURE_PARITY.md` likewise
+  and JSON decoding owns strings/values. The workspace itself admits that
+  production `asupersync/test-internals` is a stopgap for its synchronous
+  thread-per-connection context minting, while the facade exports Lab and
+  runtime authority unconditionally; this is the wrong architecture for
+  the mandated consumer-owned structured-concurrency boundary, not a
+  cosmetic gap. `FEATURE_PARITY.md` likewise
   contradicts itself about the removed update checker while retaining
   unsupported “COMPLETE” labels, so it is not current status evidence;
 - found the concrete `MIT`/rider/`LICENSE`/`LICENSE-MIT` contradiction,
   absent per-crate docs.rs qualification, nondeterministic archive
   recipes, and underspecified SBOM/provenance/signing semantics. Added an
   explicit legal decision gate, docs.rs pre/post checks, separate binary
-  versus archive reproducibility claims, SPDX 3.0.1 JSON-LD/JCS coverage,
+  versus archive repeatability claims, SPDX 3.0.1 official canonical
+  JSON-LD structural/semantic coverage,
   in-toto Statement v1 plus SLSA v1.2 provenance, and exact DSSE wrapping;
 - resolved the release-workflow self-bootstrap cycle with a separately
   sealed human-invoked bootstrap controller, workload/run-bound
   credentials, safety-authorized initial disablement, crash-resumable
   cleanup, and transaction binding of publisher/bootstrap/workflow/
-  environment/operator-host identities. CI-BASE now permits only that
+  environment/operator-host identities. CI-BASE-01 now permits only that
   exact provider-disabled dormant definition;
 - made REL-QUAR-00 an authority-separated aggregate, raised the planned
   workspace unsafe lint from warning to forbid, restricted fingerprint
   JSON to lowercase hex, and marked `safe-icon-rendering` and
   `jwt-resource-auth` experimental/unclaimed pending their own future
   gates;
+- made FND-02 consume REL-QUAR-00 so traceability cannot proceed while
+  public claims remain unsafe; the current formal graph is therefore
+  129 packages and 663 unique prerequisite edges, with roots, sinks,
+  longest path, direct gate inventory, and profile closures otherwise
+  unchanged;
 - read-only provider evidence at `2026-08-01T02:09:45Z` proved historical
   release workflow ID `224760884` is still active and the Actions secret
   inventory still includes `CARGO_REGISTRY_TOKEN`; there are no active
@@ -35783,7 +37563,7 @@ Round 22 — end-to-end project reality check and release-artifact audit:
   but this audit had no authority to edit workflow source, disable a
   provider object, or rotate a credential;
 - read-only repository evidence found a dirty/untracked worktree, local
-  `main` 17 commits ahead of `origin/main`, and the legacy compatibility
+  `main` 19 commits ahead of `origin/main`, and the legacy compatibility
   branch 13 commits behind `origin/main`. The latest inspected
   `origin/main` CI run is red,
   and its security job cannot prove audit cleanliness while the workflow
@@ -35794,6 +37574,34 @@ Round 22 — end-to-end project reality check and release-artifact audit:
   packages. Phase 3a and Phase 5 Beads mutation/refinement remain blocked,
   not skipped; no issue, status, edge, label, owner, lock, or merge anchor
   was mutated.
+
+Round 23 — final adversarial evidence-state refinement:
+
+- split immutable, store-independent logical aggregate-bundle bytes from
+  provider-specific capture envelopes/receipts; sealed automatic atomic
+  receipt and attempt-audit signatures/read-back, exact variant domains,
+  and a read-only storage-incident observer so crash recovery never
+  depends on ephemeral process facts or a second ungranted write;
+- replaced negative-read-only capture recovery with a bounded first/
+  second successor-store lineage that waits through claim/dispatch
+  deadlines, proves zero in-flight work, fences every prior generation,
+  qualifies the exact destination independently, preserves identical
+  bundle bytes/key, and denies ambiguous or concurrent cross-store puts;
+- added a single-writer maintenance-authority CAS, closed attempt
+  outcomes, actor-separated receipt capture, non-self-referential profile
+  finalization, fixed `24/16/4/2/2`, time, `6*B`, and `K*G` budgets,
+  post-expiry receipt retention, and qualification/extension/migration/
+  recovery/expiry acceptance plus fault matrices in REL-PREP-01;
+- closed the documentation-incident and publication-failure ordering:
+  initial incident capture is a hard predecessor, direct failure uses at
+  most two logical keys, an incident-origin failure uses at most three,
+  unresolved capture failure can reach authorized terminal closeout only
+  through its durable failed-attempt lineage, and no branch can cross-
+  substitute a stable, docs-terminal, or failure disposition;
+- reran independent current-byte structure checks after the refinements:
+  129 packages, 663 unique prerequisite edges, two roots, seven sinks,
+  no duplicate/unresolved/self edge or cycle, longest path 30, direct
+  gate count 66, and exact CI-final/candidate/published closures 82/83/84.
 
 Canonical fingerprint rules:
 
@@ -35856,7 +37664,7 @@ mean it cannot authorize a claim, close, schedule, or release decision.
 Current formal-plan truth, independently extracted from the package-local
 `Dependencies:` blocks, is:
 
-- 129 unique packages and 662 unique prerequisite edges;
+- 129 unique packages and 663 unique prerequisite edges;
 - no duplicate ID/edge, unresolved ID, self-edge, or cycle;
 - two intentional seeds: implementation-evidence seed `FND-01` and
   emergency release-safety seed `REL-QUAR-00`;
@@ -35874,7 +37682,7 @@ Current formal-plan truth, independently extracted from the package-local
   proxy+dual 96, and proxy+Tasks 99.
 
 Current live tracker truth, reconfirmed during the volatile read-only
-audit interval `2026-08-01T02:10:01Z–02:10:19Z`, is:
+audit interval `2026-08-01T02:47:55Z–03:02:50Z`, is:
 
 - epic `bd-mcp-2026-07-28-support-ahet`;
 - 416 issues: 290 closed, 125 open, and one in progress;
@@ -35887,7 +37695,8 @@ audit interval `2026-08-01T02:10:01Z–02:10:19Z`, is:
   36.4 evidence policy requires all twelve to reopen for current-byte
   revalidation;
 - `.1.14` is actively `in_progress`, assigned to `BrightStork`, and
-  was updated at `2026-08-01T01:56:01.021038Z`; it is therefore
+  was updated at `2026-08-01T02:47:55.362221Z`; its 106th current
+  comment records additional partial verifier work. It is therefore
   fresh/unreclaimable. Its owner and associated lanes have not handed
   off;
 - `br doctor` reports the DB/JSONL structurally healthy and in sync but
@@ -35896,7 +37705,7 @@ audit interval `2026-08-01T02:10:01Z–02:10:19Z`, is:
   process-free interval is not quiescence while the fresh claim remains
   active;
 - `br ready --json` returns no issue. `bv --robot-triage` for data hash
-  `e308a78bb565aac7` reports 126 nonclosed issues, 125 blocked, one
+  `458f7c6c2595f3f9` reports 126 nonclosed issues, 125 blocked, one
   actionable, one in progress, and no top pick; that readiness
   disagreement and its blocked-parent recommendations are unhealthy
   projection evidence, not scheduling authority;
@@ -35913,8 +37722,8 @@ inventory still contains `CARGO_REGISTRY_TOKEN`; and the repository has
 no protected environments. There are zero queued, in-progress, waiting,
 requested, or pending runs for that workflow, so no live run currently
 needs disposition, but the ambient workflow/token path remains. Local
-`main` is 17 commits ahead of `origin/main`; the legacy compatibility
-branch is 13 commits behind `origin/main` and 30 behind local `main`; and the worktree
+  `main` is 19 commits ahead of `origin/main`; the legacy compatibility
+branch is 13 commits behind `origin/main` and 32 behind local `main`; and the worktree
 has modified plus numerous untracked tracker/verifier backup artifacts.
 No push, cleanup, workflow disablement, secret rotation, or other
 provider mutation was authorized or performed by this audit.
@@ -35944,8 +37753,13 @@ child references; separate actors/authorities; exact commands, scopes,
 authorization text, timestamps, handoffs, and evidence digests. After
 rematerialization, create REL-QUAR-00's aggregate and child chain through
 `br`, attach/project that receipt without inventing retroactive ownership,
-and let the checker decide whether it can close; never backdate or infer
-tracker completion. The present reality-check
+and run the frozen independent manual schema/dependency/receipt
+projection because FND-02's checker does not exist yet. That independent
+manual validation may close the child chain and aggregate before FND-01/
+FND-02 bootstrap; never backdate or infer tracker completion. The first
+FND-02 `plan-tracker-check all` run must retrovalidate those exact closed
+bytes/receipts and stop every later claim/merge for explicit reopen and
+repair on any mismatch. The present reality-check
 turn has no such exact source/provider authorization and therefore does
 not execute the exception.
 
@@ -36347,7 +38161,7 @@ or child claim/close is authorized by this plan. The already active
 `.1.14` owner may only checkpoint and hand off its work; this text does
 not revoke or overwrite that fresh claim. Before ordinary execution
 resumes, the explicitly authorized reconciliation must produce exact
-129-package/662-edge plan/Beads equality, mappings for all seven new
+129-package/663-edge plan/Beads equality, mappings for all seven new
 packages, synchronized canonical bodies/acceptance, restored FND
 provenance, current evidence status, a completed frozen Bead-refinement
 sequence, strict export, fresh merge anchor, and clean doctor/sync/
@@ -36360,10 +38174,13 @@ checker/`bv` evidence.
    every non-REL-QUAR-00 preclaim and every implementation merge until
    REL-QUAR-00 is closed with source-quarantine, provider-side workflow-
    disable/token, historical-run-disposition, and independent-review
-   evidence. Before rematerialization, no ordinary claim is allowed at
-   all; only Section 36.1's exact human-authorized REL-QUAR-00 emergency
-   path may act. This global barrier changes execution admission, not
-   package closure calculations, and grants no publication authority.
+   evidence. Before the checker exists, closure uses Section 36.1's
+   frozen independent manual child/schema/dependency/receipt projection;
+   it is not deferred to a nonexistent tool. Before rematerialization, no
+   ordinary claim is allowed at all; only Section 36.1's exact human-
+   authorized REL-QUAR-00 emergency path may act. This global barrier
+   changes execution admission, not package closure calculations, and
+   grants no publication authority.
 
 1. Run `br doctor --json` and
    `br sync --status --json`. Require doctor `ok: true`, healthy
@@ -36414,7 +38231,12 @@ checker/`bv` evidence.
    or reorder the FND implementation lineage. The old
    Section 36.3 snapshot permits neither lineage now. No third formal
    lineage, including FND-04, may be claimed before a clean checker
-   `all` result.
+   `all` result. That first `all` run must retrovalidate the exact closed
+   REL-QUAR-00 aggregate/child chain, actors, receipts, scopes, and
+   dependency projection created by the manual bootstrap. Any mismatch
+   stops all further work and requires explicit `br` reopen/repair under
+   the normal safety gate; the checker never silently blesses or rewrites
+   historical emergency evidence.
 4. Optionally run `bv --robot-plan --label work-package` for ranking
    and parallel-track context. Ignore its epic connector and never use
    `--robot-plan`, `--robot-triage`, or `--robot-next` as readiness
