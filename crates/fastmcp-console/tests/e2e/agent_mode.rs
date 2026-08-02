@@ -13,6 +13,7 @@ fn test_mcp_client_env_triggers_agent_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -27,6 +28,7 @@ fn test_claude_code_env_triggers_agent_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -41,6 +43,7 @@ fn test_codex_cli_env_triggers_agent_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -55,6 +58,7 @@ fn test_ci_env_triggers_agent_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -69,6 +73,7 @@ fn test_agent_mode_env_triggers_agent_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -83,6 +88,7 @@ fn test_no_color_disables_ansi() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -103,6 +109,7 @@ fn test_fastmcp_plain_env_triggers_plain_mode() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -122,6 +129,7 @@ fn test_agent_mode_with_multiple_requests() {
     ]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // CRITICAL: stdout must NEVER have ANSI codes (even with many requests)
     result.assert_stdout_no_ansi();
@@ -139,6 +147,8 @@ fn test_agent_mode_stdout_is_pure_jsonrpc() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
+    result.assert_stdout_valid_jsonrpc();
 
     // Every non-empty line in stdout must be valid JSON-RPC
     for line in &result.stdout {
@@ -164,6 +174,8 @@ fn test_agent_mode_logs_to_stderr() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
+    result.assert_stdout_valid_jsonrpc();
 
     // Server should still log to stderr (even in agent mode)
     // This is informational and doesn't affect the protocol

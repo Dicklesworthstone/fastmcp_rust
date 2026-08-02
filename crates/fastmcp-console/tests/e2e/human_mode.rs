@@ -12,15 +12,14 @@ fn test_human_mode_has_rich_stderr() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_human_context();
 
-    // In human mode, stderr should have ANSI codes for rich output
-    // Note: This depends on the console actually emitting ANSI codes,
-    // which it will if FASTMCP_RICH is set
-    if result.stderr_has_ansi_codes() {
-        eprintln!("[human_mode] Rich output detected in stderr (expected)");
-    } else {
-        eprintln!("[human_mode] No ANSI codes in stderr (may be due to test environment)");
-    }
+    // FASTMCP_RICH is an explicit override, so accepting plain output here
+    // would make this test a false positive.
+    assert!(
+        result.stderr_has_ansi_codes(),
+        "forced human mode must render rich ANSI output to stderr"
+    );
 
     // stdout should NEVER have ANSI codes (even in human mode)
     result.assert_stdout_no_ansi();
@@ -35,6 +34,11 @@ fn test_force_color_enables_rich() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_human_context();
+    assert!(
+        result.stderr_has_ansi_codes(),
+        "FASTMCP_RICH must force rich ANSI output"
+    );
 
     // stdout should NEVER have ANSI codes
     result.assert_stdout_no_ansi();
@@ -49,6 +53,8 @@ fn test_human_mode_shows_server_name() {
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_human_context();
+    result.assert_stdout_valid_jsonrpc();
 
     // Server should identify itself in some way
     assert!(
@@ -71,6 +77,7 @@ fn test_human_mode_with_tool_call() {
     ]);
 
     result.print_diagnostics();
+    result.assert_human_context();
 
     // Should have valid responses
     result.assert_stdout_valid_jsonrpc();
@@ -84,14 +91,15 @@ fn test_human_mode_with_tool_call() {
 }
 
 #[test]
-fn test_default_mode_without_agent_env() {
-    // Default mode with no agent indicators should be human-like
+fn test_default_mode_without_agent_env_is_plain_when_stderr_is_piped() {
+    // The harness pipes stderr, so the honest default is agent/plain mode.
     let config = E2ETestConfig::default();
 
     let runner = TestServerRunner::new(config);
     let result = runner.run_with_messages(&[&jsonrpc::initialize(1)]);
 
     result.print_diagnostics();
+    result.assert_agent_context();
 
     // stdout should ALWAYS be clean JSON-RPC
     result.assert_stdout_no_ansi();
@@ -113,6 +121,7 @@ fn test_rich_mode_still_respects_protocol() {
     ]);
 
     result.print_diagnostics();
+    result.assert_human_context();
 
     // Even in rich mode, the protocol must be correct
     result.assert_stdout_valid_jsonrpc();

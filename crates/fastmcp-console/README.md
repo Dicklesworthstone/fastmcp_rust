@@ -2,6 +2,10 @@
 
 Rich console output for FastMCP servers.
 
+MCP 2026-07-28 support is under implementation and remains unverified. The
+workspace's public protocol constant is still `2024-11-05`; console rendering
+is not aggregate conformance or release evidence.
+
 fastmcp-console renders human-friendly output to stderr and keeps stdout
 reserved for JSON-RPC (NDJSON). This preserves protocol correctness for agents
 while giving humans polished output.
@@ -19,12 +23,10 @@ clients and agents that parse stdout as a protocol stream.
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
-use log::Level;
 
 fn main() {
     // Optional: initialize rich logger (stderr only)
     let _ = RichLoggerBuilder::new()
-        .level(Level::Info)
         .with_targets(true)
         .init();
 
@@ -58,8 +60,9 @@ suppressed. The most common toggles are:
   CI, or AGENT_MODE set.
 
 ConsoleConfig::from_env() also supports:
-- FASTMCP_FORCE_COLOR, FASTMCP_BANNER, FASTMCP_LOG,
-  FASTMCP_LOG_TIMESTAMPS, FASTMCP_TRAFFIC, RUST_BACKTRACE
+- FASTMCP_FORCE_COLOR, FASTMCP_BANNER, FASTMCP_NO_BANNER, FASTMCP_LOG,
+  FASTMCP_LOG_TIMESTAMPS, FASTMCP_LOG_TARGETS, FASTMCP_LOG_FILE_LINE,
+  FASTMCP_TRAFFIC, RUST_BACKTRACE
 
 ## API Overview
 
@@ -89,4 +92,8 @@ See `crates/fastmcp-console/examples`:
 
 ## License
 
-MIT. See LICENSE-MIT.
+The workspace release-license representation is unresolved: Cargo metadata,
+the root `LICENSE`, and the root `LICENSE-MIT` do not currently describe one
+consistent set of terms. Do not infer authoritative release terms from this
+crate page; publication remains blocked pending the explicit license decision
+required by the implementation plan.

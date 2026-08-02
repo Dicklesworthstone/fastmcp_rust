@@ -16,7 +16,13 @@
 
 use std::time::{Duration, Instant};
 
-use crate::console::FastMcpConsole;
+use crate::console::{
+    FastMcpConsole, bounded_redacted_rich_fragment, bounded_redacted_terminal_text,
+};
+
+const REQUEST_METHOD_MAX_CHARS: usize = 128;
+const REQUEST_ID_MAX_CHARS: usize = 128;
+const REQUEST_ERROR_MAX_CHARS: usize = 512;
 
 /// Format for displaying request/response activity.
 pub struct RequestLog {
@@ -42,8 +48,8 @@ impl RequestLog {
     /// Create a new request log for a method and optional request ID.
     pub fn new(method: &str, id: Option<&str>) -> Self {
         Self {
-            method: method.to_string(),
-            id: id.map(String::from),
+            method: bounded_redacted_terminal_text(method, REQUEST_METHOD_MAX_CHARS),
+            id: id.map(|id| bounded_redacted_terminal_text(id, REQUEST_ID_MAX_CHARS)),
             start: Instant::now(),
             status: RequestStatus::Pending,
         }
@@ -57,7 +63,10 @@ impl RequestLog {
 
     /// Mark the request as failed with an error message.
     pub fn error(mut self, msg: &str) -> Self {
-        self.status = RequestStatus::Error(msg.to_string(), self.start.elapsed());
+        self.status = RequestStatus::Error(
+            bounded_redacted_terminal_text(msg, REQUEST_ERROR_MAX_CHARS),
+            self.start.elapsed(),
+        );
         self
     }
 
@@ -70,7 +79,7 @@ impl RequestLog {
     /// Render the log entry to the console.
     pub fn render(&self, console: &FastMcpConsole) {
         if !console.is_rich() {
-            self.render_plain();
+            self.render_plain(console);
             return;
         }
 
@@ -86,6 +95,7 @@ impl RequestLog {
             .id
             .as_ref()
             .map(|id| {
+                let id = bounded_redacted_rich_fragment(id, REQUEST_ID_MAX_CHARS);
                 format!(
                     " [{}]#{}[/]",
                     theme.text_dim.triplet.unwrap_or_default().hex(),
@@ -118,12 +128,13 @@ impl RequestLog {
                 .as_ref()
                 .map(|c| c.triplet.unwrap_or_default().hex())
                 .unwrap_or_default(),
-            self.method,
+            bounded_redacted_rich_fragment(&self.method, REQUEST_METHOD_MAX_CHARS),
             id_str,
             duration_str
         ));
 
         if let RequestStatus::Error(msg, _) = &self.status {
+            let msg = bounded_redacted_rich_fragment(msg, REQUEST_ERROR_MAX_CHARS);
             console.print(&format!(
                 "  [{}]└─ {}[/]",
                 theme.error.triplet.unwrap_or_default().hex(),
@@ -132,7 +143,7 @@ impl RequestLog {
         }
     }
 
-    fn render_plain(&self) {
+    fn render_plain(&self, console: &FastMcpConsole) {
         let (icon, duration) = match &self.status {
             RequestStatus::Pending => ("...", None),
             RequestStatus::Success(d) => ("OK", Some(d)),
@@ -150,10 +161,13 @@ impl RequestLog {
             .map(|id| format!(" #{}", id))
             .unwrap_or_default();
 
-        eprintln!("[{}] {}{}{}", icon, self.method, id_str, duration_str);
+        console.print_plain(&format!(
+            "[{}] {}{}{}",
+            icon, self.method, id_str, duration_str
+        ));
 
         if let RequestStatus::Error(msg, _) = &self.status {
-            eprintln!("  Error: {}", msg);
+            console.print_plain(&format!("  Error: {msg}"));
         }
     }
 }
@@ -265,16 +279,17 @@ mod tests {
 
     #[test]
     fn request_log_render_plain_covers_all_statuses() {
-        RequestLog::new("tools/list", None).render_plain();
+        let console = TestConsole::new();
+        RequestLog::new("tools/list", None).render_plain(console.console());
         RequestLog::new("tools/list", Some("1"))
             .success()
-            .render_plain();
+            .render_plain(console.console());
         RequestLog::new("tools/list", Some("2"))
             .error("bad request")
-            .render_plain();
+            .render_plain(console.console());
         RequestLog::new("tools/list", Some("3"))
             .cancelled()
-            .render_plain();
+            .render_plain(console.console());
     }
 
     // =========================================================================
@@ -335,5 +350,54 @@ mod tests {
         RequestLog::new("tools/call", None)
             .error("fail")
             .render(&console);
+    }
+
+    #[test]
+    fn hostile_request_metadata_is_bounded_redacted_and_safe() {
+        let method = format!(
+            "tools/[bold]call[/]\n\u{001b}\u{202e} access_token=method-canary{}",
+            "x".repeat(2_000)
+        );
+        let id = "request[id]\r password=id-canary";
+        let error = format!(
+            "[red]failure[/]\n Authorization: Bearer error-canary {}",
+            "y".repeat(4_000)
+        );
+
+        let rich = TestConsole::new_rich();
+        RequestLog::new(&method, Some(id))
+            .error(&error)
+            .render(rich.console());
+
+        let (writer, captured) = SharedWriter::new();
+        let plain = FastMcpConsole::with_writer(writer, false);
+        RequestLog::new(&method, Some(id))
+            .error(&error)
+            .render(&plain);
+        let plain_output = String::from_utf8(
+            captured
+                .lock()
+                .expect("plain request output lock poisoned")
+                .clone(),
+        )
+        .expect("plain request output must be UTF-8");
+
+        for output in [rich.output_string(), plain_output] {
+            assert!(
+                output.contains("[bold]call[/]"),
+                "markup was executed: {output}"
+            );
+            assert!(
+                output.contains("request[id]"),
+                "brackets were corrupted: {output}"
+            );
+            assert!(output.contains("\\n"));
+            assert!(output.contains("\\u{1b}"));
+            assert!(output.contains("\\u{202e}"));
+            for canary in ["method-canary", "id-canary", "error-canary"] {
+                assert!(!output.contains(canary), "leaked {canary}: {output}");
+            }
+            assert!(output.chars().count() < 1_200, "unbounded output: {output}");
+        }
     }
 }

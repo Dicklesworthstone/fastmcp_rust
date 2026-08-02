@@ -23,46 +23,18 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Guard that kills and waits for a child process when dropped.
-/// Call `disarm()` to prevent cleanup (e.g., when ownership transfers to Client).
-struct ChildGuard(Option<Child>);
-
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self(Some(child))
-    }
-
-    /// Takes ownership of the child, preventing cleanup on drop.
-    fn disarm(mut self) -> Child {
-        self.0.take().expect("ChildGuard already disarmed")
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            // Best effort cleanup - ignore errors
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
-use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, JsonRpcMessage,
-    JsonRpcRequest, PROTOCOL_VERSION,
-};
+use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::{StdioTransport, Transport};
 
-use crate::{Client, ClientSession};
+use crate::{ChildGuard, Client, ClientSession, resolve_stdio_command};
 
 /// Builder for configuring an MCP client.
 ///
 /// Use this to configure timeout, retry, and spawn options before
 /// connecting to an MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBuilder {
     /// Client identification info.
     client_info: ClientInfo,
@@ -82,6 +54,27 @@ pub struct ClientBuilder {
     capabilities: ClientCapabilities,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
+}
+
+impl std::fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("client_info", &self.client_info)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("working_dir_set", &self.working_dir.is_some())
+            .field("env_var_count", &self.env_vars.len())
+            .field("inherit_env", &self.inherit_env)
+            .field("sampling_capability", &self.capabilities.sampling.is_some())
+            .field(
+                "elicitation_capability",
+                &self.capabilities.elicitation.is_some(),
+            )
+            .field("roots_capability", &self.capabilities.roots.is_some())
+            .field("auto_initialize", &self.auto_initialize)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -124,9 +117,13 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the request timeout in milliseconds.
+    /// Sets the response deadline in milliseconds.
     ///
-    /// This affects how long the client waits for responses from the server.
+    /// This is applied to the initialization handshake and subsequent response
+    /// receives. On Unix, bounded child-pipe readiness polling makes it a hard
+    /// receive deadline even while a server is silent or holds a partial
+    /// frame. On non-Unix targets, the standard child pipe has no portable safe
+    /// readiness primitive, so the deadline remains frame-boundary-only.
     /// Default is 30,000ms (30 seconds).
     #[must_use]
     pub fn timeout_ms(mut self, timeout: u64) -> Self {
@@ -197,7 +194,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the client capabilities to advertise to the server.
+    /// Sets the client capabilities advertised during initialization.
+    ///
+    /// The complete value replaces the default empty capability set.
     #[must_use]
     pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
@@ -297,7 +296,8 @@ impl ClientBuilder {
     /// Attempts a single connection.
     fn try_connect(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
         // Build the command
-        let mut cmd = Command::new(command);
+        let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
+        let mut cmd = Command::new(executable);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -315,24 +315,27 @@ impl ClientBuilder {
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
-
         // Spawn the subprocess
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| McpError::internal_error(format!("Failed to spawn subprocess: {e}")))?;
+        let mut child_guard = ChildGuard::new(child);
 
         // Get stdin/stdout handles
-        let stdin = child
+        let stdin = child_guard
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdin"))?;
-        let stdout = child
+        let stdout = child_guard
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdout"))?;
 
         // Create transport
         let transport = StdioTransport::new(stdout, stdin);
+        let child = child_guard.disarm();
 
         if self.auto_initialize {
             // Create uninitialized client - initialization will happen on first use
@@ -376,62 +379,19 @@ impl ClientBuilder {
         // Disarmed when client is successfully created.
         let child_guard = ChildGuard::new(child);
 
-        // Send initialize request
-        let init_params = InitializeParams {
-            protocol_version: PROTOCOL_VERSION.to_string(),
-            capabilities: self.capabilities.clone(),
-            client_info: self.client_info.clone(),
-        };
-
-        let init_request = JsonRpcRequest::new(
-            "initialize",
-            Some(serde_json::to_value(&init_params).map_err(|e| {
-                McpError::internal_error(format!("Failed to serialize params: {e}"))
-            })?),
-            1i64,
-        );
-
-        transport
-            .send(cx, &JsonRpcMessage::Request(init_request))
-            .map_err(|e| McpError::internal_error(format!("Failed to send initialize: {e}")))?;
-
-        // Receive initialize response
-        let response = loop {
-            let msg = transport.recv(cx).map_err(|e| {
-                McpError::internal_error(format!("Failed to receive response: {e}"))
-            })?;
-
-            match msg {
-                JsonRpcMessage::Response(resp) => break resp,
-                JsonRpcMessage::Request(_) => {
-                    // Ignore server requests during initialization
-                }
+        let init_result = match crate::initialize_child_transport(
+            &mut transport,
+            cx,
+            &self.client_info,
+            &self.capabilities,
+            self.timeout_ms,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = transport.close();
+                return Err(error);
             }
         };
-
-        // Check for error
-        if let Some(error) = response.error {
-            return Err(McpError::new(
-                fastmcp_core::McpErrorCode::Custom(error.code),
-                error.message,
-            ));
-        }
-
-        // Parse result
-        let result_value = response
-            .result
-            .ok_or_else(|| McpError::internal_error("No result in initialize response"))?;
-
-        let init_result: InitializeResult = serde_json::from_value(result_value).map_err(|e| {
-            McpError::internal_error(format!("Failed to parse initialize result: {e}"))
-        })?;
-
-        // Send the spec-correct `notifications/initialized` lifecycle notification.
-        let initialized_request = JsonRpcRequest::initialized_notification();
-
-        transport
-            .send(cx, &JsonRpcMessage::Request(initialized_request))
-            .map_err(|e| McpError::internal_error(format!("Failed to send initialized: {e}")))?;
 
         // Create session
         let session = ClientSession::new(
@@ -531,19 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_capabilities() {
-        let caps = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
-            elicitation: None,
-            roots: None,
-        };
-        let builder = ClientBuilder::new().capabilities(caps);
-        assert!(builder.capabilities.sampling.is_some());
-        assert!(builder.capabilities.elicitation.is_none());
-        assert!(builder.capabilities.roots.is_none());
-    }
-
-    #[test]
     fn test_builder_default_trait() {
         let builder = ClientBuilder::default();
         assert_eq!(builder.client_info.name, "fastmcp-client");
@@ -609,11 +556,26 @@ mod tests {
     }
 
     #[test]
-    fn builder_debug_includes_client_info() {
-        let builder = ClientBuilder::new().client_info("dbg-test", "0.1");
+    fn builder_debug_redacts_subprocess_environment_values() {
+        let env_value_canary = "builder-env-api-value-canary";
+        let builder = ClientBuilder::new()
+            .client_info("dbg-test", "0.1")
+            .timeout_ms(42_000)
+            .working_dir("/private/debug/path")
+            .env("SERVICE_API_TOKEN", env_value_canary)
+            .inherit_env(false);
         let debug = format!("{:?}", builder);
+
+        assert!(debug.contains("ClientBuilder"));
         assert!(debug.contains("dbg-test"));
         assert!(debug.contains("0.1"));
+        assert!(debug.contains("timeout_ms: 42000"));
+        assert!(debug.contains("working_dir_set: true"));
+        assert!(debug.contains("env_var_count: 1"));
+        assert!(debug.contains("inherit_env: false"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains("SERVICE_API_TOKEN"));
+        assert!(!debug.contains("/private/debug/path"));
     }
 
     #[test]
@@ -622,6 +584,21 @@ mod tests {
             .max_retries(0)
             .connect_stdio("fastmcp_nonexistent_binary_xyz", &["--version"]);
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_stdio_times_out_during_silent_initialization() {
+        let started = std::time::Instant::now();
+        let result = ClientBuilder::new()
+            .timeout_ms(40)
+            .connect_stdio("sh", &["-c", "exec sleep 5"]);
+
+        let Err(error) = result else {
+            panic!("silent initialization should time out");
+        };
+        assert_eq!(error.message, "Request timed out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -636,14 +613,15 @@ mod tests {
     // Additional coverage tests (bd-10fu)
     // =========================================================================
 
+    #[cfg(unix)]
     #[test]
     fn child_guard_disarm_returns_child() {
-        let child = Command::new("true")
+        let mut command = Command::new("true");
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn 'true'");
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("failed to spawn 'true'");
         let guard = ChildGuard::new(child);
         let mut returned = guard.disarm();
         // disarm gives back a valid Child we can wait on
@@ -651,15 +629,16 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn child_guard_drop_kills_child() {
-        let child = Command::new("sleep")
+        let mut command = Command::new("sleep");
+        command
             .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn 'sleep'");
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("failed to spawn 'sleep'");
         let pid = child.id();
         {
             let _guard = ChildGuard::new(child);
@@ -678,6 +657,20 @@ mod tests {
     fn builder_capabilities_default_is_empty() {
         let builder = ClientBuilder::new();
         assert!(builder.capabilities.sampling.is_none());
+        assert!(builder.capabilities.elicitation.is_none());
+        assert!(builder.capabilities.roots.is_none());
+    }
+
+    #[test]
+    fn builder_capabilities_replaces_the_advertised_set() {
+        let capabilities = ClientCapabilities {
+            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            elicitation: None,
+            roots: None,
+        };
+        let builder = ClientBuilder::new().capabilities(capabilities);
+
+        assert!(builder.capabilities.sampling.is_some());
         assert!(builder.capabilities.elicitation.is_none());
         assert!(builder.capabilities.roots.is_none());
     }

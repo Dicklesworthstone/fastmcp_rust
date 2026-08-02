@@ -3,9 +3,16 @@
 //! This module provides `RichLogFormatter` which transforms tracing events
 //! into beautifully styled console output using rich_rust.
 
+use crate::console::{
+    DEFAULT_LOG_MESSAGE_MAX_CHARS, DEFAULT_TERMINAL_FIELD_MAX_CHARS, REDACTED_VALUE,
+    bounded_redacted_rich_fragment, bounded_redacted_rich_text, bounded_redacted_terminal_text,
+    is_credential_key,
+};
 use crate::detection::DisplayContext;
 use crate::theme::FastMcpTheme;
 use rich_rust::prelude::*;
+
+const MAX_LOG_FIELDS: usize = 64;
 
 /// Formats tracing events into rich, styled output.
 ///
@@ -114,6 +121,7 @@ impl RichLogFormatter {
             return None;
         }
 
+        let timestamp = self.format_untrusted_fragment(timestamp, self.effective_max_width());
         if self.should_use_rich() {
             let dim_hex = self
                 .theme
@@ -123,7 +131,7 @@ impl RichLogFormatter {
                 .unwrap_or_default();
             Some(format!("[{dim_hex}]{timestamp}[/]"))
         } else {
-            Some(timestamp.to_string())
+            Some(timestamp)
         }
     }
 
@@ -136,7 +144,7 @@ impl RichLogFormatter {
 
         // Strip "fastmcp_rust::" prefix for cleaner output
         let target = target.strip_prefix("fastmcp_rust::").unwrap_or(target);
-        let target = self.truncate_text(target);
+        let target = self.format_untrusted_fragment(target, self.effective_max_width());
 
         if self.should_use_rich() {
             let muted_hex = self
@@ -147,36 +155,104 @@ impl RichLogFormatter {
                 .unwrap_or_default();
             Some(format!("[{muted_hex}]{target}[/]"))
         } else {
-            Some(target.to_string())
+            Some(target)
         }
     }
 
     /// Format structured fields (key=value pairs).
     #[must_use]
     pub fn format_fields(&self, fields: &[(String, String)]) -> String {
-        if fields.is_empty() {
+        self.format_field_pairs(
+            fields
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+            fields.len(),
+        )
+    }
+
+    fn format_field_pairs<'a, I>(&self, fields: I, total_fields: usize) -> String
+    where
+        I: Iterator<Item = (&'a str, &'a str)>,
+    {
+        if total_fields == 0 {
             return String::new();
         }
 
-        if self.should_use_rich() {
-            let dim_hex = self
-                .theme
-                .text_dim
-                .triplet
-                .map(|t| t.hex())
-                .unwrap_or_default();
-            fields
-                .iter()
-                .map(|(k, v)| format!("[{dim_hex}]{k}[/]={v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            fields
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
+        let aggregate_limit = self.effective_max_width();
+        if aggregate_limit == 0 {
+            return String::new();
         }
+        let component_limit = aggregate_limit.min(DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let dim_hex = self
+            .theme
+            .text_dim
+            .triplet
+            .map(|triplet| triplet.hex())
+            .unwrap_or_default();
+        let mut rendered_fields = Vec::new();
+        let mut rendered_chars = 0usize;
+
+        for (key, value) in fields.take(MAX_LOG_FIELDS) {
+            // Classify the original key before display truncation. The shared
+            // classifier has its own fixed scan bound and fails closed when the
+            // complete key cannot be inspected; classifying `bounded_key`
+            // would let truncation erase a sensitive suffix.
+            let credential_field = is_credential_key(key);
+            let bounded_key = bounded_redacted_terminal_text(key, component_limit);
+            let key = if self.should_use_rich() {
+                bounded_redacted_rich_fragment(&bounded_key, component_limit)
+            } else {
+                bounded_key
+            };
+            let value = if credential_field {
+                self.format_untrusted_text(REDACTED_VALUE, component_limit)
+            } else {
+                self.format_untrusted_text(value, component_limit)
+            };
+            let field = if self.should_use_rich() {
+                format!("[{dim_hex}]{key}[/]={value}")
+            } else {
+                format!("{key}={value}")
+            };
+            let separator_chars = usize::from(!rendered_fields.is_empty());
+            let field_chars = field.chars().count();
+            if rendered_chars
+                .saturating_add(separator_chars)
+                .saturating_add(field_chars)
+                > aggregate_limit
+            {
+                break;
+            }
+            rendered_chars = rendered_chars
+                .saturating_add(separator_chars)
+                .saturating_add(field_chars);
+            rendered_fields.push((field, field_chars));
+        }
+
+        if rendered_fields.len() < total_fields {
+            let marker: String = "...".chars().take(aggregate_limit).collect();
+            let marker_chars = marker.chars().count();
+            while !rendered_fields.is_empty()
+                && rendered_chars
+                    .saturating_add(1)
+                    .saturating_add(marker_chars)
+                    > aggregate_limit
+            {
+                if let Some((_, removed_chars)) = rendered_fields.pop() {
+                    rendered_chars = rendered_chars.saturating_sub(removed_chars);
+                    if !rendered_fields.is_empty() {
+                        rendered_chars = rendered_chars.saturating_sub(1);
+                    }
+                }
+            }
+            rendered_fields.push((marker, marker_chars));
+        }
+
+        rendered_fields
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Format a complete log event.
@@ -188,21 +264,36 @@ impl RichLogFormatter {
             .as_deref()
             .and_then(|ts| self.format_timestamp(ts));
         let target = event.target.as_deref().and_then(|t| self.format_target(t));
-        let message = self.truncate_text(&event.message);
+        let message = self.format_untrusted_text(&event.message, self.effective_max_width());
 
-        let mut fields = event.fields.clone();
-        if self.show_file_line {
-            if let Some(file) = event.file.as_deref() {
+        let component_limit = self
+            .effective_max_width()
+            .min(DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let file_line = if self.show_file_line {
+            event.file.as_deref().map(|file| {
+                let file = bounded_redacted_terminal_text(file, component_limit);
                 let file_line = if let Some(line) = event.line {
                     format!("{file}:{line}")
                 } else {
-                    file.to_string()
+                    file
                 };
-                fields.push(("file".to_string(), file_line));
-            }
-        }
-
-        let fields = self.format_fields(&fields);
+                bounded_redacted_terminal_text(&file_line, component_limit)
+            })
+        } else {
+            None
+        };
+        let reserved_file_fields = usize::from(file_line.is_some());
+        let event_field_limit = MAX_LOG_FIELDS.saturating_sub(reserved_file_fields);
+        let total_fields = event.fields.len().saturating_add(reserved_file_fields);
+        let fields = self.format_field_pairs(
+            event
+                .fields
+                .iter()
+                .take(event_field_limit)
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .chain(file_line.as_deref().map(|value| ("file", value))),
+            total_fields,
+        );
 
         FormattedLog {
             level_badge,
@@ -220,23 +311,26 @@ impl RichLogFormatter {
         formatted.to_line()
     }
 
-    fn truncate_text(&self, text: &str) -> String {
-        let Some(max) = self.max_message_width else {
-            return text.to_string();
-        };
+    fn effective_max_width(&self) -> usize {
+        self.max_message_width
+            .unwrap_or(DEFAULT_LOG_MESSAGE_MAX_CHARS)
+            .min(DEFAULT_LOG_MESSAGE_MAX_CHARS)
+    }
 
-        let len = text.chars().count();
-        if len <= max {
-            return text.to_string();
+    fn format_untrusted_text(&self, text: &str, max_chars: usize) -> String {
+        if self.should_use_rich() {
+            bounded_redacted_rich_text(text, max_chars)
+        } else {
+            bounded_redacted_terminal_text(text, max_chars)
         }
+    }
 
-        if max <= 3 {
-            return text.chars().take(max).collect();
+    fn format_untrusted_fragment(&self, text: &str, max_chars: usize) -> String {
+        if self.should_use_rich() {
+            bounded_redacted_rich_fragment(text, max_chars)
+        } else {
+            bounded_redacted_terminal_text(text, max_chars)
         }
-
-        let mut truncated: String = text.chars().take(max - 3).collect();
-        truncated.push_str("...");
-        truncated
     }
 }
 
@@ -479,6 +573,44 @@ mod tests {
             .expect("target should be present");
         assert!(target.contains("[/]"));
         assert!(target.contains("server::router"));
+    }
+
+    #[test]
+    fn rich_wrapped_components_protect_trailing_backslash_runs() {
+        fn trailing_backslashes_before(rendered: &str, suffix: &str) -> usize {
+            rendered
+                .strip_suffix(suffix)
+                .expect("trusted rich suffix should be present")
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\\')
+                .count()
+        }
+
+        let formatter = test_formatter_human();
+        for slash_count in 1..=3 {
+            let slashes = "\\".repeat(slash_count);
+            let timestamp = formatter
+                .format_timestamp(&format!("timestamp{slashes}"))
+                .expect("timestamp should be present");
+            let target = formatter
+                .format_target(&format!("fastmcp_rust::target{slashes}"))
+                .expect("target should be present");
+            let fields =
+                formatter.format_fields(&[(format!("field{slashes}"), "value".to_string())]);
+            let protected_count = slash_count * 2;
+
+            assert_eq!(
+                trailing_backslashes_before(&timestamp, "[/]"),
+                protected_count
+            );
+            assert_eq!(trailing_backslashes_before(&target, "[/]"), protected_count);
+            assert_eq!(
+                trailing_backslashes_before(&fields, "[/]=value"),
+                protected_count
+            );
+        }
     }
 
     #[test]
@@ -794,5 +926,173 @@ mod tests {
         // Should contain markup and be truncated
         assert!(target.contains("[/]"));
         assert!(target.contains("..."));
+    }
+
+    #[test]
+    fn hostile_log_components_are_terminal_safe_markup_safe_and_bounded() {
+        let message = format!(
+            "[bold]literal[/]\n\u{001b}\u{202e}{}",
+            "m".repeat(DEFAULT_LOG_MESSAGE_MAX_CHARS * 2)
+        );
+        let fields = (0..100).fold(
+            LogEvent::new(LogLevel::Warn, &message)
+                .with_target("[link]peer\u{0007}")
+                .with_timestamp("time\rstamp"),
+            |event, index| {
+                event.with_field(
+                    format!("[key{index}]\u{001b}"),
+                    format!("[value{index}]{}", "v".repeat(256)),
+                )
+            },
+        );
+
+        let plain = test_formatter_agent().format_line(&fields);
+        let rich = test_formatter_human().format_line(&fields);
+
+        for rendered in [&plain, &rich] {
+            assert!(
+                !rendered
+                    .chars()
+                    .any(crate::console::terminal_text_is_unsafe)
+            );
+            assert!(rendered.contains("\\n"));
+            assert!(rendered.contains("\\u{1b}"));
+            assert!(rendered.contains("\\u{202e}"));
+            assert!(rendered.chars().count() < 4_500);
+        }
+        assert!(plain.contains("[WARN ]"));
+        assert!(plain.contains("[bold]literal[/]"));
+        assert!(rich.contains("\\[bold]literal\\[/]"));
+    }
+
+    #[test]
+    fn no_explicit_width_still_has_a_hard_default_bound() {
+        let formatter = test_formatter_agent().with_max_width(None);
+        let event = LogEvent::new(
+            LogLevel::Info,
+            "x".repeat(DEFAULT_LOG_MESSAGE_MAX_CHARS * 4),
+        );
+
+        let formatted = formatter.format_event(&event);
+
+        assert_eq!(
+            formatted.message.chars().count(),
+            DEFAULT_LOG_MESSAGE_MAX_CHARS
+        );
+        assert!(formatted.message.ends_with("..."));
+    }
+
+    #[test]
+    fn log_messages_and_structured_fields_redact_credentials() {
+        let event = LogEvent::new(
+            LogLevel::Info,
+            "Authorization: Bearer message-canary password=message-password-canary",
+        )
+        .with_field("access_token", "field-token-canary")
+        .with_field("clientSecret", "field-secret-canary")
+        .with_field("secretHint", "safe-hint")
+        .with_field("ordinary", "api_key=embedded-canary");
+
+        for formatter in [test_formatter_agent(), test_formatter_human()] {
+            let rendered = formatter.format_line(&event);
+            for canary in [
+                "message-canary",
+                "message-password-canary",
+                "field-token-canary",
+                "field-secret-canary",
+                "embedded-canary",
+            ] {
+                assert!(!rendered.contains(canary), "leaked {canary}: {rendered}");
+            }
+            assert!(rendered.contains("[REDACTED]") || rendered.contains("\\[REDACTED]"));
+            assert!(rendered.contains("safe-hint"));
+        }
+    }
+
+    #[test]
+    fn field_omission_marker_never_exceeds_aggregate_limit() {
+        let fields = vec![
+            ("first".to_string(), "value".repeat(32)),
+            ("second".to_string(), "value".repeat(32)),
+        ];
+
+        for limit in 0..=16 {
+            let rendered = test_formatter_agent()
+                .with_max_width(Some(limit))
+                .format_fields(&fields);
+            assert!(
+                rendered.chars().count() <= limit,
+                "limit={limit}, rendered={rendered:?}"
+            );
+            if limit > 0 {
+                let expected_marker: String = "...".chars().take(limit).collect();
+                assert!(rendered.ends_with(&expected_marker));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_public_field_keys_fail_closed_before_classification() {
+        let huge_key = format!("{}access_token", "benign".repeat(100_000));
+        let fields = vec![(huge_key, "credential-canary".to_string())];
+        let rendered = test_formatter_agent()
+            .with_max_width(Some(80))
+            .format_fields(&fields);
+
+        assert!(!rendered.contains("credential-canary"));
+        assert!(rendered.contains(REDACTED_VALUE) || rendered == "...");
+        assert!(rendered.chars().count() <= 80);
+    }
+
+    #[test]
+    fn display_truncation_cannot_erase_a_sensitive_field_suffix() {
+        const SUFFIX: &str = "_access_token";
+
+        for key_chars in [257usize, 600, 2_048] {
+            let key = format!("{}{}", "k".repeat(key_chars - SUFFIX.len()), SUFFIX);
+            let fields = vec![(key, format!("suffix-canary-{key_chars}"))];
+
+            for formatter in [test_formatter_agent(), test_formatter_human()] {
+                let rendered = formatter.with_max_width(Some(1_024)).format_fields(&fields);
+                assert!(
+                    !rendered.contains(&format!("suffix-canary-{key_chars}")),
+                    "long sensitive-key value leaked: {rendered}"
+                );
+                assert!(
+                    rendered.contains(REDACTED_VALUE) || rendered.contains("\\[REDACTED]"),
+                    "redaction marker missing: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_public_field_values_and_file_locations_are_bounded() {
+        let mut value_event = LogEvent::new(LogLevel::Info, "bounded value");
+        value_event
+            .fields
+            .push(("ordinary".to_string(), "v".repeat(100_000)));
+        let value_fields = test_formatter_agent()
+            .with_max_width(Some(96))
+            .format_event(&value_event)
+            .fields;
+
+        let file_event = LogEvent::new(LogLevel::Info, "bounded location")
+            .with_file(format!("src/{}\npassword=file-canary", "x".repeat(100_000)))
+            .with_line(u32::MAX);
+        let file_fields = test_formatter_agent()
+            .with_file_line(true)
+            .with_max_width(Some(96))
+            .format_event(&file_event)
+            .fields;
+
+        assert!(value_fields.chars().count() <= 96);
+        assert!(file_fields.chars().count() <= 96);
+        assert!(!file_fields.contains("file-canary"));
+        assert!(
+            !file_fields
+                .chars()
+                .any(crate::console::terminal_text_is_unsafe)
+        );
     }
 }

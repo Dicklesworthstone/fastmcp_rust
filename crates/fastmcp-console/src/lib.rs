@@ -18,7 +18,7 @@ pub mod stats; // Runtime metrics
 pub mod tables; // Info tables
 pub mod testing; // Test utilities
 
-pub use console::console;
+pub use console::{UntrustedDisplayText, console};
 pub mod config;
 
 pub use client::RequestResponseRenderer;

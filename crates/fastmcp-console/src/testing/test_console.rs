@@ -60,8 +60,8 @@ impl TestConsole {
 
     /// Create a new test console that captures output
     ///
-    /// Note: Internally uses rich mode to ensure output goes through the writer.
-    /// ANSI codes are stripped when reading via `output()` and `output_string()`.
+    /// The underlying console uses plain mode. Use [`Self::new_rich`] when a
+    /// test specifically exercises rich rendering.
     #[must_use]
     pub fn new() -> Self {
         Self::new_inner(false)
@@ -78,9 +78,8 @@ impl TestConsole {
         let buffer = Arc::new(Mutex::new(TestBuffer::default()));
         let writer = BufferWriter(buffer.clone());
 
-        // Always use enabled=true internally so output goes through the writer
         Self {
-            inner: Arc::new(FastMcpConsole::with_writer(writer, true)),
+            inner: Arc::new(FastMcpConsole::with_writer(writer, report_as_rich)),
             buffer,
             report_as_rich,
         }
@@ -212,8 +211,7 @@ impl TestConsole {
 
     /// Check if the console reports as rich mode
     ///
-    /// Note: The internal console is always in rich mode to capture output,
-    /// but this returns the mode the TestConsole was created with.
+    /// This matches the mode of the underlying [`FastMcpConsole`].
     #[must_use]
     pub fn is_rich(&self) -> bool {
         self.report_as_rich
@@ -295,12 +293,42 @@ mod tests {
     fn test_new_creates_plain_console() {
         let tc = TestConsole::new();
         assert!(!tc.is_rich());
+        assert!(!tc.console().is_rich());
+        assert_eq!(tc.is_rich(), tc.console().is_rich());
     }
 
     #[test]
     fn test_new_rich_creates_rich_console() {
         let tc = TestConsole::new_rich();
         assert!(tc.is_rich());
+        assert!(tc.console().is_rich());
+        assert_eq!(tc.is_rich(), tc.console().is_rich());
+    }
+
+    #[test]
+    fn raw_output_preserves_rich_ansi_but_plain_and_stripped_output_do_not() {
+        let plain = TestConsole::new();
+        plain.console().print("[bold red]styled[/]");
+        let plain_raw = plain.raw_output().join("\n");
+        assert!(plain_raw.contains("styled"));
+        assert!(
+            !plain_raw.contains('\u{001b}'),
+            "plain-mode raw output unexpectedly contained ANSI: {plain_raw:?}"
+        );
+
+        let rich = TestConsole::new_rich();
+        rich.console().print("[bold red]styled[/]");
+        let rich_raw = rich.raw_output().join("\n");
+        let rich_stripped = rich.output().join("\n");
+        assert!(
+            rich_raw.contains('\u{001b}'),
+            "rich-mode raw output did not preserve ANSI: {rich_raw:?}"
+        );
+        assert!(rich_stripped.contains("styled"));
+        assert!(
+            !rich_stripped.contains('\u{001b}'),
+            "stripped rich output still contained ANSI: {rich_stripped:?}"
+        );
     }
 
     #[test]
@@ -437,5 +465,6 @@ mod tests {
     fn test_default() {
         let tc = TestConsole::default();
         assert!(!tc.is_rich());
+        assert_eq!(tc.is_rich(), tc.console().is_rich());
     }
 }

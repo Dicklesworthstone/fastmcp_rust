@@ -10,9 +10,15 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use rich_rust::r#box::ROUNDED;
 use rich_rust::prelude::*;
 
-use crate::console::FastMcpConsole;
+use crate::console::{
+    FastMcpConsole, bounded_redacted_rich_fragment, bounded_redacted_terminal_text,
+};
 use crate::detection::DisplayContext;
 use crate::theme::FastMcpTheme;
+
+const CLIENT_NAME_MAX_CHARS: usize = 128;
+const CLIENT_VERSION_MAX_CHARS: usize = 64;
+const DISCONNECT_REASON_MAX_CHARS: usize = 256;
 
 /// Renders client connection information.
 ///
@@ -47,9 +53,11 @@ impl ClientInfoRenderer {
             return;
         }
 
+        let name = bounded_redacted_rich_fragment(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_rich_fragment(&client.version, CLIENT_VERSION_MAX_CHARS);
         console.print(&format!(
             "\n[green bold]Client Connected[/]: [cyan]{}[/] [dim]v{}[/]",
-            client.name, client.version
+            name, version
         ));
     }
 
@@ -65,9 +73,11 @@ impl ClientInfoRenderer {
             return;
         }
 
+        let name = bounded_redacted_rich_fragment(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_rich_fragment(&client.version, CLIENT_VERSION_MAX_CHARS);
         console.print(&format!(
             "\n[green bold]Client Connected[/]: [cyan]{}[/] [dim]v{}[/]",
-            client.name, client.version
+            name, version
         ));
 
         let caps = self.format_capabilities(capabilities);
@@ -83,9 +93,10 @@ impl ClientInfoRenderer {
             return;
         }
 
+        let name = bounded_redacted_rich_fragment(&client.name, CLIENT_NAME_MAX_CHARS);
         console.print(&format!(
             "[yellow]Client Disconnected[/]: [cyan]{}[/]",
-            client.name
+            name
         ));
     }
 
@@ -101,9 +112,11 @@ impl ClientInfoRenderer {
             return;
         }
 
+        let name = bounded_redacted_rich_fragment(&client.name, CLIENT_NAME_MAX_CHARS);
+        let reason = bounded_redacted_rich_fragment(reason, DISCONNECT_REASON_MAX_CHARS);
         console.print(&format!(
             "[yellow]Client Disconnected[/]: [cyan]{}[/] [dim]({})[/]",
-            client.name, reason
+            name, reason
         ));
     }
 
@@ -124,8 +137,11 @@ impl ClientInfoRenderer {
         table.add_column(Column::new("Property").style(self.theme.muted_style.clone()));
         table.add_column(Column::new("Value"));
 
-        table.add_row_cells(["Name", client.name.as_str()]);
-        table.add_row_cells(["Version", client.version.as_str()]);
+        // Table string cells are plain Text, not rich-markup fragments.
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        table.add_row_cells(["Name", name.as_str()]);
+        table.add_row_cells(["Version", version.as_str()]);
 
         console.render(&table);
     }
@@ -152,8 +168,11 @@ impl ClientInfoRenderer {
         table.add_column(Column::new("Property").style(self.theme.muted_style.clone()));
         table.add_column(Column::new("Value"));
 
-        table.add_row_cells(["Name", client.name.as_str()]);
-        table.add_row_cells(["Version", client.version.as_str()]);
+        // Table string cells are plain Text, not rich-markup fragments.
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        table.add_row_cells(["Name", name.as_str()]);
+        table.add_row_cells(["Version", version.as_str()]);
 
         let caps = self.format_capabilities(capabilities);
         let caps_display = if caps.is_empty() { "none" } else { &caps };
@@ -168,6 +187,14 @@ impl ClientInfoRenderer {
 
         if caps.sampling.is_some() {
             items.push("sampling");
+        }
+        if let Some(elicitation) = &caps.elicitation {
+            match (elicitation.supports_form(), elicitation.supports_url()) {
+                (true, true) => items.push("elicitation (form, url)"),
+                (true, false) => items.push("elicitation (form)"),
+                (false, true) => items.push("elicitation (url)"),
+                (false, false) => items.push("elicitation (no modes)"),
+            }
         }
         if let Some(roots) = &caps.roots {
             if roots.list_changed {
@@ -185,10 +212,9 @@ impl ClientInfoRenderer {
     }
 
     fn render_connected_plain(&self, client: &ClientInfo, console: &FastMcpConsole) {
-        console.print(&format!(
-            "Client Connected: {} v{}",
-            client.name, client.version
-        ));
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        console.print_plain(&format!("Client Connected: {} v{}", name, version));
     }
 
     fn render_connected_with_caps_plain(
@@ -197,13 +223,12 @@ impl ClientInfoRenderer {
         capabilities: &ClientCapabilities,
         console: &FastMcpConsole,
     ) {
-        console.print(&format!(
-            "Client Connected: {} v{}",
-            client.name, client.version
-        ));
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        console.print_plain(&format!("Client Connected: {} v{}", name, version));
         let caps = self.format_capabilities(capabilities);
         if !caps.is_empty() {
-            console.print(&format!("  Capabilities: {}", caps));
+            console.print_plain(&format!("  Capabilities: {}", caps));
         }
     }
 
@@ -213,17 +238,21 @@ impl ClientInfoRenderer {
         reason: Option<&str>,
         console: &FastMcpConsole,
     ) {
-        if let Some(r) = reason {
-            console.print(&format!("Client Disconnected: {} ({})", client.name, r));
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        if let Some(reason) = reason {
+            let reason = bounded_redacted_terminal_text(reason, DISCONNECT_REASON_MAX_CHARS);
+            console.print_plain(&format!("Client Disconnected: {name} ({reason})"));
         } else {
-            console.print(&format!("Client Disconnected: {}", client.name));
+            console.print_plain(&format!("Client Disconnected: {name}"));
         }
     }
 
     fn render_detail_plain(&self, client: &ClientInfo, console: &FastMcpConsole) {
-        console.print("Connected Client:");
-        console.print(&format!("  Name: {}", client.name));
-        console.print(&format!("  Version: {}", client.version));
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        console.print_plain("Connected Client:");
+        console.print_plain(&format!("  Name: {name}"));
+        console.print_plain(&format!("  Version: {version}"));
     }
 
     fn render_detail_with_caps_plain(
@@ -232,12 +261,14 @@ impl ClientInfoRenderer {
         capabilities: &ClientCapabilities,
         console: &FastMcpConsole,
     ) {
-        console.print("Connected Client:");
-        console.print(&format!("  Name: {}", client.name));
-        console.print(&format!("  Version: {}", client.version));
+        let name = bounded_redacted_terminal_text(&client.name, CLIENT_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&client.version, CLIENT_VERSION_MAX_CHARS);
+        console.print_plain("Connected Client:");
+        console.print_plain(&format!("  Name: {name}"));
+        console.print_plain(&format!("  Version: {version}"));
         let caps = self.format_capabilities(capabilities);
         let caps_display = if caps.is_empty() { "none" } else { &caps };
-        console.print(&format!("  Capabilities: {}", caps_display));
+        console.print_plain(&format!("  Capabilities: {}", caps_display));
     }
 }
 
@@ -256,7 +287,25 @@ mod tests {
     use super::*;
     use crate::console::FastMcpConsole;
     use crate::testing::TestConsole;
-    use fastmcp_protocol::RootsCapability;
+    use fastmcp_protocol::{ElicitationCapability, RootsCapability};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut output) = self.0.lock() {
+                output.extend_from_slice(input);
+            }
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn sample_client() -> ClientInfo {
         ClientInfo {
@@ -366,6 +415,39 @@ mod tests {
     }
 
     #[test]
+    fn test_format_capabilities_elicitation_modes() {
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
+
+        for (elicitation, expected) in [
+            (ElicitationCapability::form(), "elicitation (form)"),
+            (ElicitationCapability::url(), "elicitation (url)"),
+            (ElicitationCapability::both(), "elicitation (form, url)"),
+            (ElicitationCapability::default(), "elicitation (no modes)"),
+        ] {
+            let caps = ClientCapabilities {
+                sampling: None,
+                elicitation: Some(elicitation),
+                roots: None,
+            };
+            assert_eq!(renderer.format_capabilities(&caps), expected);
+        }
+    }
+
+    #[test]
+    fn test_format_capabilities_includes_all_supported_families() {
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_agent());
+        let caps = ClientCapabilities {
+            sampling: Some(fastmcp_protocol::SamplingCapability {}),
+            elicitation: Some(ElicitationCapability::both()),
+            roots: Some(RootsCapability { list_changed: true }),
+        };
+        assert_eq!(
+            renderer.format_capabilities(&caps),
+            "sampling, elicitation (form, url), roots (list_changed)"
+        );
+    }
+
+    #[test]
     fn test_render_connected_rich() {
         let client = sample_client();
         let console = TestConsole::new_rich();
@@ -436,5 +518,78 @@ mod tests {
 
         let plain_console = FastMcpConsole::with_enabled(false);
         assert!(!renderer.should_use_rich(&plain_console));
+    }
+
+    #[test]
+    fn hostile_client_metadata_is_bounded_redacted_and_terminal_safe() {
+        let client = ClientInfo {
+            name:
+                "client[prod] [bold]literal[/]\n\u{001b}\u{202e} Authorization: Bearer name-canary"
+                    .to_owned(),
+            version: format!("v[peer] password=version-canary {}", "x".repeat(1_000)),
+        };
+
+        for (context, console) in [
+            (DisplayContext::new_agent(), TestConsole::new()),
+            (DisplayContext::new_human(), TestConsole::new_rich()),
+        ] {
+            let renderer = ClientInfoRenderer::new(context);
+            renderer.render_connected(&client, console.console());
+            renderer.render_disconnected_with_reason(
+                &client,
+                "[red]reason[/]\r password=reason-canary",
+                console.console(),
+            );
+            renderer.render_detail(&client, console.console());
+
+            let output = console.output_string();
+            assert!(
+                output.contains("client[prod]"),
+                "brackets were corrupted: {output}"
+            );
+            assert!(
+                output.contains("[bold]literal[/]"),
+                "markup was executed: {output}"
+            );
+            assert!(output.contains("\\n"));
+            assert!(output.contains("\\u{1b}"));
+            assert!(output.contains("\\u{202e}"));
+            for escaped_markup in [r"\[prod]", r"\[bold]literal\[/]", r"\[peer]"] {
+                assert!(
+                    !output.contains(escaped_markup),
+                    "table cell exposed rich escape syntax {escaped_markup:?}: {output}"
+                );
+            }
+            for canary in ["name-canary", "version-canary", "reason-canary"] {
+                assert!(!output.contains(canary), "leaked {canary}: {output}");
+            }
+            assert!(output.chars().count() < 2_500, "unbounded output: {output}");
+        }
+    }
+
+    #[test]
+    fn hostile_client_metadata_is_safe_on_a_true_plain_console() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let console = FastMcpConsole::with_writer(SharedWriter(Arc::clone(&output)), false);
+        let renderer = ClientInfoRenderer::new(DisplayContext::new_human());
+        let client = ClientInfo {
+            name: "plain[client]\nAuthorization: Bearer plain-canary".to_string(),
+            version: "v[1]".to_string(),
+        };
+
+        renderer.render_connected(&client, &console);
+        renderer.render_detail(&client, &console);
+
+        let output = String::from_utf8(
+            output
+                .lock()
+                .expect("plain client output lock poisoned")
+                .clone(),
+        )
+        .expect("plain client output must be UTF-8");
+        assert!(output.contains("plain[client]"), "{output}");
+        assert!(output.contains(r"\n"), "{output}");
+        assert!(!output.contains(r"\[client]"), "{output}");
+        assert!(!output.contains("plain-canary"), "{output}");
     }
 }
