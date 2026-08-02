@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Fast, cancel-correct MCP framework for Rust"
+description = "Asupersync-based MCP framework for Rust"
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/fastmcp-rust"
 keywords = ["mcp", "json-rpc", "async", "ai", "protocol"]
 categories = ["network-programming", "api-bindings", "development-tools"]
+exclude = ["tests/fnd_01_dependency_evidence.rs.*"]
 
 [dependencies]
 fastmcp-core.workspace = true

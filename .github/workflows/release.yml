@@ -1,30 +1,99 @@
-name: Release
+name: Release Quarantine Verification
+
+# This checked-in definition is source quarantine only. Provider-side
+# disablement of the historical workflow identity and removal/rotation of any
+# ambient publication credential remain separate, mandatory stop-the-line work.
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (e.g., v0.1.0)'
-        required: true
-        type: string
 
 concurrency:
-  group: release
-  cancel-in-progress: false  # Never cancel releases
+  group: release-quarantine
+  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: Quarantine verification
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-11
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: release-preflight-${{ runner.os }}-nightly-2026-07-11
+
+      - name: Verify workspace package versions agree
+        run: |
+          set -euo pipefail
+          workspace_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er \
+            '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace package versions differ") end')
+          printf 'workspace version: %s\n' "${workspace_version}"
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Verify workspace
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --all-targets
+          cargo test --locked --workspace --all-targets --all-features
+          cargo test --locked --workspace --doc
+          cargo test --locked --workspace --doc --all-features
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf
+        with:
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
+
+      - name: Audit locked dependency graph
+        run: cargo audit --deny warnings
+
+      # These archives remain ephemeral runner-local diagnostics only. They are
+      # not release assets, registry upload bodies, or publication candidates.
+      - name: Stage local diagnostic package archives
+        run: |
+          set -euo pipefail
+          for crate in \
+            fastmcp-derive \
+            fastmcp-core \
+            fastmcp-protocol \
+            fastmcp-transport \
+            fastmcp-console \
+            fastmcp-client \
+            fastmcp-server \
+            fastmcp-cli \
+            fastmcp-rust
+          do
+            cargo package -p "${crate}" --locked --no-verify
+          done
+
   build:
-    name: Build ${{ matrix.target }}
+    name: Diagnostic build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +120,8 @@ jobs:
             asset: fastmcp-windows-amd64.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       # FND-01: pin the exact dated nightly from rust-toolchain.toml (not floating "nightly").
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
@@ -63,8 +134,8 @@ jobs:
         with:
           key: release-${{ matrix.target }}-nightly-2026-07-11
 
-      - name: Build release CLI binary
-        run: cargo build --release --locked -p fastmcp-cli --target ${{ matrix.target }}
+      - name: Build optimized CLI diagnostic
+        run: cargo build --release --locked -p fastmcp-cli --target "${{ matrix.target }}"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
@@ -90,126 +161,10 @@ jobs:
           "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ASCII "${{ matrix.asset }}.zip.sha256"
           Pop-Location
 
+      # Short-lived repository Actions diagnostic only; no release job consumes it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ${{ matrix.asset }}
+          name: quarantine-diagnostic-${{ matrix.asset }}
           path: dist/*
-          if-no-files-found: ignore
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -la dist/ || echo "No artifacts found"
-
-      - name: Extract version
-        id: version
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: FastMCP Rust ${{ steps.version.outputs.version }}
-          generate_release_notes: true
-          files: dist/*
-          draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
-
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-
-  publish-crates:
-    name: Publish to crates.io
-    # Decoupled from the binary-build matrix (no `needs:`): crates are platform-independent and
-    # must NOT wait on throttled GitHub-hosted x86_64-linux/Windows runners — that coupling is
-    # what stranded the asupersync 0.3.4 -> fastmcp 0.3.2 -> beads_rust#353 chain for 4.5h.
-    # Runs on ubuntu-24.04-arm (consistently serviceable) in parallel with `build`/`release`, so
-    # crate publishing proceeds even while the binary matrix is queued. `cargo publish --locked`
-    # verify-builds each crate, so compilation is still gated before any upload, and the loop
-    # skips already-published versions (so a tag push and a re-dispatch coexist safely).
-    if: ${{ !contains(github.ref, '-') }}  # skip prereleases (tag like v1.2.3-rc1); main has no '-'
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # FND-01: same dated nightly contract as rust-toolchain.toml / build matrix.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: nightly-2026-07-11
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: publish-${{ runner.os }}-nightly-2026-07-11
-
-      - name: Ensure crates.io token
-        if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
-        run: |
-          echo "CARGO_REGISTRY_TOKEN is not set. Configure it in repo secrets."
-          exit 1
-
-      - name: Publish crates
-        run: |
-          set -euo pipefail
-
-          publish_crate() {
-            local crate="$1"
-            local attempt=1
-            local max_attempts=12
-            local wait_seconds=600
-
-            while true; do
-              echo "Publishing ${crate} (attempt ${attempt}/${max_attempts})..."
-              if output=$(cargo publish -p "${crate}" --locked 2>&1); then
-                echo "${output}"
-                return 0
-              fi
-
-              echo "${output}"
-              if echo "${output}" | grep -qi "already uploaded"; then
-                echo "Crate ${crate} already published. Skipping."
-                return 0
-              fi
-
-              if [ "${attempt}" -ge "${max_attempts}" ]; then
-                echo "Publishing ${crate} failed after ${max_attempts} attempts."
-                return 1
-              fi
-
-              echo "Waiting ${wait_seconds}s before retrying ${crate}..."
-              sleep "${wait_seconds}"
-              attempt=$((attempt + 1))
-            done
-          }
-
-          publish_crate fastmcp-derive
-          publish_crate fastmcp-core
-          publish_crate fastmcp-protocol
-          publish_crate fastmcp-transport
-          publish_crate fastmcp-console
-          publish_crate fastmcp-client
-          publish_crate fastmcp-server
-          publish_crate fastmcp-cli
-          publish_crate fastmcp-rust
+          if-no-files-found: error
+          retention-days: 3

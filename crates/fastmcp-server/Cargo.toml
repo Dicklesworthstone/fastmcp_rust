@@ -26,6 +26,10 @@ serde_json.workspace = true
 log.workspace = true
 chrono.workspace = true
 base64.workspace = true
+url.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+zeroize.workspace = true
 # FND-01 SERVER-NO-*: ambient crypto, JWT, and Redis edges are forbidden.
 # Crypto flows through fastmcp-core; Redis Tasks is a later optional package.
 

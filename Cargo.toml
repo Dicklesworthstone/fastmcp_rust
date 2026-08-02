@@ -41,12 +41,19 @@ readme = "README.md"
 # standalone, capability-bearing `Cx` (the blessed path,
 # `Runtime::request_cx_with_budget`, is `pub(crate)`). The genuine fix is an
 # architectural migration to runtime-managed contexts (wrap entry points in a
-# runtime, derive request scopes via `cx.scope_with_budget`, plumb `&Cx` into
-# `Transport::close`); until then we opt into `test-internals` to keep the
-# constructors visible. NOTE: `fastmcp-core::block_on` does NOT rely on this —
-# it was fixed to use `Runtime::block_on`'s own ambient `Cx`.
+# runtime, obtain a genuinely owned child region once asupersync exposes that
+# public primitive, and plumb `&Cx` into `Transport::close`). The current
+# `Cx::scope()` and `Cx::scope_with_budget()` APIs remain in the same region and
+# are not request-isolation substitutes. Until the upstream prerequisite is
+# resolved, we opt into `test-internals` to keep the constructors visible.
+# NOTE: `fastmcp-core::block_on` does NOT rely on this feature; it uses the
+# ambient `Cx` installed by `Runtime::block_on`.
 asupersync = { version = "=0.3.9", features = ["test-internals"] }
 rich_rust = { version = "=0.2.2" }
+# Safe readiness polling for interruptible Unix child-stdout reads and
+# signal-free process-group existence probes after a managed leader is reaped.
+# The non-Unix std::process pipe path remains explicitly frame-boundary-only.
+rustix = { version = "=1.1.4", default-features = false }
 
 # Serialization (only these)
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -88,6 +95,14 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 # FND-01 ROOT-PROC-MACRO2-EVIDENCE (facade evidence harness)
 proc-macro2 = { version = "=1.0.107", default-features = false, features = ["span-locations"] }
+# Resolve the public facade (including dependency renames) from procedural
+# macro expansion sites instead of assuming downstream crate names.
+proc-macro-crate = { version = "=3.5.0" }
+# Capability-relative filesystem access.  Keep this surface exact: built-in
+# filesystem resources must traverse and open beneath retained directory
+# handles instead of validating a pathname and reopening it later.
+cap-std = { version = "=4.0.2", default-features = false }
+cap-fs-ext = { version = "=4.0.2", default-features = false, features = ["std"] }
 
 # Regex (JSON Schema `pattern` validation)
 regex = { version = "=1.13.1" }
@@ -110,7 +125,7 @@ fastmcp-console = { version = "0.3.2", path = "crates/fastmcp-console" }
 fastmcp-cli = { version = "0.3.2", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+unsafe_code = "forbid"
 # Admit the FND-01 bootstrap harness custom cfg only; all other unexpected_cfgs
 # remain fatal under -D warnings.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fnd01_bootstrap)"] }
