@@ -1,0 +1,8 @@
+# RCH needs source content, not mutable local Git bookkeeping. Excluding the
+# repository database also avoids remote ownership drift blocking source sync.
+.git/
+
+# Build products stay worker-local. Copying worker-scoped target caches back
+# adds disk pressure and can stall old RCH clients after the command succeeded.
+target/
+.rch-target-*/
