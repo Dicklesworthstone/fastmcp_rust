@@ -63,3 +63,6 @@ perf.data
 
 # Beads compliance audit artifacts (local only)
 beads_compliance_audit/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/

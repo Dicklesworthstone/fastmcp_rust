@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
 
-> **Protocol status (2026-08-01):** MCP 2026-07-28 support is under
+> **Protocol status (2026-08-02):** MCP 2026-07-28 support is under
 > implementation and remains unverified. The current public
 > `PROTOCOL_VERSION` is `2024-11-05`. Source presence, examples, and historical
 > parity rows are not conformance or release evidence. Release publication
@@ -29,16 +29,17 @@
 
 ### Current qualification boundaries
 
-- **Wire cancellation is only partially qualified:** the primary stdio path now
-  keeps receiving while one bounded worker serializes dispatch, so it can route
-  a cancellation while a handler is running. Custom/SSE/WebSocket entry points
-  still use the legacy sequential loop, and independently owned request `Cx`
-  lifetimes plus reliable `awaitCleanup` semantics remain unverified.
-- **Bidirectional calls are not qualified:** the stdio receive pump can route
-  sampling, elicitation, and roots responses while its dispatch worker is
-  occupied. Custom/SSE/WebSocket paths still reject or lack that split routing,
-  public HTTP is fail-closed, and end-to-end lifecycle/cancellation evidence is
-  incomplete.
+- **Wire cancellation is only partially qualified:** on Unix, the primary
+  stdio path keeps receiving while one bounded worker serializes dispatch, so
+  it can route a cancellation while a handler is running. Non-Unix stdio and
+  custom/SSE/WebSocket entry points retain sequential or blocking boundaries,
+  and independently owned request `Cx` lifetimes plus reliable `awaitCleanup`
+  semantics remain unverified.
+- **Bidirectional calls are not qualified:** the Unix stdio receive pump can
+  route sampling, elicitation, and roots responses while its dispatch worker
+  is occupied. Non-Unix stdio and custom/SSE/WebSocket paths reject or lack
+  that split routing, public HTTP is fail-closed, and end-to-end
+  lifecycle/cancellation evidence is incomplete.
 - **Response caching is conservatively partitioned:** eligible production
   requests are keyed by committed authentication facts plus opaque session
   identity and revision. Uncommitted authentication, local-only state views,
@@ -55,6 +56,12 @@
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
+- **Subprocess cleanup is explicit and platform-bounded:**
+  `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
+  `fastmcp test` is Unix-only and fails before spawn elsewhere. It uses a live
+  anchor plus an owner-death channel, but cannot contain descendants that
+  change group/session, withstand a competing global child reaper, or close a
+  control descriptor copied by a host-side fork. Drop is best effort.
 
 ---
 
@@ -327,8 +334,47 @@ cargo build --release
 cargo install fastmcp-cli
 ```
 
+### Client request deadlines (current source tree)
+
+Ordinary client requests use separate idle and absolute response-wait
+deadlines. Both begin after the request send commits. The idle deadline
+defaults to 30 seconds; the non-resettable absolute deadline defaults to 120
+seconds. Serialization, a blocking send, and teardown are outside these
+timers. Only a valid matching progress notification on a request that actually
+supplied a progress token can reset idle.
+
+```rust
+use std::time::Duration;
+
+use fastmcp_rust::prelude::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
+
+fn connect() -> McpResult<Client> {
+    let policy = RequestTimeoutPolicy::new(
+        Duration::from_secs(20),
+        Duration::from_secs(90),
+    )?;
+    ClientBuilder::new()
+        .request_timeout_policy(policy)
+        .connect_stdio("my-mcp-server", &[])
+}
+```
+
+The published 0.3.2 CLI predates these flags. From a current source checkout,
+run the CLI through the workspace to configure the two limits independently:
+
+```bash
+cargo run -p fastmcp-cli -- test --idle-timeout 30 --absolute-timeout 120 my-mcp-server
+```
+
+The current `fastmcp test` subprocess runner is Unix-only because success
+includes verified owned-process-group cleanup. Library callers should likewise
+call `client.close()` and handle its `McpResult`; dropping a client is only a
+best-effort safety net. The group anchor protects its numeric PGID while it is
+live and closes an owner-death channel when the host exits, but this is not
+portable process-tree containment or a substitute for Windows Job Objects.
+
 **Requirements:**
-- Rust nightly-2026-07-11 (see `rust-toolchain.toml`) for Edition 2024 + FND-01 contract
+- Rust nightly-2026-07-11 (see `rust-toolchain.toml`) for Edition 2024 + the provisional FND-01 toolchain contract
 
 ---
 
@@ -524,7 +570,7 @@ pub trait PromptHandler: Send + Sync {
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | JSON-RPC `MethodNotFound` for `tools/call` | Tool not registered | Register the generated handler, for example `.tool(MyTool)` |
-| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; stdio has a continuous receive pump, but custom/SSE/WebSocket loops and request-owned cleanup semantics remain unqualified |
+| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio has a continuous receive pump, but non-Unix stdio, custom/SSE/WebSocket loops, and request-owned cleanup semantics remain unqualified |
 | Budget exhausted errors | Deadline, poll, or cost dimension exhausted | Inspect the exhausted dimension; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
 | `#[tool]` macro compilation error | Unsupported return conversion or argument schema | Prefer `String`, `Vec<Content>`, `McpResult<String>`, or `McpResult<Vec<Content>>` and ensure custom argument types implement `JsonSchema` |
 | `TransportError::Io` on startup | stdin unavailable | Ensure nothing else reads stdin |
@@ -561,10 +607,15 @@ fn commit_revision(
 | **Client Transport Coverage** | The public `fastmcp-client::Client` currently connects only to subprocess stdio; lower-level SSE and WebSocket transport types do not constitute client integration |
 | **No Built-in TLS** | Transport encryption must be handled externally |
 | **HTTP Dispatch Qualification** | The old sessionful listener is private and unreachable; public `run_http*` calls fail closed before binding. Modern `LatestOnly` still needs immutable stateless per-request dispatch and an owned request execution; a bounded owner-bound Session registry belongs only to the feature-gated LEG-02 MCP 2025-11-25 adapter |
-| **Wire Cancellation** | Stdio has a continuous receive pump plus serialized dispatch worker and can route `notifications/cancelled` during handler execution. Custom/SSE/WebSocket loops remain sequential, while request-owned `Cx` isolation and reliable `awaitCleanup` semantics remain unverified |
-| **Silent stdio peers** | On Unix, the public subprocess `Client` polls child stdout before every otherwise-blocking buffer fill, so initialization and response receive deadlines/cancellation also bound silent and partial-frame peers. Generic blocking `StdioTransport::recv`, non-Unix child-pipe reads, and blocking writes retain their documented frame/I/O-boundary limitation; the configured request timeout is therefore a hard Unix receive bound, not a portable end-to-end wall-clock bound. Those residuals remain FND-04 work |
+| **Wire Cancellation** | On Unix, stdio has a continuous receive pump plus serialized dispatch worker and can route `notifications/cancelled` during handler execution. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while request-owned `Cx` isolation and reliable `awaitCleanup` semantics remain unverified |
+| **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv`, non-Unix child-pipe reads, and blocking writes retain their documented frame/I/O-boundary limitation; these deadlines are therefore not a portable end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
+| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit; shutdown hooks are skipped unless worker quiescence is proven |
+| **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
+| **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
+| **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` remains fail-closed |
+| **Returning transport runners** | `run_transport_returning*` returns fatal receive/send/close errors and preserves simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still uses one ambient `Cx` and does not prove request-owned isolation |
 | **Request Cancellation Ownership** | Request work does not yet have an independently owned child `Cx`; cancellation must not be treated as a sibling-isolated guarantee |
-| **Bidirectional Response Routing** | Stdio continuously routes inbound responses while its dispatch worker is occupied. Custom/SSE/WebSocket paths do not provide the same split routing, public HTTP is fail-closed, and end-to-end lifecycle qualification remains open |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while its dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing, public HTTP is fail-closed, and end-to-end lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. The quarantined private HTTP helper carries native `Authorization` metadata separately, but public turnkey HTTP remains fail-closed and no complete transport-boundary admission/challenge path is qualified |
 | **Tasks RPC** | Task methods are not advertised and return `MethodNotFound`; client/task source presence is not a usable server capability |

@@ -1,10 +1,13 @@
 # Comprehensive Plan to Support MCP 2026-07-28 in FastMCP Rust
 
-- Status: proposed implementation plan
-- Target protocol: MCP `2026-07-28` final
+- Status: active implementation campaign; aggregate support remains unverified
+- Required protocol eras: MCP `2026-07-28` final and MCP `2024-11-05`
+- Required default product policy: automatic, downgrade-resistant negotiation
+  between those two exact eras; explicit modern-only and legacy-only policies
+  remain available for constrained deployments
 - Plan date: 2026-07-28
 - Original audit revalidation: 2026-07-29. Fresh reality-check
-  revalidation: 2026-07-31 through 2026-08-01. Immutable implementation
+  revalidation: 2026-07-31 through 2026-08-02. Immutable implementation
   pins remain available and authoritative; mutable comparison heads have
   moved and are recorded separately below.
 - Historical implementation snapshots:
@@ -24,28 +27,376 @@
   concurrency boundary but does not implement the target architecture.
   The old shared-`Session` listener is now private and unreachable;
   public `run_http*` entry points fail closed before binding. Modern
-  `LatestOnly` still needs immutable stateless per-request dispatch with
+  The `ModernOnly` policy and the modern branch selected by default
+  `Auto` negotiation still need immutable stateless per-request dispatch with
   an independently owned request execution and child context. A bounded,
   owner-bound Session registry belongs only to the feature-gated LEG-02
-  MCP 2025-11-25 adapter and is not a modern remedy.
+  MCP `2024-11-05` adapter and is not a modern remedy.
   Multi-client isolation, sibling-isolated cancellation, and
   `await_cleanup` therefore remain partial/blocked work. The public
   client remains subprocess-stdio-only; lower-level SSE and WebSocket
   transport types are not public `Client` integrations.
+- Reality-check client/transport delta (unverified shared-worktree
+  state, 2026-08-02): the subprocess-stdio client now has a bounded
+  ID-correlated response registry, bounded late-response tombstones,
+  post-send-commit idle and absolute response-wait deadlines, strict
+  request-owned progress validation, and bounded cancellation-control
+  writes on Unix child pipes. These source changes do not supply the
+  transport-neutral `execute(&Cx, Request) -> RequestExecution` API,
+  per-execution timeout overrides, concurrent policy/execution
+  qualification, HTTP client integration, or subscriptions. They are
+  not CLT-01 closure or aggregate protocol evidence.
+- Reality-check lifecycle delta (unverified shared-worktree state,
+  2026-08-02): explicit `Client::close(&mut self) -> McpResult<()>`
+  now surfaces transport and subprocess cleanup failures. The CLI test
+  runner uses a sanitized, readiness-confirmed Unix process-group
+  anchor and signals while the anchor pins the PGID. Successful
+  connections report explicit final cleanup separately, initialization-
+  cleanup failures remain visible, and non-Unix targets fail before spawn. Anchor
+  owner-death uses a close-on-exec control channel, but group/session
+  escape, host-fork descriptor copies (including the non-atomic Apple
+  setup window), hostile/global child reapers, Drop-only cleanup, and
+  Windows Job Objects remain outside the qualified boundary. A failed
+  one-shot connection guard has no detached cleanup worker because that
+  would violate structured concurrency; an ownership-bearing failure or
+  runtime-owned cleanup-custody design remains FND-04 work.
+- Reality-check development-process delta (unverified shared-worktree
+  state, 2026-08-02): on Unix, each `fastmcp dev` build/server group now
+  contains a signal-immune watchdog bound to a private owner-held control
+  pipe. Normal shutdown, child-handle drop, and CLI owner death release the
+  watchdog to perform bounded TERM-then-KILL cleanup without later signalling
+  a remembered PGID. Host-fork descriptor copies, group/session escape, and
+  non-Unix process-tree ownership remain outside this boundary.
+- Reality-check stdio/runner delta (unverified shared-worktree state,
+  2026-08-02): Unix primary-stdio input observes internal worker/output
+  failure while idle, and ordinary pipe/socket output has a serialized
+  bounded nonblocking commit. Notification encode/lock/write failure is
+  terminal. Descriptor-flag restoration is attempted before releasing
+  the local lock, restoration failure is terminal and may leave the
+  descriptor nonblocking, and shutdown hooks require proven worker quiescence.
+  `run_transport_returning*` now closes its transport and returns fixed,
+  structured receive/send/close failures, including both failures when
+  run and close fail together. Generic synchronous HTTP `Read` cannot be
+  preempted once blocked in the kernel; regular files/devices, inherited
+  descriptor aliases, and non-Unix stdio retain documented limits.
 - Frozen dependency evidence is not current for the live dependency
   graph: the renamed-facade macro work introduces
   `proc-macro-crate = 3.5.0`, which is absent from the sealed FND-01
-  dependency evidence. Those sealed files must not be hand-edited.
+  dependency evidence. The current shared tree also adds direct Unix
+  `rustix` event/process use in the client, an opt-in CLI framework
+  fixture, its facade dependency edge, and new fixture source inventory.
+  Those sealed files must not be hand-edited.
   Their designated producer must regenerate and independently
   re-attest the complete evidence set before any dependency-freeze,
   FND-01, release, or aggregate-support gate can pass.
 - Primary owner: FastMCP Rust maintainers
-- Execution tracker: the existing Beads projection is a historical,
-  incomplete projection of this document. It is unsafe to mutate at the
-  current live snapshot and must be reconciled and rematerialized under
-  Section 36 before it can become execution authority.
+- Execution tracker: the 2026-08-03 Beads projection contains all 143 formal
+  packages and bounded child topologies. Its graph shape is cycle-free, but a
+  fresh source/version audit found 40 formal bodies whose normative text still
+  carries superseded 2025-era, optional-profile, or core-only-release rules.
+  Those lineages are quarantined until their bodies and children are
+  rematerialized. Independently reconciled FND-01 leaves may proceed under
+  their current exact contracts; aggregate support remains unverified.
+
+### Binding 2026-08-03 dual-era and all-official-support amendment
+
+This amendment is authoritative over every older conflicting sentence in
+this document. The prior draft incorrectly substituted MCP `2025-11-25`
+for the protocol FastMCP Rust already exposes, expressly excluded MCP
+`2024-11-05`, treated the dual-era implementation as an optional release
+profile, and allowed separately implemented official extensions to remain
+outside the final product gate. Those positions are revoked.
+
+The campaign has four non-negotiable product postconditions:
+
+1. Implement the complete MCP `2026-07-28` core, including every Active
+   feature and every still-normative Deprecated feature. Deprecation changes
+   defaults and guidance; it does not permit a partial runtime implementation.
+2. Preserve the complete MCP `2024-11-05` wire contract as a deliberately
+   isolated adapter, including initialization, persistent negotiated session
+   state, bidirectional server requests, resource subscribe/unsubscribe,
+   logging/setLevel, ping, and its two-endpoint HTTP+SSE transport.
+3. Make `ProtocolPolicy::Auto` the normal product policy. It negotiates only
+   through the frozen transport-specific state machines, never through a
+   generic retry-on-error downgrade. `ModernOnly` and `LegacyOnly` are explicit
+   immutable policies; no peer input can mutate a selected era in place.
+4. Implement and qualify every official extension/profile in the separately
+   pinned official extension inventory: Tasks, MCP Apps, Enterprise-Managed
+   Authorization, and OAuth Client Credentials. Wire activation remains
+   explicit and mutually negotiated as the specifications require, but
+   implementation, composition testing, and release evidence are mandatory.
+
+MCP `2025-11-25` is a third and structurally different era. Its sessioned
+Streamable HTTP, GET/DELETE, `Mcp-Session-Id`, and `Last-Event-ID` behavior
+must never be relabeled as `2024-11-05` support. This campaign does not claim
+that third era. Any future `2025-11-25` adapter requires its own exact schema,
+transport, negotiation, conformance, and release profile.
+
+The final aggregate gate is `GATE-ALL-MCP-READY`, promoted by
+`CI-ALL-MCP-01`. It consumes the modern core gate, complete deprecated-feature
+evidence, the exact `2024-11-05` gate, every official-extension gate, all
+pairwise and N-wise composition evidence, source-drift evidence, official
+conformance evidence, and differential interoperability evidence. REL-01 and
+REL-02 cannot close without that aggregate. A green core-only or individual
+extension manifest is useful component evidence, never an aggregate support
+claim.
+
+The amended formal inventory is exactly 143 package IDs: the prior 129 formal
+packages plus `LEG-HTTP-01`, `LEG-NEG-01`, `LEG-TST-01`, `LEG-INTEROP-01`,
+`DEPR-01`, `APP-03`, `APP-04`, `AUTHX-04`, `AUTHX-05`, `EXT-SRC-01`,
+`COMP-ALL-01`, `CONF-03`, `GATE-ALL-MCP-READY`, and `CI-ALL-MCP-01`. Historical
+129/663 and 122/606 counts remain audit history only. The formal dependency
+edge count, roots, sinks, closure sets, and critical path must be regenerated
+from the amended Beads graph; no arithmetic patch to an obsolete edge count is
+authoritative.
+
+Historical evidence statements about what an earlier audit observed keep
+their literal values. Normative package bodies, acceptance criteria, commands,
+feature names, and release claims do not receive alias-based interpretation:
+they must use `ModernOnly`, `Auto`, `LegacyOnly`, and
+`legacy-2024-11-05` directly. Until a stale body is rewritten, it is invalid
+execution input and cannot be claimed. No implementation may copy a
+pre-amendment `2025-11-25` Streamable HTTP rule into the `2024-11-05`
+adapter; LEG-01, LEG-02, LEG-03, LEG-HTTP-01, and LEG-NEG-01 own the
+replacement truth tables.
 
 ---
+
+## 0. Canonical dual-era execution contract
+
+This section is the direct implementation contract. It replaces, rather than
+aliases, every normative pre-amendment occurrence of `LatestOnly`,
+`ModernWithLegacy`, `legacy-2025-11-25`, sessioned Streamable HTTP, a
+core-only publishable product, or an optional/default-off legacy product.
+Those terms may remain only inside clearly dated historical audit records.
+They are invalid in executable package bodies, acceptance criteria, public
+API names, feature names, tests, manifests, diagnostics, and support claims.
+
+### 0.1 Exact versions, policies, and product defaults
+
+The implementation has exactly two supported wire eras:
+
+- `ProtocolEra::Modern2026`, whose only version in this campaign is
+  `2026-07-28`;
+- `ProtocolEra::Legacy2024`, whose only version is `2024-11-05`.
+
+`ProtocolPolicy` has exactly `Auto`, `ModernOnly`, and `LegacyOnly`.
+`Default` is `Auto`. The ordinary facade and CLI build include and install the
+`legacy-2024-11-05` adapter so that the default is constructible. A deliberately
+stripped modern-only build is allowed as a component profile, but is neither
+the default product nor an all-MCP release candidate. Policy is immutable for
+one process, connection, or HTTP endpoint-bundle identity. Peer bytes cannot
+change it.
+
+`2025-11-25` is a recognized unsupported third era. It is never emitted,
+accepted as an alias, retried as a supported version, used as a cache key for
+a supported era, or implemented through a renamed adapter. Modern metadata or
+an HTTP version header carrying that token remains on the modern validation
+path and receives the exact unsupported-version error. An exact 2024
+`initialize` request offering an unsupported version may receive the alternate
+version `2024-11-05` under the 2024 lifecycle rules; that is not 2025 support.
+
+MCP top-level JSON-RPC batch arrays are unsupported in both supported eras and
+on every transport or proxy leg. A top-level array, including an array of one
+otherwise valid request and a mixed array, fails bounded raw admission before
+dispatch, correlation, authorization, cache, task/session/subscription,
+proxy, response, or other state effects. The sealed local endpoint role alone
+selects the resulting server-ingress error or client-ingress peer-failure
+disposition; arrays never receive partial processing.
+
+Modern discovery reports only modern versions supported by that endpoint.
+For this campaign the exact list is `["2026-07-28"]`. Availability of a
+separate 2024 transport is not advertised as an inline modern retry version.
+
+### 0.2 Exact MCP 2024-11-05 authority and wire boundary
+
+LEG-01 and FND-01 pin the exact schema at the dedicated upstream
+`2024-11-05-final` tag, whose commit is
+`48234828288ec5e5011398f17b8736f61645f130` and whose
+`schema/2024-11-05` subtree is
+`b7350c9071b01bc448ce641cf9f0cdeb0a2d522d`:
+
+- `schema/2024-11-05/schema.ts`, Git blob
+  `a40e908b8d16412b17aa62c13139bb6ad94d4f01`, 31,201 bytes,
+  SHA-256
+  `ad3264cdc22c5091b8ae96c5f5c769a2c7388473d84ca3de6fd55a4feeadfb1e`;
+- `schema/2024-11-05/schema.json`, Git blob
+  `97a92f0cc292ed4c602f4ee121732cc8ad3be973`, 87,877 bytes,
+  SHA-256
+  `61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce`.
+
+The copy of the 2024 TypeScript schema under the later 2026 final commit is
+formatting-different (31,186 bytes, SHA-256
+`8e87348b6c1a9de1ec7ac136f407b687521bcdeb357adedbf5367bfc19c18d38`)
+even though its generated JSON Schema is byte-identical. It is comparison
+evidence only and must never replace or alias the dedicated 2024 final-tag
+authority.
+
+Exact 2024 coverage includes initialization and initialized notification;
+ping; completion; tools; prompts; resources and templates; resource
+subscribe/unsubscribe; logging/setLevel; cancellation and progress; client
+roots; server-to-client ping, sampling/createMessage, and roots/list; and the
+exact list-change, logging, resource-update, progress, cancellation, and
+roots-change notification directions admitted by that schema. Negotiated
+capabilities and lifecycle state live only for the owning stdio process or
+live HTTP+SSE connection.
+
+Exact 2024 does not contain elicitation, Tasks, MRTR, modern
+`subscriptions/listen`, modern extension maps, modern per-request metadata,
+modern routing headers, `resultType`, `Mcp-Session-Id`, `Last-Event-ID`
+protocol replay, or HTTP DELETE session termination. These are planted
+cross-era negatives, not optional 2024 behavior.
+
+### 0.3 Stdio negotiation state machines
+
+The server freezes policy before reading the first frame:
+
+1. `ModernOnly` enters Modern before the first frame. Every parsed message is
+   validated as modern; an initialize-shaped request receives the fixed modern
+   diagnostic and never creates legacy state.
+2. `Auto` begins `Unclassified`. Complete modern metadata selects Modern even
+   when its version token is unsupported, after which ordinary modern version
+   handling applies. One structurally valid 2024-schema `initialize` request
+   without a modern marker selects Legacy; the legacy lifecycle then negotiates
+   only `2024-11-05`. Malformed, ambiguous, mixed-era, response-shaped, or
+   notification-shaped opening traffic receives the frozen role-correct
+   error/no-response disposition and closes. Selection occurs once.
+3. `LegacyOnly` requires a structurally valid 2024 `initialize` request first.
+   It never dispatches `server/discover` or modern application traffic.
+
+The client freezes policy before spawning:
+
+1. `ModernOnly` starts one process and sends modern `server/discover`; it never
+   emits initialize.
+2. `Auto` runs the modern probe in a disposable child. A valid discover result
+   or recognized modern error fixes Modern. Only the frozen eligible
+   well-formed non-modern JSON-RPC error or bounded first-probe timeout may
+   authorize fallback. The probe child is reaped and a fresh child begins the
+   exact 2024 initialize lifecycle. Malformed traffic, process exit, non-timeout
+   I/O failure, or cancellation is terminal and never authorizes downgrade.
+3. `LegacyOnly` starts one process and sends exact 2024 initialize first.
+
+The era is bound to the process identity. No later application failure,
+timeout, or peer message can reclassify it.
+
+### 0.4 HTTP route sets and client endpoint bundles
+
+Modern HTTP and exact 2024 HTTP+SSE are separate transports, not body/header
+branches of one sessioned endpoint.
+
+The server resolves an immutable route tuple before reading protocol
+semantics:
+
+- `ModernMcpPost`: one modern JSON-RPC message per POST, with final per-request
+  metadata and routing headers; a request produces either one JSON result or a
+  request-scoped SSE response. There is no MCP session identifier, management
+  GET, DELETE, or event-store replay.
+- `LegacySseGet`: an empty-body GET opens the exact 2024 server-to-client SSE
+  stream. Its first valid event is `endpoint`.
+- `LegacyMessagePost`: the exact URI advertised by that endpoint event accepts
+  client-to-server 2024 JSON-RPC messages; all server responses, requests, and
+  notifications travel on the owning SSE stream.
+
+`ModernOnly` mounts only the modern route, `LegacyOnly` mounts only the legacy
+GET/POST pair, and `Auto` mounts both. Bind rejects a collision between modern
+POST and legacy advertised POST tuples. A legacy GET and modern POST may share
+a canonical target only through explicit configuration because their methods
+differ. DELETE is unsupported on every standard route. Authentication and
+origin policy run before any legacy connection-capability lookup. Closing the
+SSE stream invalidates its advertised POST capability; reconnect is a fresh
+GET/endpoint/initialize lifecycle. Exact 2024 claims no standardized replay or
+resumption.
+
+The client uses an explicit `HttpEndpointBundle` containing a canonical modern
+POST candidate and a canonical legacy SSE candidate. `ModernOnly` requires the
+former, `LegacyOnly` requires the latter, and `Auto` requires both. Explicitly
+configuring the same URI is permitted; deriving `/sse`, `/messages`, or any
+other path is forbidden. Bundle identity includes both full canonical targets,
+permitted query, origin and credential partition, configuration generation,
+transport policy, and adapter-receipt generation. Origin alone is never a
+classification or cache key.
+
+For `Auto`, the client first sends one non-side-effecting modern discovery
+POST. Any recognized modern JSON-RPC result or error at any HTTP status fixes
+Modern and prohibits that GET. Only status `400`, `404`, or `405` together
+with an empty or unrecognized modern body makes exactly one GET to the
+configured legacy candidate eligible; the status itself does not select
+Legacy. That GET disables redirects, preserves the frozen origin/auth boundary,
+requires `text/event-stream`, and selects Legacy only after a valid bounded
+`endpoint` event whose URI passes the exact origin, scheme, credential, and
+routing-capability policy. Missing, malformed, oversized, foreign, or reordered
+endpoint events are terminal unclassified failures. `401`, `403`, `407`,
+`409`, `429`, other 4xx, 5xx, redirect, TLS, DNS, network, cancellation, and
+ordinary-timeout outcomes never authorize the GET. After an authorization
+challenge, a fresh attempt uses a fresh request ID. No modern POST is replayed
+as legacy initialize.
+
+### 0.5 Legacy lifecycle and translation boundary
+
+LEG-02 owns the exact server lifecycle
+`AwaitInitialize -> AwaitInitialized -> Operating -> Closed`; LEG-03 owns its
+client counterpart. Capability negotiation, reverse requests, subscriptions,
+logging level, cancellation, progress, and teardown are scoped to the owning
+process or live SSE connection. Legacy types and state never enter modern
+handler signatures. Common application handlers may be reused only through an
+explicit LEG-01 translation table whose rows are `lossless`, `legacy-owned`, or
+`rejected`; silence is not a disposition. MRTR/input-required, Tasks, modern
+subscriptions, elicitation, and unnegotiated extensions reject rather than
+being approximated.
+
+### 0.6 Official extensions and authorization profiles
+
+The mandatory official inventory contains exactly Tasks, MCP Apps,
+Enterprise-Managed Authorization, and OAuth Client Credentials. Wire use stays
+opt-in and mutually negotiated; implementation and release evidence do not.
+EXT-SRC-01 pins both current official web documentation and official extension
+repositories. Repositories govern OAuth flow semantics; current official Auth
+extension pages govern the 2026 extension identifier and per-request
+client-capabilities/server-discover overlay. Empty settings are used only when
+the official authority defines no settings; FastMCP invents none.
+
+MCP Apps normative evidence covers the stable Apps surface and its specified
+standard-MCP subset. APP-03 Apps plus host-mediated Sampling and APP-04 Apps
+plus Tasks/MRTR are mandatory FastMCP product compositions, not inflated claims
+that Sampling or Tasks are normative Apps requirements.
+
+EMA implements both OIDC and SAML. The SAML branch covers SAML assertion to
+RFC 8693 exchange for a refresh token, use of that refresh token to request an
+ID-JAG, and RFC 7523 access-token exchange, with bounded custody, issuer,
+audience, subject-token-type, one-use/replay, lifetime, rotation, and revocation
+tests. OAuth Client Credentials remains labeled Draft even though its complete
+client, protected-resource, authorization-server, advertisement, and built-in
+issuer composition is mandatory for this product release.
+
+### 0.7 Qualification and release topology
+
+Component gates and component CI jobs prove only their named slices. They do
+not publish additive support claims, edit final documentation as a side effect,
+or make a core-only candidate releasable. DOC-02 consumes every mandatory
+component manifest plus `GATE-ALL-MCP-READY` and writes the evidence-derived
+support matrix. `CI-FINAL-CORE-01` may seal a post-documentation modern-core
+component artifact, but it is not a release identity. `CI-ALL-MCP-01` is the
+sole complete release-candidate identity. REL-01 consumes that identity and
+REL-QUAR-00/REL-PREP-01 safety state; REL-02 alone performs a separately
+authorized publication transaction.
+
+REL-QUAR-00 is therefore release-only. Its disabled historical workflow,
+no-live-run observation, and still-unremoved repository credential block the
+release lineage, but never unrelated protocol implementation. The external
+credential action remains blocked-born, requires separate written authority,
+and earns zero capability credit while waiting.
+
+### 0.7.1 Evidence and execution doctrine
+
+Every work package in this plan requires real production code and both live
+positive and planted-negative tests at its named public surface. A package
+receipt is revision-bound and may claim completion only when its exact scenario
+sets satisfy `discovered == started == passed`; skipped, filtered, xfail,
+fixture-as-live, copied constants, self-close, self-hash, process artifact, or
+evidence-only artifact is not capability evidence. Each receipt identifies the
+consumer, gate, defect class, test IDs, implementation revision, and verifier;
+it cannot close or attest itself. Batch verification is code-first and
+independent: planner/process artifacts earn no implementation credit.
 
 ## 1. Executive summary
 
@@ -90,16 +441,20 @@ The recommended end state is:
    version handling is explicit; `LegacyOnly` exposes no modern method.
 8. Core capabilities and extension capabilities are negotiated per
    request.
-9. Tasks, Apps, and authorization extensions remain opt-in and do not
-   contaminate the core wire model.
+9. Tasks, Apps, Enterprise-Managed Authorization, and OAuth Client
+   Credentials remain opt-in on the wire and do not contaminate the core
+   model, while their complete implementations and composition gates are
+   mandatory release inputs.
 10. OAuth and OIDC behavior is bound to the actual HTTP transport,
     resource URI, issuer, audience, and authorization context.
 11. The final composed wire oracle, named raw-schema parity exceptions,
     and conformance harness become release gates.
-12. A deliberately isolated MCP `2025-11-25` adapter provides
-    transition interoperability.
-13. The stale local `2024-11-05` public contract is not retained as a
-    compatibility API.
+12. A deliberately isolated MCP `2024-11-05` adapter preserves the complete
+    currently exposed legacy wire contract, including its two-endpoint
+    HTTP+SSE transport.
+13. Automatic transport-specific negotiation selects exactly modern
+    `2026-07-28` or legacy `2024-11-05` without a retry-on-arbitrary-error
+    downgrade path.
 14. Operators receive a bounded, privacy-safe local health/telemetry
     contract that is distinct from MCP logging and hosted product
     control planes.
@@ -113,9 +468,9 @@ The recommended end state is:
 18. REL-01 seals a no-publish handoff; only separately authorized REL-02
     can execute the resumable registry/GitHub transaction.
 
-This is a breaking release.
-
-That is intentional.
+This is a breaking Rust API release, but it is not a legacy wire-protocol
+removal. The canonical Rust API changes directly while the exact
+`2024-11-05` protocol remains supported through the first-class adapter.
 
 The planned first release line is `0.4.0`, following the audited
 workspace `0.3.2` line and Rust's pre-1.0 semver convention for a
@@ -124,11 +479,11 @@ breaking public API revision.
 The repository is in early development, and its project instructions
 prefer a correct design over compatibility shims.
 
-The only compatibility layer proposed here is a first-class,
-versioned wire implementation for the immediately preceding official
-protocol revision.
-It exists for ecosystem interoperability, not to preserve old Rust
-types or handler signatures.
+The compatibility layer is a first-class, versioned wire implementation for
+the project's existing MCP `2024-11-05` contract. It exists for ecosystem
+interoperability and safe automatic negotiation, not to preserve old Rust
+types or handler signatures. MCP `2025-11-25` is neither implied nor silently
+aliased.
 
 ---
 
@@ -308,11 +663,15 @@ Section 25 inventory and evidence boundary.
 - Protected Resource Metadata.
 - Client ID Metadata Documents.
 - Dynamic Client Registration only as a deprecated fallback.
-- Explicit dual-era behavior for MCP `2025-11-25`.
+- Complete dual-era behavior for MCP `2024-11-05`, including its exact
+  initialization/session model and two-endpoint HTTP+SSE transport.
 - Generic extension negotiation.
 - Official Tasks extension.
 - Stable MCP Apps extension metadata and host-neutral message support.
-- Stable enterprise-managed authorization OAuth profile.
+- Stable enterprise-managed authorization profile, including both OIDC and
+  SAML identity-assertion branches.
+- Official OAuth Client Credentials profile for both external and built-in
+  authorization-server compositions.
 - Proxy and gateway behavior across protocol eras and extensions.
 - Procedural macros.
 - Facade exports.
@@ -328,7 +687,8 @@ Section 25 inventory and evidence boundary.
 ### 3.2 Explicitly out of scope
 
 - Preserving the existing public Rust API through wrappers.
-- Preserving the stale local `2024-11-05` wire behavior.
+- Preserving old public Rust signatures through wrappers or compatibility
+  shims; the wire contract is preserved by the explicit legacy adapter.
 - Adding any Tokio-based runtime, transport, or HTTP client.
 - Adding `reqwest`, `hyper`, `axum`, `tower`, `async-std`, or `smol`.
 - Automatically fetching arbitrary external JSON Schema references.
@@ -439,7 +799,7 @@ example without checking the final dated source.
   `aa7306efa4dcc03a2a9f2f223e3b2d7a0c5f3ded`. The limited comparison
   made at that time found only the recorded dated-spec link repairs.
 - Fresh mutable default-branch comparison observed on 2026-07-31:
-  `73763114e511106fc07543f6096b3a814b1a3583`. This moving head is
+  `e24f0099b60f7c00e165a0faa02a72029d2fa654`. This moving head is
   comparison-only; this reality-check does not generalize the earlier
   link-repair-only diff claim to later commits. The immutable
   `5f5440bb26a62e2cf3440b92da5a667efa03b267` final tag, dated tree and
@@ -1953,37 +2313,41 @@ Official prose differs about the exact removal horizon.
 
 Decision:
 
-- Do not implement or expose the `2024-11-05` two-endpoint HTTP+SSE
-  transport.
-- Implement only the exact sessioned Streamable HTTP behavior required
-  by the pinned `2025-11-25` adapter.
-- Keep existing two-endpoint transport code physically present but
-  unreachable because this plan does not authorize file deletion.
+- Implement and expose exact feature-gated `2024-11-05` two-endpoint
+  HTTP+SSE only through LEG-HTTP-01's legacy adapter contract.
+- Keep final `2026-07-28` Streamable HTTP on its separate modern route;
+  `2025-11-25` sessioned Streamable HTTP is unsupported and may appear only
+  as a planted negative.
+- Keep existing source physically present because this plan does not authorize
+  file deletion; its reachable disposition is governed by the exact legacy
+  adapter rather than a deprecated/removed transport claim.
 - Do not schedule physical file removal in this plan.
 - Revisit its disposition only after repository-owner approval.
 
-### 5.6 Authorization-profile wire-negotiation ambiguity
+### 5.6 Authorization-profile extension registration and wire drift
 
-The current rendered authorization-extension documentation shows
-MCP extension identifiers and empty capability settings for
-enterprise-managed authorization and OAuth client credentials.
-The exact pinned normative repository revision used for this release,
-`fb374c7db2b34f18ca9183882e0beecdf661892b`, does not define either
-identifier, a core capability-map entry, or a settings schema in the
-stable enterprise profile or draft client-credentials profile. It
-defines OAuth authorization profiles discovered through
-authorization-server metadata. The draft client-credentials prose and
-its pinned harness also disagree about client-secret placement; the
-harness expects RFC-compliant HTTP Basic authentication rather than a
-secret in the form body.
+The pinned normative source defines Enterprise-Managed Authorization as
+`io.modelcontextprotocol/enterprise-managed-authorization` and the
+official-pinned-Draft OAuth Client Credentials extension as
+`io.modelcontextprotocol/oauth-client-credentials`.  Each client request
+uses the exact registered identifier with request-local empty `{}` settings;
+neither profile uses initialization or connection-scoped capability state.
+The draft client-credentials prose and its pinned harness disagree about
+client-secret placement; the harness expects RFC-compliant HTTP Basic
+authentication rather than a secret in the form body.
 
 Decision:
 
-- Treat the pinned repository files as authoritative for the wire
-  surface of these two profiles.
-- Implement them as opt-in OAuth deployment profiles selected by
-  local policy and the exact authorization-server metadata defined by
-  the pinned documents.
+- Register and validate the two exact official extension identifiers in the
+  per-request client extension map with exact empty settings.  Missing,
+  nonempty, malformed, duplicate, or unknown client settings are typed
+  negatives and never activate either profile.
+- Implement both as opt-in OAuth deployment profiles selected by immutable
+  local policy, the request-local declaration, and their exact
+  authorization-server metadata.  The OAuth Client Credentials server
+  advertisement is RECOMMENDED rather than required: an absent advertisement
+  is a positive path, while a present advertisement is validated and any
+  wrong, malformed, stale, duplicate, or policy-inconsistent value rejects.
 - For the draft client-credentials profile, follow the pinned
   conformance harness's HTTP Basic requirement. The exact pinned prose
   says that the secret is transmitted in request content and shows
@@ -2002,17 +2366,12 @@ Decision:
   multi-cause incompatibility and prove each difference with a
   one-variable local fixture rather than weakening the implementation
   to make that scenario green.
-- Do not register, advertise, require, or parse an invented
-  `io.modelcontextprotocol/...` core extension capability for either
-  profile in this release.
-- Preserve the rendered-document identifiers as tracked upstream
-  drift evidence only. Before enabling such MCP-wire negotiation,
-  pin a normative revision that defines the identifier, settings,
-  direction, fallback, and interaction with final per-request
-  capabilities, then revise this plan and its Beads.
-- Keep enterprise-managed authorization independently claimable as a
-  stable OAuth profile and client credentials explicitly experimental;
-  neither changes core MCP conformance.
+- Reject every invented identifier, capability, settings shape, direction, or
+  connection-scoped fallback surface.  Server discovery metadata never
+  substitutes for the request-local client declaration.
+- Keep enterprise-managed authorization independently claimable as a stable
+  OAuth profile and OAuth Client Credentials labeled official extension,
+  pinned Draft; neither changes core MCP conformance.
 - Although the stable enterprise profile makes the first token
   exchange's `resource` form parameter optional, FastMCP clients send
   the exact canonical MCP resource identifier by default. Omitting it
@@ -2097,40 +2456,27 @@ Decision:
 
 ### 5.9 HTTP dual-era fallback status wording
 
-The versioning compatibility matrix summarizes a legacy HTTP signal as
-an unrecognized `4xx`. The binding-specific Streamable HTTP section
-defines initialize-era fallback on `400 Bad Request`; its later
-`400`/`404`/`405` set belongs to the separate deprecated `2024-11-05`
-HTTP+SSE fallback, which this plan excludes.
+The versioning compatibility matrix summarizes a legacy HTTP signal as an
+unrecognized `4xx`. The authoritative dual-era contract resolves that wording
+through exact `2024-11-05` HTTP+SSE, not a sessioned intermediary transport.
 
 Decision:
 
-- The detailed transport rule wins for the included sessioned
-  `2025-11-25` Streamable HTTP adapter. For an uncached trusted HTTP
-  endpoint-instance key, make the isolated first modern MCP POST a
-  non-side-effecting
-  `server/discover` request with a fresh ID, final request metadata,
-  and the final `MCP-Protocol-Version`/`Mcp-Method` headers. Send no
-  tool, resource, prompt, subscription, or extension application
-  method before this probe classifies the era. The key retains the
-  canonical absolute configured MCP endpoint's full path and permitted
-  query plus its security partition and configuration generation;
-  HTTP origin is a separate security attribute and is never sufficient
-  cache identity.
-- Only that discovery probe's `400 Bad Request` with an empty or
-  unrecognized-modern body may select initialize-era fallback. The
-  probe is one dispatch and is never replayed as part of fallback. If
-  authorization is established after a challenge, any subsequent
-  classification is a new attempt with a fresh request ID, not a
-  replay of the challenged HTTP request.
-- A recognized modern JSON-RPC error on 400 remains modern. HTTP 404
-  or 405 does not select the included legacy adapter; implementing the
-  subsequent GET/endpoint-event probe would require the explicitly
-  excluded deprecated HTTP+SSE profile.
-- Never treat 401, 403, 407, 409, 429, another 4xx, 5xx, redirect,
-  timeout, cancellation, or network failure as era downgrade.
-- Freeze this source precedence in CLT-02/HTTP-03 status/body matrix
-  tests and reopen it only for dated errata.
+- For an uncached trusted endpoint bundle, make one isolated modern MCP POST
+  `server/discover` request with a fresh ID and final metadata. Send no
+  application method before classification; canonical path/query and security
+  partition, not origin alone, form its cache identity.
+- Only status 400, 404, or 405 together with an empty or unrecognized modern
+  body authorizes exactly one GET to the configured legacy SSE candidate. The
+  probe is one dispatch and is never replayed. A recognized modern JSON-RPC
+  result or error at any HTTP status fixes Modern and prohibits that GET.
+- Authorization of the GET does not select an era. Only its valid exact-2024
+  endpoint event selects Legacy; malformed, missing, foreign, stale, or
+  reordered events fail unclassified. Never treat 401, 403, 407, 409, 429,
+  another 4xx, 5xx, redirect, timeout, cancellation, or network failure as a
+  downgrade signal.
+- Freeze this source precedence in LEG-NEG-01/CLT-02/HTTP-03 status/body
+  matrix tests and reopen it only for dated errata.
 
 ### 5.10 Stdio “any other error” fallback boundary
 
@@ -2250,7 +2596,7 @@ Decision:
 
 The final versioning example permits an
 `UnsupportedProtocolVersionError.data.supported` list containing both
-`2026-07-28` and legacy `2025-11-25`, yet the same page says a
+`2026-07-28` and legacy `2024-11-05`, yet the same page says a
 recognized modern error identifies a modern server and should not
 trigger legacy fallback. It does not define how a client could “retry”
 the original modern request under an initialization-era version:
@@ -2266,7 +2612,7 @@ Decision:
   as a fallback signal.
 - Inline retry selects only a mutually supported modern version and
   uses a fresh request ID. It never labels modern `_meta` or HTTP
-  headers with `2025-11-25`.
+  headers with `2024-11-05`.
 - If the intersection contains only legacy versions, return a typed
   `NoCommonModernVersion` with the bounded advertised list and keep
   the endpoint classified modern. Do not silently send `initialize`,
@@ -2589,10 +2935,9 @@ Decision:
   earliest removal three months after SEP-2596 reaches Final. Do not
   invent a calendar date before that lifecycle event is pinned.
 - Keep deprecated modern-core types behind truthful capability/policy
-  gates. Keep only pinned `2025-11-25` sessioned Streamable HTTP behind
-  the explicit dual-era profile; the distinct deprecated `2024-11-05`
-  two-endpoint HTTP+SSE transport remains intentionally unsupported and
-  unreachable under Section 5.5. Do not erase retained source without
+  gates. Keep exact `2024-11-05` two-endpoint HTTP+SSE behind the explicit
+  dual-era profile and LEG-HTTP-01; sessioned `2025-11-25` remains unsupported.
+  Do not erase retained source without
   permission, enable deprecated behavior by default merely because it
   remains schema-valid, or describe an earliest date as a promise that
   removal will occur then.
@@ -3130,7 +3475,7 @@ They must not remain unadvertised core fields.
 - The current resource subscription model is URI-specific rather than
   the new generic filtered subscription.
 
-These components may remain useful to a `2025-11-25` adapter.
+These components do not establish or imply a `2025-11-25` adapter.
 They must never be reachable from a modern transport policy.
 
 ### 7.14 Client gaps
@@ -3443,9 +3788,11 @@ Consequences:
 
 Decision:
 
-Implement MCP `2025-11-25` as a separate wire-era adapter.
+Implement MCP `2024-11-05` as a separate, complete wire-era adapter.
 
-Do not preserve the stale local `2024-11-05` model.
+Preserve that exact protocol because it is FastMCP Rust's existing public
+wire contract. Do not mislabel MCP `2025-11-25` behavior as legacy-2024
+support.
 
 Consequences:
 
@@ -3454,9 +3801,14 @@ Consequences:
 - The adapter maps only semantics that have an honest mapping.
 - MRTR, modern subscriptions, and extensions do not masquerade as
   legacy core methods.
-- Exact `2025-11-25` sessioned Streamable HTTP and its specified replay
-  behavior remain reachable only when the legacy adapter is enabled.
-- The older two-endpoint HTTP+SSE transport remains unsupported.
+- Exact `2024-11-05` initialization, persistent negotiated capabilities,
+  bidirectional server requests, ping/logging/resource subscriptions, and
+  result shapes remain reachable only through the legacy adapter.
+- Exact `2024-11-05` two-endpoint HTTP+SSE remains reachable only on a
+  distinct legacy route: the client opens the SSE receive endpoint, requires
+  the first valid `endpoint` event, and posts JSON-RPC messages to that
+  advertised URI. Modern Streamable HTTP headers, session IDs, GET/DELETE,
+  and replay semantics never leak into it.
 - Era selection is cached per stdio process or trusted HTTP
   endpoint-instance key; an HTTP origin alone is never a route,
   discovery, or era-cache identity.
@@ -3465,23 +3817,19 @@ Consequences:
 
 Decision:
 
-- Library builders expose `ProtocolPolicy::LatestOnly`,
-  `ProtocolPolicy::ModernWithLegacy`, and
+- Library builders expose `ProtocolPolicy::ModernOnly`,
+  `ProtocolPolicy::Auto`, and
   `ProtocolPolicy::LegacyOnly`.
-- New low-level protocol APIs default to `LatestOnly`.
-- A CLI build that explicitly enables the dual-era profile defaults to
-  `ModernWithLegacy` during the ecosystem transition.
-- A core-only CLI defaults to `LatestOnly` and reports legacy as a
-  profile-disabled option.
-- Server builders default to modern support and require an explicit
-  call to enable legacy.
-- Every client/server builder binds those values through
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  and its selected binding profile. HTTP additionally binds
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`;
-  stdio additionally binds
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`.
-  `ModernWithLegacy`/`LegacyOnly` additionally require the compiled
+- Public client and server builders default to `Auto` once the mandatory
+  legacy adapter is installed. A deliberately minimal modern-only build may
+  expose only `ModernOnly` and must report the missing product profile.
+- `ModernOnly` and `LegacyOnly` require explicit builder/CLI selection.
+- Every client/server builder binds those values through the one-to-one frozen
+  identities `fastmcp-2026-07-28-with-2024-11-05-auto-v2`,
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`, and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2`; the latter applies
+  to HTTP and the stdio identity applies to stdio.
+  `Auto`/`LegacyOnly` additionally require the compiled
   feature and the exact binding-bound
   `LegacyServerAdapterInstalledReceipt` or
   `LegacyClientAdapterInstalledReceipt`, as applicable, before any
@@ -3492,8 +3840,8 @@ Decision:
 
 Rationale:
 
-The canonical SDK remains clean while the CLI can interoperate with
-the installed ecosystem during rollout.
+The canonical business-handler model remains modern and stateless while the
+default product interoperates safely with both required wire eras.
 
 ### ADR-004: split raw transport ingress from safe request context
 
@@ -4108,9 +4456,9 @@ Transport byte ingress
             |       +-- metadata and standard routing headers
             |       +-- header/body equality
             |
-            +-- Legacy 2025-11-25 validation
-                    +-- initialize/session-header rules
-                    +-- isolated legacy session lookup
+            +-- Legacy 2024-11-05 adapter validation
+                    +-- initialize/initialized lifecycle rules
+                    +-- exact HTTP+SSE endpoint-event adapter boundary
             |
             v
         transport-owned IngressAuthenticator callback
@@ -4329,7 +4677,11 @@ PRT-02, CLT-01, STD-01, HTTP-02, HTTP-03, SCH-01, MRTR-03, AUTH-02,
 AUTH-03, AUTH-04, AUTH-06, TASK-01, TASK-02, TASK-03, TASKP-01,
 TASKR-01, EXT-01, APP-01, APP-02, AUTHX-01, AUTHX-02, AUTHX-03,
 PXY-02, OPS-01, DX-TEST-01, EXT-DEV-01, PERF-01, CI-BASE-01,
-REL-PREP-01, CI-CORE-01, CI-FINAL-CORE-01, REL-01, and REL-02. FND-04
+REL-PREP-01, CI-CORE-01, CI-FINAL-CORE-01, REL-01, REL-02,
+LEG-02, LEG-03, LEG-HTTP-01, LEG-NEG-01, LEG-TST-01, LEG-INTEROP-01,
+DEPR-01, APP-03, APP-04,
+AUTHX-04, AUTHX-05, EXT-SRC-01, COMP-ALL-01, CONF-03,
+GATE-ALL-MCP-READY, and CI-ALL-MCP-01. FND-04
 has three unresolved upstream runtime/I/O prerequisites. FND-08 and
 FND-09 each combine provider custody, cryptography, bounded execution,
 and consumer integration. TASKR-01 spans connector qualification,
@@ -4358,11 +4710,16 @@ Every mandatory or voluntary decomposition uses the same schema:
 
 - the formal work-package issue remains the aggregate and retains its
   `work-package`, domain, profile, and canonical `wp-<package>` labels;
-- every child has issue type `task`, has the formal package as its
-  Beads parent, inherits all domain and `profile-*` labels, and adds
+- every child has issue type `task`, has no Beads `parent` edge, inherits
+  all domain and `profile-*` labels, and adds
   `work-package-child`, exactly one of `implementation-child`,
   `integration-child`, or `verification-child`, and
   `wp-parent-<lowercase-package-id>`;
+- containment is represented by the stable external reference, the
+  `wp-parent-*` label, and the formal dependency closure chain. Native Beads
+  `parent-child` dependencies are forbidden for campaign execution nodes
+  because they participate in readiness and can create hidden aggregate/
+  terminal-child deadlocks that `br dep cycles` does not report;
 - child identity is stable as `<PACKAGE>/<role>-<ascii-slug>` in its
   external reference and Agent Mail thread suffix; renaming a title
   does not change that identity;
@@ -4390,11 +4747,13 @@ surface cannot first be partitioned into independent sibling ownership.
 This is a sequencing contract, not permission for concurrent duplicate
 ownership:
 
-- the implementation child remains a direct child of the formal package,
+- the implementation child remains a direct logical child of the formal
+  package through its external reference and `wp-parent-*` label,
   keeps `implementation-child`, adds
   `staged-implementation-aggregate`, has no assignee/estimate, and is no
   longer directly claimable;
-- it has at least two task children labelled `work-package-stage` and
+- it has at least two task stages with no Beads `parent` edge, labelled
+  `work-package-stage` and
   `implementation-stage`, inheriting the package/domain/profile and
   `wp-parent-*` labels; stable external references are
   `<PACKAGE>/<implementation-slug>/stage-<NN>-<ascii-slug>`;
@@ -4428,7 +4787,7 @@ claim, invent concurrent sibling ownership, or split the Bead without
 first applying this contract.
 
 The tracker checker rejects a decomposed package with a missing,
-duplicate, wrongly parented, wrongly labelled, or dependency-bypassing
+duplicate, wrongly referenced, wrongly labelled, parent-edge-bearing, or dependency-bypassing
 child. A voluntarily decomposed package is no longer directly
 claimable and follows the same implementation-to-integration-to-
 optional-verification-to-aggregate closure chain as the listed
@@ -5338,11 +5697,11 @@ Dependencies:
 - FND-01.
 - REL-QUAR-00.
 
-### FND-03 — Define protocol-era policy
+### FND-03 — Define exact 2026/2024 protocol-era policy
 
 Outcome:
 
-Make modern, legacy, and dual-era behavior explicit.
+Make MCP 2026-07-28, exact MCP 2024-11-05, and Auto negotiation behavior explicit.
 
 Reason:
 
@@ -5352,13 +5711,11 @@ into the modern implementation.
 Implementation:
 
 - Add a `ProtocolVersion` value type.
-- Add `ProtocolEra::{Modern, Legacy}`.
-- Add the policies in ADR-003.
-- Freeze
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`.
-  A builder selects exactly one immutable `LatestOnly`,
-  `ModernWithLegacy`, or `LegacyOnly` policy before connect/bind.
-  The latter two require the compiled `legacy-2025-11-25` feature plus
+- Add `ProtocolEra::{Modern2026, Legacy2024}`.
+- Add `ProtocolPolicy::{Auto, ModernOnly, LegacyOnly}` exactly as frozen in ADR-003; `Auto` is the builder and CLI default.
+- Freeze `protocol_era_policy_profile=fastmcp-2026-07-28-with-2024-11-05-auto-v2`.
+  A builder selects exactly one immutable `ModernOnly`, `Auto`, or `LegacyOnly` policy before connect/bind.
+  The latter two require the compiled `legacy-2024-11-05` feature plus
   the applicable sealed `LegacyClientAdapterInstalledReceipt` or
   `LegacyServerAdapterInstalledReceipt`; otherwise builder validation
   returns `FeatureUnavailable`. FND-03 owns these opaque receipt types
@@ -5373,12 +5730,12 @@ Implementation:
 - Define the server's supported-version set.
 - Define the client's preferred-version ordering.
 - Freeze
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`.
+  `stdio_era_policy_profile=fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`.
   On a server-side stdio process:
-  - `LatestOnly` fixes the process to Modern before its first frame.
+  - `ModernOnly` fixes the process to Modern before its first frame.
     Every request uses modern validation; exact legacy `initialize`
     receives SRV-02's supported-version diagnostic and no legacy state.
-  - `ModernWithLegacy` starts `Unclassified` and classifies exactly
+  - `Auto` starts `Unclassified` and classifies exactly
     once from the first structurally valid request: complete valid
     modern per-request metadata selects Modern, including a
     syntactically valid but unsupported protocol-version string; era
@@ -5401,25 +5758,18 @@ Implementation:
   notifications still obey no-response semantics. Only a newly
   spawned process under trusted unchanged configuration starts a new
   classification.
-- Freeze the matching client table. `LatestOnly` uses a modern
+- Freeze the matching client table. `ModernOnly` uses a modern
   `server/discover` first probe and never falls back.
-  `ModernWithLegacy` uses CLT-02's isolated one-shot modern probe and
+  `Auto` uses CLT-02's isolated one-shot modern probe and
   only its exact legacy signals before selecting LEG-03.
   `LegacyOnly` invokes LEG-03 directly with `initialize` and sends no
   modern discovery probe. Each resulting era is immutable for that
   process.
-- Bind HTTP to HTTP-02's child
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`,
-  preserving the same builder/feature/receipt invariants while using
-  its binding-specific tables.
-- Define one opaque `ClientEndpointInstanceKey` from trusted local
-  configuration for HTTP discovery and era state. It includes the
-  transport profile, security partition, configuration generation,
-  and canonical absolute configured MCP endpoint through its full path
-  and explicitly permitted query serialization, including canonical
-  scheme/host and effective port. Reject fragments. Keep the validated
-  origin separately for same-origin, credential, and network-security
-  checks; never use origin alone as endpoint identity.
+- Freeze `http_era_policy_profile=fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2` as a LEG-NEG-01 composition contract. HTTP-02 remains the modern-only Streamable HTTP server; LEG-HTTP-01 remains the exact 2024-11-05 two-endpoint HTTP+SSE transport. Neither router classifies or dispatches the other era.
+- Define a trusted `HttpEndpointBundle` containing a canonical modern POST candidate and a canonical legacy SSE candidate. `ModernOnly` requires only the modern candidate, `LegacyOnly` only the legacy candidate, and `Auto` requires both explicitly; no candidate is synthesized from peer bytes, redirects, discovery output, or origin heuristics.
+- Define one opaque `HttpEndpointBundleKey` for HTTP negotiation and cached era state. It binds both configured absolute targets through full canonical paths and explicitly permitted query serializations, their validated origins and credential partitions, the transport and security profiles, configuration and policy generations, and the installed legacy-adapter receipt generation. Fragments are rejected, and origin alone is never endpoint or bundle identity.
+- The server route set collision-checks the exact tuple `ModernMcpPost`, `LegacySseGet`, and `LegacyMessagePost` before protocol parsing; no path/method collision or request bytes may select two routes.
+- Modern discovery advertises exactly `["2026-07-28"]`; exact 2024-11-05 is selected only through LEG-NEG-01 and LEG-HTTP-01 and is never advertised as an inline Streamable HTTP version.
 - Define invalidation and re-probe behavior. Any endpoint path/query,
   security partition, transport profile, or configuration-generation
   change creates a different key. Expiry or explicit trusted
@@ -5427,13 +5777,12 @@ Implementation:
   ordinary application error or transport failure never rewrites a
   cached era in place or supplies a downgrade signal.
 - Define modern-only diagnostics for an incoming initialize request.
-- Define the exact `2025-11-25` adapter boundary.
-- Explicitly exclude local `2024-11-05` compatibility.
-- Ensure no legacy Session type appears in a modern handler signature.
+- Define the exact `2024-11-05` adapter boundary. A planted `2025-11-25` initialize or capability shape is unsupported intermediary-era traffic and must not alias to either supported era.
+- Ensure no legacy connection/lifecycle state type appears in a modern handler signature.
 
 Acceptance:
 
-- The compiler prevents a modern router from reading a legacy Session.
+- The compiler prevents a modern router from reading a legacy connection/lifecycle state.
 - Discovery lists only enabled versions.
 - The policy is visible in builder and CLI diagnostics.
 - Era detection is deterministic and transport-specific.
@@ -5443,12 +5792,10 @@ Acceptance:
 - A syntactically valid unsupported version in otherwise complete
   modern opening metadata selects Modern and receives `-32022`; it is
   neither an unclassified opening failure nor a legacy signal.
-- `LegacyOnly` clients send no modern discovery, `LatestOnly` clients
+- `LegacyOnly` clients send no modern discovery, `ModernOnly` clients
   send no initialize/fallback, and feature-off builds cannot construct
   either legacy policy.
-- Same-origin HTTP endpoints at different paths or permitted queries
-  cannot share discovery instructions, capabilities, or an era
-  decision.
+- Auto HTTP requires an explicit modern POST candidate and exact-2024 SSE candidate; changing either target, full path, permitted query, credential partition, policy, or receipt generation creates a distinct bundle that cannot share discovery or era state.
 - There is no generic “try old behavior on any error” path after an
   endpoint is classified as modern.
 
@@ -5462,20 +5809,29 @@ Tests:
   cross-era second traffic, EOF/restart/new PID, and feature/receipt
   absence. Assert at most one classification and no same-process
   retry.
-- Exhaustive stdio client policy matrix proving LatestOnly modern
-  probe/no fallback, ModernWithLegacy isolated probe/exact fallback,
+- Exhaustive stdio client policy matrix proving ModernOnly modern
+  probe/no fallback, Auto isolated probe/exact fallback,
   LegacyOnly direct initialize/no probe, immutable post-selection
   behavior, and no feature-off legacy symbols.
-- Era-cache invalidation tests, including same-origin `/mcp-a` versus
-  `/mcp-b`, permitted-query variation, security-partition/config-
-  generation changes, canonical host/default-port equivalence, and
-  proof that an origin-only collision cannot contaminate either
-  endpoint.
+- HTTP bundle-key and era-cache invalidation tests varying either modern POST or legacy SSE target, same-origin paths, permitted queries, credential and security partitions, policy/receipt and configuration generations, canonical host/default-port equivalence, and proof that an origin-only collision cannot contaminate either bundle.
 - Diagnostic snapshot tests.
 
 Dependencies:
 
 - FND-01.
+
+Tracker decomposition:
+
+- Parent: `bd-mcp-2026-07-28-support-ahet.3` (FND-03).
+- Implementations: `bd-mcp-2026-07-28-support-ahet.3.1` and
+  `bd-mcp-2026-07-28-support-ahet.3.2`.
+- Integration: `bd-mcp-2026-07-28-support-ahet.3.3` depends on both
+  implementation children.
+- Independent verification:
+  `bd-mcp-2026-07-28-support-ahet.3.4` depends on the integration child.
+- Required closure direction: `.3.1 + .3.2 → .3.3 → .3.4 → .3`.
+  The children are a Section 11 decomposition projection; formal package
+  consumers retain their dependency on FND-03 rather than bypassing it.
 
 ### FND-04 — Complete runtime-managed `Cx` migration
 
@@ -6118,7 +6474,7 @@ Implementation:
 | HTTP connection lifetime | 1 h | 24 h |
 | HTTP requests per connection | 1,000 | 100,000 |
 | Client ordinary-request idle timeout | 30 s | 5 min |
-| Ordinary request absolute/total budget | 120 s | 15 min |
+| Client ordinary-request post-commit response-wait absolute timeout | 120 s | 15 min |
 | Client subscription idle timeout | 5 min | 1 h |
 | Client subscription absolute timeout | 1 h | 24 h |
 | Stdio unexpected-process restart attempts per incident | 3 | 10 |
@@ -7851,6 +8207,10 @@ Implementation:
   server error response or a client-side owning/shared transport
   failure, so no codec call site hand-codes this branch.
 - Restrict `jsonrpc` to the literal `2.0`.
+- Admit only one top-level JSON object; reject every top-level array, including
+  an array-of-one valid request and a mixed array, through raw admission before
+  any envelope construction, dispatch, correlation, authorization, cache,
+  task/session/subscription, proxy, response, or state effect.
 - Accept only string or mathematical-integer JSON request IDs, exactly
   as the final prose and generated schema require.
 - Preserve an accepted arbitrary-precision integer's original JSON
@@ -8023,6 +8383,10 @@ Tests:
   non-integral exponent negatives.
 - Duplicate-member corpus at envelope and deeply nested parameter
   levels.
+- Top-level array-of-one-valid-request and mixed-array negatives through the
+  production raw-admission path, with server/client role dispositions and
+  proof of zero partial dispatch, correlation, authorization, cache,
+  task/session/subscription, proxy, response, or state effect.
 - Direct raw JSON valid UTF-8 positives plus leading/midstream BOM,
   truncated/overlong/surrogate-encoding, isolated-continuation, and
   every-split malformed UTF-8 negatives; contrast an SSE-decoded valid
@@ -9806,7 +10170,7 @@ Dependencies:
 - PRT-04.
 - AUTH-00.
 
-### SRV-02 — Implement mandatory `server/discover`
+### SRV-02 — Implement MCP 2026-07-28 `server/discover`
 
 Outcome:
 
@@ -9821,7 +10185,7 @@ Implementation:
 
 - Add method constant and typed request/result.
 - Allow discovery before any other lifecycle action.
-- Return enabled protocol versions in deterministic preference order.
+- Return exactly `["2026-07-28"]` in deterministic order; never advertise exact 2024-11-05 as an inline modern retry. An Auto-composed server uses this same list on its modern route.
 - Return server capabilities.
 - Derive every known capability from one immutable behavior registry:
   `logging` only with OBS-02's installed deprecated request emitter;
@@ -9845,7 +10209,7 @@ Implementation:
 - Ensure discovery reflects runtime policy, not compile-time
   possibility.
 - Ensure auth policy for discovery is explicit and documented.
-- Under `LatestOnly`, add the exact transport-neutral modern-only
+- Under `ProtocolPolicy::ModernOnly`, add the exact transport-neutral modern-only
   initialize diagnostic frozen by HTTP-02: JSON-RPC `-32601`, fixed
   message `Initialization-based MCP is not enabled`, exact bounded
   data `{"supported":["2026-07-28"]}`, and no fabricated requested
@@ -9871,7 +10235,7 @@ Acceptance:
 Tests:
 
 - Modern-only discovery.
-- Dual-era discovery.
+- Discovery through an Auto-composed server, still using MCP 2026-07-28 discovery semantics.
 - Modern-only stdio/HTTP legacy-initialize diagnostic parity, exact
   supported list, and no legacy adapter/state lookup.
 - Authenticated and unauthenticated discovery policy.
@@ -10221,10 +10585,27 @@ model.
 
 Reason:
 
-The current client is a sequential stdio-child wrapper and may discard
-unmatched responses.
+The current public client remains a subprocess-stdio wrapper. Its
+unverified 2026-08-02 shared-worktree implementation now correlates
+bounded in-flight responses by exact ID, preserves reordered responses,
+and tombstones timed-out/cancelled owners so exact late responses are
+discarded without poisoning later generations. It is still not the
+transport-neutral executor required here.
 Modern HTTP gives every POST its own response body, while stdio
 multiplexes all traffic on one channel.
+
+Partial implementation delta (2026-08-02, unverified and not CLT-01
+closure): default ordinary requests have bounded post-send-commit idle
+and absolute response-wait timers plus strict matching-progress idle
+reset, and the stdio subprocess path has bounded Unix receive/control
+primitives. Explicit close now returns cleanup failures, and opt-in
+Unix anchored group ownership provides a narrower CLI-test custody
+boundary; neither best-effort Drop nor a one-shot failed connection
+guard is an ownership-bearing cleanup result. Still missing are
+`RequestExecution`, a public
+transport-neutral `execute` surface, per-execution overrides, qualified
+concurrent execution policies, subscription lifetimes, and HTTP client
+integration.
 
 Implementation:
 
@@ -10406,7 +10787,7 @@ Dependencies:
 - PRT-04.
 - LIMIT-01.
 
-### CLT-02 — Implement modern versioning and dual-era selection
+### CLT-02 — Implement modern versioning and exact policy dispatch
 
 Outcome:
 
@@ -10418,20 +10799,21 @@ Fallback is not a generic initialize retry.
 
 Implementation:
 
-- Consume
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`,
-  and HTTP-02's child policy without inventing a client-local fourth
-  mode. Validate legacy feature plus LEG-03 installation receipt before
-  connecting under either legacy-enabled policy.
+- Consume the immutable
+  `fastmcp-2026-07-28-with-2024-11-05-auto-v2`,
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`, and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2` profiles through
+  FND-03 and LEG-NEG-01 without inventing a client-local mode. Validate the
+  legacy feature plus LEG-03 installation receipt before connecting under
+  `Auto` or `LegacyOnly`.
 - Attach modern metadata to every request.
 - Include recommended client identity by default.
 - Handle `-32022` under Section 5.14 and retry only a mutually
   supported modern version.
-- Under `LatestOnly` and `ModernWithLegacy`, implement stdio
-  discovery-first probing. `LatestOnly` keeps any well-formed
+- Under `ModernOnly` and `Auto`, implement stdio
+  discovery-first probing. `ModernOnly` keeps any well-formed
   non-modern/error outcome as a typed incompatibility and never starts
-  initialize; only `ModernWithLegacy` may take the exact isolated
+  initialize; only `Auto`, through LEG-NEG-01, may take the exact isolated
   fallback below.
 - Select modern only from a fully valid discovery complete-result
   payload or a recognized modern JSON-RPC error, with one explicitly
@@ -10460,12 +10842,12 @@ Implementation:
   their trust, and policy revision is re-evaluated before each model-
   context use. Origin remains a checked security attribute but cannot
   identify the endpoint or cache entry.
-- Under explicit `ModernWithLegacy`, treat any other well-formed
+- Under explicit `Auto`, treat any other well-formed
   JSON-RPC error response to the first `server/discover` request as the
   Section 5.10 legacy branch. Do not key fallback to `-32601`: legacy
   servers may return `-32601`, `-32602`, or an implementation-defined
   application error.
-- Under that same `ModernWithLegacy` policy, treat a bounded first-probe timeout as the
+- Under that same `Auto` policy, treat a bounded first-probe timeout as the
   other Section 5.10 legacy branch. Run the probe in a fresh disposable
   sibling stdio child before authentication or any application
   request, reap it, and start a fresh child for legacy `initialize`.
@@ -10480,15 +10862,16 @@ Implementation:
   legacy, and unknown entries. Select by the client's deterministic
   modern preference order only. A legacy-only intersection yields
   typed `NoCommonModernVersion`; it never sends final per-request
-  metadata under `2025-11-25`, starts `initialize`, or mutates the
+  metadata under `2024-11-05`, starts `initialize`, or mutates the
   modern era cache.
 - Under `LegacyOnly`, skip every modern stdio/HTTP discovery probe and
   invoke LEG-03's installed exact adapter directly. Its first wire
   message is legacy `initialize`; any modern response/marker, failed
   initialize, or later cross-era traffic is a typed legacy connection
   failure and never switches to modern.
-- Implement HTTP modern-first classification only for `LatestOnly` and
-  `ModernWithLegacy`.
+- `ModernOnly` fixes HTTP to modern before its first request; only immutable
+  `Auto` invokes LEG-NEG-01's HTTP modern-first observation. `LegacyOnly`
+  invokes the installed exact legacy adapter directly and never discovers.
 - For an uncached `ClientEndpointInstanceKey`, make the first MCP POST
   an isolated, non-side-effecting `server/discover` request with a
   fresh ID, final request `_meta`,
@@ -10498,20 +10881,19 @@ Implementation:
   selected an era. The key comes only from trusted configuration and
   retains the full canonical endpoint path and permitted query;
   same-origin endpoints never share classification implicitly.
-- Apply Section 5.9: inspect only that discovery probe's
-  `400 Bad Request` body for recognized modern errors, and fall back
-  under `ModernWithLegacy` to the included initialize-era Streamable
-  HTTP adapter only when
-  that body is empty or unrecognized-modern. No other 4xx selects it;
-  in particular, 404/405 would belong to the excluded deprecated
-  HTTP+SSE probe.
+- Apply the global fallback rule through LEG-NEG-01: only status `400`,
+  `404`, or `405` together with an empty or unrecognized modern body
+  authorizes exactly one GET to the configured `legacy_sse` target. Any
+  recognized modern JSON-RPC result or error at any HTTP status fixes Modern
+  and prohibits that GET. The GET itself cannot select an era unless its first
+  valid exact-2024 endpoint event does so.
 - Dispatch the HTTP probe at most once per classification attempt and
   never replay it during fallback, redirect handling, timeout, or
   uncertain-dispatch recovery. An authorization challenge ends that
   attempt without selecting an era; after authorization completes, a
   new attempt uses a fresh request ID and fresh request construction.
-- Cache the era by stdio process or exact
-  `ClientEndpointInstanceKey`, never by HTTP origin alone.
+- Cache the era by stdio process or FND-03's exact
+  `HttpEndpointBundleKey`, never by HTTP origin alone.
 - Treat each cached era as valid only under the exact immutable
   protocol/transport policy and adapter-receipt generation that
   created it. A policy change creates a distinct connection attempt;
@@ -10529,17 +10911,19 @@ Acceptance:
 - Mixed modern/legacy lists can select only a common modern version;
   a legacy-only common list remains a modern-classified no-common-
   modern error.
-- The pinned dual-era fallback recognizes any well-formed JSON-RPC
-  error that is not a recognized modern error, or the isolated
-  first-probe timeout, and is never coupled to one error code. A
-  schema-invalid success is never a fallback signal.
-- The retry uses a new JSON-RPC request ID.
-- Era/discovery cache scope is the exact stdio process or configured
-  HTTP endpoint instance; origin-only reuse is impossible.
+- Only LEG-NEG-01 can return an exact-2024 selection: a frozen eligible
+  stdio error/timeout may select the fresh-child legacy branch, while
+  HTTP requires a validated endpoint event after an eligible status
+  merely authorizes one legacy GET. Redirects, auth challenges,
+  malformed success, non-eligible errors, and application failures are
+  never legacy signals. Every fresh classification uses a new JSON-RPC
+  request ID.
+- Era/discovery cache scope is the exact stdio process or complete
+  `HttpEndpointBundleKey`; origin-only or one-endpoint reuse is impossible.
 - A modern-only client produces clear errors against a legacy server.
-- A `LatestOnly` client never emits initialize or uses an unrecognized
+- A `ModernOnly` client never emits initialize or uses an unrecognized
   error/400/timeout as fallback; a `LegacyOnly` client emits no modern
-  discovery; `ModernWithLegacy` is the sole fallback-capable policy.
+  discovery; `Auto` is the sole fallback-capable policy.
 - Before HTTP era classification, the wire contains no tool, resource,
   prompt, subscription, or extension application method; the only MCP
   request is the one-shot `server/discover` probe.
@@ -10555,7 +10939,7 @@ Tests:
   receipt-generation cache isolation.
 - Stdio probe process-exit test.
 - Stdio probe timeout test with virtual time.
-- `LatestOnly` repetitions of every would-be legacy signal prove typed
+- `ModernOnly` repetitions of every would-be legacy signal prove typed
   incompatibility and zero initialize; `LegacyOnly` captures direct
   initialize as the first frame/POST and zero discover; feature-off/
   missing-receipt builds fail before process spawn or network effects.
@@ -10584,11 +10968,13 @@ Tests:
   labeled, delimited lower-authority inclusion plus exact escaped
   machine JSON.
 - HTTP recognized-error test.
-- HTTP empty-400 fallback test.
-- HTTP first-probe status/body cross product covering recognized and
-  unrecognized 400 plus 401/403/404/405/407/409/429/other-4xx/5xx/
-  redirect/timeout/network failures, proving that only the exact
-  Section 5.9 case creates the included legacy adapter.
+- HTTP empty-400 eligible-GET test proving no Legacy selection until a valid endpoint event, paired with malformed/missing endpoint-event negatives.
+- HTTP first-probe status/body cross product covering every `400`/`404`/`405`
+  × recognized-modern/empty/unrecognized row plus 401/403/407/409/429/
+  other-4xx/5xx/redirect/timeout/network failures. Assert unchanged state,
+  zero legacy GET, and zero adapter lookup on every ineligible row; prove
+  eligible rows permit exactly one configured legacy SSE GET and only its
+  first valid endpoint event selects Legacy.
 - HTTP wire-order test proving `server/discover` is the first MCP POST,
   uses the exact modern body/headers, sends no application method
   before classification, is dispatched once, and is never replayed
@@ -10620,7 +11006,7 @@ Dependencies:
 
 ## 15. Phase 3 — Rebuild transports around request lifetime
 
-### STD-01 — Make stdio cancel-correct and multiplexed
+### STD-01 — Make Auto dual-era stdio cancel-correct and multiplexed
 
 Outcome:
 
@@ -10634,18 +11020,29 @@ concurrency guarantees.
 Implementation:
 
 - Replace blocking wrapper semantics with asupersync-compatible I/O.
+- Treat the current Unix readiness-polled input and bounded ordinary
+  pipe/socket output as an unverified partial delta only. Notification
+  output failure is terminal and shutdown hooks require worker
+  quiescence, but non-Unix stdio, regular files/devices, inherited
+  descriptor aliases, and arbitrary handlers that ignore cancellation
+  do not meet the final cross-platform lifetime contract.
 - Remain blocked until FND-04's public cross-platform process-stdio
   prerequisite is pinned and proven. Do not substitute a private
   thread, private runtime, `test-internals`, or a blocking Windows
   child-pipe path.
 - Preserve newline-delimited JSON framing.
 - Reject embedded newline framing violations.
+- Reject every top-level JSON-RPC batch array, including array-of-one valid
+  request and mixed-array inputs, through PRT-01 raw admission before an
+  era router, lifecycle transition, dispatch, waiter/correlation,
+  authorization, cache, task/session/subscription, response, or stdio state
+  effect.
 - Capture FND-03's immutable
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`
   at process construction. On server ingress, enforce its exact first-
   frame classification/terminal-close table before any era-specific
-  router: `LatestOnly` is preselected Modern,
-  `ModernWithLegacy` selects once from valid modern metadata versus
+  router: `ModernOnly` is preselected Modern,
+  `Auto` selects once from valid modern metadata versus
   exact initialize (a syntactically valid unsupported modern version
   still selects Modern and then receives `-32022`), and `LegacyOnly`
   requires initialize directly.
@@ -10653,8 +11050,8 @@ Implementation:
   cross-era message use the frozen error/no-response disposition and
   can never trigger a second classification on that process.
 - On client egress, permit the first frame sequence only for the
-  selected policy: modern discover for `LatestOnly`, CLT-02's isolated
-  probe for `ModernWithLegacy`, or LEG-03's direct initialize for
+  selected policy: modern discover for `ModernOnly`, CLT-02's isolated
+  probe for `Auto`, or LEG-03's direct initialize for
   `LegacyOnly`. The codec/transport cannot add fallback or infer a
   policy from received bytes.
 - Run every complete line through PRT-01's bounded raw admission before
@@ -10665,9 +11062,9 @@ Implementation:
   with one readable valid ID receives a correlated `-32600` error
   echoing that exact ID. None of these server-generated errors enters
   the waiter registry. After an era is already fixed or
-  selected—including preselected `LatestOnly`—the server connection
+  selected—including preselected `ModernOnly`—the server connection
   may continue after the bounded error frame as that binding permits.
-  During `ModernWithLegacy`'s unclassified opening, or before
+  During `Auto`'s unclassified opening, or before
   `LegacyOnly` has admitted its required initialize, the same legal
   error/no-response disposition is followed by FND-03's terminal
   close; it never permits a second opening-frame classification
@@ -10832,10 +11229,14 @@ Tests:
   rather than null ID, exact valid-ID echo, and valid-notification
   silence. Cross every first-frame case with all three policies:
   preselected/selected-era cases take the specified continuation,
-  while an unclassified `ModernWithLegacy` or not-yet-initialized
+  while an unclassified `Auto` or not-yet-initialized
   `LegacyOnly` process closes after its permitted error/no-response
   disposition and cannot classify from a second frame. In every case,
   prove no completion of an unrelated active waiter.
+- Array-of-one-valid-request and mixed top-level-array negatives at both
+  server and client stdio ingress, proving the frozen role disposition and
+  zero partial lifecycle, dispatch, waiter/correlation, authorization, cache,
+  task/session/subscription, response, or connection-state effects.
 - Identical malformed/invalid server-output lines at client ingress
   with zero, one, and multiple in-flight requests; assert no bytes are
   written back, no arbitrary waiter receives a JSON-RPC error, the
@@ -11002,603 +11403,157 @@ Dependencies:
 - AUTH-00.
 - LIMIT-01.
 
-### HTTP-02 — Enforce final server HTTP validation
+### HTTP-02 — Modern-only MCP POST admission and request-scoped response selection
 
 Outcome:
 
-Validate common unauthenticated HTTP ingress, apply the configured
-feature-valid era policy, validate the selected routing envelope, then
-invoke transport authentication without exposing raw ingress to the
-server crate.
+- HTTP-02 owns exactly one explicitly configured server MCP endpoint.  Only
+  an exact HTTP `POST` to that path can enter this package.
+- That endpoint admits only a strict MCP 2026-07-28 JSON-RPC request and,
+  for each admitted request, selects exactly one response representation:
+  JSON or request-scoped SSE.
+- A selected SSE response is a response body for that one request.  It closes
+  after that request's terminal response/error and creates no state beyond the
+  request's response writer.
 
 Reason:
 
-The final HTTP binding makes these headers part of the protocol
-contract.
+- The server route must have one small, auditable authority boundary before
+  authentication and application dispatch.  It needs to reject malformed or
+  ambiguous HTTP and JSON-RPC input before that input can select a handler,
+  affect authorization, or allocate response-stream state.
+- The 2026-07-28 response choice is per request.  Treating SSE as durable
+  state or treating an HTTP request as a policy-selection signal would expand
+  the surface outside this package.
 
 Implementation:
 
-- Expose exactly one configured modern MCP endpoint path for every
-  JSON-RPC request or extension-notification POST; do not split
-  methods, JSON responses, SSE responses, or subscription listens
-  across protocol paths. Health and administrative endpoints are
-  separate non-MCP routes and cannot accept MCP messages.
-- Define the complete integration precedence, while this package owns
-  common stages 1 through 7 and the modern branch of stage 8:
-  1. connection admission, TLS, and trusted-proxy provenance;
-  2. bounded request-line and raw header-block framing, global header
-     count/bytes,
-     occurrence-preserving
-     field capture, framing-ambiguous duplicate rejection (including
-     Content-Length/Transfer-Encoding conflicts), message size, and
-     read deadlines; field-specific duplicate semantics are deferred
-     to their owning later stage;
-  3. identify the configured endpoint path from the admitted request
-     target;
-  4. HTTP method syntax and byte-exact method capture, without yet
-     applying era-specific allowed-method policy;
-  5. Origin/CORS policy and a separate terminal OPTIONS-preflight
-     branch, using only stage 2's admitted header view and stage 4's
-     method capture;
-  6. for body-bearing POST, request media type first, then request
-     content coding, then body bounds and JSON-RPC structural parse;
-     for GET/DELETE, exact empty-body/framing validation;
-  7. exact feature-valid HTTP era-policy selection and, only for a
-     legacy-enabled policy, modern-versus-legacy wire-era
-     classification;
-  8. era-specific protocol validation: for modern JSON-RPC requests,
-     required body metadata first, then the strict dual-media Accept
-     contract, required routing headers, header/body equality, and
-     supported version; for a registered extension notification, the
-     strict Accept contract followed by only that descriptor's
-     declared transport contract and bounded structural admission of
-     its EXT-01 current-message activation proof; exact legacy
-     initialize/session rules in LEG-02;
-  9. transport-owned authentication callback;
-  10. method authorization and authorized catalog resolution;
-  11. recognized `Mcp-Param-*` validation through HTTP-05;
-  12. capability/extension validation;
-  13. sealed framework guards followed by the typed middleware,
-      handler, response-validation, cache-commit, and serialization
-      pipeline from SRV-MW-01.
-- At stage 4, validate one nonempty bounded RFC 9110 `method = token`
-  using the exact ASCII `tchar` grammar and preserve its bytes without
-  uppercasing, lowercasing, Unicode folding, or another normalization.
-  Method comparison is case-sensitive: only exact uppercase `POST`,
-  `OPTIONS`, and the exact legacy-enabled `GET`/`DELETE` spellings can
-  enter those named branches. Exact `OPTIONS` alone reaches preflight.
-  FastMCP deliberately treats every other syntactically valid token—
-  including `post`, `Post`, `options`, another case variant, or an
-  otherwise unknown token—as a recognized but non-allowed attempt
-  against this one configured MCP target. It takes the common terminal
-  HTTP 405 branch after the Origin check and before body parsing, era
-  selection, authentication, or application lookup, with the exact
-  bind-time `Allow` field below and an empty body; this target policy
-  emits no alternative 501 branch.
-  Malformed/non-token method bytes fail request-line admission and can
-  never be repaired into a known method.
-- Export typed stage outputs so later packages cannot reorder or
-  repeat parsing.
-- Keep `TransportRequestParts` private to `fastmcp-transport`.
-- Invoke `IngressAuthenticator` inside transport and export only
-  `AuthenticatedTransportIngress` plus the optional safe
-  `ValidatedForwardingHeaders` capsule.
-- Freeze
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`.
-  Every bound MCP endpoint captures exactly one immutable builder-
-  validated policy:
-  `LatestOnly`, `ModernWithLegacy`, or `LegacyOnly`.
-  `LatestOnly` is the unconditional core default.
-  `ModernWithLegacy` and `LegacyOnly` are constructible only when the
-  `legacy-2025-11-25` feature is compiled and LEG-02 supplies a live
-  adapter-installation receipt for that endpoint; otherwise builder
-  validation returns typed `FeatureUnavailable` before bind. Runtime
-  input can never switch policy, and one endpoint cannot fall through
-  to a branch whose adapter is absent.
-- Freeze `ModernEraMarker` as any of the four provably final-only
-  request metadata keys
-  `_meta["io.modelcontextprotocol/protocolVersion"]`,
-  `_meta["io.modelcontextprotocol/clientCapabilities"]`,
-  `_meta["io.modelcontextprotocol/clientInfo"]`, or
-  `_meta["io.modelcontextprotocol/logLevel"]`; either exact final-only
-  core request method `server/discover` or `subscriptions/listen`;
-  final-only MRTR retry member `params.inputResponses` or
-  `params.requestState` when present at its valid shared-method
-  `tools/call`, `resources/read`, or `prompts/get` path; any method in
-  the bind-time frozen registry of
-  enabled client→server extension descriptors whose EXT-01
-  `ExtensionHttpEraDisposition` is exactly `ModernExclusive`, whether
-  request or notification; or any `Mcp-Method`, `Mcp-Name`, or
-  registered modern `Mcp-Param-*` routing header. A descriptor marked
-  `EraAmbiguous` is not a method-text marker and remains governed by
-  the version/Session table. Core `notifications/cancelled` is
-  deliberately not a marker: it is valid in sessioned `2025-11-25`
-  HTTP but forbidden only after the final modern era is selected.
-  Registry lookup uses only the public immutable descriptor inventory
-  captured before bind, never authentication, authorization,
-  negotiated capabilities, a private catalog, or an application
-  handler. Freeze the dated-core inventory so every final
-  client-request method is classified exactly once as one of the two
-  final-only method markers or as era-ambiguous/shared, and reject an
-  omitted, duplicate, or reclassified member at build/test time.
-  Freeze a
-  `LegacyOnlyHeaderMarker` as the syntactic presence of a singleton,
-  bounded
-  `Mcp-Session-Id` or `Last-Event-ID` after common header validation.
-  Duplicate, malformed, or over-limit forms fail as header/framing
-  errors and never participate in fallback.
-- Freeze
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`
-  only for `ModernWithLegacy`, with this version-first exhaustive
-  matrix:
-  1. An exact `MCP-Protocol-Version: 2025-11-25` selects legacy only
-     when no `ModernEraMarker` is present. If one is present, return
-     the terminal HTTP 400/`-32020` cross-era error at stage 7, with no
-     Session/event-store lookup.
-  2. Any other single syntactically valid present version—including
-     exact `2026-07-28` and a syntactically valid unsupported
-     value—selects the non-legacy modern-validation branch. A
-     well-formed `Mcp-Session-Id` or `Last-Event-ID` is ignored and
-     cannot affect context or trigger lookup; malformed common header
-     syntax still fails. Header/body mismatch and supported-version
-     checks later produce their ordinary `-32020`/`-32022` outcomes.
-  3. With no version header, a `ModernEraMarker` plus either
-     `LegacyOnlyHeaderMarker` is the same terminal cross-era error. A
-     modern marker without either legacy-only header selects modern.
-  4. With no version header and no modern marker, one well-formed
-     `Mcp-Session-Id` selects legacy; an accompanying well-formed
-     `Last-Event-ID` remains legacy replay input. A lone
-     `Last-Event-ID` selects no era and returns the fixed HTTP 400
-     prior-version missing-session/header outcome with no event-store
-     lookup.
-  5. With no version or marker, an exact legacy `initialize` selects
-     legacy. Every other structurally parsed request or notification,
-     including an unregistered or era-ambiguous notification, is a
-     modern candidate and reaches the applicable modern unknown/
-     forbidden/direction validation; a later modern validation failure
-     never downgrades. A structurally parsed response on server ingress
-     takes the fixed modern wrong-direction/invalid-request path. Row 4
-     still selects legacy for a well-formed Session with an otherwise
-     unmarked method, where the legacy adapter then applies its own
-     method/direction rules; the classifier never asks whether that
-     method is implemented.
-  Era classification may inspect syntax but must never query Session
-  membership, expiry, owner, authorization, or event-store state.
-- Freeze the `LatestOnly` table under the umbrella profile:
-  every structurally parsed body-bearing MCP POST or registered
-  extension notification stays on the modern-validation branch,
-  regardless of absent/exact-legacy/unsupported version or a
-  well-formed `Mcp-Session-Id`/`Last-Event-ID`. Well-formed legacy-only
-  headers are ignored with no Session/event-store lookup; malformed
-  common headers still fail their ordinary syntax/bound checks.
-  A modern-shaped request whose header/body version agree on
-  `2025-11-25` receives ordinary `-32022` with supported
-  `["2026-07-28"]`; a mismatch receives `-32020`; other missing modern
-  metadata follows its normal error. A structurally valid legacy
-  `initialize` receives the fixed modern-only actionable HTTP 400
-  JSON-RPC `-32601` diagnostic with message
-  `Initialization-based MCP is not enabled` and exact bounded data
-  `{"supported":["2026-07-28"]}`—never a fabricated requested version,
-  Session creation, or adapter lookup. Actual MCP GET/DELETE receives
-  405 after common validation. No modern validation, auth, transport,
-  or application failure can trigger legacy retry or reclassification.
-- Freeze `LegacyOnly` as a separate LEG-02-owned table under the same
-  umbrella profile, never as the default or a branch of
-  `LatestOnly`:
-  1. An exact present `2025-11-25` version with no
-     `ModernEraMarker` enters LEG-02 validation. Adding a modern marker
-     is the terminal non-modern HTTP 400/JSON-RPC `-32600`
-     `Cross-era request is invalid` response, with no Session lookup.
-  2. Any other syntactically valid present version, or any modern
-     marker without an exact legacy version, receives that same fixed
-     non-modern 400 rejection on POST. It never emits recognized
-     modern `-32020..=-32022`, invokes modern dispatch, or changes the
-     endpoint policy.
-  3. With version absent and no modern marker, exact `initialize` or a
-     well-formed Session selects LEG-02. An accompanying
-     `Last-Event-ID` is replay input only after Session selection; a
-     lone one and every other body-bearing non-initialize POST receive
-     LEG-02's fixed missing-session/header HTTP 400 with no lookup.
-  4. GET/DELETE reaches LEG-02 only with its required exact
-     well-formed Session/version shape and no modern marker. Missing
-     Session receives the fixed no-lookup prior-version error;
-     nonlegacy version, modern marker, or another HTTP method receives
-     HTTP 405 with no modern JSON-RPC body.
-  This mode advertises no modern discovery/capability, cannot be
-  inferred from request bytes, and performs Session/event lookup only
-  after a row explicitly selects LEG-02 and transport authentication
-  succeeds.
-- After transport authentication, let the legacy branch perform the
-  exact session lookup and authorization. Unknown, expired,
-  unauthorized, wrong-owner, and malformed-after-decoding session
-  identifiers use one prior-version error/status/body shape, bounded
-  lookup/timing class, and redacted diagnostics; a pre-auth stage
-  cannot reveal whether an identifier exists.
-- Under `LatestOnly`, treat every structurally parsed body-bearing
-  request as a modern candidate. Under `ModernWithLegacy`, treat every
-  request not selected by its frozen legacy rows as modern. A malformed
-  modern request never downgrades.
-- Complete classification before authentication, so 401, 403, 429,
-  5xx, timeouts, and auth-provider failures never reclassify an era.
-- Apply allowed methods only in the era-specific branch: modern
-  accepts POST messages; LEG-02 owns prior-version POST, optional GET
-  stream, and DELETE session rules.
-- Defer complete multi-fault integration enforcement to HTTP-06.
-- Validate Origin before rejecting an otherwise unsupported HTTP
-  method.
-- Treat OPTIONS with valid CORS preflight fields as a separate
-  non-MCP branch; it carries no JSON-RPC body and never reaches auth or
-  dispatch.
-- Require preflight `Access-Control-Request-Method: POST` and require
-  each requested header to be in the configured allowlist.
-- Build one immutable `ConfiguredMcpAllowMethods` at endpoint bind from
-  local profile/install receipts, never request bytes. Canonical order
-  is `POST`, optional legacy `GET`, optional legacy `DELETE`, optional
-  CORS-preflight `OPTIONS`, filtering disabled entries and emitting
-  each token once. `POST` is present for every bound MCP endpoint;
-  `GET`/`DELETE` appear only while the exact legacy adapter operation is
-  installed for `ModernWithLegacy` or `LegacyOnly`; `OPTIONS` appears
-  only while the preflight branch is configured. Every HTTP 405 from
-  this MCP target—case-variant/other tokens, modern GET/DELETE, or an
-  era-specific disallowed method—uses one canonical `Allow` field from
-  that captured set and an empty body. It cannot echo, add, remove, or
-  reorder a method based on the attempted token, headers, body,
-  version, Session existence, authentication, or application state.
-- Accept only POST for an actual modern MCP message after era
-  classification.
-- Return the common 405/`ConfiguredMcpAllowMethods` response for modern
-  GET and DELETE.
-- Keep health endpoints separate.
-- Validate a present Origin on every request.
-- Return 403 for a rejected Origin. If policy includes the optional
-  JSON-RPC body, construct only PRT-01's omitted-ID
-  `UncorrelatedJsonRpcErrorResponse`; never synthesize null or guess
-  an unparsed request ID.
-- Bind loopback by default on `127.0.0.1` and `::1`.
-- Require explicit configuration for wildcard or non-loopback bind.
-- For every OAuth-protected deployment, require either direct HTTPS or
-  a configured trusted TLS terminator whose exact public MCP endpoint
-  and `CanonicalResourceId` use HTTPS. There is no loopback exception
-  for an OAuth resource server or bearer-token target; OAuth permits
-  cleartext loopback only for client redirect URIs. A direct loopback
-  HTTP MCP listener remains available solely to unauthenticated/non-
-  OAuth modes, or as an internal hop that accepts OAuth traffic only
-  with confidential, integrity-protected, mutually authenticated
-  trusted-terminator provenance.
-- Represent that provenance as sealed
-  `TlsProtectionEvidence::{DirectTls, TrustedTerminator}` created by
-  connection admission, never a raw `Forwarded`/`X-Forwarded-*` value.
-  A terminator profile names the exact public HTTPS origin/path,
-  internal-hop protection mechanism, certificate/route owner, header
-  strip-and-rebuild contract, and configuration generation. Admit only
-  an OS-isolated local channel whose peer credentials and permissions
-  attest confidentiality, integrity, and terminator identity, or a
-  cryptographically protected channel such as mutually authenticated
-  TLS. A source-address allowlist alone is insufficient; it may
-  contribute only on a demonstrably OS-isolated loopback boundary and
-  never authorizes plaintext private-network TCP. Startup rejects
-  OAuth enablement without one of these proofs; a request carrying
-  Authorization without the configured proof is rejected before
-  credential parsing or challenge/dispatch. Connection admission
-  strips every client-supplied forwarding/protection header and lets
-  only the attested terminator rebuild the sealed capsule.
-- Derive the OAuth resource from that configured public HTTPS URL,
-  never the listener URL, raw Host, or untrusted forwarded headers.
-- Honor forwarded headers only from configured trusted proxies.
-- Replace wildcard CORS with an allowlist.
-- Emit `Vary: Origin` where responses vary.
-- Allow Authorization and required MCP headers in valid preflight
-  responses.
-- Require a single JSON-RPC request or notification body.
-- Map invalid JSON to HTTP 400 plus PRT-01's omitted-ID parse error.
-  Map an invalid request with no admitted ID to HTTP 400 plus its
-  omitted-ID invalid-request error; if one valid ID is unambiguously
-  readable, return the correlated invalid-request error with that
-  exact ID. A structurally valid notification remains response-free at
-  the JSON-RPC layer and follows only the dated HTTP accepted/rejected
-  notification status/body rules.
-- Require exactly one bounded request `Content-Type` field for every
-  body-bearing MCP POST. Parse it without sniffing; the media-type
-  essence must be ASCII-case-insensitive `application/json`, with no
-  parameter except an optional single case-insensitive
-  `charset=utf-8`. Reject absence, duplicates, malformed syntax,
-  another charset/parameter, or another media type with HTTP
-  `415 Unsupported Media Type` and an empty body before JSON parsing.
-  This transport failure never drives era downgrade or a JSON-RPC
-  waiter.
-- Parse `Content-Encoding` under RFC 9110 and accept only absence or
-  exactly one semantic bare token that is ASCII-case-insensitively equal
-  to `identity`. First ignore up to LIMIT-01's bound of leading,
-  interior, or trailing empty RFC 9110 `#list` elements; they do not
-  count toward coding cardinality. Reject a present all-empty value,
-  empty-element-count overflow, parameters, duplicate field lines, two
-  or more semantic codings, gzip, br, deflate, or every other coding
-  before body processing with HTTP `415 Unsupported Media Type` and an
-  empty body, and disable adapter auto-decompression. On a 415 caused
-  specifically by content coding, emit canonical
-  `Accept-Encoding: identity`; never emit that response field on the
-  distinct content-type-caused 415. Local uncoded response
-  representations omit `Content-Encoding`.
-- Parse every modern POST's bounded `Accept` field as an RFC 9110
-  comma-list after combining repeated field lines in wire order.
-  Ignore up to LIMIT-01's bound of leading, interior, or trailing empty
-  `#list` elements before semantic cardinality and negotiation; empty
-  elements do not count as media ranges, while an all-empty value
-  remains insufficient and count overflow is malformed. Media type/
-  type-subtype comparison is ASCII case-insensitive; quoted strings,
-  quality values, parameters, semantic range cardinality, empty-element
-  count, and aggregate bytes are parsed before negotiation. Require at
-  least one explicit, parameterless `application/json` range and one
-  explicit, parameterless `text/event-stream` range whose highest valid
-  quality is greater than zero. `*/*`, subtype wildcards, a range with
-  media parameters, an absent/all-empty range set, or only `q=0` does
-  not satisfy the final client's explicit dual-support MUST. RFC 9110
-  has no
-  `accept-ext` grammar: process any case-insensitive parameter named
-  `q` as the weight regardless of its position, and treat every other
-  parameter before or after it as a media-range parameter. Therefore a
-  range such as `application/json;q=1;foo=bar` is not parameterless and
-  cannot satisfy this policy unless another qualifying parameterless
-  range is present.
-- Make this a documented strict FastMCP server enforcement policy, not
-  an invented MCP JSON-RPC error allocation. After Origin, endpoint,
-  framing, request media type/body structural parse, and modern-era
-  classification, validate required request body `_meta` first; then
-  reject a missing, malformed, over-limit, or insufficient `Accept`
-  field with HTTP `406 Not Acceptable` and an empty body before routing
-  header/version/capability checks, authentication, or dispatch. The
-  outcome never triggers era downgrade and cannot complete a JSON-RPC
-  waiter from an error body.
-- For every modern JSON-RPC request, require
-  `_meta["io.modelcontextprotocol/protocolVersion"]` and
-  `_meta["io.modelcontextprotocol/clientCapabilities"]` in the body.
-- Validate required body metadata before required HTTP routing
-  headers. Missing/malformed body `_meta`, body protocol version, or
-  body client capabilities returns HTTP 400 plus `-32602`.
-- For modern JSON-RPC requests, require `MCP-Protocol-Version` and
-  `Mcp-Method`, plus `Mcp-Name` for call/read/get and frozen
-  registered extension request methods through HDR-01.
-- Core `2026-07-28` defines no client-to-server HTTP notification and
-  no core request-header requirement for one. Accept an extension
-  notification only if its frozen descriptor declares the direction
-  and HTTP contract; validate only those declared headers/params.
-  Never invent core `MCP-Protocol-Version`, `Mcp-Method`, or
-  `Mcp-Name` requirements for it, and continue to forbid modern HTTP
-  `notifications/cancelled`.
-- Decode the exact Base64 sentinel format through HDR-01.
-- Apply HDR-01's single RFC 9110 `SP`/`HTAB` OWS normalization before
-  sentinel recognition and header/body equality; no adapter-specific
-  trim, Unicode whitespace rule, or second normalization is allowed.
-- Compare header and body values after decoding.
-- Within modern request stage 8, after required body metadata is
-  valid, validate missing, duplicate, malformed, and mismatched
-  required headers before checking whether a matching requested
-  protocol version is supported.
-- Return 400 plus `-32020` for a missing, malformed, duplicate, or
-  mismatched required header.
-- Return 400 plus `-32022` only when the header and body version match
-  syntactically but the requested version is unsupported.
-- After authentication/authorization and descriptor resolution,
-  return HTTP 400 plus `-32021` with exact
-  `data.requiredCapabilities` when any generic, MRTR, Tasks, or
-  extension-backed operation lacks a required client capability.
-- Preserve structurally valid unknown methods for the authenticated
-  protocol-dispatch stage, which returns HTTP 404 plus final
-  JSON-RPC `-32601`.
-- Return 202 with an empty body for accepted notifications only under
-  the ownership contract completed by HTTP-06.
-- A rejected notification may carry only PRT-01's omitted-ID
-  uncorrelated transport error body. It cannot consume/correlate a
-  request ID or be decoded as an ordinary response.
-- Ignore well-formed `Mcp-Session-Id` and `Last-Event-ID` on every
-  selected modern branch, including all `LatestOnly` requests.
-- Enforce header and body size limits.
-- Reject ambiguous transfer framing.
-- Defer schema-derived `Mcp-Param-*` validation until after transport
-  authentication and authorized tool lookup in HTTP-05.
-
-Acceptance:
-
-- All modern MCP messages target the one configured endpoint, while
-  health/administrative routes cannot be confused with it.
-- Owned stages run before authentication or application dispatch.
-- Pre-auth error HTTP status and JSON-RPC body match the final rules.
-- Required body-metadata failures are HTTP 400/`-32602`; required
-  `Accept` failures are HTTP 406 with no body; required routing-header/
-  mismatch failures are HTTP 400/`-32020`; matching unsupported
-  versions are HTTP 400/`-32022`; missing required capabilities are
-  HTTP 400/`-32021`; authenticated unknown methods are HTTP
-  404/`-32601`.
-- Unsupported request content type and unacceptable request content
-  coding are distinct empty-body HTTP 415 outcomes; only the latter
-  carries canonical `Accept-Encoding: identity`.
-- Up to the configured reasonable number of empty RFC 9110
-  `Content-Encoding`/`Accept` list elements are ignored before semantic
-  cardinality; all-empty values and empty-element saturation remain
-  deterministic failures.
-- Header names are case-insensitive.
-- HTTP method tokens are byte-exact and case-sensitive; method syntax
-  uses RFC 9110 `tchar`, but a syntactically valid differently cased
-  known spelling remains an unsupported method and never selects the
-  corresponding branch.
-- Every MCP-target 405 has an empty body and exactly the bind-time
-  canonical `Allow` set for that endpoint profile; no peer input or
-  runtime lookup can change it.
-- MCP application/routing values—`Mcp-Method`, decoded `Mcp-Name` and
-  `Mcp-Param-*`, and protocol-version equality—remain case-sensitive
-  after their explicitly defined normalization. HTTP grammar-defined
-  tokens, including media types, charset and content codings, follow
-  their own case rules.
-- The endpoint's immutable
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  selection is validated before bind and cannot be changed by peer
-  input.
-- Under core-default `LatestOnly`, every body-bearing POST remains
-  modern; well-formed legacy-only headers cause zero Session/event-
-  store lookup, matching legacy version yields `-32022`, legacy
-  initialize yields the exact supported-version diagnostic, and MCP
-  GET/DELETE yields 405. No legacy adapter symbol/state is required or
-  reachable.
-- Only under installed `ModernWithLegacy` is the frozen classifier
-  version-first: exact modern or another present non-legacy version
-  cannot fall back, and its well-formed legacy-only headers cannot
-  affect request context or cause Session/event-store lookup. Exact
-  legacy plus a modern marker and absent version plus mixed modern/
-  legacy markers are terminal conflicts. Absent version plus
-  Session-only selects legacy; absent version plus a lone
-  `Last-Event-ID` is the fixed no-lookup error.
-- `LegacyOnly` is feature/receipt-gated, exposes no modern discovery,
-  and cannot share a fallback path with `LatestOnly`.
-- This package never resolves an authorized tool, parameter schema, or
-  private catalog.
-- Duplicate singleton protocol headers are rejected.
-- OAuth/PRM/bearer paths are reachable only with sealed direct-TLS or
-  trusted-terminator evidence for the exact configured public HTTPS
-  resource; loopback binding or source-address policy alone grants no
-  exception, and the internal hop has attested confidentiality,
-  integrity, and peer identity.
+- Bind one immutable configured MCP path at server construction.  The bound
+  route accepts byte-exact `POST` only; every other method or alternate path
+  receives the fixed empty-body rejection for this route and cannot reach
+  body parsing, authentication, router dispatch, or response allocation.
+  HTTP-06 may own separately configured generic security/preflight handling;
+  it does not broaden HTTP-02's MCP method set.
+- Apply LIMIT-01 bounds before allocation and before parsing: request-line,
+  header count/bytes, singleton duplication, body bytes, response bytes,
+  JSON nesting/string/member limits, and the maximum request-scoped SSE
+  frame/count/byte budget.  Reject malformed field syntax, conflicting
+  `Content-Length`/transfer framing, and unsupported or ambiguous transfer
+  framing before consuming an application body.
+- Require the modern request media type and the one admitted content-coding
+  policy.  Unsupported media type and unsupported/ambiguous coding are
+  transport failures with no JSON-RPC dispatch.  Parse a bounded UTF-8 JSON
+  object only after those checks.
+- Reject a top-level JSON-RPC batch array, including an array-of-one valid
+  request and a mixed array, through PRT-01 raw admission before
+  authentication, dispatch, correlation, response-writer allocation, cache,
+  task/session/subscription, proxy, or any other state effect.
+- Use HDR-01 exactly once for HTTP field-name handling, singleton rules,
+  OWS, routing-header syntax, and base64 sentinel decoding.  Do not duplicate
+  header normalization, invent new routing fields, or apply Unicode or
+  second-layer whitespace rules.  Compare any required HTTP routing values to the decoded
+  modern JSON-RPC request only at the HDR-01-defined boundary.
+- Require the final PRT-03 modern protocol version and strict JSON-RPC
+  request shape.  A request that is malformed, has an invalid ID shape, or
+  names an unsupported protocol version receives the registered PRT-03
+  transport/JSON-RPC error with a deterministic precedence.  No request can
+  alter the supported-version set.
+- Negotiate response representation from the request's `Accept` fields:
+  select JSON when JSON is acceptable, select SSE only when SSE is
+  acceptable, and reject when neither representation is acceptable.  The
+  chosen representation is stored in request-local state.  An SSE response
+  emits only the frames needed for this request's terminal JSON-RPC outcome,
+  observes cancellation/backpressure and LIMIT-01 bounds, then closes.
+- After admission succeeds, hand the bounded validated request and
+  request-local response writer to AUTH-00 and the normal modern dispatcher.
+  Authentication, authorization, capability checks, method resolution,
+  parameter validation, and application execution remain downstream.  HTTP-02
+  never resolves a private catalog, authorizes a tool, or completes a request
+  from test-only state.
+- Preserve generic HTTP security and cancellation requirements that are
+  intrinsic to this entry boundary: authenticate only after safe admission,
+  propagate the request `McpContext` cancellation/deadline to the selected
+  response writer, suppress response emission after cancellation, avoid
+  credential/header logging, and make every early rejection side-effect free.
 
 Tests:
 
-- One-endpoint routing across ordinary JSON, request-scoped SSE,
-  subscription listen, and enabled extension notifications, plus
-  alternate-method-path and health-route confusion negatives.
-- Raw-socket matrix for every required header.
-- Missing, duplicate, malformed, and mismatched values.
-- Request-method goldens cover every ASCII `tchar`, one-character and
-  request-line N/N+1 token boundaries, exact uppercase
-  `POST`/`OPTIONS` and legacy-gated `GET`/`DELETE`, lowercase/mixed-case
-  look-alikes, unknown valid tokens, empty/separator/space/control/non-
-  ASCII/obs-text invalid forms, and proof only exact `OPTIONS` reaches
-  preflight while only exact `POST` reaches body/era parsing.
-  Cross every 405-producing token and era-specific branch with
-  `LatestOnly`, `ModernWithLegacy`, and `LegacyOnly`; legacy GET/DELETE
-  installed independently where the adapter permits, preflight
-  disabled/enabled, forged method/version/Session/header/body inputs,
-  and exact canonical `Allow` subsets/order. Assert one field, no
-  duplicates, empty body, zero Session/auth/application lookup, and no
-  request-derived method reflection; the deliberate fixed-target
-  policy has no 501 path.
-- `Accept` matrix covering absent/empty/malformed/over-limit,
-  case variants, combined and repeated field lines, comma lists,
-  leading/interior/trailing empty elements around each required range,
-  all-empty lists, and empty-element-count N/N+1 with qualifying ranges,
-  explicit JSON+SSE in either order, per-range `q=0`/positive/duplicate
-  maxima, `q` first/middle/last recognition, invalid quality precision/
-  range, media parameters before/after `q`, post-`q` unknown-parameter
-  insufficiency with and without a separate parameterless range, no
-  legacy `accept-ext`, `*/*` and subtype wildcards, unrelated ranges,
-  and exact empty-body 406. Cross each failure with malformed required body
-  metadata and later routing/version/auth faults to prove the frozen
-  precedence and no downgrade/dispatch/waiter completion.
-- Request `Content-Type` matrix covering exact/case variants, optional
-  UTF-8 charset, absent/duplicate/malformed/over-limit, non-UTF-8/
-  duplicate/unknown parameters, JSON suffix look-alikes, and other
-  media types; prove exact empty-body 415 precedence before JSON/era
-  parsing and no downgrade/waiter interaction.
-- Base64 sentinel boundary cases.
-- Raw-socket `Mcp-Name: "  <exact-name>  "` acceptance plus
-  leading/trailing HTAB, mixed OWS, interior-space preservation,
-  obs-fold/CRLF rejection, and OWS-before-sentinel ordering cases.
-- CRLF and header-smuggling cases.
-- Content-Length/transfer-encoding ambiguity.
-- Absent plus lowercase/uppercase/mixed-case singleton `identity`
-  content-encoding positives plus leading/interior/trailing bounded
-  empty elements around that one semantic token; present-all-empty,
-  empty-element-count N/N+1, parameterized, duplicate-field/multiple-
-  semantic-coding/non-identity, chunked-plus-encoded, truncated/
-  mislabeled, and decompression-bomb no-auto-decode negatives. Prove
-  empty-body 415 precedence and exact `Accept-Encoding: identity` only
-  for the coding-caused 415, absence on the content-type-caused 415,
-  and no downgrade/parse/dispatch/waiter effect; local response capture
-  proves uncoded emission omits `Content-Encoding`.
-- Origin allow/deny cases.
-- Rejected-Origin and rejected-notification optional-body tests:
-  omitted ID accepted only in the uncorrelated transport variant,
-  `id:null` rejected, and no in-flight request registry interaction.
-- Host and forwarded-header spoofing.
-- Wildcard-bind diagnostics.
-- Trusted-proxy behavior; direct TLS, peer-credentialed OS-isolated
-  local channel, and mTLS terminator positives; missing/forged/stale/
-  wrong-route terminator evidence; plaintext private-network hop,
-  generic source/IP allowlist, on-path mutation, and client-injected
-  forwarding/protection-header negatives; public-HTTPS/internal-
-  loopback-HTTP split with proven OS isolation; startup rejection
-  without transport protection; and direct loopback-HTTP
-  Authorization/PRM negatives while unauthenticated non-OAuth
-  loopback HTTP remains available.
-- Credentialed CORS and preflight.
-- Valid and invalid OPTIONS preflight without JSON parsing.
-- Preflight requested-method and requested-header matrix.
-- Invalid-Origin plus wrong-method precedence.
-- Pre-auth multi-fault precedence matrix.
-- Missing/malformed/mismatch-versus-unsupported-version precedence.
-- Body `_meta`/exact namespaced protocol-version/client-capabilities
-  missing-or-malformed versus header missing/malformed/mismatch versus
-  unsupported-version multi-fault ordering.
-- Exact HTTP 400/`-32021` generic, MRTR, Tasks, and registered
-  extension cases plus precedence against earlier header/auth faults.
-- Core `LatestOnly` exhaustive table: every absent/exact-legacy/exact-
-  modern/unsupported version crossed with no/Session/Last-Event-ID/
-  both legacy headers and no/modern body marker; exact zero Session/
-  event lookup on every row; malformed-header failure; matching legacy
-  version `-32022`; header/body mismatch `-32020`; fixed legacy-
-  initialize supported-version diagnostic; MCP GET/DELETE 405; and no
-  legacy symbol/adapter/state in a feature-off build.
-- `ModernWithLegacy` exact classifier: legacy initialize, valid legacy session,
-  unknown/expired/unauthorized legacy session non-oracle, no pre-auth
-  session-store access, malformed modern no-downgrade, exact
-  `ModernEraMarker` inventory, each of the four final-only metadata
-  keys, exact final-only core request-method set
-  `{server/discover, subscriptions/listen}`, MRTR
-  `params.inputResponses`/`params.requestState` at each valid shared
-  method path, modern routing, and every enabled
-  registered `ModernExclusive` extension request/notification method
-  combined with Session and/or `Last-Event-ID` under absent/legacy/
-  modern/unsupported version headers. Cross
-  `EraAmbiguous`, unregistered, and otherwise era-ambiguous
-  notifications plus a server-ingress response over the same
-  version/header matrix; assert the exact modern/cross-era/legacy-
-  unknown/wrong-direction disposition, Session-only fallback for an
-  otherwise unmarked method, Last-Event-ID-only missing-session error,
-  zero Session/event lookup on every true marker row, no lookup on
-  cross-era conflict or modern ignore, and auth/status
-  no-reclassification. Separately cross shared core
-  `notifications/cancelled`: exact legacy or absent-version plus
-  Session selects legacy cancellation; exact modern/nonlegacy or
-  absent-version without Session selects modern and then applies the
-  final HTTP prohibition; `LegacyOnly` admits only its legacy-selected
-  rows. A shared cancellation method string is never itself a marker.
-  Mutate the dated final-client-request inventory by omitting,
-  duplicating, or reclassifying every member and require failure; cross
-  each MRTR retry marker with exact-legacy/absent version plus Session
-  and prove terminal cross-era rejection with zero legacy lookup.
-  Mutate every row and precedence edge of
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`
-  and require a failing fixture.
-- `LegacyOnly` feature/installation validation, exact prior-version
-  open/session matrix, modern-marker/nonlegacy-version fixed
-  rejection, no modern discovery, and no byte-driven policy switch.
-- Builder tests reject `ModernWithLegacy`/`LegacyOnly` without both
-  the compiled feature and exact LEG-02 installation receipt before
-  bind; mutate every umbrella policy/table identity and require
-  failure.
-- Structurally valid unknown method passthrough and unsupported HTTP
-  method cases.
-- Registered extension notification without invented core request
-  headers; self-contained/negotiated-owner activation-proof structural
-  positives and absent/malformed/prior-request/connection-state
-  negatives; forbidden core cancellation notification; no-ID
-  error-body semantics; and successful empty-body 202 cases.
+- `http_02_a_positive`: a real public server entrypoint accepts a bounded,
+  well-formed 2026-07-28 POST on the configured path, validates the strict
+  JSON-RPC request, and observes exactly one JSON or one finite SSE response
+  selected by `Accept`.
+- `http_02_a_planted_negative`: change only one admission dimension
+  (configured path, exact method, content type/coding, singleton routing
+  field, modern version, or JSON-RPC request shape) and prove the registered
+  typed error plus no authentication, dispatch, response-stream allocation,
+  or state mutation.
+- `http_02_b_positive` and `http_02_b_planted_negative`: prove
+  request-scoped SSE terminal closure, response byte/frame bounds,
+  cancellation/backpressure teardown, and the same-path negative that would
+  otherwise leave a writer or response active.
+- `http_02_integration_positive` and
+  `http_02_integration_planted_negative`: exercise the shipped public
+  route through both implementation slices and prove the selected
+  representation cannot affect a later request.
+- `http_02_verification_positive` and
+  `http_02_verification_planted_negative`: independently verify the exact
+  integration revision, the complete discovered/started/passed frozen test
+  set, positive observables, planted negatives, and the no-claim boundary.
+- Rejection-only matrices cover non-POST methods, alternate paths, malformed
+  framing/headers/JSON, duplicate singleton headers, body and nesting limits,
+  unacceptable `Accept`, invalid version/header-body agreement, cancellation
+  before and during response emission, and empty-body pre-dispatch failures.
+- The same matrices cover array-of-one-valid-request and mixed top-level
+  JSON-RPC batch arrays, each proving the registered role-correct rejection
+  and zero authentication, dispatch, correlation, response-writer, cache,
+  task/session/subscription, proxy, or state effect.
+- Explicit no-claim rejection tests prove that HTTP-02 neither classifies an
+  era nor accepts a 2024-11-05 or planted 2025 request; does not initialize
+  lifecycle state; does not process legacy GET/message-POST, GET/DELETE,
+  `Mcp-Session-Id`, `Last-Event-ID`, replay/resumption, persistent
+  subscriptions, endpoint events, adapters, or downgrade paths.  Those
+  inputs must cause no legacy lookup, event-store access, session mutation,
+  or fallback dispatch.
+
+Evidence:
+
+- Bind each successful run to the exact revision/tree, configured endpoint,
+  public server entrypoint, profile/target/features, test discovery and
+  execution counts, selected response representation, terminal frame/byte
+  counts, cancellation outcome, and first-attempt result.
+- The positive observable is one admitted modern request whose response has
+  the negotiated content type and one terminal JSON-RPC outcome; the planted
+  negative observable is the registered typed rejection plus zero downstream
+  dispatch/allocation/state effects.
+- Independent verification is required before aggregate closure.  A plan edit,
+  fixture-only result, filtered test run, zero-test green result, or an
+  unbound process artifact earns no capability credit.
 
 Dependencies:
 
-- HTTP-01.
-- HDR-01.
-- PRT-03.
-- AUTH-00.
-- EXT-01.
-- LIMIT-01.
+- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
+- HDR-01 — `bd-mcp-2026-07-28-support-ahet.16`
+- PRT-03 — `bd-mcp-2026-07-28-support-ahet.10`
+- AUTH-00 — `bd-mcp-2026-07-28-support-ahet.12`
+- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
+- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
+- Independent verification gate — `bd-mcp-http-02-verification-wq1i`,
+  which depends on `bd-mcp-http-02-integration-ofev`; that integration
+  depends on `bd-mcp-http-02-a-78gg` and `bd-mcp-http-02-b-37a9`.
+
+Tracker mapping:
+
+- Plan package ID: HTTP-02
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.26`
+- Parent formal prerequisites: HTTP-01, HDR-01, PRT-03, AUTH-00, EXT-01,
+  LIMIT-01, and `bd-mcp-http-02-verification-wq1i`.
+- Dependency direction: HTTP-02 is blocked by every listed prerequisite; the
+  implementation A/B → integration → verification chain is mandatory before
+  parent closure.
+- No-claim boundary: HTTP-02 proves only modern server POST admission and
+  request-scoped JSON/SSE response selection.  It does not prove legacy
+  transport support, Tasks, Apps, subscriptions, gateway translation,
+  automatic era negotiation, or aggregate MCP conformance.
 
 ### HTTP-03 — Implement the modern HTTP client
 
@@ -12285,7 +12240,7 @@ Dependencies:
 - SRV-MW-01.
 - PRT-03.
 
-### LEG-01 — Implement exact MCP 2025-11-25 wire parity
+### LEG-01 — Implement exact MCP 2024-11-05 wire parity
 
 Outcome:
 
@@ -12298,10 +12253,14 @@ approximation assembled from current legacy code.
 
 Implementation:
 
-- Pin the official `2025-11-25` TypeScript and JSON schemas.
+- Pin the official `2024-11-05` TypeScript and JSON schemas.
 - Implement its exact request, notification, response, method, and
   error unions.
 - Validate previous-version goldens.
+- Reject every top-level JSON-RPC batch array, including an array-of-one valid
+  request and a mixed array, through PRT-01 raw admission before lifecycle,
+  dispatch, correlation, authorization, subscription, cache, adapter, or
+  transport state mutation.
 - Define lossless translation for ordinary complete
   tool/resource/prompt results.
 - Map ordinary complete tool/resource/prompt results.
@@ -12310,16 +12269,19 @@ Implementation:
 - Return a clear unsupported-feature error for MRTR or task outcomes
   that cannot be represented.
 - Keep the adapter out of the canonical prelude.
-- Explicitly exclude the `2024-11-05` two-endpoint HTTP+SSE transport.
-- Leave existing excluded transport files physically present but
-  unreachable from public builders unless separate written work
-  authorizes a different disposition.
+- Treat exact 2024 two-endpoint HTTP+SSE as a positive transport capability
+  owned by LEG-HTTP-01 and consumed through this wire model; it is not
+  unreachable or deprecated inside the exact-2024 profile.
+- A planted `2025-11-25` schema/version is unsupported intermediary-era input
+  and cannot alias to exact 2024 or 2026.
 
 Acceptance:
 
 - Modern-only tests cannot import legacy Session accidentally.
 - Previous-version fixtures validate against the pinned schema.
-- No `2024-11-05` transport behavior is claimed.
+- LEG-HTTP-01 can consume the exact wire model for positive two-endpoint
+  HTTP+SSE operation, while modern Streamable HTTP cannot import legacy
+  connection/lifecycle state.
 - Every translation is classified as lossless, rejected, or handled
   entirely inside the previous-version implementation.
 - There is no Rust API compatibility wrapper.
@@ -12329,405 +12291,441 @@ Tests:
 - Previous-version wire parity.
 - Previous-version schema checksum.
 - Unsupported modern-result mapping.
-- Two-endpoint HTTP+SSE remains unreachable.
+- Public exact-2024 stdio and LEG-HTTP-01 HTTP+SSE wire fixtures.
+- Exact-2024 array-of-one-valid-request and mixed-array planted negatives at
+  stdio and LEG-HTTP-01 consumer ingress, proving no partial lifecycle,
+  dispatch, correlation, authorization, subscription, cache, adapter, or
+  transport mutation.
 
 Dependencies:
 
 - FND-03.
 - PRT-01.
 
-### LEG-02 — Implement the previous-version server adapter
+### LEG-02 — Exact MCP 2024-11-05 server protocol and lifecycle adapter
 
 Outcome:
 
-Serve MCP `2025-11-25` under explicitly enabled dual-era or legacy-only
-policy without exposing its Session to modern handlers.
+- LEG-02 provides one transport-neutral server adapter for exact MCP
+  2024-11-05 JSON-RPC protocol, lifecycle, capability state, messages, and
+  errors.
+- The adapter is constructed only with an explicit authenticated
+  `LegacyPeerBinding` supplied by a transport consumer.  STD-01 consumes it
+  for legacy stdio; LEG-HTTP-01 is the downstream consumer for the exact
+  two-endpoint HTTP+SSE transport.
+- One binding owns one bounded lifecycle:
+  `AwaitInitialize -> AwaitInitialized -> Operating -> Closed`.  Its
+  negotiated protocol version, peer identity, capabilities, and pending
+  operations cannot be inherited by another binding.
 
 Reason:
 
-Legacy-enabled servers need initialization-era behavior, but only at a
-strict ingress/egress boundary selected before bind.
+- MCP 2024-11-05 initialization and connection-scoped capabilities are
+  structurally different from a stateless request dispatcher.  Keeping the
+  exact wire and lifecycle rules behind one adapter prevents accidental
+  cross-protocol state sharing.
+- The protocol adapter must be reusable by stdio and the later HTTP+SSE
+  transport without parsing transport frames, choosing routes, or owning
+  reconnection behavior.
 
 Implementation:
 
-- Put initialize and initialized handling in the adapter.
-- Put legacy Session ownership in the adapter. Atomically admit
-  initialize against LIMIT-01's fixed pre-auth source plus deployment
-  creation rate, then reserve the Session count and worst-case control/
-  capability/subscription/replay bytes against the verified
-  `QuotaPartitionKey` before returning a cryptographically random
-  opaque Session ID. Bind the record to exact owner, token/lease
-  lifetime, origin, endpoint, protocol version, and adapter generation;
-  possession of an ID is never authorization.
-- Enforce idle and absolute Session lifetimes, bounded per-Session
-  subscriptions/control state, and deterministic close/disconnect/
-  expiry/shutdown cleanup with exact-once quota release. Anonymous
-  ingress may receive a private resumable Session only when AUTH-00
-  supplies a verified stable per-client owner; otherwise expose only
-  explicitly public connection-local behavior or reject creation.
-- Map legacy list behavior without exposing connection state to modern
-  handlers.
-- Keep direct previous-version sampling, roots, elicitation, and
-  logging inside the adapter.
-- Support previous-version resource subscriptions.
-- Support exact sessioned `2025-11-25` Streamable HTTP semantics,
-  including its specified optional GET stream, session header, and
-  resumability behavior.
-- Keep any needed event replay reachable only from this adapter. Bind
-  every retained encoded event and opaque monotonically ordered event
-  ID to the exact Session, owner/security partition, origin, protocol
-  version, stream generation, and positive finite event age. IDs are
-  not global and `Last-Event-ID` lookup has one non-oracular
-  unknown/expired/unauthorized/gap shape.
-- Admit event append count/bytes/rate and reconnect batch count/bytes
-  before retention or replay. On capacity saturation, terminate or
-  rotate only the affected stream with an explicit nonresumable/gap
-  outcome; never silently evict another tenant or discard an event
-  while still claiming that Session can resume across the gap.
-- Reauthenticate and revalidate current owner/grants/lease before every
-  replay. Token refresh may preserve access only through AUTH-00's
-  stable owner plus current grants; a changed/anonymous owner never
-  receives prior private events.
-- Ship only a bounded process-local Session/event store. Restart or
-  routing to another instance deterministically invalidates resumption
-  without revealing existence. Durable or multi-instance continuity
-  requires a future separately featured linearizable store, gate,
-  recovery/fencing evidence, and documentation; it is not claimed by
-  the dual-era profile.
-- Support previous-version stdio.
-- On successful bounded adapter/store/configuration installation for
-  one exact HTTP endpoint or stdio server-process configuration, use
-  FND-03's sealed issuer to create a non-forgeable binding-bound
-  `LegacyServerAdapterInstalledReceipt`. It carries the exact server
-  role, transport binding, adapter, policy, endpoint-or-process
-  configuration, security partition, store, limits, and generation
-  identities. HTTP-02 and STD-01 require the matching receipt before
-  either legacy-enabled era policy can bind or accept a frame;
-  compilation alone is insufficient, and a receipt for one binding,
-  role, policy, or generation cannot authorize another.
-- Consume HTTP-02's common stages 1 through 7, then own the legacy
-  branch of era-specific stage 8.
-- Consume
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  without weakening its `LatestOnly` isolation. Under
-  `ModernWithLegacy`, consume, without restating or broadening,
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`.
-  This adapter is selected only by exact version `2025-11-25` with no
-  modern marker, exact legacy `initialize` with version absent and no
-  marker, or a well-formed legacy Session with version absent and no
-  modern marker. An accompanying well-formed `Last-Event-ID` is replay
-  input only after Session-based legacy selection; a lone one gets the
-  fixed missing-session/header error without adapter lookup. Exact
-  modern or another present non-legacy version stays in modern
-  validation and ignores well-formed legacy-only headers. Exact legacy
-  plus a modern marker, or absent version plus mixed modern and
-  legacy-only markers, is HTTP-02's terminal cross-era error and never
-  reaches this adapter. Classification never tests whether a Session
-  or event exists.
-- Under `LegacyOnly`, implement HTTP-02's exact four-row table:
-  exact-legacy/no-modern-marker open or Session selection; fixed
-  non-modern 400/`-32600` for POST modern/nonlegacy/cross-era input;
-  absent-version non-initialize/no-Session and lone-Last-Event-ID fixed
-  no-lookup missing-session outcomes; and GET/DELETE admission only
-  with the exact prior-version Session/version shape. Never emit a
-  recognized modern error, dispatch `server/discover`, or reinterpret
-  bytes as `LatestOnly`.
-- Validate legacy session headers and lifecycle only after that
-  classification and transport authentication. Use the same bounded
-  lookup path and externally indistinguishable prior-version outcome
-  for unknown, expired, unauthorized, and wrong-owner Sessions.
-- Consume
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  without inventing a transport-local fallback. Under
-  `ModernWithLegacy`, STD-01 reaches this adapter only after FND-03's
-  one-shot first-frame classifier admits an exact legacy `initialize`
-  with no modern marker; the adapter owns that opening request and the
-  remainder of the process. Under `LegacyOnly`, it requires exact
-  legacy `initialize` as the first frame directly. Under `LatestOnly`
-  it is unreachable. Every invalid/malformed/mixed opening and
-  post-selection cross-era frame uses FND-03's fixed error/no-response
-  and terminal-close disposition; an adapter failure cannot return the
-  process to `Unclassified` or enter the modern router.
-- Never reinterpret a failed modern metadata/header/version check as
-  legacy.
-- Keep authentication and later HTTP failures outside the classifier;
-  401, 403, 429, 5xx, network errors, and timeouts cannot select
-  legacy mode.
-- Permit modern and legacy traffic concurrently without shared
-  identity.
-
-Acceptance:
-
-- Modern endpoints emit no legacy headers or lifecycle notifications.
-- Legacy Session types do not appear in modern router or handler
-  signatures.
-- Modern and previous-version clients can use one dual-era server
-  concurrently.
-- A legacy-only endpoint accepts only the exact previous-version table
-  and remains visibly non-modern; neither legacy-enabled policy can
-  bind on HTTP or stdio without its exact server-installation receipt.
-- A dual-era stdio process classifies once from its opening request; a
-  legacy-only process begins directly with exact initialize; no
-  malformed, mixed, failed, or later frame can switch or retry its era.
-- The server never advertises the excluded two-endpoint transport.
-- Session and replay churn remain within count/byte/rate/age/lifetime
-  bounds, and restart/multi-instance behavior matches the explicit
-  process-local claim.
+- Admit an exact `initialize` request only in `AwaitInitialize`.  Validate
+  the exact 2024-11-05 request version, client capabilities, client
+  information, and bounded initialization parameters through LEG-01; return
+  the exact 2024-11-05 initialized server version, server capabilities,
+  server information, and optional instructions.  Freeze those admitted
+  values before emitting the response.
+- Move to `AwaitInitialized` only after a successful initialize response.
+  Admit exactly `notifications/initialized` to enter `Operating`; reject
+  duplicate, early, late, malformed, or mismatched lifecycle messages with
+  the exact LEG-01 JSON-RPC error and without mutating negotiated state.
+  Close is terminal and releases every adapter-owned reservation exactly once.
+- In `Operating`, implement only the exact LEG-01-dispositioned 2024
+  server surface: ping; tools, resources, prompts, and completion requests;
+  resource subscribe/unsubscribe; client logging-level control; client
+  cancellation/progress/message notifications; and server-to-client
+  roots/list, sampling/createMessage, and ping requests when the negotiated
+  capability permits them.  Preserve exact method direction, parameter
+  shape, result shape, notification semantics, capability prerequisites, and
+  JSON-RPC error mapping.
+- Delegate ordinary tool/resource/prompt dispatch to SRV-01 only after the
+  lifecycle and negotiated capability boundary is satisfied.  The adapter
+  neither reimplements handler registration nor silently maps an unsupported
+  2024 member to another method.
+- Keep negotiated capabilities, request correlation, reverse requests,
+  resource subscriptions, logging level, cancellation/progress records, and
+  control queues in a bounded adapter state object keyed by the opaque
+  `LegacyPeerBinding`, its authenticated owner/security partition, and a
+  monotonically unique binding generation.  Binding identity alone never
+  authorizes state access.
+- Apply AUTH-00 before private operations and reverse requests.  Apply
+  LIMIT-01 before every lifecycle allocation, correlation insertion,
+  subscription/control-queue growth, and reverse request; reserve before
+  mutation and release on completion, cancellation, peer close, expiry, or
+  shutdown.  Diagnostics are bounded, redacted, and non-oracular.
+- Use XPORT-01's total `lossless | legacy-owned | rejected` disposition for
+  shared domain values.  A rejected or unrepresentable value leaves the
+  adapter state unchanged and uses the exact legacy error path.
+- Expose a transport-neutral inbound-message/outbound-message contract and
+  close signal only.  The adapter parses neither HTTP requests nor SSE
+  frames and does not bind URLs or own HTTP-level announcements.  LEG-HTTP-01
+  later supplies the exact HTTP+SSE peer binding and independently owns its
+  GET/POST framing, endpoint advertisement, reconnect handling, security,
+  and teardown.
+- STD-01 invokes the same adapter through its explicitly selected legacy
+  stdio peer binding.  The adapter receives a preselected exact 2024 binding
+  or is not constructed.
 
 Tests:
 
-- Previous-version initialization.
-- Previous-version stdio under `ModernWithLegacy` and `LegacyOnly`,
-  including exact first-frame initialize, mixed/modern/malformed
-  openings, notification/response openings, post-selection cross-era
-  traffic, terminal close, and proof of zero reclassification or
-  modern dispatch.
-- Previous-version sessioned Streamable HTTP.
-- Previous-version resumption.
-- Concurrent modern and legacy clients.
-- Legacy-only POST/GET/DELETE table across absent/exact-legacy/exact-
-  modern/unsupported versions, all modern markers, initialize/
-  non-initialize bodies, absent/Session/Last-Event-ID/both headers,
-  exact fixed outcomes, no recognized modern error, and zero lookup
-  until authenticated legacy selection.
-- Legacy initialize without modern metadata succeeds only when the
-  dual-era profile is enabled.
-- Malformed modern no-downgrade and auth/status
-  no-reclassification matrix.
-- Raw-socket modern `_meta`, final-only method, and routing-header
-  markers crossed with Session/`Last-Event-ID` under absent, exact
-  legacy, exact modern, and syntactically valid unsupported version
-  headers; Session-only fallback, Last-Event-ID-only fixed error,
-  terminal conflict versus modern-ignore behavior, and zero Session/
-  replay lookup assertions. Every row must match HTTP-02's frozen
-  classifier profile byte-for-byte.
-- Cross EXT-01 `ModernExclusive` request/notification methods and
-  `EraAmbiguous` shared method text over that same matrix, including
-  descriptor collision/fingerprint negatives. Cross core
-  `notifications/cancelled` to prove exact-legacy or absent-version
-  plus Session reaches legacy cancellation, while exact modern/
-  nonlegacy or absent-version without Session reaches the modern HTTP
-  prohibition and never fabricates a modern marker from shared method
-  text.
-- Umbrella/HTTP/stdio policy-profile identity parity; server
-  installation-receipt missing/stale/wrong-role/wrong-transport/
-  wrong-endpoint-or-process/wrong-policy/wrong-generation rejection
-  before bind/spawn; and peer-byte policy-switch negatives.
-- Header and Session non-leakage.
-- No-pre-auth-session-membership and
-  unknown/expired/unauthorized/wrong-owner non-oracle tests.
-- Initialize/session creation churn, per-owner/deployment count/byte/
-  rate saturation, idle/absolute expiry, control/subscription growth,
-  disconnect/cancel/shutdown cleanup, and exact-once quota release.
-- Cross-session/tenant guessed `Last-Event-ID`, refresh with stable
-  owner versus changed owner, replay batch/byte/age boundaries,
-  append saturation, slow consumer, reconnect around eviction/gap,
-  event-ID overflow/wrap, restart/instance A→B invalidation, concurrent
-  append/replay/close, and no-silent-gap tests.
-- Direct previous-version request behavior.
+- `leg_02_a_positive`: exercise the shipped adapter through a real stdio
+  consumer with exact initialize, initialized notification, negotiated
+  capabilities, legal operating requests, and exact success/error messages.
+- `leg_02_a_planted_negative`: alter only one lifecycle or capability
+  dimension and prove the exact typed rejection, no handler dispatch, and no
+  negotiated-state mutation.
+- `leg_02_b_positive` and `leg_02_b_planted_negative`: prove bounded
+  reverse requests, roots, sampling, logging, subscriptions, cancellation,
+  progress, owner isolation, close races, and exact-once reservation release;
+  the planted negative differs only in the forbidden owner/capability/order
+  condition.
+- `leg_02_integration_positive` and
+  `leg_02_integration_planted_negative`: exercise both implementation
+  slices through shipped public state and prove one binding cannot observe or
+  complete another binding's operation.
+- `leg_02_verification_positive` and
+  `leg_02_verification_planted_negative`: independently verify the exact
+  integration revision, frozen discovered/started/passed test IDs, positive
+  observables, planted negatives, and no-claim boundary.
+- Exact wire goldens cover initialize request/result, initialized
+  notification, every admitted 2024 method direction, capability-gated
+  requests, null/missing/invalid parameters, JSON-RPC IDs, error objects,
+  cancellation, progress, notifications, and terminal close ordering.
+- Explicit rejection/no-claim tests cover modern Tasks, Apps, elicitation,
+  extension surfaces, 2025 sessioned Streamable HTTP, `Mcp-Session-Id`,
+  `Last-Event-ID`, replay/resumption, DELETE, discovery classification,
+  automatic cross-era fallback, and inline retry.  Each proves no accepted
+  lifecycle transition, transport state lookup, handler dispatch, or state
+  mutation.
+
+Evidence:
+
+- Bind each positive run to the exact revision/tree, legacy feature state,
+  stdio public consumer, authenticated peer-binding generation, negotiated
+  capability set, method direction, lifecycle transition, observable
+  response/error, quota reservation/release count, and first-attempt result.
+- The positive observable is one exact 2024 lifecycle reaching `Operating`
+  and completing the declared request/notification or reverse-request
+  exchange.  The planted negative observable is the exact typed error plus
+  unchanged adapter state and zero unauthorized downstream effects.
+- Real code and its positive plus near-identical planted-negative tests remain
+  on the same Bead.  Independent verification is required before aggregate
+  closure; fixture-only evidence, filtered/ignored tests, zero-test green
+  output, or a plan edit earns no capability credit.
 
 Dependencies:
 
-- LEG-01.
-- SRV-01.
-- STD-01.
-- HTTP-01.
-- HTTP-02.
-- XPORT-01.
-- AUTH-00.
-- LIMIT-01.
+- LEG-01 — `bd-mcp-2026-07-28-support-ahet.9`
+- SRV-01 — `bd-mcp-2026-07-28-support-ahet.15`
+- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
+- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
+- XPORT-01 — `bd-mcp-2026-07-28-support-ahet.48`
+- AUTH-00 — `bd-mcp-2026-07-28-support-ahet.12`
+- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
+- Independent verification gate — `bd-mcp-leg-02-verification-4wbe`,
+  which depends on `bd-mcp-leg-02-integration-wlj6`; that integration
+  depends on `bd-mcp-leg-02-a-h4l5` and `bd-mcp-leg-02-b-kk21`.
 
-### LEG-03 — Implement the previous-version client adapter
+Tracker mapping:
+
+- Plan package ID: LEG-02
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.58`
+- Parent formal prerequisites: LEG-01, SRV-01, STD-01, HTTP-01, XPORT-01,
+  AUTH-00, LIMIT-01, and `bd-mcp-leg-02-verification-4wbe`.
+- Dependency direction: LEG-02 is blocked by every listed prerequisite; the
+  implementation A/B → integration → verification chain is mandatory before
+  parent closure.
+- No-claim boundary: LEG-02 proves only the exact 2024-11-05 server protocol
+  and lifecycle adapter.  It does not implement a transport, own the
+  two-endpoint HTTP+SSE protocol, provide cross-era route selection, or prove
+  aggregate dual-era MCP conformance.
+
+### LEG-03 — Exact MCP 2024-11-05 client protocol and lifecycle adapter
 
 Outcome:
 
-Connect to `2025-11-25` servers after exact transport-specific era
-classification.
+- LEG-03 provides a transport-neutral MCP 2024-11-05 client adapter with the
+  exact initialize exchange, negotiated capabilities, client requests,
+  server-initiated requests, notifications, results, and errors.
+- The adapter is constructed only with an explicit authenticated
+  `LegacyClientPeerBinding`.  STD-01 supplies the binding for legacy stdio;
+  LEG-HTTP-01 is the downstream consumer that supplies the binding for its
+  exact two-endpoint HTTP+SSE transport.
+- One binding owns one bounded client lifecycle:
+  `AwaitInitializeResult -> Operating -> Closed`.  Negotiated
+  capabilities, correlation state, subscriptions, and pending reverse
+  operations are private to that binding generation.
 
 Reason:
 
-Client fallback owns initialize and previous-version connector
-behavior separately from the server adapter.
+- The 2024-11-05 client role has connection-scoped initialization and exact
+  bidirectional message rules.  It cannot be safely represented as a generic
+  request sender or share state with another protocol role.
+- Keeping the adapter independent of frame parsing, endpoints, and selection
+  makes the same exact protocol behavior consumable by stdio and the later
+  legacy HTTP+SSE transport without turning the client into a coordinator.
 
 Implementation:
 
-- Implement initialize and initialized.
-- On successful installation of one exact legacy client adapter and
-  bounded configuration for one HTTP endpoint instance or stdio child
-  configuration, use FND-03's sealed issuer to create a non-forgeable
-  `LegacyClientAdapterInstalledReceipt`. It binds the client role,
-  transport binding, immutable protocol policy, canonical endpoint or
-  child command/environment identity, security partition, adapter,
-  replay/configuration/limits/profile generations, and enabled
-  capabilities. CLT-02/STD-01 require the exact matching live receipt
-  before a legacy-enabled connect can spawn a child, open a socket, or
-  emit bytes; compilation or an adapter object alone is insufficient.
-- Cache the selected previous version per stdio process or FND-03
-  `ClientEndpointInstanceKey`; never by HTTP origin alone.
-- Support previous-version stdio.
-- Support previous-version sessioned Streamable HTTP.
-- Process legacy session IDs only in this adapter.
-- Process legacy event replay only in this adapter.
-- Enforce LIMIT-01 replay batch/byte/deadline bounds, treat an explicit
-  replay-gap/nonresumable response as terminal for that Session rather
-  than looping, and never reuse a Session/event ID across origin,
-  authenticated owner, or selected protocol version.
-- Support direct previous-version sampling, roots, elicitation, and
-  logging according to configured client capabilities.
-- Consume FND-03's root protocol policy plus its exact stdio and HTTP
-  child profiles. Under `ModernWithLegacy`, this adapter is entered
-  only after CLT-02's one-shot transport-specific classifier produces
-  an exact legacy outcome; it never sees or replays the discarded
-  modern probe. Under `LegacyOnly`, invoke it directly and make legacy
-  `initialize` the first MCP request with no discovery probe. Under
-  `LatestOnly`, the adapter and receipt are unreachable. A failed
-  initialize, modern marker/response, malformed reply, or later
-  cross-era traffic is terminal for that connection and never selects
-  modern or retries classification.
-- Never downgrade because of auth failures, rate limits, 5xx, network
-  errors, or ordinary timeouts.
-- Do not fall further back to the excluded two-endpoint HTTP+SSE
-  transport.
-
-Acceptance:
-
-- Fallback occurs only under the final stdio/HTTP classification
-  rules.
-- `ModernWithLegacy` is the only policy that classifies then falls
-  back; `LegacyOnly` initializes directly; `LatestOnly` cannot enter
-  this adapter.
-- A recognized modern error never selects legacy.
-- Modern and previous-version caches are distinct.
-- An excluded old transport produces an actionable unsupported error.
+- From `AwaitInitializeResult`, emit one exact 2024-11-05 `initialize`
+  request constructed from the configured client information and declared
+  client capabilities.  Accept only the matching exact result shape and
+  server protocol version, freeze the returned server information,
+  instructions, and capabilities, emit exactly
+  `notifications/initialized`, and then enter `Operating`.
+- Reject unmatched IDs, malformed results, duplicate or out-of-order
+  initialization messages, invalid capability shapes, and a second
+  initialization attempt through LEG-01's exact JSON-RPC error boundary.
+  Failed initialization closes the binding and cannot leave a usable
+  capability or correlation record.
+- In `Operating`, implement the complete LEG-01-dispositioned 2024 client
+  surface: ping; tools/list and tools/call; resources/list, templates/list,
+  read, subscribe, and unsubscribe; prompts/list and prompts/get;
+  completion/complete; logging; progress and cancellation notifications;
+  resource/list, tool/list, and prompt/list change notifications; and exact
+  response correlation/error behavior.
+- Accept only capability-permitted server-to-client requests: roots/list,
+  sampling/createMessage, and ping.  Produce the exact client result or
+  error for each direction and preserve ID, cancellation, deadline, and
+  notification ordering rules.  Never convert an unsupported method or
+  unsupported legacy representation into another request.
+- Maintain bounded negotiated capability state, request correlation, reverse
+  requests, resource subscriptions, logging level, progress/cancellation
+  records, and control queues in an adapter state object keyed by the opaque
+  peer binding, its authenticated credential/security partition, and a
+  unique binding generation.  Binding identity is not authorization.
+- Apply LIMIT-01 before every outbound allocation, correlation insertion,
+  control-queue or subscription growth, and reverse request.  Reserve before
+  mutation; release exactly once on response, cancellation, timeout, peer
+  close, expiry, or shutdown.  Late frames cannot complete a released
+  operation.
+- Use CLT-02 only for the final client policy/error and public dispatch
+  contracts, and use STD-01 only as the stdio consumer.  LEG-NEG supplies
+  any outer selection decision before a `LegacyClientPeerBinding` reaches
+  this adapter.  The adapter does not inspect selection evidence or perform
+  a second attempt.
+- Expose only a transport-neutral inbound-message/outbound-message interface
+  plus close/cancellation signals.  It opens no network connection, parses no
+  HTTP/SSE frame, chooses no endpoint, and performs no reconnect behavior.
+  LEG-HTTP-01 later owns the exact two endpoints, endpoint event,
+  advertised message target, HTTP security, and reconnect lifecycle.
+- Preserve AUTH-00 security partitions supplied by the binding and redact
+  protocol diagnostics.  Authentication, quota, I/O, malformed-frame, and
+  application failures close the current binding through the defined error
+  path; they do not create a new adapter state.
 
 Tests:
 
-- Three-policy × stdio/HTTP first-wire matrix, proving isolated
-  classifier entry only for `ModernWithLegacy`, direct initialize only
-  for `LegacyOnly`, and zero adapter entry for `LatestOnly`.
-- Stdio fallback under `ModernWithLegacy`.
-- HTTP 400-body classification under `ModernWithLegacy`.
-- Modern error no-downgrade.
-- Auth/429/5xx/network no-downgrade.
-- Previous-version Session handling.
-- Replay batch/byte/gap, cross-origin/owner ID nonreuse, restart/
-  nonresumable, cancellation, and bounded reconnect-loop tests.
-- Same-origin/different-path or permitted-query legacy endpoints retain
-  independent selected versions, sessions, replay state, and
-  invalidation; endpoint/config-generation mutation never reuses the
-  prior adapter cache.
-- Client installation-receipt missing/stale/wrong-role/wrong-
-  transport/wrong-endpoint-or-command/wrong-policy/wrong-generation
-  rejection before spawn/connect/write, plus receipt-generation cache
-  isolation and feature-off construction failure.
-- Failed initialize, malformed/mixed/modern response, and
-  post-selection cross-era traffic terminate without modern
-  reclassification or a second adapter attempt.
-- Excluded transport diagnostic.
+- `leg_03_a_positive`: exercise a shipped client entrypoint over a real
+  stdio consumer through exact initialize/result, initialized notification,
+  negotiated capabilities, ordinary client requests, and exact responses.
+- `leg_03_a_planted_negative`: change only one initialization, capability,
+  ID, or message-shape dimension and prove the exact typed error, zero
+  outbound application request, and unchanged negotiated state.
+- `leg_03_b_positive` and `leg_03_b_planted_negative`: prove
+  server-to-client roots, sampling, ping, logging, subscriptions, progress,
+  cancellation, correlation, binding isolation, and exact-once teardown; the
+  planted negative differs only in the forbidden ordering, owner, or
+  capability condition.
+- `leg_03_integration_positive` and
+  `leg_03_integration_planted_negative`: exercise both implementation
+  slices through shipped public state and prove one binding cannot complete,
+  observe, or release another binding's work.
+- `leg_03_verification_positive` and
+  `leg_03_verification_planted_negative`: independently verify the exact
+  integration revision, frozen discovered/started/passed test IDs, public
+  observables, planted negatives, and no-claim boundary.
+- Exact wire goldens cover initialize request/result, initialized
+  notification, every admitted 2024 client method and direction, capability
+  gating, response/error objects, null/missing/invalid parameters,
+  cancellation/progress ordering, resource subscriptions, reverse requests,
+  and terminal close.
+- Explicit rejection/no-claim tests cover 2025 sessioned HTTP,
+  `Mcp-Session-Id`, `Last-Event-ID`, replay/resumption, DELETE, modern
+  discovery/fallback coordination, modern-only methods, extensions, Tasks,
+  Apps, elicitation, and modern message/result shapes.  Each proves no
+  accepted lifecycle transition, transport lookup, outbound retry, or state
+  mutation.
+
+Evidence:
+
+- Bind every positive run to the exact revision/tree, legacy feature state,
+  public stdio consumer, authenticated binding generation, negotiated
+  capabilities, message direction, lifecycle transition, response/error,
+  reservation/release counts, and first-attempt result.
+- The positive observable is one exact 2024 client lifecycle entering
+  `Operating` and completing the declared client or server-initiated
+  exchange.  The planted negative observable is the exact typed error plus
+  unchanged adapter state and zero forbidden outbound effects.
+- Real code and its positive plus near-identical planted-negative tests stay
+  on the same Bead.  Independent verification is required before aggregate
+  closure; plan text, fixtures, filtered/ignored tests, zero-test green
+  output, or stale revision evidence earns no capability credit.
 
 Dependencies:
 
-- LEG-01.
-- CLT-02.
-- STD-01.
-- HTTP-01.
-- HTTP-02.
-- LIMIT-01.
+- LEG-01 — `bd-mcp-2026-07-28-support-ahet.9`
+- CLT-02 — `bd-mcp-2026-07-28-support-ahet.24`
+- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
+- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
+- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
+- Independent verification gate — `bd-mcp-leg-03-verification-dbh5`,
+  which depends on `bd-mcp-leg-03-integration-vh0b`; that integration
+  depends on `bd-mcp-leg-03-a-vsu7` and `bd-mcp-leg-03-b-uudd`.
 
-### XPORT-01 — Disposition every existing transport
+Tracker mapping:
+
+- Plan package ID: LEG-03
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.39`
+- Parent formal prerequisites: LEG-01, CLT-02, STD-01, HTTP-01, LIMIT-01,
+  and `bd-mcp-leg-03-verification-dbh5`.
+- Dependency direction: LEG-03 is blocked by every listed prerequisite; the
+  implementation A/B → integration → verification chain is mandatory before
+  parent closure.
+- No-claim boundary: LEG-03 proves only the exact 2024-11-05 client protocol
+  and lifecycle adapter.  It does not implement selection, a transport,
+  LEG-HTTP-01's two-endpoint HTTP+SSE behavior, a fallback coordinator, or
+  aggregate dual-era MCP conformance.
+
+### XPORT-01 — Disposition modern 2026 and exact 2024 transports
 
 Outcome:
 
-Ensure no existing transport accidentally implies unsupported modern
-wire behavior.
+- XPORT-01 publishes one closed transport disposition table rather than a
+  generic compatibility layer.
+- Standards-track MCP 2026-07-28 transport surfaces are standardized stdio
+  and one modern HTTP request/response POST surface.  Exact MCP 2024-11-05
+  uses its own legacy stdio adapter and the downstream LEG-HTTP-01 exact
+  two-endpoint HTTP+SSE transport.
+- Memory is test/integration-only.  WebSocket is an optional,
+  disabled-by-default FastMCP experimental byte-stream profile, never a
+  standards-track MCP transport claim.
 
 Reason:
 
-The repository contains memory, WebSocket, standalone SSE, HTTP, and
-event-store code created for earlier designs, while final core
-conformance defines modern stdio and Streamable HTTP behavior.
+- Retained transport code was written for incompatible designs.  An explicit
+  disposition prevents a public export, builder, codec, or test fixture from
+  silently promoting an obsolete path into either protocol era.
+- Modern and exact-2024 state have distinct wire, lifecycle, and ownership
+  contracts.  Their bytes may share bounded infrastructure but cannot share
+  transport selection, endpoint state, or a response stream.
 
 Implementation:
 
-- Keep memory transport as an in-process test/integration transport.
-- Upgrade memory transport to the modern request executor,
-  request-owned notifications, subscriptions, cancellation, limits,
-  and frozen extension registry.
-- Give every memory and custom/experimental byte-stream endpoint an
-  immutable explicit local role plus admitted message direction before
-  raw decode. Server-role malformed client ingress may use PRT-01's
-  sealed parse/invalid-request response; client-role malformed server
-  output produces only the owning/shared transport failure and never a
-  response back. A codec object without a role cannot dispatch.
-- Do not count memory transport as an external MCP transport
-  conformance claim.
-- Classify WebSocket as a FastMCP-specific experimental transport
-  profile, disabled by default.
-- Retain only a pure bounded frame codec and modern-message adapter over
-  a caller-owned already-upgraded asupersync async byte stream. Remove
-  production reliance on the current blocking generic
-  `std::io::{Read, Write}` transport. Carry modern stateless envelopes,
-  directionality, cancellation, backpressure, frame/message/fragment
-  bounds, close/ping/pong state, and the core-owned fresh mask draw
-  without inventing protocol sessions.
-- Do not expose a WebSocket URI connector, HTTP Upgrade handler, server
-  endpoint, or CLI runtime activation. FND-05 has not proven bounded
-  authenticated Upgrade for this nonstandard profile. A later
-  connector/endpoint requires its own package and gate; an injected
-  byte stream does not imply FastMCP authenticated the handshake,
-  origin, peer, or subprotocol. Publish those limits prominently.
-- Keep standalone SSE entry points and event-store replay unreachable
-  from every modern builder, public export, and runtime path.
-- Leave positive previous-version reachability, if any, entirely to
-  LEG-02 and GATE-DUAL-READY rather than making it an acceptance
-  condition of this core package.
-- Keep all two-endpoint `2024-11-05` HTTP+SSE behavior unreachable.
-- Make modern builders expose only stdio and Streamable HTTP as
-  standards-track transports.
-- Add a compile/public-export scan proving the disposition.
-- Do not delete old files as part of this package.
-
-Acceptance:
-
-- A user cannot select standalone SSE or event replay in modern mode.
-- Memory exercises all modern request/stream abstractions.
-- WebSocket, if built, is visibly experimental frame/stream-adapter
-  code only, has no FastMCP endpoint/connector claim, and is never
-  counted as official conformance.
-- Legacy transport code cannot emit headers or lifecycle state into a
-  modern response.
-- Reusing one codec across roles cannot turn malformed server output
-  into a client-emitted JSON-RPC error.
-- No file deletion is required.
+- Publish the immutable disposition table:
+  - standardized modern stdio is owned by STD-01;
+  - standardized modern HTTP is one configured POST request/response surface,
+    owned by HTTP-01/HTTP-02/HTTP-03 according to role;
+  - exact-2024 stdio is supplied through LEG-02/LEG-03 adapters;
+  - exact-2024 HTTP+SSE is feature-gated and supplied only downstream by
+    LEG-HTTP-01;
+  - memory is in-process test/integration infrastructure;
+  - WebSocket is optional experimental infrastructure; and
+  - retained standalone SSE, event-store/replay, and blocking generic
+    byte-stream paths are removed/superseded from every supported builder,
+    export, and runtime route without requiring file deletion.
+- Require every decoder to receive an immutable endpoint role and message
+  direction before raw decoding.  Server ingress may use the sealed
+  invalid-request disposition when a response is permitted; client ingress
+  produces only the owning transport failure and never emits a response back.
+  A roleless codec cannot dispatch.
+- Every supported decoder rejects a top-level JSON-RPC batch array, including
+  array-of-one-valid-request and mixed-array forms, through PRT-01 before
+  disposition, routing, correlation, authorization, cache,
+  task/session/subscription, proxy, response, or transport state effects.
+- Keep memory aligned with modern request execution, request-owned
+  notifications, bounded subscription behavior, cancellation, backpressure,
+  LIMIT-01, and EXT-01.  It has no external transport-conformance credit.
+- WebSocket, when its experimental feature is enabled, accepts only a
+  caller-owned already-upgraded asynchronous byte stream with `&Cx`,
+  bounded frames/fragments/messages, explicit direction, cancellation,
+  backpressure, close/ping/pong behavior, and a fresh core-owned mask draw.
+  It exposes no URI connector, HTTP Upgrade handler, server endpoint, CLI
+  activation, hidden runtime, blocking `std::io::{Read, Write}` path, or
+  authenticated-handshake claim.
+- Exclude standalone SSE and event-store replay from every modern builder,
+  public export, runtime path, and documentation support claim.  Their
+  retained source is not an active transport and cannot be selected by
+  configuration.
+- Keep legacy HTTP+SSE symbols, bindings, and state behind
+  `legacy-2024-11-05` and LEG-HTTP-01.  They cannot enter a modern
+  request/response path, public modern transport export, memory profile, or
+  experimental WebSocket profile.
+- Transport selection, policy composition, and cross-era admission are owned
+  elsewhere.  XPORT-01 consumes an already selected disposition and must not
+  infer one from peer bytes, connection failure, configuration ambiguity, or
+  application error.
 
 Tests:
 
-- Modern memory end-to-end matrix.
-- Memory subscription/cancellation/backpressure tests.
-- Memory/custom role-cross tests over identical malformed bytes,
-  including server-ingress error emission, client-ingress
-  no-response-back, one/multiple waiters, and roleless-construction
-  rejection.
-- Feature-off and disabled-by-default WebSocket tests.
-- Feature-on compile/API/source tests proving `&Cx`-aware async byte-
-  stream use, bounded frames/backpressure/cancellation, no blocking
-  `std::io::{Read,Write}`, no hidden thread/runtime, and no URI
-  connector/HTTP Upgrade/server endpoint/CLI activation symbol.
-- Modern builder compile-fail tests for standalone SSE/event store.
-- Modern unreachability and public-symbol scan.
-- Documentation support-claim consistency.
+- `xport_01_positive`: exercise the shipped public builders and codecs to
+  prove the disposition table exposes standardized modern stdio and single
+  POST, confines exact-2024 HTTP+SSE to LEG-HTTP-01's feature-gated boundary,
+  and keeps memory test-only.
+- `xport_01_planted_negative`: change only one disposition, role, feature,
+  export, or runtime-registration dimension and prove the exact typed
+  rejection plus unchanged builders, transport state, and outbound wire.
+- Run the positive and planted negative in the same execution Bead as the
+  transport code, with exact discovered/started/passed IDs and no
+  filtered/ignored substitution.
+- Cover identical malformed bytes under server/client roles, roleless codec
+  construction, memory cancellation/backpressure/bounds, public-export and
+  builder isolation, feature-off WebSocket, and feature-on experimental
+  byte-stream limits with no connector/endpoint activation.
+- Cover array-of-one-valid-request and mixed top-level JSON-RPC batch arrays
+  across standardized modern stdio/POST, exact-2024 stdio/LEG-HTTP consumer,
+  memory, and experimental byte-stream codecs. Each fails before any partial
+  disposition, routing, correlation, authorization, cache,
+  task/session/subscription, proxy, response, or transport state effect.
+- Explicit rejection/no-claim tests cover a planted 2025 transport,
+  sessioned legacy HTTP, session headers, replay, DELETE, legacy
+  two-endpoint symbols outside LEG-HTTP-01, standalone SSE/event-store
+  activation, cross-era automatic selection, and use of an experimental
+  WebSocket profile as a standards-track claim.
+
+Evidence:
+
+- Bind each run to the exact revision/tree, profile/features, public
+  builder/export subject, endpoint role/direction, selected disposition,
+  observed frame/response behavior, planted dimension, and first-attempt
+  result.
+- The positive observable is the allowed transport set only; the planted
+  negative observable is the registered typed denial and zero route, state,
+  or outbound-wire effect.
+- Real code, its same-Bead positive and near-identical planted-negative
+  tests, and revision-bound evidence are one credit unit.  Fixture-only,
+  compile-only, filtered, stale, or plan-only evidence earns no transport
+  capability credit.
 
 Dependencies:
 
-- STD-01.
-- HTTP-03.
-- SUB-01.
-- LIMIT-01.
-- EXT-01.
+- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
+- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
+- SUB-01 — `bd-mcp-2026-07-28-support-ahet.28`
+- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
+- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
 
----
+Tracker mapping:
 
-## 16. Phase 4 — MRTR and subscriptions
+- Plan package ID: XPORT-01
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.48`
+- Formal prerequisite IDs: STD-01, HTTP-03, SUB-01, LIMIT-01, EXT-01.
+- Dependency direction: XPORT-01 is blocked by every listed prerequisite.
+- No-claim boundary: XPORT-01 proves only transport disposition and bounded
+  experimental/test infrastructure.  It does not prove exact-2024 HTTP+SSE,
+  automatic era selection, WebSocket standards conformance, any superseded
+  transport, or aggregate MCP conformance.
 
 ### MRTR-01 — Implement the MRTR state machine
 
@@ -13079,6 +13077,15 @@ Dependencies:
 - FND-08.
 
 ### MRTR-03 — Implement MRTR input resolvers exactly
+
+Qualification rule:
+
+- This Bead requires real production resolver code plus live public positive
+  flows and planted-negative flows for every resolver/capability/error row;
+  fixtures cannot stand in for live execution. Its revision-bound receipt names
+  exact `discovered == started == passed` scenario IDs and rejects copied
+  constants, self-close, self-hash, or process-only artifacts as capability
+  evidence.
 
 Outcome:
 
@@ -14643,6 +14650,15 @@ Dependencies:
 - FND-07.
 
 ### RES-02 — Implement final resource read semantics
+
+Qualification rule:
+
+- This Bead requires real production read/cache/subscription code and live
+  positive plus planted-negative public tests. Cache hints apply only to a
+  complete result; an input-required result is never cached and carries no
+  cache or pagination hint. Its revision-bound receipt records exact
+  `discovered == started == passed` IDs and rejects fixture-as-live, copied
+  constants, self-close, self-hash, and process artifacts.
 
 Outcome:
 
@@ -18443,7 +18459,7 @@ Implementation:
   client→server HTTP method also freezes one
   `ExtensionHttpEraDisposition::{ModernExclusive, EraAmbiguous}`.
   `ModernExclusive` is an audited assertion that the exact method
-  cannot be valid under the included `2025-11-25` adapter and may
+  cannot be valid under the included exact `2024-11-05` adapter and may
   therefore become HTTP-02's pre-auth `ModernEraMarker`;
   `EraAmbiguous` grants no method-text marker and leaves era selection
   to the version/Session tables. Reject missing dispositions,
@@ -18617,6 +18633,108 @@ Dependencies:
 - HDR-01.
 - SRV-02.
 - CLT-01.
+
+### EXT-DEV-01 — Provide the sealed compile-linked external extension facade
+
+Outcome:
+
+Provide one facade-only, compile-linked external-extension authoring surface
+that permits a separately packaged crate to describe, install, and handle an
+extension without receiving registry, codec, authentication, raw-JSON, `Cx`,
+or runtime authority.
+
+Reason:
+
+The generic registry is an internal authority boundary. Downstream extension
+authors need typed, renamed-facade-safe ergonomics, not a dynamic plugin ABI
+or a bypass around final registration and request admission.
+This H3 is the sole normative package authority; every other EXT-DEV-01
+mention is a consumer boundary, dependency, or no-claim reference.
+
+Implementation:
+
+- Export only sealed facade types `ExtensionDescriptor`, `ExtensionContext`,
+  `ExtensionHandler`, `ExtensionRegistration`, and `ExtensionBuilder`, plus
+  the documented derive/attribute path. They are resolved through the actual
+  facade Cargo name (including a renamed dependency) or an explicit crate-path
+  override; generated code uses only the facade's hidden `__private` path and
+  never names a component crate.
+- `ExtensionDescriptor` has exactly an extension identifier, descriptor
+  version, client-settings schema ID, server-settings schema ID, and ordered
+  method/notification entries. Each entry has exactly its wire name,
+  client-to-server or server-to-client direction, parameter schema ID, result
+  or notification schema ID, and declared fallback. The facade exposes these
+  as sealed typed values; it does not expose a mutable registry, arbitrary
+  codec, raw JSON, routing-header compiler, auth provider, or server/client
+  runtime object.
+- `ExtensionContext` is constructed only after ordinary transport raw
+  admission, authentication/authorization, fixed endpoint role/direction,
+  and EXT-01's frozen descriptor/runtime registration. It carries only the
+  request-local negotiated descriptor/effective settings, bounded request
+  metadata, cancellation/deadline observation, and typed response sink. It
+  never constructs, exposes, clones, or upgrades a `Cx`, registry handle,
+  authentication credential, raw body, or executor.
+- Activation order is fixed: compiled facade feature; static descriptor
+  construction; builder installation before freeze; frozen EXT-01 descriptor
+  and local runtime registration; current-request client/server settings
+  decoding; descriptor compatibility resolution; authenticated request-local
+  binding; exact direction/method match; parameter-schema validation; then
+  sealed handler invocation. A prior request, discovery, connection, generic
+  metadata, or registration alone cannot activate the handler.
+- The derive/attribute path generates only a sealed descriptor and facade
+  handler adapter. It has no raw ingress, `block_on`, ambient runtime, direct
+  component-crate dependency, or registration-after-freeze escape. Dynamic
+  library loading, downloaded code, stable plugin ABI, and registry mutation
+  remain explicit non-goals.
+- The mandatory child topology is `A + B → I → V → EXT-DEV-01`. A owns the
+  descriptor/install facade; B owns request-local activation; I joins the
+  two through renamed packaged consumers; V independently verifies their
+  exact integration revision. The aggregate is never claimed monolithically.
+
+Acceptance:
+
+- Child A freezes exactly four descriptor/install cells: valid sealed
+  descriptor construction; pre-freeze builder installation; renamed-facade
+  derive/attribute resolution; and compile-fail denial of registry/codec/auth/
+  raw-JSON/`Cx`/runtime authority. No fifth cell substitutes for these.
+- Child B freezes exactly ten activation cells: valid current-request
+  activation; feature absent; descriptor absent; installation after freeze;
+  malformed client settings; malformed server settings; incompatible typed
+  settings; stale/prior-request binding; wrong direction or method; and
+  parameter-schema failure. Every failing cell rejects before handler,
+  dispatch, cache, proxy, or state mutation.
+- Child I executes exactly two renamed packaged consumers: one builder-based
+  and one derive/attribute-based consumer, each depending only on a renamed
+  facade and reaching the shipped sealed registration/activation path.
+- Child V binds the exact I revision and performs exactly three inventory
+  checks: facade-public-export inventory, forbidden-authority/feature
+  inventory, and discovered/started/passed test inventory. It also executes a
+  ten-cell UI matrix with exactly two pass cells (renamed builder and renamed
+  attribute) and eight fail cells (missing facade, ambiguous facade, bad
+  override, direct component path, registry access, codec/raw-JSON access,
+  auth/`Cx` access, and ambient-runtime construction).
+
+Tests:
+
+- Each A/B/I production slice contains real facade code and same-slice
+  positive plus planted-negative tests. A test-only descriptor, copied
+  assertion, mock presented as live, fixture-as-authority, or refusal-only
+  path earns no extension capability credit.
+- The two I consumers are isolated packages with renamed facade dependencies;
+  their compile and runtime observations prove descriptor fields, directions,
+  schemas, activation order, effective-settings binding, and handler result
+  through public facade entrypoints.
+- V requires every frozen cell and matrix case to be discovered == started ==
+  passed with zero ignored, filtered, feature-disabled, skipped, or not-run
+  substitutions. It verifies only the integration revision and earns zero
+  capability credit.
+
+Dependencies:
+
+- EXT-01.
+- FND-04.
+- MAC-01.
+- API-01.
 
 ### TASK-01 — Replace the Tasks wire model
 
@@ -21704,6 +21822,13 @@ Reason:
 Rust clients and gateways may need to preserve or broker Apps traffic,
 but the workspace is not a browser.
 
+Scope boundary:
+
+- APP-02 is a quarantine leaf only: typed preservation, validation, and
+  refusal-safe host-neutral broker surfaces earn no aggregate Apps, Sampling,
+  Tasks, or MRTR capability claim. Positive Apps+Sampling is APP-03 and
+  positive Apps+Tasks/MRTR composition is APP-04.
+
 Implementation:
 
 - Model Section 5.3's composed Apps dialect rather than accepting the
@@ -22992,6 +23117,16 @@ Dependencies:
 
 ### AUTHX-01 — Implement enterprise-managed authorization profile
 
+Normative extension identity and overlay:
+
+- Enterprise-Managed Authorization (EMA) is the stable official extension
+  `io.modelcontextprotocol/enterprise-managed-authorization`. The client
+  advertises it per request as exact `{}`; the server supplies only its
+  authentication-metadata overlay. Missing, malformed, unknown, or nonempty
+  client settings are separate planted negatives and never activate EMA.
+- AUTHX-04 supplies the positive SAML branch; this package and its aggregate
+  gates must not describe SAML or a future issuer/discovery path as excluded.
+
 Outcome:
 
 Support the stable enterprise-managed authorization flow as an
@@ -23005,9 +23140,12 @@ profile highlighted by the release.
 Implementation:
 
 - Pin the stable extension revision.
-- Do not register an MCP extension identifier or capability settings;
-  follow Section 5.6 until a pinned normative revision defines that
-  wire surface.
+- Register the exact official
+  `io.modelcontextprotocol/enterprise-managed-authorization` identifier in
+  the request-local client extension map with exact empty `{}` settings;
+  reject absent, nonempty, malformed, duplicate, or unknown settings before
+  profile activation. Server metadata is an overlay, never a replacement for
+  that client declaration.
 - Activate the profile only through explicit deployment policy plus
   the authorization-server metadata below.
 - Activate only after independently admitted metadata is internally
@@ -24064,6 +24202,11 @@ Tests:
 
 - Absence of any invented MCP capability-map advertisement or
   requirement.
+- Request-local exact-empty client-credentials settings with an absent server
+  advertisement positive; present-valid advertisement positive; and present
+  wrong, malformed, stale, duplicate, or policy-inconsistent advertisement
+  negatives.  The differential changes only advertisement presence/value and
+  proves absence neither rejects the profile nor changes request emission.
 - Metadata activation cross-product: resource-AS profile only, JWT-
   bearer grant only, both, neither, malformed/wrong-type/duplicate
   profile or grant; IdP token-exchange only, ID-JAG requested-token
@@ -24454,9 +24597,19 @@ Dependencies:
 
 ### AUTHX-02 — Evaluate the OAuth client credentials profile
 
+Normative extension identity and overlay:
+
+- OAuth Client Credentials is the official extension, pinned Draft,
+  `io.modelcontextprotocol/oauth-client-credentials`. The client registers it
+  per request as exact `{}`. Its server advertisement is optional/RECOMMENDED:
+  absence is a positive path, while a present advertisement is validated and a
+  wrong, malformed, stale, duplicate, or policy-inconsistent value is a
+  planted negative. Missing, malformed, unknown, or nonempty client settings
+  are distinct planted negatives and never activate the profile.
+
 Outcome:
 
-Provide a controlled experimental MCP OAuth-client path for
+Provide a controlled official-pinned-Draft MCP OAuth-client path for
 machine-to-machine auth against an external authorization server,
 without conflating it with final core compliance or adding a
 client-credentials grant to FastMCP's optional built-in issuer.
@@ -24474,10 +24627,12 @@ Implementation:
   branch to AUTH-06/FastMCP's built-in authorization server, even when
   both features compile together. A future built-in issuer role requires
   a separate work package, endpoint/security model, gate, and claim.
-- Mark the Cargo feature and runtime API experimental.
-- Do not register an MCP extension identifier or capability settings;
-  follow Section 5.6 until a pinned normative revision defines that
-  wire surface.
+- Name the Cargo feature and runtime API `oauth-client-credentials` and label
+  it official extension, pinned Draft.
+- Register the exact official client-credentials extension identifier with
+  request-local empty `{}` settings; reject every other client settings shape.
+  Treat server advertisement as optional/RECOMMENDED, validate it only when
+  present, and never use its absence to reject an otherwise admitted profile.
 - Activate the profile only through explicit deployment policy plus
   the authorization-server metadata below.
 - Require a typed `ClientCredentialsTransportPermit` resolved before
@@ -24531,7 +24686,7 @@ Implementation:
   pinned draft explicitly mandates the server auth-method metadata but
   does not mandate these client-registration or explicit server-grant
   fields. Treat the additional declarations as FastMCP's deliberately
-  stricter experimental activation subset, not as a claim that every
+  stricter pinned-Draft activation subset, not as a claim that every
   otherwise conforming peer MUST publish them.
 - Send exact `grant_type=client_credentials`.
 - Support only the pinned extension's `private_key_jwt` and
@@ -24647,7 +24802,7 @@ Implementation:
   omission according to OAuth's requested-scope rule) and reject an
   unexpected `refresh_token` in this client-credentials profile rather
   than persisting or using it.
-- Freeze this experimental revision to unconstrained RFC 6750 Bearer
+- Freeze this pinned-Draft revision to unconstrained RFC 6750 Bearer
   tokens. Advertise/send no DPoP proof and negotiate no mTLS/DPoP/
   sender-constrained token. Reject `token_type=DPoP` or sender-
   constraint metadata before token cache/use. Treat an otherwise
@@ -24689,7 +24844,7 @@ Implementation:
   custody. Run and report it independently without inheriting the JWT
   scenario's status, but require a separate nonempty HTTPS
   Streamable-HTTP Basic real-peer positive using the exact named,
-  attested custody provider before the emitted experimental method
+  attested custody provider before the emitted pinned-Draft method
   inventory may include `client_secret_basic`.
   Local derivatives need source hash, provenance, exact diff, and a
   non-upstream label.
@@ -24701,6 +24856,10 @@ Acceptance:
 - The profile and support manifest are client-role/external-AS-only;
   enabling it never changes AUTH-06 metadata or token-endpoint grant
   acceptance.
+- The exact request-local empty client settings are required. The server
+  advertisement is optional/RECOMMENDED: absence is admitted, while a present
+  wrong, malformed, stale, duplicate, or policy-inconsistent advertisement
+  fails before credential or network side effects.
 - Tokens are resource- and issuer-bound.
 - Unsupported client environments reject configuration.
 - Each auth method has a named versioned custody provider and
@@ -24741,7 +24900,7 @@ Acceptance:
 - Every request carries a nonempty exact requested scope set derived by
   intersection; an empty or default-only policy has zero credential,
   signer, and token-endpoint side effects.
-- Experimental availability has independent private-key RS256 positive
+- Official-pinned-Draft availability has independent private-key RS256 positive
   evidence and independently classified Basic raw-wire evidence. A
   Basic method claim additionally requires the independent HTTPS
   Streamable-HTTP real-peer/custody positive; the pinned multi-cause
@@ -24863,7 +25022,7 @@ Tests:
   nonempty HTTPS Streamable-HTTP real peer, named attested custody
   provider/configuration, exact command/wire capture, and passing
   Basic result before advertising that method.
-- Feature cross-product tests prove `experimental-client-credentials`
+- Feature cross-product tests prove `oauth-client-credentials`
   off/on × `builtin-auth-server` off/on leaves built-in metadata and
   endpoint grant acceptance byte-identical and never creates a
   client-credentials issuance path.
@@ -25431,6 +25590,13 @@ Implementation:
   execution/connection with no JSON-RPC response sent upstream. Never
   copy an omitted-ID error disposition or raw-decode failure across
   legs.
+- On both the downstream server and upstream client legs, reject a top-level
+  JSON-RPC batch array, including array-of-one-valid-request and mixed-array
+  forms, through PRT-01 raw admission before catalog routing, dispatch,
+  correlation, authorization, cache, task/session/subscription, proxy
+  forwarding, response, or leg state effects. The downstream leg uses only
+  its server-ingress disposition; the upstream leg fails only its owning
+  execution/connection and emits no response upstream.
 - Never copy self-reported identity into auth context.
 - Emit gateway server identity in downstream results.
 - Expose upstream identity only as diagnostic metadata.
@@ -25511,6 +25677,10 @@ Tests:
   client-role tests with one/multiple in-flight calls, no response-
   back upstream, downstream error-shape correctness, sibling-route
   isolation, and no cross-leg envelope/error forwarding.
+- Array-of-one-valid-request and mixed-array negatives on each downstream
+  server and upstream client leg, proving their distinct role dispositions,
+  zero partial route/catalog/dispatch/correlation/authorization/cache/
+  task/session/subscription/proxy/response effects, and sibling isolation.
 - Identity separation.
 
 Dependencies:
@@ -25528,7 +25698,7 @@ Dependencies:
 Outcome:
 
 Let an explicitly dual-era gateway route to exact
-`2025-11-25` upstreams without weakening unrelated modern routes.
+`2024-11-05` upstreams without weakening unrelated modern routes.
 
 Reason:
 
@@ -25540,8 +25710,14 @@ Implementation:
 - Attach LEG-03 to selected upstream configurations only.
 - Classify and cache each upstream era independently.
 - Translate only lossless results from LEG-01.
-- Keep initialization, Session, replay, and direct legacy reverse
-  requests inside the upstream adapter.
+- Keep initialization and direct legacy reverse requests inside the upstream
+  adapter; reject sessioned/replay semantics.
+- On every modern and exact-2024 downstream/upstream transport boundary,
+  reject a top-level JSON-RPC batch array, including array-of-one valid-request
+  and mixed-array forms, before translation, lifecycle, routing, dispatch,
+  correlation, authorization, cache, subscription, proxy forwarding,
+  response, or state mutation. Preserve each leg's sealed server/client role
+  disposition; no array receives partial cross-era translation.
 - Exclude modern-only MRTR, subscription, and extension behavior from
   a legacy route.
 - Preserve the union catalog supplied by unrelated modern upstreams.
@@ -25557,6 +25733,10 @@ Tests:
 - Modern-legacy and multiple mixed-upstream matrices.
 - Legacy route limitation diagnostics.
 - Modern capability non-regression.
+- Array-of-one-valid-request and mixed-array planted negatives for modern and
+  exact-2024 stdio and HTTP+SSE proxy legs, each proving no partial
+  translation/lifecycle/routing/dispatch/correlation/authorization/cache/
+  subscription/proxy/response effect and no cross-leg response emission.
 
 Dependencies:
 
@@ -26285,487 +26465,295 @@ Dependencies:
 - TASK-01.
 - TASK-02.
 
-### API-01 — Redesign builders and facade exports
+### API-01 — Auto-default dual-era builders and facade exports
 
 Outcome:
 
-Expose a coherent canonical API without compatibility shims.
+- The shipped facade exposes one immutable `ProtocolPolicy` with
+  `Auto` as the public builder default and explicit `ModernOnly` and
+  `LegacyOnly` construction.
+- The modern public module exposes exact MCP 2026-07-28 builder, client,
+  server, transport, extension, authentication, MRTR, subscription, cache,
+  macro, and `&Cx`-first lifecycle surfaces.
+- The feature-gated `legacy_2024` module exposes exact MCP 2024-11-05
+  composition only when `legacy-2024-11-05` is enabled and the caller
+  supplies the required role-specific sealed binding evidence.
 
 Reason:
 
-The new architecture must be usable without importing internal wire
-details.
+- The facade is the public policy boundary.  Defaults, protocol modules,
+  features, endpoint targets, and receipts must be captured before the first
+  side effect so users cannot accidentally compose incompatible eras.
+- A bounded ModernOnly API remains independently verifiable for the core
+  profile; the full facade additionally composes Auto and exact legacy
+  support without weakening that bounded proof.
 
 Implementation:
 
-- Add immutable `ProtocolPolicy::{LatestOnly,ModernWithLegacy,
-  LegacyOnly}` configuration bound to FND-03's root plus selected
-  stdio/HTTP child profile. Validate the legacy feature and matching
-  sealed server/client binding receipt before any bind/spawn/connect;
-  do not expose a post-construction setter or a receipt constructor.
-- Add supported-version configuration.
-- Add extension enablement.
-- Require every stateless HTTP extension-notification builder to
-  install its frozen current-message activation-proof descriptor; a
-  notification API cannot fall back to discovery, prior-request, or
-  connection negotiation state.
-- Add discovery cache policy.
-- Add request metadata defaults, including a required safe-builder
-  local `Implementation` identity that is emitted as `clientInfo` on
-  every modern request by default, an explicit bounded override, and
-  a conspicuous privacy opt-out that records the PRT-02
-  SHOULD-deviation.
-- Add cache policy.
-- Add auth providers and credential store.
-- Add MRTR resolvers.
-- Add subscription APIs.
-- Add HTTP client/server configuration.
-- Export OPS-01's read-only `OperatorSnapshotHandle`, bounded contributor
-  registration, and exporter installation through the facade. Exporters
-  receive immutable snapshots only; they cannot construct trusted
-  contributors, raw ingress/auth contexts, response writers, or dynamic
-  label keys.
-- Make HTTP liveness/readiness/metrics routes a separate explicit builder
-  installation outside the MCP path and method registry. Bind exact path,
-  methods, origin/network exposure, authentication/access policy,
-  response/time limits, cache policy, and configuration generation before
-  listener start; disabled means no route.
-- Freeze the exact configured router, handler/middleware policy, limits,
-  auth providers, operator routes, and protocol policy into one server-
-  binding value. Every accepted HTTP connection and request stream must
-  borrow that exact binding; no accept/connection path may reconstruct a
-  default handler or silently drop configured policy.
-- Expose injection of FND-04's bounded `BlockingWorkExecutor` and a
-  startup capability probe that proves admitted work runs off the
-  async executor. Do not infer safety merely from the existence of
-  `Cx::spawn_blocking`, because both the pinned `0.3.9` baseline and
-  current `0.3.10` candidate execute it inline when no blocking pool
-  handle is installed.
-- Refuse startup for enabled schema/validation or other
-  non-preemptible synchronous features when no detectable admitted
-  non-inline blocking capability is available.
-- Make server serve/accept, client connect/execute, router dispatch,
-  middleware, handler, proxy, and shutdown entry points async and
-  `&Cx`-first at the public library boundary.
-- Expose no convenience constructor that owns or re-enters a runtime;
-  document the CLI/application binary as the sole top-level runtime
-  owner.
-- Add optional consumer-owned `ApplicationNotificationSupervisor`
-  injection plus the sealed one-shot `AuthorizedNotificationRunner`
-  for HTTP notifications accepted before their work completes; without
-  it, notifications complete in request scope before 202.
-- Export modern types through the primary prelude.
-- Export legacy support through an explicit legacy module.
-- Mark public activation/building entry points for Roots, Sampling,
-  Logging, DCR, and deprecated `includeContext` values with Rust-native
-  deprecation metadata where the API shape permits. The excluded two-endpoint
-  HTTP+SSE transport has no activation/export to mark; documentation
-  names it unsupported, and the reachable legacy module is the
-  distinct `2025-11-25` sessioned Streamable HTTP adapter. Notes name
-  the upstream feature, migration, deprecated
-  revision/date, and exact earliest-eligible-removal date or event from
-  Section 5.22; do not state that removal is certain on that boundary.
-  Keep wire types needed for final-release tolerant decode available
-  without forcing internal implementation to suppress blanket
-  warnings, but carry the same lifecycle state in their public docs.
-- On explicit runtime activation/use, emit at most one local
-  configurable deprecation warning per feature/configuration
-  generation without peer payload, credential, or raw parameter data.
-  A warning never changes wire behavior, capability negotiation, or
-  the caller's explicit policy decision.
-- Remove old Rust task and initialization conveniences rather than
-  wrapping them.
-
-Acceptance:
-
-- A minimal modern server needs no initialization configuration.
-- A minimal modern client sends valid metadata automatically.
-- Its default metadata also earns
-  `sep-2575-client-sends-client-info: SUCCESS`; servers continue to
-  accept schema-valid requests whose optional `clientInfo` is absent.
-- Legacy enablement is explicit.
-- Each policy's server/client first-wire behavior is fixed before
-  effects, and a missing/wrong-role/wrong-binding/stale receipt fails
-  builder validation.
-- Extension enablement is explicit.
-- HTTP 202 ownership policy is explicit and cannot create detached
-  work.
-- The canonical prelude contains no obsolete task or Session APIs.
-- Public library signatures make ambient `Cx` ownership explicit and
-  cannot synchronously block on an async lifecycle.
-- Runtime capability validation fails early and diagnostically instead
-  of allowing schema work to run inline on an executor task.
-- Deprecated-feature API and runtime signals match the pinned registry
-  without prematurely removing the final-release wire surface.
-- Operator handles/exporters and separately installed HTTP health routes
-  expose no raw ingress/credential authority and agree with the exact
-  configured server generation.
-- Every connection uses the builder's exact router/handler/auth/limit/
-  operator configuration; changing a nondefault policy changes observed
-  behavior, and no default reconstruction path exists.
+- Make `ProtocolPolicy::{Auto, ModernOnly, LegacyOnly}` immutable,
+  non-exhaustively constructed only through validated builders, and without
+  a post-construction policy setter.  Capture the exact default Auto profile,
+  stdio profile, and HTTP profile in the builder result together with the
+  protocol/version configuration generation.
+- `ModernOnly` exposes only the exact 2026 module with the legacy feature
+  disabled.  Its first MCP action follows the final modern discovery contract,
+  and no safe public API can construct a legacy receipt, import a legacy
+  symbol, or emit an exact-2024 initialization path.
+- `LegacyOnly` exposes only the feature-gated exact-2024 module and requires
+  the matching legacy feature plus a sealed role, owner/security partition,
+  configuration-generation, and transport-binding receipt before spawn,
+  bind, or connect.  `Auto` composes both explicit modules but delegates
+  every selection decision to LEG-NEG-01; it cannot select a protocol from a
+  generic error, response, timeout, redirect, or application result.
+- For HTTP Auto construction, require an exact immutable
+  `HttpEndpointBundle`: the modern configured request/response POST target
+  plus the complete, separately named legacy HTTP+SSE targets.  Bind every
+  target, scheme/origin, credential/security partition, feature state, policy,
+  and configuration generation into the sealed server/client receipt.  A
+  missing, stale, wrong-role, wrong-owner, wrong-policy, or partial bundle
+  fails before connection or request emission.
+- Keep the modern module and the `legacy_2024` module disjoint in public
+  exports, builder state, receipts, endpoint bundles, credentials, caches,
+  subscriptions, and lifecycle types.  LEG-02, LEG-03, and LEG-HTTP-01 own
+  exact legacy behavior; API-01 only composes their sealed public contracts.
+- Export modern supported-version, extension activation, safe default
+  `clientInfo` metadata with bounded override and conspicuous privacy
+  opt-out, cache policy, authentication/credential configuration, MRTR
+  resolvers, subscription configuration, and HTTP configuration.  Extension
+  notifications require their frozen activation-proof descriptor and cannot
+  use ambient connection history as activation authority.
+- Expose FND-06 profile-isolated injection of the bounded
+  `BlockingWorkExecutor` and fail startup for enabled non-preemptible
+  synchronous work when no admitted non-inline capability is present.  Public
+  server serve/accept, client connect/execute, dispatch, middleware, handler,
+  proxy, and shutdown entries stay asynchronous and `&Cx`-first; the facade
+  owns no runtime or synchronous re-entry convenience.
+- Make request-scoped notification ownership explicit through the
+  consumer-owned supervisor/authorized runner contract.  Default behavior
+  cannot detach work beyond the accepted request's ownership.
+- Export exact public types through the canonical prelude, with modern types
+  in the primary surface and exact legacy types only from `legacy_2024`.
+  Remove obsolete task and initialization conveniences instead of wrapping
+  them.  Keep deprecation metadata and one-per-generation local diagnostics
+  for the frozen modern registry without changing wire behavior or exposing
+  peer/credential/raw-parameter data.
 
 Tests:
 
-- Facade compile tests.
-- Prelude completeness.
-- Minimal client/server example.
-- Consumer-owned top-level runtime example and nested-runtime
-  compile/runtime rejection.
-- Builder three-policy × stdio/HTTP × client/server combinations,
-  immutable profile capture, feature/receipt role/binding/generation
-  validation before effects, and no public receipt constructor.
-- Stateless extension-notification proof-descriptor required/absent/
-  prior-state-negative builder tests.
-- Notification supervisor absent/present policy.
-- Zero-worker rejection, bounded blocking admission, cancellation
-  before admission, completion-after-caller-cancel reconciliation, and
-  non-inline worker-thread proof.
-- Feature-off builds.
-- Legacy module isolation.
-- Facade-only snapshot/exporter compile/run tests, contributor-forgery and
-  raw-ingress/auth/label-authority compile failures, slow/panicking
-  exporter isolation, and disabled-route absence.
-- Authenticated/unauthenticated HTTP health-route matrix with exact path/
-  method/origin/cache/size/deadline policy and no inheritance from a peer's
-  MCP authorization context.
-- Multi-connection nondefault-router/handler/middleware/auth/limit/
-  operator-policy test that fails if any accept path constructs defaults;
-  concurrent reload generations never mix bindings within a request.
-- Compile-time deprecation-note snapshots and one-per-generation
-  runtime-warning tests for every Section 5.22 feature, including
-  disabled/no-use silence, redaction, migration/date/event text, and
-  no behavioral side effect; for excluded HTTP+SSE, assert no public
-  activation symbol or runtime path exists instead of expecting a
-  warning.
+- `api_01_modernonly_public_surface_positive` and
+  `api_01_modernonly_public_surface_planted_negative` are the exact bounded
+  leaf tests.  They compile and run a packaged external ModernOnly consumer
+  with legacy disabled, then differ only by one forbidden legacy
+  symbol/receipt/initialization attempt and prove the typed public rejection
+  with zero process/network/cache/auth mutation.
+- `api_01_auto_positive` and `api_01_auto_planted_negative` are full
+  API-01 same-Bead tests.  They exercise the shipped public facade with Auto
+  default, explicit ModernOnly, and explicit LegacyOnly across stdio and HTTP
+  bundles; the planted negative changes only one feature, receipt, endpoint,
+  owner, policy, or generation dimension.
+- Public compile/use tests cover primary-prelude completeness, modern-module
+  export inventory, feature-gated legacy-module isolation, external consumer
+  examples, immutable policy capture, default/override/opt-out client
+  metadata, `&Cx`-first ownership, no nested runtime, blocking-capability
+  admission, notification ownership, deprecation diagnostics, and stale or
+  partial endpoint-bundle rejection before effects.
+- Explicit rejection/no-claim tests cover `LatestOnly`,
+  `ModernWithLegacy`, a planted 2025 profile, sessioned transport,
+  unsealed/forged receipts, partial legacy targets, legacy symbols with the
+  feature disabled, a modern export aliasing exact legacy behavior, and every
+  error-driven selection attempt.  Each proves no endpoint selection,
+  receipt minting, connection, request emission, cache/auth state change, or
+  downgrade.
+- Every required ID is discovered, started, and passed unfiltered in the
+  same execution Bead as its real code; ignored, zero-run, fixture-only, or
+  wrapper-only output is not proof.
+
+Evidence:
+
+- Bind each run to the exact revision/tree, facade package/profile/target/
+  features, public module/export inventory, builder policy, endpoint-bundle
+  fields, sealed receipt fields, first MCP action, external consumer, planted
+  dimension, and first-attempt result.
+- The positive observable is an externally consumable public builder that
+  admits only its declared policy/module/bundle.  The planted negative
+  observable is the registered typed rejection plus unchanged public state
+  and zero outbound effect.
+- The bounded ModernOnly leaf proves only the core public surface.  The full
+  API aggregate requires its own real code, same-Bead positive and
+  near-identical planted-negative tests, and independent revision-bound
+  verification before any Auto or legacy claim.
 
 Dependencies:
 
-- MAC-01.
-- CLT-02.
-- SRV-02.
-- EXT-01.
-- AUTH-05.
-- HTTP-06.
-- MRTR-03.
-- SUB-03.
-- CACHE-03.
-- OPS-01.
+- FND-06 — `bd-mcp-2026-07-28-support-ahet.7`
+- SRV-02 — `bd-mcp-2026-07-28-support-ahet.17`
+- CLT-02 — `bd-mcp-2026-07-28-support-ahet.24`
+- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
+- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
+- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
+- MRTR-03 — `bd-mcp-2026-07-28-support-ahet.41`
+- SUB-03 — `bd-mcp-2026-07-28-support-ahet.43`
+- MAC-01 — `bd-mcp-2026-07-28-support-ahet.63`
+- HTTP-06 — `bd-mcp-2026-07-28-support-ahet.64`
+- AUTH-05 — `bd-mcp-2026-07-28-support-ahet.69`
+- CACHE-03 — `bd-mcp-2026-07-28-support-ahet.73`
+- API-01 bounded ModernOnly leaf — `bd-mcp-api-modernonly-61vo`
+- LEG-02 — `bd-mcp-2026-07-28-support-ahet.58`
+- LEG-03 — `bd-mcp-2026-07-28-support-ahet.39`
+- LEG-HTTP-01 — `bd-mcp-leg-http-01-4yed`
+- LEG-NEG-01 — `bd-mcp-leg-neg-01-jlbe`
 
-### EXT-DEV-01 — Ship a safe out-of-tree extension authoring contract
+Tracker mapping:
+
+- Plan package ID: API-01
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.79`
+- Formal prerequisite IDs: FND-06, SRV-02, CLT-02, STD-01, EXT-01,
+  HTTP-03, MRTR-03, SUB-03, MAC-01, HTTP-06, AUTH-05, CACHE-03,
+  `bd-mcp-api-modernonly-61vo`, LEG-02, LEG-03, LEG-HTTP-01, and
+  LEG-NEG-01.
+- Dependency direction: all listed prerequisites → API-01 → GATE-DUAL-READY.
+  GATE-CORE-READY depends directly on
+  `bd-mcp-api-modernonly-61vo` and never on full API-01.
+- No-claim boundary: API-01 proves only the public Auto-default composition
+  and explicit policy modules.  It does not prove a 2025/sessioned
+  transport, automatic selection outside LEG-NEG-01, independent legacy
+  transport behavior, aggregate conformance, maturity, or release readiness.
+
+### CLI-01 — Auto-default dual-era run, inspect, and diagnostics
 
 Outcome:
 
-Let downstream crates implement explicitly enabled MCP extensions
-without importing private workspace crates or bypassing FastMCP's
-admission, authorization, limits, lifecycle, and wire invariants.
+- The shipped CLI has one immutable `ProtocolPolicy` with `Auto` as the
+  public default and explicit `ModernOnly` and `LegacyOnly` selections.
+- Run, inspect, and diagnostic commands expose exactly MCP 2026-07-28 and,
+  when the legacy feature and sealed receipt are present, exactly MCP
+  2024-11-05.  They report the public policy, configured transport, first
+  MCP action, and admitted outcome without claiming an unimplemented era.
 
 Reason:
 
-EXT-01 defines the framework's internal extension model, but a framework
-that claims extensibility needs a supported external authoring surface
-for separately packaged Rust crates linked at compile time. This package
-does not define dynamic loading or a stable dynamic-library/plugin ABI.
-Exposing internal registries or raw JSON-RPC would make third-party code
-an authority escalation path and would couple consumers to private crate
-layout.
+- The CLI is a public policy boundary, not an era classifier.  Its defaults,
+  endpoint bundle, feature state, and receipt must be fixed before a command
+  starts so peer input, ordinary failures, or presentation paths cannot alter
+  protocol selection.
+- A bounded ModernOnly command surface must remain independently consumable
+  by the core gate while the full CLI composes Auto and exact legacy
+  diagnostics downstream.
 
 Implementation:
 
-- Export the minimum authoring API from the facade under a deliberate
-  `extension` module: validated identifier/settings schema builders,
-  typed descriptor builders, request/notification/result codecs,
-  direction and activation declarations, authorization requirements,
-  subscription-event descriptors, and async `&Cx`-first handler traits.
-- Keep descriptor construction sealed until every field has passed the
-  same namespace, duplicate, size, schema, direction, method-collision,
-  result-discriminator, header-projection, and capability checks used by
-  built-in extensions. There is no unchecked/public struct-literal path.
-- Require a developer-chosen extension identifier and method/result
-  namespace that cannot collide with core, another installed extension,
-  reserved FastMCP identifiers, case/Unicode look-alikes, or a legacy
-  adapter. Registration is atomic and fails before any listener starts.
-- Separate wire codecs from handlers. Decode through PRT-01/PRT-04 and
-  the registered bounded schema; provide only admitted typed values to
-  application code; validate and size-bound every returned result or
-  notification before transport commit.
-- Give handlers an `ExtensionContext` that borrows the ordinary
-  `McpContext` plus the exact authorized descriptor/settings snapshot.
-  It exposes cancellation, budget, principal-safe facts, and approved
-  services, but no raw bearer token, private transport ingress,
-  response writer, registry mutation, runtime construction, or
-  unchecked JSON-RPC emitter.
-- Require explicit compile-time inclusion and runtime installation.
-  Knowledge of an identifier, discovery from an earlier request, or a
-  downstream-provided capability map never activates an extension.
-- Bind every request/notification activation proof to descriptor digest,
-  settings digest, endpoint/configuration generation, direction,
-  authenticated security partition, and current message. Reuse or
-  cross-route replay fails before handler effects.
-- Provide typed extension errors that map only through the registered
-  contract. Panic payloads and arbitrary Rust error chains are sanitized
-  at the peer boundary while bounded local diagnostics retain the cause.
-- Define wire descriptor/schema compatibility as an explicit version
-  change rather than a permissive unknown-field parse. This is separate
-  from—and does not waive—the facade crate's ordinary documented Rust
-  semver obligations.
-  Multiple installed versions require distinct noncolliding identifiers
-  or a documented descriptor-owned negotiation rule.
-- Define capability-limited public fixture hooks that DX-TEST-01 can
-  wrap without private constructors. Document how an author proves core
-  isolation, capability-negative behavior, bounded decode/encode, auth,
-  cancellation, and packaged-consumer compatibility.
-- Include a complete example extension in existing example surfaces and
-  build it as a separate temporary consumer depending only on the
-  packaged facade under both canonical and renamed dependency names.
-- Keep the public surface free of compatibility shims for the old core
-  task, resource-subscription, reverse-request, or session contracts.
-
-Acceptance:
-
-- A downstream crate can define, install, discover, invoke, test, and
-  document an extension using only public facade APIs.
-- The same crate cannot register a core/reserved/colliding method, forge
-  activation, observe raw credentials/ingress, emit unchecked envelopes,
-  escape configured limits, or create an orphan runtime/task.
-- Extension-disabled and unadvertised paths produce no handler effects,
-  catalog entries, result discriminators, headers, notifications, or
-  subscription events.
-- Built-in and out-of-tree extensions pass the same descriptor and
-  admission pipeline; exporter/example-only success is insufficient.
-- Public authoring types remain feature-isolated from Tasks, Apps,
-  enterprise auth, and the legacy adapter unless the consumer explicitly
-  enables and composes those profiles.
+- Parse and validate `ProtocolPolicy::{Auto, ModernOnly, LegacyOnly}` once,
+  make the resulting command configuration immutable, and select `Auto` when
+  the policy flag is omitted.  There is no post-parse policy setter, inferred
+  profile, generic retry selector, or peer-controlled policy override.
+- `ModernOnly` exposes only the final 2026-07-28 run/inspect surface over
+  configured stdio and modern HTTP.  Its first MCP action is the final modern
+  discovery action; no public command path can emit initialization, open a
+  legacy SSE candidate, construct a legacy receipt, or name the legacy
+  module when the feature is disabled.
+- `LegacyOnly` is available only with the exact legacy feature and a sealed
+  role/owner/security-partition/configuration-generation/transport-binding
+  receipt.  It invokes only the exact 2024-11-05 adapter contracts supplied
+  by LEG-02 and LEG-03.  The CLI does not implement a legacy transport:
+  LEG-HTTP-01 owns the exact legacy HTTP+SSE endpoints and their endpoint
+  event contract.
+- `Auto` requires both canonical configured targets in its immutable
+  endpoint bundle.  It hands the frozen modern observation and bundle to
+  LEG-NEG-01, the sole selection owner, and renders only that sealed
+  observation/selection result.  No command turns an HTTP status, body,
+  redirect, timeout, ordinary error, or display failure into a selection;
+  no command derives a legacy URI, opens the candidate itself, or mints a
+  receipt.  Only the valid endpoint event admitted by LEG-NEG-01 can result
+  in a Legacy report.
+- Render policy/profile/version, configured transport and targets, first MCP
+  action, discovery versions/capabilities/extensions, cache, routing/header,
+  schema, subscription, MRTR, OAuth, and stable typed failure diagnostics.
+  Use an explicit safe default `clientInfo` with bounded override and a
+  conspicuous privacy opt-out; never render secrets, raw credentials, or
+  unbounded peer fields.
+- Keep exact machine JSON schema-stable and separate from human output.
+  Pass every peer-controlled human field through OBS-02
+  `UntrustedDisplayText`; disable Rich markup and terminal hyperlinks.  Do
+  not turn list, metadata, or inspection failure into an empty successful
+  catalog, and return a nonzero exit for each diagnostic failure.
+- Preserve protocol-stream purity: child stdio stdout contains only JSON-RPC;
+  human diagnostics use stderr and machine diagnostics use the explicitly
+  selected channel.  Start, handler, transport, auth, EOF, signal, and
+  cancellation failures reach a bounded structured shutdown with their
+  stable nonzero exit rather than a detached child.
 
 Tests:
 
-- Packaged-consumer compile/run matrix using only `fastmcp-rust`, a
-  renamed facade dependency, minimal/no-default features, and every
-  supported target class.
-- Descriptor goldens and collision negatives for core/reserved/legacy/
-  duplicate/case/Unicode-look-alike identifiers, methods, result types,
-  headers, and subscription events.
-- Raw duplicate/oversize/depth/numeric/schema-invalid request/settings/
-  result/notification tests proving the handler never observes rejected
-  input and no bytes commit on invalid output.
-- Compile-fail tests for private ingress construction, raw token access,
-  unchecked response emission, registry mutation after freeze, runtime
-  ownership, and non-`&Cx` async handlers.
-- Activation proof absent/stale/replayed/wrong-direction/wrong-principal/
-  wrong-generation/wrong-settings tests with zero side effects.
-- Authorization, cancellation, deadline, panic sanitation, subscription,
-  transport-neutral descriptor preservation, and reload-generation
-  integration tests. PXY-01 owns actual two-leg forwarding.
-- Feature cross-product tests proving no accidental dependency or claim
-  on Tasks, Apps, enterprise auth, or legacy support.
+- `cli_01_modernonly_public_surface_positive` and
+  `cli_01_modernonly_public_surface_planted_negative` are the exact bounded
+  leaf tests.  They execute the shipped binary with legacy disabled across
+  stdio and modern HTTP; the planted variant changes only one forbidden
+  initialize/legacy-SSE/legacy-receipt/2024-selection dimension and proves
+  typed rejection, stable machine JSON, nonzero exit, and zero
+  process/network/cache/auth mutation.
+- `cli_01_auto_public_surface_positive` and
+  `cli_01_auto_public_surface_planted_negative` are full CLI-01 same-Bead
+  tests over the shipped binary.  They cover default Auto plus explicit
+  ModernOnly and LegacyOnly across stdio and the complete configured HTTP
+  bundle; the planted case differs by only one receipt, target, owner,
+  policy, feature, observation, or generation dimension.
+- Public black-box compile/use and command tests cover argument/help parsing,
+  immutable default capture, feature-gated legacy isolation, discovery and
+  exact legacy diagnostics, receipt/profile/first-wire fields, endpoint
+  bundle completeness, safe default/override/opt-out client metadata,
+  stdout/stderr separation, machine JSON schema, redaction, terminal safety,
+  and every failure exit status.
+- Explicit rejection/no-claim tests cover `LatestOnly`-style policies, a
+  planted 2025 profile, sessioned transport, any inferred legacy endpoint,
+  missing or forged receipt, feature-disabled legacy command, modern aliases
+  for legacy behavior, and all error-driven selection attempts.  Each proves
+  no selected era, candidate GET, receipt minting, connection, request,
+  cache/auth mutation, or downgrade.
+- Real CLI code and its positive plus near-identical planted-negative tests
+  land on the same execution Bead.  Documentation, refusal-only behavior,
+  formatter-only calls, fixtures presented as a live binary, wrappers,
+  placeholders, ignored/filtered/zero-run tests, and follow-up laundering
+  earn no capability credit.
+
+Evidence:
+
+- Bind each result to the exact revision/tree, shipped binary/package/profile/
+  target/features, lockfile/toolchain, command and public export inventory,
+  immutable policy, endpoint-bundle and receipt fields, first MCP action,
+  selected output channel, exit status, and planted dimension.
+- The bounded ModernOnly leaf proves only the shipped ModernOnly run/inspect
+  diagnostic surface.  Full CLI-01 requires its own real code and same-Bead
+  positive/negative evidence at the exact revision before any Auto or legacy
+  claim.
 
 Dependencies:
 
-- PRT-04.
-- PRT-05.
-- HDR-01.
-- SCH-01.
-- EXT-01.
-- XPORT-01.
-- API-01.
+- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
+- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
+- LEG-03 — `bd-mcp-2026-07-28-support-ahet.39`
+- OBS-02 — `bd-mcp-2026-07-28-support-ahet.51`
+- LEG-02 — `bd-mcp-2026-07-28-support-ahet.58`
+- AUTH-05 — `bd-mcp-2026-07-28-support-ahet.69`
+- API-01 — `bd-mcp-2026-07-28-support-ahet.79`
+- CLI-01 bounded ModernOnly leaf — `bd-mcp-cli-modernonly-31kh`
+- LEG-HTTP-01 — `bd-mcp-leg-http-01-4yed`
+- LEG-NEG-01 — `bd-mcp-leg-neg-01-jlbe`
 
-### DX-TEST-01 — Rebuild the public modern testing toolkit
+Tracker mapping:
 
-Outcome:
-
-Provide downstream developers with deterministic, production-faithful
-helpers for modern server, client, transport, auth, extension, and
-cancellation tests.
-
-Reason:
-
-The current facade testing module is useful but reflects the legacy
-initialize/session/result model. Projects need ergonomic tests without a
-second protocol implementation that can pass while production fails.
-
-Implementation:
-
-- Rework `fastmcp_rust::testing` around production `Client`, `Server`,
-  router, codec, admission, and memory/stdio/HTTP transport boundaries.
-  Helpers may assemble these components but never duplicate dispatch,
-  capability, auth, cache, result, or extension rules.
-- Provide a `TestRuntime`/scope fixture that is explicitly supplied by
-  the test, uses `LabRuntime` where deterministic scheduling is needed,
-  exposes virtual time and schedule exploration, and never hides a
-  global or nested `block_on`.
-- Put the LabRuntime-backed layer behind a distinct non-default
-  `testing-lab` feature and audit its resolved graph. Ordinary `testing`
-  and every production/default build must remain free of asupersync
-  `test-internals`; enabling `testing-lab` is an explicit downstream
-  test-build choice and does not add protocol or auth authority.
-- Provide deterministic injectable clock, entropy, DNS/fetch, credential,
-  key, blocking-work, and durable-store fixtures only through the same
-  capability traits accepted by production builders. Put synthetic and
-  loopback-only fixtures behind a non-default `testing` facade feature;
-  treat that feature as ergonomics, not a security boundary, and ensure
-  no fixture can mint a production-trusted ingress, principal,
-  key-custody receipt, or arbitrary-network authority.
-- Add a typed `TestServer`/`TestClient` harness for modern memory
-  transport plus black-box child-process stdio and loopback Streamable
-  HTTP harnesses that exercise actual framing, headers, response streams,
-  cancellation on close, stdout purity, and shutdown.
-- Add a bounded raw-wire peer for negative tests. It may send malformed
-  bytes and record exact frames but cannot construct internally trusted
-  request/context/authorization types.
-- Provide fixture builders for required metadata, discovery, tools,
-  resources, prompts, MRTR, subscriptions, auth challenges, cache hints,
-  and registered extensions. Defaults are valid modern values and are
-  explicit about principal/profile/limit generations.
-- Provide structured event capture with monotonic sequence numbers,
-  bounded payloads, redacted human rendering, exact escaped machine
-  values, and causal request/stream/task identifiers local to the test.
-  On failure, emit seed, virtual time, schedule, frame direction, and
-  bounded state transitions.
-- Supply assertions for no bytes/effects before admission, exactly one
-  terminal outcome, response-ID preservation, no post-terminal progress,
-  cancellation provenance, queue bounds, secret absence, and clean
-  structured shutdown.
-- Support fault injection at every transport read/write/flush/close,
-  auth fetch/refresh, cache commit, durable commit, exporter, and handler
-  boundary with deterministic Nth-operation selection.
-- Keep protocol-era helpers explicit. Modern helpers never initialize or
-  create Session state; legacy helpers exist only behind the legacy
-  profile and are named as such.
-- Publish rustdoc and runnable examples for minimal tool, MRTR, HTTP,
-  auth, extension, cancellation, virtual-time, and malformed-peer tests.
-- Expose a facade-only operator-snapshot/exporter fixture and example;
-  prove a custom downstream exporter can observe bounded OPS-01 state
-  without obtaining raw ingress, credentials, or protocol authority.
-
-Acceptance:
-
-- A facade-only downstream consumer can express happy, malformed-wire,
-  auth, cancellation, concurrency, and extension tests without private
-  imports or sleep-based timing.
-- In-process convenience tests and real stdio/HTTP black-box tests use
-  identical production admission and result semantics.
-- Failed tests report enough bounded deterministic context to reproduce
-  the seed/schedule/frame sequence without revealing secrets.
-- No helper grants trusted ingress/auth types, silently initializes a
-  legacy session, owns a process-global runtime, or turns test-only
-  insecure providers into production defaults.
-
-Tests:
-
-- Facade-only and renamed-dependency packaged consumers for every public
-  helper and documented example.
-- Packaged custom-exporter positive test plus compile-fail attempts to
-  obtain raw ingress, credential, or unchecked metric-label authority.
-- Differential runs of the same scenario over memory, child stdio, HTTP
-  JSON, and HTTP SSE response modes.
-- LabRuntime virtual-time, seeded schedule reproduction, DPOR race, and
-  no-real-sleep assertions.
-- Malformed frame/header/body, duplicate key, unknown response ID,
-  disconnect, half-write, flush failure, stream close, timeout, panic,
-  and cancellation-before/during/after-commit matrices.
-- Failure-log goldens proving seed/schedule/causal detail plus secret,
-  terminal-control, unbounded-payload, and nondeterministic-field absence.
-- Compile-fail tests for private context/ingress construction, hidden
-  runtime ownership, and legacy helpers without the legacy feature;
-  default/no-default graph tests prove `testing`, `testing-lab`, and
-  asupersync `test-internals` remain absent unless explicitly selected.
-
-Dependencies:
-
-- FND-04.
-- PRT-05.
-- SRV-02.
-- SRV-04.
-- CLT-01.
-- XPORT-01.
-- API-01.
-- EXT-DEV-01.
-
-### CLI-01 — Upgrade run, inspect, and diagnostics
-
-Outcome:
-
-Make the CLI a reliable protocol and migration diagnostic tool.
-
-Reason:
-
-Current commands assume initialization and can hide list errors.
-
-Implementation:
-
-- Add exact `LatestOnly`, `ModernWithLegacy`, and `LegacyOnly`
-  protocol-policy flags and render the root plus stdio/HTTP profile
-  IDs, selected server/client first-wire action, required adapter
-  receipt generation, and feature-disabled errors without allowing
-  peer input to change the selection.
-- Add explicit protocol version selection.
-- Add stdio and HTTP transport selection.
-- Add URL configuration.
-- Display discovery versions and cache hints.
-- Display client/server capabilities.
-- Display extensions and whether each is enabled.
-- Display modern versus legacy classification.
-- Display header/meta diagnostics without secrets.
-- Add schema validation diagnostics.
-- Add subscription listen/watch.
-- Add MRTR interactive resolvers where safe.
-- Add OAuth metadata and issuer diagnostics.
-- Render OPS-01 liveness, readiness, degradation, saturation, capacity,
-  and dropped-observation state without inventing new semantics or
-  exposing forbidden dimensions.
-- Render every peer-controlled human-facing field only through
-  OBS-02's bounded `UntrustedDisplayText`; disable Rich markup and
-  terminal hyperlinks for untrusted values. Keep exact machine JSON
-  separate.
-- Never swallow list failures with defaults.
-- Make exit status reflect diagnostic failure.
-- Keep machine-readable JSON output.
-- Preserve protocol-stream purity and lifecycle truth in every execution
-  path: child stdio stdout contains JSON-RPC only; diagnostics use
-  stderr or the selected machine channel; startup/build/handler/transport
-  errors yield nonzero status; signal/cancellation/EOF triggers bounded
-  structured shutdown rather than a detached child.
-
-Acceptance:
-
-- Inspect works before any initialization in modern mode.
-- `LatestOnly` diagnostics never initialize, `LegacyOnly` diagnostics
-  never discover, and `ModernWithLegacy` reports only the frozen
-  binding-specific classifier/fallback outcome.
-- Every failure is surfaced.
-- Secret values never appear.
-- Peer values cannot emit terminal controls, markup, hyperlinks, or
-  forged diagnostic lines.
-- JSON output has stable documented fields.
-
-Tests:
-
-- Argument parsing.
-- All three policies across stdio/HTTP client/server snapshots,
-  receipt/profile/first-wire fields, and legacy-feature-disabled/
-  missing-receipt diagnostics.
-- HTTP raw integration.
-- Failure exit codes.
-- Secret redaction.
-- ANSI/OSC/Rich/bidi/newline/oversize terminal-safety snapshots and
-  exact JSON-versus-sanitized-human comparison.
-- JSON schema for CLI output.
-- Subscription commands.
-- Black-box child-process stdio tests with the packaged CLI and packaged
-  fixture server, exact stdout/stderr separation, concurrent request/
-  notification traffic, startup/build failure propagation, EOF,
-  cancellation, and bounded shutdown.
-- Real loopback Streamable HTTP JSON/SSE tests with origin/header/auth
-  failures, response-stream close cancellation, readiness transitions,
-  and nonzero exit codes.
-
-Dependencies:
-
-- API-01.
-- STD-01.
-- HTTP-03.
-- AUTH-05.
-- OBS-02.
-- OPS-01.
+- Plan package ID: CLI-01
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.83`
+- Formal prerequisite IDs: STD-01, HTTP-03, LEG-03, OBS-02, LEG-02,
+  AUTH-05, API-01, `bd-mcp-cli-modernonly-31kh`, LEG-HTTP-01, and
+  LEG-NEG-01.
+- Dependency direction: all listed prerequisites → CLI-01 → GATE-DUAL-READY.
+  GATE-CORE-READY consumes `bd-mcp-cli-modernonly-31kh` directly and never
+  the full CLI-01 aggregate.
+- No-claim boundary: CLI-01 proves only public Auto-default composition and
+  explicit exact-2026/exact-2024 policy diagnostics.  It does not prove a
+  2025/sessioned transport, selection outside LEG-NEG-01, legacy endpoint
+  behavior outside LEG-HTTP-01, aggregate conformance, maturity, or release
+  readiness.
 
 ### CLI-02 — Add Tasks extension commands
 
@@ -26810,264 +26798,233 @@ Dependencies:
 - CLI-01.
 - TASK-03.
 
-### DOC-01 — Rewrite architecture, API, and migration documentation
+### DX-TEST-01 — Provide feature-gated production-faithful facade testing
 
 Outcome:
 
-Teach the breaking migration and keep documentation truthful while
-implementation is still in progress.
+Provide a facade-only testing kit behind `testing` and `testing-lab` that lets
+renamed packaged consumers exercise real production entrypoints with a
+caller-owned `Cx`, exact traces/results/cardinality, and no ambient runtime.
 
 Reason:
 
-README and feature-parity material currently describe obsolete
-lifecycle and authorization behavior.
+Downstream testing must expose the same transport, cancellation, and terminal
+behavior as production. A mock presented as live, test-only trusted ingress,
+or a hidden runtime makes conformance evidence non-reproducible.
+This H3 is the sole normative package authority; every other DX-TEST-01
+mention is a consumer boundary, dependency, or no-claim reference.
 
 Implementation:
 
-- Update README protocol version and lifecycle.
-- Correct authorization FAQ.
-- Correct HTTP behavior and limitations.
-- Document
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  as the one immutable builder-selected `LatestOnly`,
-  `ModernWithLegacy`, or `LegacyOnly` policy shared by client and
-  server bindings. Document
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  with the exact server first-frame/terminal-close table and client
-  first-wire table: `LatestOnly` is modern discovery with no fallback;
-  `ModernWithLegacy` uses one isolated disposable modern probe and only
-  its frozen fallback signals; `LegacyOnly` sends initialize directly
-  with no discovery. A syntactically valid unsupported version in
-  complete modern opening metadata selects Modern and returns
-  `-32022`, never fallback. State that both legacy policies require the
-  compiled feature plus the matching binding/role/generation
-  installation receipt before spawn/bind/connect, and that a restart
-  creates a new process classification without replaying application
-  requests.
-- Document
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  as three immutable builder-selected tables. Core/default
-  `LatestOnly` keeps every POST modern, ignores well-formed legacy-only
-  headers without lookup, gives exact legacy-version/initialize
-  diagnostics, and returns 405 for MCP GET/DELETE.
-  `ModernWithLegacy` alone uses
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`
-  as its version-first table shared by HTTP-02 and LEG-02. State
-  the exact four metadata/two method/MRTR-retry marker inventory,
-  EXT-01's `ModernExclusive` versus `EraAmbiguous` distinction, and
-  why shared `notifications/cancelled` is not a marker. State
-  explicitly that exact modern plus well-formed Session/
-  `Last-Event-ID` stays modern and performs no lookup, while exact
-  legacy plus modern markers and absent version plus mixed markers are
-  terminal conflicts; document Session-only fallback and the lone
-  Last-Event-ID missing-session outcome. Document `LegacyOnly`'s exact
-  POST/GET/DELETE, non-modern-error, missing-session, and no-discovery
-  table. Both legacy modes require the compiled feature and matching
-  server/client endpoint adapter receipt before bind/connect; peer
-  bytes never choose policy.
-- Add a provisional final-spec support matrix whose entries remain
-  “planned” or “unverified” until DOC-02.
-- Separate core, deprecated, stable extension, and experimental
-  extension support.
-- Remove unconditional “100%” or “production ready” claims
-  immediately.
-- Add migration from old handler result types.
-- Document final `Result` openness: every selected standard complete or
-  input-required result retains bounded inert unknown siblings, while
-  selected-known fields still validate normally and an unknown
-  discriminator remains a distinct extension-policy case. Explain the
-  safe-constructor, custom-extra, client, cache, and transparent-proxy
-  behavior without suggesting that look-alike names grant semantics.
-- Add migration from Session state to explicit handles.
-- Add migration from old Tasks.
-- Document the exact composed Tasks-contract and notification profile:
-  final result/request layers, final MRTR embedded descriptors/results,
-  source-open Task notification params, and the path-scoped raw generated
-  schema/old-SDK conflicts. Do not present raw extension
-  `schema.json` as the whole-message wire oracle.
-- Document
-  `task_id_profile=fastmcp-opaque-task-id-v1`: local servers emit
-  canonical 43-byte unpadded Base64url IDs from 256-bit CSPRNG draws,
-  while clients accept bounded peer strings as exact opaque UTF-8
-  without normalization. Name the per-ID raw/decoded and per-filter
-  count/aggregate limits, fixed-size resume-store key projection,
-  exact protected-record binding, and the rule that possession of an
-  ID never authorizes a Task.
-- Add migration from reverse requests to MRTR.
-- Add migration from resource subscribe to subscriptions/listen.
-- Add protocol-policy examples.
-- Document that a stateless HTTP extension notification needs its
-  descriptor's current-message self-contained or negotiated-owner
-  activation proof. Registration, discovery, a prior request's
-  settings, and connection state are never peer capability evidence;
-  request-only core routing/capability headers are not invented for a
-  notification.
-- Add HTTP headers and auth guidance, including uncoded local
-  emission, case-insensitive singleton-semantic `identity` content-
-  coding admission, bounded RFC 9110 empty-list-element handling for
-  both `Content-Encoding` and `Accept`, the no-`accept-ext`/any-
-  position-`q` rule, the bind-time profile-derived canonical `Allow`
-  field on every MCP-target 405, and the distinct content-type/content-
-  coding 415 versus insufficient-`Accept` 406 outcomes.
-- Document the exact supported JSON Schema dialect identifier/alias
-  table, absent-`$schema` 2020-12 default, unsupported-dialect error,
-  schema-admission surfaces, trusted in-memory reference registry, and
-  default prohibition on network/filesystem `$ref` retrieval. Never
-  imply that an unknown dialect or unresolved reference is treated
-  permissively.
-- Document the final logging ambiguity honestly: HTTP logs are
-  response-stream scoped, while identifier-free concurrent stdio logs
-  use Section 5.21's sole-compatible-candidate
-  emission/attribution rule and may be suppressed or reported only as
-  uncorrelated. Do not promise request callbacks from ambiguous
-  standard bytes or imply a correlation extension is part of core.
-- Document every exposed custom transport's connection establishment,
-  framing, cancellation, and shutdown contract. In particular, label
-  `websocket-experimental` nonstandard and adapter-only, document that
-  it has no built-in Upgrade/endpoint/connector activation, and state
-  whether any future reliable byte-stream transport reuses stdio's
-  newline-delimited framing or records a reviewed reason not to.
-- Add an Apps scope statement that names both asymmetric settings-schema
-  IDs, the per-request bilateral activation predicate/resolver, and the
-  exact MIME membership rule. Document the SDK-1.29 projection profile,
-  complete standard-reuse root/transitive-closure inventory, its closed
-  advisory omissions, and initial-fallback/active-View failure boundary.
-  Document
-  `apps_lifecycle_profile=fastmcp-apps-2026-01-26-apps-1.7.5-sdk-1.29.0-strict-order-v1`:
-  the stable prohibition is Host→View only; pinned Apps `1.7.5`
-  merely warns and keeps sending from guarded methods by default and
-  exposes generic send APIs; FastMCP-owned View APIs require `Active`;
-  every other well-formed early View application request receives the
-  fixed correlated denial; and all four direction-correct View
-  application notifications enter a bounded no-side-effect sink.
-  Identify this hardened ordering rule as an interoperability
-  limitation and tell JavaScript authors to await `app.connect()` or
-  enable strict mode. Document the Apps error profile and exact
-  `apps_forward_open_result_reserved_members=["_meta","resultType"]`
-  rule on all six source-forward-open Apps-only results. Explicitly
-  state that the old-SDK-composed Apps `sampling`
-  capability/`sampling/createMessage` and hidden Tasks/MRTR result
-  mediation are unsupported.
-- In Apps author guidance, reproduce the pinned source's browser-
-  permission rule: `UIResourceMeta.permissions` is only a request that
-  a Host MAY honor through iframe Permission Policy. Apps SHOULD NOT
-  assume camera, microphone, clipboard-write, or geolocation was
-  granted and must feature-detect the corresponding browser API with a
-  safe fallback. This is documentation of View-author responsibility,
-  not a claim that the host-neutral broker implements a renderer.
-- Add exact deprecation and earliest-eligible-removal dates/events from
-  Section 5.22 plus upstream lifecycle links; label eligibility
-  separately from an actual removal decision.
-- Add source pins and a clearly provisional conformance-status block.
-- Update crate-level docs and examples.
-- Update changelog with breaking changes.
-- Do not refer readers to the Python implementation as executable
-  specification.
+- Export production-faithful helpers only under the non-default facade
+  `testing` feature. Export LabRuntime, virtual time, DPOR, and Lab-only
+  helpers only under `testing-lab`, which implies `testing`; ordinary/default
+  builds expose neither Lab symbols nor `asupersync/test-internals`.
+- Every helper accepts a caller-owned `&Cx` or caller-owned test scope and
+  returns an exact bounded trace, typed result, and cardinality receipt. It
+  never constructs an ambient runtime, hidden `Cx`, detached task, trusted raw
+  ingress, or test-only production path.
+- Exercise only real shipped entrypoints: Memory transport, child-stdio,
+  loopback HTTP JSON, and loopback HTTP request-scoped SSE. HTTP setup,
+  admission, or response failure is fail-closed and can never be counted as a
+  positive HTTP observation. Mock transports, parsers, registries, auth
+  decisions, or result algebras are forbidden as live proof.
+- Keep every packaged consumer isolated and resolve all generated/macro paths
+  through its renamed facade dependency. The kit may observe public outputs
+  and bounded state receipts but cannot mint registry, auth, raw JSON, or
+  runtime authority.
+- The mandatory child topology is `A + B → I → V → DX-TEST-01`. A owns the
+  feature-graph and facade compile surface; B owns Memory trace/cancellation/
+  terminal/cleanup behavior; I joins real child-stdio and loopback HTTP JSON/
+  SSE consumers; V independently verifies the exact integration revision.
+  The aggregate is never claimed monolithically.
 
 Acceptance:
 
-- Architecture, API, and migration material matches the implemented
-  modern model.
-- Core and extensions are clearly separated.
-- Deprecated features are labeled.
-- No modern example sends initialize.
-- No modern example omits required request metadata.
-- No dual-era example or support row can classify exact modern plus a
-  well-formed legacy-only header as cross-era or legacy.
-- No core/default example can select legacy from a Session/header/body,
-  and no legacy-enabled example omits its policy, feature, installation
-  receipt, or exact table.
-- No stdio example permits an unclassified/legacy-only invalid opening
-  to continue into a second classification; no `LatestOnly` client
-  initializes, no `LegacyOnly` client discovers, and no
-  `ModernWithLegacy` client reuses its disposable probe process.
-- No example places bearer credentials in params.
-- HTTP documentation preserves the exact RFC 9110 content-coding and
-  `Accept` parameter rules and distinguishes both 415 causes from the
-  406 outcome without inventing a JSON-RPC body.
-- No extension-notification example relies on discovery, a prior
-  request, or connection state for activation, omits its frozen proof,
-  or adds core request-only headers.
-- No custom or experimental transport is exposed without the
-  connection/framing/cancellation documentation required to
-  interoperate with it.
-- No documentation claims that a standard stdio
-  `notifications/message` identifies its request when zero or multiple
-  compatible requests are live.
-- Apps author documentation treats declared browser permissions as
-  requests, requires feature detection/fallback, and does not imply a
-  host-neutral renderer or guaranteed grant.
-- Apps documentation cannot imply same-ID or prior-request activation,
-  compare asymmetric settings for equality, hide a projection omission,
-  hide the pinned SDK's warning-only/generic-send behavior, turn an
-  early request denial or the four-notification pre-`Active`
-  compatibility sink into application authority, advertise Apps
-  sampling, or claim that Tasks/MRTR outcomes cross the Apps bridge.
-- Schema-dialect and reference-resolution documentation exactly matches
-  the compiled support/profile manifest.
-- Tasks documentation names the composed contract/notification profiles
-  and cannot silently substitute raw generated whole-message validation
-  or old imported SDK envelopes.
-- Tasks documentation cannot impose FastMCP's local Base64url shape on
-  a bounded peer ID, normalize an opaque ID, expose it as a raw
-  filesystem/database/metric key, or imply that it authorizes access.
-- Documentation never depicts a known final result as closed, silently
-  drops an open sibling, or treats an open sibling as cache, pagination,
-  MRTR, Task, routing, authorization, or extension authority.
+- Child A freezes exactly four compile graphs: default facade without test
+  exports; `testing` production-faithful facade; `testing-lab` facade with
+  Lab-only exports; and a renamed-facade packaged consumer. Each proves the
+  intended symbols and the absence of forbidden runtime/test-internals symbols
+  for its graph.
+- Child B freezes Memory concurrency at `N-1`, `N`, and `N+1` against the
+  published limit, plus cancellation, terminal-result, and cleanup cases. It
+  records the exact trace/result/cardinality evaluator outcome and proves
+  sibling isolation, no output after terminal state, and complete cleanup.
+- Child I proves isolated renamed packaged consumers at real child-stdio,
+  loopback HTTP JSON, and loopback HTTP SSE entrypoints, with a real Memory
+  baseline. Its trace/result/cardinality evaluator rejects a missing,
+  reordered, extra, or cross-request event. An HTTP failure is a typed
+  fail-closed negative, never a positive JSON or SSE category.
+- Child V binds the exact I revision and verifies exactly four packaged
+  fixtures: renamed Memory, renamed child-stdio, renamed loopback HTTP JSON,
+  and renamed loopback HTTP SSE. Each fixture must record its feature graph,
+  caller-owned context/scope, real entrypoint, trace/result/cardinality
+  receipt, and first-attempt outcome.
 
 Tests:
 
-- Doctests.
-- Example compilation.
-- Documentation link check.
-- Custom-transport contract and experimental-label check.
-- Protocol-string stale-reference search.
-- Root/stdio/HTTP era-policy profile and documentation-parity checks
-  under all three policies. Include every stdio server first-frame/
-  close row, client first-wire/fallback row, both role-specific
-  receipts, and the HTTP `ModernWithLegacy` classifier plus umbrella
-  `LatestOnly`/`LegacyOnly` tables, feature/receipt, fixed-error, and
-  zero-lookup wording parity.
-- HTTP content-coding/`Accept` grammar, case behavior, uncoded-emission,
-  bounded empty-list-element handling and saturation, 415 response-
-  field distinction, method-case/405/canonical-`Allow` profile parity,
-  and empty-body 405/415/406 documentation/wire parity.
-- Deprecated-feature registry/state/migration/date parity check,
-  including the event-relative HTTP+SSE boundary.
-- Stdio logging claim check with concurrent-request examples and
-  explicit core-versus-negotiated-extension language.
-- Schema-dialect identifier/default/error/reference-policy manifest
-  parity check.
-- Extension-notification activation-proof and no-stale-state/no-
-  invented-request-header wording check.
-- Tasks contract-profile/path-inventory/raw-versus-composed wording
-  check.
-- Task-ID profile, local-emission/remote-tolerance, limits, opaque-store-
-  key, exact-binding, and non-authority wording check.
-- Final-Result openness, known-field-collision, unknown-discriminator,
-  inert-look-alike, and client/cache/proxy preservation wording check.
-- Apps permissions-request/feature-detection/fallback and no-renderer-
-  claim documentation check.
-- Apps settings-schema/activation/projection-profile/omission/failure-
-  boundary, complete standard-reuse inventory, error profile, six-shape
-  reserved-result rule, and sampling/Tasks/MRTR exclusion wording checks.
-- Provisional support-matrix vocabulary check.
-- Operator snapshot/readiness/cardinality/privacy documentation and
-  CLI-rendering parity checks.
-- Public testing-toolkit and out-of-tree extension-authoring examples,
-  packaged-consumer commands, capability-boundary warnings, and private-
-  API import deny checks.
+- A uses real compile graphs, not documentation or synthetic export lists.
+  B's N-1/N/N+1, cancellation, terminal, and cleanup cases invoke the shipped
+  Memory entrypoint; a mocked peer cannot satisfy any case.
+- I runs the child executable and loopback HTTP listener through the facade
+  public API. JSON and finite request-scoped SSE positives require a complete
+  admitted request and exact terminal response; malformed, unauthorized,
+  cancellation, transport, or HTTP admission failures remain planted
+  negatives with no partial live-proof credit.
+- V requires its four fixture IDs to be discovered == started == passed with
+  zero ignored, filtered, feature-disabled, skipped, or not-run cases. Stale
+  integration revision, ambient-runtime construction, mock-as-live
+  substitution, trace/result/cardinality mismatch, or missing fixture fails
+  verification; V earns zero capability credit.
 
 Dependencies:
 
+- FND-04.
 - API-01.
-- CLI-01.
-- FND-03.
-- PRT-05.
-- SCH-01.
-- OPS-01.
+- MAC-01.
 - EXT-DEV-01.
-- DX-TEST-01.
+- STD-01.
+- HTTP-01.
+- HTTP-02.
+- HTTP-03.
+- XPORT-01.
+
+### DOC-01 — Truthful provisional documentation and executable examples
+
+Outcome:
+
+- Public documentation truthfully describes only exact MCP 2026-07-28 and
+  feature-gated exact MCP 2024-11-05, with immutable `Auto` as the ordinary
+  facade and CLI default plus explicit `ModernOnly` and `LegacyOnly`.
+- The documentation surface is provisional: every support row is planned or
+  unverified until its owning revision-bound implementation and gate evidence
+  exist.  No document, generated report, or successful documentation process
+  asserts aggregate support, runtime readiness, conformance, maturity, or
+  release readiness.
+
+Reason:
+
+- README, rustdoc, CLI help, migration text, and release notes are public API
+  surfaces.  They must not preserve obsolete initialization/session behavior,
+  invent a third era, or turn component evidence into a product claim.
+- Documentation receives capability credit only when actual documentation
+  sources and their executable examples/tests change together on this Bead;
+  prose, scans, generated artifacts, or refusal-only output are not a
+  substitute for that shipped work.
+
+Implementation:
+
+- Change the actual public sources `README.md`, `CHANGELOG.md`,
+  `crates/fastmcp/src/lib.rs` rustdoc, and `crates/fastmcp-cli/src/main.rs`
+  help/diagnostic text.  Remove obsolete lifecycle, transport, authorization,
+  compatibility, “100%”, and “production ready” statements rather than
+  retaining them as compatibility wording.  Do not treat the Python reference
+  as executable specification.
+- Document the canonical public policy exactly as
+  `ProtocolPolicy::{Auto, ModernOnly, LegacyOnly}` and the two supported eras
+  exactly as `ProtocolEra::{Modern2026, Legacy2024}`.  The policy is immutable
+  after validated builder/CLI parsing; peer bytes, user-visible diagnostics,
+  and ordinary failures cannot mutate it.  Feature-off documentation must
+  show ModernOnly, while LegacyOnly explains the exact legacy feature and
+  sealed role/owner/security-partition/configuration-generation/transport
+  receipt required before bind, connect, or spawn.
+- Document ModernOnly as final 2026-07-28 discovery-first behavior and
+  LegacyOnly as direct exact-2024-11-05 adapter behavior.  No modern example
+  initializes and no legacy example discovers.  Describe standard stdio and
+  modern HTTP separately from the exact legacy adapter; LEG-02 and LEG-03 own
+  legacy lifecycle, while LEG-HTTP-01 owns the exact legacy HTTP+SSE endpoint
+  pair and endpoint event.
+- Document Auto negotiation as owned solely by LEG-NEG-01.  For HTTP, exactly
+  status 400, 404, or 405 together with an empty or unrecognized modern body
+  makes one GET to the configured legacy candidate eligible.  Any recognized
+  modern JSON-RPC result or error at any HTTP status fixes Modern and prohibits
+  that GET.  Eligibility is not selection: only a valid legacy endpoint event
+  selects Legacy.  Redirects, authentication challenges, timeouts, network
+  failures, application errors, malformed events, and display failures never
+  select an era; no application request is replayed.  For stdio, document
+  only LEG-NEG-01's frozen eligible observation, reaped modern probe, and
+  fresh exact-2024 child, never a generic retry narrative.
+- Add an explicit rejection/no-claim row for MCP 2025-11-25.  It is an
+  unsupported planted negative, has no public alias or compatibility profile,
+  and cannot be selected by Auto, ModernOnly, LegacyOnly, a route, or a
+  diagnostic renderer.
+- Publish a source-controlled provisional support matrix with separate rows
+  for bounded ModernOnly, exact legacy, Auto dual-era, extensions, Tasks,
+  Apps, authorization, proxy/composition, and aggregate product claims.  Each
+  row names its owner, profile, exact revision-bound evidence requirement,
+  and present planned/unverified state; no schema, component, or process
+  artifact may satisfy another row or the aggregate row.
+- Update migration examples from initialization/session assumptions to
+  explicit policy, endpoint-bundle, receipt, and cancellation ownership.
+  Keep only claims backed by the owning public contract: typed JSON-RPC/schema
+  errors, header/auth/redaction boundaries, extension activation, Tasks,
+  MRTR, subscriptions, and Apps language remain conditional on their
+  respective implementation evidence rather than inferred from a document.
+- Make human-facing CLI examples safe and exact: machine JSON is separate,
+  secrets and peer-controlled terminal markup are absent, nonzero diagnostic
+  exits are shown, and no example fabricates a successful empty catalog or a
+  selection result.  Keep rustdoc and README code samples on public facade/
+  CLI surfaces; no internal-only helper or cfg(test)-only path is documentation
+  proof.
+
+Tests:
+
+- `doc_01_public_docs_positive` and
+  `doc_01_public_docs_planted_negative` are same-Bead real tests over the
+  shipped documentation sources and packaged public examples.  The positive
+  verifies the exact policy/era/matrix/Auto-negotiation text and executable
+  examples; the planted negative changes only one stale profile, era, fallback
+  rule, aggregate claim, or unsafe example and fails with a stable diagnostic.
+- Run real public example/doctest and CLI-help checks for the source changes,
+  plus link, rustdoc, machine-output-schema, redaction, and migration-snippet
+  tests.  Assert modern discovery first action, legacy feature/receipt
+  admission, Auto's sealed LEG-NEG observation, and the no-replay boundary
+  through the shipped surfaces rather than direct formatter calls or a copied
+  constant.
+- Test the complete HTTP documentation matrix: the six 400/404/405 ×
+  empty/unrecognized rows permit one configured candidate GET, the three
+  recognized-modern rows prohibit it, every other status/body row is
+  ineligible, and valid endpoint event is the sole legacy selection.  Verify
+  the same text remains aligned with the global fallback contract.
+- Explicit planted negatives reject an invented 2025 alias, obsolete
+  `LatestOnly`-style profile, sessioned legacy transport, generic fallback,
+  inferred endpoint, initialization in a modern example, discovery in a
+  legacy example, component-to-aggregate claim, process-artifact-only proof,
+  and fixture-as-live substitution.  Each has no claimed support result.
+- Every required test is discovered, started, and passed unfiltered with its
+  real code/documentation source change on this Bead.  Ignored, zero-run,
+  wrapper-only, scan-only, generated-report-only, or documentation-only
+  results earn no capability, conformance, or runtime credit.
+
+Evidence:
+
+- Bind each test to exact revision/tree, changed source paths, packaged
+  public surface, profile/features, toolchain, executed command/example,
+  first MCP action where applicable, output/exit result, and one planted
+  dimension.  A process artifact, self-hash, copied manifest constant, or
+  stale revision is not evidence.
+- DOC-01 may make only provisional documentation claims.  DOC-02 alone may
+  publish support claims after it consumes the requisite downstream gate
+  evidence; DOC-01 neither consumes nor proves that aggregate result.
+
+Dependencies:
+
+- FND-03 — `bd-mcp-2026-07-28-support-ahet.3`
+- PRT-05 — `bd-mcp-2026-07-28-support-ahet.14`
+- SCH-01 — `bd-mcp-2026-07-28-support-ahet.22`
+- API-01 — `bd-mcp-2026-07-28-support-ahet.79`
+- CLI-01 — `bd-mcp-2026-07-28-support-ahet.83`
+
+Tracker mapping:
+
+- Plan package ID: DOC-01
+- Parent Bead: `bd-mcp-2026-07-28-support-ahet.86`
+- Formal prerequisite IDs: FND-03, PRT-05, SCH-01, API-01, and CLI-01.
+- Dependency direction: all listed prerequisites → DOC-01 → DOC-02.  DOC-01
+  has no reverse edge to a gate, evidence artifact, or aggregate release
+  claim.
+- No-claim boundary: DOC-01 does not prove implementation, runtime behavior,
+  a gate, aggregate MCP support, conformance, maturity, or release readiness.
 
 ### DOC-02 — Publish evidence-backed support claims
 
@@ -27101,26 +27058,18 @@ Implementation:
   documentation/promotion Bead and must depend on DOC-02,
   CI-FINAL-CORE-01, and its exact profile evidence before changing
   one support-matrix row or publishing one profile bundle.
-- Never describe CI-EXPERIMENTAL-AUTH-01 as a stable support claim.
-- The dual-era row may claim only CI-DUAL-01's exact profile. It must
-  name
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`,
-  and
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`,
-  bind the unchanged core `LatestOnly` evidence, the compiled feature/
-  role-and-binding-specific client/server receipts, the complete stdio
-  server-first-frame/client-first-wire tables, and the separate HTTP
-  `LegacyOnly` POST/GET/DELETE table. Its HTTP
-  `ModernWithLegacy` subprofile must name
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`,
-  link the exhaustive truth-table/core-marker/extension-era-
-  disposition/shared-cancellation/no-lookup evidence, and state
-  exact-modern ignore, exact-legacy/modern-marker conflict,
-  absent-version mixed-marker conflict, Session-only fallback, and
-  lone-Last-Event-ID error without inventing a second classifier.
-  State that policy is immutable and feature/receipt validated; do not
-  imply that request bytes activate legacy.
+- Never describe the OAuth Client Credentials official-pinned-Draft CI record
+  as an aggregate or final-release support claim.
+- The dual-era row may claim only CI-DUAL-01's exact 2026-07-28 plus
+  2024-11-05 profile. It names the three immutable v2 profile identities,
+  binds unchanged core `ModernOnly` evidence and the compiled
+  feature/role/binding receipts, and records the complete stdio
+  server-first-frame/client-first-wire matrices plus LEG-HTTP-01's exact
+  legacy endpoint-event transport. Its `Auto` HTTP evidence is LEG-NEG-01's
+  exhaustive 400/404/405 body matrix: recognized modern JSON-RPC fixes
+  Modern, only empty/unrecognized rows authorize one configured legacy GET,
+  and only a valid endpoint event selects Legacy. Policy is immutable and
+  feature/receipt validated; request bytes never activate legacy.
 - The enterprise row may say OIDC authorization-code SSO only when
   CI-EMA-01 names the external front-channel adapter, framework-owned
   pending-flow store/envelope/restore authority, code redeemer, exact
@@ -27134,7 +27083,7 @@ Implementation:
   disposition, all six identity-source hashes, and every stable
   exclusion. Phrase the boundary as “no bundled browser UX,” not “no
   browser SSO” or “caller-injected ID Token.”
-- The experimental client-credentials row must say client-role/external-
+- The official-pinned-Draft client-credentials row must say client-role/external-
   AS-only, Streamable-HTTP-only, preregistration-only, unconstrained
   Bearer-only, and no built-in issuer branch. Publish Basic availability
   only from the independent HTTPS real-peer/attested-custody evidence,
@@ -27144,8 +27093,8 @@ Implementation:
   `token_endpoint_auth_method`, separate server metadata, custody,
   JWT-preferred selection/Basic-deviation, dispatch, singleflight,
   exact nonempty-scope/no-default behavior, response/cache/lifetime, and
-  atomic-commit evidence and retain `experimental`/
-  `stable_claim=false`.
+  atomic-commit evidence and retain `official-pinned-draft`/
+  `aggregate_claim=false`.
 - The enterprise/built-in composition row is additive and names exact
   preregistration/both-grants eligibility, persistent replay ring/
   restore evidence, policy/mapping receipt, five-way wire error
@@ -29598,11 +29547,8 @@ Implementation:
   tests satisfied.
 - Verify the core profile excludes legacy and optional extension
   claims.
-- Aggregate core-default
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  and
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  `LatestOnly` evidence with the legacy feature disabled. On both
+- Aggregate core-default `ModernOnly` evidence with the legacy feature
+  disabled under FND-03's immutable v2 policy profiles. On both
   server and client, the process is fixed Modern before first traffic;
   the first client request is modern discovery, every valid modern
   opening remains modern, exact initialize takes the supported-version
@@ -29610,9 +29556,8 @@ Implementation:
   selected-era continuation rule, and no initialize, fallback,
   adapter receipt, legacy symbol/state, or second-era classification is
   reachable.
-- Aggregate core-default
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  `LatestOnly` evidence with the legacy feature disabled: every
+- Aggregate core-default `ModernOnly` HTTP evidence with the legacy feature
+  disabled: every
   body-bearing POST stays modern, well-formed Session/replay headers
   cause no lookup, exact legacy versions/initialize take their frozen
   modern-only errors, GET/DELETE is 405, and no legacy symbol/state is
@@ -29664,7 +29609,7 @@ Acceptance:
   and `&Cx`-first.
 - Core HTTP cannot select or instantiate a legacy branch from headers,
   body, method, error, or runtime configuration.
-- Core stdio/client behavior is fixed `LatestOnly`: no wire response,
+- Core stdio/client behavior is fixed `ModernOnly`: no wire response,
   timeout, process exit, or later traffic can cause initialize,
   fallback, receipt construction, or legacy selection.
 - No client-role transport emits a parse/invalid-request response to
@@ -29682,7 +29627,7 @@ Tests:
 - Dependency-inventory equality check.
 - Beads cycle and orphan check.
 - Core-profile feature/build smoke test.
-- Nonzero root/stdio/HTTP `LatestOnly` era-policy evidence with
+- Nonzero root/stdio/HTTP `ModernOnly` era-policy evidence with
   feature-off symbol/lookup tests. Cover every stdio server opening and
   client first-wire row plus the HTTP header/body/method table; mutate
   any row into initialize/fallback/legacy selection or accept a legacy
@@ -29920,28 +29865,31 @@ Dependencies:
 - TST-03.
 - CI-BASE-01.
 
-### GATE-DUAL-READY — Aggregate previous-version readiness
+### GATE-DUAL-READY — Aggregate exact 2026/2024 Auto readiness
 
 Outcome:
 
-Prove the optional `2025-11-25` interoperability profile is isolated
+Prove the optional exact `2024-11-05` interoperability profile is isolated
 and complete.
 
 Reason:
 
-Legacy compatibility must not be inferred from the core gate or from
-the existence of old files.
+Auto is a separately qualified full dual-era API/CLI surface. It must not be
+inferred from GATE-CORE, which receives only bounded ModernOnly leaves; there
+is no reverse edge from GATE-DUAL to GATE-CORE.
 
 Implementation:
 
-- Aggregate exact previous-version schema, server, client, transport,
-  and interop evidence.
-- Aggregate
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  and
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  across all three immutable policies. Reuse the sealed core
-  `LatestOnly` table unchanged. For `ModernWithLegacy`, require the
+- Aggregate exact MCP 2024-11-05 schema, server, client, LEG-HTTP-01
+  two-endpoint SSE-GET/advertised-message-POST transport, Auto negotiation,
+  full Auto API/CLI surfaces, and interop evidence. Do not aggregate a
+  sessioned Streamable HTTP transport, session header, replay, initialize on
+  the modern route, or GET/DELETE from HTTP-02.
+- Aggregate the immutable
+  `fastmcp-2026-07-28-with-2024-11-05-auto-v2` and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2` profiles across all
+  three policies. Reuse the sealed core `ModernOnly` table unchanged. For
+  `Auto`, require the
   exact one-shot server first-frame classifier, terminal close for
   unclassified invalid openings, disposable client probe and closed
   fallback-signal set, and no post-selection reclassification. For
@@ -29951,42 +29899,31 @@ Implementation:
   exact role/transport/policy/generation
   `LegacyServerAdapterInstalledReceipt` or
   `LegacyClientAdapterInstalledReceipt` before spawn/bind/connect.
-- Aggregate
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`,
-  exact compiled-feature plus role-specific endpoint
-  installation-receipt admission, and all three mutually exclusive
-  policy tables. Reuse
-  GATE-CORE-READY's `LatestOnly` evidence unchanged; this optional gate
-  may add `ModernWithLegacy` and `LegacyOnly`, never rewrite the core
-  table.
-- Aggregate
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`
-  as the `ModernWithLegacy` HTTP-02/LEG-02 version-first truth table.
-  Require the exact four final-only metadata keys, exact two
-  final-only core request methods, both MRTR retry fields at all three
-  valid shared-method paths, routing markers, and EXT-01
-  `ModernExclusive`/`EraAmbiguous` descriptor inventory. Require every
-  present-version, absent-version, marker, Session, and
-  `Last-Event-ID` row, including exact-modern ignore and zero-lookup
-  evidence. Prove shared core `notifications/cancelled` is not a
-  marker and reaches legacy cancellation only in exact legacy/
-  Session-selected rows; no package-local classifier restatement may
-  differ.
-- Aggregate the separate `LegacyOnly` POST/GET/DELETE table, fixed
-  non-modern errors, missing-session behavior, zero lookup before
-  authenticated selection, and no recognized modern response/
-  discovery path.
+- Aggregate the immutable
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2` profile, exact
+  compiled-feature plus role-specific endpoint-receipt admission, and all
+  three mutually exclusive policy tables. Reuse GATE-CORE-READY's
+  `ModernOnly` evidence unchanged; this optional gate adds `Auto` and
+  `LegacyOnly` without rewriting the core table.
+- Aggregate LEG-NEG-01's exact HTTP matrix: only 400/404/405 with an empty
+  or unrecognized modern body authorizes one configured legacy SSE GET;
+  recognized modern JSON-RPC at any status prohibits it; only a valid exact
+  2024 endpoint event selects Legacy. No Session header, Last-Event-ID,
+  replay, DELETE, or package-local classifier is a positive condition.
+- Aggregate LEG-HTTP-01's exact legacy SSE-GET/advertised-message-POST
+  transport, direct LegacyOnly binding, fixed cross-era errors, bounded
+  reconnect/teardown, and no recognized modern discovery path.
 - Freeze every applicable previous-version harness and cross-SDK
   scenario as ID, role, transport, expected era, and required result.
 - Reject skipped, disabled, xfail, filtered, not-run, or empty
   previous-version inventories.
-- Verify the excluded two-endpoint transport remains unreachable.
+- Verify the exact 2024 two-endpoint transport is reachable only through
+  LEG-HTTP-01 and absent from the modern route.
 - Verify no legacy type appears in the modern prelude.
-- Aggregate legacy Session/event-store owner binding, count/byte/rate/
-  age/lifetime/cleanup, replay-gap, non-oracle lookup, reauthorization,
-  and process-local restart/instance-boundary evidence. Reject any
-  durable or multi-instance replay wording without a separate store
-  profile and gate.
+- Aggregate exact legacy endpoint-event ownership, origin/auth binding,
+  count/byte/rate bounds, bounded reconnect, cancellation, teardown, and
+  process-instance isolation. Reject replay/resumption, Session state, and
+  durable/multi-instance legacy transport claims.
 - Run positive dual-era CLI selection, classification, and diagnostic
   snapshots with the legacy feature enabled.
 
@@ -29994,7 +29931,7 @@ Acceptance:
 
 - The full modern/previous-version matrix passes.
 - Both eras remain independently selectable.
-- `LatestOnly`, `ModernWithLegacy`, and `LegacyOnly` remain exact
+- `ModernOnly`, `Auto`, and `LegacyOnly` remain exact
   policy-selected modes; peer bytes cannot change one into another,
   and no legacy-enabled mode binds without the feature plus exact
   role/binding adapter receipt.
@@ -30002,15 +29939,15 @@ Acceptance:
   byte classifier: every server opening, client first wire action,
   continuation/close decision, fallback signal, and receipt generation
   matches its frozen binding-specific table.
-- The exact-modern-plus-legacy-header row is modern with bounded header
-  ignore and zero Session/replay lookup, never a cross-era failure or
-  legacy fallback.
-- The profile makes no `2024-11-05` support claim.
+- Any recognized modern JSON-RPC result or error fixes Modern and prohibits a
+  legacy GET; eligible status/body evidence alone cannot select Legacy.
+- The profile makes exact `2024-11-05` support claims only from its complete
+  nonempty revision-bound matrix.
 
 Tests:
 
 - Root umbrella plus stdio/HTTP
-  `LatestOnly`/`ModernWithLegacy`/`LegacyOnly` tables, server/client
+  `ModernOnly`/`Auto`/`LegacyOnly` tables, server/client
   feature/role/binding/generation receipts, policy immutability, and
   cross-package digest aggregation.
 - Exhaustive stdio server first-frame and client first-wire matrices,
@@ -30024,13 +29961,12 @@ Tests:
 - HTTP marker-inventory mutation, extension-era descriptor collision,
   MRTR-retry no-downgrade, shared-cancellation, and per-row zero-lookup
   aggregation.
-- Legacy-only POST/GET/DELETE and non-modern-error matrix.
+- Exact legacy SSE-GET/advertised-message-POST and cross-era rejection matrix.
 - Positive dual-era CLI snapshots plus core feature-disabled
   diagnostic comparison.
 - Modern export/symbol isolation.
-- Session/replay quota, cross-owner guessed-ID, slow-consumer/gap,
-  expiry/cleanup, restart/instance invalidation, and exact-release
-  aggregation.
+- Endpoint-event origin/owner, bounded reconnect, slow-consumer, expiry/
+  cleanup, restart/instance invalidation, and exact-release aggregation.
 
 Dependencies:
 
@@ -30506,10 +30442,9 @@ Implementation:
   `13832c150ecb7b8d31d08240214388cbfc4982142ecf4808c443014c573c868b`.
   Do not import the client-credentials MDX/scenario into this stable
   gate; GATE-EXPERIMENTAL-AUTH-BUILD owns those artifacts.
-- Freeze the supported subset as framework-redeemed OIDC ID-token input
-  only.
-  Aggregate the provider-proof and defensive ID-token checks, and
-  prove pre-dispatch rejection of SAML, refresh-token subject exchange,
+- Aggregate the positive OIDC and AUTHX-04 SAML branches independently;
+  neither branch can mask the other. Retain the provider-proof and defensive
+  ID-token checks, and prove pre-dispatch rejection of refresh-token subject exchange,
   RAR, actor, and subject-alias inputs. Require the manifest field
   `jose_algorithms=RS256-only`, exact OIDC
   `id_token_signing_alg_values_supported` plus JWK intersection for
@@ -30522,8 +30457,8 @@ Implementation:
   accepted-but-ignored, non-authoritative signed data, with no account-
   link or authorization use. The gate claims only the specified OIDC
   authorization-code front channel through a named external adapter; it
-  makes no bundled browser UX, SAML parser, or generic enterprise-
-  identity claim.
+  makes no bundled browser UX, while AUTHX-04 owns the bounded official SAML
+  parser/signature/identity claim.
 - Require the evidence manifest to name the concrete
   `EnterpriseIdentityAssertionBackend` adapter, version, immutable
   artifact/configuration, trust boundary, and complete passing provider
@@ -31129,18 +31064,18 @@ Dependencies:
 - CONF-01.
 - CI-BASE-01.
 
-### GATE-EXPERIMENTAL-AUTH-BUILD — Aggregate experimental auth safety
+### GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY — Aggregate official pinned-Draft OAuth Client Credentials safety
 
 Outcome:
 
-Prove the draft client-credentials profile builds, remains isolated,
-and meets its pinned security contract without implying stable
-support.
+Prove the official pinned-Draft OAuth Client Credentials profile builds,
+remains isolated, and meets its pinned security contract without implying an
+aggregate or final-release claim.
 
 Reason:
 
-Experimental code still ships executable security behavior and needs a
-gate even though it cannot contribute a stable conformance claim.
+An official pinned-Draft extension still ships executable security behavior and
+needs its own gate without contributing aggregate conformance.
 
 Implementation:
 
@@ -31189,7 +31124,8 @@ Implementation:
   cross-product must prove AUTH-06 metadata and endpoint behavior are
   unchanged.
 - Require core OAuth to pass independently with the feature disabled.
-- Emit an evidence record whose maturity is always `experimental`.
+- Emit an evidence record whose extension status is always `official-pinned-
+  draft` and whose aggregate claim is false.
 - Freeze exact scenario `auth/client-credentials-jwt` with its ordered
   ES256/raw-PEM/missing-registration-receipt/missing-`kid`
   incompatibility vector and actual first pre-dispatch rejection, not
@@ -31227,7 +31163,8 @@ Acceptance:
   admission, sender-constraint, and atomic-commit evidence is nonempty;
   the package remains external-AS client-only in every feature
   combination.
-- No support matrix can convert this gate into a stable claim.
+- No support matrix can convert this gate into an aggregate or final-release
+  claim.
 - No manifest counts the incompatible raw JWT scenario or local
   one-variable negative as an upstream pass or uses either to replace
   RS256 positive evidence; the raw Basic scenario cannot substitute for
@@ -31462,16 +31399,15 @@ Implementation:
   `CoreReleaseCandidateInventory` nor `CoreReleaseProfileInventory`, and
   carries no publication state. Do not place optional readiness booleans
   in it.
-- Include the exact
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  and
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  `LatestOnly` table digests, exhaustive server-first-frame and
+- Include the exact immutable
+  `fastmcp-2026-07-28-with-2024-11-05-auto-v2` and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`
+  `ModernOnly` table digests, exhaustive server-first-frame and
   client-first-wire evidence, selected-era continue/close outcomes,
   feature-off adapter/receipt/symbol inventory, and zero initialize/
-  fallback/legacy-selection evidence. Include the exact
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  `LatestOnly` table digest, feature-off symbol inventory, per-row
+  fallback/legacy-selection evidence. Include the exact immutable
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2`
+  `ModernOnly` table digest, feature-off symbol inventory, per-row
   no-Session-lookup evidence, fixed legacy-version/initialize errors,
   and GET/DELETE disposition; omit legacy-enabled tables/claims.
 - Mark the manifest `qualification_only=true`. It authorizes DOC-02
@@ -31529,7 +31465,7 @@ Tests:
 - `qualification_membership` omission/extra/endpoint/count/order and
   mistaken-release-inventory mutation tests against the exact 79-member
   closure.
-- Core root/stdio/HTTP `LatestOnly` era-policy manifest completeness
+- Core root/stdio/HTTP `ModernOnly` era-policy manifest completeness
   and row-mutation tests, including a forbidden feature-off initialize,
   fallback, receipt, legacy selection, or lookup and a mutated stdio
   opening continuation/close disposition.
@@ -31607,11 +31543,10 @@ Implementation:
   manifest contains their digests, not merely a digest of the earlier
   qualification manifest.
 - Repeat and bind the freshly rerun
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`,
-  and
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  `LatestOnly` table digests and nonempty row evidence to this exact
+  `fastmcp-2026-07-28-with-2024-11-05-auto-v2`,
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`, and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2`
+  `ModernOnly` table digests and nonempty row evidence to this exact
   final source/package identity. A qualification-era digest or a final
   manifest that omits the stdio server/client first-wire inventory
   cannot seal the core release.
@@ -31633,7 +31568,7 @@ Acceptance:
   generated docs, package inventories, `.crate` bytes, and packaged
   consumers all agree with the final manifest.
 - All three core era-policy identities/tables are freshly proven
-  `LatestOnly` and bound to the same final artifacts; none can be
+  `ModernOnly` and bound to the same final artifacts; none can be
   inherited solely by reference to CI-CORE-01.
 - Any dirty state, source/tree/lock/documentation/package mismatch,
   missing inventory member, rebuilt byte, or stale cache fragment
@@ -31705,7 +31640,7 @@ Dependencies:
 Outcome:
 
 Emit an independent, reproducible evidence manifest for exact
-`2025-11-25` interoperability and compose its additive support claim
+`2024-11-05` interoperability and compose its additive support claim
 onto the evidence-backed core documentation baseline.
 
 Reason:
@@ -31717,23 +31652,16 @@ Implementation:
 
 - Run the GATE-DUAL-READY scenario inventory, feature isolation,
   packaged consumers, and both-era stdio/HTTP matrix.
-- Emit only the `dual-era-2025-11-25` profile manifest with exact
-  source pins and exclusions. It carries
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`,
-  and
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`,
-  references the sealed core `LatestOnly` table unchanged, and records
-  the compiled feature plus exact server/client binding receipts; the
-  complete stdio `ModernWithLegacy` and `LegacyOnly` server-opening,
-  client-first-wire, error/close, restart, and reclassification
-  matrices; and the complete HTTP `ModernWithLegacy` and `LegacyOnly`
-  POST/GET/DELETE matrices. The HTTP dual classifier carries
-  `dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`,
-  its exhaustive truth-table digest, exact core metadata/method/MRTR
-  marker inventory, extension `ModernExclusive`/`EraAmbiguous`
-  descriptor digest, shared-`notifications/cancelled` disposition, and
-  per-row no-lookup evidence.
+- Emit only the `dual-era-2024-11-05` profile manifest with exact source pins
+  and exclusions. It carries the immutable `fastmcp-2026-07-28-with-
+  2024-11-05-auto-v2`, `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`,
+  and `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2` identities;
+  references the sealed core `ModernOnly` table unchanged; and records the
+  compiled feature plus exact server/client binding receipts, complete stdio
+  `Auto` and `LegacyOnly` first-wire/error/close/restart matrices, and exact
+  legacy HTTP+SSE endpoint-event matrices. The HTTP evidence records
+  LEG-NEG-01's 400/404/405 body matrix, one-GET authorization, recognized-
+  modern denial, and valid-endpoint-event-only Legacy selection.
 - Consume CI-FINAL-CORE-01 and DOC-02, update only the dual-era
   support row and profile release notes, and emit a promotion bundle
   that references the exact sealed core artifact identity and exact
@@ -31743,7 +31671,7 @@ Acceptance:
 
 - The manifest is green only with a nonempty, no-skip matrix.
 - All three umbrella tables have exact identities and evidence; the
-  optional manifest cannot alter core `LatestOnly`, omit
+  optional manifest cannot alter core `ModernOnly`, omit
   `LegacyOnly`, or bind a legacy policy without the compiled feature
   and applicable role/binding receipt.
 - Core evidence is byte-identical whether this profile passes or
@@ -32295,18 +32223,18 @@ Dependencies:
 - CI-BUILTIN-AUTH-01.
 - DOC-02.
 
-### CI-EXPERIMENTAL-AUTH-01 — Publish bounded experimental auth evidence
+### CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01 — Publish bounded official pinned-Draft OAuth Client Credentials evidence
 
 Outcome:
 
-Emit a non-stable build/security record for the draft
-client-credentials profile and publish only an explicitly
-experimental availability statement.
+Emit a bounded build/security record for the official pinned-Draft OAuth
+Client Credentials profile and publish only its exact extension-status
+statement.
 
 Reason:
 
-Experimental executable code requires evidence but must not become a
-stable support claim.
+Official pinned-Draft executable code requires evidence but must not become an
+aggregate or final-release claim.
 
 Implementation:
 
@@ -32351,11 +32279,11 @@ Implementation:
   `fe9b9e2a0f62962d2eeecc772b3ed1ee8be9941a7bc792c19a9a29a8b452c3c4`,
   and the exact two scenario IDs. Changed, absent, untyped, or
   cross-profile-substituted source fields cannot publish evidence.
-- Hard-code manifest maturity `experimental` and `stable_claim=false`.
-- Consume CI-FINAL-CORE-01 and DOC-02, update only the experimental
-  row and warnings, and emit an additive non-stable promotion bundle
-  bound to the sealed core artifact identity that cannot satisfy a
-  stable claim.
+- Hard-code manifest extension status `official-pinned-draft` and
+  `aggregate_claim=false`.
+- Consume CI-FINAL-CORE-01 and DOC-02, update only the official-pinned-Draft
+  row and warnings, and emit an additive bounded bundle bound to the sealed
+  core artifact identity that cannot satisfy an aggregate claim.
 
 Acceptance:
 
@@ -32376,8 +32304,8 @@ Acceptance:
   raw Basic result from the separate production Basic real-peer result,
   and cannot label either negative or the raw loopback Basic scenario as
   production conformance.
-- The experimental statement cannot appear unless core docs, exact
-  draft evidence, warnings, and non-stable promotion checks pass.
+- The official-pinned-Draft statement cannot appear unless core docs, exact
+  draft evidence, warnings, and bounded-promotion checks pass.
 
 Tests:
 
@@ -32399,7 +32327,7 @@ Tests:
   opaque-JWT/sender-constraint evidence-schema tests, including omitted/
   default/wrong-field/stale/swapped metadata, and AUTHX-02×AUTH-06
   client-only feature cross-product.
-- Experimental-row/non-stable-promotion consistency and core-doc
+- Official-pinned-Draft-row/bounded-promotion consistency and core-doc
   nonmutation.
 
 Dependencies:
@@ -32635,15 +32563,14 @@ Implementation:
 - Run INTEROP-01's exact cross-SDK matrix.
 - Run documentation consistency.
 - Reverify the sealed
-  `protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`
-  and
-  `stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`
-  `LatestOnly` tables with the legacy feature disabled: server/client
+  `fastmcp-2026-07-28-with-2024-11-05-auto-v2` and
+  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`
+  `ModernOnly` tables with the legacy feature disabled: server/client
   first-wire behavior, exact invalid-opening continuation, modern
   discovery, initialize diagnostic, zero fallback, and no adapter
   receipt/symbol/state. Reverify the sealed
-  `http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`
-  `LatestOnly` table with the legacy feature disabled, including fixed
+  `fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2`
+  `ModernOnly` table with the legacy feature disabled, including fixed
   errors, GET/DELETE, zero Session/replay lookup, and no byte-driven
   fallback.
 - Verify no modern path emits initialize, session ID, event ID,
@@ -32661,7 +32588,7 @@ Implementation:
   server-to-client JSON-RPC request.
 - Permit legacy lifecycle/state symbols only in a path-qualified
   previous-version adapter fixture where applicable. The core
-  `LatestOnly` transport/parser may retain exact `initialize`,
+  `ModernOnly` transport/parser may retain exact `initialize`,
   `Mcp-Session-Id`, and `Last-Event-ID` literals solely in HTTP-02's
   bounded ignore/rejection table, FND-03/STD-01's fixed modern-only
   opening rejection table, SRV-02's actionable initialize diagnostic,
@@ -32776,7 +32703,7 @@ Acceptance:
 - There is no prohibited dependency.
 - There is no stale protocol string in modern docs or code.
 - Core/default stdio, HTTP, server, and client remain provably
-  `LatestOnly`; recognized legacy literals can only drive fixed
+  `ModernOnly`; recognized legacy literals can only drive fixed
   rejection/ignore behavior and never initialize, fallback, receipt
   construction, or legacy state.
 - The release candidate can reproduce its evidence bundle.
@@ -32811,7 +32738,7 @@ Tests:
 - Core/default, no-default/minimal, every shipped feature alone,
   all-features safety, forbidden-dependency/unsafe/stale-symbol, and
   exact parsed modern-denylist matrices.
-- Core root/stdio/HTTP `LatestOnly` era-policy digests, stdio
+- Core root/stdio/HTTP `ModernOnly` era-policy digests, stdio
   server-first-frame/client-first-wire/continue-close tables, HTTP
   fixed-error/ignore/405 table, approved rejection-only literal
   locations, and zero initialize/fallback/legacy lookup/state mutation
@@ -33598,6 +33525,635 @@ Dependencies:
 
 ---
 
+### LEG-HTTP-01 — Implement exact MCP 2024-11-05 HTTP+SSE
+
+Outcome:
+
+Provide the complete two-endpoint HTTP+SSE transport required by MCP
+`2024-11-05`, isolated from modern Streamable HTTP.
+
+Implementation:
+
+- On a legacy GET, establish the SSE stream and require its first valid event
+  to be `endpoint`; resolve that event's URI against the configured server
+  origin under the frozen URI/security policy.
+- POST client messages only to the advertised endpoint and deliver server
+  messages over the SSE stream with the exact 2024 JSON-RPC direction rules.
+- Implement bounded reconnect, event framing, authentication, origin/path
+  validation, backpressure, shutdown, and cancellation without importing
+  2025 session-header or GET/DELETE Streamable HTTP semantics.
+- Keep the transport reachable only through the exact 2024 adapter and
+  `ProtocolPolicy::{Auto,LegacyOnly}`; modern routing never emits an
+  `endpoint` event.
+
+Acceptance and tests:
+
+- Real-socket client/server E2E proves the endpoint event, POST routing,
+  bidirectional server requests, reconnect bounds, and deterministic teardown.
+- Near-identical negatives cover wrong first event, foreign origin, unsafe URI,
+  malformed SSE, auth/redirect/5xx, oversized event, endpoint mutation, and
+  injected 2025 session headers; no failing row selects or contaminates modern
+  transport state.
+- The public modern HTTP builder cannot construct this transport accidentally.
+
+Dependencies:
+
+- LEG-01.
+- LEG-02.
+- LEG-03.
+- HTTP-01.
+- AUTH-01.
+- LIMIT-01.
+
+### LEG-NEG-01 — Implement downgrade-resistant automatic era negotiation
+
+Outcome:
+
+Make `ProtocolPolicy::Auto` the safe default while preserving explicit
+`ModernOnly` and `LegacyOnly` behavior.
+
+Implementation:
+
+- For stdio, launch a disposable modern discovery probe process. Select modern
+  only on a valid modern response. On the frozen eligible unrecognized signal,
+  terminate and reap that process before launching a fresh legacy process whose
+  first MCP request is exact 2024 `initialize`.
+- For HTTP, issue the modern POST discovery probe first. Only an eligible
+  unrecognized `400`, `404`, or `405` may start one legacy GET probe against the
+  original endpoint; select 2024 only after the first valid `endpoint` SSE
+  event. A status alone never proves legacy.
+- Never downgrade on authentication/authorization failure, rate limiting, 5xx,
+  redirect, TLS/DNS/network failure, ordinary timeout, malformed modern output,
+  recognized modern error, or post-selection cross-era traffic.
+- Bind the selected era to the exact child process or canonical endpoint plus
+  security/configuration generation; never cache it by origin alone.
+
+Acceptance and tests:
+
+- The full three-policy x two-transport first-wire matrix is deterministic and
+  proves one classification, no credential leakage, no mixed process bytes,
+  and no reclassification.
+- Each eligible fallback has a near-identical ineligible negative differing in
+  only one signal. Concurrent same-origin/different-path endpoints remain
+  isolated.
+- `2025-11-25` is never emitted, accepted as an alias, or inferred.
+
+Dependencies:
+
+- FND-03.
+- CLT-02.
+- STD-01.
+- HTTP-03.
+- LEG-HTTP-01.
+
+### LEG-TST-01 — Qualify complete MCP 2024-11-05 behavior
+
+Outcome:
+
+Prove every required 2024 method, direction, lifecycle, capability, and
+transport behavior without allowing legacy fixtures to stand in for live
+interoperability.
+
+Implementation:
+
+- Freeze exact-schema goldens for initialize/initialized, ping, tools,
+  resources including subscribe/unsubscribe, prompts, completion, logging and
+  setLevel, sampling, roots, cancellation, notifications, and
+  bidirectional server requests.
+- Add real stdio and HTTP+SSE suites, malformed/direction/capability negatives,
+  cancellation/race coverage, and cross-era non-leakage assertions. Elicitation
+  is a planted cross-era negative, never an exact-2024 positive.
+- Record exact discovered/started/passed test IDs; zero-run, ignored, filtered,
+  or feature-disabled success is failure.
+
+Acceptance and tests:
+
+- Required test-set equality holds for the frozen 2024 inventory in both server
+  and client roles.
+- Tests exercise public builders and wire codecs, not private helpers or
+  `cfg(test)` alternatives.
+- Modern-only state, headers, methods, and result forms are rejected at the
+  adapter boundary while every valid 2024 positive remains usable.
+- Elicitation is rejected at the exact-2024 adapter boundary with no lifecycle,
+  capability, transport, or handler mutation.
+
+Dependencies:
+
+- LEG-01.
+- LEG-02.
+- LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
+- TST-01.
+- TST-03.
+- TST-04.
+
+### LEG-INTEROP-01 — Pass independent MCP 2024-11-05 SDK interoperability
+
+Outcome:
+
+Demonstrate the legacy adapter against pinned independent 2024 SDK peers over
+both required transports.
+
+Implementation:
+
+- Pin at least two independent compatible SDK implementations and their exact
+  source/toolchain identities.
+- Run FastMCP server versus each peer client and FastMCP client versus each peer
+  server over stdio and HTTP+SSE where the peer supports it.
+- Exercise server-to-client requests, subscriptions, logging, cancellation,
+  lifecycle errors, reconnect, and capability asymmetry; retain first-attempt
+  failures and distinguish unsupported peer coverage from passing coverage.
+
+Acceptance and tests:
+
+- Every claimed legacy capability has a fresh-process public-wire observation
+  from at least one independent peer and no mock substitutes for a peer.
+- Version/header/endpoint-event bytes match exact 2024 fixtures and never use
+  2025 semantics.
+- Failures remain visible by SDK, transport, direction, and feature subgroup.
+
+Dependencies:
+
+- LEG-TST-01.
+- INTEROP-01.
+
+### DEPR-01 — Complete the official six-row deprecated registry
+
+Outcome:
+
+Implement and prove the exact six rows retained by the official MCP
+2026-07-28 Deprecated registry: modern Roots, modern Sampling, modern
+Logging, Dynamic Client Registration, deprecated Sampling `includeContext`
+values `thisServer` and `allServers`, and exact legacy HTTP+SSE through
+LEG-HTTP-01.
+
+Implementation:
+
+- Freeze an immutable six-row registry manifest; no row may be merged,
+  omitted, replaced by generic pair evidence, expanded into an invented
+  seventh row, or substituted with 2025 sessioned transport.
+- Implementation A owns exactly three rows: Roots, Sampling, and Sampling
+  `includeContext` values `thisServer` and `allServers`. It supplies real
+  row-specific public code and the exact positive and planted-negative tests
+  `depr_01_roots_positive`, `depr_01_roots_planted_negative`,
+  `depr_01_sampling_positive`, `depr_01_sampling_planted_negative`,
+  `depr_01_sampling_include_context_positive`, and
+  `depr_01_sampling_include_context_planted_negative`. It consumes
+  MRTR-03's exact includeContext semantics rather than restating them.
+- Implementation B owns exactly three rows: modern Logging, Dynamic Client
+  Registration, and exact MCP 2024-11-05 HTTP+SSE supplied by LEG-HTTP-01.
+  It supplies real row-specific public code and the exact positive and
+  planted-negative tests `depr_01_logging_positive`,
+  `depr_01_logging_planted_negative`,
+  `depr_01_dynamic_client_registration_positive`,
+  `depr_01_dynamic_client_registration_planted_negative`,
+  `depr_01_legacy_http_sse_positive`, and
+  `depr_01_legacy_http_sse_planted_negative`.
+- Keep every modern row usable, negotiated, tested, and documented as
+  deprecated; deprecation never means stubbed, refusal-only, or silently
+  removed. Exact-2024 HTTP+SSE is the LEG-HTTP-01 SSE GET plus advertised
+  message POST surface, never a 2025 sessioned substitute. Its negatives
+  reject modern Streamable HTTP/sessioned substitution and route/method
+  collision before dispatch, session, or event mutation.
+- The integration child executes all six rows through shipped public
+  entrypoints, records `row_count=6` and the immutable row-manifest digest,
+  and binds both implementation revisions. The independent verification child
+  binds that exact integration revision and requires every named row test to
+  satisfy discovered == started == passed with zero ignored, filtered,
+  skipped, or not-run cases. Plans, generic evidence, fixtures-as-live,
+  refusal-only code, and process artifacts earn no row credit.
+
+Acceptance and tests:
+
+- The denominator is exactly the six named registry rows; every row has a
+  shipped public positive plus a one-variable planted negative. Roots and
+  Sampling negatives prove capability/direction rejection without request
+  state mutation; includeContext negatives cover missing capability, invalid
+  value, wrong scope, and modern replacement confusion without dispatch or
+  state mutation.
+- Logging negatives prove capability/direction rejection without state
+  mutation. Dynamic Client Registration negatives reject unsupported or
+  malformed registration before credential or registration mutation.
+- A modern client/server negotiates and uses each modern row, while the
+  legacy transport row uses only exact-2024 LEG-HTTP-01 representation.
+  Core readiness cannot close on refusal-only implementations, generic pair
+  evidence, or a row count other than six.
+
+Dependencies:
+
+- PRT-05.
+- SRV-01.
+- CLT-01.
+- AUTH-01.
+- MRTR-03.
+- LEG-01.
+- LEG-HTTP-01.
+
+### APP-03 — Implement Apps sampling and host-mediated model access
+
+Outcome:
+
+Positively qualify Apps plus Sampling through the official MCP Apps sampling
+surface, without allowing an untrusted view to bypass host consent, capability,
+origin, or data-flow policy.
+
+Implementation:
+
+- Implement the pinned Apps Host/View sampling messages and negotiation
+  identifiers through the host-neutral broker.
+- Require explicit host capability and consent for every request; bind replies
+  to view, resource, origin, request, and broker generation.
+- Enforce bounded content, tool exposure, cancellation, timeout, concurrency,
+  and redaction; views never receive model credentials or a direct provider
+  connection.
+
+Acceptance and tests:
+
+- A permitted view completes a real host-mediated sample through public Apps
+  APIs and observes the exact response correlation.
+- Near-identical origin, consent, capability, request-ID, generation, size,
+  cancellation, and replay negatives fail before model invocation.
+- CSP/resource isolation remains intact and ordinary MCP Sampling cannot be
+  confused with Apps sampling.
+
+Dependencies:
+
+- APP-01.
+- APP-02.
+- DEPR-01.
+- AUTH-01.
+- LIMIT-01.
+
+### APP-04 — Compose Apps with Tasks and MRTR
+
+Outcome:
+
+Positively qualify Apps plus Tasks/MRTR: make Apps resources, broker messages,
+sampling, Tasks handles, and MRTR rounds compose without forged ownership,
+lost cancellation, or cross-context data.
+
+Implementation:
+
+- Define exact ownership and correlation across view, host, MCP request, task,
+  result stream, and MRTR round identities.
+- Support task-returning Apps actions and MRTR input requests where the pinned
+  extension specifications permit them; reject unsupported combinations with
+  typed errors rather than fabricating completion.
+- Propagate deadlines, cancellation, auth/consent changes, and terminal state
+  exactly once across the composition.
+
+Acceptance and tests:
+
+- Positive E2E covers Apps -> Task -> MRTR input -> result and host sampling in
+  the permitted order through public surfaces.
+- Pairwise near-identical negatives cover wrong owner/view/task/round,
+  cross-origin replay, consent revocation, double terminal, cancellation races,
+  and partial capability negotiation.
+- Refusal-only handling cannot close this positive-composition package.
+
+Dependencies:
+
+- APP-03.
+- TASK-01.
+- TASK-02.
+- TASK-03.
+- MRTR-03.
+
+### AUTHX-04 — Implement the enterprise-managed SAML branch
+
+Outcome:
+
+Implement the official Enterprise-Managed Authorization SAML path alongside
+the OIDC path with one normalized, least-privilege MCP authorization result.
+
+Implementation:
+
+- Pin the official SAML metadata, assertion, binding, audience, subject,
+  condition, signature, replay, and exchange requirements used by EMA.
+- Validate signed assertions against configured enterprise trust, exact MCP
+  resource audience, clock/skew bounds, one-time identifiers, and organization
+  policy before issuing or exchanging credentials.
+- Normalize SAML and OIDC identities only after branch-specific validation;
+  never treat matching display names or email strings as identity equivalence.
+
+Acceptance and tests:
+
+- Real signed SAML known-answer and integration positives reach the same public
+  authorization boundary as the OIDC branch with preserved issuer/provenance.
+- Signature wrapping, duplicate IDs, audience/recipient/ACS mismatch, expired/
+  early/replayed assertion, weak algorithm, metadata drift, entity confusion,
+  and OIDC/SAML substitution all fail closed.
+- EMA readiness reports both branches independently; one cannot mask the other.
+
+Dependencies:
+
+- AUTHX-01.
+- AUTH-02.
+- AUTH-03.
+- AUTH-04.
+- FND-08.
+- FND-09.
+
+### AUTHX-05 — Complete OAuth client credentials on client and issuer sides
+
+Outcome:
+
+Implement the entire official OAuth Client Credentials extension profile,
+including its advertised identifier/settings, external authorization-server
+client behavior, protected-resource validation, and optional built-in issuer.
+
+Implementation:
+
+- Implement exact discovery/advertisement and request fields from the pinned
+  Draft profile without upgrading its upstream maturity label.
+- Support confidential-client authentication methods explicitly permitted by
+  the profile, exact resource/audience binding, scoped token caching, rotation,
+  expiry, revocation, retry, and secret-custody rules.
+- Add a bounded built-in issuer path behind its explicit feature/profile; the
+  external-AS client path remains independently usable.
+
+Acceptance and tests:
+
+- Public client/server E2E covers external and built-in issuers and exact
+  advertisement/negotiation.
+- Near-identical client-ID, secret/assertion, audience/resource, scope, issuer,
+  authentication-method, rotation, expiry, replay, and cross-tenant negatives
+  fail before application dispatch.
+- The extension is fully implemented and release-gated while documentation
+  truthfully labels its official maturity Draft.
+
+Dependencies:
+
+- AUTHX-02.
+- AUTH-02.
+- AUTH-04.
+- AUTH-05.
+- AUTH-06.
+- FND-09.
+
+### EXT-SRC-01 — Pin official extension sources and maturity drift
+
+Outcome:
+
+Keep the official Tasks, Apps, Enterprise-Managed Authorization, and OAuth
+Client Credentials definitions byte-pinned and detect upstream maturity or
+identifier drift before implementation or release claims change.
+
+Implementation:
+
+- Record authoritative source URLs, revisions, schema/document digests,
+  maturity, negotiation identifiers, and supersession rules for each official
+  extension/profile.
+- Fail closed on source disappearance, digest/identifier drift, silent maturity
+  change, or local inventory omission. Updating a pin requires semantic review
+  and reopens every consuming qualification gate.
+- This package gates named consumers only; it produces zero protocol capability
+  by itself and retires into the ordinary FND-02 source inventory after release.
+
+Acceptance and tests:
+
+- Exact-set source inventory and planted missing/duplicate/drift/maturity/
+  identifier negatives pass under the offline verifier.
+- Each extension implementation and gate names and consumes its pinned row.
+- No future evidence identifier, fake receipt, or network success is minted at
+  planning time.
+
+Dependencies:
+
+- FND-01.
+- FND-02.
+
+### COMP-ALL-01 — Prove cross-feature and cross-era composition
+
+Outcome:
+
+Execute the frozen pairwise and risk-selected N-wise composition matrix across
+eras, transports, directions, auth, extensions, deprecated rows, and proxy
+legs through shipped public entrypoints.
+
+Implementation:
+
+- Freeze these exactly ordered axes and values: `era={modern_2026_07_28,
+  legacy_2024_11_05}`; `policy={modern_only,auto,legacy_only}`;
+  `transport={stdio,modern_http_post,legacy_http_sse}`;
+  `direction={client_to_server,server_to_client}`;
+  `auth_base={none,core_oauth,ema_oidc,ema_saml}`;
+  `oauth_cc={off,absent_advertisement,advertised}`;
+  `tasks={off,on}`; `apps={off,on}`; `mrtr={off,on}`;
+  `subscriptions={off,on}`; `cancellation={off,on}`;
+  `cache_hints={off,on}`; `schema={closed,recursive_json}`;
+  `deprecated={off,on}`; and `proxy_leg={direct,downstream,upstream}`.
+- Define the closed legal predicate: modern allows only
+  `modern_only|auto` with `stdio|modern_http_post`; legacy allows only
+  `legacy_only|auto` with `stdio|legacy_http_sse` and requires
+  `tasks=apps=mrtr=cache_hints=deprecated=off`. `oauth_cc` values
+  `absent_advertisement|advertised` require `modern_http_post`,
+  `client_to_server`, `direct|upstream`, an auth base other than
+  `core_oauth`, and exact current-request registration `{}`. OAuth Client
+  Credentials remains official Draft/default-off; absent advertisement is a
+  required positive. All other combinations are legal only when these rules
+  admit them.
+- The predicate must enumerate exactly 31,488 legal full vectors and exactly
+  602 unordered axis-value pair cells: 567 legal and 35 illegal. The real
+  production generator emits every cell once in canonical order; skipped,
+  unsupported, synthesized, or post-hoc cells are red.
+- Each legal pair has ID
+  `comp_all_01_pair__<axis_a>__<value_a>__<axis_b>__<value_b>__positive`,
+  uses the lexicographically first legal 15-axis completion, and reaches the
+  recorded public client/server/transport/proxy entrypoint in a fresh process
+  with isolated state. Each illegal pair uses the same form ending
+  `__negative`, returns `E_COMP_ALL_ILLEGAL_PAIR` before side effects, names
+  its nearest legal row, and preserves its row-owned state digest and
+  side-effect counters.
+- Execute exactly five N-wise scenario pairs through shipped public
+  entrypoints: `apps_tasks_mrtr`, `dual_era_proxy_auth`,
+  `subscription_cache_cancel`, `ema_oauth_cc_absent_advertisement`, and
+  `ema_oauth_cc_advertised`. Each has
+  `comp_all_01_nwise__<name>__positive` and
+  `comp_all_01_nwise__<name>__planted_negative`; the negative changes exactly
+  one security, owner, era, route, advertisement, cancellation,
+  subscription, cache, Task, Apps, or MRTR binding and reaches the same
+  boundary with the frozen typed rejection and unchanged named state.
+- Execute exactly two out-of-domain negatives:
+  `comp_all_01_negative__era_2025_11_25` and
+  `comp_all_01_negative__skills`. Neither value exists on an axis; both fail
+  before dispatch or state mutation and cannot be reclassified as a supported
+  era, extension, or profile.
+- Construct a domain-separated SHA-256 denominator digest beginning
+  `fastmcp-comp-all-v1\0`, using u32-big-endian-length-prefixed UTF-8 fields in
+  fixed order for format/version, axis/value indices and text,
+  exclusion-rule IDs, row ordinal/kind, pair indices, completed vector,
+  expected observable/error, and nearest legal row; then append the ten
+  ordered N-wise IDs/vectors/observables and two ordered out-of-domain
+  IDs/rejection codes. Maps, implicit ordering, whitespace normalization,
+  copy-of-constant, and self-hash shortcuts are forbidden.
+
+Acceptance and tests:
+
+- The denominator is exactly 614 case IDs: 567 legal pair positives, 35
+  typed illegal-pair negatives, ten IDs for five positive/planted-negative
+  N-wise pairs, and two out-of-domain negatives.
+- Every legal row records its selected era/policy, transport disposition,
+  direction, auth and extension activation, negotiated capabilities,
+  operation result, proxy isolation, and before/after state digest. Every
+  illegal row exposes its typed prohibition and near-identical legal row.
+  Every N-wise positive records its exact vector, public entrypoints,
+  subprocess seed, selected era/route, auth/extension state, result, proxy or
+  owner isolation, and before/after state digest.
+- Preserve subgroup first failure, exact revision/tree, profile/features,
+  process seed, and state digest. Required == discovered == started == passed
+  == 614 and ignored == filtered == feature_disabled == 0. The independent
+  receipt must prove that exact equality; a zero-test green, skip, omission,
+  filtered profile, copied assertion, fixture-as-live substitution, or
+  process artifact is a failure.
+- COMP-ALL-01 proves composition coverage only. It is a mandatory planning
+  aggregate, never claimed monolithically, and does not itself establish
+  aggregate MCP support, maturity, release readiness, or publication
+  authority.
+
+Dependencies:
+
+- DEPR-01.
+- LEG-TST-01.
+- TASK-03.
+- APP-03.
+- APP-04.
+- AUTHX-04.
+- AUTHX-05.
+- PXY-02.
+
+### CONF-03 — Supplement incomplete official conformance coverage
+
+Outcome:
+
+Combine the pinned official conformance runner with repository-owned tests for
+every required behavior the runner does not cover.
+
+Implementation:
+
+- Pin the official runner revision and map each discovered case to the exact
+  MCP requirement, role, transport, era, and profile it proves.
+- Maintain a gap inventory for modern core, deprecated features, exact 2024,
+  all official extensions, automatic negotiation, compositions, and security/
+  cancellation boundaries; fill each gap with a real public-surface test.
+- Require exact test-set equality and retain official-runner and supplement
+  results separately so a small official denominator cannot imply completeness.
+
+Acceptance and tests:
+
+- Zero official-runner failures plus zero uncovered frozen requirements is the
+  only pass condition; zero executed tests or excluded profiles is red.
+- Planted runner omission, renamed test, ignored/filter mismatch, early compile
+  abort, unsupported capability, and supplement deletion are detected.
+- Every aggregate claim maps to exact official or supplemental test IDs.
+
+Dependencies:
+
+- CONF-01.
+- CONF-02.
+- LEG-TST-01.
+- COMP-ALL-01.
+- TST-02.
+- TST-03.
+- TST-04.
+
+### GATE-ALL-MCP-READY — Aggregate complete MCP implementation readiness
+
+Outcome:
+
+Establish one non-release implementation gate proving complete MCP 2026-07-28,
+complete MCP 2024-11-05, automatic negotiation, every official extension/
+profile, and required compositions.
+
+Implementation and acceptance:
+
+- Consume the completed modern core/deprecated, dual-era, Tasks, Apps, EMA,
+  OAuth Client Credentials, built-in auth, proxy, source-pin, composition,
+  conformance-supplement, and interoperability gates without weakening any
+  component denominator.
+- Reject any missing profile, refusal-only positive, partial branch, stale
+  evidence, aggregate-only percentage, unbound revision, or unverified
+  composition.
+- Emit no protocol capability itself. It is a hard release consumer of named
+  component evidence and earns zero independent capability credit.
+
+Tests:
+
+- Planted missing/stale/wrong-revision/subgroup/component substitution for
+  every prerequisite.
+- Exact closure-set equality and proof that Redis backend readiness is a
+  separate operational profile, not falsely required for MCP wire completeness.
+
+Dependencies:
+
+- GATE-CORE-READY.
+- GATE-DUAL-READY.
+- GATE-TASKS-READY.
+- GATE-APPS-READY.
+- GATE-EMA-READY.
+- GATE-BUILTIN-AUTH-READY.
+- GATE-EMA-BUILTIN-READY.
+- GATE-PROXY-READY.
+- GATE-PROXY-DUAL-READY.
+- GATE-PROXY-TASKS-READY.
+- GATE-EXPERIMENTAL-AUTH-BUILD.
+- EXT-SRC-01.
+- EXT-DEV-01.
+- DX-TEST-01.
+- OPS-01.
+- PERF-01.
+- COMP-ALL-01.
+- CONF-03.
+- LEG-INTEROP-01.
+- INTEROP-01.
+
+### CI-ALL-MCP-01 — Seal the complete all-MCP release candidate
+
+Outcome:
+
+Produce the sole revision-bound release identity that REL-01 and REL-02 may
+consume for the complete supported product.
+
+Implementation and acceptance:
+
+- From one clean source/tree/lock/toolchain identity, rerun and bind all
+  component CI promotions, the all-MCP implementation gate, documentation,
+  package/facade consumers, platform jobs, feature propagation, conformance,
+  interop, composition, security, cancellation, and performance gates.
+- Package every publishable crate and verify fresh consumers for ModernOnly,
+  Auto, LegacyOnly, Tasks, Apps, EMA OIDC/SAML, OAuth Client Credentials,
+  built-in auth, and proxy compositions.
+- Any source movement, dirty file, stale component result, missing test ID,
+  mixed revision, unsupported profile, or package/documentation mismatch
+  invalidates the whole candidate. No core-only artifact may substitute.
+
+Tests:
+
+- Clean-checkout serialized RCH matrix with exact required/passed test equality.
+- Planted stale/mixed/missing component, feature, package, documentation,
+  platform, profile, and revision substitutions.
+- Fresh downstream consumers exercise every advertised feature through the
+  facade without accessing component crates directly.
+
+Dependencies:
+
+- GATE-ALL-MCP-READY.
+- CI-FINAL-CORE-01.
+- CI-DUAL-01.
+- CI-TASKS-01.
+- CI-APPS-01.
+- CI-EMA-01.
+- CI-BUILTIN-AUTH-01.
+- CI-EMA-BUILTIN-01.
+- CI-EXPERIMENTAL-AUTH-01.
+- CI-PROXY-01.
+- CI-PROXY-DUAL-01.
+- CI-PROXY-TASKS-01.
+- DOC-02.
+
+---
+
 ## 24. Dependency graph and critical path
 
 The per-package dependency lists are normative.
@@ -34191,11 +34747,8 @@ or absence of publication authorization leaves REL-02 open and must not
 falsify the candidate's technical conformance evidence or turn the
 candidate into a published-release claim.
 Its first planned release is `0.4.0`.
-Its transport/version identity binds
-`protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-`stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`, and
-`http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1` in
-`LatestOnly` mode with the legacy feature absent. The stdio server is
+Its transport/version identity binds FND-03's immutable v2 profiles in
+`ModernOnly` mode with the legacy feature absent. The stdio server is
 preselected Modern and the client discovers first with no initialize
 or fallback; HTTP keeps every body-bearing message on the modern
 branch. No adapter receipt, legacy state, or byte-driven policy switch
@@ -34245,43 +34798,36 @@ Adds:
 - GATE-DUAL-READY.
 - CI-DUAL-01.
 - dual-era conformance and interop matrix.
-- previous-version sessioned Streamable HTTP tests.
-- an assertion that the older two-endpoint transport is unreachable.
+- exact-2024 HTTP+SSE endpoint-event transport tests.
+- an assertion that the legacy two-endpoint transport is reachable only through
+  LEG-HTTP-01 and absent from the modern route.
 
 The core profile does not require legacy support and retains its sealed
-`LatestOnly` table unchanged.
+`ModernOnly` table unchanged.
 
 Every legacy-enabled support claim names
-`protocol_era_policy_profile=fastmcp-2026-07-28-protocol-era-policy-v1`,
-`stdio_era_policy_profile=fastmcp-2026-07-28-stdio-era-policy-v1`, and
-`http_era_policy_profile=fastmcp-2026-07-28-http-era-policy-v1`,
+`fastmcp-2026-07-28-with-2024-11-05-auto-v2`,
+`fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`, and
+`fastmcp-2026-07-28-with-2024-11-05-auto-http-sse-v2`,
 requires the compiled feature plus the exact role-, binding-, policy-,
 and generation-bound `LegacyServerAdapterInstalledReceipt`/
 `LegacyClientAdapterInstalledReceipt`, and contains separate
-`ModernWithLegacy` and `LegacyOnly` matrices. The stdio matrices bind
+`Auto` and `LegacyOnly` matrices. The stdio matrices bind
 the one-shot server opening classifier, invalid-opening
 error/no-response plus close, client first-wire action, disposable
 probe/fallback signals, direct legacy-only initialize, process restart,
 and no reclassification.
-The `ModernWithLegacy` HTTP subprofile names
-`dual_era_classifier_profile=fastmcp-2026-07-28-with-2025-11-25-v1`
-and its exhaustive truth-table digest, exact four-metadata/two-method/
-MRTR-retry marker inventory, extension `ModernExclusive`/
-`EraAmbiguous` descriptor digest, and shared-cancellation disposition.
-Exact modern or another present
-non-legacy version cannot fall back and ignores well-formed legacy-only
-headers without lookup; exact legacy plus a modern marker and absent
-version plus mixed marker families are terminal conflicts; absent
-version plus Session-only selects legacy; and a lone
-`Last-Event-ID` receives the fixed no-lookup missing-session outcome.
-The `LegacyOnly` table separately fixes POST/GET/DELETE,
-modern/nonlegacy/cross-era rejection, missing-session, no-recognized-
-modern-error, and no-discovery behavior. Peer bytes never switch the
-builder-selected policy.
+The `Auto` HTTP subprofile records LEG-NEG-01's exhaustive status/body digest:
+only 400/404/405 plus empty/unrecognized modern body authorizes one configured
+legacy SSE GET, recognized modern JSON-RPC at any status fixes Modern, and
+only a valid endpoint event selects Legacy. The `LegacyOnly` table binds the
+exact legacy HTTP+SSE adapter directly and rejects modern/nonlegacy/cross-era
+traffic. No Session header, Last-Event-ID, replay, DELETE, or peer bytes
+switches builder-selected policy.
 
-A CLI build that explicitly enables the dual-era profile defaults to
-`ModernWithLegacy`, as specified by ADR-003. A core-only CLI defaults
-to `LatestOnly`; neither build changes policy from peer bytes.
+Ordinary CLI and facade defaults compile `legacy-2024-11-05` and select
+`Auto`; explicitly stripped builds select `ModernOnly`. Neither build changes
+policy from peer bytes.
 
 ### 25.3 Tasks profile
 
@@ -34535,16 +35081,16 @@ neither standalone promotion may cite this composite result.
 It inherits Section 25.5's OIDC-ID-Token-only input scope and all of
 that profile's explicit exclusions.
 
-### 25.7 Experimental auth profile
+### 25.7 OAuth Client Credentials official pinned-Draft profile
 
 Adds:
 
 - FND-09.
 - AUTHX-02.
-- GATE-EXPERIMENTAL-AUTH-BUILD.
-- CI-EXPERIMENTAL-AUTH-01.
+- GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY.
+- CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01.
 
-This profile must retain an experimental label.
+This profile must retain the `official-pinned-draft` extension status.
 
 It is an MCP OAuth-client profile against an external authorization
 server only; it adds no client-credentials grant, advertisement, or
@@ -34561,9 +35107,8 @@ explicit selected `token_endpoint_auth_method`, independently of the
 authorization server's matching `grant_types_supported` and
 `token_endpoint_auth_methods_supported`; neither metadata side, a
 default, nor another grant can supply the other. Those explicit client
-and server grant declarations are a documented stricter FastMCP
-experimental subset, not an extra normative requirement attributed to
-the draft. The draft's JWT recommendation is enforced: fully available
+and server grant declarations are a documented stricter FastMCP pinned-Draft
+subset, not an extra normative requirement attributed to the draft. The draft's JWT recommendation is enforced: fully available
 `private_key_jwt` wins, and
 each Basic selection requires a current reviewed reason/expiry-bound
 `ClientCredentialsBasicDeviation`; runtime failure never falls back
@@ -34654,7 +35199,7 @@ endpoint itself. They are inventory checks, not support claims:
 | `CI-EMA-01` enterprise authorization | `profile-enterprise-auth` | 85 |
 | `CI-BUILTIN-AUTH-01` built-in authorization server | `profile-builtin-auth-server` | 86 |
 | `CI-EMA-BUILTIN-01` enterprise + built-in composition | `profile-enterprise-builtin` | 92 |
-| `CI-EXPERIMENTAL-AUTH-01` experimental auth | `profile-experimental-auth` | 86 |
+| `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01` official pinned-Draft OAuth Client Credentials | `profile-oauth-client-credentials-draft` | 86 |
 | `CI-PROXY-01` modern proxy | `profile-proxy` | 88 |
 | `CI-PROXY-DUAL-01` proxy + dual era | `profile-proxy-dual` | 96 |
 | `CI-PROXY-TASKS-01` proxy + Tasks | `profile-proxy-tasks` | 99 |
@@ -34676,8 +35221,10 @@ one reviewed transaction.
 ### 25.10 Cargo feature and propagation matrix
 
 Core `2026-07-28` behavior is compiled unconditionally in each
-applicable crate.
-Every row below is optional and defaults off.
+applicable crate. Every optional row below defaults off except
+`legacy-2024-11-05`, which ordinary CLI and facade defaults include so
+their immutable public default can be `Auto`; explicitly stripped builds are
+`ModernOnly`.
 `P`, `T`, `S`, `C`, `M`, `O`, `L`, and `F` mean
 `fastmcp-protocol`, `fastmcp-transport`, `fastmcp-server`,
 `fastmcp-client`, the `fastmcp-derive` package in
@@ -34686,14 +35233,14 @@ Every row below is optional and defaults off.
 
 | Cargo feature | P | T | S | C | M | O | L | F | Required propagation and constraints |
 |---|---|---|---|---|---|---|---|---|---|
-| `legacy-2025-11-25` | wire adapter | protocol feature | protocol + transport | protocol + transport | — | protocol rendering | client/transport and optional server path | P/T/S/C/O | no legacy exports or policy activation when absent |
+| `legacy-2024-11-05` | exact-2024 wire adapter | protocol feature | protocol + transport | protocol + transport | — | protocol rendering | client/transport and server path | P/T/S/C/O | ordinary CLI/facade defaults include it for `Auto`; explicitly absent builds expose only `ModernOnly` |
 | `tasks` | Tasks wire descriptor | — | protocol Tasks runtime | protocol Tasks client | task attributes | task rendering | protocol/client task commands | P/S/C/M/O | compile feature plus runtime opt-in |
 | `apps` | Apps wire descriptor | — | Apps catalog/broker + bounded HTML5 parser | headless host/client + bounded HTML5 parser | — | Apps rendering | diagnostics only | P/S/C/O | no renderer dependency or claim; exact parser edge is optional with Apps |
 | `enterprise-auth` | shared JOSE admission/RS256 | — | enterprise policy | grant-flow client | — | redacted rendering | auth diagnostics | P/S/C/O | OAuth profile; no invented MCP capability descriptor |
-| `experimental-client-credentials` | shared JOSE admission/RS256 | — | resource-server policy | grant-flow client | — | experimental label | auth diagnostics | P/S/C/O | OAuth profile; always experimental; no DCR or invented MCP capability |
+| `oauth-client-credentials` | shared JOSE admission/RS256 | — | resource-server policy | grant-flow client | — | official extension, pinned Draft | auth diagnostics | P/S/C/O | official-pinned-Draft OAuth profile; no DCR; exact request-local empty settings |
 | `builtin-auth-server` | shared JOSE admission/RS256 | — | issuer/token server + asymmetric JWT/JWKS crypto | — | — | redacted rendering | server configuration | P/S/O | never implied by core OAuth |
 | `proxy` | — | — | gateway; enables optional `fastmcp-client` dependency | upstream client APIs | — | proxy rendering | gateway commands | S/C/O | server has no client dependency when absent |
-| `proxy-legacy` | legacy descriptor | legacy transport | `proxy` + `legacy-2025-11-25` | legacy client | — | proxy-era rendering | composite commands | S/C/O | must imply both base features |
+| `proxy-legacy` | legacy descriptor | legacy transport | `proxy` + `legacy-2024-11-05` | legacy client | — | proxy-era rendering | composite commands | S/C/O | must imply both base features |
 | `proxy-tasks` | Tasks descriptor | — | `proxy` + `tasks` | Tasks client | — | task-proxy rendering | composite commands | S/C/O | must imply both base features |
 | `websocket-experimental` | — | bounded frame codec | already-upgraded stream adapter only | already-upgraded stream adapter only | — | experimental label | diagnostics only | T/S/C/O | nonstandard, default off, no Upgrade/endpoint/connector/CLI activation, never core evidence |
 | `redis-tasks` | — | — | `tasks` + optional Redis backend | — | — | backend diagnostics | backend config | S/O | Redis graph remains Tokio-free |
@@ -34720,14 +35267,14 @@ An omitted crate/feature pair does not exist.
 
 | Package | Literal target feature equations |
 |---|---|
-| `fastmcp-protocol` | `legacy-2025-11-25=[]`; `tasks=[]`; `apps=[]`; `jose=["dep:ring"]` |
-| `fastmcp-transport` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25"]`; `websocket-experimental=[]` |
-| `fastmcp-client` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps","dep:html5ever"]`; `enterprise-auth=["fastmcp-protocol/jose"]`; `experimental-client-credentials=["fastmcp-protocol/jose"]`; `safe-icon-rendering=["dep:image","dep:resvg"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental"]` |
-| `fastmcp-server` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps","dep:html5ever"]`; `enterprise-auth=["fastmcp-protocol/jose"]`; `experimental-client-credentials=["fastmcp-protocol/jose"]`; `builtin-auth-server=["fastmcp-protocol/jose","dep:argon2"]`; `proxy=["dep:fastmcp-client"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-client/legacy-2025-11-25"]`; `proxy-tasks=["proxy","tasks","fastmcp-client/tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental"]`; `redis-tasks=["tasks","dep:redis"]`; `jwt-resource-auth=["fastmcp-protocol/jose"]` |
+| `fastmcp-protocol` | `legacy-2024-11-05=[]`; `tasks=[]`; `apps=[]`; `jose=["dep:ring"]` |
+| `fastmcp-transport` | `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05"]`; `websocket-experimental=[]` |
+| `fastmcp-client` | `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05","fastmcp-transport/legacy-2024-11-05"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps","dep:html5ever"]`; `enterprise-auth=["fastmcp-protocol/jose"]`; `oauth-client-credentials=["fastmcp-protocol/jose"]`; `safe-icon-rendering=["dep:image","dep:resvg"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental"]` |
+| `fastmcp-server` | `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05","fastmcp-transport/legacy-2024-11-05"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps","dep:html5ever"]`; `enterprise-auth=["fastmcp-protocol/jose"]`; `oauth-client-credentials=["fastmcp-protocol/jose"]`; `builtin-auth-server=["fastmcp-protocol/jose","dep:argon2"]`; `proxy=["dep:fastmcp-client"]`; `proxy-legacy=["proxy","legacy-2024-11-05","fastmcp-client/legacy-2024-11-05"]`; `proxy-tasks=["proxy","tasks","fastmcp-client/tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental"]`; `redis-tasks=["tasks","dep:redis"]`; `jwt-resource-auth=["fastmcp-protocol/jose"]` |
 | `fastmcp-derive` | `tasks=[]` |
-| `fastmcp-console` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps"]`; `enterprise-auth=[]`; `experimental-client-credentials=[]`; `builtin-auth-server=[]`; `proxy=[]`; `proxy-legacy=["proxy","legacy-2025-11-25"]`; `proxy-tasks=["proxy","tasks"]`; `websocket-experimental=[]`; `redis-tasks=["tasks"]`; `jwt-resource-auth=[]` |
-| `fastmcp-cli` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25","fastmcp-client/legacy-2025-11-25","fastmcp-console/legacy-2025-11-25","fastmcp-server?/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-client/tasks","fastmcp-console/tasks","fastmcp-server?/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-client/apps","fastmcp-console/apps","fastmcp-server?/apps"]`; `enterprise-auth=["fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth","fastmcp-server?/enterprise-auth"]`; `experimental-client-credentials=["fastmcp-client/experimental-client-credentials","fastmcp-console/experimental-client-credentials","fastmcp-server?/experimental-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["dep:fastmcp-server","fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["dep:fastmcp-server","fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental","fastmcp-server?/websocket-experimental"]`; `redis-tasks=["tasks","dep:fastmcp-server","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["dep:fastmcp-server","fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]` |
-| `fastmcp-rust` | `legacy-2025-11-25=["fastmcp-protocol/legacy-2025-11-25","fastmcp-transport/legacy-2025-11-25","fastmcp-server/legacy-2025-11-25","fastmcp-client/legacy-2025-11-25","fastmcp-console/legacy-2025-11-25"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-server/tasks","fastmcp-client/tasks","fastmcp-derive/tasks","fastmcp-console/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-server/apps","fastmcp-client/apps","fastmcp-console/apps"]`; `enterprise-auth=["fastmcp-server/enterprise-auth","fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth"]`; `experimental-client-credentials=["fastmcp-server/experimental-client-credentials","fastmcp-client/experimental-client-credentials","fastmcp-console/experimental-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2025-11-25","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-server/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental"]`; `redis-tasks=["tasks","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]`; `testing=[]`; `testing-lab=["testing","asupersync/test-internals"]` |
+| `fastmcp-console` | `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05"]`; `tasks=["fastmcp-protocol/tasks"]`; `apps=["fastmcp-protocol/apps"]`; `enterprise-auth=[]`; `oauth-client-credentials=[]`; `builtin-auth-server=[]`; `proxy=[]`; `proxy-legacy=["proxy","legacy-2024-11-05"]`; `proxy-tasks=["proxy","tasks"]`; `websocket-experimental=[]`; `redis-tasks=["tasks"]`; `jwt-resource-auth=[]` |
+| `fastmcp-cli` | `default=["legacy-2024-11-05"]`; `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05","fastmcp-transport/legacy-2024-11-05","fastmcp-client/legacy-2024-11-05","fastmcp-console/legacy-2024-11-05","fastmcp-server?/legacy-2024-11-05"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-client/tasks","fastmcp-console/tasks","fastmcp-server?/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-client/apps","fastmcp-console/apps","fastmcp-server?/apps"]`; `enterprise-auth=["fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth","fastmcp-server?/enterprise-auth"]`; `oauth-client-credentials=["fastmcp-client/oauth-client-credentials","fastmcp-console/oauth-client-credentials","fastmcp-server?/oauth-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["dep:fastmcp-server","fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["dep:fastmcp-server","fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2024-11-05","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental","fastmcp-server?/websocket-experimental"]`; `redis-tasks=["tasks","dep:fastmcp-server","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["dep:fastmcp-server","fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]` |
+| `fastmcp-rust` | `default=["legacy-2024-11-05"]`; `legacy-2024-11-05=["fastmcp-protocol/legacy-2024-11-05","fastmcp-transport/legacy-2024-11-05","fastmcp-server/legacy-2024-11-05","fastmcp-client/legacy-2024-11-05","fastmcp-console/legacy-2024-11-05"]`; `tasks=["fastmcp-protocol/tasks","fastmcp-server/tasks","fastmcp-client/tasks","fastmcp-derive/tasks","fastmcp-console/tasks"]`; `apps=["fastmcp-protocol/apps","fastmcp-server/apps","fastmcp-client/apps","fastmcp-console/apps"]`; `enterprise-auth=["fastmcp-server/enterprise-auth","fastmcp-client/enterprise-auth","fastmcp-console/enterprise-auth"]`; `oauth-client-credentials=["fastmcp-server/oauth-client-credentials","fastmcp-client/oauth-client-credentials","fastmcp-console/oauth-client-credentials"]`; `safe-icon-rendering=["fastmcp-client/safe-icon-rendering"]`; `builtin-auth-server=["fastmcp-server/builtin-auth-server","fastmcp-console/builtin-auth-server"]`; `proxy=["fastmcp-server/proxy","fastmcp-console/proxy"]`; `proxy-legacy=["proxy","legacy-2024-11-05","fastmcp-server/proxy-legacy","fastmcp-console/proxy-legacy"]`; `proxy-tasks=["proxy","tasks","fastmcp-server/proxy-tasks","fastmcp-console/proxy-tasks"]`; `websocket-experimental=["fastmcp-transport/websocket-experimental","fastmcp-server/websocket-experimental","fastmcp-client/websocket-experimental","fastmcp-console/websocket-experimental"]`; `redis-tasks=["tasks","fastmcp-server/redis-tasks","fastmcp-console/redis-tasks"]`; `jwt-resource-auth=["fastmcp-server/jwt-resource-auth","fastmcp-console/jwt-resource-auth"]`; `testing=[]`; `testing-lab=["testing","asupersync/test-internals"]` |
 
 Each facade feature forwards only the cells shown.
 The CLI mirrors the same feature names; it does not silently compile
@@ -34781,9 +35328,9 @@ RNG feature graph.
 
 `ProtocolPolicy` values remain parseable for actionable
 configuration diagnostics.
-Selecting `ModernWithLegacy` or `LegacyOnly` without
-`legacy-2025-11-25` returns a typed `FeatureUnavailable` during builder
-validation; it never silently selects `LatestOnly`.
+Selecting `Auto` or `LegacyOnly` without `legacy-2024-11-05` returns a typed
+`FeatureUnavailable` during builder validation; it never silently selects
+`ModernOnly`.
 With the feature present, the same policies still fail before
 bind/spawn/connect unless the exact live FND-03
 `LegacyServerAdapterInstalledReceipt` or
@@ -34799,7 +35346,7 @@ Feature implications make these invalid combinations unrepresentable
 in a successful build:
 
 - `proxy-legacy` without both `proxy` and
-  `legacy-2025-11-25`;
+  `legacy-2024-11-05`;
 - `proxy-tasks` without both `proxy` and `tasks`;
 - `redis-tasks` without `tasks`;
 - task macro attributes without `tasks`;
@@ -34812,35 +35359,35 @@ package invocation so workspace feature unification cannot hide a
 missing edge:
 
 ```text
-fastmcp-protocol:       ""; legacy-2025-11-25; tasks; apps; jose
-fastmcp-transport:      ""; legacy-2025-11-25; websocket-experimental
-fastmcp-client:         ""; legacy-2025-11-25; tasks; apps;
-                        enterprise-auth; experimental-client-credentials;
+fastmcp-protocol:       ""; legacy-2024-11-05; tasks; apps; jose
+fastmcp-transport:      ""; legacy-2024-11-05; websocket-experimental
+fastmcp-client:         ""; legacy-2024-11-05; tasks; apps;
+                        enterprise-auth; oauth-client-credentials;
                         safe-icon-rendering; websocket-experimental
-fastmcp-server:         ""; legacy-2025-11-25; tasks; apps;
-                        enterprise-auth; experimental-client-credentials;
+fastmcp-server:         ""; legacy-2024-11-05; tasks; apps;
+                        enterprise-auth; oauth-client-credentials;
                         builtin-auth-server;
                         enterprise-auth,builtin-auth-server;
                         proxy; proxy-legacy;
                         proxy-tasks; websocket-experimental; redis-tasks;
                         jwt-resource-auth
 fastmcp-derive:         ""; tasks
-fastmcp-console:        ""; legacy-2025-11-25; tasks; apps;
-                        enterprise-auth; experimental-client-credentials;
+fastmcp-console:        ""; legacy-2024-11-05; tasks; apps;
+                        enterprise-auth; oauth-client-credentials;
                         builtin-auth-server;
                         enterprise-auth,builtin-auth-server;
                         proxy; proxy-legacy;
                         proxy-tasks; websocket-experimental; redis-tasks;
                         jwt-resource-auth
-fastmcp-cli:            ""; legacy-2025-11-25; tasks; apps;
-                        enterprise-auth; experimental-client-credentials;
+fastmcp-cli:            ""; legacy-2024-11-05; tasks; apps;
+                        enterprise-auth; oauth-client-credentials;
                         safe-icon-rendering; builtin-auth-server;
                         enterprise-auth,builtin-auth-server;
                         proxy; proxy-legacy;
                         proxy-tasks; websocket-experimental; redis-tasks;
                         jwt-resource-auth
-fastmcp-rust:           ""; legacy-2025-11-25; tasks; apps;
-                        enterprise-auth; experimental-client-credentials;
+fastmcp-rust:           ""; legacy-2024-11-05; tasks; apps;
+                        enterprise-auth; oauth-client-credentials;
                         safe-icon-rendering; builtin-auth-server;
                         enterprise-auth,builtin-auth-server;
                         proxy; proxy-legacy;
@@ -34855,8 +35402,8 @@ the pairwise expansion. Generate and check in a second deterministic
 ```text
 anchors = {builtin-auth-server, proxy, jwt-resource-auth}
 fastmcp-server bases =
-  {legacy-2025-11-25, tasks, apps, enterprise-auth,
-   experimental-client-credentials, builtin-auth-server, proxy,
+  {legacy-2024-11-05, tasks, apps, enterprise-auth,
+   oauth-client-credentials, builtin-auth-server, proxy,
    websocket-experimental, redis-tasks, jwt-resource-auth}
 fastmcp-console bases = same set
 fastmcp-cli bases =
@@ -36890,16 +37437,14 @@ For wire correctness defects:
   stable support claim.
 - File deletion always requires separate written permission.
 - Beads status becomes the execution source of truth only after Section
-  36.4's clean rematerialization, doctor/sync, exact graph, and checker
-  preconditions pass. Until then, package-local dependencies are planning-
-  order truth only and execution is stopped except for the active owner's
-  checkpoint/handoff and Section 36.1's narrowly human-authorized
-  REL-QUAR-00 emergency safety path.
-- REL-QUAR-00 is a global preclaim/merge barrier, not merely an ordinary
-  DAG prerequisite: after tracker repair, no other package may be claimed
-  or merged until its source and provider-side quarantine evidence
-  closes. Its one CI-BASE-01 edge avoids duplicating this execution policy
-  into every package closure.
+  36.4's rematerialization, doctor/sync, exact graph, and checker preconditions
+  pass for the affected lineage. A stale package body is not claimable;
+  independently reconciled, bounded capability leaves may proceed only when
+  their current bodies, dependencies, ownership cards, and exact tests agree.
+- REL-QUAR-00 is a release-only gate. Its source and provider-state evidence
+  must close before REL-PREP-01, publication-capable CI, REL-01, or REL-02 can
+  proceed, but an external credential action never blocks unrelated MCP
+  implementation. Waiting on that action earns zero capability credit.
 - Agent Mail, when used, is the coordination and reservation source of
   truth.
 - `br sync --flush-only` exports tracker state; it does not perform Git
@@ -37356,8 +37901,11 @@ Round 13 — end-to-end project reality check:
   not applied to effective handler deadlines, panic payloads can cross
   the peer boundary, bound HTTP configuration can be discarded,
   CLI errors are swallowed, public docs/examples overstate current APIs,
-  the client is effectively single-flight/lossy for unmatched responses,
-  and the FND verifier has grown to exactly 85,819 physical lines;
+  and, at that assessed snapshot, the client was effectively
+  single-flight/lossy for unmatched responses. The unverified 2026-08-02
+  delta above partially addresses correlation and deadlines without
+  closing CLT-01. The FND verifier had grown to exactly 85,819 physical
+  lines;
 - RCH evidence: workspace check passed with warnings, Clippy failed
   under `-D warnings`, and workspace tests stopped at a timed-out
   `fastmcp-cli` hot-reload end-to-end test. Therefore no clean baseline,
@@ -38154,33 +38702,148 @@ required closure/provenance edges or inventing readiness.
 
 ### 36.4 Execution protocol
 
+#### 36.4.1 Canonical mandatory-topology rework ledger
+
+This is a normative decomposition ledger, not a capability, readiness, test,
+or release claim. Its independent inventory has exactly 143 formal parents:
+59 already conform to `A + B → I → V → parent`; 84 violate it. Of the 84,
+81 have `0/0/0` implementation/integration/verification children, API-01 and
+CLI-01 have only one bounded A leaf, and FND-01 has a nonconforming `15/1/1`
+shape. Every row below must be rematerialized before its parent is claimable.
+
+For every ledger row, A and B are disjoint real-production slices with their
+own same-Bead positives and planted negatives; I depends on A and B and wires
+only their named shipped public surfaces; V depends on I, binds I's exact
+revision/tree and receipt inventory, performs independent verification only,
+and earns zero capability credit; the parent depends on V. A and B retain only
+the applicable existing external entries from the parent's canonical
+`Dependencies:` list, I adds only A/B, V adds only I, and no row adds a formal
+parent dependency or changes an existing external edge. `none` means no
+exception: the ordinary topology is required. The only supported eras are
+`2026-07-28` and `2024-11-05`; a `2025-11-25` value is an unsupported planted
+negative, never an A/B slice or positive I observation.
+
+| Violating parent | A — disjoint production slice | B — disjoint production slice | I — exact public wiring | V — receipt-only independent check | Rationale |
+|---|---|---|---|---|---|
+| AUTH-01 | transport credential extraction and principal admission | verifier/provider policy, challenge and typed rejection | server auth boundary through public builder | revision, principal-isolation and test-inventory receipt | none |
+| AUTH-05 | static/custom token configuration and safe public builder | error taxonomy, redaction, expiry and revocation behavior | configured server/client auth entrypoints | public diagnostics and zero-skip receipt | none |
+| AUTH-07 | authorization policy declarations and resource mapping | enforcement precedence and denial diagnostics | public protected-operation path | policy/revision/negative receipt | none |
+| CACHE-01 | cache key/value and partition model | expiry, invalidation and capacity admission | public server cache middleware | partition/isolation receipt | none |
+| CACHE-02 | request cacheability and response metadata rules | revalidation, mutation and error-path behavior | public client/server cache use | observable cache-state receipt | none |
+| CACHE-03 | cross-layer cache partition primitives | invalidation propagation and stale-entry denial | public cache/proxy composition | partition-digest receipt | none |
+| CI-APPS-01 | Apps profile job/inventory execution | Apps evidence, failure and skip detection | shipped Apps profile CI entrypoint | exact job/result receipt | none |
+| CI-BUILTIN-AUTH-01 | issuer profile job/inventory execution | custody/evidence and failure detection | shipped issuer profile CI entrypoint | exact job/result receipt | none |
+| CI-DUAL-01 | exact-2026/exact-2024 profile runner | Auto/Legacy receipt and cross-era rejection checks | shipped dual-era CI entrypoint | era/profile equality receipt | none |
+| CI-EMA-01 | EMA profile job/inventory execution | trust/evidence and failure detection | shipped EMA CI entrypoint | exact job/result receipt | none |
+| CI-EMA-BUILTIN-01 | EMA-plus-issuer composition runner | composite custody/evidence failures | shipped composite CI entrypoint | exact composite receipt | none |
+| CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01 | official-Draft profile runner | absent/advertised settings and failure matrix | shipped Draft CI entrypoint | profile equality receipt | none |
+| CI-PROXY-01 | modern proxy job/inventory execution | route/isolation evidence and failure detection | shipped proxy CI entrypoint | exact job/result receipt | none |
+| CI-PROXY-DUAL-01 | dual-era proxy runner | legacy-route isolation and downgrade negatives | shipped dual-proxy CI entrypoint | profile equality receipt | none |
+| CI-PROXY-TASKS-01 | Tasks proxy runner | task/route isolation and failure matrix | shipped Tasks-proxy CI entrypoint | profile equality receipt | none |
+| CI-REDIS-TASKS-01 | Redis Tasks profile runner | topology/durability evidence and failures | shipped Redis Tasks CI entrypoint | profile equality receipt | none |
+| CI-TASKS-01 | Tasks profile runner | task evidence and zero-skip failure detection | shipped Tasks CI entrypoint | exact job/result receipt | none |
+| CLI-02 | official Tasks command parsing and public output | task watch/update/cancel execution, redaction and exits | shipped CLI Tasks commands | binary/profile/test-inventory receipt | none |
+| CLT-02 | immutable policy and endpoint-bundle construction | modern-first negotiation, fallback eligibility and cache isolation | public client connect/execute builder | selected-era/no-downgrade receipt | none |
+| CMP-01 | completion request/response types and validation | completion dispatch, bounds and error behavior | public completion API and handler route | schema/observable receipt | none |
+| CONF-01 | pinned official runner invocation and case mapping | runner environment, discovery and failure normalization | shipped conformance command | runner/case equality receipt | none |
+| CONF-02 | repository supplemental requirement mapping | public conformance gap tests and mutation oracles | combined official-plus-supplemental entrypoint | requirement/test equality receipt | none |
+| DOC-01 | provisional documentation source and examples | executable example validation and negative claim checks | public docs/example package surface | source/example revision receipt | none |
+| DOC-02 | evidence-derived support matrix generation | claim denial, link and artifact consistency | public documentation publication inputs | evidence/wording receipt | none |
+| FND-05 | DNS/TLS/HTTP feasibility primitives | target, feature, crypto and failure-boundary qualification | public network capability boundary | source/target/test receipt | none |
+| FND-06 | secret/configuration typed custody primitives | configuration loading, redaction and rotation boundaries | public auth/config builder boundary | custody/revision receipt | none |
+| FND-07 | filesystem capability/path policy primitives | bounded I/O, symlink and error isolation | public filesystem provider boundary | capability/path receipt | none |
+| GATE-APPS-READY | Apps closure-set evaluation | stale/missing/mixed-revision rejection | public Apps readiness evaluator | zero-capability gate receipt | none |
+| GATE-BUILTIN-AUTH-READY | issuer closure-set evaluation | stale/missing/mixed-revision rejection | public issuer readiness evaluator | zero-capability gate receipt | none |
+| GATE-CORE-READY | bounded modern-core closure evaluator | evidence substitution and stale-revision rejection | public modern readiness evaluator | zero-capability gate receipt | none |
+| GATE-DUAL-READY | dual-era closure evaluator | receipt/feature/era substitution rejection | public dual readiness evaluator | zero-capability gate receipt | none |
+| GATE-EMA-BUILTIN-READY | composite closure evaluator | composite evidence substitution rejection | public composite readiness evaluator | zero-capability gate receipt | none |
+| GATE-EMA-READY | EMA closure evaluator | trust/evidence substitution rejection | public EMA readiness evaluator | zero-capability gate receipt | none |
+| GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY | Draft closure evaluator | advertisement/profile substitution rejection | public Draft readiness evaluator | zero-capability gate receipt | none |
+| GATE-PROXY-DUAL-READY | dual-proxy closure evaluator | route/era evidence substitution rejection | public dual-proxy readiness evaluator | zero-capability gate receipt | none |
+| GATE-PROXY-READY | proxy closure evaluator | route/evidence substitution rejection | public proxy readiness evaluator | zero-capability gate receipt | none |
+| GATE-PROXY-TASKS-READY | Tasks-proxy closure evaluator | task/route evidence substitution rejection | public Tasks-proxy readiness evaluator | zero-capability gate receipt | none |
+| GATE-REDIS-TASKS-READY | Redis Tasks closure evaluator | topology/durability evidence substitution rejection | public Redis Tasks readiness evaluator | zero-capability gate receipt | none |
+| GATE-TASKS-READY | Tasks closure evaluator | task evidence substitution rejection | public Tasks readiness evaluator | zero-capability gate receipt | none |
+| HDR-01 | canonical HTTP header syntax and singleton admission | routing projection, collision and normalization rules | public HTTP header/routing boundary | header-table/digest receipt | none |
+| HTTP-01 | per-request response stream abstraction | cancellation, backpressure and terminal closure | public HTTP server response path | stream-lifetime receipt | none |
+| HTTP-04 | HTTP server routing and listener binding | connection lifecycle, bounds and shutdown | public HTTP server entrypoint | listener/route receipt | none |
+| HTTP-05 | HTTP middleware/error response composition | request guard, drain and close failure handling | public HTTP middleware path | error/teardown receipt | none |
+| HTTP-06 | generic HTTP origin/security/preflight handling | forwarding headers, limits and denial precedence | public HTTP security boundary | origin/header receipt | none |
+| INTEROP-01 | pinned peer-client interoperability matrix | pinned peer-server interoperability matrix | public cross-SDK harness | peer/version/result receipt | none |
+| MAC-01 | core tool/resource/prompt attribute expansion | schema/timeout/error diagnostics and renamed facade resolution | packaged facade-only macro consumer | expansion/use receipt | none |
+| MAC-TASK-01 | Tasks attribute parsing and feature gating | task result conversion and runtime registration denial | packaged Tasks macro consumer | feature/use receipt | none |
+| MRTR-01 | input-required wire/state model | request validation, errors and result transitions | public MRTR protocol boundary | state/schema receipt | none |
+| MRTR-02 | server resolver/broker ownership and correlation | consent, cancellation, expiry and persistence behavior | public MRTR resolver entrypoint | owner/terminal receipt | none |
+| OBS-01 | structured event/log model and redaction | sink filtering, bounds and failure behavior | public observability API | event/redaction receipt | none |
+| OBS-02 | untrusted display text and terminal-safe rendering | log attribution, suppression and diagnostics | public CLI/server diagnostics path | display/attribution receipt | none |
+| OBS-03 | metrics/export snapshot model | cardinality, privacy and sink failure handling | public observability export path | metric/cardinality receipt | none |
+| PRM-01 | prompt model/schema and registration | prompt rendering, arguments and dispatch behavior | public prompt API | schema/result receipt | none |
+| PRM-02 | prompt handler macro/builder integration | prompt bounds, metadata and errors | public prompt registration path | handler/observable receipt | none |
+| PRT-03 | final protocol-version/header semantics | request admission precedence and typed errors | public modern protocol ingress | version/error receipt | none |
+| PRT-04 | result discriminator/open-member model | typed decode, unknown preservation and rejection | public result codec/API | discriminator/round-trip receipt | none |
+| PRT-05 | official schema artifact generation | schema parity, golden and drift verification | public schema export boundary | artifact/parity receipt | none |
+| PXY-01 | upstream discovery/catalog and route identity | proxy leg auth, routing, failure and isolation | public gateway downstream/upstream path | leg/isolation receipt | none |
+| PXY-03 | proxy error/diagnostic translation | retry, failover and cancellation propagation | public gateway execution path | error/failover receipt | none |
+| PXY-04 | proxy catalog/extension composition | configuration revision and route capability isolation | public gateway catalog path | catalog/revision receipt | none |
+| PXY-LEG-01 | exact-2024 upstream route selection | lossless translation and mixed-era rejection | public mixed-era gateway path | era/translation receipt | none |
+| PXY-TASK-01 | Tasks upstream route and handle mapping | task state/cancellation and cross-owner denial | public Tasks gateway path | task/owner receipt | none |
+| RES-01 | resource model/schema and registration | read/list/template dispatch and errors | public resource API | schema/result receipt | none |
+| RES-02 | resource handler/builder integration | provider bounds, metadata and cache behavior | public resource registration path | handler/observable receipt | none |
+| SCH-02 | schema derivation/type mapping | recursive bounds, diagnostics and generation | public schema derive/API path | generated-schema receipt | none |
+| SCH-03 | schema validator integration | reference/error/handler enforcement | public schema validation path | validator/result receipt | none |
+| SRV-01 | immutable server/router dispatch | handler invocation, result conversion and errors | public server builder/dispatch | request/result receipt | none |
+| SRV-02 | catalog registration and server composition | capability/discovery and lifecycle freeze | public server construction path | catalog/freeze receipt | none |
+| SRV-03 | middleware chain ordering | cache/rate/transform cancellation and failures | public middleware server path | ordering/state receipt | none |
+| SRV-04 | handler deadlines and request execution | cancellation, budgets and terminal result gate | public handler execution path | deadline/terminal receipt | none |
+| SRV-MW-01 | middleware traits/context propagation | ordering, error and short-circuit semantics | public middleware API | chain/observable receipt | none |
+| SUB-01 | subscription protocol/handle model | server registration and event dispatch | public subscription API | handle/event receipt | none |
+| SUB-02 | subscription state, replay policy and bounds | cancellation, expiry and cross-owner denial | public subscription execution path | state/terminal receipt | none |
+| SUB-03 | client listen/reconnect model | resubscribe, gap and teardown behavior | public client subscription path | reconnect/gap receipt | none |
+| TOOL-01 | tool schema/catalog and registration | call dispatch, validation and error results | public tool API | schema/result receipt | none |
+| TOOL-02 | tool handler/builder integration | metadata, cache and deadline behavior | public tool registration path | handler/observable receipt | none |
+| TST-01 | canonical positive wire fixtures | planted-invalid wire fixtures and mutation oracle | public codec fixture runner | fixture/result receipt | none |
+| TST-02 | fuzz/property corpus generation | seed, shrink, timeout and regression handling | public test harness runner | corpus/seed receipt | none |
+| TST-03 | real end-to-end process harness | failure, cancellation and cleanup diagnosis | public E2E runner | process/result receipt | none |
+| TST-04 | differential/reference test harness | discrepancy triage and regression corpus | public differential runner | peer/result receipt | none |
+| XPORT-01 | modern/exact-2024 transport disposition table | role/direction codec and experimental transport isolation | public transport builder/codec path | disposition/role receipt | none |
+| API-01 | existing bounded ModernOnly leaf, retained as A | Auto/Legacy composition, legacy module and feature-gated endpoint bundle | full public builder/facade exports through A+B | independent public export/profile receipt | prior one-leaf shape is not an exception |
+| CLI-01 | existing bounded ModernOnly run/inspect leaf, retained as A | Auto/Legacy commands, endpoint bundle and diagnostics | full shipped binary policy surface through A+B | independent binary/profile receipt | prior one-leaf shape is not an exception |
+| FND-01 | regroup the 15 existing production leaves into one A aggregate: authoritative source/toolchain/dependency/provenance and core primitive slices | regroup the remaining production leaves into one B aggregate: migration, crypto/provider, SDK and external-capability qualification slices | retain the single existing baseline assembly as I, now depending only on A+B aggregates | retain final attestation as V with exact I tree/inventory receipt | 15/1/1 is not an exception; only its internal A/B staging remains narrow |
+
 Use the following fail-closed sequence for every implementation turn.
 
-At the current 2026-08-01 state, step 1 fails and no new formal-package
-or child claim/close is authorized by this plan. The already active
-`.1.14` owner may only checkpoint and hand off its work; this text does
-not revoke or overwrite that fresh claim. Before ordinary execution
-resumes, the explicitly authorized reconciliation must produce exact
-129-package/663-edge plan/Beads equality, mappings for all seven new
-packages, synchronized canonical bodies/acceptance, restored FND
-provenance, current evidence status, a completed frozen Bead-refinement
-sequence, strict export, fresh merge anchor, and clean doctor/sync/
-checker/`bv` evidence.
+2026-08-02 scope reconciliation: the user's explicit reality-check
+hardening instruction authorizes the non-FND shared-worktree fixes
+recorded in the dated deltas above. It does not rematerialize this plan
+as Beads execution authority, authorize a formal-package claim or close,
+override REL-QUAR-00, or permit edits to the active `.1.14` owner's three
+protected evidence files. Section 36.4 continues to govern every formal
+package transition; the current hardening work records no such
+transition.
 
-0. Treat REL-QUAR-00 as a global execution/merge safety barrier that is
-   deliberately stronger than package dependency readiness. The formal
-   graph records its CI-BASE-01 consumption without duplicating an edge
-   to every package, but after rematerialization the checker must reject
-   every non-REL-QUAR-00 preclaim and every implementation merge until
-   REL-QUAR-00 is closed with source-quarantine, provider-side workflow-
-   disable/token, historical-run-disposition, and independent-review
-   evidence. Before the checker exists, closure uses Section 36.1's
-   frozen independent manual child/schema/dependency/receipt projection;
-   it is not deferred to a nonexistent tool. Before rematerialization, no
-   ordinary claim is allowed at all; only Section 36.1's exact human-
-   authorized REL-QUAR-00 emergency path may act. This global barrier
-   changes execution admission, not package closure calculations, and
-   grants no publication authority.
+The 2026-08-03 projection contains the amended 143 formal packages and
+their bounded children, but source/version audit found normative 2025-era
+semantics in affected package bodies. A package with stale policy, transport,
+feature, extension, gate, CI, documentation, or release acceptance text is not
+claim-ready until its body and children are rematerialized. This targeted
+quarantine does not stop already-reconciled, nonoverlapping capability leaves.
+Before any affected lineage resumes, reconciliation must produce synchronized
+canonical bodies and acceptance criteria, restored provenance, current
+evidence status, strict export, and clean graph/checker evidence.
+
+0. Treat REL-QUAR-00 as a publication and release-candidate gate, not as a
+   global implementation-admission gate. Its checked-in source quarantine,
+   provider-disabled historical workflow identity, no-live-run observation,
+   and unresolved credential-removal action remain release-critical facts.
+   They block REL-PREP-01, every publication-capable CI path, REL-01, and
+   REL-02 until independently verified; they do not block unrelated MCP code,
+   tests, source freezing, or component qualification. This boundary prevents
+   a security guard from becoming process ceremony that starves capability
+   work. No worker may mutate provider state, credentials, workflow enablement,
+   tags, registry state, or public release state. The exact credential removal
+   remains blocked-born external work requiring the repository owner's
+   separate written authorization and earns zero capability credit while
+   waiting.
 
 1. Run `br doctor --json` and
    `br sync --status --json`. Require doctor `ok: true`, healthy
@@ -38221,22 +38884,39 @@ checker/`bv` evidence.
    child, parent-child hierarchy is ownership only, not a real
    prerequisite: after FND-02 exists its checker computes the exact
    contracted child projection. Before then, only the frozen manually
-   reconciled FND-01 and FND-02 child projections described in this
-   section may supplement `br ready`.
+   reconciled FND-01, FND-02, and FND-03 child projections described in this
+   section may supplement `br ready`. The FND-03 projection is exactly
+   `bd-mcp-2026-07-28-support-ahet.3.1 + .3.2 → .3.3 → .3.4 → .3`; no
+   consumer may bypass the parent formal package with a child edge.
+   The PRT-01 projection is exactly
+   `bd-mcp-2026-07-28-support-ahet.5.1 + .5.2 → .5.3 → .5.4 → .5`:
+   `.5.1` owns strict JSON-RPC envelopes, IDs, endpoint roles, and raw JSON
+   admission; `.5.2` owns reusable security-document, compact-JWS, JWK, and
+   RFC 7638 thumbprint admission; `.5.3` integrates both through shipped
+   codecs and consumers; `.5.4` independently binds and verifies that exact
+   integration revision. The LEG-01 projection is exactly
+   `bd-mcp-2026-07-28-support-ahet.9.1 + .9.2 → .9.3 → .9.4 → .9`:
+   `.9.1` owns exact 2024 schema, 24-method/capability/envelope parity;
+   `.9.2` owns lossless translation and exact legacy disposition; `.9.3`
+   integrates them through shipped adapter entrypoints for stdio and
+   LEG-HTTP-01; `.9.4` independently binds and verifies that exact integration
+   revision. No consumer may bypass either parent formal package with a child
+   edge.
 3. After FND-02 has installed it, run
    `cargo xtask plan-tracker-check all`. Before that point, a fresh
-   post-rematerialization manual bootstrap may permit only the already-
-   satisfied REL-QUAR-00 global barrier, then the independently validated
-   FND-01 lineage and FND-02 in that order. REL-QUAR-00 does not consume
-   or reorder the FND implementation lineage. The old
+   post-rematerialization manual bootstrap may permit the independently
+   validated FND-01 lineage and FND-02 in that order. REL-QUAR-00 does not
+   consume, gate, or reorder the FND implementation lineage; it gates only
+   release preparation and publication-capable paths. The old
    Section 36.3 snapshot permits neither lineage now. No third formal
    lineage, including FND-04, may be claimed before a clean checker
-   `all` result. That first `all` run must retrovalidate the exact closed
-   REL-QUAR-00 aggregate/child chain, actors, receipts, scopes, and
-   dependency projection created by the manual bootstrap. Any mismatch
-   stops all further work and requires explicit `br` reopen/repair under
-   the normal safety gate; the checker never silently blesses or rewrites
-   historical emergency evidence.
+   `all` result. That first `all` run must validate the exact REL-QUAR-00
+   aggregate/child chain, actors, receipts, scopes, and dependency projection
+   without requiring externally blocked provider-state leaves to be closed.
+   A mismatch blocks the release lineage that consumes REL-QUAR-00 and
+   requires explicit `br` repair; it does not invalidate independent protocol
+   work. The checker never silently blesses or rewrites historical emergency
+   evidence.
 4. Optionally run `bv --robot-plan --label work-package` for ranking
    and parallel-track context. Ignore its epic connector and never use
    `--robot-plan`, `--robot-triage`, or `--robot-next` as readiness

@@ -18,15 +18,15 @@ Release publication remains quarantined. This document supplies neither publicat
 
 ### Current qualification snapshot
 
-- The primary stdio path now keeps a receive pump active while one bounded
-  worker serializes dispatch, so cancellation can be routed during handler
-  execution. Custom/SSE/WebSocket entry points retain the legacy sequential
-  loop; request-owned `Cx` isolation and reliable cleanup qualification remain
-  open across the aggregate surface.
-- Stdio can route sampling, elicitation, and roots responses while its dispatch
-  worker is occupied. Custom/SSE/WebSocket paths reject or lack equivalent
-  split routing, public HTTP remains fail-closed, and end-to-end lifecycle
-  qualification is incomplete.
+- On Unix, the primary stdio path now keeps a receive pump active while one
+  bounded worker serializes dispatch, so cancellation can be routed during
+  handler execution. Non-Unix stdio and custom/SSE/WebSocket entry points
+  retain sequential or blocking boundaries; request-owned `Cx` isolation and
+  reliable cleanup qualification remain open across the aggregate surface.
+- Unix stdio can route sampling, elicitation, and roots responses while its
+  dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths
+  reject or lack equivalent split routing, public HTTP remains fail-closed,
+  and end-to-end lifecycle qualification is incomplete.
 - Eligible production cache entries are partitioned by committed authentication
   facts plus opaque session identity and revision. Ambiguous authentication,
   unsafe state views, allocation failure, and state mutation fail closed.
@@ -40,6 +40,10 @@ Release publication remains quarantined. This document supplies neither publicat
   `MethodNotFound`.
 - OAuth/OIDC public source APIs exist for development, but production security
   and profile conformance remain unverified and quarantined from support claims.
+- Explicit client close now returns process/transport cleanup failures. The
+  anchored owned-process-group mode used by `fastmcp test` is Unix-only; Drop
+  is best effort, and group/session escape, fork-copied descriptors, competing
+  reapers, and Windows Job Object support remain unqualified.
 
 ## Executive Summary
 
@@ -88,8 +92,8 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | WebSocket transport | ✅ | ✅ | `run_websocket()` with `WsTransport` and caller-provided reader/writer integration |
 | **HTTP transport** | ✅ | 🟡 | HTTP parsing/framing primitives exist; the turnkey `run_http*` listener fails closed before bind pending stateless qualification |
 | **Streamable HTTP transport** | ✅ | 🟡 | `StreamableHttpTransport` primitives exist; no qualified public modern listener/client path is claimed |
-| Request timeout/budget | ✅ | 🟡 | Via asupersync `Budget`; the Unix public subprocess client bounds silent and partial-frame stdout receives, but generic blocking `recv`, non-Unix child pipes, synchronous writes, and bounded best-effort teardown keep this short of a portable end-to-end wall-clock guarantee (FND-04) |
-| Cancellation behavior | 🟡 | 🟡 | Stdio keeps receiving while a bounded worker dispatches and can route a live cancellation; custom/SSE/WebSocket loops remain sequential, and request-owned child `Cx` isolation plus cleanup qualification remain open |
+| Server request timeout/budget | ✅ | 🟡 | Server dispatch uses asupersync `Budget`; request-owned child-context isolation and end-to-end cleanup qualification remain open (FND-04) |
+| Cancellation behavior | 🟡 | 🟡 | Unix stdio keeps receiving while a bounded worker dispatches and can route a live cancellation; non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries, and request-owned child `Cx` isolation plus cleanup qualification remain open |
 | HTTP multi-client isolation | ✅ | 🟡 | The unsafe shared-Session listener is quarantined and unreachable. Modern `LatestOnly` still needs immutable stateless per-request dispatch with an owned request execution; a bounded owner-bound Session registry is LEG-02-only legacy work |
 | Lifecycle hooks (lifespan) | ✅ | ✅ | `on_startup()` / `on_shutdown()` |
 | Ping/health check | ✅ | ✅ | `ping` method handled |
@@ -200,14 +204,14 @@ edge nor a network capability while TASK-01/TASK-02 remain open.
 
 ### Bidirectional Communication Infrastructure
 
-The following bidirectional building blocks exist in source. This inventory does not certify end-to-end behavior for MCP 2026-07-28. The primary stdio path now keeps a receive pump active while its dispatch worker runs. Custom/SSE/WebSocket paths still use the legacy sequential loop and do not provide equivalent response routing; public HTTP remains fail-closed, and request-owned lifecycle evidence is incomplete.
+The following bidirectional building blocks exist in source. This inventory does not certify end-to-end behavior for MCP 2026-07-28. On Unix, the primary stdio path keeps a receive pump active while its dispatch worker runs. Non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries and do not provide equivalent response routing; public HTTP remains fail-closed, and request-owned lifecycle evidence is incomplete.
 
 1. ✅ `PendingRequests` - Tracks server-to-client requests with response routing
 2. ✅ `RequestSender` - Sends requests through transport with response awaiting
 3. ✅ `TransportSamplingSender` - Implements `SamplingSender` trait
 4. ✅ `TransportElicitationSender` - Implements `ElicitationSender` trait
 5. ✅ `TransportRootsProvider` - Provides `roots/list` requests
-6. 🟡 The primary stdio receive pump continues routing responses during handler dispatch; custom/SSE/WebSocket loops do not yet provide equivalent split routing
+6. 🟡 The Unix primary-stdio receive pump continues routing responses during handler dispatch; non-Unix stdio and custom/SSE/WebSocket loops do not yet provide equivalent split routing
 7. ✅ `Server` struct has `pending_requests` field for tracking
 
 ---
@@ -216,17 +220,17 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| Subprocess spawning | ✅ | ✅ | Stdio subprocess integration exists; lifecycle verification remains part of the active hardening work |
+| Subprocess spawning | ✅ | 🟡 | Stdio subprocess integration exists. Explicit `Client::close` returns cleanup failures; opt-in anchored group ownership is Unix-only and is not portable process-tree containment |
 | Client transport integration | ✅ | 🟡 | Public `Client` construction is subprocess stdio only; lower-level SSE/WebSocket transport types are not connected to it |
 | Tool invocation | ✅ | ✅ | `call_tool()` |
 | Resource reading | ✅ | ✅ | `read_resource()` |
 | Prompt fetching | ✅ | ✅ | `get_prompt()` |
 | Progress callbacks | ✅ | ✅ | `call_tool_with_progress()` |
 | List operations | ✅ | ✅ | Tool/resource/prompt list methods exist |
-| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the stdio receive pump can route it during dispatch. Custom/SSE/WebSocket loops remain sequential; reliable interruption, cleanup waiting, and request-owned isolation remain open |
+| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
 | Log level setting | ✅ | ✅ | `set_log_level()` |
 | Response ID validation | ✅ | ✅ | Validates response IDs |
-| Timeout support | ✅ | 🟡 | Configuration exists; end-to-end enforcement gates remain |
+| Client request idle/absolute deadlines | ✅ | 🟡 | Ordinary requests use monotonic `Instant` deadlines that begin after send commit (30-second idle and 120-second non-resettable absolute defaults). Unix subprocess stdout receives, including silent and partial frames, are bounded; generic blocking `recv`, non-Unix child pipes, synchronous writes, and best-effort Drop prevent a portable end-to-end wall-clock guarantee (FND-04) |
 | **MCPConfig client creation** | ✅ | ✅ | `mcp_config.rs` with JSON/TOML parsing |
 | **SamplingHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing; custom transport routing and lifecycle qualification remain open |
 | **ElicitationHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing; custom transport routing and lifecycle qualification remain open |
@@ -367,9 +371,9 @@ The following bidirectional building blocks exist in source. This inventory does
 | **`fastmcp run`** | ✅ | ✅ | `fastmcp-cli` crate |
 | **`fastmcp inspect`** | ✅ | ✅ | JSON/text/mcp output formats |
 | **`fastmcp install`** | ✅ | ✅ | Claude Desktop, Cursor, Cline targets |
-| **`fastmcp dev`** | ✅ | 🟡 | Unix file-watching/restart paths include bounded owned-group cleanup; non-Unix fails closed until safe bounded pipe I/O and process-tree ownership are implemented |
+| **`fastmcp dev`** | ✅ | 🟡 | Unix file-watching/restart paths use bounded owned-group cleanup plus an in-group watchdog tied to an owner-held control pipe, covering CLI owner death and child-handle drop. Descriptor copies made by a host fork and group/session escape remain outside the boundary; non-Unix fails closed |
 | **`fastmcp list`** | ✅ | ✅ | List available servers |
-| **`fastmcp test`** | ✅ | ✅ | Test server connectivity |
+| **`fastmcp test`** | ✅ | 🟡 | Tests connectivity using anchored Unix process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible; non-Unix fails before spawn until a Job Object/equivalent ownership path exists |
 | **`fastmcp tasks`** | ✅ | 🚧 | CLI command paths exist, but the server task capability is quarantined and all task RPC methods return `MethodNotFound` |
 
 ---
@@ -436,11 +440,11 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 
 Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2.14.4. **That is not a current MCP 2026-07-28 support claim.**
 
-**Current FND-01 stance (2026-08-01):**
+**Current FND-01 stance (2026-08-02):**
 
 - Foundation evidence, dependency freeze, and integration assembly are in progress under beads FND-01
-- JWT/`jsonwebtoken` and Redis optional features are **removed** from the default graph for FND-01
-- OAuth/OIDC/Redis Tasks/Apps/media remain later work packages (AUTH-*, TASKR-01, etc.)
+- JWT/`jsonwebtoken` and Redis are absent from the current workspace dependency graph
+- OAuth/OIDC production promotion, Redis Tasks, Apps, and media remain later work packages (AUTH-*, TASKR-01, etc.)
 - Aggregate support requires GATE / final attestation packages — not this document
 
 **Current implementation surfaces (not an aggregate claim):**
@@ -459,13 +463,24 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
   and use immutable stateless per-request dispatch with an owned request
   execution; a bounded owner-bound Session registry belongs only to the
   feature-gated LEG-02 MCP 2025-11-25 adapter
-- Stdio keeps a receive pump active while a bounded worker serializes dispatch,
-  allowing cancellation routing during handler execution. Custom/SSE/WebSocket
-  loops remain sequential, and request-owned interruption plus reliable
-  `awaitCleanup` are not yet qualified
-- Stdio can route sampling, elicitation, and roots responses while its worker is
-  occupied. Custom/SSE/WebSocket paths lack equivalent split routing, public
-  HTTP is fail-closed, and end-to-end lifecycle qualification remains open
+- Unix stdio keeps a receive pump active while a bounded worker serializes
+  dispatch, allowing cancellation routing during handler execution. Non-Unix
+  stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries,
+  and request-owned interruption plus reliable `awaitCleanup` are not yet
+  qualified
+- Unix primary-stdio output is serialized and bounded for ordinary pipes and
+  sockets; write/notification failure is terminal, and shutdown hooks require
+  worker quiescence. Regular files/devices, non-Unix output, and handlers that
+  ignore cancellation retain documented bounds or process-exit limitations
+- Low-level HTTP reads checkpoint and retry interruption, but a generic
+  synchronous `Read` already blocked in the kernel is not preemptible
+- `Client::close` is proof-bearing and retryable while the client remains
+  owned; Drop is best effort. Anchored group ownership does not contain
+  group/session escape, fork-copied descriptors, or hostile/global reapers
+- Unix stdio can route sampling, elicitation, and roots responses while its
+  worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths lack
+  equivalent split routing, public HTTP is fail-closed, and end-to-end
+  lifecycle qualification remains open
 - Request work still needs an independently owned child `Cx`; cancellation is
   not a sibling-isolated guarantee until that boundary exists
 - Eligible response-cache entries use committed-auth plus opaque
