@@ -36,6 +36,55 @@ owned_paths = [
 ]
 shared_files_modified = false
 
+[phase_a_validation_contract]
+phase = "A"
+status = "reserved for explicit Phase B shared-verifier handoff; no validator implementation or execution is claimed by this evidence child"
+positive_test_id = "ordinary::fnd_01_media_dependencies_positive"
+planted_negative_test_id = "ordinary::fnd_01_media_dependencies_planted_negative"
+test_id_count = 2
+positive_test_shared_verifier_owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+planted_negative_test_shared_verifier_owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+final_source_rebind_owner = "bd-mcp-2026-07-28-support-ahet.1.14B"
+central_target_execution_owner = "bd-mcp-2026-07-28-support-ahet.1.14B"
+shared_verifier_ownership_rule = "bd-mcp-2026-07-28-support-ahet.1.12 owns the two named shared-verifier tests and their evidence semantics. bd-mcp-2026-07-28-support-ahet.1.14B owns only final source rebind and central target execution; it does not own or alter either test contract."
+production_entrypoint = "ordinary::validate_media_dependency_bundle"
+baseline_entrypoint = "ordinary::validate_media_dependency_bundle"
+planted_negative_entrypoint = "ordinary::validate_media_dependency_bundle"
+entrypoint_rule = "The positive baseline and every planted negative invoke the identical production evidence-validator entrypoint; test-only acceptance paths, copied constants, fixtures as live proof, and process receipts are forbidden."
+input_paths_ascending_raw_bytes = [
+  "evidence/fnd-01/media-dependencies.toml",
+  "evidence/fnd-01/vectors/media/graph-snapshot.toml",
+  "evidence/fnd-01/vectors/media/jpeg-metadata-valid-upstream.jpg",
+  "evidence/fnd-01/vectors/media/png-valid-upstream.png",
+  "evidence/fnd-01/vectors/media/security-vectors.toml",
+  "evidence/fnd-01/vectors/media/tiny-skia-0.12.0.crate",
+  "evidence/fnd-01/vectors/media/tiny-skia-path-0.12.0.crate",
+  "evidence/fnd-01/vectors/media/usvg-0.47.0.crate",
+  "evidence/fnd-01/vectors/media/webp-animated-upstream.webp",
+  "evidence/fnd-01/vectors/media/webp-static-valid-upstream.webp",
+]
+full_input_digest_algorithm = "sha256"
+full_input_digest_domain_ascii = "FND01MEDIAINPUTSv1"
+full_input_digest_domain_separator_hex = "00"
+full_input_digest_domain_bytes = "ASCII bytes of FND01MEDIAINPUTSv1 followed by the single byte 0x00"
+full_input_digest_encoding = "ASCII(FND01MEDIAINPUTSv1) || 0x00 || for each input path in ascending raw-byte order: u32be(path_bytes_len) || path_bytes || u64be(file_bytes_len) || file_bytes"
+full_input_digest_storage = "not stored in this manifest: Phase B computes it over the live bytes of this manifest plus every listed immutable input at invocation time; no manifest snapshot hash, self-hash, or copied digest constant is accepted"
+manifest_snapshot_binding = "live invocation input only: this manifest is bound by its exact current bytes under input_paths_ascending_raw_bytes; final source rebind is external and no derived manifest hash is stored here"
+negative_id = "media-svg-external-resource-policy-drift"
+negative_target_path = "evidence/fnd-01/vectors/media/security-vectors.toml"
+negative_target_selector = "case[id=svg-external-use].expected"
+negative_operator = "replace"
+negative_baseline_value = "reject_before_renderer_entry"
+negative_mutated_value = "admit_to_renderer_gate"
+negative_mutation_count = 1
+negative_compile_validity = "The replacement is syntactically valid TOML and a declared outcome token; only the SVG external-resource policy disposition changes."
+negative_expected_diagnostic = "E_MEDIA_SVG_EXTERNAL_RESOURCE"
+negative_expected_diagnostic_path = "case[id=svg-external-use].expected"
+unchanged_other_input_proof = "Before and after the in-memory exact-one substitution, the validator compares every non-target input byte digest to the baseline full-input digest decomposition; no repository file is written."
+baseline_reacceptance = "After the planted negative fails, rerun ordinary::validate_media_dependency_bundle over the original immutable bundle and require the original domain-separated full-input digest plus positive acceptance."
+phase_b_precondition = "The shared verifier test owner, bd-mcp-2026-07-28-support-ahet.1.12, must bind this exact live-byte bundle and implement the two declared test IDs during an explicit serialized Phase B handoff. The final source rebind and central target execution owner is bd-mcp-2026-07-28-support-ahet.1.14B only."
+runtime_nonclaim = "This contract validates dependency evidence only. It cannot claim HTML decoding, image decoding, SVG rendering, Apps support, safe icon rendering, or any runtime capability."
+
 [toolchain]
 rust_version = "1.99"
 channel = "nightly-2026-07-11"
@@ -937,12 +986,14 @@ root_dependencies_present = false
 client_features_present = false
 server_apps_dependency_present = false
 workspace_lock_entries_present = false
-current_workspace_rust_version = "1.85"
+current_workspace_rust_version = "1.99"
 planned_workspace_rust_version = "1.99 plus nightly-2026-07-11"
 shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
 
 [gate]
-root_archive_identity_verified = true
+root_archive_identity_verified = false
+root_archive_identity_status = "typed-unverified: no immutable root .crate archive bytes are present in this evidence bundle"
+root_archive_identity_rule = "Copied checksums, sparse-index metadata, source-ref receipts, and local registry observations cannot establish root archive identity without the exact immutable root archive bytes."
 root_source_identity_verified = true
 root_license_msrv_verified = true
 root_feature_policy_frozen = true

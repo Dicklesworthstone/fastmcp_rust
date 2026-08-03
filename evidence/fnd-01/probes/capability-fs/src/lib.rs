@@ -45,3 +45,25 @@ pub fn open_file_component_nofollow(root: &Dir, component: &Path) -> io::Result<
 pub fn identity_projection(metadata: &Metadata) -> (u64, u64, u64) {
     (metadata.dev(), metadata.ino(), metadata.nlink())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::require_one_normal_component;
+
+    #[test]
+    fn component_policy_accepts_one_normal_component() {
+        assert!(require_one_normal_component(Path::new("document.txt")).is_ok());
+    }
+
+    #[test]
+    fn component_policy_rejects_escape_and_multicomponent_inputs() {
+        for candidate in ["", ".", "..", "../escape", "nested/component", "/absolute"] {
+            assert!(
+                require_one_normal_component(Path::new(candidate)).is_err(),
+                "candidate {candidate:?} must not cross the one-component boundary"
+            );
+        }
+    }
+}

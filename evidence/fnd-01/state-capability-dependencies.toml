@@ -6,7 +6,9 @@
 # archives. No Cargo command, compilation, test, network request, or shared
 # workspace edit was used to produce this child artifact. Consequently every
 # build-, target-, advisory-execution-, and support-level gate remains false
-# until its named downstream owner verifies it.
+# until its named downstream owner verifies it. The 2026-08-03 rematerialized
+# contract adds source-level positive and planted-negative tests without
+# executing Cargo or changing a manifest or lock.
 
 format_version = 1
 evidence_id = "FND-01/state-capability-dependencies"
@@ -35,7 +37,7 @@ commit_time_utc = "2026-07-29T15:17:10Z"
 worktree_clean = true
 advisory_count_from_frozen_fnd01_evidence = 1173
 audit_executed_for_these_locks = false
-audit_result = "pending bd-mcp-2026-07-28-support-ahet.1.1 RCH execution; .1.14 authors offline policy/tests only; .1.15 independently attests receipts; no clean claim"
+audit_result = "pending bd-mcp-2026-07-28-support-ahet.1.1 RCH execution; .1.13 owns only the local hard-gate test source; .1.15 independently attests receipts; no clean claim"
 ignore_list = []
 known_relevant_records = [
   "RUSTSEC-2019-0029 chacha20 counter overflow; patched >=0.2.3; selected 0.10.1",
@@ -76,6 +78,43 @@ prohibited_active_packages = [
   "reqwest",
 ]
 package_name_matching = "exact package identity; sha1_smol is allowed and must never be classified as the smol async runtime"
+
+[rematerialized_hard_gate]
+recorded_at_utc = "2026-08-03T05:19:44Z"
+owner = "bd-mcp-2026-07-28-support-ahet.1.13"
+test_source = "evidence/fnd-01/probes/redis/src/lib.rs"
+test_ids = [
+  "tests::fnd_01_state_capability_dependencies_positive",
+  "tests::fnd_01_state_capability_dependencies_planted_negative",
+]
+positive_contract = "One bounded leaf-local validator consumes a supplied immutable state/manifests/locks/source bundle. It exact-checks manifest metadata and dependency-key sets, recorded manifest/lock/source byte+SHA-256 bindings (except the test file itself, which is deliberately not self-proved), package counts/full registry tuples/dependency-edge reachability, package-keyed registry license/MSRV tuples bound to lock source/checksum, requested/allowed/prohibited features and package absences, the complete recorded advisory snapshot, exact target rows, bounds, and all gate values. Frozen provenance evidence is not an execution, archive-live, semantic-support, or aggregate conformance claim."
+planted_negative_contract = "The negative deep-clones the immutable bundle, changes exactly one Redis direct feature by adding tokio-comp, then derives only that virtual probe's manifest byte/hash mirror from the changed manifest before calling the same full validator. It requires the typed StructuredEvidenceError::ForbiddenFeature subject=redis requested_features feature=tokio-comp stable diagnostic, proves exactly one semantic input change and no state change beyond the derived mirror, observes the domain-separated bundle digest change, and freshly reaccepts the unmodified baseline."
+execution_status = "not executed locally: this child must not invoke Cargo, a compiler, a build, or a test; CopperShore and CreamLotus own serialized verification."
+historical_negative_rows = "Earlier NEG-*-mutation_test_status values name a broader .1.14 policy effort. They are not execution receipts for this rematerialized .1.13 contract and do not make any additional negative pass."
+coverage = [
+  "envelope: exact manifest selection; frozen candidate checksum/license/MSRV/features; lock count/direct checksum/registry checksum shape; RNG absence; frozen target union",
+  "capability-filesystem: exact cap-fs-ext and cap-std selections; frozen checksums/licenses/MSRVs/features; lock count/direct checksum/registry checksum shape; Tokio/smol/aio absence; frozen target union",
+  "redis: exact acl+script selection; all frozen prohibited Redis features including cluster/aio/Tokio/smol/TLS/connection-manager; frozen checksum/license/MSRV; lock count/direct checksum/registry checksum shape; prohibited package absence; advisory/target/persistence boundaries",
+]
+unverified_required_facts = [
+  "archive bytes are unavailable at the recorded local cache paths, so current archive rehash and full transitive license/MSRV provenance remain unverified",
+  "canonical normal/build/feature/dev graph receipts, target compilation, and advisory execution remain false pending the serialized owners",
+  "constant-time target qualification, filesystem semantics, bounded Redis connector/parser, peer identity, and Redis profile support remain false",
+]
+
+[current_revalidation]
+checked_at_utc = "2026-08-03T06:20:00Z"
+as_of_utc = "2026-08-03T06:20:00Z"
+method = "read-only exact-path inspection plus source-level hard-gate test refresh; no Cargo, compiler, build, test, manifest, lock, or shared-workspace mutation"
+archive_cache_paths_available_now = false
+archive_availability = [
+  "chacha20poly1305-0.11.0: absent",
+  "cap-std-4.0.2: present",
+  "cap-fs-ext-4.0.2: present",
+  "redis-1.4.1: absent",
+]
+archive_cache_risk = "Only the two capability archive paths appeared during this recheck; chacha20poly1305 and redis remained absent. No aggregate archive claim is promoted: current archive-byte rehash, full transitive provenance, and all execution/support gates remain unverified."
+primary_registry_records = "https://index.crates.io/ remains the registry authority named by the frozen evidence; no network or resolver result is treated as a verification receipt."
 
 [[crate]]
 role = "envelope primitive"
@@ -329,8 +368,8 @@ manifest_path = "evidence/fnd-01/probes/envelope/Cargo.toml"
 manifest_bytes = 272
 manifest_sha256 = "bf66b37a0e2822b965f2a4d42b84cd3dffff14a7342bbdddcd853319a4732268"
 source_path = "evidence/fnd-01/probes/envelope/src/lib.rs"
-source_bytes = 1655
-source_sha256 = "0b8f64e24c409242607f37fd00091eae22b4a287b6b3ea87aa2b21566778b6d7"
+source_bytes = 2757
+source_sha256 = "8b245c7428f0041d65ec38592aaf6d5d2dcf1cde57e0426c1d95c250e9ab78b1"
 lock_path = "evidence/fnd-01/probes/envelope/Cargo.lock"
 lock_bytes = 4046
 lock_sha256 = "f60c46fe85004ade47468d2b93441ab87551cd6a1cc6a9481eb75b199614c1e5"
@@ -394,8 +433,8 @@ manifest_path = "evidence/fnd-01/probes/capability-fs/Cargo.toml"
 manifest_bytes = 316
 manifest_sha256 = "55079b44bc44108739223f54b53f42741bbe6c18d256d448effb11b90a5f6fae"
 source_path = "evidence/fnd-01/probes/capability-fs/src/lib.rs"
-source_bytes = 1829
-source_sha256 = "c153f99324014351695d27a448175e28e4c2863bfc08638ebbe5389da41682ec"
+source_bytes = 2470
+source_sha256 = "b5405f2df4e07db90cb9326b8ebc9c95d5045a9d7d99c8294fb16879b6e09188"
 lock_path = "evidence/fnd-01/probes/capability-fs/Cargo.lock"
 lock_bytes = 9614
 lock_sha256 = "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c"
@@ -491,8 +530,22 @@ license_msrv_projection = [
   "windows-sys 0.61.2 | MIT OR Apache-2.0 | 1.71",
   "windows-targets 0.52.6 | MIT OR Apache-2.0 | 1.56",
   "windows-targets 0.53.5 | MIT OR Apache-2.0 | 1.60",
-  "windows target leaf crates 0.52.6 | MIT OR Apache-2.0 | 1.56",
-  "windows target leaf crates 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_aarch64_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_aarch64_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_aarch64_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_aarch64_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_gnu 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_gnu 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_gnu 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_gnu 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
   "winx 0.36.4 | Apache-2.0 WITH LLVM-exception | 1.63",
 ]
 
@@ -501,8 +554,8 @@ manifest_path = "evidence/fnd-01/probes/redis/Cargo.toml"
 manifest_bytes = 254
 manifest_sha256 = "62ed2704f3c878d08dba3e48c42df07bdea9325ce3e570a975795bc47fbe880b"
 source_path = "evidence/fnd-01/probes/redis/src/lib.rs"
-source_bytes = 1238
-source_sha256 = "bbaf811ab02689a612de695a7027b26396705391fc69ba74a66ae05d5299a6b1"
+source_bytes = 110480
+source_sha256 = "b37b792d04e3b6dc31d4464b34d9d3a89b84acf15f06d2bb7d4e02dca62a642b"
 lock_path = "evidence/fnd-01/probes/redis/Cargo.lock"
 lock_bytes = 10699
 lock_sha256 = "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45"
@@ -600,7 +653,13 @@ license_msrv_projection = [
   "combine 4.6.7 | MIT | UNDECLARED",
   "displaydoc 0.2.6 | MIT OR Apache-2.0 | 1.56.0",
   "form_urlencoded 1.2.2 | MIT OR Apache-2.0 | 1.51",
-  "ICU4X 2.2.0 crates | Unicode-3.0 | 1.86",
+  "icu_collections 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_locale_core 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_normalizer 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_normalizer_data 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_properties 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_properties_data 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_provider 2.2.0 | Unicode-3.0 | 1.86",
   "idna 1.1.0 | MIT OR Apache-2.0 | 1.57",
   "idna_adapter 1.2.2 | Apache-2.0 OR MIT | 1.86",
   "itoa 1.0.18 | MIT OR Apache-2.0 | 1.68",
@@ -1337,14 +1396,14 @@ result = "feature minimization does not remove TCP/DNS/ambient Unix APIs or intr
 mutation_test_status = "known fail-closed fact, not a future positive expectation"
 
 [current_workspace_gap]
-observed_at_utc = "2026-07-29T22:50:43Z"
-root_manifest_sha256 = "cbbf8bd6eae1096fd7240e10f93b5b5e647453f18a8b9048130b709f35d3fa1a"
-workspace_lock_sha256 = "cb01db46cb61c8d5c6ec2164057ae52efead24abd0c7ef0795d2e5960fd101a0"
-core_manifest_sha256 = "8b9e1e0478aaaa02b22ad6143bf7faa58f6fa1f72434090d54068089764798ab"
-server_manifest_sha256 = "cea4825acb699d86f9daf72d94855e3aec9aa594b9cfaa19b27d2730ae1fa4fc"
+observed_at_utc = "2026-08-03T06:12:00Z"
+root_manifest_sha256 = "972dfd2adc52a2fb93dda2c86c2f72a8f0a3cae75e226542edbf833f33210189"
+workspace_lock_sha256 = "5dec0d659736b87c4cb93af2c0c6d9960624c10e1d062ebab469ae546a1f3ab3"
+core_manifest_sha256 = "24f0d3cd57de87a57f87637ee9fae24f5f61dace7eeae2562809243e2a5cc22c"
+server_manifest_sha256 = "d5991bc8532e0524dd714d4882870936016cb23e55a938390667a876dc00559d"
 chacha20poly1305 = "workspace lock contains 0.10.1 through asupersync; direct 0.11.0 envelope edge is absent. Coexistence must be preserved/scoped unless the asupersync owner changes it."
-capability_fs = "cap-std and cap-fs-ext are absent"
-redis = "root declaration is floating redis = \"1\" with defaults; server feature is named redis; lock resolves 1.4.1 with default num-bigint in its active workspace edge"
+capability_fs = "root and server manifests now carry the exact cap-std/cap-fs-ext 4.0.2 selections. This observation is not a candidate graph regeneration, target receipt, or filesystem-support claim."
+redis = "no root or server redis declaration was observed, while the shared workspace lock still contains unrelated num-bigint 0.4.8. Neither fact proves or enables a Redis profile."
 shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
 
 [gate]
@@ -1380,15 +1439,16 @@ claim = "Direct immutable provenance and offline isolated lock/archive projectio
 network_policy = "offline only for verification of these checked-in probes"
 lock_parse = "yq -p toml -o json '.' evidence/fnd-01/probes/<candidate>/Cargo.lock"
 archive_projection = "For every package with source=registry in each lock, require the local <name>-<version>.crate SHA-256 to equal the lock checksum."
-cargo_regeneration = "bd-mcp-2026-07-28-support-ahet.1.1 alone performs manifest/lock regeneration through the authorized RCH/offline coordinator and records regenerated bytes and hashes; .1.14 authors only the offline policy/test and local mutation enforcement."
+cargo_regeneration = "bd-mcp-2026-07-28-support-ahet.1.1 alone performs manifest/lock regeneration through the authorized RCH/offline coordinator and records regenerated bytes and hashes; .1.13 supplies only source-level hard-gate tests and no regeneration."
 target_graph = "bd-mcp-2026-07-28-support-ahet.1.1 alone captures canonical normal/build/features/dev output, target/package/symbol inventories, and hashes through RCH; .1.15 independently rehashes, validates, and attests those receipts."
-advisory_check = "bd-mcp-2026-07-28-support-ahet.1.1 alone executes pinned no-fetch advisory/license checks through RCH and preserves full JSON bytes/hash; .1.14 authors policy/tests and .1.15 independently attests the receipts."
-negative_mutations = "bd-mcp-2026-07-28-support-ahet.1.14 authors offline policy/tests and local one-field mutation enforcement only. Every NEG-REDIS-FEATURE-* entry is a distinct single-feature mutation; grouped or package-only checks cannot substitute for any one of them."
+advisory_check = "bd-mcp-2026-07-28-support-ahet.1.1 alone executes pinned no-fetch advisory/license checks through RCH and preserves full JSON bytes/hash; .1.13 supplies the local hard-gate test source and .1.15 independently attests the receipts."
+negative_mutations = "The rematerialized .1.13 test changes exactly one direct Redis feature (tokio-comp) and rejects it at a typed boundary. Earlier NEG-REDIS-FEATURE-* rows remain enumerated risk, not test receipts; grouped or package-only checks cannot substitute for any future per-feature gate."
 
 [handoff]
-verification_owner = "bd-mcp-2026-07-28-support-ahet.1.14 (offline policy/test and local mutation enforcement only)"
+verification_owner = "bd-mcp-2026-07-28-support-ahet.1.13 (source-level hard-gate tests only; execution remains serialized)"
 verification_pending = [
-  "author the offline policy, verifier tests, and deterministic local one-field mutation enforcement",
+  "run the exact rematerialized positive and planted-negative test IDs only through the serialized verification owner and preserve the receipt",
+  "rehash the four archive bytes when the recorded cache inputs are available again",
   "leave manifest/lock regeneration, canonical graphs, advisory/license/symbol/target/package inventories, and all RCH execution to .1.1",
   "leave independent receipt rehash/validation/attestation to .1.15",
 ]

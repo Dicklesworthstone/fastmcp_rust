@@ -1,9 +1,9 @@
 manifest_format = "fastmcp-fnd-01-core-conformance-v1"
 work_package = "FND-01"
 bead = "bd-mcp-2026-07-28-support-ahet.1.2"
-scope = "Final MCP 2026-07-28 core and pinned launch-day conformance inputs"
+scope = "Exact MCP 2026-07-28 and exact MCP 2024-11-05 core inputs, plus separately pinned conformance evidence"
 retrieval_date = "2026-07-29"
-artifact_count = 6
+artifact_count = 8
 artifact_bytes_are_unmodified = true
 source_rewriting_generator_used = false
 
@@ -75,6 +75,35 @@ dated_schema_tree = "8b5e263be073848f9531151cb363ccb764eb2da6"
 classification = "Within the dated 2026-07-28 specification subtree, only link-target repairs were observed; no wire shape, normative requirement, or behavioral prose change in that subtree supersedes the final tag. This statement makes no claim about changes elsewhere in the compared repository commit."
 authority_changed = false
 
+[core_2024_11_05]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+protocol_version = "2024-11-05"
+release_tag = "2024-11-05-final"
+release_tag_target_type = "commit"
+release_tag_commit = "48234828288ec5e5011398f17b8736f61645f130"
+release_commit_tree = "268325249340b611e0a2644cd2da15c19d1b899c"
+release_commit_author_date = "2025-03-26T13:14:14Z"
+release_tag_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2024-11-05-final"
+schema_tree = "043f58f4067386664a03a648c73d90008e423110"
+schema_2024_11_05_subtree = "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d"
+dated_tag = "2024-11-05"
+dated_tag_target_type = "annotated_tag"
+dated_tag_object = "db349f740fad5a1cf44e248f07c9245064ff10ac"
+dated_tag_date = "2025-01-17T20:35:31Z"
+dated_tag_peeled_commit = "0d63bea927001bedf3be3e59be735c979ba0aacb"
+dated_tag_annotated_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2024-11-05"
+dated_tag_peeled_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2024-11-05^{}"
+release_commit_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/commit/48234828288ec5e5011398f17b8736f61645f130"
+dated_tag_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/releases/tag/2024-11-05"
+specification_url = "https://modelcontextprotocol.io/specification/2024-11-05"
+authority = "The exact 2024-11-05-final release tag freezes the supported legacy-era corpus. The similarly dated non-final tag is recorded only to make the release identity reproducible."
+
+[unsupported_third_era_negative]
+protocol_version = "2025-11-25"
+role = "planted_unsupported_substitution_negative"
+rule = "MCP 2025-11-25 is neither supported core era and must fail typed source-integrity validation if substituted for either 2024-11-05 or 2026-07-28."
+historical_compare_provenance = "The core.compare_to_prior_version_url remains legitimate 2026-07-28 historical provenance and is not a supported-era declaration."
+
 [conformance]
 repository = "https://github.com/modelcontextprotocol/conformance"
 revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
@@ -140,6 +169,7 @@ git_blob_sha1 = "9b55feeb412bc3ae877f2eac10b5c01ba29a2eed"
 upstream_path = "schema/2026-07-28/schema.ts"
 source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/git/blobs/9b55feeb412bc3ae877f2eac10b5c01ba29a2eed"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts"
 media_type = "text/typescript; charset=utf-8"
@@ -157,11 +187,48 @@ git_blob_sha1 = "213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8"
 upstream_path = "schema/2026-07-28/schema.json"
 source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.json"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/git/blobs/213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json"
 media_type = "application/schema+json"
 byte_length = 181474
 sha256 = "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203"
+
+[[artifacts]]
+id = "legacy-core-schema-ts"
+kind = "final_legacy_core_typescript_schema"
+authority = "exact_2024_11_05_final_tagged_schema"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+git_tree = "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d"
+git_blob_sha1 = "a40e908b8d16412b17aa62c13139bb6ad94d4f01"
+upstream_path = "schema/2024-11-05/schema.ts"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/48234828288ec5e5011398f17b8736f61645f130/schema/2024-11-05/schema.ts"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/48234828288ec5e5011398f17b8736f61645f130/schema/2024-11-05/schema.ts"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/git/blobs/a40e908b8d16412b17aa62c13139bb6ad94d4f01"
+retrieval_date = "2026-08-03"
+vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts"
+media_type = "text/typescript; charset=utf-8"
+byte_length = 31201
+sha256 = "ad3264cdc22c5091b8ae96c5f5c769a2c7388473d84ca3de6fd55a4feeadfb1e"
+
+[[artifacts]]
+id = "legacy-core-schema-json"
+kind = "final_legacy_core_generated_json_schema"
+authority = "exact_2024_11_05_final_tagged_schema"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+git_tree = "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d"
+git_blob_sha1 = "97a92f0cc292ed4c602f4ee121732cc8ad3be973"
+upstream_path = "schema/2024-11-05/schema.json"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/48234828288ec5e5011398f17b8736f61645f130/schema/2024-11-05/schema.json"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/48234828288ec5e5011398f17b8736f61645f130/schema/2024-11-05/schema.json"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/git/blobs/97a92f0cc292ed4c602f4ee121732cc8ad3be973"
+retrieval_date = "2026-08-03"
+vendored_path = "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json"
+media_type = "application/schema+json"
+byte_length = 87877
+sha256 = "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce"
 
 [[artifacts]]
 id = "core-changelog"
@@ -174,6 +241,7 @@ git_blob_sha1 = "dc5c9a9cf3e6895504534cf3f300514394d8c6ae"
 upstream_path = "docs/specification/2026-07-28/changelog.mdx"
 source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/git/blobs/dc5c9a9cf3e6895504534cf3f300514394d8c6ae"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx"
 media_type = "text/mdx; charset=utf-8"
@@ -191,6 +259,7 @@ git_blob_sha1 = "e59d9f0411a9f7e9e11f2b57f45bdbcab65e1137"
 upstream_path = "package.json"
 source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/package.json"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/package.json"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/conformance/git/blobs/e59d9f0411a9f7e9e11f2b57f45bdbcab65e1137"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/conformance-package-49103de6.json"
 media_type = "application/json"
@@ -208,6 +277,7 @@ git_blob_sha1 = "eff5e255fac86344d2d212c5942454fa4664c731"
 upstream_path = "src/scenarios/client/auth/enterprise-managed-authorization.ts"
 source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/enterprise-managed-authorization.ts"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/enterprise-managed-authorization.ts"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/conformance/git/blobs/eff5e255fac86344d2d212c5942454fa4664c731"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/conformance-enterprise-managed-authorization-49103de6.ts"
 media_type = "text/typescript; charset=utf-8"
@@ -225,6 +295,7 @@ git_blob_sha1 = "d633f7a57fe3da3a3e9eaff28af213c3669beac9"
 upstream_path = "src/scenarios/client/auth/client-credentials.ts"
 source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/client-credentials.ts"
 retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/client/auth/client-credentials.ts"
+blob_url = "https://api.github.com/repos/modelcontextprotocol/conformance/git/blobs/d633f7a57fe3da3a3e9eaff28af213c3669beac9"
 retrieval_date = "2026-07-29"
 vendored_path = "evidence/fnd-01/vendor/core/conformance-client-credentials-49103de6.ts"
 media_type = "text/typescript; charset=utf-8"
@@ -744,12 +815,14 @@ steps = [
 ]
 
 [verification]
+# The central FND-01 harness executes the required dual-era source-integrity checks.
 local_sha256_command = "shasum -a 256 <vendored_path>"
 local_byte_length_command = "wc -c < <vendored_path>"
 remote_sha256_command = "curl --fail --silent --show-error --location <retrieval_url> | shasum -a 256"
 remote_byte_length_command = "curl --fail --silent --show-error --location <retrieval_url> | wc -c"
 git_blob_command = "curl --fail --silent --show-error --location <retrieval_url> | git hash-object --stdin"
 core_tag_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2026-07-28"
+legacy_core_tag_command = "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2024-11-05-final"
 toml_parse_command = "python3 -c 'import pathlib,tomllib; tomllib.loads(pathlib.Path(\"evidence/fnd-01/core-conformance.toml\").read_text())'"
 required_negative_cases = [
   "missing artifact",
@@ -772,6 +845,7 @@ required_negative_cases = [
   "expected policy rejection mislabeled as upstream pass",
   "wrong final error code",
   "missing or duplicate Section 5 ambiguity entry",
+  "MCP 2025-11-25 substituted for either exact supported core era",
 ]
 
 # This register freezes the complete known ambiguity inventory. The full

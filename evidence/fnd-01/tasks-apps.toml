@@ -1,10 +1,10 @@
 schema_version = 1
-evidence_id = "fnd-01-tasks-apps-2026-07-29-v3"
+evidence_id = "fnd-01-tasks-apps-2026-07-29-v4"
 plan_package_id = "FND-01"
 bead_id = "bd-mcp-2026-07-28-support-ahet.1.3"
 retrieved_on = "2026-07-29"
 byte_handling = "verbatim-upstream-bytes-no-generation-no-normalization"
-manual_update_policy = "Any source, artifact, import, direction, union, authority, quarantine, composition, or profile change requires an explicit semantic diff, a new reviewed evidence identifier, and refreshed drift negatives."
+manual_update_policy = "Any source, artifact, import, direction, union, authority, quarantine, composition, executable same-validator contract, or profile change requires an explicit semantic diff, a new reviewed evidence identifier, and refreshed drift negatives."
 
 [verification_contract]
 tasks_artifact_count = 4
@@ -39,6 +39,77 @@ require_sdk_sha512_integrity = true
 reject_floating_branch_or_latest_in_evidence_provenance_fields = true
 reject_aggregate_schema_digest_as_substitute = true
 reject_generated_schema_as_whole_message_or_direction_oracle = true
+
+[executable_same_validator_contract]
+contract_id = "fnd-01-tasks-apps-source-integrity-v1"
+shared_verifier_path = "crates/fastmcp/tests/fnd_01_dependency_evidence.rs"
+required_test_ids = [
+  "tests::fnd_01_tasks_apps_sources_positive",
+  "tests::fnd_01_tasks_apps_sources_planted_negative",
+]
+required_enclosing_module = "tests"
+phase_a_source_observation = "At Phase A the two required functions and an enclosing tests module are absent from the shared integration-test source; Phase B must add exactly those functions in exactly that module under the serialized shared-source handoff."
+production_validator_symbol = "validate_tasks_apps_sources"
+validator_identity_rule = "The positive test, every planted-negative case, and post-mutation baseline reacceptance call the identical production validator over a fresh virtual manifest plus the same virtual 13-vendor input map; helper-only checks, a second permissive validator, and direct assertion of fixture literals are forbidden."
+baseline_result = "accept"
+baseline_reacceptance_rule = "The unmodified baseline must be accepted before the planted-negative loop and again after every fresh mutation has been discarded; no mutation state, digest, parser state, or diagnostic may cross case boundaries."
+virtual_input_count = 13
+virtual_input_total_bytes = 1173466
+vendor_family_digest_algorithm = "SHA-256 over ASCII FND01TASKSAPPSVENDORv1 then NUL, u32be entry count, then raw-UTF-8-path-sorted entries of u32be path length, path bytes, u64be byte length, and raw 32-byte SHA-256; tasks-apps.toml is intentionally excluded so this is not a manifest self-hash."
+vendor_family_digest_sha256 = "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a"
+unchanged_other_input_proof = "For each fresh virtual case, prove exact path, byte length, and SHA-256 equality for all twelve non-target vendor inputs and for every non-target manifest field before validator invocation; only the named target field or named target input may differ from baseline."
+diagnostic_format = "FND01|Error|<stable-code>|<subject>|<field>"
+runtime_capability_credit = false
+remote_provenance_capability_credit = false
+receipt_or_manifest_self_hash = "forbidden"
+central_source_rebind = "later-owned; Phase A must not edit the shared verifier, policy, or source-family bindings"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "missing-required-artifact-id"
+operation = "remove-one-manifest-field"
+target = "tasks.artifact[0].id"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.artifact[0]|id"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "swapped-vendor-path"
+operation = "replace-one-manifest-field"
+target = "tasks.artifact[0].vendor_path"
+replacement = "evidence/fnd-01/vendor/apps/apps.mdx"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_BINDING|tasks-prose|vendor_path"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "truncated-vendor-bytes"
+operation = "remove-one-terminal-byte-from-one-virtual-input"
+target = "evidence/fnd-01/vendor/tasks/tasks.md"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "substituted-vendor-bytes"
+operation = "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input"
+target = "evidence/fnd-01/vendor/tasks/tasks.md"
+replacement_input = "evidence/fnd-01/vendor/apps/apps.mdx"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-authority-classification-promotion"
+operation = "replace-one-manifest-field"
+target = "tasks.final_core_authority"
+replacement = true
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|final_core_authority"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-2025-authority-leakage"
+operation = "replace-one-manifest-field"
+target = "apps.stable_spec_date"
+replacement = "2025-11-25"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_LEGACY_2025_AUTHORITY|apps|stable_spec_date"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-maturity-classification-drift"
+operation = "replace-one-manifest-field"
+target = "apps.maturity_at_pin"
+replacement = "experimental"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin"
 
 [provenance_policy]
 floating_reference_rejection_scope = "evidence-controlled provenance fields only"
@@ -1061,6 +1132,7 @@ tree_url = "https://github.com/modelcontextprotocol/ext-apps/tree/92f46a574568a3
 package_name = "@modelcontextprotocol/ext-apps"
 package_version = "1.7.5"
 stable_spec_date = "2026-01-26"
+maturity_at_pin = "stable"
 final_core_authority = false
 whole_message_wire_oracle = false
 apps_forward_open_result_reserved_members = ["_meta", "resultType"]

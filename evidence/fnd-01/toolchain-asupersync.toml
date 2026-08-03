@@ -476,7 +476,7 @@ if (($ActualTargets -join "`n") -cne ($ExpectedTargets -join "`n")) {
 status = "partial observation only; not the exact required component inventory and not accepted as the clean-home execution"
 host = "aarch64-apple-darwin"
 active_alias = "nightly-aarch64-apple-darwin"
-active_alias_source = "floating nightly override from the repository's current rust-toolchain.toml"
+active_alias_source = "dated nightly-2026-07-11 override from the repository's current rust-toolchain.toml"
 rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
 rustc_commit = "375b1431b7d89d1c2e2bc168c011848ae12b7d14"
 cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
@@ -614,7 +614,7 @@ resolved_transitive_feature_graph_status = "pending integration-owned RCH cargo-
 tag_note = "The annotated v0.3.9 tag dereferences to e7e0af2f..., which does not equal the packaged VCS commit. The immutable crate archive plus registry checksum, not the Git tag, is authoritative."
 
 [asupersync.baseline.current_workspace_selection]
-manifest_requirement = "0.3.9"
+manifest_requirement = "=0.3.9"
 default_features = true
 explicit_features = ["test-internals"]
 enabled_local_feature_closure = [
@@ -629,7 +629,7 @@ enabled_direct_optional_dependencies = [
   "tracing-subscriber",
   "visibility",
 ]
-note = "This records the current shared root manifest without editing it. The unqualified semver requirement is integration-owned."
+note = "This records the current shared root manifest without editing it. Its exact semver requirement is a read-only observation."
 
 [asupersync.baseline.planned_release_selection]
 default_features = false

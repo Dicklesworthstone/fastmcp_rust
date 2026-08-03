@@ -7,8 +7,8 @@
 #![forbid(unsafe_code)]
 
 use chacha20poly1305::{
-    Key, XChaCha20Poly1305, XNonce,
     aead::{AeadInPlace, KeyInit},
+    Key, XChaCha20Poly1305, XNonce,
 };
 
 pub const KEY_BYTES: usize = 32;
@@ -44,4 +44,38 @@ pub fn open_in_place(
         associated_data,
         ciphertext_and_tag,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{open_in_place, seal_in_place, KEY_BYTES, NONCE_BYTES, TAG_BYTES};
+
+    #[test]
+    fn caller_supplied_key_and_nonce_round_trip() {
+        let key = [0x11; KEY_BYTES];
+        let nonce = [0x22; NONCE_BYTES];
+        let associated_data = b"fnd-01 envelope probe";
+        let mut payload = b"caller-supplied entropy only".to_vec();
+
+        seal_in_place(&key, &nonce, associated_data, &mut payload).unwrap();
+        assert_eq!(
+            payload.len(),
+            b"caller-supplied entropy only".len() + TAG_BYTES
+        );
+        open_in_place(&key, &nonce, associated_data, &mut payload).unwrap();
+
+        assert_eq!(payload, b"caller-supplied entropy only");
+    }
+
+    #[test]
+    fn altered_ciphertext_is_rejected() {
+        let key = [0x33; KEY_BYTES];
+        let nonce = [0x44; NONCE_BYTES];
+        let mut payload = b"authenticated probe payload".to_vec();
+
+        seal_in_place(&key, &nonce, b"aad", &mut payload).unwrap();
+        payload[0] ^= 0x01;
+
+        assert!(open_in_place(&key, &nonce, b"aad", &mut payload).is_err());
+    }
 }

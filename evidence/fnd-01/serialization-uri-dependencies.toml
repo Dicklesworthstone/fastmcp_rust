@@ -37,7 +37,8 @@ audit_output_json = '''{"database":{"advisory-count":1173,"last-commit":null,"la
 vulnerabilities = []
 warnings = []
 direct_package_advisories = []
-result = "clean at the pinned advisory database commit; no ignore list used"
+result = "recorded historical clean result; execution remains unverified"
+execution_status = "recorded-unverified"
 
 [policy]
 supported_targets = [
@@ -522,46 +523,156 @@ advisory_database_verify = "test \"$(git -C \"$FASTMCP_RUSTSEC_DB\" rev-parse HE
 advisory_check = "cargo audit --db \"$FASTMCP_RUSTSEC_DB\" --file \"$FASTMCP_FND01_PROBE_DIR/Cargo.lock\" --no-fetch --json"
 
 [current_workspace_gap]
-serde_json_lock = "1.0.151 is present, but the workspace declaration is floating and does not request arbitrary_precision"
-url_lock = "2.5.8 is present transitively, but fastmcp-core is not its sole direct owner"
-zeroize_lock = "1.9.0 is present transitively, but there is no common core-owned secret-container edge"
+serde_json_lock = "1.0.151 is present and the read-only root declaration is exact with arbitrary_precision"
+url_lock = "2.5.8 is present and the read-only root declaration is exact with default-features=false and std; both fastmcp-core and fastmcp-server directly consume the workspace edge, contrary to the planned core-sole-owner integration"
+zeroize_lock = "1.9.0 is present and the read-only root declaration is exact with default-features=false and alloc,derive; both fastmcp-core and fastmcp-server directly consume the workspace edge, contrary to the planned core-sole-owner integration"
 jsonschema_lock = "absent"
 argon2_lock = "absent"
 shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
 required_integration = [
-  "pin the exact declarations and ownership in shared Cargo manifests",
-  "converge Cargo.lock against this evidence",
+  "add the missing exact jsonschema and argon2 declarations and ownership in shared Cargo manifests",
+  "converge Cargo.lock after those two declarations are integrated",
   "run the isolated and workspace package-consumer checks through RCH",
   "verify every target graph and prohibited-package assertion",
 ]
 
 [gate]
-registry_bytes_verified = true
-upstream_source_identity_verified = true
+registry_bytes_verified = false
+upstream_source_identity_verified = false
 declared_normal_build_dev_graphs_recorded = true
 consumer_resolution_locked = true
 consumer_lock_checked_in = true
 consumer_target_graph_hashes_recorded = true
 consumer_target_graph_bytes_checked_in = false
-consumer_target_graphs_reproducible_under_recorded_prerequisites = true
-advisory_snapshot_clean = true
+consumer_target_graphs_reproducible_under_recorded_prerequisites = false
+advisory_snapshot_clean = false
 workspace_manifests_integrated = false
 workspace_lock_integrated = false
 rch_compile_verified = false
-claim = "registry bytes, the exact isolated consumer lock, declared graphs, and reproducible target-graph hashes are frozen; canonical target-graph output bytes and workspace integration/RCH proof remain downstream gates, so the aggregate stays fail-closed"
+claim = "the checked-in isolated consumer lock and recorded historical registry, advisory, and target-graph metadata are frozen; registry/archive, advisory execution, target-graph execution, workspace integration, and RCH proof remain unverified downstream gates, so the aggregate stays fail-closed"
 
 [handoff]
 evidence_child_complete_when = "Every direct registry/source/declaration record, the checked-in resolver-2 consumer lock, materialization recipe, dev-edge proof, target-graph hash, advisory binding, and negative assertion in this artifact independently validates."
 integration_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
 verification_owner = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_owned_pending = [
-  "apply the exact dependencies to shared workspace manifests",
+  "apply the missing jsonschema and argon2 dependencies and planned ownership to shared workspace manifests",
   "converge the shared Cargo.lock",
   "run all compilation through RCH",
 ]
 verification_owned_pending = [
+  "independently verify registry/archive and advisory observations rather than treating recorded metadata as proof",
   "capture and compare canonical target-graph output bytes from a clean materialized consumer",
   "run packaged-consumer compilation and prohibited-package checks",
   "turn the three workspace/RCH gate fields above true only after observed success",
 ]
 closure_boundary = "This evidence child may close before integration only after independent review of its owned records. Its closure is not a workspace dependency-support claim and cannot make any aggregate FND-01 gate pass."
+
+[refresh_2026_08_03]
+observed_at_utc = "2026-08-03T05:19:12Z"
+method = "read-only manifest and lock inspection; streamed official crates.io archive hashes and normalized Cargo.toml metadata; no Cargo, compiler, RCH, build, or test invocation"
+workspace_read_only_inputs = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "crates/fastmcp-core/Cargo.toml",
+  "crates/fastmcp-protocol/Cargo.toml",
+  "crates/fastmcp-server/Cargo.toml",
+]
+workspace_resolution = "serde_json 1.0.151, url 2.5.8, and zeroize 1.9.0 resolve with the recorded checksums; fastmcp-server still directly declares url and zeroize, so core-sole-owner integration is not met; jsonschema and argon2 are absent"
+required_positive_test = "ordinary::fnd_01_serialization_uri_dependencies_positive"
+required_planted_negative_test = "ordinary::fnd_01_serialization_uri_dependencies_planted_negative"
+test_gate = "defined but execution remains unverified: no Cargo, compiler, RCH, build, or test invocation was authorized for this refresh"
+
+[phase_a_input_contract]
+format = "FND01SERIALIZATIONURIINPUTSv2"
+digest_algorithm = "sha256"
+domain_separator_text = "FND01SERIALIZATIONURIINPUTSv2"
+domain_separator_hex = "464e44303153455249414c495a4154494f4e555249494e50555453763200"
+domain_separator_rule = "The first preimage bytes are the ASCII bytes of domain_separator_text followed by one actual ASCII NUL byte (0x00); the hexadecimal value above is normative. The TOML value contains no escaped or literal backslash-u sequence."
+string_encoding = "Every field value is UTF-8 encoded without normalization, including the ASCII token absent."
+row_field_order = ["id", "kind", "byte_presence", "content_sha256", "verification_status"]
+row_encoding = "For each immutable_input in declaration order, append each row_field_order value as u32 big-endian UTF-8 byte length followed immediately by its UTF-8 bytes. No newline, separator, implicit terminator, TOML serialization, or omitted field is permitted."
+preimage = "domain_separator_bytes followed by the encoded immutable_input rows only. The source-contract row encodes its typed self-exclusion, while the format, baseline_sha256 field, explanatory prose, and this manifest's enclosing bytes are not recursively serialized into the preimage."
+manifest_source_contract = "This TOML document is the byte-present source contract that defines the ordered rows and validation policy. Its source-contract row deliberately records content_sha256=self-excluded rather than a recursive manifest self-hash. Phase B must load this exact source contract before recomputing the non-self baseline."
+baseline_sha256 = "38efd1e5aafd5018eb1d21c8276bc0969431ac22ad6baa5691b13715787fe0f3"
+reacceptance = "Phase B must recompute baseline_sha256 from this exact v2 preimage before semantic validation. A changed byte-bound row, an altered row order, or an altered row field requires independent typed reacceptance; it never inherits registry, advisory, target, workspace, or RCH credit."
+production_validator_contract = "The production validator loads this source contract, recomputes the v2 baseline, then validates every byte-bound component before semantic joins. Byte-absent rows remain typed-unverified and cannot be promoted by copied metadata, nonzero byte counts, or equal copied constants."
+planted_feature_policy_negative = "The ordinary::fnd_01_serialization_uri_dependencies_planted_negative test first proves the accepted source-contract wrapper baseline unchanged, then mutates only crate[name=jsonschema].prohibited_features[0] from default to default-drift in memory and requires the same production validator to emit FND01|Error|E_SERIALIZATION_URI_FEATURE_POLICY|serialization-uri-dependencies|crate[name=jsonschema].prohibited_features."
+archive_metadata_rule = "archive_bytes, archive checksums, registry/API values, and publisher-lock values recorded in [[crate]] are historical copied metadata only in Phase A. A nonzero archive_bytes value, an equal copied constant, or a recorded checksum is not archive, registry, API, or publisher-lock proof."
+
+[[phase_a_input_contract.immutable_input]]
+id = "serialization-uri-dependencies-source-contract"
+kind = "toml-source-contract"
+content_sha256 = "self-excluded"
+byte_presence = "byte-present-self-excluded"
+verification_status = "source-contract-not-content-hashed"
+
+[[phase_a_input_contract.immutable_input]]
+id = "consumer-probe-manifest"
+kind = "embedded-toml-bytes"
+content_sha256 = "1131b5d2403f5ce9bce00014c0fc70ecdf3a0c595180b32e5f9daeca214d32d0"
+byte_presence = "byte-present"
+verification_status = "byte-bound-local"
+
+[[phase_a_input_contract.immutable_input]]
+id = "consumer-probe-source"
+kind = "embedded-rust-bytes"
+content_sha256 = "31d7843263bb4b61502b7ae9d92ac7b121b8d70e4f1421afd719bffc5e898f55"
+byte_presence = "byte-present"
+verification_status = "byte-bound-local"
+
+[[phase_a_input_contract.immutable_input]]
+id = "consumer-lock"
+kind = "checked-in-toml-bytes"
+content_sha256 = "c13836da46ef5637de3a16a025fbd51e00ae063f24434d121d60b6f73b7b15ef"
+byte_presence = "byte-present"
+verification_status = "byte-bound-local"
+
+[[phase_a_input_contract.immutable_input]]
+id = "advisory-audit-json"
+kind = "embedded-json-bytes"
+content_sha256 = "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
+byte_presence = "byte-present"
+verification_status = "byte-bound-historical-execution-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "registry-index"
+kind = "external-registry-index"
+content_sha256 = "absent"
+byte_presence = "byte-absent"
+verification_status = "typed-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "registry-api"
+kind = "external-registry-api"
+content_sha256 = "absent"
+byte_presence = "byte-absent"
+verification_status = "typed-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "registry-archives"
+kind = "external-crate-archives"
+content_sha256 = "absent"
+byte_presence = "byte-absent"
+verification_status = "typed-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "publisher-locks"
+kind = "external-publisher-locks"
+content_sha256 = "absent"
+byte_presence = "byte-absent"
+verification_status = "typed-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "canonical-target-graphs"
+kind = "canonical-cargo-target-graph-output"
+content_sha256 = "absent"
+byte_presence = "byte-absent"
+verification_status = "typed-unverified"
+
+[[phase_a_input_contract.immutable_input]]
+id = "declared-normal-build-dev-graph-text"
+kind = "recorded-toml-graph-text"
+content_sha256 = "absent"
+byte_presence = "recorded-text-not-canonical-output"
+verification_status = "typed-unverified"
