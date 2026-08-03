@@ -2,7 +2,9 @@
 
 #![cfg(unix)]
 
-use std::io::Read;
+#[cfg(feature = "e2e-fixture")]
+use std::io::Write;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, ExitStatus, Stdio};
 use std::process::{Command, Output};
@@ -15,6 +17,10 @@ const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
+const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/static_mcp_server.sh"
+);
 
 fn fastmcp_bin() -> String {
     env!("CARGO_BIN_EXE_fastmcp").to_string()
@@ -245,6 +251,12 @@ impl ProcessGroupGuard {
 }
 
 #[cfg(target_os = "linux")]
+fn proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
 fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> {
     let processes = std::fs::read_dir("/proc")
         .map_err(|error| format!("failed to enumerate /proc: {error}"))?;
@@ -261,14 +273,14 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
         };
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_process_disappeared(&error) => continue,
             Err(error) => {
                 return Err(format!("failed to read process {pid} state: {error}"));
             }
         };
         let (state, group) = linux_process_state_and_group(&stat)
             .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-        if group == process_group_id && !matches!(state, 'Z' | 'X') {
+        if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
@@ -328,7 +340,7 @@ fn process_is_zombie(pid: u32) -> Result<bool, String> {
         .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-    Ok(matches!(state, 'Z' | 'X'))
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 #[cfg(target_os = "linux")]
@@ -542,8 +554,8 @@ fn run_cli(args: &[&str]) -> Output {
 
 #[cfg(unix)]
 #[test]
-fn e2e_test_json_report_against_echo_server_example() {
-    // Use the workspace example server as the subprocess being tested.
+fn e2e_test_json_report_against_static_protocol_fixture() {
+    // Use a deterministic stdio peer as the subprocess being tested.
     // This exercises:
     // - stdio subprocess spawning
     // - initialization
@@ -552,18 +564,13 @@ fn e2e_test_json_report_against_echo_server_example() {
     let output = run_cli(&[
         "test",
         "--json",
-        "--timeout",
+        "--idle-timeout",
         "30",
-        "cargo",
+        "--absolute-timeout",
+        "120",
+        "/bin/sh",
         "--",
-        "run",
-        "--locked",
-        "--offline",
-        "-q",
-        "-p",
-        "fastmcp-rust",
-        "--example",
-        "echo_server",
+        STATIC_MCP_SERVER_FIXTURE,
     ]);
 
     assert!(output.status.success());
@@ -575,37 +582,422 @@ fn e2e_test_json_report_against_echo_server_example() {
         .get("tests")
         .and_then(|v| v.as_array())
         .expect("test results array");
-    assert!(
-        tests
+    for (name, expected_details) in [
+        ("initialize", "protocol 2024-11-05"),
+        ("ping", "server responded"),
+        ("list_tools", "4 tools"),
+        ("list_resources", "2 resources"),
+        ("list_prompts", "2 prompts"),
+    ] {
+        let result = tests
             .iter()
-            .any(|test| test.get("name").and_then(|name| name.as_str()) == Some("ping")),
-        "test report must include a real ping request"
-    );
+            .find(|test| test.get("name").and_then(|value| value.as_str()) == Some(name))
+            .unwrap_or_else(|| panic!("test report must include {name}"));
+        assert_eq!(
+            result.get("success").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "{name} must succeed"
+        );
+        assert_ne!(
+            result.get("skipped").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "{name} must exercise the peer instead of being skipped"
+        );
+        assert_eq!(
+            result.get("details").and_then(serde_json::Value::as_str),
+            Some(expected_details),
+            "{name} must report the expected bounded result"
+        );
+    }
     assert!(json.get("total_duration_ms").is_some());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
-fn e2e_test_timeout_bounds_silent_initialization() {
-    assert_initialization_receive_timeout("exec sleep 5", "silent peer");
+fn reality_check_regression_e2e_test_cleans_descendants_before_success() {
+    const FORKING_SERVER_WRAPPER: &str = r#"
+trap '' HUP
+/bin/sh -c 'trap "" HUP; exec </dev/null >/dev/null 2>/dev/null; while :; do /bin/sleep 3600; done' &
+stubborn_pid=$!
+printf "FASTMCP_TEST_STUBBORN_PID=%s\n" "$stubborn_pid" >&2
+# A non-interactive shell may otherwise connect an asynchronous list's stdin
+# to /dev/null. Save the inherited MCP request pipe before starting the
+# asynchronous list, then close both extra descriptor copies promptly.
+exec 3<&0
+/bin/sh -c 'exec 3<&-; trap "" HUP; printf "FASTMCP_TEST_DESCENDANT_PID=%s\n" "$$" >&2; exec /bin/sh "$1"' fastmcp-descendant "$1" <&3 &
+exec 3<&-
+exit 0
+"#;
+
+    let output = run_cli(&[
+        "test",
+        "--json",
+        "--idle-timeout",
+        "30",
+        "--absolute-timeout",
+        "120",
+        "/bin/sh",
+        "--",
+        "-c",
+        FORKING_SERVER_WRAPPER,
+        "fastmcp-forking-server",
+        STATIC_MCP_SERVER_FIXTURE,
+    ]);
+    assert!(
+        output.status.success(),
+        "the descendant-served protocol probe should succeed: status={}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse descendant cleanup report");
+    assert_eq!(report["success"], true);
+    let cleanup = report["tests"]
+        .as_array()
+        .and_then(|tests| tests.iter().find(|test| test["name"] == "cleanup"))
+        .expect("successful report must include explicit cleanup verification");
+    assert_eq!(cleanup["success"], true);
+    assert_eq!(cleanup["details"], "owned subprocess group stopped");
+
+    let stderr = std::str::from_utf8(&output.stderr).expect("peer marker must be UTF-8");
+    for (marker, description) in [
+        ("FASTMCP_TEST_DESCENDANT_PID=", "protocol descendant"),
+        ("FASTMCP_TEST_STUBBORN_PID=", "stubborn descendant"),
+    ] {
+        let descendant_pid = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(marker))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("forked {description} must report its PID"));
+        let deadline = Instant::now() + PROCESS_CLEANUP_DEADLINE;
+        loop {
+            match std::fs::read_to_string(format!("/proc/{descendant_pid}/stat")) {
+                Ok(stat) => {
+                    let (state, _) = linux_process_state_and_group(&stat)
+                        .expect("descendant process state must be parseable");
+                    if matches!(state, 'Z' | 'X' | 'x') {
+                        break;
+                    }
+                }
+                Err(error) if proc_process_disappeared(&error) => break,
+                Err(error) => panic!("failed to inspect descendant process state: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fastmcp test reported success while {description} {descendant_pid} remained live"
+            );
+            std::thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reality_check_regression_e2e_test_owner_death_stops_anchored_group() {
+    const DELAYED_SERVER: &str = r#"
+printf "FASTMCP_TEST_OWNER_DEATH_PID=%s\n" "$$" >&2
+/bin/sleep 30
+exec /bin/sh "$1"
+"#;
+
+    let mut command = Command::new(fastmcp_bin());
+    command
+        .args([
+            "test",
+            "--json",
+            "--idle-timeout",
+            "30",
+            "--absolute-timeout",
+            "120",
+            "/bin/sh",
+            "--",
+            "-c",
+            DELAYED_SERVER,
+            "fastmcp-owner-death-server",
+            STATIC_MCP_SERVER_FIXTURE,
+        ])
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut process = ProcessGroupGuard::spawn(&mut command);
+    let stderr = process
+        .child_mut()
+        .stderr
+        .take()
+        .expect("owner-death stderr");
+    let (marker_sender, marker_receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stderr).read_line(&mut line);
+        let _ = marker_sender.send((result, line));
+    });
+    let (read_result, marker) = marker_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("owner-death fixture did not report its PID: {error}"));
+    read_result.expect("read owner-death PID marker");
+    let target_pid = marker
+        .trim()
+        .strip_prefix("FASTMCP_TEST_OWNER_DEATH_PID=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("parse owner-death PID marker");
+
+    process
+        .child_mut()
+        .kill()
+        .expect("kill only the fastmcp CLI owner");
+    let owner_status = process
+        .wait_until(Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("reap fastmcp CLI owner: {error:?}"));
+    assert!(!owner_status.success(), "killed CLI owner cannot succeed");
+    reader.join().expect("stderr marker reader");
+
+    let deadline = Instant::now() + PROCESS_CLEANUP_DEADLINE;
+    loop {
+        match std::fs::read_to_string(format!("/proc/{target_pid}/stat")) {
+            Ok(stat) => {
+                let (state, _) = linux_process_state_and_group(&stat)
+                    .expect("owner-death process state must be parseable");
+                if matches!(state, 'Z' | 'X' | 'x') {
+                    break;
+                }
+            }
+            Err(error) if proc_process_disappeared(&error) => break,
+            Err(error) => panic!("failed to inspect owner-death target: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "anchor did not stop target {target_pid} after CLI owner death"
+        );
+        std::thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+}
+
+#[cfg(feature = "e2e-fixture")]
+#[test]
+fn e2e_test_json_report_against_compiled_fastmcp_server() {
+    let server = env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server");
+
+    let output = run_cli(&[
+        "test",
+        "--json",
+        "--idle-timeout",
+        "30",
+        "--absolute-timeout",
+        "120",
+        server,
+    ]);
+    assert!(output.status.success());
+
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("parse framework test report");
+    assert_eq!(report["success"], true);
+    let tests = report["tests"]
+        .as_array()
+        .expect("framework report test array");
+    for (name, expected_details) in [
+        ("initialize", "protocol 2024-11-05"),
+        ("ping", "server responded"),
+        ("list_tools", "1 tools"),
+        ("list_resources", "1 resources"),
+        ("list_prompts", "1 prompts"),
+    ] {
+        let result = tests
+            .iter()
+            .find(|test| test["name"] == name)
+            .unwrap_or_else(|| panic!("framework report must include {name}"));
+        assert_eq!(result["success"], true, "{name} must succeed");
+        assert_ne!(
+            result["skipped"].as_bool(),
+            Some(true),
+            "{name} must execute"
+        );
+        assert_eq!(result["details"], expected_details);
+    }
+}
+
+#[cfg(feature = "e2e-fixture")]
+#[test]
+fn reality_check_regression_compiled_stdio_server_exits_when_worker_output_fails() {
+    let server = env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server");
+    let mut command = Command::new(server);
+    command
+        .env("FASTMCP_NO_BANNER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut guard = ProcessGroupGuard::spawn(&mut command);
+    let mut stdin = guard
+        .child_mut()
+        .stdin
+        .take()
+        .expect("compiled fixture stdin");
+    let stdout = guard
+        .child_mut()
+        .stdout
+        .take()
+        .expect("compiled fixture stdout");
+    drop(stdout);
+
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n")
+        .expect("request reaches compiled fixture");
+    stdin.flush().expect("request flushes");
+    let started = Instant::now();
+    let status = guard
+        .wait_until(Duration::from_secs(10))
+        .unwrap_or_else(|timeout| panic!("compiled fixture did not stop: {timeout:?}"));
+
+    assert!(!status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(stdin);
+}
+
+#[cfg(feature = "e2e-fixture")]
+#[test]
+fn reality_check_regression_compiled_stdio_server_bounds_unread_output_pipe() {
+    let server = env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server");
+    let mut command = Command::new(server);
+    command
+        .env("FASTMCP_NO_BANNER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut guard = ProcessGroupGuard::spawn(&mut command);
+    let mut stdin = guard
+        .child_mut()
+        .stdin
+        .take()
+        .expect("compiled fixture stdin");
+    let _unread_stdout = guard
+        .child_mut()
+        .stdout
+        .take()
+        .expect("compiled fixture stdout");
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "pipe-saturation-test", "version": "1.0.0"}
+        }
+    });
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "echo",
+            "arguments": {"message": "x".repeat(1024 * 1024)},
+            "_meta": {"progressToken": "saturation-progress"}
+        }
+    });
+    for request in [initialize, call] {
+        serde_json::to_writer(&mut stdin, &request).expect("encode saturation request");
+        stdin.write_all(b"\n").expect("frame saturation request");
+    }
+    stdin.flush().expect("saturation requests flush");
+
+    let started = Instant::now();
+    let status = guard
+        .wait_until(Duration::from_secs(10))
+        .unwrap_or_else(|timeout| panic!("compiled fixture did not bound stdout: {timeout:?}"));
+
+    assert!(!status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(stdin);
 }
 
 #[cfg(unix)]
 #[test]
-fn e2e_test_timeout_bounds_partial_initialization_frame() {
-    assert_initialization_receive_timeout(
+fn e2e_static_protocol_fixture_ignores_nested_notification_ids() {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        r#"printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":99}}' '{"jsonrpc":"2.0","method":"ping","id":7}' | /bin/sh "$1""#,
+        "fixture-notification-probe",
+        STATIC_MCP_SERVER_FIXTURE,
+    ]);
+    let output = run_with_deadline(command, Duration::from_secs(10))
+        .expect("static protocol fixture must exit after its input closes");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let responses = std::str::from_utf8(&output.stdout)
+        .expect("fixture output must be UTF-8")
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses.len(),
+        1,
+        "notification params.id must not produce a response"
+    );
+    let response: serde_json::Value =
+        serde_json::from_str(responses[0]).expect("fixture response must be valid JSON");
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"], serde_json::json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_test_absolute_timeout_bounds_silent_initialization() {
+    assert_initialization_absolute_timeout("exec sleep 5", "silent peer");
+}
+
+#[test]
+fn e2e_test_json_report_is_emitted_when_connect_fails() {
+    let missing_server = format!(
+        "/definitely-missing-fastmcp-e2e-server-{}",
+        std::process::id()
+    );
+    let mut cmd = Command::new(fastmcp_bin());
+    cmd.args(["test", "--json", &missing_server])
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0");
+
+    let output = run_with_deadline(cmd, Duration::from_secs(10))
+        .expect("missing executable failure must remain promptly bounded");
+
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("JSON mode must report connection failure on stdout");
+    assert_eq!(report["server"].as_str(), Some(missing_server.as_str()));
+    assert_eq!(report["success"], false);
+    let tests = report["tests"]
+        .as_array()
+        .expect("connection failure report must contain tests");
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0]["name"], "initialize");
+    assert_eq!(tests[0]["success"], false);
+    assert!(
+        tests[0]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert!(tests[0].get("timeout_source").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_test_absolute_timeout_bounds_partial_initialization_frame() {
+    assert_initialization_absolute_timeout(
         r#"printf '%s' '{"jsonrpc":"2.0"'; exec sleep 5"#,
         "partial-frame peer",
     );
 }
 
 #[cfg(unix)]
-fn assert_initialization_receive_timeout(server_script: &str, scenario: &str) {
+fn assert_initialization_absolute_timeout(server_script: &str, scenario: &str) {
     let mut cmd = Command::new(fastmcp_bin());
     cmd.args([
         "test",
         "--json",
-        "--timeout",
+        "--idle-timeout",
+        "2",
+        "--absolute-timeout",
         "1",
         "sh",
         "--",
@@ -635,14 +1027,29 @@ fn assert_initialization_receive_timeout(server_script: &str, scenario: &str) {
     let stderr = std::str::from_utf8(&output.stderr)
         .expect("timeout diagnostics must be strict UTF-8 terminal text");
     assert!(
-        stderr.contains("Request timed out"),
-        "{scenario} omitted the product timeout diagnostic: {stderr}"
+        stderr.contains("Request timed out at the absolute deadline"),
+        "{scenario} did not select the intentionally earlier absolute deadline: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("JSON mode must report initialization timeout on stdout");
+    assert_eq!(report["success"], false);
+    let tests = report["tests"]
+        .as_array()
+        .expect("initialization failure report must contain tests");
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0]["name"], "initialize");
+    assert_eq!(tests[0]["success"], false);
+    assert_eq!(tests[0]["timeout_source"], "absolute");
+    assert!(
+        tests[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Request timed out at the absolute deadline"))
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn e2e_test_timeout_reports_late_ping_response() {
+fn e2e_test_idle_timeout_reports_late_ping_response() {
     // Complete initialization, then delay the ping response beyond the product
     // deadline to cover the post-initialization request path separately from
     // the silent and partial-frame initialization cases above.
@@ -659,8 +1066,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
     cmd.args([
         "test",
         "--json",
-        "--timeout",
+        "--idle-timeout",
         "1",
+        "--absolute-timeout",
+        "3",
         "sh",
         "--",
         "-c",
@@ -700,8 +1109,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
     assert!(
         ping.get("error")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|error| error.contains("Request timed out")),
-        "ping result should contain the product timeout diagnostic: {ping}"
+            .is_some_and(|error| error.contains("Request timed out at the idle deadline")),
+        "ping result should select the intentionally earlier idle deadline: {ping}"
+    );
+    assert_eq!(
+        ping.get("timeout_source")
+            .and_then(serde_json::Value::as_str),
+        Some("idle")
     );
     let stderr =
         std::str::from_utf8(&output.stderr).expect("fastmcp test stderr must be valid UTF-8");

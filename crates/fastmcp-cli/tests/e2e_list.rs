@@ -30,7 +30,9 @@ impl TestTempDir {
             .expect("system time before unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("resolve the test temporary directory without symlink components");
+        let path = temp_root.join(format!(
             "fastmcp-cli-{prefix}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
@@ -290,6 +292,12 @@ fn configure_process_group(command: &mut Command) {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(target_os = "linux")]
+fn proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
 fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> {
     let processes = std::fs::read_dir("/proc")
         .map_err(|error| format!("failed to enumerate /proc: {error}"))?;
@@ -306,14 +314,14 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
         };
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_process_disappeared(&error) => continue,
             Err(error) => {
                 return Err(format!("failed to read process {pid} state: {error}"));
             }
         };
         let (state, group) = linux_process_state_and_group(&stat)
             .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-        if group == process_group_id && !matches!(state, 'Z' | 'X') {
+        if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
@@ -373,7 +381,7 @@ fn process_is_zombie(pid: u32) -> Result<bool, String> {
         .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-    Ok(matches!(state, 'Z' | 'X'))
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 #[cfg(target_os = "linux")]
@@ -560,6 +568,9 @@ fn run_cli(home: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR")
         .current_dir(cwd);
     run_command(command)
 }
@@ -593,7 +604,7 @@ fn cursor_cfg(home: &Path) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn cline_cfg(home: &Path) -> PathBuf {
-    home.join(".config/Code/User/settings.json")
+    home.join(".cline/data/settings/cline_mcp_settings.json")
 }
 
 #[cfg(target_os = "linux")]
@@ -612,7 +623,7 @@ fn e2e_list_json_enumerates_multiple_sources() {
     );
     write_file(
         &cline_cfg(&home),
-        r#"{"cline.mcpServers":{"cline-srv":{"command":"echo","args":["c"]}}}"#,
+        r#"{"mcpServers":{"cline-srv":{"transport":{"type":"stdio","command":"echo","args":["c"]}}}}"#,
     );
     write_file(
         &proj.join("mcp.json"),
@@ -941,6 +952,7 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
     const JSON_SECRET: &str = "JSON_SOURCE_CREDENTIAL_MUST_NOT_LEAK";
     const TOML_SECRET: &str = "TOML_SOURCE_CREDENTIAL_MUST_NOT_LEAK";
     const TYPO_SECRET: &str = "UNKNOWN_FIELD_CREDENTIAL_MUST_NOT_LEAK";
+    const ENTRY_NAME_SECRET: &str = "UNKNOWN_ENTRY_NAME_CREDENTIAL_MUST_NOT_LEAK";
 
     let home = mktemp_dir("list-strict-custom-home");
     let proj = mktemp_dir("list-strict-custom-proj");
@@ -1006,7 +1018,7 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
         ),
         (
             "typo.json",
-            r#"{"mcpServers":{"bad\u001b[31m":{"command":"echo","credential_typo":["UNKNOWN_FIELD_CREDENTIAL_MUST_NOT_LEAK"]}}}"#,
+            r#"{"mcpServers":{"token=UNKNOWN_ENTRY_NAME_CREDENTIAL_MUST_NOT_LEAK\u001b[31m":{"command":"echo","credential_typo":["UNKNOWN_FIELD_CREDENTIAL_MUST_NOT_LEAK"]}}}"#,
             "schema validation failed",
         ),
     ];
@@ -1032,6 +1044,7 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
             "unexpected {file_name} diagnostic"
         );
         assert!(!stderr.contains(TYPO_SECRET));
+        assert!(!stderr.contains(ENTRY_NAME_SECRET));
         assert!(!stderr.contains('\u{1b}'));
         assert!(stderr.len() < 16 * 1024);
     }
@@ -1039,8 +1052,8 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn e2e_list_explicit_client_config_requires_object_registry_and_strict_entries() {
-    const TYPO_SECRET: &str = "CLIENT_FIELD_CREDENTIAL_MUST_NOT_LEAK";
+fn e2e_list_explicit_client_config_requires_object_registry_and_valid_core_entries() {
+    const FIELD_SECRET: &str = "CLIENT_FIELD_CREDENTIAL_MUST_NOT_LEAK";
 
     let home = mktemp_dir("list-strict-client-home");
     let proj = mktemp_dir("list-strict-client-proj");
@@ -1051,6 +1064,10 @@ fn e2e_list_explicit_client_config_requires_object_registry_and_strict_entries()
         (
             r#"{"mcpServers":"CLIENT_REGISTRY_CREDENTIAL_MUST_NOT_LEAK"}"#,
             "MCP server registry must be a JSON object",
+        ),
+        (
+            r#"{"mcpServers":{"bad":{"command":"echo","args":"CLIENT_FIELD_CREDENTIAL_MUST_NOT_LEAK"}}}"#,
+            "schema validation failed",
         ),
         (
             r#"{"mcpServers":{"bad":{"command":"echo","argumentz":["CLIENT_FIELD_CREDENTIAL_MUST_NOT_LEAK"]}}}"#,
@@ -1069,9 +1086,39 @@ fn e2e_list_explicit_client_config_requires_object_registry_and_strict_entries()
         assert!(output.stdout.is_empty());
         let stderr = stderr_str(&output);
         assert!(stderr.contains(expected));
-        assert!(!stderr.contains(TYPO_SECRET));
+        assert!(!stderr.contains(FIELD_SECRET));
         assert!(!stderr.contains("CLIENT_REGISTRY_CREDENTIAL_MUST_NOT_LEAK"));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_list_accepts_client_owned_cline_extension_fields() {
+    let home = mktemp_dir("list-cline-extension-home");
+    let proj = mktemp_dir("list-cline-extension-proj");
+    let config_path = cline_cfg(&home);
+    write_file(
+        &config_path,
+        r#"{"mcpServers":{"extended":{"transport":{"type":"stdio","command":"echo","args":["--mode","test"],"cwd":"/srv/server","env":{"MODE":"test"}},"disabled":true,"autoApprove":["echo"],"timeout":60,"remoteConfigured":false,"oauth":null,"metadata":["e2e",null]}}}"#,
+    );
+
+    let output = run_cli(
+        &home,
+        &proj,
+        &["list", "--target", "cline", "--format", "json"],
+    );
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("parse Cline list JSON");
+    assert_eq!(json["servers"][0]["name"], "extended");
+    assert_eq!(json["servers"][0]["command"], "echo");
+    assert_eq!(
+        json["servers"][0]["args"],
+        serde_json::json!(["--<option>", "<redacted>"])
+    );
+    assert_eq!(json["servers"][0]["env"]["MODE"], "<redacted>");
+    assert_eq!(json["servers"][0]["cwd"], "/srv/server");
+    assert_eq!(json["servers"][0]["enabled"], false);
 }
 
 #[test]

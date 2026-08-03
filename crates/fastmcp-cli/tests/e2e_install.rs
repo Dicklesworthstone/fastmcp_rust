@@ -38,7 +38,9 @@ impl TestTempDir {
             .expect("system time before unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("resolve the test temporary directory without symlink components");
+        let path = temp_root.join(format!(
             "fastmcp-cli-{prefix}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
@@ -300,6 +302,12 @@ fn configure_process_group(command: &mut Command) {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(target_os = "linux")]
+fn proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
 fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> {
     let processes = std::fs::read_dir("/proc")
         .map_err(|error| format!("failed to enumerate /proc: {error}"))?;
@@ -316,14 +324,14 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
         };
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_process_disappeared(&error) => continue,
             Err(error) => {
                 return Err(format!("failed to read process {pid} state: {error}"));
             }
         };
         let (state, group) = linux_process_state_and_group(&stat)
             .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-        if group == process_group_id && !matches!(state, 'Z' | 'X') {
+        if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
@@ -383,7 +391,7 @@ fn process_is_zombie(pid: u32) -> Result<bool, String> {
         .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-    Ok(matches!(state, 'Z' | 'X'))
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 #[cfg(target_os = "linux")]
@@ -558,7 +566,10 @@ fn run_cli_with_home(home: &Path, args: &[&str]) -> Output {
         .env("FASTMCP_CHECK_FOR_UPDATES", "0")
         .env("HOME", home)
         .env("USERPROFILE", home) // used as fallback for cursor path on non-unix
-        .env_remove("XDG_CONFIG_HOME");
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR");
     run_command(command)
 }
 
@@ -575,7 +586,10 @@ fn run_cli_with_home_and_umask(home: &Path, umask: &str, args: &[&str]) -> Outpu
         .env("FASTMCP_CHECK_FOR_UPDATES", "0")
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env_remove("XDG_CONFIG_HOME");
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR");
     run_command(command)
 }
 
@@ -588,7 +602,40 @@ fn run_cli_with_config_home(home: &Path, config_home: &Path, args: &[&str]) -> O
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", config_home)
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR")
         .current_dir(home);
+    run_command(command)
+}
+
+#[cfg(target_os = "linux")]
+fn run_cli_with_cline_overrides(
+    home: &Path,
+    settings_path: Option<&Path>,
+    data_dir: Option<&Path>,
+    cline_dir: Option<&Path>,
+    args: &[&str],
+) -> Output {
+    let mut command = Command::new(get_binary_path());
+    command
+        .args(args)
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR");
+    if let Some(path) = settings_path {
+        command.env("CLINE_MCP_SETTINGS_PATH", path);
+    }
+    if let Some(path) = data_dir {
+        command.env("CLINE_DATA_DIR", path);
+    }
+    if let Some(path) = cline_dir {
+        command.env("CLINE_DIR", path);
+    }
     run_command(command)
 }
 
@@ -673,7 +720,7 @@ fn cursor_path(home: &Path) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn cline_path(home: &Path) -> PathBuf {
-    home.join(".config/Code/User/settings.json")
+    home.join(".cline/data/settings/cline_mcp_settings.json")
 }
 
 #[cfg(target_os = "linux")]
@@ -1014,7 +1061,7 @@ fn e2e_install_cursor_modifies_config_and_creates_backup() {
     let path = cursor_path(&home);
     create_secure_fixture_directory(&home, path.parent().unwrap());
 
-    let original = r#"{"mcpServers":{"existing":{"command":"x","args":[]}}}"#;
+    let original = r#"{"mcpServers":{"existing":{"command":"x","args":[]},"my-server":{"type":"http","url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer stale"},"auth":{"mode":"stale"},"oauth":{"clientId":"stale"},"envFile":".env.local","command":"stale"}}}"#;
     write_secure_config_fixture(&path, original);
 
     let output = run_cli_with_home(
@@ -1035,18 +1082,35 @@ fn e2e_install_cursor_modifies_config_and_creates_backup() {
         .expect("mcpServers must be an object");
     assert!(servers.contains_key("existing"));
     assert!(servers.contains_key("my-server"));
-    assert!(servers["my-server"].get("cwd").is_none());
+    let installed = servers["my-server"]
+        .as_object()
+        .expect("installed Cursor entry must be an object");
+    assert_eq!(installed.get("type"), Some(&serde_json::json!("stdio")));
+    assert_eq!(
+        installed.get("command"),
+        Some(&serde_json::json!("/bin/echo"))
+    );
+    assert_eq!(
+        installed.get("envFile"),
+        Some(&serde_json::json!(".env.local"))
+    );
+    for stale in ["url", "headers", "auth", "oauth", "transportType"] {
+        assert!(
+            !installed.contains_key(stale),
+            "stale Cursor field: {stale}"
+        );
+    }
+    assert!(!installed.contains_key("cwd"));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn e2e_install_cline_modifies_vscode_settings_and_creates_backup() {
+fn e2e_install_cline_clears_transport_ownership_and_preserves_generic_metadata() {
     let home = mktemp_home("install-cline");
     let path = cline_path(&home);
     create_secure_fixture_directory(&home, path.parent().unwrap());
 
-    let original =
-        r#"{"editor.tabSize": 2, "cline.mcpServers": {"existing": {"command":"x","args":[]}}}"#;
+    let original = r#"{"otherSetting":{"keep":true},"mcpServers":{"existing":{"transport":{"type":"stdio","command":"x","args":[]}},"my-server":{"transport":{"type":"stdio","command":"stale-command","args":["stale"],"cwd":"/stale","env":{"STALE":"1"}},"type":"stdio","transportType":"stdio","command":"legacy-command","args":["legacy"],"cwd":"/legacy","env":{"LEGACY":"1"},"url":"https://example.invalid/stale","headers":{"X-Stale":"value"},"auth":{"mode":"stale"},"disabled":false,"autoApprove":["echo"],"timeout":120,"remoteConfigured":true,"oauth":{"clientId":"preserve-me"},"metadata":{"owner":"preserve-me"}}}}"#;
     write_secure_config_fixture(&path, original);
 
     let output = run_cli_with_home(
@@ -1061,14 +1125,140 @@ fn e2e_install_cline_modifies_vscode_settings_and_creates_backup() {
 
     let new_content = read_to_string(&path);
     let json: serde_json::Value = serde_json::from_str(&new_content).unwrap();
-    assert_eq!(json.get("editor.tabSize").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(json["otherSetting"]["keep"], true);
+    assert!(json.get("cline.mcpServers").is_none());
 
     let servers = json
-        .get("cline.mcpServers")
+        .get("mcpServers")
         .and_then(|v| v.as_object())
-        .expect("cline.mcpServers must be an object");
+        .expect("mcpServers must be an object");
     assert!(servers.contains_key("existing"));
     assert!(servers.contains_key("my-server"));
+    let installed = servers["my-server"]
+        .as_object()
+        .expect("installed Cline entry must be an object");
+    assert_eq!(installed["transport"]["type"], "stdio");
+    assert_eq!(installed["transport"]["command"], "/bin/echo");
+    assert_eq!(installed["transport"]["args"], serde_json::json!([]));
+    assert_eq!(installed["autoApprove"], serde_json::json!(["echo"]));
+    assert_eq!(installed["timeout"], 120);
+    assert_eq!(installed["metadata"]["owner"], "preserve-me");
+    assert!(
+        installed.get("remoteConfigured").is_none(),
+        "a local install must clear the remote-sync ownership marker"
+    );
+    assert!(
+        installed.get("oauth").is_none(),
+        "OAuth state belongs to the replaced transport"
+    );
+    for stale in [
+        "type",
+        "transportType",
+        "command",
+        "args",
+        "cwd",
+        "env",
+        "url",
+        "headers",
+        "auth",
+    ] {
+        assert!(!installed.contains_key(stale), "stale Cline field: {stale}");
+    }
+
+    let list_output = run_cli_with_home(&home, &["list", "--target", "cline", "--format", "json"]);
+    assert!(
+        list_output.status.success(),
+        "stderr: {}",
+        stderr_str(&list_output)
+    );
+    let listed: serde_json::Value = serde_json::from_str(&stdout_str(&list_output)).unwrap();
+    let listed_server = listed["servers"]
+        .as_array()
+        .and_then(|servers| servers.iter().find(|server| server["name"] == "my-server"))
+        .expect("updated Cline server must be listable");
+    assert_eq!(listed_server["command"], "/bin/echo");
+
+    let before_noop = read_to_string(&path);
+    let noop = run_cli_with_home(
+        &home,
+        &["install", "my-server", "/bin/echo", "--target", "cline"],
+    );
+    assert!(noop.status.success(), "stderr: {}", stderr_str(&noop));
+    assert!(stdout_str(&noop).contains("already configured"));
+    assert_eq!(read_to_string(&path), before_noop);
+    let second_backup = PathBuf::from(format!("{}.bak.1", path.display()));
+    assert!(
+        !second_backup.exists(),
+        "semantic no-op must not create a backup"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_install_cline_honors_settings_data_and_cline_directory_precedence() {
+    let home = mktemp_home("install-cline-overrides");
+    let direct = home.join("direct/settings.json");
+    let data_dir = home.join("data-override");
+    let cline_dir = home.join("cline-override");
+    let data_settings = data_dir.join("settings/cline_mcp_settings.json");
+    let cline_settings = cline_dir.join("data/settings/cline_mcp_settings.json");
+
+    let direct_output = run_cli_with_cline_overrides(
+        &home,
+        Some(&direct),
+        Some(&data_dir),
+        Some(&cline_dir),
+        &["install", "direct", "/bin/echo", "--target", "cline"],
+    );
+    assert!(
+        direct_output.status.success(),
+        "stderr: {}",
+        stderr_str(&direct_output)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_to_string(&direct)).unwrap()["mcpServers"]
+            ["direct"]["transport"]["command"],
+        "/bin/echo"
+    );
+    assert!(!data_settings.exists());
+    assert!(!cline_settings.exists());
+
+    let data_output = run_cli_with_cline_overrides(
+        &home,
+        None,
+        Some(&data_dir),
+        Some(&cline_dir),
+        &["install", "data", "/bin/echo", "--target", "cline"],
+    );
+    assert!(
+        data_output.status.success(),
+        "stderr: {}",
+        stderr_str(&data_output)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_to_string(&data_settings)).unwrap()["mcpServers"]
+            ["data"]["transport"]["type"],
+        "stdio"
+    );
+    assert!(!cline_settings.exists());
+
+    let cline_output = run_cli_with_cline_overrides(
+        &home,
+        None,
+        None,
+        Some(&cline_dir),
+        &["install", "cline", "/bin/echo", "--target", "cline"],
+    );
+    assert!(
+        cline_output.status.success(),
+        "stderr: {}",
+        stderr_str(&cline_output)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_to_string(&cline_settings)).unwrap()["mcpServers"]
+            ["cline"]["transport"]["type"],
+        "stdio"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1168,7 +1358,7 @@ fn e2e_install_restores_exact_secure_modes_under_maximally_restrictive_umask() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn e2e_install_update_preserves_client_extensions_and_sets_cwd() {
+fn e2e_install_refuses_unsupported_per_server_fields_consistently_with_list() {
     let home = mktemp_home("install-extension-cwd");
     let path = claude_path(&home);
     create_secure_fixture_directory(&home, path.parent().unwrap());
@@ -1198,18 +1388,20 @@ fn e2e_install_update_preserves_client_extensions_and_sets_cwd() {
         ],
     );
 
-    assert!(output.status.success(), "stderr: {}", stderr_str(&output));
-    assert!(stdout_str(&output).contains("Updated 'my-server'"));
-    let document: serde_json::Value = serde_json::from_str(&read_to_string(&path)).unwrap();
-    let server = &document["mcpServers"]["my-server"];
-    assert_eq!(server["command"], "/bin/echo");
-    assert_eq!(server["cwd"], "/srv/my-server");
-    assert_eq!(server["clientExtension"]["transportHint"], "keep-me");
-    assert_eq!(document["clientRootExtension"], true);
-    assert_eq!(
-        std::fs::read(PathBuf::from(format!("{}.bak", path.display()))).unwrap(),
-        original
+    assert!(!output.status.success());
+    assert!(
+        stderr_str(&output).contains("unsupported or malformed per-server fields"),
+        "stderr: {}",
+        stderr_str(&output)
     );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!PathBuf::from(format!("{}.bak", path.display())).exists());
+
+    let list = run_cli_with_home(&home, &["list", "--target", "claude", "--format", "json"]);
+    assert!(!list.status.success());
+    assert!(stderr_str(&list).contains("schema validation failed"));
+    assert!(list.stdout.is_empty(), "failed list output must be atomic");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
 #[cfg(target_os = "linux")]

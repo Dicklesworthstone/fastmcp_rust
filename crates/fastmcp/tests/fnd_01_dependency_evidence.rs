@@ -8190,14 +8190,44 @@ mod trust_std {
             record.string("environment_set_sha256")?,
             "control environment set",
         )?;
-        if authoring_closure_sha256 != expected.authoring_closure_sha256
-            || integration_seal_sha256 != expected.integration_seal_sha256
-            || tool_set_sha256 != expected.tool_set_sha256
-            || environment_set_sha256 != expected.environment_set_sha256
-        {
+        if authoring_closure_sha256 != expected.authoring_closure_sha256 {
             return Err(TrustError::new(
                 "E_CONTROL_AUTHORITY",
-                "authoring/integration/tool/environment digest mismatch",
+                format!(
+                    "authoring_closure_sha256 expected={} observed={}",
+                    encode_lower_hex(&expected.authoring_closure_sha256),
+                    encode_lower_hex(&authoring_closure_sha256),
+                ),
+            ));
+        }
+        if integration_seal_sha256 != expected.integration_seal_sha256 {
+            return Err(TrustError::new(
+                "E_CONTROL_AUTHORITY",
+                format!(
+                    "integration_seal_sha256 expected={} observed={}",
+                    encode_lower_hex(&expected.integration_seal_sha256),
+                    encode_lower_hex(&integration_seal_sha256),
+                ),
+            ));
+        }
+        if tool_set_sha256 != expected.tool_set_sha256 {
+            return Err(TrustError::new(
+                "E_CONTROL_AUTHORITY",
+                format!(
+                    "tool_set_sha256 expected={} observed={}",
+                    encode_lower_hex(&expected.tool_set_sha256),
+                    encode_lower_hex(&tool_set_sha256),
+                ),
+            ));
+        }
+        if environment_set_sha256 != expected.environment_set_sha256 {
+            return Err(TrustError::new(
+                "E_CONTROL_AUTHORITY",
+                format!(
+                    "environment_set_sha256 expected={} observed={}",
+                    encode_lower_hex(&expected.environment_set_sha256),
+                    encode_lower_hex(&environment_set_sha256),
+                ),
             ));
         }
 
@@ -32503,13 +32533,14 @@ use super::trust_std::{
     parse_canonical_record_file_with_final_self_digest,
     parse_ordinary_handoff_arguments, read_ordinary_handoff_environment,
     rebind_control_ledger_regular_files, retain_integration_and_outer_files,
-    sha256, validate_control_ledger_bytes, validate_outer_role_record,
+    sha256 as trust_sha256, validate_control_ledger_bytes, validate_outer_role_record,
     validate_sparse_index_semantics,
 };
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
+use ring::digest::{digest as ring_digest, SHA1_FOR_LEGACY_USE_ONLY};
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
 use semver::{Version as SemverVersion, VersionReq as SemverVersionReq};
 use serde::de::{DeserializeOwned, Error as DeError, MapAccess, SeqAccess, Visitor};
@@ -74999,20 +75030,1415 @@ fn validate_sdk_matrix_semantics(
     Ok(())
 }
 
-fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
-    let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
-    let core_negatives = string_array(
-        &core,
+#[derive(Debug, Clone, Copy)]
+struct SerializationUriCandidate {
+    name: &'static str,
+    version: &'static str,
+    checksum: &'static str,
+    default_features: bool,
+    requested_features: &'static [&'static str],
+    resolved_features: &'static [&'static str],
+    allowed_features: &'static [&'static str],
+    prohibited_features: &'static [&'static str],
+    license: &'static str,
+    rust_version: &'static str,
+}
+
+const SERIALIZATION_URI_CANDIDATES: &[SerializationUriCandidate] = &[
+    SerializationUriCandidate {
+        name: "serde_json",
+        version: "1.0.151",
+        checksum: "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+        default_features: true,
+        requested_features: &["arbitrary_precision"],
+        resolved_features: &["arbitrary_precision", "default", "float_roundtrip", "std"],
+        allowed_features: &["arbitrary_precision", "default", "float_roundtrip", "std"],
+        prohibited_features: &["preserve_order", "raw_value", "unbounded_depth"],
+        license: "MIT OR Apache-2.0",
+        rust_version: "1.71",
+    },
+    SerializationUriCandidate {
+        name: "jsonschema",
+        version: "0.49.2",
+        checksum: "f8a77951c56b6a0af03c22af6953d6ffcfba9403c765578921f3f1089b999db6",
+        default_features: false,
+        requested_features: &["arbitrary-precision"],
+        resolved_features: &["arbitrary-precision"],
+        allowed_features: &["arbitrary-precision"],
+        prohibited_features: &[
+            "default",
+            "resolve-http",
+            "resolve-file",
+            "resolve-async",
+            "tls-aws-lc-rs",
+            "tls-ring",
+            "macros",
+            "conformance",
+            "magnus",
+            "pyo3",
+        ],
+        license: "MIT",
+        rust_version: "1.85.0",
+    },
+    SerializationUriCandidate {
+        name: "url",
+        version: "2.5.8",
+        checksum: "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+        default_features: false,
+        requested_features: &["std"],
+        resolved_features: &["std"],
+        allowed_features: &["std"],
+        prohibited_features: &["default", "serde", "debugger_visualizer", "expose_internals"],
+        license: "MIT OR Apache-2.0",
+        rust_version: "1.63",
+    },
+    SerializationUriCandidate {
+        name: "zeroize",
+        version: "1.9.0",
+        checksum: "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e",
+        default_features: false,
+        requested_features: &["alloc", "derive"],
+        resolved_features: &["alloc", "derive", "zeroize_derive"],
+        allowed_features: &["alloc", "derive", "zeroize_derive"],
+        prohibited_features: &["default", "std", "serde", "aarch64", "simd"],
+        license: "Apache-2.0 OR MIT",
+        rust_version: "1.85",
+    },
+    SerializationUriCandidate {
+        name: "argon2",
+        version: "0.5.3",
+        checksum: "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072",
+        default_features: false,
+        requested_features: &["alloc", "password-hash", "zeroize"],
+        resolved_features: &["alloc", "password-hash", "zeroize"],
+        allowed_features: &["alloc", "password-hash", "zeroize"],
+        prohibited_features: &["default", "rand", "simple", "std"],
+        license: "MIT OR Apache-2.0",
+        rust_version: "1.65",
+    },
+];
+
+const SERIALIZATION_URI_TARGETS: &[(&str, i64, i64, &str, i64, i64, &str, &[&str])] = &[
+    (
+        "x86_64-unknown-linux-gnu",
+        211,
+        4461,
+        "9b802aeff758416ab30d423baf958e67f7f9c780c755514b6e46cc4960da8ff6",
+        713,
+        38330,
+        "b86235c2b14bb7bdb912d1279644d3dfe03680e8c9b0093e777fc7c6056823ff",
+        &["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"],
+    ),
+    (
+        "aarch64-unknown-linux-gnu",
+        210,
+        4440,
+        "7aec3d8196b21e77c1c3f53a4482eec871c9e654fb962b675be3774ff0ee4afe",
+        711,
+        38278,
+        "06e56bb8eb215c35134c766afbe1442f7753244587f30acc99d3b02e28d6ab86",
+        &["getrandom 0.3.4", "rand_core 0.6.4"],
+    ),
+    (
+        "x86_64-apple-darwin",
+        211,
+        4461,
+        "9b802aeff758416ab30d423baf958e67f7f9c780c755514b6e46cc4960da8ff6",
+        713,
+        38330,
+        "b86235c2b14bb7bdb912d1279644d3dfe03680e8c9b0093e777fc7c6056823ff",
+        &["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"],
+    ),
+    (
+        "aarch64-apple-darwin",
+        210,
+        4440,
+        "7aec3d8196b21e77c1c3f53a4482eec871c9e654fb962b675be3774ff0ee4afe",
+        711,
+        38278,
+        "06e56bb8eb215c35134c766afbe1442f7753244587f30acc99d3b02e28d6ab86",
+        &["getrandom 0.3.4", "rand_core 0.6.4"],
+    ),
+    (
+        "x86_64-pc-windows-msvc",
+        210,
+        4452,
+        "c62ce8288cdfc40e2b3785ed6f8554119897414fbeb429f93879771f910b374d",
+        710,
+        38256,
+        "60463587f417c18f0e8f6e76190728dad95bf9a533cfa2c990672d64429e99dc",
+        &["cpufeatures 0.2.17", "getrandom 0.3.4", "rand_core 0.6.4"],
+    ),
+];
+
+const SERIALIZATION_URI_KEY_LOCK_ROWS: &[(&str, &str, &str, &[&str])] = &[
+    ("ahash", "0.8.12", "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75", &["default", "getrandom", "runtime-rng", "serde", "std"]),
+    ("getrandom", "0.3.4", "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd", &["default through ahash on supported targets"]),
+    ("password-hash", "0.5.0", "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166", &["alloc", "default", "rand_core"]),
+    ("rand_core", "0.6.4", "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c", &[]),
+    ("jsonschema-value", "0.49.2", "94e097778f3e9c6a33862077dbf07aca0360d0b18d2a7abc323da132df49ee83", &["arbitrary-precision", "default", "serde_json"]),
+    ("jsonschema-regex", "0.49.2", "a4c2e64f341a1d6a15d2daa3c967e48921cf15b9c7f23a9899e8b63c7f7c4199", &[]),
+    ("referencing", "0.49.2", "b772e96f8eb6badd4eb10fbc08b8a98244c09b4af37e72e8fa612c854604b870", &["default"]),
+    ("num-bigint", "0.4.8", "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367", &["default", "std"]),
+    ("zeroize_derive", "1.5.0", "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328", &[]),
+];
+
+fn serialization_uri_contract_error(code: &str, path: impl Into<String>) -> Diagnostic {
+    Diagnostic::error(code, "serialization-uri-dependencies").at(path)
+}
+
+fn validate_serialization_uri_candidate(
+    row: &toml::Value,
+    expected: SerializationUriCandidate,
+) -> VResult<()> {
+    let subject = format!("serialization-uri/{}", expected.name);
+    let row = row
+        .as_table()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_CANDIDATE", format!("crate[name={}]", expected.name)))?;
+    let base = format!("crate[name={}]", expected.name);
+    let exact_requirement = format!("={}", expected.version);
+    for (field, required) in [
+        ("name", expected.name),
+        ("version", expected.version),
+        ("requirement", exact_requirement.as_str()),
+        ("license", expected.license),
+        ("rust_version", expected.rust_version),
+    ] {
+        if record_string(row, field, &subject)? != required {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_CANDIDATE",
+                format!("{base}.{field}"),
+            ));
+        }
+    }
+    let checksum = record_string(row, "checksum_sha256", &subject)?;
+    validate_sha256(checksum, &subject)?;
+    if checksum != expected.checksum {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CHECKSUM",
+            format!("{base}.checksum_sha256"),
+        ));
+    }
+    if record_bool(row, "default_features", &subject)? != expected.default_features {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_FEATURE_POLICY",
+            format!("{base}.default_features"),
+        ));
+    }
+    for (field, required) in [
+        ("requested_features", expected.requested_features),
+        ("resolved_features", expected.resolved_features),
+        ("allowed_features", expected.allowed_features),
+        ("prohibited_features", expected.prohibited_features),
+    ] {
+        let actual = record_string_array(row, field, &subject)?;
+        if !string_sequence_is(&actual, required) {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_FEATURE_POLICY",
+                format!("{base}.{field}"),
+            ));
+        }
+    }
+    if record_u64(row, "archive_bytes", &subject)? == 0 {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CANDIDATE",
+            format!("{base}.archive_bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_serialization_uri_dependency_document(
+    document: &toml::Value,
+    consumer_lock: &toml::Value,
+    consumer_lock_bytes: &[u8],
+) -> VResult<()> {
+    if pointer_get(document, "/toolchain/resolver", "serialization-uri resolver")?.as_str()
+        != Some("2")
+        || pointer_get(
+            document,
+            "/gate/workspace_manifests_integrated",
+            "serialization-uri resolver",
+        )?
+        .as_bool()
+            != Some(false)
+        || pointer_get(document, "/gate/consumer_target_graph_bytes_checked_in", "serialization-uri resolver")?
+            .as_bool()
+            != Some(false)
+        || pointer_get(document, "/gate/consumer_target_graphs_reproducible_under_recorded_prerequisites", "serialization-uri resolver")?
+            .as_bool()
+            != Some(false)
+        || pointer_get(document, "/gate/advisory_snapshot_clean", "serialization-uri resolver")?
+            .as_bool()
+            != Some(false)
+        || pointer_get(document, "/gate/rch_compile_verified", "serialization-uri resolver")?
+            .as_bool()
+            != Some(false)
+    {
+        return Err(serialization_uri_contract_error(
+            "E_RESOLVER_CANDIDATE",
+            "toolchain.resolver",
+        ));
+    }
+    let candidates = pointer_get(document, "/crate", "serialization-uri candidates")?
+        .as_array()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_CANDIDATE", "crate"))?;
+    if candidates.len() != SERIALIZATION_URI_CANDIDATES.len() {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CANDIDATE",
+            "crate.count",
+        ));
+    }
+    for (row, expected) in candidates.iter().zip(SERIALIZATION_URI_CANDIDATES) {
+        validate_serialization_uri_candidate(row, *expected)?;
+    }
+
+    let advisory = pointer_get(document, "/advisory_snapshot", "serialization-uri advisory")?
+        .as_table()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_ADVISORY", "advisory_snapshot"))?;
+    if record_string(advisory, "commit", "serialization-uri advisory")?
+        != "7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
+        || record_usize(advisory, "advisory_count", "serialization-uri advisory")? != 1173
+        || record_usize(advisory, "consumer_lock_dependency_count", "serialization-uri advisory")? != 129
+        || record_u64(advisory, "audit_output_bytes", "serialization-uri advisory")? != 314
+        || record_string(advisory, "audit_output_sha256", "serialization-uri advisory")?
+            != "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
+        || record_string(advisory, "result", "serialization-uri advisory")?
+            != "recorded historical clean result; execution remains unverified"
+        || record_string(advisory, "execution_status", "serialization-uri advisory")?
+            != "recorded-unverified"
+        || !record_array(advisory, "vulnerabilities", "serialization-uri advisory")?.is_empty()
+        || !record_array(advisory, "warnings", "serialization-uri advisory")?.is_empty()
+        || !record_array(advisory, "direct_package_advisories", "serialization-uri advisory")?.is_empty()
+    {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_ADVISORY",
+            "advisory_snapshot",
+        ));
+    }
+
+    let supported_targets = string_array(document, "/policy/supported_targets", "serialization-uri targets")?;
+    let expected_targets = SERIALIZATION_URI_TARGETS
+        .iter()
+        .map(|record| record.0)
+        .collect::<Vec<_>>();
+    if !string_sequence_is(&supported_targets, &expected_targets) {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_TARGET_GRAPH",
+            "policy.supported_targets",
+        ));
+    }
+    let target_graphs = pointer_get(document, "/target_graph", "serialization-uri target graph")?
+        .as_array()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_TARGET_GRAPH", "target_graph"))?;
+    if target_graphs.len() != SERIALIZATION_URI_TARGETS.len() {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_TARGET_GRAPH",
+            "target_graph.count",
+        ));
+    }
+    for (row, expected) in target_graphs.iter().zip(SERIALIZATION_URI_TARGETS) {
+        let row = row.as_table().ok_or_else(|| {
+            serialization_uri_contract_error("E_SERIALIZATION_URI_TARGET_GRAPH", "target_graph.row")
+        })?;
+        let base = format!("target_graph[target={}]", expected.0);
+        if record_string(row, "target", &base)? != expected.0
+            || record_i64(row, "normal_build_lines", &base)? != expected.1
+            || record_i64(row, "normal_build_bytes", &base)? != expected.2
+            || record_string(row, "normal_build_sha256", &base)? != expected.3
+            || record_i64(row, "feature_lines", &base)? != expected.4
+            || record_i64(row, "feature_bytes", &base)? != expected.5
+            || record_string(row, "feature_sha256", &base)? != expected.6
+            || !string_sequence_is(
+                &record_string_array(row, "active_special_packages", &base)?,
+                expected.7,
+            )
+        {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_TARGET_GRAPH",
+                base,
+            ));
+        }
+    }
+
+    let consumer = pointer_get(document, "/consumer_probe", "serialization-uri consumer")?
+        .as_table()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_probe"))?;
+    let probe_manifest = parse_toml_document(
+        record_string(consumer, "manifest", "serialization-uri consumer")?,
+        "serialization-uri embedded consumer manifest",
+    )?;
+    let probe_dependencies = pointer_get(
+        &probe_manifest,
+        "/dependencies",
+        "serialization-uri embedded consumer manifest",
+    )?
+    .as_table()
+    .ok_or_else(|| {
+        serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_probe.manifest.dependencies")
+    })?;
+    let expected_dependency_names = SERIALIZATION_URI_CANDIDATES
+        .iter()
+        .map(|candidate| candidate.name)
+        .collect::<BTreeSet<_>>();
+    if probe_dependencies.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != expected_dependency_names
+    {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CONSUMER_LOCK",
+            "consumer_probe.manifest.dependencies",
+        ));
+    }
+    for expected in SERIALIZATION_URI_CANDIDATES {
+        let dependency = probe_dependencies
+            .get(expected.name)
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| {
+                serialization_uri_contract_error(
+                    "E_SERIALIZATION_URI_CONSUMER_LOCK",
+                    format!("consumer_probe.manifest.dependencies.{}", expected.name),
+                )
+            })?;
+        let dependency_path = format!("consumer_probe.manifest.dependencies.{}", expected.name);
+        if record_string(dependency, "version", &dependency_path)? != format!("={}", expected.version)
+            || dependency
+                .get("default-features")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(true)
+                != expected.default_features
+            || !string_sequence_is(
+                &record_string_array(dependency, "features", &dependency_path)?,
+                expected.requested_features,
+            )
+        {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_CONSUMER_LOCK",
+                dependency_path,
+            ));
+        }
+    }
+    let lock_sha256 = record_string(consumer, "lock_sha256", "serialization-uri consumer")?;
+    validate_sha256(lock_sha256, "serialization-uri consumer")?;
+    if record_string(consumer, "lock_artifact_path", "serialization-uri consumer")?
+        != "evidence/fnd-01/serialization-uri-consumer.lock"
+        || !record_bool(consumer, "lock_artifact_checked_in", "serialization-uri consumer")?
+        || !record_bool(consumer, "lock_artifact_byte_identical_to_probe", "serialization-uri consumer")?
+        || record_u64(consumer, "lock_bytes", "serialization-uri consumer")?
+            != u64::try_from(consumer_lock_bytes.len()).unwrap_or(u64::MAX)
+        || lock_sha256 != lower_hex(&sha256(consumer_lock_bytes))
+    {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CONSUMER_LOCK",
+            "consumer_probe.lock_artifact",
+        ));
+    }
+    let lock_packages = pointer_get(consumer_lock, "/package", "serialization-uri consumer lock")?
+        .as_array()
+        .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_lock.package"))?;
+    if lock_packages.len() != 129
+        || record_usize(consumer, "lock_package_count", "serialization-uri consumer")? != 129
+    {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CONSUMER_LOCK",
+            "consumer_lock.package.count",
+        ));
+    }
+    for expected in SERIALIZATION_URI_CANDIDATES {
+        let matches = lock_packages
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .filter(|row| row.get("name").and_then(toml::Value::as_str) == Some(expected.name))
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || record_string(matches[0], "version", expected.name)? != expected.version
+            || record_string(matches[0], "checksum", expected.name)? != expected.checksum
+            || record_string(matches[0], "source", expected.name)?
+                != "registry+https://github.com/rust-lang/crates.io-index"
+        {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_CONSUMER_LOCK",
+                format!("consumer_lock.package[name={}]", expected.name),
+            ));
+        }
+    }
+    let key_rows = pointer_get(
+        document,
+        "/consumer_probe/key_resolved_package",
+        "serialization-uri key lock rows",
+    )?
+    .as_array()
+    .ok_or_else(|| serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_probe.key_resolved_package"))?;
+    if key_rows.len() != SERIALIZATION_URI_KEY_LOCK_ROWS.len() {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_CONSUMER_LOCK",
+            "consumer_probe.key_resolved_package.count",
+        ));
+    }
+    for (row, expected) in key_rows.iter().zip(SERIALIZATION_URI_KEY_LOCK_ROWS) {
+        let row = row.as_table().ok_or_else(|| {
+            serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_probe.key_resolved_package.row")
+        })?;
+        let path = format!("consumer_probe.key_resolved_package[name={}]", expected.0);
+        if record_string(row, "name", &path)? != expected.0
+            || record_string(row, "version", &path)? != expected.1
+            || record_string(row, "checksum_sha256", &path)? != expected.2
+            || !string_sequence_is(&record_string_array(row, "features", &path)?, expected.3)
+            || lock_packages.iter().filter_map(toml::Value::as_table).filter(|lock_row| {
+                record_string(lock_row, "name", &path).ok() == Some(expected.0)
+                    && record_string(lock_row, "version", &path).ok() == Some(expected.1)
+                    && record_string(lock_row, "checksum", &path).ok() == Some(expected.2)
+            }).count() != 1
+        {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_CONSUMER_LOCK",
+                path,
+            ));
+        }
+    }
+    let prohibited = string_array(
+        document,
+        "/policy/prohibited_active_packages",
+        "serialization-uri prohibited packages",
+    )?;
+    if !string_sequence_is(
+        &prohibited,
+        &[
+            "tokio",
+            "reqwest",
+            "hyper",
+            "axum",
+            "tower",
+            "async-std",
+            "smol",
+            "rustls",
+            "aws-lc-rs",
+            "rand",
+        ],
+    )
+        || !string_array(
+            document,
+            "/policy/prohibited_active_packages_found",
+            "serialization-uri prohibited packages",
+        )?
+        .is_empty()
+        || pointer_get(
+            document,
+            "/policy/schema_draft",
+            "serialization-uri schema policy",
+        )?
+        .as_str()
+            != Some("Draft 2020-12")
+        || pointer_get(
+            document,
+            "/policy/network_schema_resolution",
+            "serialization-uri schema policy",
+        )?
+        .as_str()
+            != Some("disabled")
+    {
+        return Err(serialization_uri_contract_error(
+            "E_SERIALIZATION_URI_FEATURE_POLICY",
+            "policy.prohibited_active_packages",
+        ));
+    }
+    for package in &prohibited {
+        if lock_packages.iter().filter_map(toml::Value::as_table).any(|row| {
+            row.get("name").and_then(toml::Value::as_str) == Some(package.as_str())
+        }) {
+            return Err(serialization_uri_contract_error(
+                "E_SERIALIZATION_URI_CONSUMER_LOCK",
+                format!("consumer_lock.prohibited_package={package}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_serialization_uri_dependency_contract(files: &[LoadedFile]) -> VResult<()> {
+    let document = parse_source_toml(files, "evidence/fnd-01/serialization-uri-dependencies.toml")?;
+    let lock_file = source_lookup(files, "evidence/fnd-01/serialization-uri-consumer.lock")?;
+    let lock_text = std::str::from_utf8(&lock_file.bytes).map_err(|_| {
+        serialization_uri_contract_error("E_SERIALIZATION_URI_CONSUMER_LOCK", "consumer_lock.utf8")
+    })?;
+    let lock = parse_toml_document(lock_text, "serialization-uri consumer lock")?;
+    validate_serialization_uri_dependency_document(&document, &lock, &lock_file.bytes)
+}
+
+const CORE_CONFORMANCE_NEGATIVE_FAMILIES: [&str; 21] = [
+    "missing artifact",
+    "swapped artifact paths",
+    "truncated artifact",
+    "wrong byte length",
+    "wrong SHA-256",
+    "wrong Git blob",
+    "changed retrieval URL",
+    "floating revision or latest URL",
+    "missing provenance field",
+    "duplicate or missing scenario ID",
+    "missing, duplicate, or changed scenario-local declared check ID",
+    "expected-success versus conditional-failure check-role mismatch",
+    "incomplete transitive helper inventory mislabeled complete",
+    "file-level auth scenario classification",
+    "nonfatal missing cache header mislabeled as forced input",
+    "empty-scope omission mislabeled as a forced signed-scope failure",
+    "missing exact-issuer ID-JAG policy mislabeled as production-only evidence",
+    "expected policy rejection mislabeled as upstream pass",
+    "wrong final error code",
+    "missing or duplicate Section 5 ambiguity entry",
+    "MCP 2025-11-25 substituted for either exact supported core era",
+];
+
+fn core_conformance_authority_field(
+    document: &toml::Value,
+    section: &str,
+    field: &str,
+    expected: &str,
+) -> VResult<()> {
+    if document
+        .as_table()
+        .and_then(|root| root.get(section))
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(field))
+        .and_then(toml::Value::as_str)
+        != Some(expected)
+    {
+        return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", section).at(field));
+    }
+    Ok(())
+}
+
+fn core_conformance_artifact<'a>(
+    document: &'a toml::Value,
+    id: &str,
+) -> VResult<&'a toml::map::Map<String, toml::Value>> {
+    document
+        .as_table()
+        .and_then(|root| root.get("artifacts"))
+        .and_then(toml::Value::as_array)
+        .and_then(|artifacts| {
+            artifacts.iter().filter_map(toml::Value::as_table).find(|artifact| {
+                artifact.get("id").and_then(toml::Value::as_str) == Some(id)
+            })
+        })
+        .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", id))
+}
+
+fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut canonical = format!("blob {}\0", bytes.len()).into_bytes();
+    canonical.extend_from_slice(bytes);
+    lower_hex(ring_digest(&SHA1_FOR_LEGACY_USE_ONLY, &canonical).as_ref())
+}
+
+fn validate_core_conformance_sources(document: &toml::Value, root: &Path) -> VResult<()> {
+    for (section, field, expected) in [
+        ("core", "protocol_version", "2026-07-28"),
+        ("core", "tag", "2026-07-28"),
+        ("core", "tag_commit", "5f5440bb26a62e2cf3440b92da5a667efa03b267"),
+        ("core", "commit_tree", "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"),
+        ("core", "dated_schema_tree", "8b5e263be073848f9531151cb363ccb764eb2da6"),
+        ("core_2024_11_05", "protocol_version", "2024-11-05"),
+        ("core_2024_11_05", "release_tag", "2024-11-05-final"),
+        (
+            "core_2024_11_05",
+            "release_tag_commit",
+            "48234828288ec5e5011398f17b8736f61645f130",
+        ),
+        (
+            "core_2024_11_05",
+            "release_commit_tree",
+            "268325249340b611e0a2644cd2da15c19d1b899c",
+        ),
+        (
+            "core_2024_11_05",
+            "schema_tree",
+            "043f58f4067386664a03a648c73d90008e423110",
+        ),
+        (
+            "core_2024_11_05",
+            "schema_2024_11_05_subtree",
+            "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d",
+        ),
+    ] {
+        core_conformance_authority_field(document, section, field, expected)?;
+    }
+    if pointer_get(document, "/verification/core_tag_command", "core-conformance-verification")?
+        .as_str()
+        != Some(
+            "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2026-07-28",
+        )
+    {
+        return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", "core")
+            .at("core_tag_command"));
+    }
+    if pointer_get(
+        document,
+        "/verification/legacy_core_tag_command",
+        "core-conformance-verification",
+    )?
+    .as_str()
+        != Some(
+            "git ls-remote https://github.com/modelcontextprotocol/modelcontextprotocol.git refs/tags/2024-11-05-final",
+        )
+    {
+        return Err(Diagnostic::error(
+            "E_CORE_CONFORMANCE_AUTHORITY",
+            "core_2024_11_05",
+        )
+        .at("legacy_core_tag_command"));
+    }
+
+    let artifact_ids = [
+        "core-schema-ts",
+        "core-schema-json",
+        "legacy-core-schema-ts",
+        "legacy-core-schema-json",
+        "core-changelog",
+        "conformance-package",
+        "conformance-enterprise-auth",
+        "conformance-client-credentials",
+    ];
+    let artifacts = document
+        .as_table()
+        .and_then(|table| table.get("artifacts"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT_INVENTORY", "artifacts"))?;
+    if artifacts.len() != artifact_ids.len()
+        || document
+            .as_table()
+            .and_then(|table| table.get("artifact_count"))
+            .and_then(toml::Value::as_integer)
+            != Some(8)
+    {
+        return Err(Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT_INVENTORY", "artifacts")
+            .at("count"));
+    }
+    for (index, (artifact, expected_id)) in artifacts.iter().zip(artifact_ids).enumerate() {
+        let artifact = artifact.as_table().ok_or_else(|| {
+            Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT_INVENTORY", "artifacts")
+                .at(index.to_string())
+        })?;
+        if record_string(artifact, "id", "core artifact")? != expected_id {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT_INVENTORY", "artifacts")
+                .at(format!("{index}.id")));
+        }
+        let expected_revision = match expected_id {
+            "core-schema-ts"
+            | "core-schema-json"
+            | "legacy-core-schema-ts"
+            | "legacy-core-schema-json"
+            | "core-changelog" => "5f5440bb26a62e2cf3440b92da5a667efa03b267",
+            "conformance-package"
+            | "conformance-enterprise-auth"
+            | "conformance-client-credentials" => {
+                "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+            }
+            _ => unreachable!("the artifact inventory is fixed"),
+        };
+        if matches!(expected_id, "legacy-core-schema-ts" | "legacy-core-schema-json") {
+            if record_string(artifact, "repository_revision", expected_id)?
+                != "48234828288ec5e5011398f17b8736f61645f130"
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", expected_id)
+                    .at("repository_revision"));
+            }
+        } else if record_string(artifact, "repository_revision", expected_id)? != expected_revision {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", expected_id)
+                .at("repository_revision"));
+        }
+        for field in [
+            "kind",
+            "authority",
+            "repository",
+            "repository_revision",
+            "git_tree",
+            "git_blob_sha1",
+            "upstream_path",
+            "source_page_url",
+            "retrieval_url",
+            "retrieval_date",
+            "vendored_path",
+            "media_type",
+            "sha256",
+        ] {
+            let value = record_string(artifact, field, expected_id)?;
+            if value.is_empty()
+                || (field.ends_with("url") && !value.starts_with("https://"))
+                || (field == "repository" && !value.starts_with("https://github.com/"))
+                || (field == "source_page_url" && !value.contains(record_string(artifact, "repository_revision", expected_id)?))
+                || (field == "retrieval_url" && !value.contains(record_string(artifact, "repository_revision", expected_id)?))
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id)
+                    .at(field));
+            }
+        }
+        if record_usize(artifact, "byte_length", expected_id)? == 0 {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id)
+                .at("byte_length"));
+        }
+    }
+
+    let negative_families = string_array(
+        document,
         "/verification/required_negative_cases",
         "core-required-negative-cases",
     )?;
-    if core_negatives.len() != 20 {
+    if !string_sequence_is(&negative_families, &CORE_CONFORMANCE_NEGATIVE_FAMILIES) {
         return Err(Diagnostic::error(
-            "E_SUPPLEMENTAL_CORE",
+            "E_CORE_CONFORMANCE_NEGATIVE_REGISTRY",
             "required_negative_cases",
         ));
     }
-    validate_case_unique(core_negatives, "core required negative cases")?;
+
+    for (id, path, byte_length, expected_sha256, git_tree, expected_git_blob_sha1) in [
+        (
+            "core-schema-ts",
+            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts",
+            98_426usize,
+            "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd",
+            "8b5e263be073848f9531151cb363ccb764eb2da6",
+            "9b55feeb412bc3ae877f2eac10b5c01ba29a2eed",
+        ),
+        (
+            "core-schema-json",
+            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json",
+            181_474usize,
+            "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203",
+            "8b5e263be073848f9531151cb363ccb764eb2da6",
+            "213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8",
+        ),
+        (
+            "legacy-core-schema-ts",
+            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts",
+            31_201usize,
+            "ad3264cdc22c5091b8ae96c5f5c769a2c7388473d84ca3de6fd55a4feeadfb1e",
+            "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d",
+            "a40e908b8d16412b17aa62c13139bb6ad94d4f01",
+        ),
+        (
+            "legacy-core-schema-json",
+            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json",
+            87_877usize,
+            "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce",
+            "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d",
+            "97a92f0cc292ed4c602f4ee121732cc8ad3be973",
+        ),
+    ] {
+        let artifact = core_conformance_artifact(document, id)?;
+        for (field, expected) in [
+            ("vendored_path", path),
+            ("sha256", expected_sha256),
+            ("git_tree", git_tree),
+            ("git_blob_sha1", expected_git_blob_sha1),
+        ] {
+            if record_string(artifact, field, id)? != expected {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", id).at(field));
+            }
+        }
+        if record_usize(artifact, "byte_length", id)? != byte_length {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", id).at("byte_length"));
+        }
+        let bytes = fs::read(root.join(path))
+            .map_err(|_| Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_IO", id).at(path))?;
+        if bytes.len() != byte_length {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id)
+                .at("byte_length"));
+        }
+        if lower_hex(&sha256(&bytes)) != expected_sha256 {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("sha256"));
+        }
+        if git_blob_sha1(&bytes) != expected_git_blob_sha1 {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id)
+                .at("git_blob_sha1"));
+        }
+    }
+    Ok(())
+}
+
+/// Exact source-order authority inventory for `evidence/fnd-01/auth-standards.toml`.
+const AUTH_ARTIFACT_IDS: &[&str] = &[
+    "mcp-enterprise-managed-authorization",
+    "mcp-oauth-client-credentials",
+    "mcp-auth-overview-2026-07-28",
+    "mcp-enterprise-managed-authorization-overlay-2026-07-28",
+    "mcp-oauth-client-credentials-overlay-2026-07-28",
+    "mcp-authorization-2024-11-05-final",
+    "mcp-authorization-2026-07-28",
+    "mcp-authorization-server-discovery-2026-07-28",
+    "mcp-client-registration-2026-07-28",
+    "mcp-authorization-security-2026-07-28",
+    "id-jag-04",
+    "identity-chaining-12",
+    "oidc-core-errata2",
+    "oidc-discovery-errata2",
+    "oidc-dynamic-registration-errata2",
+    "oidc-enterprise-extensions-01",
+    "oauth-2.1-13",
+    "oauth-2.1-14",
+    "cimd-00",
+    "oauth-2.1-12",
+    "rfc-3986",
+    "rfc-6749",
+    "rfc-6750",
+    "rfc-7591",
+    "rfc-8414",
+    "rfc-8707",
+    "rfc-9207",
+    "rfc-9728",
+    "saml-core-2.0-os",
+    "saml-bindings-2.0-os",
+    "saml-profiles-2.0-os",
+    "saml-metadata-2.0-os",
+    "xml-signature-1.1",
+    "mcp-repository-license-2026-07-28",
+    "ext-auth-license",
+    "rfc-8693",
+    "rfc-7523",
+    "conformance-enterprise-managed-authorization",
+    "conformance-client-credentials",
+];
+
+const AUTH_REQUIRED_DIMENSIONS: &[&str] = &[
+    "id",
+    "group",
+    "title",
+    "title_source",
+    "status",
+    "revision",
+    "published_on",
+    "retrieval_url",
+    "retrieved_on",
+    "format",
+    "byte_length",
+    "sha256",
+    "content_address",
+    "storage",
+    "license_profile",
+    "authority",
+    "must_not_substitute",
+];
+
+const AUTH_FULL_INPUT_DIGEST: &str =
+    "59d0b88301e3ea72b0ac7d672c6ee54aeeab78d8e72bb6c6e3d2f072d3e6d5d1";
+
+const AUTH_EXTENSION_IDENTIFIERS: &[&str] = &[
+    "io.modelcontextprotocol/enterprise-managed-authorization",
+    "io.modelcontextprotocol/oauth-client-credentials",
+];
+
+const AUTH_SAML_STAGE_AUTHORITIES: &[&[&str]] = &[
+    &[
+        "saml-core-2.0-os",
+        "saml-bindings-2.0-os",
+        "saml-profiles-2.0-os",
+        "saml-metadata-2.0-os",
+        "xml-signature-1.1",
+    ],
+    &["rfc-8693", "rfc-8707"],
+    &[
+        "mcp-enterprise-managed-authorization",
+        "id-jag-04",
+        "identity-chaining-12",
+        "rfc-8693",
+        "rfc-8707",
+    ],
+    &["rfc-7523", "rfc-6750", "rfc-8707"],
+];
+
+fn auth_dimension_code(field: &str) -> &'static str {
+    match field {
+        "id" => "E_AUTH_ID",
+        "group" => "E_AUTH_GROUP",
+        "title" | "title_source" | "format" => "E_AUTH_IDENTITY",
+        "status" => "E_AUTH_MATURITY",
+        "revision" => "E_AUTH_REVISION",
+        "published_on" | "retrieved_on" => "E_AUTH_DATE",
+        "retrieval_url" => "E_AUTH_URL",
+        "byte_length" => "E_AUTH_LENGTH",
+        "sha256" => "E_AUTH_SHA256",
+        "content_address" => "E_AUTH_CONTENT_ADDRESS",
+        "storage" => "E_AUTH_STORAGE",
+        "license_profile" => "E_AUTH_LICENSE",
+        "authority" => "E_AUTH_AUTHORITY",
+        "must_not_substitute" => "E_AUTH_SUBSTITUTION",
+        _ => "E_AUTH_IDENTITY",
+    }
+}
+
+fn auth_scalar_rhs_token(value: &toml::Value, id: &str, field: &str) -> VResult<String> {
+    match value {
+        toml::Value::String(text) => {
+            if text.as_bytes().contains(&0) || text.contains('\n') || text.contains('\r') {
+                return Err(Diagnostic::error(auth_dimension_code(field), id).at(field));
+            }
+            let mut encoded = String::from("\"");
+            for ch in text.chars() {
+                match ch {
+                    '\\' => encoded.push_str("\\\\"),
+                    '"' => encoded.push_str("\\\""),
+                    other => encoded.push(other),
+                }
+            }
+            encoded.push('"');
+            Ok(encoded)
+        }
+        toml::Value::Integer(integer) => Ok(integer.to_string()),
+        _ => Err(Diagnostic::error(auth_dimension_code(field), id).at(field)),
+    }
+}
+
+fn auth_is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn auth_artifact_tables(document: &toml::Value) -> VResult<Vec<&toml::map::Map<String, toml::Value>>> {
+    let artifacts = document
+        .as_table()
+        .and_then(|table| table.get("artifacts"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| Diagnostic::error("E_AUTH_ROW_SET", "artifacts").at("missing"))?;
+    let mut tables = Vec::with_capacity(artifacts.len());
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let table = artifact.as_table().ok_or_else(|| {
+            Diagnostic::error("E_AUTH_ROW_SET", "artifacts").at(index.to_string())
+        })?;
+        tables.push(table);
+    }
+    Ok(tables)
+}
+
+fn auth_compile_full_input_digest(
+    artifacts: &[&toml::map::Map<String, toml::Value>],
+) -> VResult<[u8; 32]> {
+    let mut canonical = Vec::new();
+    for artifact in artifacts {
+        let id = record_string(artifact, "id", "auth artifact")?;
+        for field in AUTH_REQUIRED_DIMENSIONS {
+            let value = artifact.get(*field).ok_or_else(|| {
+                Diagnostic::error(auth_dimension_code(field), id).at(*field)
+            })?;
+            let token = auth_scalar_rhs_token(value, id, field)?;
+            canonical.extend_from_slice(field.as_bytes());
+            canonical.push(0);
+            canonical.extend_from_slice(token.as_bytes());
+            canonical.push(0);
+        }
+        canonical.push(b'\n');
+    }
+    Ok(sha256(&canonical))
+}
+
+fn auth_required_set_ids(document: &toml::Value) -> VResult<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    for set_name in [
+        "auth_extensions",
+        "official_extension_overlay",
+        "core_authorization",
+        "enterprise_identity",
+        "core_authorization_drafts",
+        "saml_authorities",
+        "token_exchange_authorities",
+        "rfc_authorities",
+        "license_authorities",
+        "scenario_sources",
+    ] {
+        let members = string_array(
+            document,
+            &format!("/required_sets/{set_name}"),
+            "auth required sets",
+        )?;
+        for member in members {
+            ids.insert(member);
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_auth_sources(document: &toml::Value) -> VResult<()> {
+    let root = document
+        .as_table()
+        .ok_or_else(|| Diagnostic::error("E_AUTH_ROW_SET", "auth-standards").at("root"))?;
+
+    if record_string(root, "evidence_id", "auth-standards")? != "FND-01/auth-standards"
+        || record_string(root, "package_id", "auth-standards")? != "FND-01"
+        || record_string(root, "bead_id", "auth-standards")?
+            != "bd-mcp-2026-07-28-support-ahet.1.4"
+        || record_string(root, "hash_algorithm", "auth-standards")? != "sha256"
+        || record_bool(root, "primary_source_only", "auth-standards")? != true
+        || record_bool(root, "offline_body_rehash_available", "auth-standards")? != false
+        || record_usize(root, "vendor_copy_count", "auth-standards")? != 0
+        || record_usize(root, "remote_pinned_identity_artifact_count", "auth-standards")? != 39
+        || record_usize(root, "authority_artifact_count", "auth-standards")? != 39
+        || record_usize(root, "standard_artifact_count", "auth-standards")? != 35
+        || record_usize(root, "scenario_source_artifact_count", "auth-standards")? != 2
+        || record_usize(root, "license_authority_artifact_count", "auth-standards")? != 2
+        || record_usize(root, "scenario_count", "auth-standards")? != 3
+    {
+        return Err(Diagnostic::error("E_AUTH_ROW_SET", "auth-standards").at("inventory"));
+    }
+
+    let artifacts = auth_artifact_tables(document)?;
+    if artifacts.len() != AUTH_ARTIFACT_IDS.len() {
+        return Err(Diagnostic::error("E_AUTH_ROW_SET", "artifacts").at("count"));
+    }
+
+    let required_ids = auth_required_set_ids(document)?;
+    if required_ids.len() != AUTH_ARTIFACT_IDS.len()
+        || !AUTH_ARTIFACT_IDS
+            .iter()
+            .all(|id| required_ids.contains(*id))
+    {
+        return Err(Diagnostic::error("E_AUTH_ROW_SET", "required_sets").at("membership"));
+    }
+
+    let scenarios = string_array(document, "/required_sets/scenarios", "auth scenarios")?;
+    if !string_sequence_is(
+        &scenarios,
+        &[
+            "auth/enterprise-managed-authorization",
+            "auth/client-credentials-jwt",
+            "auth/client-credentials-basic",
+        ],
+    ) {
+        return Err(Diagnostic::error("E_AUTH_ROW_SET", "required_sets").at("scenarios"));
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    for (index, (artifact, expected_id)) in artifacts.iter().zip(AUTH_ARTIFACT_IDS).enumerate() {
+        let id = record_string(artifact, "id", "auth artifact")?;
+        if id != *expected_id || !seen_ids.insert(id.to_owned()) {
+            return Err(Diagnostic::error("E_AUTH_ID", *expected_id).at(format!("{index}.id")));
+        }
+
+        for field in AUTH_REQUIRED_DIMENSIONS {
+            let value = artifact.get(*field).ok_or_else(|| {
+                Diagnostic::error(auth_dimension_code(field), id).at(*field)
+            })?;
+            match *field {
+                "byte_length" => {
+                    let length = value.as_integer().and_then(|n| u64::try_from(n).ok()).ok_or_else(
+                        || Diagnostic::error("E_AUTH_LENGTH", id).at("byte_length"),
+                    )?;
+                    if length == 0 {
+                        return Err(Diagnostic::error("E_AUTH_LENGTH", id).at("byte_length"));
+                    }
+                }
+                "sha256" => {
+                    let digest = value.as_str().ok_or_else(|| {
+                        Diagnostic::error("E_AUTH_SHA256", id).at("sha256")
+                    })?;
+                    if !auth_is_lower_hex_sha256(digest) {
+                        return Err(Diagnostic::error("E_AUTH_SHA256", id).at("sha256"));
+                    }
+                }
+                "content_address" => {
+                    let address = value.as_str().ok_or_else(|| {
+                        Diagnostic::error("E_AUTH_CONTENT_ADDRESS", id).at("content_address")
+                    })?;
+                    let digest = record_string(artifact, "sha256", id)?;
+                    if address != format!("sha256:{digest}") {
+                        return Err(
+                            Diagnostic::error("E_AUTH_CONTENT_ADDRESS", id).at("content_address")
+                        );
+                    }
+                }
+                "storage" => {
+                    let storage = value.as_str().ok_or_else(|| {
+                        Diagnostic::error("E_AUTH_STORAGE", id).at("storage")
+                    })?;
+                    if storage != "remote-pinned-identity-only" {
+                        return Err(Diagnostic::error("E_AUTH_STORAGE", id).at("storage"));
+                    }
+                }
+                "retrieval_url" => {
+                    let url = value.as_str().ok_or_else(|| {
+                        Diagnostic::error("E_AUTH_URL", id).at("retrieval_url")
+                    })?;
+                    if !url.starts_with("https://") || url.is_empty() {
+                        return Err(Diagnostic::error("E_AUTH_URL", id).at("retrieval_url"));
+                    }
+                }
+                "revision" | "published_on" | "retrieved_on" | "group" | "title"
+                | "title_source" | "status" | "format" | "license_profile" | "authority"
+                | "must_not_substitute" | "id" => {
+                    let text = value.as_str().ok_or_else(|| {
+                        Diagnostic::error(auth_dimension_code(field), id).at(*field)
+                    })?;
+                    if text.is_empty() {
+                        return Err(Diagnostic::error(auth_dimension_code(field), id).at(*field));
+                    }
+                }
+                _ => {}
+            }
+            let _ = auth_scalar_rhs_token(value, id, field)?;
+        }
+    }
+
+    let observed_digest = lower_hex(&auth_compile_full_input_digest(&artifacts)?);
+    if observed_digest != AUTH_FULL_INPUT_DIGEST {
+        return Err(
+            Diagnostic::error("E_AUTH_REACCEPTANCE_REQUIRED", "phase_b_authority_table")
+                .at("full_input_digest"),
+        );
+    }
+    if pointer_get(
+        document,
+        "/phase_b_authority_table/full_input_digest",
+        "auth phase-b digest",
+    )?
+    .as_str()
+        != Some(AUTH_FULL_INPUT_DIGEST)
+        || pointer_get(
+            document,
+            "/phase_b_authority_table/expected_row_count",
+            "auth phase-b digest",
+        )?
+        .as_integer()
+            != Some(39)
+    {
+        return Err(
+            Diagnostic::error("E_AUTH_REACCEPTANCE_REQUIRED", "phase_b_authority_table")
+                .at("declared_digest"),
+        );
+    }
+
+    let client_credentials = artifacts
+        .iter()
+        .find(|artifact| {
+            artifact
+                .get("id")
+                .and_then(toml::Value::as_str)
+                == Some("mcp-oauth-client-credentials")
+        })
+        .ok_or_else(|| {
+            Diagnostic::error("E_AUTH_ID", "mcp-oauth-client-credentials").at("missing")
+        })?;
+    if record_string(client_credentials, "status", "mcp-oauth-client-credentials")? != "draft" {
+        return Err(
+            Diagnostic::error("E_AUTH_MATURITY", "mcp-oauth-client-credentials").at("status"),
+        );
+    }
+
+    if pointer_get(
+        document,
+        "/extension_wire_shape/settings_value_kind",
+        "auth wire shape",
+    )?
+    .as_str()
+        != Some("the exact extension member value is the empty object {} and nothing else")
+        || pointer_get(
+            document,
+            "/extension_wire_shape/server_discover_method",
+            "auth wire shape",
+        )?
+        .as_str()
+            != Some("server/discover")
+    {
+        return Err(Diagnostic::error("E_AUTH_WIRE_PATH", "extension_wire_shape").at("settings"));
+    }
+
+    let client_entries = pointer_get(
+        document,
+        "/extension_wire_shape/client_request_entries",
+        "auth wire shape",
+    )?
+    .as_array()
+    .ok_or_else(|| Diagnostic::error("E_AUTH_WIRE_PATH", "client_request_entries").at("type"))?;
+    if client_entries.len() != AUTH_EXTENSION_IDENTIFIERS.len() {
+        return Err(
+            Diagnostic::error("E_AUTH_WIRE_PATH", "client_request_entries").at("count"),
+        );
+    }
+    for (entry, expected_id) in client_entries.iter().zip(AUTH_EXTENSION_IDENTIFIERS) {
+        let table = entry.as_table().ok_or_else(|| {
+            Diagnostic::error("E_AUTH_WIRE_PATH", "client_request_entries").at("row")
+        })?;
+        if record_string(table, "extension_id", "client_request_entries")? != *expected_id
+            || record_string(table, "exact_json_value", "client_request_entries")? != "{}"
+        {
+            return Err(
+                Diagnostic::error("E_AUTH_WIRE_PATH", *expected_id).at("extension_id"),
+            );
+        }
+    }
+
+    if pointer_get(
+        document,
+        "/rendered_document_drift/rendered_capability_settings",
+        "auth wire shape",
+    )?
+    .as_str()
+        != Some("empty")
+    {
+        return Err(
+            Diagnostic::error("E_AUTH_WIRE_PATH", "rendered_document_drift").at("settings"),
+        );
+    }
+
+    if pointer_get(document, "/clause_provenance/oauth_general_security", "auth clause")?
+        .as_str()
+        != Some("oauth-2.1-13")
+        || pointer_get(
+            document,
+            "/clause_provenance/oauth_refresh_token_confidentiality",
+            "auth clause",
+        )?
+        .as_str()
+            != Some("oauth-2.1-14")
+        || pointer_get(
+            document,
+            "/clause_provenance/core_client_id_metadata_document",
+            "auth clause",
+        )?
+        .as_str()
+            != Some("cimd-00")
+    {
+        return Err(Diagnostic::error("E_AUTH_AUTHORITY", "clause_provenance").at("oauth_routing"));
+    }
+
+    let stages = pointer_get(document, "/saml_chain/stages", "auth saml chain")?
+        .as_array()
+        .ok_or_else(|| Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at("stages"))?;
+    if stages.len() != AUTH_SAML_STAGE_AUTHORITIES.len() {
+        return Err(Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at("stage_count"));
+    }
+    for (index, (stage, expected_authorities)) in
+        stages.iter().zip(AUTH_SAML_STAGE_AUTHORITIES).enumerate()
+    {
+        let table = stage
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at(index.to_string()))?;
+        if record_usize(table, "order", "saml_chain")? != index + 1 {
+            return Err(Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at(format!("{index}.order")));
+        }
+        let authorities = record_string_array(table, "authority_artifacts", "saml_chain")?;
+        if !string_sequence_is(&authorities, expected_authorities) {
+            return Err(
+                Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at(format!("{index}.authorities")),
+            );
+        }
+    }
+    let accepted_forms = string_array(
+        document,
+        "/saml_chain/accepted_initial_identity_forms",
+        "auth saml chain",
+    )?;
+    if !string_sequence_is(&accepted_forms, &["OIDC ID Token", "SAML assertion"]) {
+        return Err(
+            Diagnostic::error("E_AUTH_CHAIN", "saml_chain").at("accepted_initial_identity_forms"),
+        );
+    }
+
+    if pointer_get(
+        document,
+        "/closure_boundary/aggregate_auth_support_claimed",
+        "auth nonpromotion",
+    )?
+    .as_bool()
+        != Some(false)
+        || pointer_get(
+            document,
+            "/closure_boundary/aggregate_fnd_01_support_claimed",
+            "auth nonpromotion",
+        )?
+        .as_bool()
+            != Some(false)
+        || pointer_get(document, "/vendor_snapshot/present_artifact_count", "auth vendor")?
+            .as_integer()
+            != Some(0)
+        || pointer_get(document, "/vendor_snapshot/capability_credit", "auth vendor")?.as_bool()
+            != Some(false)
+        || pointer_get(
+            document,
+            "/client_secret_transport_conflict/draft_conformance_claimed",
+            "auth client-secret conflict",
+        )?
+        .as_bool()
+            != Some(false)
+        || pointer_get(
+            document,
+            "/verification_tests/capability_credit",
+            "auth verification",
+        )?
+        .as_bool()
+            != Some(false)
+        || pointer_get(
+            document,
+            "/verification_tests/positive_test_id",
+            "auth verification",
+        )?
+        .as_str()
+            != Some("ordinary::fnd_01_auth_sources_positive")
+        || pointer_get(
+            document,
+            "/verification_tests/planted_negative_test_id",
+            "auth verification",
+        )?
+        .as_str()
+            != Some("ordinary::fnd_01_auth_sources_planted_negative")
+    {
+        return Err(Diagnostic::error("E_AUTH_AUTHORITY", "closure_boundary").at("nonpromotion"));
+    }
+
+    let scenario_rows = pointer_get(document, "/scenarios", "auth scenarios")?
+        .as_array()
+        .ok_or_else(|| Diagnostic::error("E_AUTH_ROW_SET", "scenarios").at("missing"))?;
+    if scenario_rows.len() != 3 {
+        return Err(Diagnostic::error("E_AUTH_ROW_SET", "scenarios").at("count"));
+    }
+    for (index, (expected_id, expected_upstream_pass_claim)) in [
+        (
+            "auth/enterprise-managed-authorization",
+            "forbidden",
+        ),
+        ("auth/client-credentials-jwt", "forbidden"),
+        (
+            "auth/client-credentials-basic",
+            "forbidden-as-production-evidence",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let table = scenario_rows[index].as_table().ok_or_else(|| {
+            Diagnostic::error("E_AUTH_ROW_SET", "scenarios").at(index.to_string())
+        })?;
+        if record_string(table, "id", "scenarios")? != expected_id
+            || record_string(table, "upstream_pass_claim", "scenarios")?
+                != expected_upstream_pass_claim
+        {
+            return Err(Diagnostic::error("E_AUTH_ROW_SET", expected_id).at("scenario"));
+        }
+    }
+
+    if pointer_get(
+        document,
+        "/scenario_classification/raw_expected_rejection_is_upstream_pass",
+        "auth scenario classification",
+    )?
+    .as_bool()
+        != Some(false)
+        || pointer_get(
+            document,
+            "/scenario_classification/duplicate_enterprise_inventory_in_this_manifest",
+            "auth scenario classification",
+        )?
+        .as_bool()
+            != Some(false)
+    {
+        return Err(
+            Diagnostic::error("E_AUTH_AUTHORITY", "scenario_classification").at("nonnormative"),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
+    let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
+    validate_core_conformance_sources(&core, &repository_root())?;
 
     let jose = parse_source_toml(files, "evidence/fnd-01/jose-ring.toml")?;
     if parse_rs256_source_vectors(files)?.len() != RS256_SOURCE_REGISTRY.len() {
@@ -75271,42 +76697,8 @@ fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VRe
     }
 
     let auth = parse_source_toml(files, "evidence/fnd-01/auth-standards.toml")?;
-    if pointer_get(
-        &auth,
-        "/closure_boundary/aggregate_auth_support_claimed",
-        "auth nonpromotion",
-    )?
-    .as_bool()
-        != Some(false)
-        || pointer_get(
-            &auth,
-            "/closure_boundary/aggregate_fnd_01_support_claimed",
-            "auth nonpromotion",
-        )?
-        .as_bool()
-            != Some(false)
-    {
-        return Err(Diagnostic::error("E_QUARANTINE_AUTH", "support claims"));
-    }
-    let serialization = parse_source_toml(
-        files,
-        "evidence/fnd-01/serialization-uri-dependencies.toml",
-    )?;
-    if pointer_get(&serialization, "/toolchain/resolver", "serialization resolver")?.as_str()
-        != Some("2")
-        || pointer_get(
-            &serialization,
-            "/gate/workspace_manifests_integrated",
-            "serialization resolver",
-        )?
-        .as_bool()
-            != Some(false)
-    {
-        return Err(Diagnostic::error(
-            "E_RESOLVER_CANDIDATE",
-            "serialization-uri",
-        ));
-    }
+    validate_auth_sources(&auth)?;
+    validate_serialization_uri_dependency_contract(files)?;
     let media_graph = parse_source_toml(
         files,
         "evidence/fnd-01/vectors/media/graph-snapshot.toml",
@@ -81867,6 +83259,2767 @@ fn fnd_01_rng_delta_rejects_coordinate_endpoint_and_reachability_drift() {
     assert_eq!(error.code, "E_RNG_GRAPH_REACHABILITY");
 }
 
+fn serialization_uri_contract_test_sources() -> Vec<LoadedFile> {
+    let root = repository_root();
+    let (policy, _) =
+        read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    load_sources(&root, &policy)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+}
+
+#[test]
+fn fnd_01_serialization_uri_dependencies_positive() {
+    let files = serialization_uri_contract_test_sources();
+    validate_serialization_uri_dependency_contract(&files)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+}
+
+#[test]
+fn fnd_01_serialization_uri_dependencies_planted_negative() {
+    let files = serialization_uri_contract_test_sources();
+    validate_serialization_uri_dependency_contract(&files)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let mut document = parse_source_toml(&files, "evidence/fnd-01/serialization-uri-dependencies.toml")
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let lock_file = source_lookup(&files, "evidence/fnd-01/serialization-uri-consumer.lock")
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let consumer_lock = parse_toml_document(
+        std::str::from_utf8(&lock_file.bytes).expect("consumer lock UTF-8"),
+        "serialization-uri planted negative lock",
+    )
+    .expect("consumer lock TOML");
+    let original = pointer_get(
+        &document,
+        "/crate/name=jsonschema/prohibited_features/0",
+        "serialization-uri planted negative",
+    )
+    .expect("jsonschema's first forbidden feature")
+    .as_str()
+    .expect("forbidden feature is a string")
+    .to_owned();
+    assert_eq!(original, "default");
+    set_pointer(
+        &mut document,
+        "/crate/name=jsonschema/prohibited_features/0",
+        toml::Value::String("default-drift".to_owned()),
+        "serialization-uri planted negative",
+    )
+    .expect("one forbidden feature replacement");
+
+    let error = validate_serialization_uri_dependency_document(
+        &document,
+        &consumer_lock,
+        &lock_file.bytes,
+    )
+    .expect_err("one forbidden-feature mutation must fail the production contract");
+    assert_eq!(
+        error.stable(),
+        "FND01|Error|E_SERIALIZATION_URI_FEATURE_POLICY|serialization-uri-dependencies|crate[name=jsonschema].prohibited_features"
+    );
+    assert_eq!(
+        pointer_get(
+            &parse_source_toml(&files, "evidence/fnd-01/serialization-uri-dependencies.toml")
+                .expect("accepted source remains parseable"),
+            "/crate/name=jsonschema/prohibited_features/0",
+            "accepted serialization-uri source",
+        )
+        .expect("accepted forbidden feature")
+        .as_str(),
+        Some("default")
+    );
+}
+
+fn core_conformance_test_document() -> toml::Value {
+    let root = repository_root();
+    let path = root.join("evidence/fnd-01/core-conformance.toml");
+    let bytes = fs::read(&path).expect("core conformance manifest must be readable");
+    parse_toml_document(
+        std::str::from_utf8(&bytes).expect("core conformance manifest must be UTF-8"),
+        "core conformance test manifest",
+    )
+    .expect("core conformance manifest must be TOML")
+}
+
+#[test]
+fn fnd_01_core_conformance_sources_positive() {
+    let root = repository_root();
+    let document = core_conformance_test_document();
+    validate_core_conformance_sources(&document, &root)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+}
+
+#[test]
+fn fnd_01_core_conformance_sources_planted_negative() {
+    let root = repository_root();
+    let baseline = core_conformance_test_document();
+    validate_core_conformance_sources(&baseline, &root)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+    for (family, pointer, replacement, expected) in [
+        ("missing artifact", "/artifacts/0/id", "missing", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|0.id"),
+        ("swapped artifact paths", "/artifacts/0/vendored_path", "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|vendored_path"),
+        ("truncated artifact", "/artifacts/0/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|sha256"),
+        ("wrong byte length", "/artifacts/0/byte_length", "1", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
+        ("wrong SHA-256", "/artifacts/1/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|sha256"),
+        ("wrong Git blob", "/artifacts/1/git_blob_sha1", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|git_blob_sha1"),
+        ("changed retrieval URL", "/artifacts/4/retrieval_url", "http://example.invalid", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|retrieval_url"),
+        ("floating revision or latest URL", "/artifacts/4/repository_revision", "main", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-changelog|repository_revision"),
+        ("missing provenance field", "/artifacts/4/authority", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|authority"),
+        ("duplicate or missing scenario ID", "/artifacts/5/id", "core-changelog", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|5.id"),
+        ("missing, duplicate, or changed scenario-local declared check ID", "/artifacts/5/upstream_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-package|upstream_path"),
+        ("expected-success versus conditional-failure check-role mismatch", "/artifacts/5/kind", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-package|kind"),
+        ("incomplete transitive helper inventory mislabeled complete", "/artifacts/6/media_type", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|media_type"),
+        ("file-level auth scenario classification", "/artifacts/6/repository", "not-a-url", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|repository"),
+        ("nonfatal missing cache header mislabeled as forced input", "/artifacts/6/git_tree", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|git_tree"),
+        ("empty-scope omission mislabeled as a forced signed-scope failure", "/artifacts/6/source_page_url", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|source_page_url"),
+        ("missing exact-issuer ID-JAG policy mislabeled as production-only evidence", "/artifacts/7/retrieval_date", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|retrieval_date"),
+        ("expected policy rejection mislabeled as upstream pass", "/artifacts/7/vendored_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|vendored_path"),
+        ("wrong final error code", "/artifacts/7/git_blob_sha1", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|git_blob_sha1"),
+        ("missing or duplicate Section 5 ambiguity entry", "/artifact_count", "7", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count"),
+        ("MCP 2025-11-25 substituted for either exact supported core era", "/core_2024_11_05/release_tag", "2025-11-25", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core_2024_11_05|release_tag"),
+    ] {
+        let mut drifted = baseline.clone();
+        let value = if pointer.ends_with("byte_length") || pointer == "/artifact_count" {
+            toml::Value::Integer(replacement.parse().expect("integer mutation"))
+        } else {
+            toml::Value::String(replacement.to_owned())
+        };
+        set_pointer(&mut drifted, pointer, value, family)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let error = validate_core_conformance_sources(&drifted, &root)
+            .expect_err("each registered core mutation must reject");
+        assert_eq!(error.stable(), expected, "{family}");
+    }
+
+    validate_core_conformance_sources(&baseline, &root)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+}
+
+fn auth_standards_test_document() -> toml::Value {
+    let root = repository_root();
+    let path = root.join("evidence/fnd-01/auth-standards.toml");
+    let bytes = fs::read(&path).expect("auth standards manifest must be readable");
+    parse_toml_document(
+        std::str::from_utf8(&bytes).expect("auth standards manifest must be UTF-8"),
+        "auth standards test manifest",
+    )
+    .expect("auth standards manifest must be TOML")
+}
+
+#[test]
+fn fnd_01_auth_sources_positive() {
+    let document = auth_standards_test_document();
+    validate_auth_sources(&document)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let artifacts = auth_artifact_tables(&document).expect("validated artifacts");
+    assert_eq!(artifacts.len(), 39);
+    assert_eq!(
+        lower_hex(&auth_compile_full_input_digest(&artifacts).expect("digest")),
+        AUTH_FULL_INPUT_DIGEST
+    );
+}
+
+#[test]
+fn fnd_01_auth_sources_planted_negative() {
+    let baseline = auth_standards_test_document();
+    validate_auth_sources(&baseline)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+    for (family, pointer, replacement, expected) in [
+        (
+            "missing required artifact id",
+            "/artifacts/0/id",
+            toml::Value::String("missing-required-artifact".to_owned()),
+            "FND01|Error|E_AUTH_ID|mcp-enterprise-managed-authorization|0.id",
+        ),
+        (
+            "draft client-credentials maturity inflation",
+            "/artifacts/1/status",
+            toml::Value::String("stable".to_owned()),
+            "FND01|Error|E_AUTH_REACCEPTANCE_REQUIRED|phase_b_authority_table|full_input_digest",
+        ),
+        (
+            "changed retrieval URL",
+            "/artifacts/2/retrieval_url",
+            toml::Value::String("https://example.invalid/overlay".to_owned()),
+            "FND01|Error|E_AUTH_REACCEPTANCE_REQUIRED|phase_b_authority_table|full_input_digest",
+        ),
+        (
+            "changed byte length",
+            "/artifacts/0/byte_length",
+            toml::Value::Integer(1),
+            "FND01|Error|E_AUTH_REACCEPTANCE_REQUIRED|phase_b_authority_table|full_input_digest",
+        ),
+        (
+            "sha256 and content_address disagree",
+            "/artifacts/0/sha256",
+            toml::Value::String(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ),
+            "FND01|Error|E_AUTH_CONTENT_ADDRESS|mcp-enterprise-managed-authorization|content_address",
+        ),
+        (
+            "floating latest revision",
+            "/artifacts/0/revision",
+            toml::Value::String("git:main".to_owned()),
+            "FND01|Error|E_AUTH_REACCEPTANCE_REQUIRED|phase_b_authority_table|full_input_digest",
+        ),
+        (
+            "local storage promotion",
+            "/artifacts/0/storage",
+            toml::Value::String("local-vendor-copy".to_owned()),
+            "FND01|Error|E_AUTH_STORAGE|mcp-enterprise-managed-authorization|storage",
+        ),
+        (
+            "wire identifier substitution",
+            "/extension_wire_shape/client_request_entries/0/extension_id",
+            toml::Value::String("io.modelcontextprotocol/not-an-official-id".to_owned()),
+            "FND01|Error|E_AUTH_WIRE_PATH|io.modelcontextprotocol/enterprise-managed-authorization|extension_id",
+        ),
+        (
+            "empty settings mutation",
+            "/extension_wire_shape/client_request_entries/0/exact_json_value",
+            toml::Value::String("{\"enabled\":true}".to_owned()),
+            "FND01|Error|E_AUTH_WIRE_PATH|io.modelcontextprotocol/enterprise-managed-authorization|extension_id",
+        ),
+        (
+            "saml chain authority edge mutation",
+            "/saml_chain/stages/1/authority_artifacts/0",
+            toml::Value::String("rfc-6749".to_owned()),
+            "FND01|Error|E_AUTH_CHAIN|saml_chain|1.authorities",
+        ),
+        (
+            "oauth clause routing swap",
+            "/clause_provenance/oauth_general_security",
+            toml::Value::String("oauth-2.1-14".to_owned()),
+            "FND01|Error|E_AUTH_AUTHORITY|clause_provenance|oauth_routing",
+        ),
+        (
+            "scenario inventory drift",
+            "/required_sets/scenarios/0",
+            toml::Value::String("auth/not-a-scenario".to_owned()),
+            "FND01|Error|E_AUTH_ROW_SET|required_sets|scenarios",
+        ),
+        (
+            "aggregate claim promotion",
+            "/closure_boundary/aggregate_auth_support_claimed",
+            toml::Value::Boolean(true),
+            "FND01|Error|E_AUTH_AUTHORITY|closure_boundary|nonpromotion",
+        ),
+        (
+            "declared full-input digest drift",
+            "/phase_b_authority_table/full_input_digest",
+            toml::Value::String(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ),
+            "FND01|Error|E_AUTH_REACCEPTANCE_REQUIRED|phase_b_authority_table|declared_digest",
+        ),
+    ] {
+        let mut drifted = baseline.clone();
+        set_pointer(&mut drifted, pointer, replacement, family)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let error =
+            validate_auth_sources(&drifted).expect_err("each registered auth mutation must reject");
+        assert_eq!(error.stable(), expected, "{family}");
+        validate_auth_sources(&baseline)
+            .unwrap_or_else(|diagnostic| panic!("baseline must reaccept after {family}: {}", diagnostic.stable()));
+    }
+
+    validate_auth_sources(&baseline)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+}
+
+#[derive(Clone)]
+struct StatePartitionRngRustSource {
+    text: String,
+    tokens: TokenStream,
+}
+
+#[derive(Clone)]
+struct StatePartitionRngInventory {
+    rust_sources: BTreeMap<String, StatePartitionRngRustSource>,
+    manifests: BTreeMap<String, String>,
+    member_roots: BTreeSet<String>,
+    cargo_lock: String,
+}
+
+fn state_partition_rng_inventory_error(path: impl Into<String>) -> Diagnostic {
+    Diagnostic::error("E_STATE_PARTITION_RNG_INVENTORY", "state-partition-rng").at(path)
+}
+
+fn load_state_partition_rng_rust_source(
+    inventory: &mut StatePartitionRngInventory,
+    logical_path: String,
+    absolute_path: &Path,
+) -> VResult<()> {
+    let text = fs::read_to_string(absolute_path)
+        .map_err(|_| state_partition_rng_inventory_error(&logical_path))?;
+    let tokens = TokenStream::from_str(&text).map_err(|error| {
+        state_partition_rng_inventory_error(format!("{logical_path}:{error}"))
+    })?;
+    if inventory
+        .rust_sources
+        .insert(logical_path.clone(), StatePartitionRngRustSource { text, tokens })
+        .is_some()
+    {
+        return Err(state_partition_rng_inventory_error(format!(
+            "duplicate:{logical_path}"
+        )));
+    }
+    Ok(())
+}
+
+fn collect_state_partition_rng_workspace_inventory(
+    inventory: &mut StatePartitionRngInventory,
+    root: &Path,
+    logical_directory: &str,
+) -> VResult<()> {
+    let directory = root.join(logical_directory);
+    let mut entries = fs::read_dir(&directory)
+        .map_err(|_| state_partition_rng_inventory_error(logical_directory))?
+        .map(|entry| {
+            let entry = entry.map_err(|_| state_partition_rng_inventory_error(logical_directory))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| state_partition_rng_inventory_error(logical_directory))?;
+            Ok((name, entry.path()))
+        })
+        .collect::<VResult<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, absolute_path) in entries {
+        let logical_path = format!("{logical_directory}/{name}");
+        let metadata = fs::symlink_metadata(&absolute_path)
+            .map_err(|_| state_partition_rng_inventory_error(&logical_path))?;
+        if metadata.file_type().is_symlink() {
+            return Err(state_partition_rng_inventory_error(format!(
+                "symlink:{logical_path}"
+            )));
+        }
+        if metadata.is_dir() {
+            collect_state_partition_rng_workspace_inventory(inventory, root, &logical_path)?;
+        } else if metadata.is_file() && name.ends_with(".rs") {
+            load_state_partition_rng_rust_source(inventory, logical_path, &absolute_path)?;
+        } else if metadata.is_file() && name == "Cargo.toml" {
+            let manifest = fs::read_to_string(&absolute_path)
+                .map_err(|_| state_partition_rng_inventory_error(&logical_path))?;
+            if inventory.manifests.insert(logical_path.clone(), manifest).is_some() {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "duplicate:{logical_path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn state_partition_rng_inventory() -> VResult<StatePartitionRngInventory> {
+    let root = repository_root();
+    let mut inventory = StatePartitionRngInventory {
+        rust_sources: BTreeMap::new(),
+        manifests: BTreeMap::new(),
+        member_roots: BTreeSet::new(),
+        cargo_lock: fs::read_to_string(root.join("Cargo.lock"))
+            .map_err(|_| state_partition_rng_inventory_error("Cargo.lock"))?,
+    };
+    let root_manifest = root.join("Cargo.toml");
+    inventory.manifests.insert(
+        "Cargo.toml".to_owned(),
+        fs::read_to_string(root_manifest)
+            .map_err(|_| state_partition_rng_inventory_error("Cargo.toml"))?,
+    );
+    let root_value = toml::from_str::<toml::Value>(
+        inventory
+            .manifests
+            .get("Cargo.toml")
+            .expect("root manifest was just inserted"),
+    )
+    .map_err(|_| state_partition_rng_inventory_error("Cargo.toml"))?;
+    let members = root_value
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| state_partition_rng_inventory_error("Cargo.toml:workspace.members"))?;
+    for member in members {
+        let member = member
+            .as_str()
+            .filter(|member| {
+                member.starts_with("crates/")
+                    && !member.contains('*')
+                    && !Path::new(member).is_absolute()
+                    && Path::new(member)
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+            })
+            .ok_or_else(|| state_partition_rng_inventory_error("Cargo.toml:workspace.members"))?;
+        if !inventory.member_roots.insert(member.to_owned()) {
+            return Err(state_partition_rng_inventory_error(format!("duplicate:{member}")));
+        }
+    }
+    for member in inventory.member_roots.clone() {
+        collect_state_partition_rng_workspace_inventory(&mut inventory, &root, &member)?;
+    }
+    let expected_manifests = inventory
+        .member_roots
+        .iter()
+        .map(|member| format!("{member}/Cargo.toml"))
+        .collect::<BTreeSet<_>>();
+    let actual_manifests = inventory
+        .manifests
+        .keys()
+        .filter(|path| path.as_str() != "Cargo.toml")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_manifests != expected_manifests {
+        return Err(state_partition_rng_inventory_error("workspace member manifests"));
+    }
+    Ok(inventory)
+}
+
+fn state_partition_rng_path_count(
+    stream: &TokenStream,
+    first: &str,
+    second: &str,
+) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .windows(4)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], first)
+                && matches!(&window[1], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[2], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && state_partition_rng_token_identifier_is(&window[3], second)
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_path_count(
+                    &group.stream(),
+                    first,
+                    second,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_identifier_is(identifier: &proc_macro2::Ident, expected: &str) -> bool {
+    let rendered = identifier.to_string();
+    rendered.strip_prefix("r#").unwrap_or(&rendered) == expected
+}
+
+fn state_partition_rng_token_identifier_is(tree: &TokenTree, expected: &str) -> bool {
+    matches!(tree, TokenTree::Ident(identifier) if state_partition_rng_identifier_is(identifier, expected))
+}
+
+fn state_partition_rng_identifier_count(stream: &TokenStream, expected: &str) -> usize {
+    stream
+        .clone()
+        .into_iter()
+        .map(|tree| match tree {
+            TokenTree::Ident(identifier) => usize::from(state_partition_rng_identifier_is(&identifier, expected)),
+            TokenTree::Group(group) => state_partition_rng_identifier_count(&group.stream(), expected),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => 0,
+        })
+        .sum()
+}
+
+fn state_partition_rng_qualified_call_count(stream: &TokenStream, path: &[&str]) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = (path.len() >= 2)
+        .then(|| {
+            trees
+                .iter()
+                .enumerate()
+                .filter(|(start, _)| {
+                    let mut index = *start;
+                    for (segment_index, segment) in path.iter().enumerate() {
+                        if !trees
+                            .get(index)
+                            .is_some_and(|tree| state_partition_rng_token_identifier_is(tree, segment))
+                        {
+                            return false;
+                        }
+                        index += 1;
+                        if segment_index + 1 != path.len() {
+                            if !matches!(trees.get(index), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+                                || !matches!(trees.get(index + 1), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+                            {
+                                return false;
+                            }
+                            index += 2;
+                        }
+                    }
+                    matches!(
+                        trees.get(index),
+                        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis
+                    )
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_qualified_call_count(
+                    &group.stream(),
+                    path,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_use_root_count(stream: &TokenStream, root: &str) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .iter()
+        .enumerate()
+        .filter(|(index, tree)| {
+            if !state_partition_rng_token_identifier_is(tree, "use") {
+                return false;
+            }
+            let mut root_index = index + 1;
+            if matches!(trees.get(root_index), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+                && matches!(trees.get(root_index + 1), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+            {
+                root_index += 2;
+            }
+            trees
+                .get(root_index)
+                .is_some_and(|tree| state_partition_rng_token_identifier_is(tree, root))
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => {
+                    Some(state_partition_rng_use_root_count(&group.stream(), root))
+                }
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_namespace_reference_count(stream: &TokenStream, namespace: &str) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .iter()
+        .enumerate()
+        .filter(|(index, tree)| {
+            state_partition_rng_token_identifier_is(tree, namespace)
+                && ((matches!(trees.get(index.saturating_sub(2)), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+                    && matches!(trees.get(index.saturating_sub(1)), Some(TokenTree::Punct(punct)) if punct.as_char() == ':'))
+                    || (matches!(trees.get(index + 1), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')
+                        && matches!(trees.get(index + 2), Some(TokenTree::Punct(punct)) if punct.as_char() == ':')))
+        })
+        .count();
+    local
+        + state_partition_rng_use_root_count(stream, namespace)
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_namespace_reference_count(
+                    &group.stream(),
+                    namespace,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+const STATE_PARTITION_RNG_SEALED_APIS: [&str; 5] = [
+    "draw_hmac_sha256_key",
+    "draw_security_identifier",
+    "draw_ephemeral_key_material",
+    "draw_nonce_domain_material",
+    "draw_websocket_mask",
+];
+
+fn state_partition_rng_sealed_api_reference_count(stream: &TokenStream, api: &str) -> usize {
+    stream
+        .clone()
+        .into_iter()
+        .map(|tree| match tree {
+            TokenTree::Ident(identifier) => usize::from(state_partition_rng_identifier_is(&identifier, api)),
+            TokenTree::Group(group) => {
+                state_partition_rng_sealed_api_reference_count(&group.stream(), api)
+            }
+            TokenTree::Punct(_) | TokenTree::Literal(_) => 0,
+        })
+        .sum()
+}
+
+fn state_partition_rng_sealed_api_is_allowlisted(path: &str, api: &str) -> bool {
+    match path {
+        "crates/fastmcp-core/src/crypto.rs"
+        | "crates/fastmcp-core/src/lib.rs"
+        | "crates/fastmcp/src/lib.rs" => STATE_PARTITION_RNG_SEALED_APIS.contains(&api),
+        "crates/fastmcp-core/src/state.rs"
+        | "crates/fastmcp-server/src/oauth.rs"
+        | "crates/fastmcp-transport/src/http.rs"
+        | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
+        "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
+        _ => false,
+    }
+}
+
+fn state_partition_rng_source<'a>(
+    inventory: &'a StatePartitionRngInventory,
+    path: &str,
+) -> VResult<&'a StatePartitionRngRustSource> {
+    inventory.rust_sources.get(path).ok_or_else(|| {
+        Diagnostic::error("E_STATE_PARTITION_RNG_INVENTORY", "state-partition-rng").at(path)
+    })
+}
+
+fn state_partition_rng_method_body(
+    source: &StatePartitionRngRustSource,
+    method: &str,
+) -> VResult<Group> {
+    let methods = impl_method_suffixes(&source.tokens, "SessionState", method);
+    if methods.len() != 1 {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM",
+            "state-partition-rng",
+        )
+        .at(format!("crates/fastmcp-core/src/state.rs:SessionState::{method}")));
+    }
+    Ok(methods[0].1.clone())
+}
+
+fn state_partition_rng_method_suffix(
+    source: &StatePartitionRngRustSource,
+    method: &str,
+) -> VResult<Vec<TokenTree>> {
+    let methods = impl_method_suffixes(&source.tokens, "SessionState", method);
+    if methods.len() != 1 {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM_SIGNATURE",
+            "state-partition-rng",
+        )
+        .at(format!("crates/fastmcp-core/src/state.rs:SessionState::{method}")));
+    }
+    Ok(methods[0].0.clone())
+}
+
+fn state_partition_rng_session_state_method_bodies(
+    stream: &TokenStream,
+) -> Vec<(String, Group)> {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let mut methods = Vec::new();
+    for index in 0..trees.len().saturating_sub(2) {
+        if !state_partition_rng_token_identifier_is(&trees[index], "impl")
+            || !state_partition_rng_token_identifier_is(&trees[index + 1], "SessionState")
+        {
+            continue;
+        }
+        let Some(TokenTree::Group(implementation)) = trees.get(index + 2) else {
+            continue;
+        };
+        if implementation.delimiter() != Delimiter::Brace {
+            continue;
+        }
+        let members = implementation.stream().into_iter().collect::<Vec<_>>();
+        for member_index in 0..members.len().saturating_sub(1) {
+            if !state_partition_rng_token_identifier_is(&members[member_index], "fn") {
+                continue;
+            }
+            let Some(TokenTree::Ident(name)) = members.get(member_index + 1) else {
+                continue;
+            };
+            if let Some(TokenTree::Group(body)) = members
+                .iter()
+                .skip(member_index + 2)
+                .find(|tree| matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
+            {
+                methods.push((name.to_string(), body.clone()));
+            }
+        }
+    }
+    methods
+}
+
+fn state_partition_rng_method_visibility_count(stream: &TokenStream, method: &str) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let direct = trees
+        .windows(3)
+        .filter(|window| {
+            matches!(&window[0], TokenTree::Ident(ident) if ident == "pub")
+                && matches!(&window[1], TokenTree::Ident(ident) if ident == "fn")
+                && matches!(&window[2], TokenTree::Ident(ident) if ident == method)
+        })
+        .count();
+    let restricted = trees
+        .windows(4)
+        .filter(|window| {
+            matches!(&window[0], TokenTree::Ident(ident) if ident == "pub")
+                && matches!(&window[1], TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis)
+                && matches!(&window[2], TokenTree::Ident(ident) if ident == "fn")
+                && matches!(&window[3], TokenTree::Ident(ident) if ident == method)
+        })
+        .count();
+    direct
+        + restricted
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_method_visibility_count(
+                    &group.stream(),
+                    method,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_named_function_bodies(stream: &TokenStream, name: &str) -> Vec<Group> {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let mut bodies = Vec::new();
+    for index in 0..trees.len().saturating_sub(1) {
+        if !state_partition_rng_token_identifier_is(&trees[index], "fn")
+            || !state_partition_rng_token_identifier_is(&trees[index + 1], name)
+        {
+            continue;
+        }
+        if let Some(TokenTree::Group(body)) = trees
+            .iter()
+            .skip(index + 2)
+            .find(|tree| matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
+        {
+            bodies.push(body.clone());
+        }
+    }
+    for tree in &trees {
+        if let TokenTree::Group(group) = tree {
+            bodies.extend(state_partition_rng_named_function_bodies(&group.stream(), name));
+        }
+    }
+    bodies
+}
+
+fn state_partition_rng_input_digest_excluding_paths(
+    inventory: &StatePartitionRngInventory,
+    excluded_paths: &[&str],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for (path, source) in &inventory.rust_sources {
+        if !excluded_paths.contains(&path.as_str()) {
+            digest.update(path.as_bytes());
+            digest.update([0]);
+            digest.update(source.text.as_bytes());
+            digest.update([0]);
+        }
+    }
+    for (path, manifest) in &inventory.manifests {
+        if !excluded_paths.contains(&path.as_str()) {
+            digest.update(path.as_bytes());
+            digest.update([0]);
+            digest.update(manifest.as_bytes());
+            digest.update([0]);
+        }
+    }
+    for member in &inventory.member_roots {
+        digest.update(member.as_bytes());
+        digest.update([0]);
+    }
+    if !excluded_paths.contains(&"Cargo.lock") {
+        digest.update(b"Cargo.lock");
+        digest.update([0]);
+        digest.update(inventory.cargo_lock.as_bytes());
+        digest.update([0]);
+    }
+    digest.finalize().into()
+}
+
+fn state_partition_rng_input_digest_excluding(
+    inventory: &StatePartitionRngInventory,
+    excluded_path: &str,
+) -> [u8; 32] {
+    state_partition_rng_input_digest_excluding_paths(inventory, &[excluded_path])
+}
+
+fn state_partition_rng_other_input_digest(inventory: &StatePartitionRngInventory) -> [u8; 32] {
+    state_partition_rng_input_digest_excluding(inventory, "crates/fastmcp-core/src/state.rs")
+}
+
+fn state_partition_rng_use_member_count(
+    stream: &TokenStream,
+    public: bool,
+    crate_name: &str,
+    member: &str,
+) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let prefix = if public { 5 } else { 4 };
+    let mut count = trees
+        .windows(prefix + 1)
+        .filter_map(|window| {
+            let offset = usize::from(public);
+            let matches_visibility = !public || state_partition_rng_token_identifier_is(&window[0], "pub");
+            let matches_prefix = matches_visibility
+                && state_partition_rng_token_identifier_is(&window[offset], "use")
+                && state_partition_rng_token_identifier_is(&window[offset + 1], crate_name)
+                && matches!(&window[offset + 2], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[offset + 3], TokenTree::Punct(punct) if punct.as_char() == ':');
+            let TokenTree::Group(group) = &window[offset + 4] else {
+                return None;
+            };
+            (matches_prefix && group.delimiter() == Delimiter::Brace).then_some(group)
+        })
+        .map(|group| {
+            let members = group.stream().into_iter().collect::<Vec<_>>();
+            members
+                .iter()
+                .enumerate()
+                .filter(|(index, tree)| {
+                    state_partition_rng_token_identifier_is(tree, member)
+                        && !members
+                            .get(index + 1)
+                            .is_some_and(|tree| state_partition_rng_token_identifier_is(tree, "as"))
+                })
+                .count()
+        })
+        .sum::<usize>();
+    count = count.saturating_add(
+        trees
+            .windows(prefix + 2)
+            .filter(|window| {
+                let offset = usize::from(public);
+                let matches_visibility =
+                    !public || state_partition_rng_token_identifier_is(&window[0], "pub");
+                matches_visibility
+                    && state_partition_rng_token_identifier_is(&window[offset], "use")
+                    && state_partition_rng_token_identifier_is(&window[offset + 1], crate_name)
+                    && matches!(&window[offset + 2], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && matches!(&window[offset + 3], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && state_partition_rng_token_identifier_is(&window[offset + 4], member)
+                    && matches!(&window[offset + 5], TokenTree::Punct(punct) if punct.as_char() == ';')
+            })
+            .count(),
+    );
+    count
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_use_member_count(
+                    &group.stream(),
+                    public,
+                    crate_name,
+                    member,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_public_reexport_alias_count(
+    stream: &TokenStream,
+    crate_name: &str,
+    member: &str,
+) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let grouped = trees
+        .windows(6)
+        .filter_map(|window| {
+            (state_partition_rng_token_identifier_is(&window[0], "pub")
+                && state_partition_rng_token_identifier_is(&window[1], "use")
+                && state_partition_rng_token_identifier_is(&window[2], crate_name)
+                && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':'))
+            .then_some(window.get(5))
+            .flatten()
+        })
+        .filter_map(|tree| match tree {
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => Some(group),
+            TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) | TokenTree::Group(_) => {
+                None
+            }
+        })
+        .map(|group| {
+            let members = group.stream().into_iter().collect::<Vec<_>>();
+            members
+                .windows(2)
+                .filter(|window| {
+                    state_partition_rng_token_identifier_is(&window[0], member)
+                        && state_partition_rng_token_identifier_is(&window[1], "as")
+                })
+                .count()
+        })
+        .sum::<usize>();
+    let direct = trees
+        .windows(7)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], "pub")
+                && state_partition_rng_token_identifier_is(&window[1], "use")
+                && state_partition_rng_token_identifier_is(&window[2], crate_name)
+                && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && state_partition_rng_token_identifier_is(&window[5], member)
+                && state_partition_rng_token_identifier_is(&window[6], "as")
+        })
+        .count();
+    grouped
+        + direct
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_public_reexport_alias_count(
+                    &group.stream(),
+                    crate_name,
+                    member,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_function_item_count(stream: &TokenStream, name: &str) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .windows(2)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], "fn")
+                && state_partition_rng_token_identifier_is(&window[1], name)
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => {
+                    Some(state_partition_rng_function_item_count(&group.stream(), name))
+                }
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_public_function_item_count(stream: &TokenStream, name: &str) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let direct = trees
+        .windows(3)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], "pub")
+                && state_partition_rng_token_identifier_is(&window[1], "fn")
+                && state_partition_rng_token_identifier_is(&window[2], name)
+        })
+        .count();
+    let restricted = trees
+        .windows(4)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], "pub")
+                && matches!(&window[1], TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis)
+                && state_partition_rng_token_identifier_is(&window[2], "fn")
+                && state_partition_rng_token_identifier_is(&window[3], name)
+        })
+        .count();
+    direct
+        + restricted
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => {
+                    Some(state_partition_rng_public_function_item_count(&group.stream(), name))
+                }
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn validate_state_partition_rng_crypto_owner(crypto: &StatePartitionRngRustSource) -> VResult<()> {
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        let expected_body = TokenStream::from_str(&format!("{api}_with(&OsRandomSource)"))
+            .expect("fixed core sealed-draw body tokenizes");
+        let bodies = state_partition_rng_named_function_bodies(&crypto.tokens, api);
+        let has_exact_public_owner = bodies.len() == 1
+            && token_trees_fingerprint(&bodies[0].stream().into_iter().collect::<Vec<_>>())
+                == token_trees_fingerprint(&expected_body.into_iter().collect::<Vec<_>>());
+        if state_partition_rng_sealed_api_reference_count(&crypto.tokens, api) != 2
+            || state_partition_rng_function_item_count(&crypto.tokens, api) != 1
+            || state_partition_rng_public_function_item_count(&crypto.tokens, api) != 1
+            || !has_exact_public_owner
+        {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_SEALED_OWNER",
+                "state-partition-rng",
+            )
+            .at("crates/fastmcp-core/src/crypto.rs"));
+        }
+    }
+    Ok(())
+}
+
+fn state_partition_rng_public_visibility_end(trees: &[TokenTree], index: usize) -> Option<usize> {
+    if !trees
+        .get(index)
+        .is_some_and(|tree| state_partition_rng_token_identifier_is(tree, "pub"))
+    {
+        return None;
+    }
+    Some(
+        index
+            + if matches!(trees.get(index + 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis)
+            {
+                2
+            } else {
+                1
+            },
+    )
+}
+
+fn state_partition_rng_function_index_after_visibility(
+    trees: &[TokenTree],
+    mut index: usize,
+) -> Option<usize> {
+    loop {
+        let tree = trees.get(index)?;
+        if state_partition_rng_token_identifier_is(tree, "fn") {
+            return Some(index);
+        }
+        if state_partition_rng_token_identifier_is(tree, "const")
+            || state_partition_rng_token_identifier_is(tree, "async")
+            || state_partition_rng_token_identifier_is(tree, "unsafe")
+            || state_partition_rng_token_identifier_is(tree, "safe")
+            || state_partition_rng_token_identifier_is(tree, "default")
+        {
+            index += 1;
+            continue;
+        }
+        if state_partition_rng_token_identifier_is(tree, "extern") {
+            index += 1;
+            if matches!(trees.get(index), Some(TokenTree::Literal(_))) {
+                index += 1;
+            }
+            continue;
+        }
+        return None;
+    }
+}
+
+fn state_partition_rng_crypto_public_callable_items(
+    stream: &TokenStream,
+    container: &str,
+) -> Vec<(String, String, Group)> {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let mut items = Vec::new();
+    for index in 0..trees.len() {
+        if state_partition_rng_token_identifier_is(&trees[index], "impl") {
+            let Some(TokenTree::Ident(type_name)) = trees.get(index + 1) else {
+                continue;
+            };
+            let Some(TokenTree::Group(body)) = trees
+                .iter()
+                .skip(index + 2)
+                .find(|tree| matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
+            else {
+                continue;
+            };
+            items.extend(state_partition_rng_crypto_public_callable_items(
+                &body.stream(),
+                &type_name.to_string(),
+            ));
+            continue;
+        }
+
+        let Some(after_visibility) = state_partition_rng_public_visibility_end(&trees, index) else {
+            continue;
+        };
+        let Some(function_index) =
+            state_partition_rng_function_index_after_visibility(&trees, after_visibility)
+        else {
+            continue;
+        };
+        let Some(TokenTree::Ident(name)) = trees.get(function_index + 1) else {
+            continue;
+        };
+        let Some(body_index) = trees
+            .iter()
+            .enumerate()
+            .skip(function_index + 2)
+            .find_map(|(body_index, tree)| {
+                matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)
+                    .then_some(body_index)
+            })
+        else {
+            continue;
+        };
+        let Some(TokenTree::Group(body)) = trees.get(body_index) else {
+            continue;
+        };
+        let signature = trees[index..body_index]
+            .iter()
+            .cloned()
+            .collect::<TokenStream>()
+            .to_string();
+        items.push((
+            format!("{container}::{}", name),
+            signature,
+            body.clone(),
+        ));
+    }
+    items
+}
+
+fn state_partition_rng_crypto_public_escape_count(stream: &TokenStream) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = (0..trees.len())
+        .filter(|&index| {
+            state_partition_rng_public_visibility_end(&trees, index)
+                .and_then(|after_visibility| trees.get(after_visibility))
+                .is_some_and(|tree| {
+                    state_partition_rng_token_identifier_is(tree, "trait")
+                        || state_partition_rng_token_identifier_is(tree, "use")
+                        || state_partition_rng_token_identifier_is(tree, "macro")
+                        || state_partition_rng_token_identifier_is(tree, "type")
+                })
+                || state_partition_rng_token_identifier_is(&trees[index], "macro_rules")
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_crypto_public_escape_count(
+                    &group.stream(),
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_crypto_use_alias_count(stream: &TokenStream) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let mut aliases = 0;
+    for index in 0..trees.len() {
+        if !state_partition_rng_token_identifier_is(&trees[index], "use") {
+            continue;
+        }
+        let imported = trees
+            .iter()
+            .skip(index + 1)
+            .take_while(|tree| !matches!(tree, TokenTree::Punct(punct) if punct.as_char() == ';'))
+            .cloned()
+            .collect::<TokenStream>();
+        if state_partition_rng_identifier_count(&imported, "as") != 0 {
+            aliases += 1;
+        }
+    }
+    aliases
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => {
+                    Some(state_partition_rng_crypto_use_alias_count(&group.stream()))
+                }
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_crypto_public_callable_inventory(
+    crypto: &StatePartitionRngRustSource,
+) -> Vec<(String, String)> {
+    state_partition_rng_crypto_public_callable_items(&crypto.tokens, "crate")
+        .into_iter()
+        .map(|(container, signature, _)| (container, signature))
+        .collect()
+}
+
+fn state_partition_rng_crypto_nonapproved_public_entropy_reference_count(
+    crypto: &StatePartitionRngRustSource,
+) -> usize {
+    let entropy_identifiers = [
+        "draw_hmac_sha256_key_with",
+        "draw_security_identifier_with",
+        "draw_ephemeral_key_material_with",
+        "draw_nonce_domain_material_with",
+        "draw_websocket_mask_with",
+        "draw_bytes",
+        "OsRandomSource",
+        "RandomSource",
+        "fill",
+        "HmacSha256Key",
+        "SecurityIdentifier",
+        "EphemeralKeyMaterial",
+        "NonceDomainMaterial",
+        "WebSocketMask",
+    ];
+    state_partition_rng_crypto_public_callable_items(&crypto.tokens, "crate")
+        .into_iter()
+        .filter(|(container, _, _)| {
+            !STATE_PARTITION_RNG_SEALED_APIS
+                .iter()
+                .any(|api| container == &format!("crate::{api}"))
+        })
+        .map(|(_, _, body)| {
+            entropy_identifiers
+                .iter()
+                .map(|identifier| state_partition_rng_identifier_count(&body.stream(), identifier))
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn state_partition_rng_canonical_signature(signature: &str) -> String {
+    TokenStream::from_str(signature)
+        .expect("fixed public callable signature tokenizes")
+        .to_string()
+}
+
+fn validate_state_partition_rng_crypto_public_surface(
+    crypto: &StatePartitionRngRustSource,
+) -> VResult<()> {
+    let expected = [
+        (
+            "Sha256Digest::from_bytes",
+            "pub const fn from_bytes(bytes: [u8; SHA256_DIGEST_BYTES]) -> Self",
+        ),
+        (
+            "Sha256Digest::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; SHA256_DIGEST_BYTES]",
+        ),
+        (
+            "Sha256Digest::into_bytes",
+            "pub const fn into_bytes(self) -> [u8; SHA256_DIGEST_BYTES]",
+        ),
+        (
+            "crate::sha256_bounded",
+            "pub fn sha256_bounded(input: &[u8], max_input_bytes: usize) -> Result<Sha256Digest, CryptoInputTooLongError>",
+        ),
+        (
+            "HmacSha256Key::from_bytes",
+            "pub fn from_bytes(bytes: [u8; HMAC_SHA256_KEY_BYTES]) -> Self",
+        ),
+        (
+            "HmacSha256Key::authenticate_bounded",
+            "pub fn authenticate_bounded(&self, input: &[u8], max_input_bytes: usize) -> Result<HmacSha256Tag, CryptoInputTooLongError>",
+        ),
+        (
+            "HmacSha256Key::verify_bounded",
+            "pub fn verify_bounded(&self, input: &[u8], max_input_bytes: usize, tag: &HmacSha256Tag) -> Result<(), HmacVerificationError>",
+        ),
+        (
+            "HmacSha256Tag::from_bytes",
+            "pub const fn from_bytes(bytes: [u8; HMAC_SHA256_TAG_BYTES]) -> Self",
+        ),
+        (
+            "HmacSha256Tag::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; HMAC_SHA256_TAG_BYTES]",
+        ),
+        (
+            "HmacSha256Tag::into_bytes",
+            "pub const fn into_bytes(self) -> [u8; HMAC_SHA256_TAG_BYTES]",
+        ),
+        (
+            "SecurityIdentifier::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; SECURITY_IDENTIFIER_BYTES]",
+        ),
+        (
+            "EphemeralKeyMaterial::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; EPHEMERAL_KEY_MATERIAL_BYTES]",
+        ),
+        (
+            "NonceDomainMaterial::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; NONCE_DOMAIN_MATERIAL_BYTES]",
+        ),
+        (
+            "NonceDomainMaterial::into_bytes",
+            "pub const fn into_bytes(self) -> [u8; NONCE_DOMAIN_MATERIAL_BYTES]",
+        ),
+        (
+            "WebSocketMask::as_bytes",
+            "pub const fn as_bytes(&self) -> &[u8; WEBSOCKET_MASK_BYTES]",
+        ),
+        (
+            "WebSocketMask::into_bytes",
+            "pub const fn into_bytes(self) -> [u8; WEBSOCKET_MASK_BYTES]",
+        ),
+        (
+            "crate::draw_hmac_sha256_key",
+            "pub fn draw_hmac_sha256_key() -> Result<HmacSha256Key, RandomDrawError>",
+        ),
+        (
+            "crate::draw_security_identifier",
+            "pub fn draw_security_identifier() -> Result<SecurityIdentifier, RandomDrawError>",
+        ),
+        (
+            "crate::draw_ephemeral_key_material",
+            "pub fn draw_ephemeral_key_material() -> Result<EphemeralKeyMaterial, RandomDrawError>",
+        ),
+        (
+            "crate::draw_nonce_domain_material",
+            "pub fn draw_nonce_domain_material() -> Result<NonceDomainMaterial, RandomDrawError>",
+        ),
+        (
+            "crate::draw_websocket_mask",
+            "pub fn draw_websocket_mask() -> Result<WebSocketMask, RandomDrawError>",
+        ),
+    ]
+    .into_iter()
+    .map(|(container, signature)| {
+        (
+            container.to_owned(),
+            state_partition_rng_canonical_signature(signature),
+        )
+    })
+    .collect::<Vec<_>>();
+    if state_partition_rng_crypto_public_callable_inventory(crypto) != expected
+        || state_partition_rng_crypto_public_escape_count(&crypto.tokens) != 0
+        || state_partition_rng_crypto_use_alias_count(&crypto.tokens) != 0
+        || state_partition_rng_crypto_nonapproved_public_entropy_reference_count(crypto) != 0
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEALED_OWNER",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/crypto.rs"));
+    }
+    Ok(())
+}
+
+fn state_partition_rng_path_empty_call_count(
+    stream: &TokenStream,
+    first: &str,
+    second: &str,
+) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .windows(5)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], first)
+                && matches!(&window[1], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[2], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && state_partition_rng_token_identifier_is(&window[3], second)
+                && matches!(&window[4], TokenTree::Group(group)
+                    if group.delimiter() == Delimiter::Parenthesis && group.stream().is_empty())
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_path_empty_call_count(
+                    &group.stream(),
+                    first,
+                    second,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+fn state_partition_rng_call_with_ident_count(
+    stream: &TokenStream,
+    function: &str,
+    argument_ident: &str,
+) -> usize {
+    let trees = stream.clone().into_iter().collect::<Vec<_>>();
+    let local = trees
+        .windows(2)
+        .filter(|window| {
+            state_partition_rng_token_identifier_is(&window[0], function)
+                && matches!(&window[1], TokenTree::Group(group)
+                    if group.delimiter() == Delimiter::Parenthesis
+                        && state_partition_rng_identifier_count(&group.stream(), argument_ident) == 1)
+        })
+        .count();
+    local
+        + trees
+            .iter()
+            .filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(state_partition_rng_call_with_ident_count(
+                    &group.stream(),
+                    function,
+                    argument_ident,
+                )),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            })
+            .sum::<usize>()
+}
+
+#[derive(Clone)]
+struct StatePartitionRngDependencyEdge {
+    table_path: String,
+    alias: String,
+    package: Option<String>,
+    workspace: Option<bool>,
+    declaration: toml::Value,
+}
+
+fn state_partition_rng_dependency_edges(value: &toml::Value) -> Vec<StatePartitionRngDependencyEdge> {
+    fn visit(
+        value: &toml::Value,
+        table_path: &str,
+        edges: &mut Vec<StatePartitionRngDependencyEdge>,
+    ) {
+        let Some(table) = value.as_table() else {
+            return;
+        };
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(dependencies) = table.get(section).and_then(toml::Value::as_table) {
+                let dependency_path = if table_path.is_empty() {
+                    section.to_owned()
+                } else {
+                    format!("{table_path}.{section}")
+                };
+                for (alias, declaration) in dependencies {
+                    let dependency_table = declaration.as_table();
+                    edges.push(StatePartitionRngDependencyEdge {
+                        table_path: dependency_path.clone(),
+                        alias: alias.clone(),
+                        package: dependency_table
+                            .and_then(|dependency| dependency.get("package"))
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_owned),
+                        workspace: dependency_table
+                            .and_then(|dependency| dependency.get("workspace"))
+                            .and_then(toml::Value::as_bool),
+                        declaration: declaration.clone(),
+                    });
+                }
+            }
+        }
+        for (name, nested) in table {
+            let nested_path = if table_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{table_path}.{name}")
+            };
+            visit(nested, &nested_path, edges);
+        }
+    }
+
+    let mut edges = Vec::new();
+    visit(value, "", &mut edges);
+    edges
+}
+
+fn state_partition_rng_package_edges<'a>(
+    edges: &'a [StatePartitionRngDependencyEdge],
+    package: &str,
+) -> Vec<&'a StatePartitionRngDependencyEdge> {
+    edges
+        .iter()
+        .filter(|edge| edge.alias == package || edge.package.as_deref() == Some(package))
+        .collect()
+}
+
+fn state_partition_rng_is_exact_workspace_edge(
+    edge: &StatePartitionRngDependencyEdge,
+    table_path: &str,
+    package: &str,
+) -> bool {
+    edge.table_path == table_path
+        && edge.alias == package
+        && edge.package.is_none()
+        && edge.workspace == Some(true)
+        && edge.declaration.as_table().is_some_and(|declaration| {
+            declaration.len() == 1
+                && declaration.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+        })
+}
+
+fn state_partition_rng_manifest_has_override(value: &toml::Value) -> bool {
+    value
+        .as_table()
+        .is_some_and(|table| table.contains_key("patch") || table.contains_key("replace"))
+}
+
+
+fn validate_state_partition_rng_lock_ownership(inventory: &StatePartitionRngInventory) -> VResult<()> {
+    let lock = toml::from_str::<toml::Value>(&inventory.cargo_lock).map_err(|_| {
+        Diagnostic::error("E_STATE_PARTITION_RNG_LOCK", "state-partition-rng").at("Cargo.lock")
+    })?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            Diagnostic::error("E_STATE_PARTITION_RNG_LOCK", "state-partition-rng").at("Cargo.lock")
+        })?;
+    let expected_source = "registry+https://github.com/rust-lang/crates.io-index";
+    let expected_checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099";
+    let getrandom = packages
+        .iter()
+        .filter(|package| {
+            package.get("name").and_then(toml::Value::as_str) == Some("getrandom")
+                && package.get("version").and_then(toml::Value::as_str) == Some("0.4.3")
+        })
+        .collect::<Vec<_>>();
+    let core = packages
+        .iter()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some("fastmcp-core"))
+        .collect::<Vec<_>>();
+    if getrandom.len() != 1
+        || getrandom[0].get("source").and_then(toml::Value::as_str) != Some(expected_source)
+        || getrandom[0].get("checksum").and_then(toml::Value::as_str) != Some(expected_checksum)
+        || core.len() != 1
+        || core[0]
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .is_none_or(|dependencies| {
+                let records = dependencies
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .filter(|dependency| dependency.starts_with("getrandom"))
+                    .collect::<Vec<_>>();
+                records != vec!["getrandom 0.4.3"]
+            })
+    {
+        return Err(Diagnostic::error("E_STATE_PARTITION_RNG_LOCK", "state-partition-rng")
+            .at("Cargo.lock"));
+    }
+    Ok(())
+}
+
+fn validate_state_partition_rng_core_consumers(inventory: &StatePartitionRngInventory) -> VResult<()> {
+    let expected = BTreeSet::from([
+        "crates/fastmcp-cli/Cargo.toml",
+        "crates/fastmcp-client/Cargo.toml",
+        "crates/fastmcp-console/Cargo.toml",
+        "crates/fastmcp-protocol/Cargo.toml",
+        "crates/fastmcp-server/Cargo.toml",
+        "crates/fastmcp-transport/Cargo.toml",
+        "crates/fastmcp/Cargo.toml",
+    ]);
+    let mut actual = BTreeSet::new();
+    for (path, manifest) in inventory
+        .manifests
+        .iter()
+        .filter(|(path, _)| path.as_str() != "Cargo.toml")
+    {
+        let value = toml::from_str::<toml::Value>(manifest).map_err(|_| {
+            Diagnostic::error("E_STATE_PARTITION_RNG_CONSUMER", "state-partition-rng").at(path)
+        })?;
+        let edges = state_partition_rng_dependency_edges(&value);
+        let core_edges = state_partition_rng_package_edges(&edges, "fastmcp-core");
+        if !core_edges.is_empty() {
+            actual.insert(path.as_str());
+            if core_edges.len() != 1
+                || !state_partition_rng_is_exact_workspace_edge(
+                    core_edges[0],
+                    "dependencies",
+                    "fastmcp-core",
+                )
+            {
+                return Err(Diagnostic::error(
+                    "E_STATE_PARTITION_RNG_CONSUMER",
+                    "state-partition-rng",
+                )
+                .at(path));
+            }
+        }
+    }
+    if actual != expected {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_CONSUMER",
+            "state-partition-rng",
+        )
+        .at("workspace fastmcp-core consumers"));
+    }
+    Ok(())
+}
+
+fn validate_state_partition_rng_manifest_ownership(
+    inventory: &StatePartitionRngInventory,
+) -> VResult<()> {
+    validate_state_partition_rng_lock_ownership(inventory)?;
+    validate_state_partition_rng_core_consumers(inventory)?;
+    let root_manifest = inventory.manifests.get("Cargo.toml").ok_or_else(|| {
+        Diagnostic::error("E_STATE_PARTITION_RNG_MANIFEST", "state-partition-rng")
+            .at("Cargo.toml")
+    })?;
+    let root_value = toml::from_str::<toml::Value>(root_manifest).map_err(|_| {
+        Diagnostic::error("E_STATE_PARTITION_RNG_MANIFEST", "state-partition-rng")
+            .at("Cargo.toml")
+    })?;
+    let root_edges = state_partition_rng_dependency_edges(&root_value);
+    let root_getrandom_edges = state_partition_rng_package_edges(&root_edges, "getrandom");
+    if state_partition_rng_manifest_has_override(&root_value)
+        || root_getrandom_edges.len() != 1
+        || root_getrandom_edges[0].table_path != "workspace.dependencies"
+        || root_getrandom_edges[0].alias != "getrandom"
+        || root_getrandom_edges[0].package.is_some()
+        || root_getrandom_edges[0].workspace.is_some()
+        || root_getrandom_edges[0]
+            .declaration
+            .as_table()
+            .is_none_or(|dependency| {
+                dependency.len() != 2
+                    || ["package", "path", "git", "registry", "workspace"]
+                        .iter()
+                        .any(|field| dependency.contains_key(*field))
+                    || dependency
+                        .get("version")
+                        .and_then(toml::Value::as_str)
+                        != Some("=0.4.3")
+                    || dependency
+                        .get("default-features")
+                        .and_then(toml::Value::as_bool)
+                        != Some(false)
+            })
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_MANIFEST",
+            "state-partition-rng",
+        )
+        .at("Cargo.toml"));
+    }
+
+    for (path, manifest) in inventory
+        .manifests
+        .iter()
+        .filter(|(path, _)| path.as_str() != "Cargo.toml")
+    {
+        let value = toml::from_str::<toml::Value>(manifest).map_err(|_| {
+            Diagnostic::error("E_STATE_PARTITION_RNG_MANIFEST", "state-partition-rng")
+                .at(path)
+        })?;
+        let edges = state_partition_rng_dependency_edges(&value);
+        let getrandom_edges = state_partition_rng_package_edges(&edges, "getrandom");
+        if state_partition_rng_manifest_has_override(&value) {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_MANIFEST",
+                "state-partition-rng",
+            )
+            .at(path));
+        }
+        if path == "crates/fastmcp-core/Cargo.toml" {
+            if getrandom_edges.len() != 1
+                || !state_partition_rng_is_exact_workspace_edge(
+                    getrandom_edges[0],
+                    "dependencies",
+                    "getrandom",
+                )
+            {
+                return Err(Diagnostic::error(
+                    "E_STATE_PARTITION_RNG_MANIFEST",
+                    "state-partition-rng",
+                )
+                .at(path));
+            }
+        } else if !getrandom_edges.is_empty() {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_MANIFEST",
+                "state-partition-rng",
+            )
+            .at(path));
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_partition_rng_seam(inventory: &StatePartitionRngInventory) -> VResult<()> {
+    validate_state_partition_rng_manifest_ownership(inventory)?;
+    let state = state_partition_rng_source(inventory, "crates/fastmcp-core/src/state.rs")?;
+    let crypto = state_partition_rng_source(inventory, "crates/fastmcp-core/src/crypto.rs")?;
+    let core_lib = state_partition_rng_source(inventory, "crates/fastmcp-core/src/lib.rs")?;
+    let facade_lib = state_partition_rng_source(inventory, "crates/fastmcp/src/lib.rs")?;
+    let oauth = state_partition_rng_source(inventory, "crates/fastmcp-server/src/oauth.rs")?;
+    let http = state_partition_rng_source(inventory, "crates/fastmcp-transport/src/http.rs")?;
+    let websocket = state_partition_rng_source(inventory, "crates/fastmcp-transport/src/websocket.rs")?;
+    let cli = state_partition_rng_source(inventory, "crates/fastmcp-cli/src/main.rs")?;
+
+    let getrandom_namespace_owners = inventory
+        .rust_sources
+        .iter()
+        .filter_map(|(path, source)| {
+            let count = state_partition_rng_namespace_reference_count(&source.tokens, "getrandom");
+            (count != 0).then_some((path.as_str(), count))
+        })
+        .collect::<Vec<_>>();
+    if getrandom_namespace_owners.len() != 1
+        || getrandom_namespace_owners[0].0 != "crates/fastmcp-core/src/crypto.rs"
+    {
+        let path = getrandom_namespace_owners
+            .iter()
+            .find_map(|(path, _)| (*path != "crates/fastmcp-core/src/crypto.rs").then_some(*path))
+            .unwrap_or("crates/fastmcp-core/src/crypto.rs");
+        let code = if path == "crates/fastmcp-core/src/state.rs" {
+            "E_STATE_PARTITION_DIRECT_GETRANDOM"
+        } else {
+            "E_STATE_PARTITION_RNG_OWNER"
+        };
+        return Err(Diagnostic::error(code, "state-partition-rng").at(path));
+    }
+
+    let direct_fill_count = inventory
+        .rust_sources
+        .values()
+        .map(|source| {
+            state_partition_rng_qualified_call_count(&source.tokens, &["getrandom", "fill"])
+        })
+        .sum::<usize>();
+    if direct_fill_count != 1
+        || state_partition_rng_qualified_call_count(&crypto.tokens, &["getrandom", "fill"])
+            != 1
+    {
+        return Err(Diagnostic::error(
+            "E_CORE_CRYPTO_RNG_OWNER",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/crypto.rs"));
+    }
+
+    validate_state_partition_rng_crypto_owner(crypto)?;
+    validate_state_partition_rng_crypto_public_surface(crypto)?;
+
+    let sealed_draw_callers = state_partition_rng_session_state_method_bodies(&state.tokens)
+        .into_iter()
+        .filter_map(|(method, body)| {
+            (state_partition_rng_qualified_call_count(
+                &body.stream(),
+                &["crate", "crypto", "draw_security_identifier"],
+            ) != 0)
+                .then_some((method, body))
+        })
+        .collect::<Vec<_>>();
+    if sealed_draw_callers.len() != 1
+        || sealed_draw_callers[0].0.strip_prefix("r#").unwrap_or(&sealed_draw_callers[0].0)
+            != "from_map"
+        || state_partition_rng_qualified_call_count(
+            &sealed_draw_callers[0].1.stream(),
+            &["crate", "crypto", "draw_security_identifier"],
+        ) != 1
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEALED_DRAW_CALLSITE",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs"));
+    }
+
+    for (path, source) in &inventory.rust_sources {
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            let references = state_partition_rng_sealed_api_reference_count(&source.tokens, api);
+            if references != 0 && !state_partition_rng_sealed_api_is_allowlisted(path, api) {
+                return Err(Diagnostic::error(
+                    "E_STATE_PARTITION_RNG_SEALED_API_OWNER",
+                    "state-partition-rng",
+                )
+                .at(path));
+            }
+        }
+    }
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        let expected_references = if api == "draw_security_identifier" { 1 } else { 0 };
+        if state_partition_rng_sealed_api_reference_count(&state.tokens, api) != expected_references {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_SEALED_API_OWNER",
+                "state-partition-rng",
+            )
+            .at("crates/fastmcp-core/src/state.rs"));
+        }
+    }
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        if state_partition_rng_sealed_api_reference_count(&core_lib.tokens, api) != 1
+            || state_partition_rng_use_member_count(&core_lib.tokens, true, "crypto", api) != 1
+            || state_partition_rng_public_reexport_alias_count(&core_lib.tokens, "crypto", api)
+                != 0
+            || state_partition_rng_function_item_count(&core_lib.tokens, api) != 0
+        {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
+                "state-partition-rng",
+            )
+            .at("crates/fastmcp-core/src/lib.rs"));
+        }
+        if state_partition_rng_sealed_api_reference_count(&facade_lib.tokens, api) != 1
+            || state_partition_rng_use_member_count(&facade_lib.tokens, true, "fastmcp_core", api)
+                != 1
+            || state_partition_rng_public_reexport_alias_count(
+                &facade_lib.tokens,
+                "fastmcp_core",
+                api,
+            ) != 0
+            || state_partition_rng_function_item_count(&facade_lib.tokens, api) != 0
+        {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
+                "state-partition-rng",
+            )
+            .at("crates/fastmcp/src/lib.rs"));
+        }
+    }
+
+    let from_map = state_partition_rng_method_body(state, "from_map")?;
+    let seam = state_partition_rng_method_body(state, "from_map_with_partition_draw")?;
+    let mut seam_signature = state_partition_rng_method_suffix(state, "from_map_with_partition_draw")?;
+    let seam_body = seam_signature.pop().ok_or_else(|| {
+        Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM_SIGNATURE",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs")
+    })?;
+    if !matches!(&seam_body, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace) {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM_SIGNATURE",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs"));
+    }
+    let expected_from_map = TokenStream::from_str(
+        "Self::from_map_with_partition_draw(values, || { crate::crypto::draw_security_identifier().map(|identifier| *identifier.as_bytes()) })",
+    )
+    .expect("fixed state partition draw expression tokenizes");
+    let expected_seam_signature = TokenStream::from_str(
+        "from_map_with_partition_draw<F, E>(values: HashMap<String, serde_json::Value>, draw: F) -> Self where F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,",
+    )
+    .expect("fixed state partition draw signature tokenizes");
+    let expected_seam_body = TokenStream::from_str(
+        "let cache_partition = draw().ok(); Self { inner: Arc::new(Mutex::new(values)), local: None, cache_partition, revision: Arc::new(AtomicU64::new(0)), }",
+    )
+    .expect("fixed state partition draw body tokenizes");
+    let from_map_fingerprint = token_trees_fingerprint(
+        &from_map.stream().into_iter().collect::<Vec<_>>(),
+    );
+    let expected_from_map_fingerprint = token_trees_fingerprint(
+        &expected_from_map.into_iter().collect::<Vec<_>>(),
+    );
+    let seam_signature_fingerprint = token_trees_fingerprint(&seam_signature);
+    let expected_seam_signature_fingerprint = token_trees_fingerprint(
+        &expected_seam_signature.into_iter().collect::<Vec<_>>(),
+    );
+    let seam_body_fingerprint = token_trees_fingerprint(
+        &seam.stream().into_iter().collect::<Vec<_>>(),
+    );
+    let expected_seam_body_fingerprint = token_trees_fingerprint(
+        &expected_seam_body.into_iter().collect::<Vec<_>>(),
+    );
+    let injected_draw = [
+        SourceTokenAtom::Ident("draw"),
+        SourceTokenAtom::EmptyGroup(Delimiter::Parenthesis),
+    ];
+    let error_to_none = [
+        SourceTokenAtom::Ident("draw"),
+        SourceTokenAtom::EmptyGroup(Delimiter::Parenthesis),
+        SourceTokenAtom::Punct('.'),
+        SourceTokenAtom::Ident("ok"),
+        SourceTokenAtom::EmptyGroup(Delimiter::Parenthesis),
+    ];
+    if seam_signature_fingerprint != expected_seam_signature_fingerprint
+        || state_partition_rng_method_visibility_count(
+            &state.tokens,
+            "from_map_with_partition_draw",
+        ) != 0
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM_SIGNATURE",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs"));
+    }
+
+    if from_map_fingerprint != expected_from_map_fingerprint
+        || seam_body_fingerprint != expected_seam_body_fingerprint
+        || count_sibling_token_sequence(&seam.stream(), &injected_draw) != 1
+        || count_sibling_token_sequence(&seam.stream(), &error_to_none) != 1
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEAM",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs"));
+    }
+
+    let success_draw_tests = state_partition_rng_named_function_bodies(
+        &state.tokens,
+        "cache_partition_injected_draw_stores_exact_partition_once",
+    );
+    let failure_draw_tests = state_partition_rng_named_function_bodies(
+        &state.tokens,
+        "cache_partition_injected_draw_failure_is_rejected_once",
+    );
+    if state_partition_rng_path_count(
+        &state.tokens,
+        "Self",
+        "from_map_with_partition_draw",
+    ) != 1
+        || state_partition_rng_path_count(
+            &state.tokens,
+            "SessionState",
+            "from_map_with_partition_draw",
+        ) != 2
+        || success_draw_tests.len() != 1
+        || failure_draw_tests.len() != 1
+        || state_partition_rng_path_count(
+            &success_draw_tests[0].stream(),
+            "SessionState",
+            "from_map_with_partition_draw",
+        ) != 1
+        || state_partition_rng_path_count(
+            &failure_draw_tests[0].stream(),
+            "SessionState",
+            "from_map_with_partition_draw",
+        ) != 1
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_CALLSITE",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/state.rs"));
+    }
+
+    if count_sibling_token_sequence(
+        &core_lib.tokens,
+        &[
+            SourceTokenAtom::Ident("pub"),
+            SourceTokenAtom::Ident("mod"),
+            SourceTokenAtom::Ident("crypto"),
+            SourceTokenAtom::Punct(';'),
+        ],
+    ) != 1
+        || state_partition_rng_use_member_count(
+            &core_lib.tokens,
+            true,
+            "crypto",
+            "draw_security_identifier",
+        ) != 1
+        || state_partition_rng_use_member_count(
+            &facade_lib.tokens,
+            true,
+            "fastmcp_core",
+            "draw_security_identifier",
+        ) != 1
+        || state_partition_rng_use_member_count(
+            &oauth.tokens,
+            false,
+            "fastmcp_core",
+            "draw_security_identifier",
+        ) != 1
+        || state_partition_rng_call_with_ident_count(
+            &oauth.tokens,
+            "generate_token_with_draw",
+            "draw_security_identifier",
+        ) != 1
+        || state_partition_rng_use_member_count(
+            &http.tokens,
+            false,
+            "fastmcp_core",
+            "draw_security_identifier",
+        ) != 1
+        || count_sibling_token_sequence(
+            &http.tokens,
+            &[
+                SourceTokenAtom::Ident("draw_security_identifier"),
+                SourceTokenAtom::EmptyGroup(Delimiter::Parenthesis),
+            ],
+        ) != 1
+        || state_partition_rng_use_member_count(
+            &websocket.tokens,
+            false,
+            "fastmcp_core",
+            "draw_websocket_mask",
+        ) != 1
+        || count_sibling_token_sequence(
+            &websocket.tokens,
+            &[
+                SourceTokenAtom::Ident("draw_websocket_mask"),
+                SourceTokenAtom::EmptyGroup(Delimiter::Parenthesis),
+            ],
+        ) != 1
+        || state_partition_rng_path_empty_call_count(
+            &cli.tokens,
+            "fastmcp_core",
+            "draw_security_identifier",
+        ) != 2
+    {
+        return Err(Diagnostic::error(
+            "E_STATE_PARTITION_RNG_SEALED_CONSUMER",
+            "state-partition-rng",
+        )
+        .at("crates/fastmcp-core/src/lib.rs"));
+    }
+
+    Ok(())
+}
+
+fn assert_state_partition_rng_public_behavior() {
+    let state = fastmcp_core::SessionState::new();
+    let independent = fastmcp_core::SessionState::new();
+    let initial = state
+        .cache_partition()
+        .expect("the operating-system random source must provide a state partition");
+    let independent_partition = independent
+        .cache_partition()
+        .expect("independent state must receive a cache partition");
+    assert_ne!(initial.0, independent_partition.0);
+
+    let cloned = state.clone();
+    assert_eq!(cloned.cache_partition(), Some(initial));
+    assert!(cloned.set("state-partition-revision", true));
+    let mutated = state
+        .cache_partition()
+        .expect("a state mutation must retain its cache partition");
+    assert_eq!(mutated.0, initial.0);
+    assert_eq!(mutated.1, initial.1 + 1);
+
+    let snapshot = state.snapshot();
+    let snapshot_partition = snapshot
+        .cache_partition()
+        .expect("a snapshot must receive an independent cache partition");
+    assert_ne!(snapshot_partition.0, mutated.0);
+    assert!(state.with_local_overrides().cache_partition().is_none());
+}
+
+fn state_partition_rng_byte_offset(
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Option<usize> {
+    let mut offset = 0usize;
+    for (index, source_line) in source.split_inclusive('\n').enumerate() {
+        if index + 1 == line {
+            let position = offset.checked_add(column)?;
+            return (position <= source.len()).then_some(position);
+        }
+        offset = offset.checked_add(source_line.len())?;
+    }
+    None
+}
+
+#[test]
+fn fnd_01_state_partition_rng_uses_sealed_core_positive() {
+    let inventory = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&inventory)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    assert_state_partition_rng_public_behavior();
+}
+
+#[test]
+fn fnd_01_state_partition_rng_rejects_direct_getrandom_planted_negative() {
+    let baseline = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&baseline)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+    let baseline_state = state_partition_rng_source(&baseline, "crates/fastmcp-core/src/state.rs")
+        .expect("baseline state source is present");
+    let baseline_state_digest: [u8; 32] = Sha256::digest(baseline_state.text.as_bytes()).into();
+    let baseline_other_input_digest = state_partition_rng_other_input_digest(&baseline);
+    let assert_fresh_baseline = || {
+        let fresh = state_partition_rng_inventory()
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        validate_state_partition_rng_seam(&fresh)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let fresh_state = state_partition_rng_source(&fresh, "crates/fastmcp-core/src/state.rs")
+            .expect("fresh state source is present");
+        assert_eq!(fresh_state.text, baseline_state.text);
+        let fresh_state_digest: [u8; 32] = Sha256::digest(fresh_state.text.as_bytes()).into();
+        assert_eq!(fresh_state_digest, baseline_state_digest);
+        assert_eq!(
+            state_partition_rng_other_input_digest(&fresh),
+            baseline_other_input_digest,
+            "fresh inventory must retain the baseline non-state domain"
+        );
+    };
+    let from_map = state_partition_rng_method_body(baseline_state, "from_map")
+        .expect("baseline state source has exactly one from_map method");
+    let insertion = state_partition_rng_byte_offset(
+        &baseline_state.text,
+        from_map.span_open().start().line,
+        from_map.span_open().start().column,
+    )
+    .expect("from_map opening brace has a byte position in the baseline source");
+
+    let mut planted = baseline.clone();
+    let state = planted
+        .rust_sources
+        .get_mut("crates/fastmcp-core/src/state.rs")
+        .expect("state source is present in the workspace inventory");
+    state.text.insert_str(
+        insertion + 1,
+        " let mut fnd01_planted_bytes = [0_u8; 1]; let _ = getrandom::fill(&mut fnd01_planted_bytes);",
+    );
+    state.tokens = TokenStream::from_str(&state.text)
+        .expect("the one-change planted state source remains tokenizable");
+    assert_eq!(
+        state_partition_rng_other_input_digest(&planted),
+        baseline_other_input_digest,
+        "direct-RNG plant must not alter any other inventory input"
+    );
+    let error = validate_state_partition_rng_seam(&planted)
+        .expect_err("one planted direct state RNG call must fail closed");
+    assert_eq!(
+        error.stable(),
+        "FND01|Error|E_STATE_PARTITION_DIRECT_GETRANDOM|state-partition-rng|crates/fastmcp-core/src/state.rs"
+    );
+
+    let fresh = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&fresh)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let fresh_state = state_partition_rng_source(&fresh, "crates/fastmcp-core/src/state.rs")
+        .expect("fresh state source is present");
+    assert_eq!(fresh_state.text, baseline_state.text);
+    let fresh_state_digest: [u8; 32] = Sha256::digest(fresh_state.text.as_bytes()).into();
+    assert_eq!(fresh_state_digest, baseline_state_digest);
+    assert_eq!(
+        state_partition_rng_other_input_digest(&fresh),
+        baseline_other_input_digest,
+        "fresh inventory must retain the baseline non-state domain"
+    );
+
+    let signature_marker = "Result<[u8; CACHE_PARTITION_BYTES], E>";
+    let signature_offset = baseline_state
+        .text
+        .find(signature_marker)
+        .expect("baseline seam signature contains the generic result type");
+    let mut signature_planted = baseline.clone();
+    let signature_state = signature_planted
+        .rust_sources
+        .get_mut("crates/fastmcp-core/src/state.rs")
+        .expect("state source is present in the workspace inventory");
+    signature_state.text.replace_range(
+        signature_offset..signature_offset + signature_marker.len(),
+        "std::result::Result<[u8; CACHE_PARTITION_BYTES], E>",
+    );
+    signature_state.tokens = TokenStream::from_str(&signature_state.text)
+        .expect("the one-change planted signature remains tokenizable");
+    assert_eq!(
+        state_partition_rng_other_input_digest(&signature_planted),
+        baseline_other_input_digest,
+        "signature plant must not alter any other inventory input"
+    );
+    let signature_error = validate_state_partition_rng_seam(&signature_planted)
+        .expect_err("one planted compile-valid signature mutation must fail closed");
+    assert_eq!(
+        signature_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_SEAM_SIGNATURE|state-partition-rng|crates/fastmcp-core/src/state.rs"
+    );
+
+    let signature_fresh = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&signature_fresh)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let signature_fresh_state =
+        state_partition_rng_source(&signature_fresh, "crates/fastmcp-core/src/state.rs")
+            .expect("fresh state source is present after signature plant");
+    assert_eq!(signature_fresh_state.text, baseline_state.text);
+    let signature_fresh_digest: [u8; 32] =
+        Sha256::digest(signature_fresh_state.text.as_bytes()).into();
+    assert_eq!(signature_fresh_digest, baseline_state_digest);
+    assert_eq!(
+        state_partition_rng_other_input_digest(&signature_fresh),
+        baseline_other_input_digest,
+        "fresh inventory must retain the baseline non-state domain after signature plant"
+    );
+
+    let mut raw_identifier_planted = baseline.clone();
+    let raw_identifier_state = raw_identifier_planted
+        .rust_sources
+        .get_mut("crates/fastmcp-core/src/state.rs")
+        .expect("state source is present for raw-identifier planting");
+    raw_identifier_state.text.insert_str(
+        insertion + 1,
+        " let mut fnd01_raw_identifier_bytes = [0_u8; 1]; let _ = r#getrandom::fill(&mut fnd01_raw_identifier_bytes);",
+    );
+    raw_identifier_state.tokens = TokenStream::from_str(&raw_identifier_state.text)
+        .expect("the raw-identifier planted state source remains tokenizable");
+    assert_eq!(
+        state_partition_rng_other_input_digest(&raw_identifier_planted),
+        baseline_other_input_digest,
+        "raw-identifier plant must not alter any other inventory input"
+    );
+    let raw_identifier_error = validate_state_partition_rng_seam(&raw_identifier_planted)
+        .expect_err("one planted raw getrandom identifier must fail closed");
+    assert_eq!(
+        raw_identifier_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_DIRECT_GETRANDOM|state-partition-rng|crates/fastmcp-core/src/state.rs"
+    );
+
+    let raw_identifier_fresh = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&raw_identifier_fresh)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let raw_identifier_fresh_state =
+        state_partition_rng_source(&raw_identifier_fresh, "crates/fastmcp-core/src/state.rs")
+            .expect("fresh state source is present after raw-identifier plant");
+    assert_eq!(raw_identifier_fresh_state.text, baseline_state.text);
+    let raw_identifier_fresh_digest: [u8; 32] =
+        Sha256::digest(raw_identifier_fresh_state.text.as_bytes()).into();
+    assert_eq!(raw_identifier_fresh_digest, baseline_state_digest);
+    assert_eq!(
+        state_partition_rng_other_input_digest(&raw_identifier_fresh),
+        baseline_other_input_digest,
+        "fresh inventory must retain the baseline non-state domain after raw-identifier plant"
+    );
+
+    let unlisted_method_offset = baseline_state
+        .text
+        .find("\n    fn record_mutation")
+        .expect("baseline SessionState implementation has the post-constructor method anchor");
+    let mut sealed_draw_planted = baseline.clone();
+    let sealed_draw_state = sealed_draw_planted
+        .rust_sources
+        .get_mut("crates/fastmcp-core/src/state.rs")
+        .expect("state source is present for sealed-draw planting");
+    sealed_draw_state.text.insert_str(
+        unlisted_method_offset,
+        "\n    fn fnd01_unlisted_private_draw() { let _ = crate::crypto::draw_security_identifier(); }\n",
+    );
+    sealed_draw_state.tokens = TokenStream::from_str(&sealed_draw_state.text)
+        .expect("the unlisted private sealed-draw plant remains tokenizable");
+    assert_eq!(
+        state_partition_rng_other_input_digest(&sealed_draw_planted),
+        baseline_other_input_digest,
+        "sealed-draw plant must not alter any non-state inventory input"
+    );
+    let sealed_draw_error = validate_state_partition_rng_seam(&sealed_draw_planted)
+        .expect_err("one unlisted private sealed draw must fail closed");
+    assert_eq!(
+        sealed_draw_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_SEALED_DRAW_CALLSITE|state-partition-rng|crates/fastmcp-core/src/state.rs"
+    );
+    assert_fresh_baseline();
+
+    let record_mutation = state_partition_rng_method_body(baseline_state, "record_mutation")
+        .expect("baseline state source has exactly one record_mutation method");
+    let record_mutation_insertion = state_partition_rng_byte_offset(
+        &baseline_state.text,
+        record_mutation.span_open().start().line,
+        record_mutation.span_open().start().column,
+    )
+    .expect("record_mutation opening brace has a byte position in the baseline source");
+    for (api, planted_reference) in [
+        (
+            "draw_hmac_sha256_key",
+            " use crate::crypto::draw_hmac_sha256_key as fnd01_hmac_draw; let _ = fnd01_hmac_draw();",
+        ),
+        (
+            "draw_security_identifier",
+            " let fnd01_security_draw = crate::crypto::draw_security_identifier; let _ = fnd01_security_draw();",
+        ),
+        (
+            "draw_ephemeral_key_material",
+            " use crate::crypto::draw_ephemeral_key_material as fnd01_ephemeral_draw; let _ = fnd01_ephemeral_draw();",
+        ),
+        (
+            "draw_nonce_domain_material",
+            " let fnd01_nonce_draw = crate::crypto::draw_nonce_domain_material; let _ = fnd01_nonce_draw();",
+        ),
+        (
+            "draw_websocket_mask",
+            " use crate::crypto::draw_websocket_mask as fnd01_mask_draw; let _ = fnd01_mask_draw();",
+        ),
+    ] {
+        let mut sealed_api_planted = baseline.clone();
+        let sealed_api_state = sealed_api_planted
+            .rust_sources
+            .get_mut("crates/fastmcp-core/src/state.rs")
+            .expect("state source is present for sealed API planting");
+        sealed_api_state
+            .text
+            .insert_str(record_mutation_insertion + 1, planted_reference);
+        sealed_api_state.tokens = TokenStream::from_str(&sealed_api_state.text)
+            .expect("the aliased sealed API plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_other_input_digest(&sealed_api_planted),
+            baseline_other_input_digest,
+            "{api} plant must not alter any non-state inventory input"
+        );
+        let sealed_api_error = validate_state_partition_rng_seam(&sealed_api_planted)
+            .expect_err("each unallowlisted sealed API reference must fail closed");
+        assert_eq!(
+            sealed_api_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_API_OWNER|state-partition-rng|crates/fastmcp-core/src/state.rs",
+            "{api}"
+        );
+        assert_fresh_baseline();
+    }
+
+    let state_path = "crates/fastmcp-core/src/state.rs";
+    let core_lib_path = "crates/fastmcp-core/src/lib.rs";
+    let paired_non_target_digest =
+        state_partition_rng_input_digest_excluding_paths(&baseline, &[state_path, core_lib_path]);
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        let alias = format!("fnd01_public_{api}");
+        let mut reexport_planted = baseline.clone();
+        let reexport_core_lib = reexport_planted
+            .rust_sources
+            .get_mut(core_lib_path)
+            .expect("core library source is present for public alias planting");
+        let raw_reexport = format!("{api},");
+        let aliased_reexport = format!("{api} as {alias},");
+        let reexport_replacement =
+            reexport_core_lib
+                .text
+                .replacen(&raw_reexport, &aliased_reexport, 1);
+        assert_ne!(
+            reexport_replacement, reexport_core_lib.text,
+            "{api} grouped public reexport plant changes the core export"
+        );
+        reexport_core_lib.text = reexport_replacement;
+        reexport_core_lib.tokens = TokenStream::from_str(&reexport_core_lib.text)
+            .expect("the grouped public alias export remains tokenizable");
+
+        let reexport_state = reexport_planted
+            .rust_sources
+            .get_mut(state_path)
+            .expect("state source is present for public alias indirection planting");
+        reexport_state.text.insert_str(
+            unlisted_method_offset,
+            &format!(
+                "\n    fn fnd01_public_alias_indirection() {{ trait Fnd01PublicAlias {{ fn call(); }} struct Fnd01PublicAliasOwner; impl Fnd01PublicAlias for Fnd01PublicAliasOwner {{ fn call() {{ let _ = crate::{alias}(); }} }} <Fnd01PublicAliasOwner as Fnd01PublicAlias>::call(); }}\n"
+            ),
+        );
+        reexport_state.tokens = TokenStream::from_str(&reexport_state.text)
+            .expect("the trait and function-item alias indirection remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(
+                &reexport_planted,
+                &[state_path, core_lib_path],
+            ),
+            paired_non_target_digest,
+            "{api} two-file public alias plant preserves every non-target input"
+        );
+        let reexport_error = validate_state_partition_rng_seam(&reexport_planted)
+            .expect_err("each aliased public sealed API export must fail closed");
+        assert_eq!(
+            reexport_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp-core/src/lib.rs",
+            "{api}"
+        );
+        assert_fresh_baseline();
+    }
+
+    let crypto_path = "crates/fastmcp-core/src/crypto.rs";
+    let facade_path = "crates/fastmcp/src/lib.rs";
+    let core_wrapper_non_target_digest =
+        state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, state_path]);
+    let facade_wrapper_non_target_digest =
+        state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, facade_path]);
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        let core_wrapper = format!("fnd01_core_owner_wrapper_{api}");
+        let mut core_wrapper_planted = baseline.clone();
+        let core_wrapper_crypto = core_wrapper_planted
+            .rust_sources
+            .get_mut(crypto_path)
+            .expect("crypto source is present for core wrapper planting");
+        core_wrapper_crypto.text.push_str(&format!(
+            "\npub fn {core_wrapper}() {{ let _ = {api}(); }}\n"
+        ));
+        core_wrapper_crypto.tokens = TokenStream::from_str(&core_wrapper_crypto.text)
+            .expect("the core owner wrapper plant remains tokenizable");
+        let core_wrapper_state = core_wrapper_planted
+            .rust_sources
+            .get_mut(state_path)
+            .expect("state source is present for core wrapper proxy planting");
+        core_wrapper_state.text.insert_str(
+            unlisted_method_offset,
+            &format!(
+                "\n    fn fnd01_core_wrapper_proxy_{api}() {{ let _ = crate::crypto::{core_wrapper}(); }}\n"
+            ),
+        );
+        core_wrapper_state.tokens = TokenStream::from_str(&core_wrapper_state.text)
+            .expect("the core wrapper proxy plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(
+                &core_wrapper_planted,
+                &[crypto_path, state_path],
+            ),
+            core_wrapper_non_target_digest,
+            "{api} core wrapper plant preserves every non-target input"
+        );
+        let core_wrapper_error = validate_state_partition_rng_seam(&core_wrapper_planted)
+            .expect_err("each owner-module wrapper must fail closed before consumer validation");
+        assert_eq!(
+            core_wrapper_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_OWNER|state-partition-rng|crates/fastmcp-core/src/crypto.rs",
+            "{api} core-module wrapper route"
+        );
+        assert_fresh_baseline();
+
+        let facade_wrapper = format!("fnd01_facade_owner_wrapper_{api}");
+        let mut facade_wrapper_planted = baseline.clone();
+        let facade_wrapper_crypto = facade_wrapper_planted
+            .rust_sources
+            .get_mut(crypto_path)
+            .expect("crypto source is present for facade wrapper planting");
+        facade_wrapper_crypto.text.push_str(&format!(
+            "\npub fn {facade_wrapper}() {{ let _ = {api}(); }}\n"
+        ));
+        facade_wrapper_crypto.tokens = TokenStream::from_str(&facade_wrapper_crypto.text)
+            .expect("the facade owner wrapper plant remains tokenizable");
+        let facade_wrapper_source = facade_wrapper_planted
+            .rust_sources
+            .get_mut(facade_path)
+            .expect("facade source is present for facade wrapper proxy planting");
+        facade_wrapper_source.text.push_str(&format!(
+            "\npub fn fnd01_facade_wrapper_proxy_{api}() {{ let _ = fastmcp_core::crypto::{facade_wrapper}(); }}\n"
+        ));
+        facade_wrapper_source.tokens = TokenStream::from_str(&facade_wrapper_source.text)
+            .expect("the facade-visible wrapper proxy plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(
+                &facade_wrapper_planted,
+                &[crypto_path, facade_path],
+            ),
+            facade_wrapper_non_target_digest,
+            "{api} facade wrapper plant preserves every non-target input"
+        );
+        let facade_wrapper_error = validate_state_partition_rng_seam(&facade_wrapper_planted)
+            .expect_err("each facade-visible owner wrapper must fail closed before consumer validation");
+        assert_eq!(
+            facade_wrapper_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_OWNER|state-partition-rng|crates/fastmcp-core/src/crypto.rs",
+            "{api} facade-visible wrapper route"
+        );
+        assert_fresh_baseline();
+    }
+
+    let helper_wrapper_non_target_digest =
+        state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, state_path]);
+    for api in STATE_PARTITION_RNG_SEALED_APIS {
+        let helper_wrapper = format!("fnd01_private_helper_wrapper_{api}");
+        let mut helper_wrapper_planted = baseline.clone();
+        let helper_wrapper_crypto = helper_wrapper_planted
+            .rust_sources
+            .get_mut(crypto_path)
+            .expect("crypto source is present for helper-wrapper planting");
+        helper_wrapper_crypto.text.push_str(&format!(
+            "\npub fn {helper_wrapper}() {{ let _ = {api}_with(&OsRandomSource); }}\n"
+        ));
+        helper_wrapper_crypto.tokens = TokenStream::from_str(&helper_wrapper_crypto.text)
+            .expect("the private-helper wrapper plant remains tokenizable");
+        let helper_wrapper_state = helper_wrapper_planted
+            .rust_sources
+            .get_mut(state_path)
+            .expect("state source is present for helper-wrapper proxy planting");
+        helper_wrapper_state.text.insert_str(
+            unlisted_method_offset,
+            &format!(
+                "\n    fn fnd01_private_helper_proxy_{api}() {{ let _ = crate::crypto::{helper_wrapper}(); }}\n"
+            ),
+        );
+        helper_wrapper_state.tokens = TokenStream::from_str(&helper_wrapper_state.text)
+            .expect("the helper-wrapper proxy plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(
+                &helper_wrapper_planted,
+                &[crypto_path, state_path],
+            ),
+            helper_wrapper_non_target_digest,
+            "{api} private-helper wrapper plant preserves every non-target input"
+        );
+        let helper_wrapper_error = validate_state_partition_rng_seam(&helper_wrapper_planted)
+            .expect_err("each public entropy-helper wrapper must fail closed");
+        assert_eq!(
+            helper_wrapper_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_OWNER|state-partition-rng|crates/fastmcp-core/src/crypto.rs",
+            "{api} private-helper wrapper route"
+        );
+        assert_fresh_baseline();
+    }
+
+    for (variant, crypto_append, state_proxy) in [
+        (
+            "extern",
+            "\npub extern \"C\" fn fnd01_hmac_ffi_wrapper() { let _ = draw_hmac_sha256_key_with(&OsRandomSource); }\n",
+            "\n    fn fnd01_hmac_ffi_proxy() { let _ = crate::crypto::fnd01_hmac_ffi_wrapper(); }\n",
+        ),
+        (
+            "unsafe-extern",
+            "\npub(crate) unsafe extern \"C\" fn fnd01_hmac_unsafe_ffi_wrapper() { let _ = draw_hmac_sha256_key_with(&OsRandomSource); }\n",
+            "\n    fn fnd01_hmac_unsafe_ffi_proxy() { let _ = crate::crypto::fnd01_hmac_unsafe_ffi_wrapper; }\n",
+        ),
+        (
+            "async",
+            "\npub async fn fnd01_async_entropy_wrapper() { let _ = draw_hmac_sha256_key_with(&OsRandomSource); }\n",
+            "\n    fn fnd01_async_entropy_proxy() { let _ = crate::crypto::fnd01_async_entropy_wrapper; }\n",
+        ),
+        (
+            "const",
+            "\npub const fn fnd01_const_escape_wrapper() -> usize { 1 }\n",
+            "\n    fn fnd01_const_escape_proxy() { let _ = crate::crypto::fnd01_const_escape_wrapper(); }\n",
+        ),
+        (
+            "alias",
+            "\nuse self::draw_hmac_sha256_key_with as fnd01_private_hmac_helper; pub fn fnd01_alias_entropy_wrapper() { let _ = fnd01_private_hmac_helper(&OsRandomSource); }\n",
+            "\n    fn fnd01_alias_entropy_proxy() { let _ = crate::crypto::fnd01_alias_entropy_wrapper(); }\n",
+        ),
+        (
+            "fill",
+            "\npub fn fnd01_fill_entropy_wrapper() { let mut bytes = [0_u8; 1]; let _ = OsRandomSource.fill(&mut bytes); }\n",
+            "\n    fn fnd01_fill_entropy_proxy() { let _ = crate::crypto::fnd01_fill_entropy_wrapper(); }\n",
+        ),
+        (
+            "constructor",
+            "\npub fn fnd01_constructor_escape_wrapper() -> SecurityIdentifier { SecurityIdentifier { bytes: [0_u8; SECURITY_IDENTIFIER_BYTES] } }\n",
+            "\n    fn fnd01_constructor_escape_proxy() { let _ = crate::crypto::fnd01_constructor_escape_wrapper(); }\n",
+        ),
+        (
+            "trait",
+            "\npub trait Fnd01EntropyTrait { fn draw() -> Result<HmacSha256Key, RandomDrawError> { draw_hmac_sha256_key_with(&OsRandomSource) } } impl Fnd01EntropyTrait for () {}\n",
+            "\n    fn fnd01_trait_entropy_proxy() { let _ = <() as crate::crypto::Fnd01EntropyTrait>::draw(); }\n",
+        ),
+        (
+            "macro",
+            "\npub fn fnd01_macro_entropy_helper() -> Result<HmacSha256Key, RandomDrawError> { draw_hmac_sha256_key_with(&OsRandomSource) } #[macro_export] macro_rules! fnd01_entropy_escape { () => { $crate::crypto::fnd01_macro_entropy_helper() }; }\n",
+            "\n    fn fnd01_macro_entropy_proxy() { let _ = crate::fnd01_entropy_escape!(); }\n",
+        ),
+    ] {
+        let mut variant_planted = baseline.clone();
+        let variant_crypto = variant_planted
+            .rust_sources
+            .get_mut(crypto_path)
+            .expect("crypto source is present for public-surface variant planting");
+        variant_crypto.text.push_str(crypto_append);
+        variant_crypto.tokens = TokenStream::from_str(&variant_crypto.text)
+            .expect("the public-surface variant remains tokenizable");
+        let variant_state = variant_planted
+            .rust_sources
+            .get_mut(state_path)
+            .expect("state source is present for public-surface variant proxy planting");
+        variant_state
+            .text
+            .insert_str(unlisted_method_offset, state_proxy);
+        variant_state.tokens = TokenStream::from_str(&variant_state.text)
+            .expect("the public-surface variant proxy remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(
+                &variant_planted,
+                &[crypto_path, state_path],
+            ),
+            helper_wrapper_non_target_digest,
+            "{variant} public-surface variant preserves every non-target input"
+        );
+        let variant_error = validate_state_partition_rng_seam(&variant_planted)
+            .expect_err("each public callable shape must fail closed");
+        assert_eq!(
+            variant_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_OWNER|state-partition-rng|crates/fastmcp-core/src/crypto.rs",
+            "{variant} public-surface variant"
+        );
+        assert_fresh_baseline();
+    }
+
+    let failure_tests = state_partition_rng_named_function_bodies(
+        &baseline_state.tokens,
+        "cache_partition_injected_draw_failure_is_rejected_once",
+    );
+    let failure_test = (failure_tests.len() == 1)
+        .then(|| {
+            let body = &failure_tests[0];
+            state_partition_rng_byte_offset(
+                &baseline_state.text,
+                body.span_open().start().line,
+                body.span_open().start().column,
+            )
+        })
+        .flatten()
+        .expect("baseline contains exactly one deterministic failure test body");
+    let mut callsite_planted = baseline.clone();
+    let callsite_state = callsite_planted
+        .rust_sources
+        .get_mut("crates/fastmcp-core/src/state.rs")
+        .expect("state source is present for callsite planting");
+    callsite_state.text.insert_str(
+        failure_test + 1,
+        " let _fnd01_extra_partition = SessionState::from_map_with_partition_draw(HashMap::new(), || Ok::<[u8; CACHE_PARTITION_BYTES], &'static str>([0_u8; CACHE_PARTITION_BYTES]));",
+    );
+    callsite_state.tokens = TokenStream::from_str(&callsite_state.text)
+        .expect("the callsite-planted state source remains tokenizable");
+    assert_eq!(
+        state_partition_rng_other_input_digest(&callsite_planted),
+        baseline_other_input_digest,
+        "callsite plant must not alter any other inventory input"
+    );
+    let callsite_error = validate_state_partition_rng_seam(&callsite_planted)
+        .expect_err("one planted private seam callsite must fail closed");
+    assert_eq!(
+        callsite_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_CALLSITE|state-partition-rng|crates/fastmcp-core/src/state.rs"
+    );
+
+    let callsite_fresh = state_partition_rng_inventory()
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    validate_state_partition_rng_seam(&callsite_fresh)
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    let callsite_fresh_state =
+        state_partition_rng_source(&callsite_fresh, "crates/fastmcp-core/src/state.rs")
+            .expect("fresh state source is present after callsite plant");
+    assert_eq!(callsite_fresh_state.text, baseline_state.text);
+    let callsite_fresh_digest: [u8; 32] =
+        Sha256::digest(callsite_fresh_state.text.as_bytes()).into();
+    assert_eq!(callsite_fresh_digest, baseline_state_digest);
+    assert_eq!(
+        state_partition_rng_other_input_digest(&callsite_fresh),
+        baseline_other_input_digest,
+        "fresh inventory must retain the baseline non-state domain after callsite plant"
+    );
+
+    let root_non_target_digest = state_partition_rng_input_digest_excluding(&baseline, "Cargo.toml");
+    let mut compact_root_planted = baseline.clone();
+    let compact_root = compact_root_planted
+        .manifests
+        .get_mut("Cargo.toml")
+        .expect("root manifest is present for compact dependency planting");
+    let compact_root_replacement = compact_root.replacen(
+        "getrandom = { version = \"=0.4.3\", default-features = false }",
+        "getrandom = \"=0.4.3\"",
+        1,
+    );
+    assert_ne!(compact_root_replacement, *compact_root, "compact plant changes one root edge");
+    *compact_root = compact_root_replacement;
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&compact_root_planted, "Cargo.toml"),
+        root_non_target_digest,
+        "compact root edge plant preserves every non-target input"
+    );
+    let compact_root_error = validate_state_partition_rng_seam(&compact_root_planted)
+        .expect_err("compact root dependency edge must fail closed");
+    assert_eq!(
+        compact_root_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_MANIFEST|state-partition-rng|Cargo.toml"
+    );
+    assert_fresh_baseline();
+
+    let mut dotted_root_planted = baseline.clone();
+    let dotted_root = dotted_root_planted
+        .manifests
+        .get_mut("Cargo.toml")
+        .expect("root manifest is present for dotted dependency planting");
+    dotted_root.push_str(
+        "\n[target.'cfg(unix)'.dependencies]\nfnd01_dotted_rng = { package = \"getrandom\", version = \"=0.4.3\", default-features = false }\n",
+    );
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&dotted_root_planted, "Cargo.toml"),
+        root_non_target_digest,
+        "dotted root edge plant preserves every non-target input"
+    );
+    let dotted_root_error = validate_state_partition_rng_seam(&dotted_root_planted)
+        .expect_err("dotted target dependency edge must fail closed");
+    assert_eq!(
+        dotted_root_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_MANIFEST|state-partition-rng|Cargo.toml"
+    );
+    assert_fresh_baseline();
+
+    let core_manifest_path = "crates/fastmcp-core/Cargo.toml";
+    let core_non_target_digest = state_partition_rng_input_digest_excluding(&baseline, core_manifest_path);
+    let mut renamed_core_planted = baseline.clone();
+    let renamed_core = renamed_core_planted
+        .manifests
+        .get_mut(core_manifest_path)
+        .expect("core manifest is present for renamed dependency planting");
+    let renamed_core_replacement = renamed_core.replacen(
+        "getrandom = { workspace = true }\n",
+        "getrandom = { workspace = true }\nfnd01_renamed_rng = { package = \"getrandom\", workspace = true }\n",
+        1,
+    );
+    assert_ne!(renamed_core_replacement, *renamed_core, "renamed plant changes one core edge");
+    *renamed_core = renamed_core_replacement;
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&renamed_core_planted, core_manifest_path),
+        core_non_target_digest,
+        "renamed core edge plant preserves every non-target input"
+    );
+    let renamed_core_error = validate_state_partition_rng_seam(&renamed_core_planted)
+        .expect_err("renamed package edge must fail closed");
+    assert_eq!(
+        renamed_core_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_MANIFEST|state-partition-rng|crates/fastmcp-core/Cargo.toml"
+    );
+    assert_fresh_baseline();
+
+    let mut patch_root_planted = baseline.clone();
+    patch_root_planted.cargo_lock = baseline.cargo_lock.clone();
+    let patch_root = patch_root_planted
+        .manifests
+        .get_mut("Cargo.toml")
+        .expect("root manifest is present for patch planting");
+    patch_root.push_str(
+        "\n[patch.crates-io]\nfnd01_patched_rng = { package = \"getrandom\", version = \"=0.4.3\" }\n",
+    );
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&patch_root_planted, "Cargo.toml"),
+        root_non_target_digest,
+        "root patch plant preserves every non-target input"
+    );
+    let patch_root_error = validate_state_partition_rng_seam(&patch_root_planted)
+        .expect_err("root patch override must fail closed");
+    assert_eq!(
+        patch_root_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_MANIFEST|state-partition-rng|Cargo.toml"
+    );
+    assert_fresh_baseline();
+
+    let mut replace_core_planted = baseline.clone();
+    let replace_core = replace_core_planted
+        .manifests
+        .get_mut(core_manifest_path)
+        .expect("core manifest is present for replace planting");
+    replace_core.push_str("\n[replace]\n\"getrandom:0.4.3\" = { path = \"vendor/getrandom\" }\n");
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&replace_core_planted, core_manifest_path),
+        core_non_target_digest,
+        "core replace plant preserves every non-target input"
+    );
+    let replace_core_error = validate_state_partition_rng_seam(&replace_core_planted)
+        .expect_err("core replace override must fail closed");
+    assert_eq!(
+        replace_core_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_MANIFEST|state-partition-rng|crates/fastmcp-core/Cargo.toml"
+    );
+    assert_fresh_baseline();
+
+    let lock_non_target_digest = state_partition_rng_input_digest_excluding(&baseline, "Cargo.lock");
+    let getrandom_lock_record = "name = \"getrandom\"\nversion = \"0.4.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099\"";
+    let mut alternate_source_lock_planted = baseline.clone();
+    alternate_source_lock_planted.cargo_lock = alternate_source_lock_planted.cargo_lock.replacen(
+        getrandom_lock_record,
+        "name = \"getrandom\"\nversion = \"0.4.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099\"",
+        1,
+    );
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&alternate_source_lock_planted, "Cargo.lock"),
+        lock_non_target_digest,
+        "alternate source lock plant preserves every non-target input"
+    );
+    let alternate_source_lock_error = validate_state_partition_rng_seam(&alternate_source_lock_planted)
+        .expect_err("alternate getrandom lock source must fail closed");
+    assert_eq!(
+        alternate_source_lock_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_LOCK|state-partition-rng|Cargo.lock"
+    );
+    assert_fresh_baseline();
+
+    let mut alternate_dependency_lock_planted = baseline.clone();
+    let core_lock_offset = alternate_dependency_lock_planted
+        .cargo_lock
+        .find("name = \"fastmcp-core\"")
+        .expect("fastmcp-core lock record is present");
+    let dependency_offset = alternate_dependency_lock_planted.cargo_lock[core_lock_offset..]
+        .find("\"getrandom 0.4.3\",")
+        .map(|offset| core_lock_offset + offset)
+        .expect("fastmcp-core lock record contains the exact getrandom dependency");
+    alternate_dependency_lock_planted.cargo_lock.replace_range(
+        dependency_offset..dependency_offset + "\"getrandom 0.4.3\",".len(),
+        "\"getrandom 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)\",",
+    );
+    assert_eq!(
+        state_partition_rng_input_digest_excluding(&alternate_dependency_lock_planted, "Cargo.lock"),
+        lock_non_target_digest,
+        "alternate dependency lock plant preserves every non-target input"
+    );
+    let alternate_dependency_lock_error =
+        validate_state_partition_rng_seam(&alternate_dependency_lock_planted)
+            .expect_err("alternate getrandom lock dependency record must fail closed");
+    assert_eq!(
+        alternate_dependency_lock_error.stable(),
+        "FND01|Error|E_STATE_PARTITION_RNG_LOCK|state-partition-rng|Cargo.lock"
+    );
+    assert_fresh_baseline();
+}
+
 #[test]
 fn fnd_01_sdk_matrix_is_derived_from_locks_artifacts_and_execution_facts() {
     let root = repository_root();
@@ -85173,7 +89326,7 @@ fn ordinary_sealed_file_binding_record(binding: &ValidatedFileBinding) -> Canoni
 }
 
 fn ordinary_sealed_raw_stream_record(bytes: &[u8]) -> Result<CanonicalRecord, String> {
-    let digest = sha256(bytes).map_err(|error| format!("E_CONTROL_RAW_DIGEST: {error}"))?;
+    let digest = trust_sha256(bytes).map_err(|error| format!("E_CONTROL_RAW_DIGEST: {error}"))?;
     let length = u64::try_from(bytes.len())
         .map_err(|_| "E_CONTROL_RAW_LENGTH: stream length".to_owned())?;
     Ok(CanonicalRecord {
@@ -85394,7 +89547,7 @@ fn ordinary_sealed_encode_control_ledger_bytes(
         .field_offsets
         .get(digest_index)
         .ok_or_else(|| "E_CONTROL_LEDGER: missing ledger_set_sha256 offset".to_owned())?;
-    let digest = sha256(
+    let digest = trust_sha256(
         bytes
             .get(..preimage_end)
             .ok_or_else(|| "E_CONTROL_LEDGER: digest preimage bounds".to_owned())?,
@@ -86215,16 +90368,56 @@ fn emit_ordinary_entry_failure(
     expected: &str,
     observed: &str,
 ) {
-    let role = format!("role={mode}");
-    let run = format!("run_id={run_id}");
-    let expected = format!("expected={expected}");
-    let observed = format!("observed={observed}");
+    let [role, run, expected, observed] =
+        ordinary_entry_failure_fields(mode, run_id, expected, observed);
     emit_entry_diagnostic_parts(
         stage,
         mode,
         code,
         &[&role, &run, &expected, &observed],
     );
+}
+
+/// The ordinary product diagnostic is structured rather than detail-parsed:
+/// every mapped failure retains its role, available run identifier, expected
+/// invariant, and observed fact.  Keep this formatter shared with the actual
+/// stderr emitter so B-R4 cannot be satisfied by a test-only representation.
+fn ordinary_entry_failure_fields(
+    mode: &str,
+    run_id: &str,
+    expected: &str,
+    observed: &str,
+) -> [String; 4] {
+    [
+        format!("role={mode}"),
+        format!("run_id={run_id}"),
+        format!("expected={expected}"),
+        format!("observed={observed}"),
+    ]
+}
+
+/// The final ordinary handoff step deliberately has one production dispatch
+/// surface.  It is called only after the probe permit, strict control-ledger
+/// join, archive validation, and bookend rebinds.  Pending integration gates
+/// are not rewritten as failures; verifier errors cannot fall back to the
+/// pre-consume pending sentinel.
+fn dispatch_ordinary_evidence(result: VResult<Report>) -> Result<(), String> {
+    match result {
+        Ok(report) => {
+            if report.has_errors() {
+                let detail = report
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                    .map(Diagnostic::stable)
+                    .next()
+                    .unwrap_or_else(|| "verifier reported errors".to_owned());
+                return Err(format!("E_ORDINARY_EVIDENCE: {detail}"));
+            }
+            Ok(())
+        }
+        Err(diagnostic) => Err(format!("E_ORDINARY_EVIDENCE: {}", diagnostic.stable())),
+    }
 }
 
 
@@ -87115,22 +91308,7 @@ fn validate_ordinary_handoff_entry(
     // Integration receipts remain Severity::Pending (E_PENDING_GATE); only
     // Severity::Error fails closed as E_ORDINARY_EVIDENCE. This is not a
     // permanent E_ORDINARY_HANDOFF_PENDING stub on the happy path.
-    match run_verifier() {
-        Ok(report) => {
-            if report.has_errors() {
-                let detail = report
-                    .diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.severity == Severity::Error)
-                    .map(Diagnostic::stable)
-                    .next()
-                    .unwrap_or_else(|| "verifier reported errors".to_owned());
-                return Err(format!("E_ORDINARY_EVIDENCE: {detail}"));
-            }
-            Ok(())
-        }
-        Err(diagnostic) => Err(format!("E_ORDINARY_EVIDENCE: {}", diagnostic.stable())),
-    }
+    dispatch_ordinary_evidence(run_verifier())
 }
 
 #[test]
@@ -87676,7 +91854,7 @@ fn ordinary_sealed_control_ledger_expectation_joins_all_live_fields() {
 /// `validate_control_ledger_bytes` → `ValidatedControlLedger`.
 /// // B-R2-SEALED
 #[test]
-fn ordinary_b_r2_sealed_production_control_ledger_e2e() {
+fn ordinary_b_r2_sealed_production_e2e() {
     let (expectation, ledger_bytes, package_root, target_root) =
         ordinary_sealed_produce_control_fixture()
             .expect("sealed produce control fixture must encode");
@@ -87787,11 +91965,40 @@ fn ordinary_b_r2_sealed_production_control_ledger_e2e() {
         .expect("empty supply archive set must validate with zero members");
 }
 
+/// B-R2 negative: a live expectation field is independently desynchronized
+/// after ledger sealing.  The production validator must preserve the stable
+/// authority code and expose the exact expected/observed digests.
+#[test]
+fn ordinary_b_r2_sealed_field_desync_fails_closed() {
+    let (mut expectation, ledger_bytes, _package_root, _target_root) =
+        ordinary_sealed_produce_control_fixture()
+            .expect("sealed fixture must encode before independent mutation");
+    let observed = expectation.tool_set_sha256;
+    expectation.tool_set_sha256[0] ^= 0x80;
+    let expected = expectation.tool_set_sha256;
+
+    let error = validate_control_ledger_bytes(&ledger_bytes, &expectation)
+        .expect_err("desynchronized live tool_set field must fail closed");
+    assert_eq!(error.code(), "E_CONTROL_AUTHORITY");
+    assert_eq!(
+        error.detail(),
+        format!(
+            "tool_set_sha256 expected={} observed={}",
+            encode_lower_hex(&expected),
+            encode_lower_hex(&observed),
+        )
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_LEDGER", error.detail()),
+        "ledger",
+    );
+}
+
 /// B-R3 pure tier: compose dual-path pure authority + pure ControlLedgerExpectation
 /// field join + environment digest without ledger/FS/network children.
 /// // B-R3-PURE
 #[test]
-fn ordinary_b_r3_pure_matrix_composes_dual_path_and_control_join() {
+fn ordinary_b_r3_pure_matrix() {
     let pure = ordinary_reprobe_dual_path_pure_authority()
         .expect("B-R3 pure dual-path");
     assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
@@ -87824,7 +92031,7 @@ fn ordinary_b_r3_pure_matrix_composes_dual_path_and_control_join() {
 /// validate_control_ledger_bytes on the encoded sealed fixture.
 /// // B-R3-SEALED
 #[test]
-fn ordinary_b_r3_sealed_matrix_reuses_sealed_tables_and_production_validator() {
+fn ordinary_b_r3_sealed_matrix() {
     let (expectation, ledger_bytes, _package_root, _target_root) =
         ordinary_sealed_produce_control_fixture()
             .expect("B-R3 sealed fixture");
@@ -87852,7 +92059,7 @@ fn ordinary_b_r3_sealed_matrix_reuses_sealed_tables_and_production_validator() {
 /// either Ok(nonzero digests) on qualified hosts or fail-closed platform/tool codes.
 /// // B-R3-LIVE
 #[test]
-fn ordinary_b_r3_live_matrix_dual_path_then_reprobe_residual() {
+fn ordinary_b_r3_live_matrix() {
     let pure = ordinary_reprobe_dual_path_pure_authority()
         .expect("B-R3 live pure half first");
     assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
@@ -87893,6 +92100,51 @@ fn ordinary_b_r3_live_matrix_dual_path_then_reprobe_residual() {
             );
         }
     }
+}
+
+/// B-R1 qualified live half: only the qualified Linux executor is allowed to
+/// claim the twenty-tool reprobe.  This is deliberately not a best-effort
+/// host probe: all 20 rows and both live digests are mandatory on that tier.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
+    let pure = ordinary_reprobe_dual_path_pure_authority()
+        .expect("qualified Linux pure dual-path authority");
+    let reprobe = ordinary_reprobe_tool_set_shared(
+        &repository_root(),
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    )
+    .expect("qualified Linux must complete the ordinary twenty-tool reprobe");
+    assert_eq!(reprobe.inventory.native_tool_count(), ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(reprobe.inventory.native_tool_count(), pure.native_tool_count);
+    assert_ne!(reprobe.tool_set_sha256, [0; 32]);
+    assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
+}
+
+/// B-R3 ordering negative: an unqualified host reaches the platform gate
+/// before any ledger open, validator, archive, or evidence dispatch.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[test]
+fn ordinary_b_r3_unqualified_platform_fails_before_ledger_open() {
+    let error = match ordinary_reprobe_tool_set_shared(
+        &repository_root(),
+        BootstrapMode::Produce,
+        "0123456789abcdef0123456789abcdef",
+        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    ) {
+        Ok(_) => panic!("unqualified platform must not reach ledger-open work"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_UNQUALIFIED_PLATFORM", &error),
+        "reprobe"
+    );
 }
 
 /// B-R1 live half: unqualified hosts must fail closed at reprobe stage with
@@ -89352,6 +93604,1194 @@ where
             }
             3
         }
+    }
+}
+
+// The Tasks and Apps source evidence is intentionally verified as a separate
+// immutable bundle.  The artifact expectations below are an independent
+// compiled authority boundary, not a second manifest: the manifest remains the
+// sole input inventory and this validator rejects drift from these frozen
+// primary-source bindings before any product capability is credited.
+const TASKS_APPS_MANIFEST_PATH: &str = "evidence/fnd-01/tasks-apps.toml";
+const TASKS_APPS_VENDOR_PATHS: [&str; 13] = [
+    "evidence/fnd-01/vendor/tasks/conformance-wire-fields.ts",
+    "evidence/fnd-01/vendor/tasks/package-lock.json",
+    "evidence/fnd-01/vendor/tasks/schema.json",
+    "evidence/fnd-01/vendor/tasks/schema.ts",
+    "evidence/fnd-01/vendor/tasks/tasks.md",
+    "evidence/fnd-01/vendor/apps/app-bridge.ts",
+    "evidence/fnd-01/vendor/apps/app.ts",
+    "evidence/fnd-01/vendor/apps/apps.mdx",
+    "evidence/fnd-01/vendor/apps/generated-schema.json",
+    "evidence/fnd-01/vendor/apps/generated-schema.ts",
+    "evidence/fnd-01/vendor/apps/package-lock.json",
+    "evidence/fnd-01/vendor/apps/spec.types.ts",
+    "evidence/fnd-01/vendor/apps/types.ts",
+];
+const TASKS_APPS_VENDOR_DIGEST: &str =
+    "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a";
+
+#[derive(Clone, Debug)]
+struct TasksAppsSourceBundle {
+    manifest: toml::Value,
+    manifest_bytes: Vec<u8>,
+    vendor_bytes: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+struct TasksAppsArtifactExpectation {
+    id: &'static str,
+    upstream_path: &'static str,
+    vendor_path: &'static str,
+    byte_length: usize,
+    sha256: &'static str,
+    authority_role: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct TasksAppsPlantedMutation {
+    id: String,
+    operation: String,
+    target: String,
+    replacement: Option<toml::Value>,
+    replacement_input: Option<String>,
+    expected_diagnostic: String,
+}
+
+#[derive(Clone, Copy)]
+enum TasksAppsMutationPayload {
+    None,
+    ReplacementText(&'static str),
+    ReplacementBool(bool),
+    ReplacementInput(&'static str),
+}
+
+const TASKS_ARTIFACTS: [TasksAppsArtifactExpectation; 4] = [
+    TasksAppsArtifactExpectation {
+        id: "tasks-prose",
+        upstream_path: "specification/draft/tasks.md",
+        vendor_path: "evidence/fnd-01/vendor/tasks/tasks.md",
+        byte_length: 33_967,
+        sha256: "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11",
+        authority_role: "extension-prose-semantics-with-recorded-ambiguities",
+    },
+    TasksAppsArtifactExpectation {
+        id: "tasks-typescript-schema",
+        upstream_path: "schema/draft/schema.ts",
+        vendor_path: "evidence/fnd-01/vendor/tasks/schema.ts",
+        byte_length: 9_421,
+        sha256: "2203cc75469e32a92a60f4b7b4de949577e25f18fafff69aa92ec06773ab70f6",
+        authority_role: "raw-typescript-extension-fields-unions-and-old-sdk-import-shape",
+    },
+    TasksAppsArtifactExpectation {
+        id: "tasks-generated-json-schema",
+        upstream_path: "schema/draft/schema.json",
+        vendor_path: "evidence/fnd-01/vendor/tasks/schema.json",
+        byte_length: 46_903,
+        sha256: "b17cb4a2534379c214b17770bd5d3d54f69fde16a953bfb542c58235a61274bb",
+        authority_role: "generated-raw-schema-provenance-and-path-scoped-drift",
+    },
+    TasksAppsArtifactExpectation {
+        id: "tasks-package-lock",
+        upstream_path: "package-lock.json",
+        vendor_path: "evidence/fnd-01/vendor/tasks/package-lock.json",
+        byte_length: 237_713,
+        sha256: "c2a0d2e1d66ee2db1aca03a87127034998892e6584fece413437b312f4f908f7",
+        authority_role: "dependency-resolution-and-sdk-integrity",
+    },
+];
+
+const APPS_ARTIFACTS: [TasksAppsArtifactExpectation; 8] = [
+    TasksAppsArtifactExpectation {
+        id: "apps-stable-spec",
+        upstream_path: "specification/2026-01-26/apps.mdx",
+        vendor_path: "evidence/fnd-01/vendor/apps/apps.mdx",
+        byte_length: 59_181,
+        sha256: "ee452a7d1b9b7fb900acfeb4d6932d3963375b0f3f37d196a4b93eb80312af0e",
+        authority_role: "normative-apps-security-behavior-lifecycle-and-registered-settings",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-source-spec-types",
+        upstream_path: "src/spec.types.ts",
+        vendor_path: "evidence/fnd-01/vendor/apps/spec.types.ts",
+        byte_length: 29_516,
+        sha256: "2ae52b6156f0f1fd2387717f15a8de968501d264e200d5409f09055297f8bc24",
+        authority_role: "ui-specific-source-interface-shapes",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-source-unions",
+        upstream_path: "src/types.ts",
+        vendor_path: "evidence/fnd-01/vendor/apps/types.ts",
+        byte_length: 7_191,
+        sha256: "22c74e3be838481e5f58af8a7f6d3f516a7200b08d9c7eaa33a518c30f1c9b52",
+        authority_role: "standard-reuse-union-and-root-inventory",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-view-implementation",
+        upstream_path: "src/app.ts",
+        vendor_path: "evidence/fnd-01/vendor/apps/app.ts",
+        byte_length: 72_234,
+        sha256: "6909662619a7c35366096578d389ae58ef8a4841c4bea77e04c4bfc1774e0812",
+        authority_role: "view-emitter-handler-and-default-behavior-direction-evidence",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-host-bridge",
+        upstream_path: "src/app-bridge.ts",
+        vendor_path: "evidence/fnd-01/vendor/apps/app-bridge.ts",
+        byte_length: 69_035,
+        sha256: "72ee4695d536e3183f682c09614d64230847fd99d3f853a86914520428134e1f",
+        authority_role: "host-emitter-handler-and-bridge-direction-evidence",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-generated-typescript-schema",
+        upstream_path: "src/generated/schema.ts",
+        vendor_path: "evidence/fnd-01/vendor/apps/generated-schema.ts",
+        byte_length: 40_227,
+        sha256: "239277f079524bd457ffa3133728a0aa5573206b0cb6c57fc115c66deefef770",
+        authority_role: "generated-runtime-schema-drift-and-partial-validation",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-generated-json-schema",
+        upstream_path: "src/generated/schema.json",
+        vendor_path: "evidence/fnd-01/vendor/apps/generated-schema.json",
+        byte_length: 219_846,
+        sha256: "002db9178110e644499e781415ee1025e5fde1e54500d14986626ba4a7b5b331",
+        authority_role: "generated-json-schema-drift-and-partial-validation",
+    },
+    TasksAppsArtifactExpectation {
+        id: "apps-package-lock",
+        upstream_path: "package-lock.json",
+        vendor_path: "evidence/fnd-01/vendor/apps/package-lock.json",
+        byte_length: 338_858,
+        sha256: "ddeb690845d40ed20a7e1989aae8820d36253a73a33a2080e66c7e03d0229bec",
+        authority_role: "dependency-resolution-and-sdk-import-closure",
+    },
+];
+
+fn tasks_apps_error(code: &str, subject: &str, field: &str) -> Diagnostic {
+    Diagnostic::error(code, subject).at(field)
+}
+
+fn tasks_apps_table<'a>(
+    value: &'a toml::Value,
+    subject: &str,
+) -> VResult<&'a toml::map::Map<String, toml::Value>> {
+    value
+        .as_table()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, "table"))
+}
+
+fn tasks_apps_field<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+    subject: &str,
+) -> VResult<&'a toml::Value> {
+    table
+        .get(field)
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+}
+
+fn tasks_apps_string<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+    subject: &str,
+) -> VResult<&'a str> {
+    tasks_apps_field(table, field, subject)?
+        .as_str()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+}
+
+fn tasks_apps_bool(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    subject: &str,
+) -> VResult<bool> {
+    tasks_apps_field(table, field, subject)?
+        .as_bool()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+}
+
+fn tasks_apps_usize(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    subject: &str,
+) -> VResult<usize> {
+    let value = tasks_apps_field(table, field, subject)?
+        .as_integer()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))?;
+    usize::try_from(value).map_err(|_| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+}
+
+fn tasks_apps_expect_string(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    expected: &str,
+    code: &str,
+    subject: &str,
+) -> VResult<()> {
+    if tasks_apps_string(table, field, subject)? != expected {
+        return Err(tasks_apps_error(code, subject, field));
+    }
+    Ok(())
+}
+
+fn tasks_apps_vendor_digest(vendor_bytes: &BTreeMap<String, Vec<u8>>) -> VResult<[u8; 32]> {
+    if vendor_bytes.len() != TASKS_APPS_VENDOR_PATHS.len()
+        || TASKS_APPS_VENDOR_PATHS
+            .iter()
+            .any(|path| !vendor_bytes.contains_key(*path))
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_ARTIFACT_INVENTORY",
+            "vendor-inputs",
+            "paths",
+        ));
+    }
+    let mut ordered = vendor_bytes.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let mut digest = Sha256::new();
+    digest.update(b"FND01TASKSAPPSVENDORv1\0");
+    digest.update(
+        u32::try_from(ordered.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for (path, bytes) in ordered {
+        let path_length = u32::try_from(path.len()).map_err(|_| {
+            tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "path")
+        })?;
+        digest.update(path_length.to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(sha256(bytes));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn load_tasks_apps_source_bundle(root: &Path) -> VResult<TasksAppsSourceBundle> {
+    let manifest_path = resolve_safe(root, TASKS_APPS_MANIFEST_PATH, TASKS_APPS_MANIFEST_PATH)?;
+    let manifest_bytes = read_bounded(&manifest_path, 2 * 1024 * 1024, TASKS_APPS_MANIFEST_PATH)?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)
+        .map_err(|_| tasks_apps_error("E_TASKS_APPS_MANIFEST", "manifest", "utf8"))?;
+    let manifest = parse_toml_document(manifest_text, TASKS_APPS_MANIFEST_PATH)?;
+    let mut vendor_bytes = BTreeMap::new();
+    for path in TASKS_APPS_VENDOR_PATHS {
+        let absolute = resolve_safe(root, path, path)?;
+        let bytes = read_bounded(&absolute, 512 * 1024, path)?;
+        if vendor_bytes.insert(path.to_owned(), bytes).is_some() {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                "vendor-inputs",
+                "duplicate path",
+            ));
+        }
+    }
+    Ok(TasksAppsSourceBundle {
+        manifest,
+        manifest_bytes,
+        vendor_bytes,
+    })
+}
+
+fn validate_tasks_apps_artifacts(
+    family: &str,
+    parent: &toml::map::Map<String, toml::Value>,
+    expected: &[TasksAppsArtifactExpectation],
+    repository: &str,
+    commit: &str,
+    bundle: &TasksAppsSourceBundle,
+) -> VResult<()> {
+    let rows = tasks_apps_field(parent, "artifact", family)?
+        .as_array()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", family, "artifact"))?;
+    if rows.len() != expected.len() {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_ARTIFACT_INVENTORY",
+            family,
+            "artifact count",
+        ));
+    }
+    for (index, (row, frozen)) in rows.iter().zip(expected).enumerate() {
+        let subject = format!("{family}.artifact[{index}]");
+        let row = tasks_apps_table(row, &subject)?;
+        // This check intentionally precedes every artifact binding so the
+        // required missing-ID negative has one stable diagnostic.
+        if row.get("id").and_then(toml::Value::as_str) != Some(frozen.id) {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                &subject,
+                "id",
+            ));
+        }
+        tasks_apps_expect_string(
+            row,
+            "repository_commit",
+            commit,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            frozen.id,
+        )?;
+        tasks_apps_expect_string(
+            row,
+            "upstream_path",
+            frozen.upstream_path,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            frozen.id,
+        )?;
+        tasks_apps_expect_string(
+            row,
+            "vendor_path",
+            frozen.vendor_path,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            frozen.id,
+        )?;
+        let source_url = format!(
+            "https://raw.githubusercontent.com/{}/{}/{}",
+            repository.trim_start_matches("https://github.com/"),
+            commit,
+            frozen.upstream_path
+        );
+        tasks_apps_expect_string(
+            row,
+            "source_url",
+            &source_url,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            frozen.id,
+        )?;
+        if tasks_apps_usize(row, "byte_length", frozen.id)? != frozen.byte_length
+            || tasks_apps_string(row, "sha256", frozen.id)? != frozen.sha256
+            || tasks_apps_string(row, "authority_role", frozen.id)? != frozen.authority_role
+        {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_BINDING",
+                frozen.id,
+                "frozen fields",
+            ));
+        }
+        let bytes = bundle.vendor_bytes.get(frozen.vendor_path).ok_or_else(|| {
+            tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", frozen.id, "vendor_path")
+        })?;
+        if bytes.len() != frozen.byte_length || lower_hex(&sha256(bytes)) != frozen.sha256 {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_VENDOR_BYTES",
+                frozen.id,
+                "sha256",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tasks_apps_lock_license(
+    bundle: &TasksAppsSourceBundle,
+    path: &str,
+    expected: &str,
+    subject: &str,
+) -> VResult<()> {
+    let bytes = bundle.vendor_bytes.get(path).ok_or_else(|| {
+        tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", subject, "package-lock")
+    })?;
+    let lock: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| tasks_apps_error("E_TASKS_APPS_LOCK_LICENSE", subject, "json"))?;
+    if lock
+        .pointer("/packages//license")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected)
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_LOCK_LICENSE",
+            subject,
+            "packages[\"\"].license",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tasks_apps_sdk(
+    parent: &toml::map::Map<String, toml::Value>,
+    artifact: &str,
+    subject: &str,
+) -> VResult<()> {
+    let sdk = tasks_apps_table(tasks_apps_field(parent, "sdk_1_29_0", subject)?, subject)?;
+    for (field, expected) in [
+        ("package", "@modelcontextprotocol/sdk"),
+        ("resolved_version", "1.29.0"),
+        (
+            "resolved_url",
+            "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.29.0.tgz",
+        ),
+        (
+            "sha256",
+            "1c51470eca288ae744a5d8bb48e217d3eab5869eb2cbaf587fc29f336d6b096c",
+        ),
+        ("resolved_from_artifact", artifact),
+    ] {
+        tasks_apps_expect_string(
+            sdk,
+            field,
+            expected,
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            subject,
+        )?;
+    }
+    if tasks_apps_usize(sdk, "byte_length", subject)? != 572_539
+        || !tasks_apps_string(sdk, "lock_integrity", subject)?.starts_with("sha512-")
+        || tasks_apps_string(sdk, "lock_integrity", subject)?
+            != tasks_apps_string(sdk, "verified_integrity", subject)?
+        || tasks_apps_bool(sdk, "final_core_authority", subject)?
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            subject,
+            "sdk_1_29_0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tasks_apps_planted_mutations(
+    contract: &toml::map::Map<String, toml::Value>,
+) -> VResult<Vec<TasksAppsPlantedMutation>> {
+    let mutations = tasks_apps_field(
+        contract,
+        "planted_mutation",
+        "executable_same_validator_contract",
+    )?
+    .as_array()
+    .ok_or_else(|| {
+        tasks_apps_error(
+            "E_TASKS_APPS_MUTATION_SCHEMA",
+            "executable_same_validator_contract",
+            "planted_mutation",
+        )
+    })?;
+    let expected = [
+        (
+            "missing-required-artifact-id",
+            "remove-one-manifest-field",
+            "tasks.artifact[0].id",
+            "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.artifact[0]|id",
+            TasksAppsMutationPayload::None,
+        ),
+        (
+            "swapped-vendor-path",
+            "replace-one-manifest-field",
+            "tasks.artifact[0].vendor_path",
+            "FND01|Error|E_TASKS_APPS_ARTIFACT_BINDING|tasks-prose|vendor_path",
+            TasksAppsMutationPayload::ReplacementText("evidence/fnd-01/vendor/apps/apps.mdx"),
+        ),
+        (
+            "truncated-vendor-bytes",
+            "remove-one-terminal-byte-from-one-virtual-input",
+            "evidence/fnd-01/vendor/tasks/tasks.md",
+            "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256",
+            TasksAppsMutationPayload::None,
+        ),
+        (
+            "substituted-vendor-bytes",
+            "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input",
+            "evidence/fnd-01/vendor/tasks/tasks.md",
+            "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256",
+            TasksAppsMutationPayload::ReplacementInput("evidence/fnd-01/vendor/apps/apps.mdx"),
+        ),
+        (
+            "tasks-authority-classification-promotion",
+            "replace-one-manifest-field",
+            "tasks.final_core_authority",
+            "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|final_core_authority",
+            TasksAppsMutationPayload::ReplacementBool(true),
+        ),
+        (
+            "apps-2025-authority-leakage",
+            "replace-one-manifest-field",
+            "apps.stable_spec_date",
+            "FND01|Error|E_TASKS_APPS_LEGACY_2025_AUTHORITY|apps|stable_spec_date",
+            TasksAppsMutationPayload::ReplacementText("2025-11-25"),
+        ),
+        (
+            "apps-maturity-classification-drift",
+            "replace-one-manifest-field",
+            "apps.maturity_at_pin",
+            "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin",
+            TasksAppsMutationPayload::ReplacementText("experimental"),
+        ),
+    ];
+    if mutations.len() != expected.len() {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_MUTATION_SCHEMA",
+            "executable_same_validator_contract",
+            "planted_mutation count",
+        ));
+    }
+    let mut plans = Vec::with_capacity(expected.len());
+    for (row, (id, operation, target, diagnostic, payload)) in mutations.iter().zip(expected) {
+        let row = tasks_apps_table(row, id)?;
+        let mut allowed = vec!["id", "operation", "target", "expected_diagnostic"];
+        match payload {
+            TasksAppsMutationPayload::None => {}
+            TasksAppsMutationPayload::ReplacementText(_)
+            | TasksAppsMutationPayload::ReplacementBool(_) => {
+                allowed.push("replacement");
+            }
+            TasksAppsMutationPayload::ReplacementInput(_) => allowed.push("replacement_input"),
+        }
+        if row.len() != allowed.len() || allowed.iter().any(|field| !row.contains_key(*field)) {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_MUTATION_SCHEMA",
+                id,
+                "fields",
+            ));
+        }
+        for (field, expected) in [
+            ("id", id),
+            ("operation", operation),
+            ("target", target),
+            ("expected_diagnostic", diagnostic),
+        ] {
+            tasks_apps_expect_string(row, field, expected, "E_TASKS_APPS_MUTATION_SCHEMA", id)?;
+        }
+        let (replacement, replacement_input) = match payload {
+            TasksAppsMutationPayload::None => (None, None),
+            TasksAppsMutationPayload::ReplacementText(expected) => {
+                tasks_apps_expect_string(
+                    row,
+                    "replacement",
+                    expected,
+                    "E_TASKS_APPS_MUTATION_SCHEMA",
+                    id,
+                )?;
+                (Some(toml::Value::String(expected.to_owned())), None)
+            }
+            TasksAppsMutationPayload::ReplacementBool(expected) => {
+                if tasks_apps_bool(row, "replacement", id)? != expected {
+                    return Err(tasks_apps_error(
+                        "E_TASKS_APPS_MUTATION_SCHEMA",
+                        id,
+                        "replacement",
+                    ));
+                }
+                (Some(toml::Value::Boolean(expected)), None)
+            }
+            TasksAppsMutationPayload::ReplacementInput(expected) => {
+                tasks_apps_expect_string(
+                    row,
+                    "replacement_input",
+                    expected,
+                    "E_TASKS_APPS_MUTATION_SCHEMA",
+                    id,
+                )?;
+                (None, Some(expected.to_owned()))
+            }
+        };
+        plans.push(TasksAppsPlantedMutation {
+            id: id.to_owned(),
+            operation: operation.to_owned(),
+            target: target.to_owned(),
+            replacement,
+            replacement_input,
+            expected_diagnostic: diagnostic.to_owned(),
+        });
+    }
+    Ok(plans)
+}
+
+fn tasks_apps_manifest_pointer(target: &str) -> VResult<&'static str> {
+    match target {
+        "tasks.artifact[0].id" => Ok("/tasks/artifact/0/id"),
+        "tasks.artifact[0].vendor_path" => Ok("/tasks/artifact/0/vendor_path"),
+        "tasks.final_core_authority" => Ok("/tasks/final_core_authority"),
+        "apps.stable_spec_date" => Ok("/apps/stable_spec_date"),
+        "apps.maturity_at_pin" => Ok("/apps/maturity_at_pin"),
+        _ => Err(tasks_apps_error(
+            "E_TASKS_APPS_MUTATION_SCHEMA",
+            "executable_same_validator_contract",
+            target,
+        )),
+    }
+}
+
+fn validate_tasks_apps_sources(bundle: &TasksAppsSourceBundle) -> VResult<()> {
+    let root = tasks_apps_table(&bundle.manifest, "manifest")?;
+    tasks_apps_expect_string(
+        root,
+        "evidence_id",
+        "fnd-01-tasks-apps-2026-07-29-v4",
+        "E_TASKS_APPS_MANIFEST",
+        "manifest",
+    )?;
+    let contract = tasks_apps_table(
+        tasks_apps_field(root, "executable_same_validator_contract", "manifest")?,
+        "executable_same_validator_contract",
+    )?;
+    for (field, expected) in [
+        ("production_validator_symbol", "validate_tasks_apps_sources"),
+        ("required_enclosing_module", "tests"),
+        ("vendor_family_digest_sha256", TASKS_APPS_VENDOR_DIGEST),
+        ("receipt_or_manifest_self_hash", "forbidden"),
+    ] {
+        tasks_apps_expect_string(
+            contract,
+            field,
+            expected,
+            "E_TASKS_APPS_MANIFEST",
+            "executable_same_validator_contract",
+        )?;
+    }
+    if tasks_apps_usize(
+        contract,
+        "virtual_input_count",
+        "executable_same_validator_contract",
+    )? != TASKS_APPS_VENDOR_PATHS.len()
+        || tasks_apps_usize(
+            contract,
+            "virtual_input_total_bytes",
+            "executable_same_validator_contract",
+        )? != 1_173_466
+        || tasks_apps_bool(
+            contract,
+            "runtime_capability_credit",
+            "executable_same_validator_contract",
+        )?
+        || tasks_apps_bool(
+            contract,
+            "remote_provenance_capability_credit",
+            "executable_same_validator_contract",
+        )?
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_MANIFEST",
+            "executable_same_validator_contract",
+            "capability boundary",
+        ));
+    }
+    let test_ids = tasks_apps_field(
+        contract,
+        "required_test_ids",
+        "executable_same_validator_contract",
+    )?
+    .as_array()
+    .ok_or_else(|| {
+        tasks_apps_error(
+            "E_TASKS_APPS_MANIFEST",
+            "executable_same_validator_contract",
+            "required_test_ids",
+        )
+    })?;
+    if test_ids
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect::<Vec<_>>()
+        != [
+            "tests::fnd_01_tasks_apps_sources_positive",
+            "tests::fnd_01_tasks_apps_sources_planted_negative",
+        ]
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_MANIFEST",
+            "executable_same_validator_contract",
+            "required_test_ids",
+        ));
+    }
+    let _validated_mutations = validate_tasks_apps_planted_mutations(contract)?;
+
+    let tasks = tasks_apps_table(tasks_apps_field(root, "tasks", "manifest")?, "tasks")?;
+    tasks_apps_expect_string(
+        tasks,
+        "repository",
+        "https://github.com/modelcontextprotocol/ext-tasks",
+        "E_TASKS_APPS_ARTIFACT_BINDING",
+        "tasks",
+    )?;
+    let tasks_commit = "2c1425d9a288b9b1f489430fe1e00bb392b47e48";
+    tasks_apps_expect_string(
+        tasks,
+        "commit",
+        tasks_commit,
+        "E_TASKS_APPS_ARTIFACT_BINDING",
+        "tasks",
+    )?;
+    for (field, expected) in [
+        (
+            "commit_url",
+            "https://github.com/modelcontextprotocol/ext-tasks/commit/2c1425d9a288b9b1f489430fe1e00bb392b47e48",
+        ),
+        (
+            "tree_url",
+            "https://github.com/modelcontextprotocol/ext-tasks/tree/2c1425d9a288b9b1f489430fe1e00bb392b47e48",
+        ),
+    ] {
+        tasks_apps_expect_string(tasks, field, expected, "E_TASKS_APPS_ARTIFACT_BINDING", "tasks")?;
+    }
+    for (field, expected) in [
+        ("tree", "21adc5de7a6ce0de1c81077de129e41f9a843035"),
+        ("maturity_at_pin", "experimental"),
+        (
+            "tasks_contract_profile",
+            "fastmcp-final-core-2026-07-28-tasks-2c1425d9-v1",
+        ),
+    ] {
+        tasks_apps_expect_string(
+            tasks,
+            field,
+            expected,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            "tasks",
+        )?;
+    }
+    if tasks_apps_bool(tasks, "final_core_authority", "tasks")? {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            "tasks",
+            "final_core_authority",
+        ));
+    }
+    if tasks_apps_bool(tasks, "whole_message_wire_oracle", "tasks")? {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            "tasks",
+            "whole_message_wire_oracle",
+        ));
+    }
+    validate_tasks_apps_artifacts(
+        "tasks",
+        tasks,
+        &TASKS_ARTIFACTS,
+        "https://github.com/modelcontextprotocol/ext-tasks",
+        tasks_commit,
+        bundle,
+    )?;
+    validate_tasks_apps_sdk(tasks, "tasks-package-lock", "tasks")?;
+    validate_tasks_apps_lock_license(
+        bundle,
+        "evidence/fnd-01/vendor/tasks/package-lock.json",
+        "Apache-2.0",
+        "tasks",
+    )?;
+
+    let conformance_rows = tasks_apps_field(tasks, "conformance_artifact", "tasks")?
+        .as_array()
+        .ok_or_else(|| {
+            tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                "tasks",
+                "conformance_artifact",
+            )
+        })?;
+    if conformance_rows.len() != 1 {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_ARTIFACT_INVENTORY",
+            "tasks",
+            "conformance_artifact count",
+        ));
+    }
+    let conformance = conformance_rows
+        .first()
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                "tasks",
+                "conformance_artifact",
+            )
+        })?;
+    for (field, expected) in [
+        ("id", "tasks-conformance-wire-fields"),
+        (
+            "repository",
+            "https://github.com/modelcontextprotocol/conformance",
+        ),
+        (
+            "repository_commit",
+            "49103de6ed70804e940637bf3e9e29e4a3f54e64",
+        ),
+        (
+            "repository_tree",
+            "699705222f144a15fb7fdcc1b4f0b0a62825aef0",
+        ),
+        ("git_blob", "73684a19c7d0004fc13445c0f3e59df159eb5b94"),
+        (
+            "commit_url",
+            "https://github.com/modelcontextprotocol/conformance/commit/49103de6ed70804e940637bf3e9e29e4a3f54e64",
+        ),
+        ("upstream_path", "src/scenarios/server/tasks/wire-fields.ts"),
+        (
+            "source_url",
+            "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/server/tasks/wire-fields.ts",
+        ),
+        (
+            "blob_url",
+            "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/server/tasks/wire-fields.ts",
+        ),
+        (
+            "vendor_path",
+            "evidence/fnd-01/vendor/tasks/conformance-wire-fields.ts",
+        ),
+        (
+            "sha256",
+            "a729a7c6d9a0dce3b4aae691f856933f2d798af6c668a84716076ad03b696dca",
+        ),
+    ] {
+        tasks_apps_expect_string(
+            conformance,
+            field,
+            expected,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            "tasks-conformance-wire-fields",
+        )?;
+    }
+    if tasks_apps_usize(conformance, "byte_length", "tasks-conformance-wire-fields")? != 9_374 {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            "tasks-conformance-wire-fields",
+            "frozen fields",
+        ));
+    }
+
+    let apps = tasks_apps_table(tasks_apps_field(root, "apps", "manifest")?, "apps")?;
+    tasks_apps_expect_string(
+        apps,
+        "repository",
+        "https://github.com/modelcontextprotocol/ext-apps",
+        "E_TASKS_APPS_ARTIFACT_BINDING",
+        "apps",
+    )?;
+    let apps_commit = "92f46a574568a3ddac7600343b7d3c4c4ed7b588";
+    tasks_apps_expect_string(
+        apps,
+        "commit",
+        apps_commit,
+        "E_TASKS_APPS_ARTIFACT_BINDING",
+        "apps",
+    )?;
+    for (field, expected) in [
+        ("tree", "f6b62ab50fbb8297d458d9ba90c4c2cb67de4759"),
+        ("package_name", "@modelcontextprotocol/ext-apps"),
+        ("package_version", "1.7.5"),
+    ] {
+        tasks_apps_expect_string(
+            apps,
+            field,
+            expected,
+            "E_TASKS_APPS_ARTIFACT_BINDING",
+            "apps",
+        )?;
+    }
+    for (field, expected) in [
+        (
+            "commit_url",
+            "https://github.com/modelcontextprotocol/ext-apps/commit/92f46a574568a3ddac7600343b7d3c4c4ed7b588",
+        ),
+        (
+            "tree_url",
+            "https://github.com/modelcontextprotocol/ext-apps/tree/92f46a574568a3ddac7600343b7d3c4c4ed7b588",
+        ),
+    ] {
+        tasks_apps_expect_string(apps, field, expected, "E_TASKS_APPS_ARTIFACT_BINDING", "apps")?;
+    }
+    if tasks_apps_string(apps, "stable_spec_date", "apps")? != "2026-01-26" {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_LEGACY_2025_AUTHORITY",
+            "apps",
+            "stable_spec_date",
+        ));
+    }
+    if tasks_apps_string(apps, "maturity_at_pin", "apps")? != "stable" {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            "apps",
+            "maturity_at_pin",
+        ));
+    }
+    if tasks_apps_bool(apps, "final_core_authority", "apps")?
+        || tasks_apps_bool(apps, "whole_message_wire_oracle", "apps")?
+        || tasks_apps_bool(apps, "apps_sampling_supported", "apps")?
+        || tasks_apps_bool(apps, "apps_tasks_result_bridge_supported", "apps")?
+        || tasks_apps_bool(apps, "apps_mrtr_result_bridge_supported", "apps")?
+        || tasks_apps_bool(apps, "apps_renderer_supported", "apps")?
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            "apps",
+            "final_core_authority",
+        ));
+    }
+    let precedence = tasks_apps_field(apps, "source_precedence", "apps")?
+        .as_array()
+        .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", "apps", "source_precedence"))?;
+    let expected_precedence = [
+        "final core 2026-07-28 for MCP envelopes and rebound core symbols",
+        "the frozen FastMCP composed contract for explicit conflict resolutions",
+        "stable Apps prose for Apps-only normative security and behavior",
+        "src/spec.types.ts for UI-specific interfaces it declares",
+        "src/types.ts for standard-reuse union and root inventory",
+        "src/app.ts and src/app-bridge.ts for sender/handler direction and physical SDK behavior",
+        "lock-resolved SDK 1.29.0 for imported compatibility shapes before explicit rebind/projection",
+        "generated schemas only for drift and partial validation",
+    ];
+    if precedence
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect::<Vec<_>>()
+        != expected_precedence
+    {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+            "apps",
+            "source_precedence",
+        ));
+    }
+    validate_tasks_apps_artifacts(
+        "apps",
+        apps,
+        &APPS_ARTIFACTS,
+        "https://github.com/modelcontextprotocol/ext-apps",
+        apps_commit,
+        bundle,
+    )?;
+    validate_tasks_apps_sdk(apps, "apps-package-lock", "apps")?;
+    validate_tasks_apps_lock_license(
+        bundle,
+        "evidence/fnd-01/vendor/apps/package-lock.json",
+        "MIT",
+        "apps",
+    )?;
+
+    let digest = lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes)?);
+    if digest != TASKS_APPS_VENDOR_DIGEST {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_VENDOR_DIGEST",
+            "vendor-inputs",
+            "domain-separated-sha256",
+        ));
+    }
+    let total_bytes = bundle.vendor_bytes.values().map(Vec::len).sum::<usize>();
+    if total_bytes != 1_173_466 || bundle.manifest_bytes.is_empty() {
+        return Err(tasks_apps_error(
+            "E_TASKS_APPS_ARTIFACT_INVENTORY",
+            "vendor-inputs",
+            "bundle length",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline_tasks_apps_bundle() -> TasksAppsSourceBundle {
+        load_tasks_apps_source_bundle(&repository_root()).expect("load immutable Tasks/Apps bundle")
+    }
+
+    fn assert_unchanged_non_target_inputs(
+        baseline: &TasksAppsSourceBundle,
+        candidate: &TasksAppsSourceBundle,
+        target: Option<&str>,
+    ) {
+        assert_eq!(
+            baseline.vendor_bytes.keys().collect::<Vec<_>>(),
+            candidate.vendor_bytes.keys().collect::<Vec<_>>()
+        );
+        for path in baseline.vendor_bytes.keys() {
+            if Some(path.as_str()) != target {
+                let before = baseline.vendor_bytes.get(path).expect("baseline input");
+                let after = candidate.vendor_bytes.get(path).expect("candidate input");
+                assert_eq!(before.len(), after.len(), "unchanged byte length: {path}");
+                assert_eq!(sha256(before), sha256(after), "unchanged sha256: {path}");
+            }
+        }
+    }
+
+    fn assert_stable_diagnostic(bundle: &TasksAppsSourceBundle, expected: &str) {
+        let diagnostic = validate_tasks_apps_sources(bundle).expect_err("planted case must reject");
+        assert_eq!(diagnostic.stable(), expected);
+    }
+
+    fn assert_live_baseline_reloads_unchanged(
+        baseline: &TasksAppsSourceBundle,
+        baseline_digest: [u8; 32],
+    ) {
+        let live = baseline_tasks_apps_bundle();
+        validate_tasks_apps_sources(&live)
+            .expect("untouched live baseline reaccepts after discarded virtual mutation");
+        assert_eq!(
+            live.manifest_bytes, baseline.manifest_bytes,
+            "manifest bytes persist unchanged"
+        );
+        assert_eq!(
+            live.vendor_bytes, baseline.vendor_bytes,
+            "all vendor bytes persist unchanged"
+        );
+        assert_eq!(
+            tasks_apps_vendor_digest(&live.vendor_bytes).expect("live baseline digest"),
+            baseline_digest,
+            "live baseline digest persists unchanged",
+        );
+        assert_eq!(
+            lower_hex(&baseline_digest),
+            TASKS_APPS_VENDOR_DIGEST,
+            "live baseline retains the exact domain-separated family digest",
+        );
+    }
+
+    fn assert_only_manifest_mutation(
+        baseline: &toml::Value,
+        candidate: &toml::Value,
+        pointer: &str,
+        replacement: Option<toml::Value>,
+        subject: &str,
+    ) {
+        let mut expected = baseline.clone();
+        match replacement {
+            Some(value) => set_pointer(&mut expected, pointer, value, subject),
+            None => remove_pointer(&mut expected, pointer, subject),
+        }
+        .expect("same one-field virtual mutation must be valid");
+        assert_eq!(
+            candidate, &expected,
+            "only the named manifest field changed"
+        );
+    }
+
+    #[test]
+    fn fnd_01_tasks_apps_sources_positive() {
+        let bundle = baseline_tasks_apps_bundle();
+        assert_eq!(
+            1 + bundle.vendor_bytes.len(),
+            14,
+            "one manifest plus thirteen vendors"
+        );
+        validate_tasks_apps_sources(&bundle).expect("same production validator accepts baseline");
+        assert_eq!(
+            lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes).expect("bundle digest")),
+            TASKS_APPS_VENDOR_DIGEST,
+            "domain-separated family digest",
+        );
+    }
+
+    #[test]
+    fn fnd_01_tasks_apps_sources_planted_negative() {
+        let baseline = baseline_tasks_apps_bundle();
+        validate_tasks_apps_sources(&baseline).expect("fresh baseline accepts before mutations");
+        let baseline_digest =
+            tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest");
+        let contract = tasks_apps_table(&baseline.manifest, "manifest")
+            .and_then(|manifest| {
+                tasks_apps_field(manifest, "executable_same_validator_contract", "manifest")
+            })
+            .and_then(|value| tasks_apps_table(value, "executable_same_validator_contract"))
+            .expect("validated manifest contract");
+        let plans = validate_tasks_apps_planted_mutations(contract)
+            .expect("production validator's exact planted-mutation schema");
+        assert_eq!(plans.len(), 7, "all validated concrete plants are present");
+
+        for plan in plans {
+            let mut candidate = baseline.clone();
+            let changed_vendor = match plan.operation.as_str() {
+                "remove-one-manifest-field" => {
+                    let pointer = tasks_apps_manifest_pointer(&plan.target)
+                        .expect("validated manifest target has a pointer");
+                    assert!(plan.replacement.is_none());
+                    assert!(plan.replacement_input.is_none());
+                    remove_pointer(&mut candidate.manifest, pointer, &plan.id)
+                        .expect("remove only the validated target field");
+                    assert_only_manifest_mutation(
+                        &baseline.manifest,
+                        &candidate.manifest,
+                        pointer,
+                        None,
+                        &plan.id,
+                    );
+                    None
+                }
+                "replace-one-manifest-field" => {
+                    let pointer = tasks_apps_manifest_pointer(&plan.target)
+                        .expect("validated manifest target has a pointer");
+                    let replacement = plan
+                        .replacement
+                        .clone()
+                        .expect("validated replacement payload");
+                    assert!(plan.replacement_input.is_none());
+                    set_pointer(
+                        &mut candidate.manifest,
+                        pointer,
+                        replacement.clone(),
+                        &plan.id,
+                    )
+                    .expect("replace only the validated target field");
+                    assert_only_manifest_mutation(
+                        &baseline.manifest,
+                        &candidate.manifest,
+                        pointer,
+                        Some(replacement),
+                        &plan.id,
+                    );
+                    None
+                }
+                "remove-one-terminal-byte-from-one-virtual-input" => {
+                    assert!(plan.replacement.is_none());
+                    assert!(plan.replacement_input.is_none());
+                    candidate
+                        .vendor_bytes
+                        .get_mut(&plan.target)
+                        .expect("validated target vendor")
+                        .pop()
+                        .expect("nonempty validated target vendor");
+                    assert_eq!(
+                        candidate.manifest, baseline.manifest,
+                        "no manifest field changed"
+                    );
+                    Some(plan.target.as_str())
+                }
+                "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input" => {
+                    assert!(plan.replacement.is_none());
+                    let replacement_input = plan
+                        .replacement_input
+                        .as_deref()
+                        .expect("validated replacement input payload");
+                    let replacement = baseline
+                        .vendor_bytes
+                        .get(replacement_input)
+                        .expect("validated listed replacement input")
+                        .clone();
+                    candidate
+                        .vendor_bytes
+                        .insert(plan.target.clone(), replacement);
+                    assert_eq!(
+                        candidate.manifest, baseline.manifest,
+                        "no manifest field changed"
+                    );
+                    Some(plan.target.as_str())
+                }
+                _ => panic!(
+                    "validated operation must have a concrete plant: {}",
+                    plan.operation
+                ),
+            };
+            assert_unchanged_non_target_inputs(&baseline, &candidate, changed_vendor);
+            let candidate_digest =
+                tasks_apps_vendor_digest(&candidate.vendor_bytes).expect("candidate digest");
+            if changed_vendor.is_some() {
+                assert_ne!(
+                    candidate_digest, baseline_digest,
+                    "changed virtual vendor changes digest"
+                );
+            } else {
+                assert_eq!(
+                    candidate_digest, baseline_digest,
+                    "manifest-only plant preserves digest"
+                );
+            }
+            assert_stable_diagnostic(&candidate, &plan.expected_diagnostic);
+            drop(candidate);
+            assert_live_baseline_reloads_unchanged(&baseline, baseline_digest);
+        }
+
+        validate_tasks_apps_sources(&baseline)
+            .expect("fresh baseline reaccepts after every isolated mutation");
+        assert_eq!(
+            tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest"),
+            baseline_digest
+        );
     }
 }
 } // mod ordinary

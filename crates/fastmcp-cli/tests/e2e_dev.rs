@@ -41,7 +41,9 @@ impl TestTempDir {
             .expect("system time before unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("resolve the test temporary directory without symlink components");
+        let path = temp_root.join(format!(
             "fastmcp-cli-{prefix}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
@@ -492,7 +494,12 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-fn run_cli_to_completion(command: Command, context: &str) -> Output {
+fn run_cli_to_completion(mut command: Command, context: &str) -> Output {
+    command
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .env("FASTMCP_PLAIN", "1");
     run_with_deadline(command, CLI_DEADLINE).unwrap_or_else(|expired| {
         panic!(
             "{context} exceeded the {:?} harness deadline; cleanup error: {:?}; captured stdout={} bytes, stderr={} bytes (content redacted)",
@@ -593,12 +600,17 @@ impl Drop for DevProcess {
     }
 }
 
+fn proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
 fn linux_process_is_zombie(pid: u32) -> Result<bool, String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-    Ok(matches!(state, 'Z' | 'X'))
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 fn linux_process_group_has_live_member(process_group_id: u32) -> Result<bool, String> {
@@ -617,14 +629,14 @@ fn linux_process_group_has_live_member(process_group_id: u32) -> Result<bool, St
         };
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_process_disappeared(&error) => continue,
             Err(error) => {
                 return Err(format!("failed to read process {pid} state: {error}"));
             }
         };
         let (state, group) = linux_process_state_and_group(&stat)
             .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-        if group == process_group_id && !matches!(state, 'Z' | 'X') {
+        if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
@@ -763,6 +775,10 @@ fn spawn_dev(root: &Path, args: &[&str]) -> (DevProcess, mpsc::Receiver<String>)
         .arg("--verbose")
         .args(subcommand_args)
         .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .env("FASTMCP_PLAIN", "1")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TARGET_DIR", root.join("target"))
         .env("CARGO_TERM_COLOR", "never")
@@ -1028,7 +1044,7 @@ fn assert_live_process_in_group(pid: u32, process_group_id: u32, context: &str) 
     let (state, observed_group_id) = linux_process_state_and_group(&stat)
         .unwrap_or_else(|| panic!("{context}: malformed /proc/{pid}/stat"));
     assert!(
-        !matches!(state, 'Z' | 'X'),
+        !matches!(state, 'Z' | 'X' | 'x'),
         "{context}: process {pid} was not live"
     );
     assert_eq!(
@@ -1158,6 +1174,70 @@ fn e2e_dev_no_reload_signal_cleans_up_descendant_processes() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn reality_check_regression_e2e_dev_owner_death_stops_managed_group() {
+    let root = mktemp_dir("dev-owner-death");
+    let server = root.join("server.sh");
+    let process_marker = root.join("server-process");
+    write_file(
+        &server,
+        r#"#!/bin/sh
+trap '' HUP INT TERM
+process_group_id=$(/usr/bin/ps -o pgid= -p "$$") || exit 70
+printf '%s %s\n' "$$" "$process_group_id" > "$FASTMCP_DEV_PROCESS_MARKER" || exit 71
+while :; do
+    sleep 60
+done
+"#,
+    );
+    make_executable(&server);
+
+    let process_marker_env = format!("FASTMCP_DEV_PROCESS_MARKER={}", process_marker.display());
+    let (mut process, _output) = spawn_dev(
+        &root,
+        &[
+            "dev",
+            "--no-reload",
+            "--env",
+            process_marker_env.as_str(),
+            server.to_str().expect("server path"),
+        ],
+    );
+    let (server_pid, managed_group_id) =
+        wait_for_process_marker(&process_marker, Duration::from_secs(10));
+    assert_ne!(
+        managed_group_id, process.process.process_group_id,
+        "the managed server must not share the outer CLI process group"
+    );
+    assert_live_process_in_group(
+        server_pid,
+        managed_group_id,
+        "owner-death fixture before killing the CLI",
+    );
+
+    // Kill only the CLI owner, not its outer harness group. Closing the
+    // inherited write end of the private control pipe must wake the in-group
+    // watchdog and stop the independently managed server group.
+    process
+        .process
+        .child_mut()
+        .kill()
+        .expect("kill the exact fastmcp dev owner process");
+    let status = wait_for_dev_exit(
+        &mut process,
+        Duration::from_secs(10),
+        "SIGKILLed fastmcp dev owner",
+    );
+    assert!(
+        !status.success(),
+        "SIGKILLed CLI owner cannot exit successfully"
+    );
+
+    wait_for_linux_process_exit(server_pid, Duration::from_secs(10));
+    wait_for_linux_process_group_exit(managed_group_id, Duration::from_secs(10));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn e2e_dev_closed_stdout_cleans_up_idle_managed_group() {
     let root = mktemp_dir("dev-closed-stdout");
     let server = root.join("server.sh");
@@ -1183,6 +1263,7 @@ done
     let mut command = Command::new(fastmcp_bin());
     command
         .arg("dev")
+        .arg("--clear")
         .arg("--reload-dir")
         .arg(root.as_os_str())
         .arg("--reload-pattern")
@@ -1191,6 +1272,10 @@ done
         .arg(&process_marker_env)
         .arg(&server)
         .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .env("FASTMCP_PLAIN", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut guarded = ProcessGroupGuard::spawn(&mut command);
@@ -1233,7 +1318,7 @@ done
 
     // The stdout reader returned (and therefore closed the pipe) only after it
     // observed watcher readiness. Touching this exact matching path now makes
-    // the `Change detected` status write fail while the idle child is live.
+    // the requested terminal clear fail while the idle child is live.
     write_file(&reload_trigger, "reload\n");
 
     let status = wait_for_dev_exit(

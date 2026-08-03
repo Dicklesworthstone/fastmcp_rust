@@ -299,8 +299,9 @@ fn spawn_middleware_server(
     let handle = std::thread::spawn(move || {
         set_echo_tool_calls(echo_calls);
         let cx = Cx::for_testing();
-        server.run_transport_returning_with_cx(&cx, server_transport);
+        let run_result = server.run_transport_returning_with_cx(&cx, server_transport);
         set_echo_tool_calls(None);
+        run_result.expect("middleware server loop");
     });
 
     (client_transport, handle)

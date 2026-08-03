@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, ExitStatus, Stdio};
 use std::process::{Command, Output};
-#[cfg(unix)]
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, mpsc};
@@ -36,7 +34,10 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
-static ECHO_SERVER_CARGO_LOCK: Mutex<()> = Mutex::new(());
+const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/static_mcp_server.sh"
+);
 
 struct TestTempDir {
     path: PathBuf,
@@ -49,7 +50,9 @@ impl TestTempDir {
             .expect("system time before Unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("resolve the test temporary directory without symlink components");
+        let path = temp_root.join(format!(
             "fastmcp-cli-{prefix}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
@@ -328,6 +331,12 @@ fn configure_process_group(command: &mut Command) {
 }
 
 #[cfg(target_os = "linux")]
+fn proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
 fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> {
     let processes = std::fs::read_dir("/proc")
         .map_err(|error| format!("failed to enumerate /proc: {error}"))?;
@@ -344,14 +353,14 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
         };
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_process_disappeared(&error) => continue,
             Err(error) => {
                 return Err(format!("failed to read process {pid} state: {error}"));
             }
         };
         let (state, group) = linux_process_state_and_group(&stat)
             .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-        if group == process_group_id && !matches!(state, 'Z' | 'X') {
+        if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
@@ -411,7 +420,7 @@ fn process_is_zombie(pid: u32) -> Result<bool, String> {
         .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-    Ok(matches!(state, 'Z' | 'X'))
+    Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
 #[cfg(target_os = "linux")]
@@ -631,34 +640,20 @@ fn run_cli(args: &[&str]) -> Output {
     command
         .args(args)
         // Keep E2E output deterministic: no network checks and no "update available" noise.
-        .env("FASTMCP_CHECK_FOR_UPDATES", "0");
+        .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+        .env_remove("CLINE_MCP_SETTINGS_PATH")
+        .env_remove("CLINE_DATA_DIR")
+        .env_remove("CLINE_DIR");
     run_command(command)
 }
 
 #[cfg(unix)]
-fn echo_server_cargo_lock() -> MutexGuard<'static, ()> {
-    ECHO_SERVER_CARGO_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(unix)]
-fn echo_server_args<'a>(prefix: &[&'a str], after_server: &[&'a str]) -> Vec<&'a str> {
-    let mut args = Vec::with_capacity(prefix.len() + after_server.len() + 10);
+fn fixture_server_args<'a>(prefix: &[&'a str], after_server: &[&'a str]) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(prefix.len() + after_server.len() + 3);
     args.extend_from_slice(prefix);
-    args.push("cargo");
+    args.push("/bin/sh");
     args.extend_from_slice(after_server);
-    args.extend_from_slice(&[
-        "--",
-        "run",
-        "--locked",
-        "--offline",
-        "-q",
-        "-p",
-        "fastmcp-rust",
-        "--example",
-        "echo_server",
-    ]);
+    args.extend_from_slice(&["--", STATIC_MCP_SERVER_FIXTURE]);
     args
 }
 
@@ -706,6 +701,9 @@ impl IsolatedCliEnvironment {
             .env("XDG_CACHE_HOME", &self.xdg_cache)
             .env("APPDATA", self.home.join("AppData/Roaming"))
             .env("LOCALAPPDATA", self.home.join("AppData/Local"))
+            .env_remove("CLINE_MCP_SETTINGS_PATH")
+            .env_remove("CLINE_DATA_DIR")
+            .env_remove("CLINE_DIR")
             .current_dir(&self.project);
         run_command(command)
     }
@@ -726,9 +724,8 @@ fn stderr_str(output: &Output) -> String {
 }
 
 #[cfg(unix)]
-fn inspect_echo_server(format: &str) -> Output {
-    let _cargo_lock = echo_server_cargo_lock();
-    run_cli(&echo_server_args(&["inspect", "-f", format], &[]))
+fn inspect_fixture_server(format: &str) -> Output {
+    run_cli(&fixture_server_args(&["inspect", "-f", format], &[]))
 }
 
 #[cfg(unix)]
@@ -819,8 +816,21 @@ fn e2e_cli_test_help() {
 
     let stdout = stdout_str(&output);
     assert!(stdout.contains("Test"));
-    assert!(stdout.contains("--timeout"));
+    assert!(stdout.contains("--idle-timeout"));
+    assert!(stdout.contains("--absolute-timeout"));
+    assert!(!stdout.contains("  --timeout"));
+    assert!(stdout.contains("[default: 30]"));
+    assert!(stdout.contains("[default: 120]"));
     assert!(stdout.contains("--verbose"));
+    let normalized = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("Per-request idle timeout in seconds (1-300)."));
+    assert!(normalized.contains("Non-resettable per-request absolute timeout in seconds (1-900)."));
+    assert!(normalized.contains("Starts when initialization or a later MCP request is committed."));
+    assert!(normalized.contains("The current connectivity probes do not attach progress tokens"));
+    assert!(normalized.contains("peer traffic does not reset their idle timers."));
+    assert!(normalized.contains("It does not bound the whole CLI or subprocess lifetime."));
+    assert!(normalized.contains("Non-Unix child-pipe reads remain frame-boundary-only"));
+    assert!(normalized.contains("blocking child-stdin writes cannot be preempted"));
 }
 
 #[test]
@@ -1024,7 +1034,7 @@ fn e2e_cli_inspect_missing_server_fails() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_inspect_text_lists_server_capabilities_and_items() {
-    let output = inspect_echo_server("text");
+    let output = inspect_fixture_server("text");
     assert!(
         output.status.success(),
         "inspect text should succeed, stderr: {}",
@@ -1053,7 +1063,7 @@ fn e2e_cli_inspect_text_lists_server_capabilities_and_items() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_inspect_json_lists_tools_resources_and_prompts() {
-    let output = inspect_echo_server("json");
+    let output = inspect_fixture_server("json");
     assert!(
         output.status.success(),
         "inspect json should succeed, stderr: {}",
@@ -1100,10 +1110,9 @@ fn e2e_cli_inspect_json_lists_tools_resources_and_prompts() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_inspect_closed_stdout_exits_nonzero() {
-    let _cargo_lock = echo_server_cargo_lock();
     let mut command = Command::new(get_binary_path());
     command
-        .args(echo_server_args(&["inspect", "-f", "json"], &[]))
+        .args(fixture_server_args(&["inspect", "-f", "json"], &[]))
         .env("FASTMCP_CHECK_FOR_UPDATES", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1176,8 +1185,7 @@ fn e2e_cli_inspect_output_file_writes_payload() {
         .expect("set inspect output mode");
     let seeded_metadata = std::fs::metadata(&output_path).expect("inspect seeded output");
 
-    let cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(
+    let output = run_cli(&fixture_server_args(
         &[
             "inspect",
             "-f",
@@ -1217,9 +1225,7 @@ fn e2e_cli_inspect_output_file_writes_payload() {
     assert_eq!(first_metadata.uid(), seeded_metadata.uid());
     assert_eq!(first_metadata.gid(), seeded_metadata.gid());
 
-    drop(cargo_lock);
-    let _cargo_lock = echo_server_cargo_lock();
-    let second = run_cli(&echo_server_args(
+    let second = run_cli(&fixture_server_args(
         &[
             "inspect",
             "-f",
@@ -1292,8 +1298,7 @@ fn e2e_cli_tasks_missing_subcommand_fails() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_list_is_quarantined_by_the_server() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(&["tasks", "list"], &[]));
+    let output = run_cli(&fixture_server_args(&["tasks", "list"], &[]));
 
     assert!(!output.status.success());
     assert!(stdout_str(&output).is_empty());
@@ -1303,8 +1308,7 @@ fn e2e_cli_tasks_list_is_quarantined_by_the_server() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_list_json_is_quarantined_by_the_server() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(&["tasks", "list", "--json"], &[]));
+    let output = run_cli(&fixture_server_args(&["tasks", "list", "--json"], &[]));
 
     assert!(!output.status.success());
     assert!(stdout_str(&output).is_empty());
@@ -1314,8 +1318,7 @@ fn e2e_cli_tasks_list_json_is_quarantined_by_the_server() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_list_with_status_filter_is_quarantined() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(
+    let output = run_cli(&fixture_server_args(
         &["tasks", "list", "--status", "pending"],
         &[],
     ));
@@ -1328,8 +1331,7 @@ fn e2e_cli_tasks_list_with_status_filter_is_quarantined() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_stats_json_is_quarantined_by_the_server() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(&["tasks", "stats", "--json"], &[]));
+    let output = run_cli(&fixture_server_args(&["tasks", "stats", "--json"], &[]));
 
     assert!(!output.status.success());
     assert!(stdout_str(&output).is_empty());
@@ -1339,8 +1341,7 @@ fn e2e_cli_tasks_stats_json_is_quarantined_by_the_server() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_show_is_quarantined_before_task_lookup() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(&["tasks", "show"], &["task-999"]));
+    let output = run_cli(&fixture_server_args(&["tasks", "show"], &["task-999"]));
 
     assert!(!output.status.success());
     assert!(
@@ -1353,8 +1354,7 @@ fn e2e_cli_tasks_show_is_quarantined_before_task_lookup() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_tasks_cancel_is_quarantined_before_task_lookup() {
-    let _cargo_lock = echo_server_cargo_lock();
-    let output = run_cli(&echo_server_args(&["tasks", "cancel"], &["task-999"]));
+    let output = run_cli(&fixture_server_args(&["tasks", "cancel"], &["task-999"]));
 
     assert!(!output.status.success());
     assert!(
@@ -1397,6 +1397,20 @@ fn e2e_cli_dev_removed_network_options_fail() {
             "removed option {option} must be rejected"
         );
     }
+}
+
+#[test]
+fn e2e_cli_test_removed_single_timeout_option_fails() {
+    let output = run_cli(&["test", "--timeout", "30", "./server"]);
+
+    assert!(
+        !output.status.success(),
+        "removed --timeout option must not remain as an alias"
+    );
+    assert!(
+        stderr_str(&output).contains("--timeout"),
+        "clap should identify the removed option"
+    );
 }
 
 #[test]
@@ -1459,6 +1473,16 @@ fn e2e_cli_install_dry_run_cline() {
     ]);
 
     assert!(output.status.success());
+    let stdout = stdout_str(&output);
+    assert!(stdout.contains("Cline settings"));
+    let json_start = stdout.find('{').expect("Cline dry-run JSON object");
+    let preview: serde_json::Value =
+        serde_json::from_str(&stdout[json_start..]).expect("parse Cline dry-run JSON");
+    let entry = &preview["mcpServers"]["test-server"];
+    assert_eq!(entry["transport"]["type"], "stdio");
+    assert_eq!(entry["transport"]["command"], "/bin/server");
+    assert!(entry.get("command").is_none());
+    assert!(preview.get("cline.mcpServers").is_none());
 }
 
 // =============================================================================
