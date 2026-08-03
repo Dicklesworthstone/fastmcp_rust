@@ -43,7 +43,7 @@
 //! ```
 //!
 //! Authority-bearing resource identifiers cannot be constructed without an
-//! exact configured-endpoint binding:
+//! configured-endpoint binding:
 //!
 //! ```compile_fail
 //! use fastmcp_core::CanonicalResourceId;
@@ -102,6 +102,12 @@ pub const DEFAULT_CANONICAL_URL_MAX_BYTES: usize = DEFAULT_ABSOLUTE_URI_MAX_BYTE
 
 /// Hard input and canonical-output byte ceiling for a network URL.
 pub const CANONICAL_URL_HARD_MAX_BYTES: usize = ABSOLUTE_URI_HARD_MAX_BYTES;
+
+/// Maximum configured endpoints considered by one resource binding.
+pub const MAX_CONFIGURED_RESOURCE_ENDPOINTS: usize = 64;
+
+/// Maximum UTF-8 bytes in one stable configured-endpoint identity.
+pub const MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES: usize = 256;
 
 /// An optional URI component with its wire-presence state intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -864,6 +870,11 @@ pub enum CanonicalHttpUrlError {
         /// Active limit.
         max_bytes: usize,
     },
+    /// A percent sign was not followed by two ASCII hexadecimal digits.
+    InvalidPercentEncoding {
+        /// Byte offset of the malformed percent sign in the caller input.
+        byte_index: usize,
+    },
     /// The `url` parser rejected the input.
     Parse(url::ParseError),
     /// The parsed URL's scheme was neither HTTP nor HTTPS.
@@ -898,6 +909,10 @@ impl fmt::Display for CanonicalHttpUrlError {
                 "canonical-URL input is {input_bytes} bytes, exceeding the \
                  {max_bytes}-byte limit"
             ),
+            Self::InvalidPercentEncoding { byte_index } => write!(
+                formatter,
+                "canonical-URL input has malformed percent encoding at byte {byte_index}"
+            ),
             Self::Parse(error) => write!(formatter, "URL parser rejected input: {error}"),
             Self::SchemeNotHttp => formatter.write_str("URL scheme is not HTTP or HTTPS"),
             Self::MissingHost => formatter.write_str("HTTP(S) URL is missing a host"),
@@ -928,9 +943,24 @@ impl std::error::Error for CanonicalHttpUrlError {
 /// behavior, including its reported non-fatal syntax violations. Security use
 /// sites that require stricter admission must construct a purpose type such as
 /// [`CanonicalResourceId`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct CanonicalHttpUrl {
     url: Url,
+    syntax_flags: UrlSyntaxFlags,
+}
+
+impl PartialEq for CanonicalHttpUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+
+impl Eq for CanonicalHttpUrl {}
+
+impl std::hash::Hash for CanonicalHttpUrl {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.url.hash(state);
+    }
 }
 
 impl CanonicalHttpUrl {
@@ -1014,6 +1044,10 @@ impl CanonicalHttpUrl {
     pub fn has_userinfo(&self) -> bool {
         self.url.authority().contains('@')
     }
+
+    fn has_syntax_violation(&self) -> bool {
+        self.syntax_flags.any
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1042,6 +1076,10 @@ fn parse_canonical_http_url(
             input_bytes: input.len(),
             max_bytes,
         });
+    }
+    validate_http_percent_triplets(input)?;
+    if has_empty_http_authority(input) {
+        return Err(CanonicalHttpUrlError::MissingHost);
     }
 
     let syntax_flags = Cell::new(UrlSyntaxFlags::default());
@@ -1075,9 +1113,42 @@ fn parse_canonical_http_url(
     }
 
     Ok(ParsedCanonicalHttpUrl {
-        url: CanonicalHttpUrl { url },
+        url: CanonicalHttpUrl {
+            url,
+            syntax_flags: syntax_flags.get(),
+        },
         syntax_flags: syntax_flags.get(),
     })
+}
+
+fn validate_http_percent_triplets(input: &str) -> Result<(), CanonicalHttpUrlError> {
+    let bytes = input.as_bytes();
+    for (byte_index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (byte_index + 2 >= bytes.len()
+                || !bytes[byte_index + 1].is_ascii_hexdigit()
+                || !bytes[byte_index + 2].is_ascii_hexdigit())
+        {
+            return Err(CanonicalHttpUrlError::InvalidPercentEncoding { byte_index });
+        }
+    }
+    Ok(())
+}
+
+fn has_empty_http_authority(input: &str) -> bool {
+    let Some((scheme, after_scheme)) = input.split_once(':') else {
+        return false;
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return false;
+    }
+    let Some(authority) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    authority.is_empty()
+        || authority.starts_with('/')
+        || authority.starts_with('?')
+        || authority.starts_with('#')
 }
 
 /// Endpoint-path shape accepted for a protected MCP resource.
@@ -1110,6 +1181,53 @@ impl ResourceEndpointPathPolicy {
 pub struct CanonicalResourceIdPolicy {
     endpoint_path: ResourceEndpointPathPolicy,
     query: QueryPolicy,
+}
+
+/// A named configured MCP endpoint considered by resource binding.
+///
+/// The identity is retained by [`CanonicalResourceId`] after selection so a
+/// caller can bind later authorization to the precise configured endpoint,
+/// rather than to a URI string alone.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfiguredResourceEndpoint<'a> {
+    identity: &'a str,
+    endpoint: &'a CanonicalHttpUrl,
+    resource_policy: CanonicalResourceIdPolicy,
+}
+
+impl<'a> ConfiguredResourceEndpoint<'a> {
+    /// Creates a configured endpoint with an explicit stable identity and
+    /// complete named resource policy.
+    #[must_use]
+    pub const fn new(
+        identity: &'a str,
+        endpoint: &'a CanonicalHttpUrl,
+        resource_policy: CanonicalResourceIdPolicy,
+    ) -> Self {
+        Self {
+            identity,
+            endpoint,
+            resource_policy,
+        }
+    }
+
+    /// Returns the configured endpoint identity.
+    #[must_use]
+    pub const fn identity(self) -> &'a str {
+        self.identity
+    }
+
+    /// Returns the configured canonical endpoint URL.
+    #[must_use]
+    pub const fn endpoint(self) -> &'a CanonicalHttpUrl {
+        self.endpoint
+    }
+
+    /// Returns the complete named resource policy for this endpoint.
+    #[must_use]
+    pub const fn resource_policy(self) -> CanonicalResourceIdPolicy {
+        self.resource_policy
+    }
 }
 
 impl CanonicalResourceIdPolicy {
@@ -1202,12 +1320,42 @@ pub enum CanonicalResourceIdError {
         /// Required path shape.
         required: ResourceEndpointPathPolicy,
     },
-    /// The canonical protected-resource path did not exactly match the
-    /// configured MCP endpoint path.
-    ConfiguredEndpointPathMismatch,
-    /// The canonical resource query state/value did not exactly match the
-    /// configured MCP endpoint query.
-    ConfiguredEndpointQueryMismatch,
+    /// No configured endpoint was supplied for binding.
+    ConfiguredEndpointSetEmpty,
+    /// A configured endpoint omitted its stable identity.
+    ConfiguredEndpointIdentityEmpty,
+    /// More than one configured endpoint used the same stable identity.
+    ConfiguredEndpointIdentityDuplicate,
+    /// The configured endpoint set exceeded its bounded admission limit.
+    ConfiguredEndpointSetTooLarge {
+        /// Supplied configured endpoint count.
+        endpoint_count: usize,
+        /// Maximum admitted configured endpoint count.
+        max_endpoints: usize,
+    },
+    /// A configured endpoint identity exceeded its bounded admission limit.
+    ConfiguredEndpointIdentityTooLong {
+        /// Supplied identity UTF-8 byte count.
+        identity_bytes: usize,
+        /// Maximum admitted identity UTF-8 byte count.
+        max_identity_bytes: usize,
+    },
+    /// A configured endpoint contains userinfo and cannot be a resource
+    /// binding authority.
+    ConfiguredEndpointUserinfoNotAllowed,
+    /// A configured endpoint was accepted only after a non-fatal URL parser
+    /// repair and therefore cannot satisfy the resource syntax policy.
+    ConfiguredEndpointNonCanonicalSyntax,
+    /// A configured endpoint does not satisfy its complete named policy.
+    ConfiguredEndpointPolicyMismatch,
+    /// No configured endpoint had the canonical scheme, host, and effective
+    /// port of the protected resource.
+    ConfiguredEndpointOriginMismatch,
+    /// No origin-compatible configured endpoint matched the resource path and
+    /// query under its complete named policy.
+    NoMatchingConfiguredEndpoint,
+    /// More than one matching configured endpoint had maximal specificity.
+    AmbiguousConfiguredEndpoint,
 }
 
 impl fmt::Display for CanonicalResourceIdError {
@@ -1231,11 +1379,46 @@ impl fmt::Display for CanonicalResourceIdError {
                 formatter,
                 "resource identifier path does not satisfy endpoint policy {required:?}"
             ),
-            Self::ConfiguredEndpointPathMismatch => formatter.write_str(
-                "resource identifier path does not match the configured MCP endpoint path",
+            Self::ConfiguredEndpointSetEmpty => {
+                formatter.write_str("resource identifier requires a configured endpoint")
+            }
+            Self::ConfiguredEndpointIdentityEmpty => {
+                formatter.write_str("configured MCP endpoint identity must not be empty")
+            }
+            Self::ConfiguredEndpointIdentityDuplicate => {
+                formatter.write_str("configured MCP endpoint identities must be unique")
+            }
+            Self::ConfiguredEndpointSetTooLarge {
+                endpoint_count,
+                max_endpoints,
+            } => write!(
+                formatter,
+                "configured MCP endpoint count of {endpoint_count} exceeds the \
+                 {max_endpoints}-endpoint limit"
             ),
-            Self::ConfiguredEndpointQueryMismatch => formatter.write_str(
-                "resource identifier query does not match the configured MCP endpoint query",
+            Self::ConfiguredEndpointIdentityTooLong {
+                identity_bytes,
+                max_identity_bytes,
+            } => write!(
+                formatter,
+                "configured MCP endpoint identity is {identity_bytes} bytes, exceeding the \
+                 {max_identity_bytes}-byte limit"
+            ),
+            Self::ConfiguredEndpointUserinfoNotAllowed => {
+                formatter.write_str("configured MCP endpoint must not contain userinfo")
+            }
+            Self::ConfiguredEndpointNonCanonicalSyntax => {
+                formatter.write_str("configured MCP endpoint contains non-canonical URL syntax")
+            }
+            Self::ConfiguredEndpointPolicyMismatch => formatter
+                .write_str("configured MCP endpoint does not satisfy its named resource policy"),
+            Self::ConfiguredEndpointOriginMismatch => formatter
+                .write_str("resource identifier origin does not match any configured MCP endpoint"),
+            Self::NoMatchingConfiguredEndpoint => {
+                formatter.write_str("resource identifier does not match a configured MCP endpoint")
+            }
+            Self::AmbiguousConfiguredEndpoint => formatter.write_str(
+                "resource identifier matches multiple equally specific configured MCP endpoints",
             ),
         }
     }
@@ -1254,13 +1437,13 @@ impl std::error::Error for CanonicalResourceIdError {
 ///
 /// Userinfo and fragments are always rejected. Queries and endpoint trailing
 /// slash/root semantics require explicit named policy. Equality and hashing
-/// use only the final canonical serialization and exist solely within this
-/// resource-identifier domain. Construction is available only through
-/// [`parse_for_endpoint`](Self::parse_for_endpoint), which binds the canonical
-/// path and query exactly to a configured endpoint.
+/// use the final canonical serialization plus the selected configured endpoint
+/// identity and exist solely within this resource-identifier domain.
+/// Construction is available only through endpoint-binding constructors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalResourceId {
     url: CanonicalHttpUrl,
+    configured_endpoint_identity: String,
 }
 
 impl CanonicalResourceId {
@@ -1273,19 +1456,7 @@ impl CanonicalResourceId {
     ) -> Result<Self, CanonicalResourceIdError> {
         let parsed = parse_canonical_http_url(input, max_bytes)
             .map_err(CanonicalResourceIdError::HttpUrl)?;
-
-        if parsed.syntax_flags.credentials || parsed.url.has_userinfo() {
-            return Err(CanonicalResourceIdError::UserinfoNotAllowed);
-        }
-        if parsed.syntax_flags.any {
-            return Err(CanonicalResourceIdError::NonCanonicalSyntax);
-        }
-        if parsed.url.scheme() != "https" {
-            return Err(CanonicalResourceIdError::HttpsRequired);
-        }
-        if parsed.url.fragment().is_some() {
-            return Err(CanonicalResourceIdError::FragmentNotAllowed);
-        }
+        validate_resource_common(&parsed)?;
         if policy.query == QueryPolicy::Reject && parsed.url.query().is_some() {
             return Err(CanonicalResourceIdError::QueryNotAllowed);
         }
@@ -1295,20 +1466,125 @@ impl CanonicalResourceId {
             });
         }
 
-        Ok(Self { url: parsed.url })
+        Ok(Self {
+            url: parsed.url,
+            configured_endpoint_identity: String::new(),
+        })
     }
 
-    /// Parses and binds the resource identifier to the exact canonical path
-    /// and query of a configured MCP endpoint.
+    /// Parses and binds a resource to exactly one maximal matching configured
+    /// endpoint.
     ///
-    /// Query absence, an empty query, and a nonempty query are distinct and
-    /// must match exactly. The default policy therefore binds only to an
-    /// endpoint whose query is absent; resource-significant query policy
-    /// permits query states but never relaxes exact endpoint binding.
+    /// Candidates must have the endpoint's canonical scheme, host, and
+    /// effective port. Their query state/value must match exactly, and their
+    /// path must be at or below the endpoint path on a path-segment boundary.
+    /// The longest matching endpoint path wins; an equal-specificity tie is
+    /// rejected rather than selected by configuration order.
+    pub fn parse_for_configured_endpoints(
+        input: &str,
+        configured_endpoints: &[ConfiguredResourceEndpoint<'_>],
+    ) -> Result<Self, CanonicalResourceIdError> {
+        Self::parse_for_configured_endpoints_with_max_bytes(
+            input,
+            configured_endpoints,
+            DEFAULT_CANONICAL_URL_MAX_BYTES,
+        )
+    }
+
+    /// Bounded form of
+    /// [`parse_for_configured_endpoints`](Self::parse_for_configured_endpoints).
+    pub fn parse_for_configured_endpoints_with_max_bytes(
+        input: &str,
+        configured_endpoints: &[ConfiguredResourceEndpoint<'_>],
+        max_bytes: usize,
+    ) -> Result<Self, CanonicalResourceIdError> {
+        if configured_endpoints.is_empty() {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointSetEmpty);
+        }
+        if configured_endpoints.len() > MAX_CONFIGURED_RESOURCE_ENDPOINTS {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointSetTooLarge {
+                endpoint_count: configured_endpoints.len(),
+                max_endpoints: MAX_CONFIGURED_RESOURCE_ENDPOINTS,
+            });
+        }
+        validate_configured_endpoint_identities(configured_endpoints)?;
+
+        let parsed = parse_canonical_http_url(input, max_bytes)
+            .map_err(CanonicalResourceIdError::HttpUrl)?;
+        validate_resource_common(&parsed)?;
+        validate_configured_endpoint_policies(configured_endpoints)?;
+        let mut selected: Option<(usize, Self)> = None;
+        let mut ambiguous_specificity = None;
+        let mut origin_compatible = false;
+        let mut any_policy_accepted = false;
+        let mut resource_error = None;
+
+        for configured in configured_endpoints {
+            if !canonical_origins_match(&parsed.url, configured.endpoint) {
+                continue;
+            }
+            origin_compatible = true;
+
+            let mut resource = match Self::parse_unbound_with_policy_and_max_bytes(
+                input,
+                configured.resource_policy,
+                max_bytes,
+            ) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    resource_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            any_policy_accepted = true;
+
+            if resource.query() != configured.endpoint.query()
+                || !endpoint_path_is_prefix_of_resource(configured.endpoint.path(), resource.path())
+            {
+                continue;
+            }
+
+            resource.configured_endpoint_identity = configured.identity.to_owned();
+            let specificity = configured.endpoint.path().len();
+            match &selected {
+                None => {
+                    selected = Some((specificity, resource));
+                    ambiguous_specificity = None;
+                }
+                Some((selected_specificity, _)) if specificity > *selected_specificity => {
+                    selected = Some((specificity, resource));
+                    ambiguous_specificity = None;
+                }
+                Some((selected_specificity, _)) if specificity == *selected_specificity => {
+                    ambiguous_specificity = Some(specificity);
+                }
+                Some(_) => {}
+            }
+        }
+
+        if let Some((_, resource)) = selected {
+            if ambiguous_specificity.is_some() {
+                return Err(CanonicalResourceIdError::AmbiguousConfiguredEndpoint);
+            }
+            return Ok(resource);
+        }
+        if !origin_compatible {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointOriginMismatch);
+        }
+        if !any_policy_accepted {
+            if let Some(error) = resource_error {
+                return Err(error);
+            }
+        }
+        Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
+    }
+
+    /// Parses and binds a resource against one configured endpoint.
     ///
-    /// The endpoint may describe an internal cleartext hop behind a trusted
-    /// terminator while the public resource identifier still requires HTTPS
-    /// and may use a different external origin.
+    /// This is the single-endpoint convenience form of the bounded endpoint
+    /// set selector. It applies the same canonical-origin and named-policy
+    /// checks; it never treats an internal HTTP endpoint as interchangeable
+    /// with a public HTTPS resource.
     pub fn parse_for_endpoint(
         input: &str,
         configured_endpoint: &CanonicalHttpUrl,
@@ -1329,14 +1605,12 @@ impl CanonicalResourceId {
         policy: CanonicalResourceIdPolicy,
         max_bytes: usize,
     ) -> Result<Self, CanonicalResourceIdError> {
-        let resource = Self::parse_unbound_with_policy_and_max_bytes(input, policy, max_bytes)?;
-        if resource.path() != configured_endpoint.path() {
-            return Err(CanonicalResourceIdError::ConfiguredEndpointPathMismatch);
-        }
-        if resource.query() != configured_endpoint.query() {
-            return Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch);
-        }
-        Ok(resource)
+        let configured = [ConfiguredResourceEndpoint::new(
+            "single-configured-endpoint",
+            configured_endpoint,
+            policy,
+        )];
+        Self::parse_for_configured_endpoints_with_max_bytes(input, &configured, max_bytes)
     }
 
     /// Returns the selected complete named policy.
@@ -1386,6 +1660,96 @@ impl CanonicalResourceId {
     pub fn query(&self) -> Option<&str> {
         self.url.query()
     }
+
+    /// Returns the identity of the configured endpoint selected at binding.
+    #[must_use]
+    pub fn configured_endpoint_identity(&self) -> &str {
+        &self.configured_endpoint_identity
+    }
+}
+
+fn validate_resource_common(
+    parsed: &ParsedCanonicalHttpUrl,
+) -> Result<(), CanonicalResourceIdError> {
+    if parsed.syntax_flags.credentials || parsed.url.has_userinfo() {
+        return Err(CanonicalResourceIdError::UserinfoNotAllowed);
+    }
+    if parsed.syntax_flags.any {
+        return Err(CanonicalResourceIdError::NonCanonicalSyntax);
+    }
+    if parsed.url.scheme() != "https" {
+        return Err(CanonicalResourceIdError::HttpsRequired);
+    }
+    if parsed.url.fragment().is_some() {
+        return Err(CanonicalResourceIdError::FragmentNotAllowed);
+    }
+    Ok(())
+}
+
+fn canonical_origins_match(left: &CanonicalHttpUrl, right: &CanonicalHttpUrl) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.effective_port() == right.effective_port()
+}
+
+fn validate_configured_endpoint_identities(
+    configured_endpoints: &[ConfiguredResourceEndpoint<'_>],
+) -> Result<(), CanonicalResourceIdError> {
+    for (index, configured) in configured_endpoints.iter().enumerate() {
+        if configured.identity.is_empty() {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointIdentityEmpty);
+        }
+        if configured.identity.len() > MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES {
+            return Err(
+                CanonicalResourceIdError::ConfiguredEndpointIdentityTooLong {
+                    identity_bytes: configured.identity.len(),
+                    max_identity_bytes: MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES,
+                },
+            );
+        }
+        if configured_endpoints[..index]
+            .iter()
+            .any(|earlier| earlier.identity == configured.identity)
+        {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointIdentityDuplicate);
+        }
+    }
+    Ok(())
+}
+
+fn validate_configured_endpoint_policies(
+    configured_endpoints: &[ConfiguredResourceEndpoint<'_>],
+) -> Result<(), CanonicalResourceIdError> {
+    for configured in configured_endpoints {
+        if configured.endpoint.has_syntax_violation() {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointNonCanonicalSyntax);
+        }
+        if configured.endpoint.has_userinfo() {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointUserinfoNotAllowed);
+        }
+        if !configured_endpoint_matches_policy(configured) {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointPolicyMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn configured_endpoint_matches_policy(configured: &ConfiguredResourceEndpoint<'_>) -> bool {
+    configured.endpoint.scheme() == "https"
+        && configured.endpoint.fragment().is_none()
+        && (configured.resource_policy.query != QueryPolicy::Reject
+            || configured.endpoint.query().is_none())
+        && endpoint_path_matches(
+            configured.endpoint.path(),
+            configured.resource_policy.endpoint_path,
+        )
+}
+
+fn endpoint_path_is_prefix_of_resource(endpoint_path: &str, resource_path: &str) -> bool {
+    resource_path == endpoint_path
+        || (resource_path.starts_with(endpoint_path)
+            && (endpoint_path.ends_with('/')
+                || resource_path.as_bytes().get(endpoint_path.len()) == Some(&b'/')))
 }
 
 fn endpoint_path_matches(path: &str, policy: ResourceEndpointPathPolicy) -> bool {
@@ -1738,7 +2102,8 @@ mod tests {
         let upper = CanonicalHttpUrl::parse("https://example.test/mcp/%7E").unwrap();
         let literal = CanonicalHttpUrl::parse("https://example.test/mcp/~").unwrap();
         let dot = CanonicalHttpUrl::parse("https://example.test/a/%2e/b").unwrap();
-        let bad = CanonicalHttpUrl::parse("https://example.test/mcp/%zz").unwrap();
+        let encoded_delimiters =
+            CanonicalHttpUrl::parse("https://example.test/mcp/%2F%3F%23?key=%26#%3D").unwrap();
 
         assert_eq!(lower.as_str(), "https://example.test/mcp/%7e");
         assert_eq!(upper.as_str(), "https://example.test/mcp/%7E");
@@ -1746,7 +2111,30 @@ mod tests {
         assert_ne!(lower, upper);
         assert_ne!(upper, literal);
         assert_eq!(dot.as_str(), "https://example.test/a/b");
-        assert_eq!(bad.as_str(), "https://example.test/mcp/%zz");
+        assert_eq!(
+            encoded_delimiters.as_str(),
+            "https://example.test/mcp/%2F%3F%23?key=%26#%3D"
+        );
+    }
+
+    #[test]
+    fn canonical_http_rejects_malformed_percent_triplets_before_url_parsing() {
+        let cases = [
+            "https://example.test/mcp/%zz",
+            "https://example.test/mcp/%2",
+            "https://example.test/mcp/%",
+            "https://example.test/mcp?key=%q0",
+            "https://example.test/mcp#%0g",
+        ];
+        for input in cases {
+            assert_eq!(
+                CanonicalHttpUrl::parse(input),
+                Err(CanonicalHttpUrlError::InvalidPercentEncoding {
+                    byte_index: input.find('%').unwrap(),
+                }),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -1765,11 +2153,16 @@ mod tests {
             "urn:example:x",
             "/relative",
             "https://",
+            "https:///mcp",
             "https://example.test:99999/x",
         ];
         for input in cases {
             assert!(CanonicalHttpUrl::parse(input).is_err(), "{input}");
         }
+        assert_eq!(
+            CanonicalHttpUrl::parse("https:///mcp"),
+            Err(CanonicalHttpUrlError::MissingHost)
+        );
     }
 
     #[test]
@@ -1915,51 +2308,270 @@ mod tests {
 
     #[test]
     fn canonical_resource_can_bind_the_most_specific_configured_endpoint() {
-        let internal = CanonicalHttpUrl::parse("http://127.0.0.1:8080/tenant/mcp").unwrap();
-        let resource = CanonicalResourceId::parse_for_endpoint(
-            "https://api.example.test/tenant/mcp",
-            &internal,
-            CanonicalResourceIdPolicy::DEFAULT,
+        let tenant_base = CanonicalHttpUrl::parse("https://api.example.test/tenant").unwrap();
+        let tenant = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
+        let endpoints = [
+            ConfiguredResourceEndpoint::new(
+                "tenant-base",
+                &tenant_base,
+                CanonicalResourceIdPolicy::DEFAULT,
+            ),
+            ConfiguredResourceEndpoint::new("tenant", &tenant, CanonicalResourceIdPolicy::DEFAULT),
+        ];
+
+        let resource = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://api.example.test/tenant/mcp/tool",
+            &endpoints,
         )
         .unwrap();
-        assert_eq!(resource.path(), "/tenant/mcp");
+        assert_eq!(resource.path(), "/tenant/mcp/tool");
+        assert_eq!(resource.configured_endpoint_identity(), "tenant");
+
+        let first_identity = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://api.example.test/tenant/mcp/tool",
+            &[ConfiguredResourceEndpoint::new(
+                "first-identity",
+                &tenant,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )],
+        )
+        .unwrap();
+        let second_identity = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://api.example.test/tenant/mcp/tool",
+            &[ConfiguredResourceEndpoint::new(
+                "second-identity",
+                &tenant,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )],
+        )
+        .unwrap();
+        assert_ne!(first_identity, second_identity);
+
+        let ipv6 = CanonicalHttpUrl::parse("https://[2001:db8::1]/mcp").unwrap();
+        let ipv6_resource = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://[2001:db8::1]/mcp/tool",
+            &[ConfiguredResourceEndpoint::new(
+                "ipv6",
+                &ipv6,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )],
+        )
+        .unwrap();
+        assert_eq!(ipv6_resource.configured_endpoint_identity(), "ipv6");
 
         assert_eq!(
-            CanonicalResourceId::parse_for_endpoint(
-                "https://api.example.test/tenant",
-                &internal,
-                CanonicalResourceIdPolicy::DEFAULT,
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/tenant/mcp%2Ftool",
+                &endpoints,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointPathMismatch)
+            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
+    }
+
+    #[test]
+    fn configured_endpoint_selection_rejects_ties_foreign_origins_and_confusion() {
+        let first = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
+        let second = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
+        let tied = [
+            ConfiguredResourceEndpoint::new("first", &first, CanonicalResourceIdPolicy::DEFAULT),
+            ConfiguredResourceEndpoint::new("second", &second, CanonicalResourceIdPolicy::DEFAULT),
+        ];
         assert_eq!(
-            CanonicalResourceId::parse_for_endpoint(
+            CanonicalResourceId::parse_for_configured_endpoints(
                 "https://api.example.test/tenant/mcp/tool",
-                &internal,
-                CanonicalResourceIdPolicy::DEFAULT,
+                &tied,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointPathMismatch)
+            Err(CanonicalResourceIdError::AmbiguousConfiguredEndpoint)
         );
 
-        let slash_policy = CanonicalResourceIdPolicy::non_root_with_trailing_slash();
-        let slash_endpoint = CanonicalHttpUrl::parse("http://127.0.0.1:8080/tenant/mcp/").unwrap();
+        let public = CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap();
+        let endpoints = [ConfiguredResourceEndpoint::new(
+            "public",
+            &public,
+            CanonicalResourceIdPolicy::DEFAULT,
+        )];
+        for resource in [
+            "https://evil.example.test/mcp/tool",
+            "https://127.0.0.1/mcp/tool",
+            "https://[::1]/mcp/tool",
+        ] {
+            assert_eq!(
+                CanonicalResourceId::parse_for_configured_endpoints(resource, &endpoints),
+                Err(CanonicalResourceIdError::ConfiguredEndpointOriginMismatch),
+                "{resource}"
+            );
+        }
+
+        let userinfo = CanonicalHttpUrl::parse("https://user@api.example.test/mcp").unwrap();
         assert_eq!(
-            CanonicalResourceId::parse_for_endpoint(
-                "https://api.example.test/other/mcp/",
-                &slash_endpoint,
-                slash_policy,
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/mcp",
+                &[ConfiguredResourceEndpoint::new(
+                    "userinfo",
+                    &userinfo,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                )],
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointPathMismatch)
+            Err(CanonicalResourceIdError::ConfiguredEndpointUserinfoNotAllowed)
+        );
+    }
+
+    #[test]
+    fn configured_endpoint_selection_rejects_repaired_provenance_and_bounds() {
+        let endpoint = CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap();
+        let repaired_endpoint = CanonicalHttpUrl::parse("https:api.example.test/mcp").unwrap();
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/mcp",
+                &[ConfiguredResourceEndpoint::new(
+                    "repaired",
+                    &repaired_endpoint,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                )],
+            ),
+            Err(CanonicalResourceIdError::ConfiguredEndpointNonCanonicalSyntax)
         );
 
-        let root_endpoint = CanonicalHttpUrl::parse("http://127.0.0.1:8080/").unwrap();
-        assert!(
-            CanonicalResourceId::parse_for_endpoint(
-                "https://api.example.test/",
-                &root_endpoint,
-                CanonicalResourceIdPolicy::root_endpoint(),
+        let foreign_endpoint = CanonicalHttpUrl::parse("https://foreign.example.test/mcp").unwrap();
+        let foreign = ConfiguredResourceEndpoint::new(
+            "foreign",
+            &foreign_endpoint,
+            CanonicalResourceIdPolicy::DEFAULT,
+        );
+        let last = ConfiguredResourceEndpoint::new(
+            "sole-last-match",
+            &endpoint,
+            CanonicalResourceIdPolicy::DEFAULT,
+        );
+        let mut at_limit = vec![foreign; MAX_CONFIGURED_RESOURCE_ENDPOINTS];
+        *at_limit.last_mut().unwrap() = last;
+        let selected = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://api.example.test/mcp",
+            &at_limit,
+        )
+        .unwrap();
+        assert_eq!(selected.configured_endpoint_identity(), "sole-last-match");
+
+        let over_limit = vec![last; MAX_CONFIGURED_RESOURCE_ENDPOINTS + 1];
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/mcp/%zz",
+                &over_limit,
+            ),
+            Err(CanonicalResourceIdError::ConfiguredEndpointSetTooLarge {
+                endpoint_count: MAX_CONFIGURED_RESOURCE_ENDPOINTS + 1,
+                max_endpoints: MAX_CONFIGURED_RESOURCE_ENDPOINTS,
+            })
+        );
+
+        let identity_at_limit = "a".repeat(MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES);
+        let at_identity_limit = CanonicalResourceId::parse_for_configured_endpoints(
+            "https://api.example.test/mcp",
+            &[ConfiguredResourceEndpoint::new(
+                &identity_at_limit,
+                &endpoint,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            at_identity_limit.configured_endpoint_identity(),
+            identity_at_limit
+        );
+
+        let identity_over_limit = "a".repeat(MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES + 1);
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/mcp",
+                &[ConfiguredResourceEndpoint::new(
+                    &identity_over_limit,
+                    &endpoint,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                )],
+            ),
+            Err(
+                CanonicalResourceIdError::ConfiguredEndpointIdentityTooLong {
+                    identity_bytes: MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES + 1,
+                    max_identity_bytes: MAX_CONFIGURED_RESOURCE_ENDPOINT_IDENTITY_BYTES,
+                }
             )
-            .is_ok()
+        );
+    }
+
+    #[test]
+    fn configured_endpoint_selection_rejects_duplicate_identities_before_matching() {
+        let shorter = CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap();
+        let longer = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/tenant/mcp/tool",
+                &[
+                    ConfiguredResourceEndpoint::new(
+                        "shared-identity",
+                        &shorter,
+                        CanonicalResourceIdPolicy::DEFAULT,
+                    ),
+                    ConfiguredResourceEndpoint::new(
+                        "shared-identity",
+                        &longer,
+                        CanonicalResourceIdPolicy::DEFAULT,
+                    ),
+                ],
+            ),
+            Err(CanonicalResourceIdError::ConfiguredEndpointIdentityDuplicate)
+        );
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/tenant/mcp/%zz",
+                &[
+                    ConfiguredResourceEndpoint::new(
+                        "shared-identity",
+                        &shorter,
+                        CanonicalResourceIdPolicy::DEFAULT,
+                    ),
+                    ConfiguredResourceEndpoint::new(
+                        "shared-identity",
+                        &longer,
+                        CanonicalResourceIdPolicy::DEFAULT,
+                    ),
+                ],
+            ),
+            Err(CanonicalResourceIdError::ConfiguredEndpointIdentityDuplicate)
+        );
+    }
+
+    #[test]
+    fn configured_endpoint_selection_rejects_prefix_lookalikes_and_fragments() {
+        let endpoint = CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp").unwrap();
+        let endpoints = [ConfiguredResourceEndpoint::new(
+            "tenant",
+            &endpoint,
+            CanonicalResourceIdPolicy::DEFAULT,
+        )];
+        for input in [
+            "https://api.example.test/tenant/mcp-evil",
+            "https://api.example.test/tenant/mcp.evil",
+            "https://api.example.test/tenant/mcp%2Ftool",
+        ] {
+            assert_eq!(
+                CanonicalResourceId::parse_for_configured_endpoints(input, &endpoints),
+                Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint),
+                "{input}"
+            );
+        }
+
+        let fragmented =
+            CanonicalHttpUrl::parse("https://api.example.test/tenant/mcp#fragment").unwrap();
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints(
+                "https://api.example.test/tenant/mcp/tool",
+                &[ConfiguredResourceEndpoint::new(
+                    "fragmented",
+                    &fragmented,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                )],
+            ),
+            Err(CanonicalResourceIdError::ConfiguredEndpointPolicyMismatch)
         );
     }
 
@@ -1967,22 +2579,20 @@ mod tests {
     fn configured_resource_significant_query_must_match_exactly() {
         let policy = CanonicalResourceIdPolicy::DEFAULT.with_resource_significant_query();
         let endpoint =
-            CanonicalHttpUrl::parse("https://internal.example.test/mcp?tenant=one").unwrap();
-        assert!(
-            CanonicalResourceId::parse_for_endpoint(
-                "https://public.example.test/mcp?tenant=one",
-                &endpoint,
-                policy,
-            )
-            .is_ok()
-        );
+            CanonicalHttpUrl::parse("https://public.example.test/mcp?tenant=one").unwrap();
+        assert!(CanonicalResourceId::parse_for_endpoint(
+            "https://public.example.test/mcp?tenant=one",
+            &endpoint,
+            policy,
+        )
+        .is_ok());
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp?tenant=two",
                 &endpoint,
                 policy,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch)
+            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
@@ -1990,49 +2600,47 @@ mod tests {
                 &endpoint,
                 policy,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch)
+            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
 
-        let empty_endpoint = CanonicalHttpUrl::parse("https://internal.example.test/mcp?").unwrap();
-        assert!(
-            CanonicalResourceId::parse_for_endpoint(
-                "https://public.example.test/mcp?",
-                &empty_endpoint,
-                policy,
-            )
-            .is_ok()
-        );
+        let empty_endpoint = CanonicalHttpUrl::parse("https://public.example.test/mcp?").unwrap();
+        assert!(CanonicalResourceId::parse_for_endpoint(
+            "https://public.example.test/mcp?",
+            &empty_endpoint,
+            policy,
+        )
+        .is_ok());
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp",
                 &empty_endpoint,
                 policy,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch)
+            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
 
-        let absent_endpoint = CanonicalHttpUrl::parse("https://internal.example.test/mcp").unwrap();
+        let absent_endpoint = CanonicalHttpUrl::parse("https://public.example.test/mcp").unwrap();
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp?",
                 &absent_endpoint,
                 policy,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch)
+            Err(CanonicalResourceIdError::NoMatchingConfiguredEndpoint)
         );
     }
 
     #[test]
     fn configured_endpoint_query_must_be_absent_under_default_policy() {
         let endpoint =
-            CanonicalHttpUrl::parse("https://internal.example.test/mcp?tenant=one").unwrap();
+            CanonicalHttpUrl::parse("https://public.example.test/mcp?tenant=one").unwrap();
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
                 "https://public.example.test/mcp",
                 &endpoint,
                 CanonicalResourceIdPolicy::DEFAULT,
             ),
-            Err(CanonicalResourceIdError::ConfiguredEndpointQueryMismatch)
+            Err(CanonicalResourceIdError::ConfiguredEndpointPolicyMismatch)
         );
         assert_eq!(
             CanonicalResourceId::parse_for_endpoint(
@@ -2064,7 +2672,6 @@ mod tests {
             "https:example.test/mcp",
             r"https://example.test\mcp",
             "https://example.test/mcp with-space",
-            "https://example.test/mcp/%zz",
         ];
         for input in cases {
             assert_eq!(
@@ -2073,6 +2680,67 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_resource_rejects_malformed_percent_encoded_delimiters_and_bounds() {
+        let endpoint = CanonicalHttpUrl::parse("https://example.test/mcp").unwrap();
+        for input in [
+            "https://example.test/mcp/%zz",
+            "https://example.test/mcp/%2",
+            "https://example.test/mcp?x=%q0",
+            "https://example.test/mcp#%0g",
+        ] {
+            assert_eq!(
+                CanonicalResourceId::parse_for_endpoint(
+                    input,
+                    &endpoint,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                ),
+                Err(CanonicalResourceIdError::HttpUrl(
+                    CanonicalHttpUrlError::InvalidPercentEncoding {
+                        byte_index: input.find('%').unwrap(),
+                    }
+                )),
+                "{input}"
+            );
+        }
+
+        let endpoints = [ConfiguredResourceEndpoint::new(
+            "bounded",
+            &endpoint,
+            CanonicalResourceIdPolicy::DEFAULT,
+        )];
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints_with_max_bytes(
+                "https://example.test/mcp",
+                &endpoints,
+                CANONICAL_URL_HARD_MAX_BYTES + 1,
+            ),
+            Err(CanonicalResourceIdError::HttpUrl(
+                CanonicalHttpUrlError::LimitExceedsHardCeiling {
+                    requested_max_bytes: CANONICAL_URL_HARD_MAX_BYTES + 1,
+                    hard_max_bytes: CANONICAL_URL_HARD_MAX_BYTES,
+                }
+            ))
+        );
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints_with_max_bytes(
+                "https://example.test/mcp",
+                &endpoints,
+                10,
+            ),
+            Err(CanonicalResourceIdError::HttpUrl(
+                CanonicalHttpUrlError::InputTooLong {
+                    input_bytes: "https://example.test/mcp".len(),
+                    max_bytes: 10,
+                }
+            ))
+        );
+        assert_eq!(
+            CanonicalResourceId::parse_for_configured_endpoints("https://example.test/mcp", &[],),
+            Err(CanonicalResourceIdError::ConfiguredEndpointSetEmpty)
+        );
     }
 
     #[test]

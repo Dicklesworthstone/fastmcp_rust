@@ -11,10 +11,25 @@ readme.workspace = true
 documentation = "https://docs.rs/fastmcp-cli"
 keywords = ["mcp", "cli", "server", "tools", "json-rpc"]
 categories = ["command-line-interface", "development-tools"]
+default-run = "fastmcp"
 
 [[bin]]
 name = "fastmcp"
 path = "src/main.rs"
+
+[[bin]]
+name = "fastmcp_cli_e2e_server"
+path = "tests/fixtures/fastmcp_cli_e2e_server.rs"
+required-features = ["e2e-fixture"]
+test = false
+bench = false
+doc = false
+
+[features]
+# Internal opt-in used only to compile the framework-backed CLI E2E fixture.
+# Cargo features are public, so `--all-features` also exposes the deliberately
+# conspicuous fixture binary; default builds and installs include only `fastmcp`.
+e2e-fixture = ["dep:fastmcp-rust"]
 
 [dependencies]
 # Internal crates
@@ -23,6 +38,7 @@ fastmcp-core = { workspace = true }
 fastmcp-protocol = { workspace = true }
 fastmcp-console = { workspace = true }
 fastmcp-transport = { workspace = true }
+fastmcp-rust = { workspace = true, optional = true }
 
 # Runtime
 asupersync = { workspace = true }

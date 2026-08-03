@@ -94,7 +94,7 @@ pub struct RichLayer {
 
 enum LayerConsole {
     Global(&'static FastMcpConsole),
-    Owned(FastMcpConsole),
+    Owned(Box<FastMcpConsole>),
 }
 
 impl LayerConsole {
@@ -123,7 +123,7 @@ impl RichLayer {
     /// usable by global subscribers without requiring a leaked reference.
     #[must_use]
     pub fn with_console(mut self, console: FastMcpConsole) -> Self {
-        self.console = LayerConsole::Owned(console);
+        self.console = LayerConsole::Owned(Box::new(console));
         self
     }
 
@@ -399,9 +399,9 @@ impl RichSubscriberBuilder {
             .with_max_width(self.max_width);
 
         let console = if let Some(console) = self.console {
-            LayerConsole::Owned(console)
+            LayerConsole::Owned(Box::new(console))
         } else if explicit_context.is_some() {
-            LayerConsole::Owned(FastMcpConsole::with_enabled(context.is_human()))
+            LayerConsole::Owned(Box::new(FastMcpConsole::with_enabled(context.is_human())))
         } else {
             LayerConsole::Global(crate::console::console())
         };

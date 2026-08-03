@@ -23,5 +23,8 @@ log.workspace = true
 toml.workspace = true
 dirs.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["event", "fs", "process"] }
+
 [lints]
 workspace = true

@@ -66,10 +66,19 @@ impl fmt::Debug for SessionState {
 
 impl SessionState {
     fn from_map(values: HashMap<String, serde_json::Value>) -> Self {
-        let mut cache_partition = [0_u8; CACHE_PARTITION_BYTES];
-        let cache_partition = getrandom::fill(&mut cache_partition)
-            .ok()
-            .map(|()| cache_partition);
+        Self::from_map_with_partition_draw(values, || {
+            crate::crypto::draw_security_identifier().map(|identifier| *identifier.as_bytes())
+        })
+    }
+
+    fn from_map_with_partition_draw<F, E>(
+        values: HashMap<String, serde_json::Value>,
+        draw: F,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,
+    {
+        let cache_partition = draw().ok();
         Self {
             inner: Arc::new(Mutex::new(values)),
             local: None,
@@ -391,6 +400,8 @@ impl SessionState {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -525,30 +536,24 @@ mod tests {
         }
 
         let typed = SessionState::new();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = typed.set(PanickingKey, true);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = typed.set(PanickingKey, true);
+        }))
+        .is_err());
         assert!(typed.set("after-typed-panic", true));
 
         let raw = SessionState::new();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = raw.set_raw(PanickingKey, serde_json::Value::Null);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = raw.set_raw(PanickingKey, serde_json::Value::Null);
+        }))
+        .is_err());
         assert!(raw.set_raw("after-raw-panic", serde_json::Value::Null));
 
         let layered = SessionState::new().with_local_overrides();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = layered.set_local_raw(PanickingKey, serde_json::Value::Null);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = layered.set_local_raw(PanickingKey, serde_json::Value::Null);
+        }))
+        .is_err());
         assert!(layered.set_local_raw("after-local-panic", serde_json::Value::Null));
     }
 
@@ -567,6 +572,31 @@ mod tests {
             .expect("ordinary mutation keeps the partition available");
         assert_eq!(mutated.0, initial.0);
         assert_eq!(mutated.1, initial.1 + 1);
+    }
+
+    #[test]
+    fn cache_partition_injected_draw_stores_exact_partition_once() {
+        let expected = [0x5a; CACHE_PARTITION_BYTES];
+        let calls = Cell::new(0);
+        let state = SessionState::from_map_with_partition_draw(HashMap::new(), || {
+            calls.set(calls.get() + 1);
+            Ok::<[u8; CACHE_PARTITION_BYTES], &'static str>(expected)
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(state.cache_partition(), Some((expected, 0)));
+    }
+
+    #[test]
+    fn cache_partition_injected_draw_failure_is_rejected_once() {
+        let calls = Cell::new(0);
+        let state = SessionState::from_map_with_partition_draw(HashMap::new(), || {
+            calls.set(calls.get() + 1);
+            Err::<[u8; CACHE_PARTITION_BYTES], _>("deterministic RNG failure")
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(state.cache_partition(), None);
     }
 
     #[test]

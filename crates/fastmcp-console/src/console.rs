@@ -120,16 +120,16 @@ pub fn is_credential_key(key: &str) -> bool {
         });
     let exact_single = matches!(
         word_refs.as_slice(),
-        ["authorization"]
-            | ["auth"]
-            | ["token"]
-            | ["secret"]
-            | ["credential"]
-            | ["credentials"]
-            | ["cookie"]
-            | ["password"]
-            | ["passphrase"]
-            | ["signature"]
+        ["authorization"
+            | "auth"
+            | "token"
+            | "secret"
+            | "credential"
+            | "credentials"
+            | "cookie"
+            | "password"
+            | "passphrase"
+            | "signature"]
     );
     let sensitive_suffix = !benign_metadata_suffix
         && (word_refs.last().is_some_and(|word| {
@@ -1010,10 +1010,13 @@ impl FastMcpConsole {
         let console = self.lock_inner();
         if self.enabled {
             match title {
-                Some(t) => console
-                    .print_renderable(&Rule::with_title(t).style(self.theme.border_style.clone())),
+                Some(t) => {
+                    console.print_renderable(
+                        &Rule::with_title(t).style(self.theme.border_style.clone()),
+                    );
+                }
                 None => {
-                    console.print_renderable(&Rule::new().style(self.theme.border_style.clone()))
+                    console.print_renderable(&Rule::new().style(self.theme.border_style.clone()));
                 }
             }
         } else {

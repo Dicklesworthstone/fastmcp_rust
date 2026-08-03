@@ -173,7 +173,10 @@ pub use fastmcp_server::providers;
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
-pub use fastmcp_client::{BoundedListPage, Client, ClientBuilder, ClientSession, ListPageLimits};
+pub use fastmcp_client::{
+    BoundedListPage, Client, ClientBuilder, ClientSession, ListPageLimits, RequestTimeoutPolicy,
+    RequestTimeoutSource,
+};
 
 // Re-export client configuration module
 pub use fastmcp_client::mcp_config;
@@ -197,6 +200,8 @@ pub mod prelude {
         // Client
         BoundedListPage,
         Client,
+        ClientBuilder,
+        ClientSession,
         // Protocol types
         Content,
         JsonSchema,
@@ -215,6 +220,8 @@ pub mod prelude {
         ProxyBackend,
         ProxyCatalog,
         ProxyClient,
+        RequestTimeoutPolicy,
+        RequestTimeoutSource,
         Resource,
         ResourceContent,
         ResultExt,
@@ -233,4 +240,38 @@ pub mod prelude {
         resource,
         tool,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{RequestTimeoutPolicy, RequestTimeoutSource};
+
+    #[test]
+    fn facade_reexports_client_timeout_types() {
+        let policy = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
+            .expect("facade timeout policy must validate");
+
+        assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
+        assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
+        assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[test]
+    fn prelude_reexports_client_timeout_configuration_surface() {
+        use super::prelude::{
+            Client, ClientBuilder, ClientSession, RequestTimeoutPolicy, RequestTimeoutSource,
+        };
+
+        let _: ClientBuilder = Client::builder();
+        let policy = RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(7))
+            .expect("prelude timeout policy must validate");
+
+        assert_eq!(policy.idle_timeout(), Duration::from_secs(3));
+        assert_eq!(policy.absolute_timeout(), Duration::from_secs(7));
+        let source: RequestTimeoutSource = RequestTimeoutSource::Idle;
+        assert!(matches!(source, RequestTimeoutSource::Idle));
+        let _ = std::mem::size_of::<ClientSession>();
+    }
 }

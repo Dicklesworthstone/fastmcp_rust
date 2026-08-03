@@ -617,11 +617,7 @@ impl BoundedEncodeBuffer {
 
 impl std::io::Write for BoundedEncodeBuffer {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let next_size = self
-            .bytes
-            .len()
-            .checked_add(buffer.len())
-            .unwrap_or(usize::MAX);
+        let next_size = self.bytes.len().saturating_add(buffer.len());
         if next_size > self.max_message_size {
             self.rejected_size = Some(next_size);
             return Err(std::io::Error::other(
@@ -843,7 +839,7 @@ impl Codec {
                 .last()
                 .or_else(|| self.buffer.last())
                 .is_some_and(|byte| *byte == b'\r');
-            let delimiter_bytes = if has_trailing_cr { 1 } else { 0 };
+            let delimiter_bytes = usize::from(has_trailing_cr);
             let frame_len = raw_frame_len.saturating_sub(delimiter_bytes);
             if frame_len > self.max_message_size {
                 self.buffer.clear();
@@ -886,7 +882,7 @@ impl Codec {
             .last()
             .or_else(|| self.buffer.last())
             .is_some_and(|byte| *byte == b'\r');
-        let delimiter_bytes = if has_trailing_cr { 1 } else { 0 };
+        let delimiter_bytes = usize::from(has_trailing_cr);
         let projected_frame_size = projected_size.saturating_sub(delimiter_bytes);
         if projected_frame_size > self.max_message_size {
             self.buffer.clear();

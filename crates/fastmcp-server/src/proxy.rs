@@ -418,8 +418,12 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use asupersync::Cx;
+    #[cfg(unix)]
+    use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_core::McpContext;
     use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
 
@@ -528,6 +532,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn scripted_peer_timeout_policy() -> RequestTimeoutPolicy {
+        // These fixtures emit responses immediately. Keep the former
+        // five-second total ceiling while detecting an idle peer first.
+        RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5))
+            .expect("valid scripted-peer timeout policy")
+    }
+
+    #[cfg(unix)]
     #[test]
     fn proxy_catalog_initializes_real_client_before_capability_checks() {
         let initialize = fastmcp_protocol::InitializeResult {
@@ -588,7 +600,7 @@ exec sleep 2
         let cx = Cx::for_testing();
         let mut client = fastmcp_client::ClientBuilder::new()
             .auto_initialize(true)
-            .timeout_ms(5_000)
+            .request_timeout_policy(scripted_peer_timeout_policy())
             .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
             .expect("spawn scripted auto-initializing client");
         assert!(!client.is_initialized());
@@ -601,7 +613,7 @@ exec sleep 2
         assert!(catalog.resources.is_empty());
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.prompts.is_empty());
-        client.close();
+        client.close().expect("close proxy catalog client");
     }
 
     #[cfg(unix)]
@@ -624,7 +636,7 @@ exec sleep 2
         let cx = Cx::for_testing();
         let mut client = fastmcp_client::ClientBuilder::new()
             .auto_initialize(true)
-            .timeout_ms(5_000)
+            .request_timeout_policy(scripted_peer_timeout_policy())
             .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
             .expect("spawn scripted auto-initializing client");
 
@@ -636,7 +648,7 @@ exec sleep 2
         assert!(catalog.resources.is_empty());
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.prompts.is_empty());
-        client.close();
+        client.close().expect("close proxy catalog client");
     }
 
     #[test]

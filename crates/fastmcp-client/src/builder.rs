@@ -6,19 +6,27 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_rust::ClientBuilder;
+//! use std::time::Duration;
+//! use fastmcp_rust::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
 //!
-//! let client = ClientBuilder::new()
-//!     .client_info("my-client", "1.0.0")
-//!     .timeout_ms(60_000)
-//!     .max_retries(3)
-//!     .retry_delay_ms(1000)
-//!     .working_dir("/tmp")
-//!     .env("DEBUG", "1")
-//!     .connect_stdio("uvx", &["my-server"])?;
+//! fn connect() -> McpResult<Client> {
+//!     ClientBuilder::new()
+//!         .client_info("my-client", "1.0.0")
+//!         .request_timeout_policy(RequestTimeoutPolicy::new(
+//!             Duration::from_secs(30),
+//!             Duration::from_secs(60),
+//!         )?)
+//!         .max_retries(3)
+//!         .retry_delay_ms(1000)
+//!         .working_dir("/tmp")
+//!         .env("DEBUG", "1")
+//!         .connect_stdio("uvx", &["my-server"])
+//! }
 //! ```
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -28,7 +36,11 @@ use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::{StdioTransport, Transport};
 
-use crate::{ChildGuard, Client, ClientSession, resolve_stdio_command};
+use crate::{
+    ChildGuard, ChildOwnership, Client, ClientSession, ProcessGroupAnchor, RequestTimeoutPolicy,
+    combine_cleanup_results, combine_operation_with_cleanup, is_cleanup_unverified,
+    resolve_stdio_command, transport_error_to_mcp,
+};
 
 /// Builder for configuring an MCP client.
 ///
@@ -38,8 +50,8 @@ use crate::{ChildGuard, Client, ClientSession, resolve_stdio_command};
 pub struct ClientBuilder {
     /// Client identification info.
     client_info: ClientInfo,
-    /// Request timeout in milliseconds.
-    timeout_ms: u64,
+    /// Validated ordinary-request idle/absolute timeout policy.
+    timeout_policy: RequestTimeoutPolicy,
     /// Maximum number of connection retries.
     max_retries: u32,
     /// Delay between retries in milliseconds.
@@ -54,13 +66,15 @@ pub struct ClientBuilder {
     capabilities: ClientCapabilities,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
+    /// Whether the subprocess must be isolated in an owned Unix process group.
+    owned_process_group: bool,
 }
 
 impl std::fmt::Debug for ClientBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientBuilder")
             .field("client_info", &self.client_info)
-            .field("timeout_ms", &self.timeout_ms)
+            .field("timeout_policy", &self.timeout_policy)
             .field("max_retries", &self.max_retries)
             .field("retry_delay_ms", &self.retry_delay_ms)
             .field("working_dir_set", &self.working_dir.is_some())
@@ -73,6 +87,7 @@ impl std::fmt::Debug for ClientBuilder {
             )
             .field("roots_capability", &self.capabilities.roots.is_some())
             .field("auto_initialize", &self.auto_initialize)
+            .field("owned_process_group", &self.owned_process_group)
             .finish()
     }
 }
@@ -82,7 +97,9 @@ impl ClientBuilder {
     ///
     /// Default configuration:
     /// - Client name: "fastmcp-client"
-    /// - Timeout: 30 seconds
+    /// - Request idle timeout: 30 seconds
+    /// - Request absolute timeout: 120 seconds
+    /// - Matching strictly increasing progress resets idle: enabled
     /// - Max retries: 0 (no retries)
     /// - Retry delay: 1 second
     /// - Inherit environment: true
@@ -94,7 +111,7 @@ impl ClientBuilder {
                 name: "fastmcp-client".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
-            timeout_ms: 30_000,
+            timeout_policy: RequestTimeoutPolicy::default(),
             max_retries: 0,
             retry_delay_ms: 1_000,
             working_dir: None,
@@ -102,6 +119,7 @@ impl ClientBuilder {
             inherit_env: true,
             capabilities: ClientCapabilities::default(),
             auto_initialize: false,
+            owned_process_group: false,
         }
     }
 
@@ -117,17 +135,20 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the response deadline in milliseconds.
+    /// Sets the validated idle/absolute policy for ordinary requests.
     ///
-    /// This is applied to the initialization handshake and subsequent response
-    /// receives. On Unix, bounded child-pipe readiness polling makes it a hard
-    /// receive deadline even while a server is silent or holds a partial
-    /// frame. On non-Unix targets, the standard child pipe has no portable safe
-    /// readiness primitive, so the deadline remains frame-boundary-only.
-    /// Default is 30,000ms (30 seconds).
+    /// Initialization uses the same idle and absolute bounds, but has no
+    /// request-owned progress that could reset idle. On Unix, bounded
+    /// child-pipe readiness polling enforces both response timers even while a
+    /// server is silent or holds a partial frame. On non-Unix targets,
+    /// the standard child pipe has no portable safe readiness primitive, so
+    /// reads remain frame-boundary-only and synchronous child-stdin response
+    /// writes cannot be preempted by these timers. It also has no equivalent
+    /// bounded atomic cancellation-control write, so a required cancellation
+    /// or timeout control explicitly fails that connection.
     #[must_use]
-    pub fn timeout_ms(mut self, timeout: u64) -> Self {
-        self.timeout_ms = timeout;
+    pub fn request_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
+        self.timeout_policy = policy;
         self
     }
 
@@ -228,6 +249,33 @@ impl ClientBuilder {
         self
     }
 
+    /// Requires ownership of the subprocess's inherited Unix process group.
+    ///
+    /// When enabled, a `/bin/sh` anchor becomes a dedicated process-group
+    /// leader. The requested executable is still spawned directly, as the
+    /// anchor's sibling in that group, so its executable, argument vector,
+    /// environment, working directory, and protocol descriptors retain normal
+    /// [`Command`] semantics. A private close-on-exec control pipe keeps the
+    /// anchor alive and asks it to kill its own group on explicit close, drop,
+    /// or owner-process death.
+    ///
+    /// The caller must retain exclusive ownership of the spawned child: a
+    /// process-wide `waitpid(-1)` reaper or external signalling can interfere
+    /// with bounded reap verification. Descendants that deliberately enter
+    /// another process group or session are outside this ownership boundary.
+    /// A host-side `fork` that retains the private control descriptor can also
+    /// delay owner-death cleanup until that copy closes. This includes a
+    /// concurrent setup-time raw fork on Unix targets whose standard library
+    /// cannot create the internal socket pair with atomic close-on-exec.
+    ///
+    /// The mode fails closed during connection on platforms where this crate
+    /// has no safe process-group or Job Object equivalent.
+    #[must_use]
+    pub fn owned_process_group(mut self, enabled: bool) -> Self {
+        self.owned_process_group = enabled;
+        self
+    }
+
     /// Connects to a server via stdio subprocess.
     ///
     /// Spawns the specified command as a subprocess and communicates via
@@ -241,6 +289,7 @@ impl ClientBuilder {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The request idle/absolute policy is invalid
     /// - The subprocess fails to spawn
     /// - The initialization handshake fails
     /// - All retry attempts are exhausted
@@ -256,6 +305,11 @@ impl ClientBuilder {
     /// Same as [`connect_stdio`](Self::connect_stdio) but allows providing
     /// a custom capability context for cancellation support.
     pub fn connect_stdio_with_cx(self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+        // Reject unusable configuration once, before cancellation checks,
+        // retries, command resolution, or subprocess creation. In particular,
+        // auto-initialize must never return a live client that cannot issue its
+        // first protocol request.
+        self.timeout_policy.validate()?;
         let mut last_error = None;
         // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
         let attempts = u64::from(self.max_retries) + 1;
@@ -283,6 +337,7 @@ impl ClientBuilder {
 
             match self.try_connect(command, args, cx) {
                 Ok(client) => return Ok(client),
+                Err(error) if is_cleanup_unverified(&error) => return Err(error),
                 Err(e) => {
                     last_error = Some(e);
                 }
@@ -297,9 +352,9 @@ impl ClientBuilder {
     fn try_connect(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
-        let mut cmd = Command::new(executable);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        let (mut cmd, child_ownership, mut group_anchor) =
+            self.prepare_stdio_command(executable, args)?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
@@ -316,33 +371,90 @@ impl ClientBuilder {
             cmd.env(key, value);
         }
         // Spawn the subprocess
-        let child = cmd
-            .spawn()
-            .map_err(|e| McpError::internal_error(format!("Failed to spawn subprocess: {e}")))?;
-        let mut child_guard = ChildGuard::new(child);
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let operation = Err(McpError::internal_error(format!(
+                    "Failed to spawn subprocess: {error}"
+                )));
+                return combine_operation_with_cleanup(operation, || {
+                    group_anchor
+                        .as_mut()
+                        .map_or(Ok(()), ProcessGroupAnchor::cleanup)
+                });
+            }
+        };
+        let mut child_guard = match group_anchor.take() {
+            Some(anchor) => ChildGuard::with_process_group(child, anchor),
+            None => ChildGuard::with_ownership(child, child_ownership),
+        };
+        if let Err(error) = child_guard.verify_group_anchor() {
+            return combine_operation_with_cleanup(Err(error), || child_guard.cleanup());
+        }
 
         // Get stdin/stdout handles
-        let stdin = child_guard
-            .child_mut()
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdin"))?;
-        let stdout = child_guard
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdout"))?;
+        let stdin = match child_guard.child_mut().stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return combine_operation_with_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdin")),
+                    || child_guard.cleanup(),
+                );
+            }
+        };
+        let stdout = match child_guard.child_mut().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return combine_operation_with_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdout")),
+                    || child_guard.cleanup(),
+                );
+            }
+        };
 
         // Create transport
         let transport = StdioTransport::new(stdout, stdin);
-        let child = child_guard.disarm();
+        let (child, group_anchor) = child_guard.disarm_all();
 
         if self.auto_initialize {
             // Create uninitialized client - initialization will happen on first use
-            Ok(self.create_uninitialized_client(child, transport, cx))
+            Ok(self.create_uninitialized_client(
+                child,
+                child_ownership,
+                group_anchor,
+                transport,
+                cx,
+            ))
         } else {
             // Perform initialization immediately
-            self.initialize_client(child, transport, cx)
+            self.initialize_client(child, child_ownership, group_anchor, transport, cx)
+        }
+    }
+
+    fn prepare_stdio_command(
+        &self,
+        executable: PathBuf,
+        args: &[&str],
+    ) -> McpResult<(Command, ChildOwnership, Option<ProcessGroupAnchor>)> {
+        let mut command = Command::new(executable);
+        command.args(args);
+        if !self.owned_process_group {
+            return Ok((command, ChildOwnership::DirectChild, None));
+        }
+
+        #[cfg(unix)]
+        {
+            let anchor = ProcessGroupAnchor::spawn()?;
+            command.process_group(anchor.raw_process_group());
+            Ok((command, ChildOwnership::OwnedProcessGroup, Some(anchor)))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            Err(McpError::internal_error(
+                "Owned subprocess groups are unavailable on this platform",
+            ))
         }
     }
 
@@ -350,6 +462,8 @@ impl ClientBuilder {
     fn create_uninitialized_client(
         &self,
         child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
         transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
     ) -> Client {
@@ -365,31 +479,48 @@ impl ClientBuilder {
             String::new(),
         );
 
-        Client::from_parts_uninitialized(child, transport, cx.clone(), session, self.timeout_ms)
+        Client::from_parts_uninitialized_with_ownership(
+            child,
+            child_ownership,
+            group_anchor,
+            transport,
+            cx.clone(),
+            session,
+            self.timeout_policy,
+        )
     }
 
     /// Performs the initialization handshake and creates the client.
     fn initialize_client(
         &self,
         child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
         mut transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
     ) -> McpResult<Client> {
         // Guard ensures child process is killed if initialization fails.
         // Disarmed when client is successfully created.
-        let child_guard = ChildGuard::new(child);
+        let child_guard = match group_anchor {
+            Some(anchor) => ChildGuard::with_process_group(child, anchor),
+            None => ChildGuard::with_ownership(child, child_ownership),
+        };
 
         let init_result = match crate::initialize_child_transport(
             &mut transport,
             cx,
             &self.client_info,
             &self.capabilities,
-            self.timeout_ms,
+            self.timeout_policy,
         ) {
             Ok(result) => result,
             Err(error) => {
-                let _ = transport.close();
-                return Err(error);
+                return combine_operation_with_cleanup(Err(error), || {
+                    combine_cleanup_results(
+                        transport.close().map_err(transport_error_to_mcp),
+                        child_guard.cleanup(),
+                    )
+                });
             }
         };
 
@@ -403,12 +534,15 @@ impl ClientBuilder {
         );
 
         // Create client - disarm guard since Client now owns the subprocess
-        Ok(Client::from_parts(
-            child_guard.disarm(),
+        let (child, group_anchor) = child_guard.disarm_all();
+        Ok(Client::from_parts_with_ownership(
+            child,
+            child_ownership,
+            group_anchor,
             transport,
             cx.clone(),
             session,
-            self.timeout_ms,
+            self.timeout_policy,
         ))
     }
 }
@@ -428,36 +562,48 @@ mod tests {
     fn test_builder_defaults() {
         let builder = ClientBuilder::new();
         assert_eq!(builder.client_info.name, "fastmcp-client");
-        assert_eq!(builder.timeout_ms, 30_000);
+        assert_eq!(builder.timeout_policy, RequestTimeoutPolicy::default());
         assert_eq!(builder.max_retries, 0);
         assert_eq!(builder.retry_delay_ms, 1_000);
         assert!(builder.inherit_env);
         assert!(builder.working_dir.is_none());
         assert!(builder.env_vars.is_empty());
         assert!(!builder.auto_initialize);
+        assert!(!builder.owned_process_group);
     }
 
     #[test]
     fn test_builder_fluent_api() {
         let builder = ClientBuilder::new()
             .client_info("test-client", "2.0.0")
-            .timeout_ms(60_000)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(20), Duration::from_secs(60))
+                    .unwrap()
+                    .reset_idle_on_matching_progress(false),
+            )
             .max_retries(3)
             .retry_delay_ms(500)
             .working_dir("/tmp")
             .env("FOO", "bar")
             .env("BAZ", "qux")
-            .inherit_env(false);
+            .inherit_env(false)
+            .owned_process_group(true);
 
         assert_eq!(builder.client_info.name, "test-client");
         assert_eq!(builder.client_info.version, "2.0.0");
-        assert_eq!(builder.timeout_ms, 60_000);
+        assert_eq!(
+            builder.timeout_policy,
+            RequestTimeoutPolicy::new(Duration::from_secs(20), Duration::from_secs(60))
+                .unwrap()
+                .reset_idle_on_matching_progress(false)
+        );
         assert_eq!(builder.max_retries, 3);
         assert_eq!(builder.retry_delay_ms, 500);
         assert_eq!(builder.working_dir, Some(PathBuf::from("/tmp")));
         assert_eq!(builder.env_vars.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(builder.env_vars.get("BAZ"), Some(&"qux".to_string()));
         assert!(!builder.inherit_env);
+        assert!(builder.owned_process_group);
     }
 
     #[test]
@@ -473,12 +619,17 @@ mod tests {
     fn test_builder_clone() {
         let builder1 = ClientBuilder::new()
             .client_info("test", "1.0")
-            .timeout_ms(5000);
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5)).unwrap(),
+            );
 
         let builder2 = builder1.clone();
 
         assert_eq!(builder2.client_info.name, "test");
-        assert_eq!(builder2.timeout_ms, 5000);
+        assert_eq!(
+            builder2.timeout_policy,
+            RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5)).unwrap()
+        );
     }
 
     #[test]
@@ -494,9 +645,32 @@ mod tests {
     fn test_builder_default_trait() {
         let builder = ClientBuilder::default();
         assert_eq!(builder.client_info.name, "fastmcp-client");
-        assert_eq!(builder.timeout_ms, 30_000);
+        assert_eq!(builder.timeout_policy, RequestTimeoutPolicy::default());
         assert_eq!(builder.max_retries, 0);
         assert!(!builder.auto_initialize);
+        assert!(!builder.owned_process_group);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reality_check_regression_owned_process_group_preserves_spawn_command() {
+        let builder = ClientBuilder::new().owned_process_group(true);
+        let (command, ownership, mut anchor) = builder
+            .prepare_stdio_command(PathBuf::from("echo"), &["--flag"])
+            .expect("Unix owned-group command");
+
+        assert_eq!(ownership, ChildOwnership::OwnedProcessGroup);
+        assert_eq!(command.get_program(), "echo");
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, vec!["--flag".to_owned()]);
+        anchor
+            .as_mut()
+            .expect("owned group has an anchor")
+            .cleanup()
+            .expect("anchor cleanup");
     }
 
     #[test]
@@ -556,11 +730,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_timeout_policy_is_rejected_by_its_constructor() {
+        for (idle, absolute) in [
+            (Duration::ZERO, Duration::from_millis(1)),
+            (
+                crate::MAX_CLIENT_IDLE_TIMEOUT + Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+            (Duration::from_millis(1), Duration::ZERO),
+            (
+                Duration::from_millis(1),
+                crate::MAX_CLIENT_ABSOLUTE_TIMEOUT + Duration::from_millis(1),
+            ),
+            (Duration::MAX, Duration::MAX),
+        ] {
+            let error = RequestTimeoutPolicy::new(idle, absolute)
+                .expect_err("invalid timeout policy must be rejected");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+        }
+    }
+
+    #[test]
     fn builder_debug_redacts_subprocess_environment_values() {
         let env_value_canary = "builder-env-api-value-canary";
         let builder = ClientBuilder::new()
             .client_info("dbg-test", "0.1")
-            .timeout_ms(42_000)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(21), Duration::from_secs(42))
+                    .unwrap()
+                    .reset_idle_on_matching_progress(false),
+            )
             .working_dir("/private/debug/path")
             .env("SERVICE_API_TOKEN", env_value_canary)
             .inherit_env(false);
@@ -569,7 +768,9 @@ mod tests {
         assert!(debug.contains("ClientBuilder"));
         assert!(debug.contains("dbg-test"));
         assert!(debug.contains("0.1"));
-        assert!(debug.contains("timeout_ms: 42000"));
+        assert!(debug.contains("idle_timeout: 21s"));
+        assert!(debug.contains("absolute_timeout: 42s"));
+        assert!(debug.contains("reset_idle_on_matching_progress: false"));
         assert!(debug.contains("working_dir_set: true"));
         assert!(debug.contains("env_var_count: 1"));
         assert!(debug.contains("inherit_env: false"));
@@ -591,13 +792,20 @@ mod tests {
     fn connect_stdio_times_out_during_silent_initialization() {
         let started = std::time::Instant::now();
         let result = ClientBuilder::new()
-            .timeout_ms(40)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(40))
+                    .unwrap(),
+            )
             .connect_stdio("sh", &["-c", "exec sleep 5"]);
 
         let Err(error) = result else {
             panic!("silent initialization should time out");
         };
-        assert_eq!(error.message, "Request timed out");
+        assert_eq!(error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 

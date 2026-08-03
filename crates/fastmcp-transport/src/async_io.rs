@@ -17,7 +17,8 @@
 //! cost-quota exhaustion. The `AsyncRead`/`AsyncWrite` poll methods themselves
 //! have no `Cx` and perform blocking standard-library I/O. None of these
 //! checkpoints can interrupt an operation once the underlying read, write,
-//! flush, or stdout lock blocks.
+//! flush, or stdout lock blocks. Unix stdio server entrypoints use the separate
+//! bounded nonblocking stdout commit method instead of these legacy writes.
 
 use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -25,6 +26,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 fn io_checkpoint(cx: &Cx) -> io::Result<()> {
     cx.checkpoint().map_err(|error| {
@@ -106,6 +109,32 @@ pub struct AsyncStdout {
 
 static STDOUT_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
+fn lock_stdout_until(deadline: Instant) -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match STDOUT_LOCK.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("stdout lock poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stdout lock acquisition exceeded the commit deadline",
+                    ));
+                }
+                std::thread::park_timeout(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(1)),
+                );
+            }
+        }
+    }
+}
+
 impl AsyncStdout {
     /// Creates a new `AsyncStdout` wrapping the standard output.
     #[must_use]
@@ -181,6 +210,99 @@ impl AsyncStdout {
             .lock()
             .map_err(|_| io::Error::other("stdout lock poisoned"))?;
         self.inner.flush()
+    }
+
+    /// Commits one complete byte sequence to Unix stdout with a wall-clock
+    /// bound and nonblocking descriptor writes.
+    ///
+    /// The method owns the process-wide stdout serialization lock for the
+    /// entire sequence, enables `O_NONBLOCK` on fd 1, polls for writability,
+    /// and retries partial writes and `EINTR`/`EAGAIN` until completion. Once a
+    /// prefix has been written, any later error is connection-fatal because a
+    /// subsequent frame could not safely repair the byte stream. If this call
+    /// enables `O_NONBLOCK`, it attempts to restore the original descriptor
+    /// flags before releasing the process-local stdout lock. Restoration
+    /// failure is returned as a connection-fatal I/O error; in that case the
+    /// descriptor may remain nonblocking. A separately inherited/duped
+    /// descriptor can also observe the temporary flag change because Unix
+    /// stores status flags on the shared open-file description.
+    ///
+    /// Regular files and some device/filesystem implementations may ignore
+    /// `O_NONBLOCK`; the bound is guaranteed for ordinary Unix pipes and
+    /// sockets, which are the supported MCP stdio host boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for a zero timeout, a timeout error when
+    /// lock acquisition or writability exceeds the bound, or the underlying
+    /// descriptor/poll/write error.
+    #[cfg(unix)]
+    pub fn write_all_bounded(&mut self, mut bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout commit timeout must be nonzero",
+            ));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout overflow"))?;
+        let _guard = lock_stdout_until(deadline)?;
+        let flags = rustix::fs::fcntl_getfl(&self.inner).map_err(io::Error::from)?;
+        let restore_flags = !flags.contains(rustix::fs::OFlags::NONBLOCK);
+        if restore_flags {
+            rustix::fs::fcntl_setfl(&self.inner, flags | rustix::fs::OFlags::NONBLOCK)
+                .map_err(io::Error::from)?;
+        }
+
+        let write_result = (|| {
+            while !bytes.is_empty() {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stdout write exceeded the commit deadline",
+                    ));
+                }
+                let poll_timeout =
+                    rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "timeout out of range")
+                        })?;
+                let mut poll_fds = [rustix::event::PollFd::new(
+                    &self.inner,
+                    rustix::event::PollFlags::OUT,
+                )];
+                match rustix::event::poll(&mut poll_fds, Some(&poll_timeout)) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "stdout writability exceeded the commit deadline",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(io::Error::from(error)),
+                }
+
+                match rustix::io::write(&self.inner, bytes) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(written) => bytes = &bytes[written..],
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                    Err(error) => return Err(io::Error::from(error)),
+                }
+            }
+            Ok(())
+        })();
+        let restore_result = if restore_flags {
+            rustix::fs::fcntl_setfl(&self.inner, flags).map_err(io::Error::from)
+        } else {
+            Ok(())
+        };
+        match (write_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -275,6 +397,7 @@ impl AsyncWrite for AsyncStdout {
 pub struct AsyncLineReader {
     stdin: AsyncStdin,
     buffer: Vec<u8>,
+    terminal: bool,
 }
 
 /// Default bound used by the public line-reading convenience methods.
@@ -295,6 +418,74 @@ impl From<io::Error> for BoundedLineReadError {
     }
 }
 
+fn bounded_frame_len(buffer: &[u8]) -> usize {
+    let without_lf = buffer.strip_suffix(b"\n").unwrap_or(buffer);
+    without_lf.strip_suffix(b"\r").unwrap_or(without_lf).len()
+}
+
+fn bounded_line_failure_is_terminal(error: &BoundedLineReadError, buffer: &[u8]) -> bool {
+    matches!(error, BoundedLineReadError::TooLarge(_))
+        || matches!(error, BoundedLineReadError::Io(_)) && !buffer.is_empty()
+}
+
+fn read_line_bytes_bounded_from<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    cx: &Cx,
+    max_frame_size: usize,
+) -> Result<Option<usize>, BoundedLineReadError> {
+    buffer.clear();
+    let wire_limit = max_frame_size.saturating_add(2);
+
+    loop {
+        io_checkpoint(cx)?;
+
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                // A signal interruption is transient. Re-enter the full
+                // context checkpoint before retrying so cancellation,
+                // deadlines, quotas, and masking retain their authoritative
+                // semantics without discarding an already-read frame prefix.
+                io_checkpoint(cx)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if available.is_empty() {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            let frame_len = bounded_frame_len(buffer);
+            if frame_len > max_frame_size {
+                buffer.clear();
+                return Err(BoundedLineReadError::TooLarge(frame_len));
+            }
+            return Ok(Some(frame_len));
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let bytes_to_consume = newline.map_or(available.len(), |position| position + 1);
+        let projected = buffer.len().saturating_add(bytes_to_consume);
+        if projected > wire_limit {
+            buffer.clear();
+            return Err(BoundedLineReadError::TooLarge(projected));
+        }
+
+        buffer.extend_from_slice(&available[..bytes_to_consume]);
+        reader.consume(bytes_to_consume);
+
+        if newline.is_some() {
+            let frame_len = bounded_frame_len(buffer);
+            if frame_len > max_frame_size {
+                buffer.clear();
+                return Err(BoundedLineReadError::TooLarge(frame_len));
+            }
+            return Ok(Some(frame_len));
+        }
+    }
+}
+
 impl AsyncLineReader {
     /// Creates a new `AsyncLineReader`.
     #[must_use]
@@ -302,12 +493,8 @@ impl AsyncLineReader {
         Self {
             stdin: AsyncStdin::new(),
             buffer: Vec::with_capacity(4096),
+            terminal: false,
         }
-    }
-
-    fn frame_len(&self) -> usize {
-        let without_lf = self.buffer.strip_suffix(b"\n").unwrap_or(&self.buffer);
-        without_lf.strip_suffix(b"\r").unwrap_or(without_lf).len()
     }
 
     /// Reads at most one line without allowing `BufRead::read_line` to grow a
@@ -320,46 +507,24 @@ impl AsyncLineReader {
         cx: &Cx,
         max_frame_size: usize,
     ) -> Result<Option<usize>, BoundedLineReadError> {
-        self.buffer.clear();
-        let wire_limit = max_frame_size.saturating_add(2);
-
-        loop {
-            io_checkpoint(cx)?;
-
-            let available = self.stdin.inner.fill_buf()?;
-            if available.is_empty() {
-                if self.buffer.is_empty() {
-                    return Ok(None);
-                }
-                let frame_len = self.frame_len();
-                if frame_len > max_frame_size {
-                    self.buffer.clear();
-                    return Err(BoundedLineReadError::TooLarge(frame_len));
-                }
-                return Ok(Some(frame_len));
-            }
-
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let bytes_to_consume = newline.map_or(available.len(), |position| position + 1);
-            let projected = self.buffer.len().saturating_add(bytes_to_consume);
-            if projected > wire_limit {
-                self.buffer.clear();
-                return Err(BoundedLineReadError::TooLarge(projected));
-            }
-
-            self.buffer
-                .extend_from_slice(&available[..bytes_to_consume]);
-            self.stdin.inner.consume(bytes_to_consume);
-
-            if newline.is_some() {
-                let frame_len = self.frame_len();
-                if frame_len > max_frame_size {
-                    self.buffer.clear();
-                    return Err(BoundedLineReadError::TooLarge(frame_len));
-                }
-                return Ok(Some(frame_len));
-            }
+        if self.terminal {
+            return Err(BoundedLineReadError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "line reader is terminal after a prior partial-frame failure",
+            )));
         }
+        let result = read_line_bytes_bounded_from(
+            &mut self.stdin.inner,
+            &mut self.buffer,
+            cx,
+            max_frame_size,
+        );
+        if let Err(error) = &result
+            && bounded_line_failure_is_terminal(error, &self.buffer)
+        {
+            self.terminal = true;
+        }
+        result
     }
 
     pub(crate) fn read_non_empty_line_bounded(
@@ -389,8 +554,11 @@ impl AsyncLineReader {
     ///   budget is observed at a checkpoint.
     /// - Returns other I/O errors as-is.
     ///
-    /// A size-limit error is terminal for the current input stream because the
-    /// unread remainder of the oversized line is deliberately not drained.
+    /// A size-limit error is terminal for this reader because the unread
+    /// remainder of the oversized line is deliberately not drained. An I/O,
+    /// cancellation, or budget error after a frame prefix was consumed is also
+    /// terminal: retrying could reinterpret the suffix as a new frame. A
+    /// checkpoint failure before any bytes are consumed remains retryable.
     pub fn read_line(&mut self, cx: &Cx) -> io::Result<Option<String>> {
         let Some(frame_len) = self
             .read_line_bytes_bounded(cx, DEFAULT_MAX_LINE_SIZE)
@@ -445,6 +613,61 @@ impl Default for AsyncLineReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    enum DeterministicBufReadStep {
+        Bytes(Vec<u8>),
+        Interrupted,
+        Eof,
+    }
+
+    struct DeterministicInterruptedBufRead {
+        steps: VecDeque<DeterministicBufReadStep>,
+        current: Vec<u8>,
+        offset: usize,
+        cancel_on_interrupt: Option<Cx>,
+    }
+
+    impl Read for DeterministicInterruptedBufRead {
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let read = available.len().min(destination.len());
+            destination[..read].copy_from_slice(&available[..read]);
+            self.consume(read);
+            Ok(read)
+        }
+    }
+
+    impl BufRead for DeterministicInterruptedBufRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.offset < self.current.len() {
+                return Ok(&self.current[self.offset..]);
+            }
+
+            match self.steps.pop_front() {
+                Some(DeterministicBufReadStep::Bytes(bytes)) => {
+                    assert!(!bytes.is_empty(), "byte steps must make progress");
+                    self.current = bytes;
+                    self.offset = 0;
+                    Ok(&self.current)
+                }
+                Some(DeterministicBufReadStep::Interrupted) => {
+                    if let Some(cx) = &self.cancel_on_interrupt {
+                        cx.set_cancel_requested(true);
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "deterministic signal interruption",
+                    ))
+                }
+                Some(DeterministicBufReadStep::Eof) | None => Ok(&[]),
+            }
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.offset = self.offset.saturating_add(amount).min(self.current.len());
+        }
+    }
 
     // =========================================================================
     // AsyncStdin tests
@@ -735,6 +958,83 @@ mod tests {
             reader.read_non_empty_line(&quota_cx).unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn reality_check_regression_async_line_reader_retries_interrupted_fill_with_prefix() {
+        let mut reader = DeterministicInterruptedBufRead {
+            steps: VecDeque::from([
+                DeterministicBufReadStep::Bytes(b"frame-pre".to_vec()),
+                DeterministicBufReadStep::Interrupted,
+                DeterministicBufReadStep::Bytes(b"fix\nnext-frame\n".to_vec()),
+                DeterministicBufReadStep::Eof,
+            ]),
+            current: Vec::new(),
+            offset: 0,
+            cancel_on_interrupt: None,
+        };
+        let mut buffer = Vec::new();
+
+        let frame_len = read_line_bytes_bounded_from(
+            &mut reader,
+            &mut buffer,
+            &Cx::for_testing(),
+            DEFAULT_MAX_LINE_SIZE,
+        )
+        .expect("a transient interruption must be retried")
+        .expect("the complete frame must be returned");
+
+        assert_eq!(&buffer[..frame_len], b"frame-prefix");
+        assert_eq!(
+            reader.fill_buf().expect("the suffix remains buffered"),
+            b"next-frame\n"
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_async_line_reader_checks_context_after_interruption() {
+        let cx = Cx::for_testing();
+        let mut reader = DeterministicInterruptedBufRead {
+            steps: VecDeque::from([
+                DeterministicBufReadStep::Bytes(b"partial".to_vec()),
+                DeterministicBufReadStep::Interrupted,
+                DeterministicBufReadStep::Bytes(b"must-not-be-read\n".to_vec()),
+            ]),
+            current: Vec::new(),
+            offset: 0,
+            cancel_on_interrupt: Some(cx.clone()),
+        };
+        let mut buffer = Vec::new();
+
+        let error =
+            read_line_bytes_bounded_from(&mut reader, &mut buffer, &cx, DEFAULT_MAX_LINE_SIZE)
+                .expect_err("the context cancellation must stop the retry");
+
+        assert!(matches!(
+            error,
+            BoundedLineReadError::Io(ref error)
+                if error.kind() == io::ErrorKind::Interrupted
+        ));
+        assert!(bounded_line_failure_is_terminal(&error, &buffer));
+        assert_eq!(buffer, b"partial");
+        assert!(matches!(
+            reader.steps.front(),
+            Some(DeterministicBufReadStep::Bytes(bytes))
+                if bytes.as_slice() == b"must-not-be-read\n"
+        ));
+    }
+
+    #[test]
+    fn reality_check_regression_async_line_reader_rejects_retry_after_partial_failure() {
+        let mut reader = AsyncLineReader::new();
+        reader.terminal = true;
+
+        let error = reader
+            .read_line(&Cx::for_testing())
+            .expect_err("a terminal reader must not reinterpret a frame suffix");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("terminal"));
     }
 
     // =========================================================================

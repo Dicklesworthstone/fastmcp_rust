@@ -7088,89 +7088,91 @@ mod helper_function_tests {
         let barrier_for_receive = Arc::clone(&barrier);
         let mut step = 0_u8;
 
-        server.run_loop_returning(
-            &Cx::for_testing(),
-            move |_| {
-                let current = step;
-                step = step.saturating_add(1);
-                match current {
-                    0 => Ok(JsonRpcMessage::Request(
-                        fastmcp_protocol::JsonRpcRequest::new(
-                            "initialize",
-                            Some(
-                                serde_json::to_value(InitializeParams {
-                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
-                                        .to_string(),
-                                    capabilities: ClientCapabilities::default(),
-                                    client_info: ClientInfo {
-                                        name: "pump-client".to_string(),
-                                        version: "1.0.0".to_string(),
-                                    },
-                                })
-                                .expect("serialize initialize"),
-                            ),
-                            1_i64,
-                        ),
-                    )),
-                    1 => Ok(JsonRpcMessage::Request(
-                        fastmcp_protocol::JsonRpcRequest::new(
-                            "tools/call",
-                            Some(
-                                serde_json::to_value(CallToolParams {
-                                    name: "block_until_cancelled".to_string(),
-                                    arguments: Some(serde_json::json!({})),
-                                    meta: None,
-                                })
-                                .expect("serialize call"),
-                            ),
-                            2_i64,
-                        ),
-                    )),
-                    2 => {
-                        barrier_for_receive.wait();
-                        Ok(JsonRpcMessage::Request(
-                            fastmcp_protocol::JsonRpcRequest::notification(
-                                "notifications/cancelled",
+        server
+            .run_loop_returning(
+                &Cx::for_testing(),
+                move |_, _worker_failed| {
+                    let current = step;
+                    step = step.saturating_add(1);
+                    match current {
+                        0 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::new(
+                                "initialize",
                                 Some(
-                                    serde_json::to_value(CancelledParams {
-                                        request_id: RequestId::Number(2),
-                                        reason: Some("test cancellation".to_string()),
-                                        await_cleanup: Some(false),
+                                    serde_json::to_value(InitializeParams {
+                                        protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                            .to_string(),
+                                        capabilities: ClientCapabilities::default(),
+                                        client_info: ClientInfo {
+                                            name: "pump-client".to_string(),
+                                            version: "1.0.0".to_string(),
+                                        },
                                     })
-                                    .expect("serialize cancellation"),
+                                    .expect("serialize initialize"),
                                 ),
+                                1_i64,
                             ),
-                        ))
-                    }
-                    _ => {
-                        let deadline = Instant::now() + Duration::from_secs(2);
-                        while Instant::now() < deadline {
-                            match outbound_rx.recv_timeout(Duration::from_millis(20)) {
-                                Ok(JsonRpcMessage::Response(response))
-                                    if response.id == Some(RequestId::Number(2)) =>
-                                {
-                                    return Err(fastmcp_transport::TransportError::Closed);
-                                }
-                                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
+                        )),
+                        1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::new(
+                                "tools/call",
+                                Some(
+                                    serde_json::to_value(CallToolParams {
+                                        name: "block_until_cancelled".to_string(),
+                                        arguments: Some(serde_json::json!({})),
+                                        meta: None,
+                                    })
+                                    .expect("serialize call"),
+                                ),
+                                2_i64,
+                            ),
+                        )),
+                        2 => {
+                            barrier_for_receive.wait();
+                            Ok(JsonRpcMessage::Request(
+                                fastmcp_protocol::JsonRpcRequest::notification(
+                                    "notifications/cancelled",
+                                    Some(
+                                        serde_json::to_value(CancelledParams {
+                                            request_id: RequestId::Number(2),
+                                            reason: Some("test cancellation".to_string()),
+                                            await_cleanup: Some(false),
+                                        })
+                                        .expect("serialize cancellation"),
+                                    ),
+                                ),
+                            ))
                         }
-                        Err(fastmcp_transport::TransportError::Timeout)
+                        _ => {
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            while Instant::now() < deadline {
+                                match outbound_rx.recv_timeout(Duration::from_millis(20)) {
+                                    Ok(JsonRpcMessage::Response(response))
+                                        if response.id == Some(RequestId::Number(2)) =>
+                                    {
+                                        return Err(fastmcp_transport::TransportError::Closed);
+                                    }
+                                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                }
+                            }
+                            Err(fastmcp_transport::TransportError::Timeout)
+                        }
                     }
-                }
-            },
-            move |_, message| {
-                sent_for_transport
-                    .lock()
-                    .expect("sent messages lock")
-                    .push(message.clone());
-                outbound_tx
-                    .send(message.clone())
-                    .map_err(|_| fastmcp_transport::TransportError::Closed)
-            },
-            Arc::new(|_| {}),
-            "test",
-        );
+                },
+                move |_, message| {
+                    sent_for_transport
+                        .lock()
+                        .expect("sent messages lock")
+                        .push(message.clone());
+                    outbound_tx
+                        .send(message.clone())
+                        .map_err(|_| fastmcp_transport::TransportError::Closed)
+                },
+                Arc::new(|_| {}),
+                "test",
+            )
+            .expect("scripted returning loop must close cleanly");
 
         let sent = sent.lock().expect("sent messages lock");
         let cancellation_response = sent.iter().find_map(|message| match message {
@@ -7197,91 +7199,93 @@ mod helper_function_tests {
         let sent_for_transport = Arc::clone(&sent);
         let mut step = 0_u8;
 
-        server.run_loop_returning(
-            &Cx::for_testing(),
-            move |_| {
-                let current = step;
-                step = step.saturating_add(1);
-                match current {
-                    0 => Ok(JsonRpcMessage::Request(
-                        fastmcp_protocol::JsonRpcRequest::new(
-                            "initialize",
-                            Some(
-                                serde_json::to_value(InitializeParams {
-                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
-                                        .to_string(),
-                                    capabilities: ClientCapabilities {
-                                        sampling: Some(SamplingCapability::default()),
-                                        ..ClientCapabilities::default()
-                                    },
-                                    client_info: ClientInfo {
-                                        name: "sampling-client".to_string(),
-                                        version: "1.0.0".to_string(),
-                                    },
-                                })
-                                .expect("serialize initialize"),
+        server
+            .run_loop_returning(
+                &Cx::for_testing(),
+                move |_, _worker_failed| {
+                    let current = step;
+                    step = step.saturating_add(1);
+                    match current {
+                        0 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::new(
+                                "initialize",
+                                Some(
+                                    serde_json::to_value(InitializeParams {
+                                        protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                            .to_string(),
+                                        capabilities: ClientCapabilities {
+                                            sampling: Some(SamplingCapability::default()),
+                                            ..ClientCapabilities::default()
+                                        },
+                                        client_info: ClientInfo {
+                                            name: "sampling-client".to_string(),
+                                            version: "1.0.0".to_string(),
+                                        },
+                                    })
+                                    .expect("serialize initialize"),
+                                ),
+                                1_i64,
                             ),
-                            1_i64,
-                        ),
-                    )),
-                    1 => Ok(JsonRpcMessage::Request(
-                        fastmcp_protocol::JsonRpcRequest::new(
-                            "tools/call",
-                            Some(
-                                serde_json::to_value(CallToolParams {
-                                    name: "sampling_round_trip".to_string(),
-                                    arguments: Some(serde_json::json!({})),
-                                    meta: None,
-                                })
-                                .expect("serialize call"),
+                        )),
+                        1 => Ok(JsonRpcMessage::Request(
+                            fastmcp_protocol::JsonRpcRequest::new(
+                                "tools/call",
+                                Some(
+                                    serde_json::to_value(CallToolParams {
+                                        name: "sampling_round_trip".to_string(),
+                                        arguments: Some(serde_json::json!({})),
+                                        meta: None,
+                                    })
+                                    .expect("serialize call"),
+                                ),
+                                2_i64,
                             ),
-                            2_i64,
-                        ),
-                    )),
-                    2 => loop {
-                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
-                            Ok(JsonRpcMessage::Request(request))
-                                if request.method == "sampling/createMessage" =>
-                            {
-                                let id = request.id.expect("sampling request id");
-                                return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
-                                    id,
-                                    serde_json::to_value(CreateMessageResult::text(
-                                        "sampled-value",
-                                        "test-model",
-                                    ))
-                                    .expect("serialize sampling result"),
-                                )));
+                        )),
+                        2 => loop {
+                            match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                                Ok(JsonRpcMessage::Request(request))
+                                    if request.method == "sampling/createMessage" =>
+                                {
+                                    let id = request.id.expect("sampling request id");
+                                    return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                                        id,
+                                        serde_json::to_value(CreateMessageResult::text(
+                                            "sampled-value",
+                                            "test-model",
+                                        ))
+                                        .expect("serialize sampling result"),
+                                    )));
+                                }
+                                Ok(_) => {}
+                                Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
                             }
-                            Ok(_) => {}
-                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
-                        }
-                    },
-                    _ => loop {
-                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
-                            Ok(JsonRpcMessage::Response(response))
-                                if response.id == Some(RequestId::Number(2)) =>
-                            {
-                                return Err(fastmcp_transport::TransportError::Closed);
+                        },
+                        _ => loop {
+                            match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                                Ok(JsonRpcMessage::Response(response))
+                                    if response.id == Some(RequestId::Number(2)) =>
+                                {
+                                    return Err(fastmcp_transport::TransportError::Closed);
+                                }
+                                Ok(_) => {}
+                                Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
                             }
-                            Ok(_) => {}
-                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
-                        }
-                    },
-                }
-            },
-            move |_, message| {
-                sent_for_transport
-                    .lock()
-                    .expect("sent messages lock")
-                    .push(message.clone());
-                outbound_tx
-                    .send(message.clone())
-                    .map_err(|_| fastmcp_transport::TransportError::Closed)
-            },
-            Arc::new(|_| {}),
-            "test",
-        );
+                        },
+                    }
+                },
+                move |_, message| {
+                    sent_for_transport
+                        .lock()
+                        .expect("sent messages lock")
+                        .push(message.clone());
+                    outbound_tx
+                        .send(message.clone())
+                        .map_err(|_| fastmcp_transport::TransportError::Closed)
+                },
+                Arc::new(|_| {}),
+                "test",
+            )
+            .expect("scripted returning loop must close cleanly");
 
         let sent = sent.lock().expect("sent messages lock");
         let tool_response = sent.iter().find_map(|message| match message {

@@ -87,7 +87,7 @@ impl<'de> Deserialize<'de> for RequestId {
     {
         struct RequestIdVisitor;
 
-        impl<'de> Visitor<'de> for RequestIdVisitor {
+        impl Visitor<'_> for RequestIdVisitor {
             type Value = RequestId;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -598,11 +598,7 @@ mod tests {
             r#"{"method":"tools/list","id":1}"#,
         ] {
             let error = serde_json::from_str::<JsonRpcRequest>(input).unwrap_err();
-            assert!(
-                error.to_string().contains("jsonrpc")
-                    || error.to_string().contains("missing field"),
-                "unexpected error for {input}: {error}"
-            );
+            assert!(error.is_data(), "unexpected error for {input}: {error}");
         }
     }
 
@@ -778,11 +774,7 @@ mod tests {
             r#"{"result":{"tools":[]},"id":1}"#,
         ] {
             let error = serde_json::from_str::<JsonRpcResponse>(input).unwrap_err();
-            assert!(
-                error.to_string().contains("jsonrpc")
-                    || error.to_string().contains("missing field"),
-                "unexpected error for {input}: {error}"
-            );
+            assert!(error.is_data(), "unexpected error for {input}: {error}");
         }
     }
 

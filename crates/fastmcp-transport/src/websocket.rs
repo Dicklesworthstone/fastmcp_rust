@@ -334,7 +334,7 @@ impl<R: Read> WsReader<R> {
                 ));
             }
             payload_len = u64::from_be_bytes(ext);
-            if payload_len <= u64::from(u16::MAX) {
+            if u16::try_from(payload_len).is_ok() {
                 return Err(websocket_invalid_data(
                     "Non-minimal WebSocket payload-length encoding",
                 ));
@@ -1298,7 +1298,9 @@ mod tests {
             other => panic!("expected mask-draw I/O error, got {other:?}"),
         };
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(std::error::Error::source(&error).is_some());
+        // `io::Error::source()` reflects the wrapped error's own source chain,
+        // which is empty here. `get_ref()` is the contract for recovering the
+        // directly wrapped typed error.
         assert!(
             error
                 .get_ref()

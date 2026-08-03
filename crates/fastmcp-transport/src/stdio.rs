@@ -48,18 +48,24 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsFd;
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 #[cfg(unix)]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(unix)]
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::async_io::{AsyncLineReader, AsyncStdout, BoundedLineReadError};
 use crate::{Codec, CodecError, SendPermit, Transport, TransportError, TwoPhaseTransport};
 
 #[cfg(unix)]
 const STDIO_READINESS_POLL_SLICE: Duration = Duration::from_millis(10);
+/// POSIX guarantees atomic pipe writes of at least 512 bytes.
+#[cfg(unix)]
+const STDIO_ATOMIC_CONTROL_FRAME_MAX: usize = 512;
 
 fn stdio_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
@@ -112,6 +118,37 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             line_buffer: Vec::with_capacity(4096),
             closed: false,
         }
+    }
+
+    /// Returns whether this transport has entered a terminal state.
+    ///
+    /// In particular, a receive timeout leaves the transport open when no
+    /// frame bytes were consumed, but latches it closed when a partial frame
+    /// was consumed. Strict [`Self::recv_until`] also closes after consuming a
+    /// complete late frame; [`Self::recv_until_with_completion`] instead gives
+    /// that aligned frame to a request-policy owner while keeping the transport
+    /// open.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Receives one blocking frame and reports its decode-completion instant.
+    ///
+    /// This preserves the timestamp taken immediately after successful decode
+    /// and before the final context checkpoint. Callers that can only observe
+    /// deadlines at complete-frame boundaries can therefore avoid charging
+    /// later checkpoint or scheduling delay to the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same closure, cancellation, I/O, and codec errors as
+    /// [`Transport::recv`].
+    pub fn recv_with_completion(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<(JsonRpcMessage, Instant), TransportError> {
+        self.recv_with_readiness(cx, |_, _| Ok(()))
     }
 
     /// Encodes and sends a message, appending newline.
@@ -192,6 +229,12 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
 
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if let Err(error) = stdio_checkpoint(cx) {
+                        return Err(self.abort_pending_read(error));
+                    }
+                    continue;
+                }
                 Err(error) => {
                     self.closed = true;
                     self.line_buffer.clear();
@@ -247,7 +290,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         &mut self,
         cx: &Cx,
         mut wait_for_readiness: F,
-    ) -> Result<JsonRpcMessage, TransportError>
+    ) -> Result<(JsonRpcMessage, Instant), TransportError>
     where
         F: FnMut(&BufReader<R>, &Cx) -> Result<(), TransportError>,
     {
@@ -258,8 +301,10 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         loop {
             let frame_len = match self.read_line_with_readiness(cx, &mut wait_for_readiness) {
                 Ok(frame_len) => frame_len,
-                Err(error @ TransportError::Closed)
-                | Err(error @ TransportError::Codec(CodecError::MessageTooLarge(_))) => {
+                Err(
+                    error @ (TransportError::Closed
+                    | TransportError::Codec(CodecError::MessageTooLarge(_))),
+                ) => {
                     self.closed = true;
                     return Err(error);
                 }
@@ -276,26 +321,31 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             let message = self
                 .codec
                 .decode_complete_message(&self.line_buffer[..frame_len])?;
+            let completed_at = Instant::now();
             if let Err(error) = stdio_checkpoint(cx) {
                 return Err(self.latch_consumed_read_failure(error));
             }
-            return Ok(message);
+            return Ok((message, completed_at));
         }
     }
 }
 
 #[cfg(unix)]
-fn wait_for_unix_readiness<R: AsFd>(
+fn wait_for_unix_readiness<R: AsFd, F: FnMut() -> bool>(
     reader: &BufReader<R>,
     cx: &Cx,
     deadline: Option<Instant>,
+    should_stop: &mut F,
 ) -> Result<(), TransportError> {
     loop {
+        if should_stop() {
+            return Err(TransportError::Cancelled);
+        }
         let remaining = match deadline {
             Some(deadline) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(TransportError::Timeout);
+                    return Err(TransportError::ReceiveDeadlineExceeded);
                 }
                 Some(deadline.duration_since(now))
             }
@@ -322,9 +372,24 @@ fn wait_for_unix_readiness<R: AsFd>(
         })?;
         let mut descriptors = [PollFd::new(reader.get_ref(), PollFlags::IN)];
         match poll(&mut descriptors, Some(&timeout)) {
-            Ok(0) => stdio_checkpoint(cx)?,
-            Ok(_) => return Ok(()),
-            Err(rustix::io::Errno::INTR) => stdio_checkpoint(cx)?,
+            Ok(0) => {
+                if should_stop() {
+                    return Err(TransportError::Cancelled);
+                }
+                stdio_checkpoint(cx)?;
+            }
+            Ok(_) => {
+                if should_stop() {
+                    return Err(TransportError::Cancelled);
+                }
+                return Ok(());
+            }
+            Err(rustix::io::Errno::INTR) => {
+                if should_stop() {
+                    return Err(TransportError::Cancelled);
+                }
+                stdio_checkpoint(cx)?;
+            }
             Err(error) => return Err(TransportError::Io(error.into())),
         }
     }
@@ -332,33 +397,113 @@ fn wait_for_unix_readiness<R: AsFd>(
 
 #[cfg(unix)]
 impl<R: Read + AsFd, W: Write> StdioTransport<R, W> {
-    /// Receives one frame while bounding every potentially blocking pipe read.
+    /// Receives one frame and reports when its complete decode finished.
+    ///
+    /// Unlike [`Self::recv_until`], this preserves a complete, framing-aligned
+    /// message when decoding finishes after `deadline`. For ordinary Unix
+    /// pipes (including `ChildStdout`), readiness checks before empty-buffer
+    /// fills keep silence and partial frames observable at the deadline.
+    /// Arbitrary `Read + AsFd` implementations are not preempted if their own
+    /// `read` blocks after readiness. Callers that own request-level timeout
+    /// policy can validate and route a consumed message before selecting their
+    /// local timeout outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ReceiveDeadlineExceeded`] when the explicit
+    /// deadline expires before a complete frame is available. A partial-frame
+    /// deadline latches the transport closed, while a silent deadline leaves
+    /// it reusable. Context cancellation and all I/O, closure, and codec errors
+    /// follow [`Transport::recv`].
+    pub fn recv_until_with_completion(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+    ) -> Result<(JsonRpcMessage, Instant), TransportError> {
+        let mut never_stop = || false;
+        self.recv_with_readiness(cx, |reader, cx| {
+            wait_for_unix_readiness(reader, cx, deadline, &mut never_stop)
+        })
+    }
+
+    /// Receives one frame with deadline checks around ordinary Unix pipe reads.
     ///
     /// Readiness is polled in short slices before each empty-`BufReader` fill,
     /// so cancellation, context budgets, and `deadline` remain observable even
     /// when a peer is silent or stops midway through an NDJSON frame. A final
     /// checkpoint and deadline check run after complete frame decoding. Failure
     /// there is terminal because the frame has already been consumed. This
-    /// Unix-specific API is used for child-process pipes; generic
-    /// [`Transport::recv`] retains its ordinary blocking `Read` contract.
+    /// Unix-specific API is used for child-process pipes. It does not preempt
+    /// an arbitrary `Read + AsFd` implementation that blocks after reporting
+    /// readiness; generic [`Transport::recv`] retains its ordinary blocking
+    /// `Read` contract.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Timeout`] at the explicit deadline or a context
-    /// deadline, [`TransportError::Cancelled`] for explicit cancellation or
-    /// quota exhaustion, or the same I/O, closure, and codec errors as
+    /// Returns [`TransportError::ReceiveDeadlineExceeded`] at the explicit
+    /// deadline, [`TransportError::Timeout`] at a context deadline,
+    /// [`TransportError::Cancelled`] for explicit cancellation or quota
+    /// exhaustion, or the same I/O, closure, and codec errors as
     /// [`Transport::recv`].
     pub fn recv_until(
         &mut self,
         cx: &Cx,
         deadline: Option<Instant>,
     ) -> Result<JsonRpcMessage, TransportError> {
-        let message = self.recv_with_readiness(cx, |reader, cx| {
-            wait_for_unix_readiness(reader, cx, deadline)
-        })?;
+        let (message, completed_at) = self.recv_until_with_completion(cx, deadline)?;
 
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(self.latch_consumed_read_failure(TransportError::Timeout));
+        if deadline.is_some_and(|deadline| completed_at >= deadline) {
+            return Err(self.latch_consumed_read_failure(TransportError::ReceiveDeadlineExceeded));
+        }
+        Ok(message)
+    }
+
+    /// Receives one frame while also observing an internal, non-maskable stop
+    /// predicate between readiness polls.
+    ///
+    /// The predicate is for terminal transport-owner failure/wakeup state, not
+    /// caller cancellation. Caller cancellation, budgets, and masking continue
+    /// to use the supplied [`Cx`]. Any true stop outcome latches the connection
+    /// closed; when it races a consumed prefix, complete frame, EOF, or receive
+    /// failure, that terminal owner stop wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Cancelled`] when `should_stop` becomes true,
+    /// or the same deadline, cancellation, I/O, closure, and codec errors as
+    /// [`Self::recv_until`].
+    pub fn recv_until_or_stopped<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+        mut should_stop: F,
+    ) -> Result<JsonRpcMessage, TransportError>
+    where
+        F: FnMut() -> bool,
+    {
+        let result = self.recv_with_readiness(cx, |reader, cx| {
+            wait_for_unix_readiness(reader, cx, deadline, &mut should_stop)
+        });
+        let (message, completed_at) = match result {
+            Ok(completed) => completed,
+            Err(error) => {
+                // A transport-owner failure can race EOF or another read
+                // error after the readiness helper's last predicate check.
+                // Recheck before exposing that error so callers cannot
+                // accidentally classify a connection-fatal owner failure as
+                // clean closure.
+                if should_stop() {
+                    return Err(self.latch_consumed_read_failure(TransportError::Cancelled));
+                }
+                return Err(error);
+            }
+        };
+
+        if should_stop() {
+            return Err(self.latch_consumed_read_failure(TransportError::Cancelled));
+        }
+        if deadline.is_some_and(|deadline| completed_at >= deadline) {
+            return Err(self.latch_consumed_read_failure(TransportError::ReceiveDeadlineExceeded));
         }
         Ok(message)
     }
@@ -371,6 +516,86 @@ impl StdioTransport<std::io::Stdin, std::io::Stdout> {
     #[must_use]
     pub fn stdio() -> Self {
         Self::new(std::io::stdin(), std::io::stdout())
+    }
+}
+
+#[cfg(unix)]
+impl<R, W: AsFd> StdioTransport<R, W> {
+    fn try_write_atomic_control(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if bytes.len() > STDIO_ATOMIC_CONTROL_FRAME_MAX {
+            return Err(TransportError::ControlFrameTooLarge {
+                size: bytes.len(),
+                max: STDIO_ATOMIC_CONTROL_FRAME_MAX,
+            });
+        }
+
+        let writer = self.writer.as_mut().ok_or(TransportError::Closed)?;
+        let original_flags = match fcntl_getfl(&*writer) {
+            Ok(flags) => flags,
+            Err(error) => {
+                self.closed = true;
+                return Err(TransportError::Io(error.into()));
+            }
+        };
+        if let Err(error) = fcntl_setfl(&*writer, original_flags | OFlags::NONBLOCK) {
+            self.closed = true;
+            return Err(TransportError::Io(error.into()));
+        }
+
+        // Use the descriptor directly so a custom `Write` implementation
+        // cannot buffer the frame or block before reaching the pipe.
+        let write_result = rustix::io::write(&*writer, bytes);
+        let restore_result = fcntl_setfl(&*writer, original_flags);
+        let result = match (write_result, restore_result) {
+            (Ok(written), Ok(())) if written == bytes.len() => Ok(()),
+            (Ok(_), Ok(())) => Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "stdio control frame was not written atomically",
+            ))),
+            (Err(error), _) => Err(TransportError::Io(error.into())),
+            (Ok(_), Err(error)) => Err(TransportError::Io(error.into())),
+        };
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+impl<R> StdioTransport<R, std::process::ChildStdin> {
+    /// Attempts one small connection-control write without blocking.
+    ///
+    /// This capability is intentionally available only for the owned,
+    /// unbuffered child-stdin pipe used by the direct MCP client. The encoded
+    /// frame must fit the POSIX minimum atomic pipe-write bound. The descriptor
+    /// is switched to nonblocking mode for exactly one write syscall and then
+    /// restored. A short write, full pipe, flag-restoration failure, or any
+    /// other I/O error latches the transport closed so a caller cannot continue
+    /// after an ambiguous control disposition.
+    ///
+    /// The caller must retain exclusive ownership of the child pipe and must
+    /// not duplicate its descriptor. This operation deliberately performs no
+    /// request-context checkpoint and no potentially blocking flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ControlFrameTooLarge`] when a valid encoded
+    /// message exceeds the atomic control-frame bound, a codec error when the
+    /// message itself cannot be encoded, or an I/O/closed error when the frame
+    /// cannot be committed immediately and completely.
+    pub fn try_send_control_message(
+        &mut self,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportError> {
+        let bytes = match message {
+            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+        };
+        self.try_write_atomic_control(&bytes)
     }
 }
 
@@ -387,7 +612,7 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        self.recv_with_readiness(cx, |_, _| Ok(()))
+        self.recv_with_completion(cx).map(|(message, _)| message)
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -686,13 +911,47 @@ impl TwoPhaseTransport for AsyncStdioTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    struct TestChildGuard {
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(unix)]
+    impl TestChildGuard {
+        fn new(child: std::process::Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().expect("test child already reaped")
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let mut child = self.child.take().expect("test child already reaped");
+            child.wait()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     struct DropAwareWriter {
         dropped: Arc<AtomicBool>,
@@ -825,6 +1084,47 @@ mod tests {
         }
     }
 
+    enum DeterministicReadStep {
+        Bytes(Vec<u8>),
+        Interrupted,
+        Eof,
+    }
+
+    struct DeterministicInterruptedReader {
+        steps: VecDeque<DeterministicReadStep>,
+        cancel_on_interrupt: Option<Cx>,
+    }
+
+    impl Read for DeterministicInterruptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(step) = self.steps.pop_front() else {
+                return Ok(0);
+            };
+            match step {
+                DeterministicReadStep::Bytes(mut bytes) => {
+                    let read = bytes.len().min(buffer.len());
+                    buffer[..read].copy_from_slice(&bytes[..read]);
+                    if read < bytes.len() {
+                        let remaining = bytes.split_off(read);
+                        self.steps
+                            .push_front(DeterministicReadStep::Bytes(remaining));
+                    }
+                    Ok(read)
+                }
+                DeterministicReadStep::Interrupted => {
+                    if let Some(cx) = &self.cancel_on_interrupt {
+                        cx.set_cancel_requested(true);
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "deterministic transient fill interruption",
+                    ))
+                }
+                DeterministicReadStep::Eof => Ok(0),
+            }
+        }
+    }
+
     #[test]
     fn test_send_receive_roundtrip() {
         // Create a transport with a buffer as both reader and writer
@@ -866,6 +1166,51 @@ mod tests {
         let cx = Cx::for_testing();
         let result = transport.recv(&cx);
         assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn reality_check_regression_stdio_retries_interrupted_fill_without_losing_prefix() {
+        let reader = DeterministicInterruptedReader {
+            steps: VecDeque::from([
+                DeterministicReadStep::Bytes(br#"{"jsonrpc":"2.0","meth"#.to_vec()),
+                DeterministicReadStep::Interrupted,
+                DeterministicReadStep::Bytes(b"od\":\"eintr\",\"id\":1}\n".to_vec()),
+                DeterministicReadStep::Eof,
+            ]),
+            cancel_on_interrupt: None,
+        };
+        let mut transport = StdioTransport::new(reader, Vec::new());
+
+        let message = transport
+            .recv(&Cx::for_testing())
+            .expect("a transient fill interruption must preserve the frame prefix");
+
+        assert!(matches!(
+            message,
+            JsonRpcMessage::Request(ref request) if request.method == "eintr"
+        ));
+        assert!(!transport.closed);
+    }
+
+    #[test]
+    fn reality_check_regression_stdio_checks_context_before_interrupted_retry() {
+        let cx = Cx::for_testing();
+        let reader = DeterministicInterruptedReader {
+            steps: VecDeque::from([
+                DeterministicReadStep::Bytes(br#"{"jsonrpc":"2.0","meth"#.to_vec()),
+                DeterministicReadStep::Interrupted,
+                DeterministicReadStep::Bytes(b"od\":\"must-not-run\",\"id\":1}\n".to_vec()),
+            ]),
+            cancel_on_interrupt: Some(cx.clone()),
+        };
+        let mut transport = StdioTransport::new(reader, Vec::new());
+
+        assert!(matches!(
+            transport.recv(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(transport.closed);
+        assert!(transport.line_buffer.is_empty());
     }
 
     #[test]
@@ -1025,10 +1370,57 @@ mod tests {
 
         assert!(matches!(
             transport.recv_until(&cx, Some(deadline)),
-            Err(TransportError::Timeout)
+            Err(TransportError::ReceiveDeadlineExceeded)
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!transport.closed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reality_check_regression_internal_stop_wakes_masked_silent_stdio_receive() {
+        let (_silent_peer, reader) = UnixStream::pair().expect("create socket pair");
+        let mut transport = StdioTransport::new(reader, Vec::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            stop_for_thread.store(true, Ordering::Release);
+        });
+        let cx = Cx::for_testing();
+        let started = Instant::now();
+
+        let result = cx
+            .masked(|| transport.recv_until_or_stopped(&cx, None, || stop.load(Ordering::Acquire)));
+        trigger.join().expect("stop trigger must not panic");
+
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(transport.closed);
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reality_check_regression_internal_stop_wins_concurrent_eof() {
+        let (peer, reader) = UnixStream::pair().expect("create socket pair");
+        drop(peer);
+        let mut transport = StdioTransport::new(reader, Vec::new());
+        let cx = Cx::for_testing();
+        let checks = std::cell::Cell::new(0_u8);
+
+        let result = transport.recv_until_or_stopped(&cx, None, || {
+            let next = checks.get().saturating_add(1);
+            checks.set(next);
+            // The readiness path checks before polling and after the EOF/HUP
+            // readiness event. Turn the latch on only for the final check
+            // after `recv_with_readiness` has classified the empty read.
+            next >= 3
+        });
+
+        assert!(matches!(result, Err(TransportError::Cancelled)));
+        assert!(checks.get() >= 3);
+        assert!(transport.closed);
     }
 
     #[cfg(unix)]
@@ -1046,7 +1438,7 @@ mod tests {
 
         assert!(matches!(
             transport.recv_until(&cx, Some(deadline)),
-            Err(TransportError::Timeout)
+            Err(TransportError::ReceiveDeadlineExceeded)
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(transport.closed);
@@ -1094,7 +1486,7 @@ mod tests {
 
         assert!(matches!(
             transport.recv_until(&Cx::for_testing(), Some(deadline)),
-            Err(TransportError::Timeout)
+            Err(TransportError::ReceiveDeadlineExceeded)
         ));
         assert!(transport.closed);
         assert!(transport.line_buffer.is_empty());
@@ -1102,6 +1494,176 @@ mod tests {
             transport.recv_until(&Cx::for_testing(), None),
             Err(TransportError::Closed)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_until_with_completion_preserves_a_complete_late_frame() {
+        let (mut peer, reader) = UnixStream::pair().expect("create socket pair");
+        peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"slow\",\"id\":1}\n")
+            .expect("write complete frame");
+        peer.flush().expect("flush complete frame");
+
+        let reader = SlowReadyReader {
+            inner: reader,
+            delay: Duration::from_millis(200),
+        };
+        let mut transport = StdioTransport::new(reader, Vec::new());
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        let (message, completed_at) = transport
+            .recv_until_with_completion(&Cx::for_testing(), Some(deadline))
+            .expect("a complete frame remains available to its policy owner");
+
+        assert!(completed_at >= deadline);
+        assert!(!transport.is_closed());
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "slow");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_control_send_commits_one_complete_frame() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "IFS= read -r line; printf '%s\\n' \"$line\""])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn child-pipe reader"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let peer = child.child_mut().stdout.take().expect("child stdout");
+        let mut transport = StdioTransport::new(Cursor::new(Vec::<u8>::new()), writer);
+        let request = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 7})),
+        );
+
+        transport
+            .try_send_control_message(&JsonRpcMessage::Request(request))
+            .expect("small control frame must commit immediately");
+
+        let mut peer_transport = StdioTransport::new(peer, Vec::new());
+        let decoded = peer_transport
+            .recv_until(
+                &Cx::for_testing(),
+                Some(Instant::now() + Duration::from_secs(2)),
+            )
+            .expect("read control frame before the bounded test deadline");
+        let JsonRpcMessage::Request(decoded) = decoded else {
+            panic!("expected cancellation request");
+        };
+        assert_eq!(decoded.method, "notifications/cancelled");
+        assert_eq!(decoded.id, None);
+        assert!(!transport.is_closed());
+        assert!(child.wait().expect("reap child-pipe reader").success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_control_capacity_accepts_512_and_rejects_513_without_closing() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "exec sleep 60"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn bounded control-capacity peer"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let mut transport = StdioTransport::new(Cursor::new(Vec::<u8>::new()), writer);
+
+        transport
+            .try_write_atomic_control(&[b'x'; STDIO_ATOMIC_CONTROL_FRAME_MAX])
+            .expect("the exact POSIX minimum atomic bound must be admitted");
+        assert!(!transport.is_closed());
+
+        let error = transport
+            .try_write_atomic_control(&[b'x'; STDIO_ATOMIC_CONTROL_FRAME_MAX + 1])
+            .expect_err("one byte above atomic capacity must be rejected before I/O");
+        assert!(matches!(
+            error,
+            TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512
+            }
+        ));
+        assert!(
+            !transport.is_closed(),
+            "a pre-commit capacity rejection is not an ambiguous pipe failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoded_oversized_control_reports_capacity_not_codec_failure() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "exec sleep 60"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn bounded oversized-control peer"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let mut transport = StdioTransport::new(Cursor::new(Vec::<u8>::new()), writer);
+        let request = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": 7,
+                "reason": "x".repeat(STDIO_ATOMIC_CONTROL_FRAME_MAX)
+            })),
+        );
+
+        let error = transport
+            .try_send_control_message(&JsonRpcMessage::Request(request))
+            .expect_err("valid JSON-RPC can exceed the atomic control capacity");
+        assert!(matches!(
+            error,
+            TransportError::ControlFrameTooLarge {
+                size,
+                max: STDIO_ATOMIC_CONTROL_FRAME_MAX
+            } if size > STDIO_ATOMIC_CONTROL_FRAME_MAX
+        ));
+        assert!(!transport.is_closed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_control_send_fails_boundedly_when_peer_does_not_read() {
+        let mut child = TestChildGuard::new(
+            Command::new("sh")
+                .args(["-c", "exec sleep 60"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn non-reading child"),
+        );
+        let writer = child.child_mut().stdin.take().expect("child stdin");
+        let mut transport = StdioTransport::new(Cursor::new(Vec::<u8>::new()), writer);
+        let request = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 7})),
+        );
+        let message = JsonRpcMessage::Request(request);
+
+        let error = (0..100_000)
+            .find_map(|_| transport.try_send_control_message(&message).err())
+            .expect("a non-reading peer must eventually exhaust finite pipe capacity");
+
+        let TransportError::Io(error) = error else {
+            panic!("full nonblocking pipe must report an I/O readiness error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(matches!(child.child_mut().try_wait(), Ok(None)));
+        assert!(transport.is_closed());
     }
 
     #[test]

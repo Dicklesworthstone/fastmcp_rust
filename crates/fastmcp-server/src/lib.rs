@@ -156,6 +156,11 @@ const RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE: &str = "Resource subscription capa
 const MAX_DISPATCH_QUEUE_DEPTH: usize = 64;
 const MAX_DISPATCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exhausted";
+const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static INSTALL_EXTENSION_PANIC_HOOK: Once = Once::new();
 #[cfg(test)]
 static REDACTED_EXTENSION_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -403,16 +408,14 @@ impl DispatchQueueState {
 struct DispatchWorkerFailureLatch {
     failed: Arc<AtomicBool>,
     queue: Arc<DispatchQueueState>,
-    cx: Cx,
     armed: bool,
 }
 
 impl DispatchWorkerFailureLatch {
-    fn new(failed: Arc<AtomicBool>, queue: Arc<DispatchQueueState>, cx: Cx) -> Self {
+    fn new(failed: Arc<AtomicBool>, queue: Arc<DispatchQueueState>) -> Self {
         Self {
             failed,
             queue,
-            cx,
             armed: true,
         }
     }
@@ -429,7 +432,16 @@ impl Drop for DispatchWorkerFailureLatch {
         }
         self.failed.store(true, Ordering::Release);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.queue.stop()));
-        self.cx.set_cancel_requested(true);
+    }
+}
+
+struct DispatchWorkerCompletionSignal(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for DispatchWorkerCompletionSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -523,11 +535,12 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
 use fastmcp_transport::sse::SseServerTransport;
 use fastmcp_transport::websocket::WsTransport;
 use fastmcp_transport::{AsyncStdout, Codec, StdioTransport, Transport, TransportError};
-use log::{Level, LevelFilter};
+#[cfg(test)]
+use log::Level;
+use log::LevelFilter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReceiveErrorDisposition {
-    Retry,
     ReplyWithParseError,
     ReplyWithInvalidRequest(Option<RequestId>),
     Terminate,
@@ -535,8 +548,16 @@ enum ReceiveErrorDisposition {
 
 fn classify_receive_error(error: &TransportError) -> ReceiveErrorDisposition {
     match error {
-        // A timeout does not consume or corrupt a message boundary.
-        TransportError::Timeout => ReceiveErrorDisposition::Retry,
+        // A transport timeout does not prove that the byte stream is still at
+        // a message boundary. Some receive paths report it after consuming a
+        // partial or complete frame, while a context deadline remains
+        // exhausted even when no bytes were consumed. Retrying is therefore
+        // neither framing-safe nor capable of making progress in general.
+        TransportError::Timeout => ReceiveErrorDisposition::Terminate,
+        // An explicit bounded-receive deadline may have interrupted a partial
+        // frame. This server dispatcher does not own the transport-specific
+        // closed-state proof needed to retry it safely.
+        TransportError::ReceiveDeadlineExceeded => ReceiveErrorDisposition::Terminate,
         // JSON decoding begins only after a transport has isolated one
         // complete message. Reply with the fixed uncorrelated JSON-RPC error,
         // then admit the next complete message.
@@ -561,10 +582,81 @@ fn classify_receive_error(error: &TransportError) -> ReceiveErrorDisposition {
         // I/O errors include HTTP/WebSocket framing and protocol violations.
         // Continuing on the same byte stream could reinterpret attacker-owned
         // suffix bytes after the parser has lost synchronization.
-        TransportError::Io(_) | TransportError::Closed | TransportError::Cancelled => {
-            ReceiveErrorDisposition::Terminate
-        }
+        TransportError::Io(_)
+        | TransportError::Closed
+        | TransportError::ControlFrameTooLarge { .. }
+        | TransportError::Cancelled => ReceiveErrorDisposition::Terminate,
     }
+}
+
+fn transport_run_error(stage: &'static str, error: &TransportError) -> McpError {
+    let kind = match error {
+        TransportError::Io(_) => "io",
+        TransportError::Closed => "closed",
+        TransportError::Codec(_) => "codec",
+        TransportError::Timeout => "timeout",
+        TransportError::ReceiveDeadlineExceeded => "receive_deadline_exceeded",
+        TransportError::ControlFrameTooLarge { .. } => "control_frame_too_large",
+        TransportError::Cancelled => "cancelled",
+    };
+    McpError::with_data(
+        McpErrorCode::InternalError,
+        format!("Server transport failed during {stage}"),
+        serde_json::json!({
+            "stage": stage,
+            "kind": kind,
+        }),
+    )
+}
+
+fn returning_send_result(error: &TransportError) -> McpResult<()> {
+    if error.is_cancelled() {
+        Ok(())
+    } else {
+        Err(transport_run_error("send", error))
+    }
+}
+
+fn server_run_error(stage: &'static str, kind: &'static str, message: &'static str) -> McpError {
+    McpError::with_data(
+        McpErrorCode::InternalError,
+        message,
+        serde_json::json!({
+            "stage": stage,
+            "kind": kind,
+        }),
+    )
+}
+
+fn returning_send_result_with_connection_failure(
+    error: &TransportError,
+    connection_failure: &Option<Arc<AtomicBool>>,
+) -> McpResult<()> {
+    if connection_failure
+        .as_ref()
+        .is_some_and(|failed| failed.load(Ordering::Acquire))
+    {
+        Err(server_run_error(
+            "notification",
+            "send_failure",
+            "Server notification send failed",
+        ))
+    } else {
+        returning_send_result(error)
+    }
+}
+
+fn combined_run_and_close_error(run_error: McpError, close_error: McpError) -> McpError {
+    McpError::with_data(
+        McpErrorCode::InternalError,
+        "Server transport run and close both failed",
+        serde_json::json!({
+            "stage": "run_and_close",
+            "kind": "multiple_failures",
+            "run": run_error,
+            "close": close_error,
+        }),
+    )
 }
 
 fn send_uncorrelated_parse_error<S>(send: &Arc<Mutex<S>>, cx: &Cx) -> Result<(), TransportError>
@@ -1229,7 +1321,19 @@ impl Server {
 
     /// Runs the server on stdio with a provided Cx.
     ///
-    /// This allows integration with a real asupersync runtime.
+    /// On Unix, the receive pump uses readiness polling so cancellation from a
+    /// failed dispatch worker remains observable while stdin is silent or a
+    /// pipe frame is incomplete. Unix responses use nonblocking writes with a
+    /// bounded commit deadline for ordinary pipes and sockets; regular files
+    /// and some devices may ignore `O_NONBLOCK`. Other targets use the
+    /// sequential server loop: that avoids a worker failing while the receive
+    /// side is blocked, but generic blocking stdin reads and stdout writes
+    /// remain observable only at frame boundaries or I/O completion.
+    ///
+    /// If an arbitrary handler does not quiesce within the bounded worker
+    /// shutdown deadline, the process exits unsuccessfully without running the
+    /// shutdown hook; running a hook concurrently with a live handler would
+    /// violate the hook's quiescence contract.
     pub fn run_stdio_with_cx(self, cx: &Cx) -> ! {
         // Initialize rich logging first, before any log output
         self.init_rich_logging();
@@ -1241,26 +1345,84 @@ impl Server {
         // Create a notification sender that writes to a separate stdout handle.
         // This allows progress notifications to be sent during handler execution
         // while the main transport is blocked on recv().
-        let notification_sender = create_notification_sender();
+        let fatal_notification_output = Arc::new(AtomicBool::new(false));
+        let notification_sender =
+            create_notification_sender(Arc::clone(&fatal_notification_output));
 
-        self.run_loop(
-            cx,
-            move |cx| transport.recv(cx),
-            move |cx, message| {
-                if cx.is_cancel_requested() {
-                    return Err(TransportError::Cancelled);
-                }
-                let bytes = match message {
-                    JsonRpcMessage::Request(request) => codec.encode_request(request)?,
-                    JsonRpcMessage::Response(response) => codec.encode_response(response)?,
-                };
-                stdout.write_all_unchecked(&bytes)?;
-                stdout.flush_unchecked()?;
-                Ok(())
-            },
-            notification_sender,
-            "stdio",
-        )
+        #[cfg(unix)]
+        {
+            let receive_fatal_output = Arc::clone(&fatal_notification_output);
+            let send_fatal_output = Arc::clone(&fatal_notification_output);
+            self.run_loop(
+                cx,
+                move |cx, worker_failed| {
+                    transport.recv_until_or_stopped(cx, None, || {
+                        if receive_fatal_output.load(Ordering::Acquire) {
+                            worker_failed.store(true, Ordering::Release);
+                            true
+                        } else {
+                            worker_failed.load(Ordering::Acquire)
+                        }
+                    })
+                },
+                move |cx, message| {
+                    if send_fatal_output.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                        return Err(TransportError::Cancelled);
+                    }
+                    let bytes = match message {
+                        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+                        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+                    };
+                    stdout.write_all_bounded(&bytes, STDIO_OUTPUT_COMMIT_TIMEOUT)?;
+                    Ok(())
+                },
+                notification_sender,
+                Arc::clone(&fatal_notification_output),
+                "stdio",
+            )
+        }
+
+        #[cfg(not(unix))]
+        {
+            let receive_fatal_output = Arc::clone(&fatal_notification_output);
+            let send_fatal_output = Arc::clone(&fatal_notification_output);
+            self.run_loop_legacy(
+                cx,
+                move |cx| {
+                    if receive_fatal_output.load(Ordering::Acquire) {
+                        return Err(TransportError::Io(std::io::Error::other(
+                            "notification output failed",
+                        )));
+                    }
+                    let result = transport.recv(cx);
+                    if receive_fatal_output.load(Ordering::Acquire) {
+                        // Generic non-Unix reads cannot be interrupted once
+                        // blocked, but the fatal latch must still dominate a
+                        // concurrently completed frame or clean EOF.
+                        Err(TransportError::Io(std::io::Error::other(
+                            "notification output failed",
+                        )))
+                    } else {
+                        result
+                    }
+                },
+                move |cx, message| {
+                    if send_fatal_output.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                        return Err(TransportError::Cancelled);
+                    }
+                    let bytes = match message {
+                        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+                        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+                    };
+                    stdout.write_all_unchecked(&bytes)?;
+                    stdout.flush_unchecked()?;
+                    Ok(())
+                },
+                notification_sender,
+                Some(Arc::clone(&fatal_notification_output)),
+                "stdio",
+            )
+        }
     }
 
     /// Runs the server on a custom transport under one ambient server context.
@@ -1294,7 +1456,12 @@ impl Server {
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
-        let notification_sender = create_transport_notification_sender(shared.clone(), cx.clone());
+        let notification_failure = Arc::new(AtomicBool::new(false));
+        let notification_sender = create_transport_notification_sender(
+            shared.clone(),
+            cx.clone(),
+            Arc::clone(&notification_failure),
+        );
 
         let shared_recv = shared.clone();
         let shared_send = shared;
@@ -1303,49 +1470,86 @@ impl Server {
             move |cx| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
             notification_sender,
+            Some(notification_failure),
             label,
         )
     }
 
-    /// Runs the server on a custom transport and returns when the transport closes or the Cx is cancelled.
+    /// Runs the server on a custom transport until clean closure, cancellation,
+    /// or failure.
     ///
     /// Unlike [`run_transport_with_cx`](Self::run_transport_with_cx), this does not call
     /// `std::process::exit` on shutdown. This is useful for tests and embedding where you need
-    /// the server loop to be joinable.
-    pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T)
+    /// the server loop to be joinable. Clean EOF and cancellation return
+    /// `Ok(())`; startup, protocol, fatal receive, and fatal send failures
+    /// return an error.
+    /// Transport failures carry fixed `stage` and `kind` fields in the error
+    /// data without copying peer-controlled I/O or codec text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when startup fails, a fatal receive/protocol failure is
+    /// observed, the server cannot send a required response, or transport
+    /// close fails. A simultaneous run and close failure retains both
+    /// structured errors under `data.run` and `data.close`.
+    pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
     where
         T: Transport + Send + 'static,
     {
         self.init_rich_logging();
 
         let shared = SharedTransport::new(transport);
-        let notification_sender = create_transport_notification_sender(shared.clone(), cx.clone());
+        let notification_failure = Arc::new(AtomicBool::new(false));
+        let notification_sender = create_transport_notification_sender(
+            shared.clone(),
+            cx.clone(),
+            Arc::clone(&notification_failure),
+        );
 
         let shared_recv = shared.clone();
-        let shared_send = shared;
-        self.run_loop_returning_legacy(
+        let shared_send = shared.clone();
+        let run_result = self.run_loop_returning_legacy(
             cx,
             move |cx| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
             notification_sender,
+            Some(notification_failure),
             "custom",
         );
+        let close_result = shared
+            .close()
+            .map_err(|error| transport_run_error("close", &error));
+        match (run_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(run_error), Err(close_error)) => {
+                Err(combined_run_and_close_error(run_error, close_error))
+            }
+        }
     }
 
-    /// Runs the server on a custom transport and returns when the transport closes.
+    /// Runs the server on a custom transport until clean closure, cancellation,
+    /// or failure.
     ///
     /// This uses one ambient server [`Cx`], but unlike
     /// [`run_transport`](Self::run_transport) it does not exit the process.
     /// Independently owned per-request child contexts are not yet provided by
-    /// this legacy loop.
-    pub fn run_transport_returning<T>(self, transport: T)
+    /// this legacy loop. Clean EOF and cancellation return `Ok(())`; failures
+    /// are returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when startup fails, a fatal receive/protocol failure is
+    /// observed, the server cannot send a required response, or transport
+    /// close fails.
+    pub fn run_transport_returning<T>(self, transport: T) -> McpResult<()>
     where
         T: Transport + Send + 'static,
     {
         block_on(async move {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_transport_returning_with_cx(&cx, transport);
-        });
+            self.run_transport_returning_with_cx(&cx, transport)
+        })
     }
 
     /// Runs the server using SSE transport with a testing Cx.
@@ -1546,7 +1750,7 @@ impl Server {
 
         // Accept loop — each connection is handled in its own thread.
         loop {
-            if cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() {
                 info!(target: targets::SERVER, "Cancellation requested, shutting down HTTP server");
                 if returning {
                     server.graceful_shutdown_returning();
@@ -1886,42 +2090,103 @@ impl Server {
         recv: R,
         send: S,
         notification_sender: NotificationSender,
+        connection_failure: Arc<AtomicBool>,
         transport_label: &'static str,
     ) -> !
     where
-        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        let exit_code = self.run_loop_pump(cx, recv, send, notification_sender, transport_label);
+        let exit_code = self.run_loop_pump_with_policy(
+            cx,
+            recv,
+            send,
+            notification_sender,
+            transport_label,
+            true,
+            Some(connection_failure),
+        );
         std::process::exit(exit_code)
     }
 
     /// Returning counterpart of [`Self::run_loop`].
+    ///
+    /// Clean closure or cancellation returns `Ok(())`; any failing pump status
+    /// is preserved as a local server-loop error. A receive implementation
+    /// that can block must include the supplied worker-failure flag in its
+    /// readiness/stop predicate. The legacy session currently shares the
+    /// ambient `Cx` with request work, so shutdown cancellation is not isolated
+    /// from that caller context.
+    /// Unlike the process-exiting stdio entry point, this returning helper
+    /// never detaches a non-quiescent handler: after logging the bounded
+    /// shutdown deadline it continues waiting before running lifecycle hooks.
     fn run_loop_returning<R, S>(
-        self,
-        cx: &Cx,
-        recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        transport_label: &'static str,
-    ) where
-        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        let _ = self.run_loop_pump(cx, recv, send, notification_sender, transport_label);
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn run_loop_pump<R, S>(
         self,
         cx: &Cx,
         mut recv: R,
         send: S,
         notification_sender: NotificationSender,
         transport_label: &'static str,
+    ) -> McpResult<()>
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        match self.run_loop_pump_with_policy(
+            cx,
+            move |cx, worker_failed| recv(cx, worker_failed),
+            send,
+            notification_sender,
+            transport_label,
+            false,
+            None,
+        ) {
+            0 => Ok(()),
+            _ => Err(server_run_error(
+                "transport",
+                "pump_failure",
+                "Server transport loop failed",
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_loop_pump<R, S>(
+        self,
+        cx: &Cx,
+        recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        transport_label: &'static str,
     ) -> i32
     where
-        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
+        self.run_loop_pump_with_policy(
+            cx,
+            recv,
+            send,
+            notification_sender,
+            transport_label,
+            true,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_loop_pump_with_policy<R, S>(
+        self,
+        cx: &Cx,
+        mut recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        transport_label: &'static str,
+        detach_on_worker_timeout: bool,
+        connection_failure: Option<Arc<AtomicBool>>,
+    ) -> i32
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         if let Some(ref stats) = self.stats {
@@ -1968,22 +2233,25 @@ impl Server {
         let worker_cx = cx.clone();
         let worker_notification_sender = Arc::clone(&notification_sender);
         let worker_renderer = traffic_renderer.clone();
+        let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
+            let _completion = DispatchWorkerCompletionSignal(Some(worker_completion_sender));
             let mut failure_latch = DispatchWorkerFailureLatch::new(
                 Arc::clone(&worker_failed_flag),
                 Arc::clone(&worker_queue_state),
-                worker_cx.clone(),
             );
-            let mut returned_failure = false;
             let mut session = session;
+            let mut clean_exit = false;
             loop {
                 if worker_queue_state.is_stopping() {
+                    clean_exit = true;
                     break;
                 }
                 let queued_request = match dispatch_receiver.try_recv() {
                     Ok(request) => request,
                     Err(asupersync_mpsc::RecvError::Empty) => {
                         if worker_queue_state.is_stopping() {
+                            clean_exit = true;
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(1));
@@ -1992,7 +2260,10 @@ impl Server {
                     Err(
                         asupersync_mpsc::RecvError::Disconnected
                         | asupersync_mpsc::RecvError::Cancelled,
-                    ) => break,
+                    ) => {
+                        clean_exit = worker_queue_state.is_stopping();
+                        break;
+                    }
                 };
                 worker_queue_state.release_queued_bytes(queued_request.serialized_bytes);
                 let request = queued_request.request;
@@ -2001,12 +2272,13 @@ impl Server {
                     if let Some(id) = request.id.as_ref() {
                         worker_queue_state.discard(id);
                     }
+                    clean_exit = true;
                     break;
                 }
 
                 let start_time = Instant::now();
                 if let Some(renderer) = &worker_renderer {
-                    renderer.render_request(&request, &self.console);
+                    renderer.render_request(&request, &worker_server.console);
                 }
 
                 let request_id = request.id.clone();
@@ -2039,7 +2311,7 @@ impl Server {
                 drop(send_guard);
                 if let Ok(response) = &send_result {
                     if let Some(renderer) = &worker_renderer {
-                        renderer.render_response(response, Some(duration), &self.console);
+                        renderer.render_response(response, Some(duration), &worker_server.console);
                     }
                     if let Some(ref stats) = worker_server.stats
                         && let Ok(json) = serde_json::to_string(response)
@@ -2050,31 +2322,41 @@ impl Server {
                 if let Some(id) = request_id.as_ref() {
                     worker_queue_state.discard(id);
                 }
-                if send_result.is_err() {
-                    returned_failure = true;
+                if let Err(send_error) = &send_result {
+                    // The send callback already maps a pre-commit context stop
+                    // to `Cancelled`. Once it reports I/O or codec failure,
+                    // that concrete output failure wins over any concurrent
+                    // EOF, queue stop, or ambient cancellation.
+                    if send_error.is_cancelled() {
+                        worker_queue_state.stop();
+                        clean_exit = true;
+                    }
                     break;
                 }
             }
-            if !returned_failure && worker_queue_state.is_stopping() {
+            if clean_exit {
                 failure_latch.disarm();
             }
         });
 
         let mut exit_code = 0;
         loop {
-            if worker_failed.load(Ordering::Acquire) {
+            if worker_failed.load(Ordering::Acquire)
+                || connection_failure
+                    .as_ref()
+                    .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
                 exit_code = 1;
                 break;
             }
-            if cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() {
                 break;
             }
 
-            let message = match recv(cx) {
+            let message = match recv(cx, &worker_failed) {
                 Ok(message) => message,
                 Err(TransportError::Closed | TransportError::Cancelled) => break,
                 Err(error) => match classify_receive_error(&error) {
-                    ReceiveErrorDisposition::Retry => continue,
                     ReceiveErrorDisposition::ReplyWithParseError => {
                         if send_uncorrelated_parse_error(&send, cx).is_err() {
                             exit_code = 1;
@@ -2095,6 +2377,15 @@ impl Server {
                     }
                 },
             };
+
+            // The receive implementation rechecks its stop predicate after a
+            // completed frame, but a worker failure can still race the final
+            // closure return. Never admit or mutate state for a frame after a
+            // connection-fatal worker exit has become observable.
+            if worker_failed.load(Ordering::Acquire) {
+                exit_code = 1;
+                break;
+            }
 
             // Account at the receive boundary so queued, rejected, cancelled,
             // and bidirectional-response frames are not omitted from traffic
@@ -2265,13 +2556,66 @@ impl Server {
         drop(dispatch_sender);
         server.cancel_active_requests(CancelKind::Shutdown, false);
         pending_requests.cancel_all();
-        if worker.join().is_err() {
+        let worker_quiesced = match worker_completion_receiver
+            .recv_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+        {
+            Ok(()) => {
+                if worker.join().is_err() {
+                    exit_code = 1;
+                }
+                true
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if worker.join().is_err() {
+                    exit_code = 1;
+                }
+                true
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                error!(
+                    target: targets::SERVER,
+                    "Dispatch worker did not stop within the bounded shutdown deadline"
+                );
+                exit_code = 1;
+                if detach_on_worker_timeout {
+                    // `run_stdio_with_cx` exits the process immediately
+                    // after this return. Rust cannot safely preempt an
+                    // arbitrary blocking handler; detaching is the only
+                    // bounded process-exit fallback here.
+                    drop(worker);
+                    false
+                } else {
+                    error!(
+                        target: targets::SERVER,
+                        "Returning server pump is waiting for dispatch-worker quiescence before running shutdown hooks"
+                    );
+                    let _ = worker_completion_receiver.recv();
+                    if worker.join().is_err() {
+                        exit_code = 1;
+                    }
+                    true
+                }
+            }
+        };
+        // Recheck all producer-owned failure latches after the dispatch worker
+        // has quiesced. This closes the final-load race where notification
+        // output fails immediately after recv classifies concurrent EOF as a
+        // clean close.
+        if worker_failed.load(Ordering::Acquire)
+            || connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+        {
             exit_code = 1;
         }
-        if worker_failed.load(Ordering::Acquire) {
-            exit_code = 1;
+        if worker_quiesced {
+            server.run_shutdown_hook();
+        } else {
+            error!(
+                target: targets::SERVER,
+                "Skipping shutdown hook because dispatch-worker quiescence was not established"
+            );
         }
-        server.run_shutdown_hook();
         if let Some(ref stats) = server.stats {
             stats.connection_closed();
         }
@@ -2285,6 +2629,7 @@ impl Server {
         mut recv: R,
         send: S,
         notification_sender: NotificationSender,
+        connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
     ) -> !
     where
@@ -2324,14 +2669,29 @@ impl Server {
 
         // Main request loop
         loop {
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
+                self.graceful_shutdown(1);
+            }
             // Check for cancellation
-            if cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() {
                 info!(target: targets::SERVER, "Cancellation requested, shutting down");
                 self.graceful_shutdown(0);
             }
 
             // Receive next message
-            let message = match recv(cx) {
+            let receive_result = recv(cx);
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
+                self.graceful_shutdown(1);
+            }
+            let message = match receive_result {
                 Ok(msg) => msg,
                 Err(TransportError::Closed) => {
                     // Clean shutdown - track connection close
@@ -2342,10 +2702,6 @@ impl Server {
                     self.graceful_shutdown(0);
                 }
                 Err(error) => match classify_receive_error(&error) {
-                    ReceiveErrorDisposition::Retry => {
-                        debug!(target: targets::TRANSPORT, "Transport receive timed out; retrying");
-                        continue;
-                    }
                     ReceiveErrorDisposition::ReplyWithParseError => {
                         error!(target: targets::TRANSPORT, "Rejected malformed transport message");
                         if send_uncorrelated_parse_error(&send, cx).is_err() {
@@ -2424,6 +2780,14 @@ impl Server {
                     continue;
                 }
             };
+
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
+                self.graceful_shutdown(1);
+            }
 
             let duration = start_time.elapsed();
 
@@ -2463,7 +2827,8 @@ impl Server {
     /// Shared server loop for embedding/testing, returning on shutdown instead of exiting.
     ///
     /// This is intentionally separate from [`run_loop`](Self::run_loop) because the primary server
-    /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases.
+    /// entrypoints use `std::process::exit` on shutdown for subprocess use-cases. Clean EOF and
+    /// cancellation return success; startup, protocol, and fatal transport failures return errors.
     #[allow(clippy::too_many_lines)]
     fn run_loop_returning_legacy<R, S>(
         self,
@@ -2471,8 +2836,10 @@ impl Server {
         mut recv: R,
         send: S,
         notification_sender: NotificationSender,
+        connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
-    ) where
+    ) -> McpResult<()>
+    where
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
@@ -2502,7 +2869,11 @@ impl Server {
         if !self.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed, stopping");
             self.graceful_shutdown_returning();
-            return;
+            return Err(server_run_error(
+                "startup",
+                "hook_failure",
+                "Server startup hook failed",
+            ));
         }
 
         // Create traffic renderer if enabled
@@ -2510,52 +2881,77 @@ impl Server {
 
         // Main request loop
         loop {
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                self.graceful_shutdown_returning();
+                return Err(server_run_error(
+                    "notification",
+                    "send_failure",
+                    "Server notification send failed",
+                ));
+            }
             // Check for cancellation
-            if cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() {
                 info!(target: targets::SERVER, "Cancellation requested, stopping");
                 self.graceful_shutdown_returning();
-                return;
+                return Ok(());
             }
 
             // Receive next message
-            let message = match recv(cx) {
+            let receive_result = recv(cx);
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                self.graceful_shutdown_returning();
+                return Err(server_run_error(
+                    "notification",
+                    "send_failure",
+                    "Server notification send failed",
+                ));
+            }
+            let message = match receive_result {
                 Ok(msg) => msg,
                 Err(TransportError::Closed) => {
                     self.graceful_shutdown_returning();
-                    return;
+                    return Ok(());
                 }
                 Err(TransportError::Cancelled) => {
                     info!(target: targets::SERVER, "Transport cancelled");
                     self.graceful_shutdown_returning();
-                    return;
+                    return Ok(());
                 }
                 Err(error) => match classify_receive_error(&error) {
-                    ReceiveErrorDisposition::Retry => {
-                        debug!(target: targets::TRANSPORT, "Transport receive timed out; retrying");
-                        continue;
-                    }
                     ReceiveErrorDisposition::ReplyWithParseError => {
                         error!(target: targets::TRANSPORT, "Rejected malformed transport message");
-                        if send_uncorrelated_parse_error(&send, cx).is_err() {
+                        if let Err(send_error) = send_uncorrelated_parse_error(&send, cx) {
                             error!(target: targets::TRANSPORT, "Failed to send parse-error response; terminating transport");
                             self.graceful_shutdown_returning();
-                            return;
+                            return returning_send_result_with_connection_failure(
+                                &send_error,
+                                &connection_failure,
+                            );
                         }
                         continue;
                     }
                     ReceiveErrorDisposition::ReplyWithInvalidRequest(request_id) => {
                         error!(target: targets::TRANSPORT, "Rejected invalid JSON-RPC request");
-                        if send_invalid_request(&send, cx, request_id).is_err() {
+                        if let Err(send_error) = send_invalid_request(&send, cx, request_id) {
                             error!(target: targets::TRANSPORT, "Failed to send invalid-request response; terminating transport");
                             self.graceful_shutdown_returning();
-                            return;
+                            return returning_send_result_with_connection_failure(
+                                &send_error,
+                                &connection_failure,
+                            );
                         }
                         continue;
                     }
                     ReceiveErrorDisposition::Terminate => {
                         error!(target: targets::TRANSPORT, "Fatal transport receive failure; terminating transport");
                         self.graceful_shutdown_returning();
-                        return;
+                        return Err(transport_run_error("receive", &error));
                     }
                 },
             };
@@ -2573,9 +2969,12 @@ impl Server {
             let response_opt = match message {
                 JsonRpcMessage::Request(request) => {
                     if request.validate().is_err() {
-                        if send_invalid_request(&send, cx, request.id).is_err() {
+                        if let Err(send_error) = send_invalid_request(&send, cx, request.id) {
                             self.graceful_shutdown_returning();
-                            return;
+                            return returning_send_result_with_connection_failure(
+                                &send_error,
+                                &connection_failure,
+                            );
                         }
                         continue;
                     }
@@ -2600,7 +2999,11 @@ impl Server {
                 JsonRpcMessage::Response(response) => {
                     if response.validate().is_err() {
                         self.graceful_shutdown_returning();
-                        return;
+                        return Err(server_run_error(
+                            "receive",
+                            "invalid_response",
+                            "Received invalid JSON-RPC response",
+                        ));
                     }
                     // Route response to pending server-initiated request (bidirectional)
                     if pending_requests.route_response(&response) {
@@ -2617,6 +3020,18 @@ impl Server {
                     continue;
                 }
             };
+
+            if connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                self.graceful_shutdown_returning();
+                return Err(server_run_error(
+                    "notification",
+                    "send_failure",
+                    "Server notification send failed",
+                ));
+            }
 
             let duration = start_time.elapsed();
 
@@ -2645,10 +3060,13 @@ impl Server {
                         stats.add_bytes_sent(json.len() as u64 + 1);
                     }
                 }
-                if send_result.is_err() {
+                if let Err(send_error) = send_result {
                     error!(target: targets::TRANSPORT, "Failed to send response; terminating transport");
                     self.graceful_shutdown_returning();
-                    return;
+                    return returning_send_result_with_connection_failure(
+                        &send_error,
+                        &connection_failure,
+                    );
                 }
             }
         }
@@ -4919,6 +5337,11 @@ impl<T: Transport> SharedTransport<T> {
         };
         guard.send(cx, message)
     }
+
+    fn close(&self) -> Result<(), TransportError> {
+        let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
+        guard.close()
+    }
 }
 
 fn transport_lock_error() -> TransportError {
@@ -4928,6 +5351,7 @@ fn transport_lock_error() -> TransportError {
 fn create_transport_notification_sender<T>(
     transport: SharedTransport<T>,
     cx: Cx,
+    failure: Arc<AtomicBool>,
 ) -> NotificationSender
 where
     T: Transport + Send + 'static,
@@ -4935,6 +5359,9 @@ where
     Arc::new(move |request: JsonRpcRequest| {
         let message = JsonRpcMessage::Request(request);
         if let Err(e) = transport.send(&cx, &message) {
+            if !e.is_cancelled() {
+                failure.store(true, Ordering::Release);
+            }
             log::error!(
                 target: targets::TRANSPORT,
                 "Failed to send notification: {}",
@@ -4952,7 +5379,7 @@ where
 ///
 /// The sender uses NDJSON format (newline-delimited JSON) to match the
 /// standard MCP transport format.
-fn create_notification_sender() -> NotificationSender {
+fn create_notification_sender(fatal_output: Arc<AtomicBool>) -> NotificationSender {
     use std::sync::Mutex;
 
     // Use AsyncStdout so notifications share the global stdout lock used by
@@ -4965,19 +5392,29 @@ fn create_notification_sender() -> NotificationSender {
             Ok(b) => b,
             Err(e) => {
                 log::error!(target: targets::SERVER, "Failed to encode notification: {}", e);
+                fatal_output.store(true, Ordering::Release);
                 return;
             }
         };
 
-        if let Ok(mut stdout) = stdout.lock() {
-            if let Err(e) = stdout.write_all_unchecked(&bytes) {
-                log::error!(target: targets::TRANSPORT, "Failed to send notification: {}", e);
-            }
-            if let Err(e) = stdout.flush_unchecked() {
-                log::error!(target: targets::TRANSPORT, "Failed to flush notification: {}", e);
-            }
-        } else {
-            log::warn!(target: targets::SERVER, "Failed to acquire stdout lock for notification");
+        let Ok(mut stdout) = stdout.lock() else {
+            log::error!(target: targets::SERVER, "Failed to acquire stdout lock for notification");
+            fatal_output.store(true, Ordering::Release);
+            return;
+        };
+        #[cfg(unix)]
+        let write_result = stdout.write_all_bounded(&bytes, STDIO_OUTPUT_COMMIT_TIMEOUT);
+        #[cfg(not(unix))]
+        let write_result = stdout.write_all_unchecked(&bytes);
+        if let Err(e) = write_result {
+            log::error!(target: targets::TRANSPORT, "Failed to send notification: {}", e);
+            fatal_output.store(true, Ordering::Release);
+            return;
+        }
+        #[cfg(not(unix))]
+        if let Err(e) = stdout.flush_unchecked() {
+            log::error!(target: targets::TRANSPORT, "Failed to flush notification: {}", e);
+            fatal_output.store(true, Ordering::Release);
         }
     })
 }
@@ -7149,29 +7586,42 @@ mod lib_unit_tests {
         }
     }
 
+    fn wait_for_dispatch_worker_failure(worker_failed: &AtomicBool) -> TransportError {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker_failed.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if worker_failed.load(Ordering::Acquire) {
+            TransportError::Cancelled
+        } else {
+            // Let the pump perform its normal stop-and-join cleanup. The
+            // callback-entry assertion then fails the test without detaching
+            // its worker thread through an unwind from inside `recv`.
+            TransportError::Timeout
+        }
+    }
+
     #[test]
     fn dispatch_worker_send_failure_returns_failure_status() {
         let emitted = Arc::new(AtomicBool::new(false));
         let emitted_for_receive = Arc::clone(&emitted);
+        let send_attempted = Arc::new(AtomicBool::new(false));
+        let send_attempted_by_worker = Arc::clone(&send_attempted);
         let cx = Cx::for_testing();
         let exit_code = Server::new("worker-send-failure-test", "1.0.0")
             .build()
             .run_loop_pump(
                 &cx,
-                move |receive_cx| {
+                move |_receive_cx, worker_failed| {
                     if !emitted_for_receive.swap(true, Ordering::AcqRel) {
                         return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
                             "ping", None, 701_i64,
                         )));
                     }
-                    if receive_cx.is_cancel_requested() {
-                        Err(TransportError::Cancelled)
-                    } else {
-                        std::thread::yield_now();
-                        Err(TransportError::Timeout)
-                    }
+                    Err(wait_for_dispatch_worker_failure(worker_failed))
                 },
-                |_send_cx, _message| {
+                move |_send_cx, _message| {
+                    send_attempted_by_worker.store(true, Ordering::Release);
                     Err(TransportError::Io(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "test response send failure",
@@ -7182,31 +7632,76 @@ mod lib_unit_tests {
             );
 
         assert_eq!(exit_code, 1);
+        assert!(send_attempted.load(Ordering::Acquire));
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn reality_check_regression_worker_io_failure_wins_concurrent_clean_eof() {
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_for_receive = Arc::clone(&emitted);
+        let send_entered = Arc::new(AtomicBool::new(false));
+        let send_entered_for_receive = Arc::clone(&send_entered);
+        let send_entered_by_worker = Arc::clone(&send_entered);
+
+        let exit_code = Server::new("worker-send-eof-race-test", "1.0.0")
+            .build()
+            .run_loop_pump(
+                &Cx::for_testing(),
+                move |_receive_cx, _worker_failed| {
+                    if !emitted_for_receive.swap(true, Ordering::AcqRel) {
+                        return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "ping", None, 706_i64,
+                        )));
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !send_entered_for_receive.load(Ordering::Acquire)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TransportError::Closed)
+                },
+                move |send_cx, _message| {
+                    send_entered_by_worker.store(true, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while send_cx.checkpoint().is_ok() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "test response failure after concurrent EOF",
+                    )))
+                },
+                Arc::new(|_| {}),
+                "test",
+            );
+
+        assert!(send_entered.load(Ordering::Acquire));
+        assert_eq!(exit_code, 1);
     }
 
     #[test]
     fn dispatch_worker_panic_trips_failure_latch_and_returns_failure_status() {
         let emitted = Arc::new(AtomicBool::new(false));
         let emitted_for_receive = Arc::clone(&emitted);
+        let send_entered = Arc::new(AtomicBool::new(false));
+        let send_entered_by_worker = Arc::clone(&send_entered);
         let cx = Cx::for_testing();
         let exit_code = Server::new("worker-panic-latch-test", "1.0.0")
             .build()
             .run_loop_pump(
                 &cx,
-                move |receive_cx| {
+                move |_receive_cx, worker_failed| {
                     if !emitted_for_receive.swap(true, Ordering::AcqRel) {
                         return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
                             "ping", None, 702_i64,
                         )));
                     }
-                    if receive_cx.is_cancel_requested() {
-                        Err(TransportError::Cancelled)
-                    } else {
-                        std::thread::yield_now();
-                        Err(TransportError::Timeout)
-                    }
+                    Err(wait_for_dispatch_worker_failure(worker_failed))
                 },
-                |_send_cx, _message| -> Result<(), TransportError> {
+                move |_send_cx, _message| -> Result<(), TransportError> {
+                    send_entered_by_worker.store(true, Ordering::Release);
                     panic!("dispatch worker send callback panic")
                 },
                 Arc::new(|_| {}),
@@ -7214,6 +7709,504 @@ mod lib_unit_tests {
             );
 
         assert_eq!(exit_code, 1);
+        assert!(send_entered.load(Ordering::Acquire));
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn reality_check_regression_dispatch_worker_shutdown_is_bounded() {
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_for_receive = Arc::clone(&emitted);
+        let send_entered = Arc::new(AtomicBool::new(false));
+        let send_entered_for_receive = Arc::clone(&send_entered);
+        let send_entered_by_worker = Arc::clone(&send_entered);
+        let send_finished = Arc::new(AtomicBool::new(false));
+        let send_finished_by_worker = Arc::clone(&send_finished);
+        let release_send = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_send_for_worker = Arc::clone(&release_send);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_observer = Arc::clone(&shutdown_called);
+
+        let exit_code = Server::new("bounded-worker-shutdown-test", "1.0.0")
+            .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+            .build()
+            .run_loop_pump(
+                &Cx::for_testing(),
+                move |_receive_cx, _worker_failed| {
+                    if !emitted_for_receive.swap(true, Ordering::AcqRel) {
+                        return Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "ping", None, 705_i64,
+                        )));
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !send_entered_for_receive.load(Ordering::Acquire)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(TransportError::Closed)
+                },
+                move |_send_cx, _message| {
+                    send_entered_by_worker.store(true, Ordering::Release);
+                    let (release_lock, release_cv) = &*release_send_for_worker;
+                    let release = release_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = release_cv
+                        .wait_timeout_while(release, Duration::from_secs(5), |release| !*release)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    send_finished_by_worker.store(true, Ordering::Release);
+                    Ok(())
+                },
+                Arc::new(|_| {}),
+                "test",
+            );
+
+        let returned_before_send_finished = !send_finished.load(Ordering::Acquire);
+        {
+            let (release_lock, release_cv) = &*release_send;
+            let mut release = release_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *release = true;
+            release_cv.notify_all();
+        }
+        let send_finish_deadline = Instant::now() + Duration::from_secs(2);
+        while !send_finished.load(Ordering::Acquire) && Instant::now() < send_finish_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(exit_code, 1);
+        assert!(send_entered.load(Ordering::Acquire));
+        assert!(!shutdown_called.load(Ordering::Acquire));
+        assert!(
+            returned_before_send_finished,
+            "process-exiting pump must detach instead of awaiting the blocked worker"
+        );
+        assert!(
+            send_finished.load(Ordering::Acquire),
+            "released dispatch worker must finish before the regression test exits"
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_notification_failure_wins_concurrent_clean_eof() {
+        let notification_failure = Arc::new(AtomicBool::new(false));
+        let failure_from_receive = Arc::clone(&notification_failure);
+
+        let exit_code = Server::new("notification-eof-race-test", "1.0.0")
+            .build()
+            .run_loop_pump_with_policy(
+                &Cx::for_testing(),
+                move |_receive_cx, _worker_failed| {
+                    // Model notification output failing immediately after a
+                    // stop-aware receiver's final predicate check but before
+                    // it returns the concurrently observed EOF.
+                    failure_from_receive.store(true, Ordering::Release);
+                    Err(TransportError::Closed)
+                },
+                move |_send_cx, _message| Ok(()),
+                Arc::new(|_| {}),
+                "stdio-test",
+                true,
+                Some(Arc::clone(&notification_failure)),
+            );
+
+        assert!(notification_failure.load(Ordering::Acquire));
+        assert_eq!(exit_code, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reality_check_regression_dispatch_worker_send_failure_wakes_unix_stdio_receive() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut peer, server_stream) =
+            UnixStream::pair().expect("Unix stream fixture must be available");
+        peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":703}\n")
+            .expect("request fixture must reach the server stream");
+        peer.flush().expect("request fixture must be flushed");
+
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let receive_count = Arc::clone(&receive_calls);
+        let receive_count_for_worker = Arc::clone(&receive_calls);
+        let send_attempted = Arc::new(AtomicBool::new(false));
+        let send_attempted_by_worker = Arc::clone(&send_attempted);
+        let mut transport = StdioTransport::new(server_stream, Vec::<u8>::new());
+        let cx = Cx::for_testing();
+        let exit_code = cx.masked(|| {
+            Server::new("unix-stdio-worker-failure-test", "1.0.0")
+                .build()
+                .run_loop_pump(
+                    &cx,
+                    move |receive_cx, worker_failed| {
+                        receive_count.fetch_add(1, Ordering::AcqRel);
+                        transport.recv_until_or_stopped(receive_cx, None, || {
+                            worker_failed.load(Ordering::Acquire)
+                        })
+                    },
+                    move |_send_cx, _message| {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while receive_count_for_worker.load(Ordering::Acquire) < 2
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        send_attempted_by_worker.store(true, Ordering::Release);
+                        Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "test response send failure",
+                        )))
+                    },
+                    Arc::new(|_| {}),
+                    "stdio-test",
+                )
+        });
+
+        assert_eq!(exit_code, 1);
+        assert!(send_attempted.load(Ordering::Acquire));
+        assert_eq!(receive_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReturningProbeReceive {
+        Closed,
+        Cancelled,
+        Timeout,
+        PingThenClosed,
+    }
+
+    struct ReturningProbeTransport {
+        receive: ReturningProbeReceive,
+        fail_send: bool,
+        fail_close: bool,
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    struct CancelledNotificationTransport;
+
+    impl Transport for CancelledNotificationTransport {
+        fn send(&mut self, _cx: &Cx, _message: &JsonRpcMessage) -> Result<(), TransportError> {
+            Err(TransportError::Cancelled)
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            Err(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reality_check_regression_transport_notification_sender_latches_send_failure() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let sender = create_transport_notification_sender(
+            SharedTransport::new(ReturningProbeTransport {
+                receive: ReturningProbeReceive::Closed,
+                fail_send: true,
+                fail_close: false,
+                close_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Cx::for_testing(),
+            Arc::clone(&failure),
+        );
+
+        sender(JsonRpcRequest::notification("notifications/progress", None));
+
+        assert!(failure.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn reality_check_regression_notification_sender_does_not_promote_cancellation() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let sender = create_transport_notification_sender(
+            SharedTransport::new(CancelledNotificationTransport),
+            Cx::for_testing(),
+            Arc::clone(&failure),
+        );
+
+        sender(JsonRpcRequest::notification("notifications/progress", None));
+
+        assert!(!failure.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn reality_check_regression_returning_loop_preserves_notification_failure() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let failure_from_receive = Arc::clone(&failure);
+        let error = Server::new("returning-notification-failure-test", "1.0.0")
+            .build()
+            .run_loop_returning_legacy(
+                &Cx::for_testing(),
+                move |_receive_cx| {
+                    failure_from_receive.store(true, Ordering::Release);
+                    Err(TransportError::Closed)
+                },
+                move |_send_cx, _message| Ok(()),
+                Arc::new(|_| {}),
+                Some(failure),
+                "custom-test",
+            )
+            .expect_err("notification failure must dominate concurrent clean EOF");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("notification")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("send_failure")
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_notification_failure_wins_cancelled_response_send() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let failure_from_send = Arc::clone(&failure);
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_from_receive = Arc::clone(&emitted);
+        let error = Server::new("returning-notification-send-race-test", "1.0.0")
+            .build()
+            .run_loop_returning_legacy(
+                &Cx::for_testing(),
+                move |_receive_cx| {
+                    if emitted_from_receive.swap(true, Ordering::AcqRel) {
+                        Err(TransportError::Closed)
+                    } else {
+                        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "ping", None, 707_i64,
+                        )))
+                    }
+                },
+                move |_send_cx, _message| {
+                    failure_from_send.store(true, Ordering::Release);
+                    Err(TransportError::Cancelled)
+                },
+                Arc::new(|_| {}),
+                Some(failure),
+                "custom-test",
+            )
+            .expect_err("latched notification I/O failure must win cancelled response send");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("notification")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("send_failure")
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_parse_error_send_preserves_notification_failure() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let failure_from_send = Arc::clone(&failure);
+        let error = Server::new("returning-notification-parse-error-race-test", "1.0.0")
+            .build()
+            .run_loop_returning_legacy(
+                &Cx::for_testing(),
+                move |_receive_cx| {
+                    Err(TransportError::Codec(fastmcp_transport::CodecError::Json(
+                        serde_json::from_str::<serde_json::Value>("{")
+                            .expect_err("fixture must be invalid JSON"),
+                    )))
+                },
+                move |_send_cx, message| {
+                    let JsonRpcMessage::Response(response) = message else {
+                        panic!("recoverable JSON syntax failure must emit a response");
+                    };
+                    assert!(response.id.is_none());
+                    assert_eq!(
+                        response
+                            .error
+                            .as_ref()
+                            .map(|response_error| response_error.code),
+                        Some(-32700)
+                    );
+                    failure_from_send.store(true, Ordering::Release);
+                    Err(TransportError::Cancelled)
+                },
+                Arc::new(|_| {}),
+                Some(failure),
+                "custom-test",
+            )
+            .expect_err("latched notification failure must win cancelled parse-error reply");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("notification")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("send_failure")
+        );
+    }
+
+    impl Transport for ReturningProbeTransport {
+        fn send(&mut self, _cx: &Cx, _message: &JsonRpcMessage) -> Result<(), TransportError> {
+            if self.fail_send {
+                Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test returning-transport send failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            match self.receive {
+                ReturningProbeReceive::Closed => Err(TransportError::Closed),
+                ReturningProbeReceive::Cancelled => Err(TransportError::Cancelled),
+                ReturningProbeReceive::Timeout => Err(TransportError::Timeout),
+                ReturningProbeReceive::PingThenClosed => {
+                    self.receive = ReturningProbeReceive::Closed;
+                    Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "ping", None, 704_i64,
+                    )))
+                }
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.close_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_close {
+                Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test returning-transport close failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reality_check_regression_returning_transport_treats_clean_stop_as_success() {
+        for receive in [
+            ReturningProbeReceive::Closed,
+            ReturningProbeReceive::Cancelled,
+        ] {
+            Server::new("returning-clean-stop-test", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(
+                    &Cx::for_testing(),
+                    ReturningProbeTransport {
+                        receive,
+                        fail_send: false,
+                        fail_close: false,
+                        close_calls: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+                .expect("clean EOF and transport cancellation must return success");
+        }
+    }
+
+    #[test]
+    fn reality_check_regression_returning_transport_propagates_fatal_receive_error() {
+        let error = Server::new("returning-receive-failure-test", "1.0.0")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ReturningProbeTransport {
+                    receive: ReturningProbeReceive::Timeout,
+                    fail_send: false,
+                    fail_close: false,
+                    close_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect_err("fatal transport receive failure must propagate");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("receive")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("timeout")
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_returning_transport_propagates_response_send_error() {
+        let error = Server::new("returning-send-failure-test", "1.0.0")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ReturningProbeTransport {
+                    receive: ReturningProbeReceive::PingThenClosed,
+                    fail_send: true,
+                    fail_close: false,
+                    close_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect_err("response send failure must propagate");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("send")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("io")
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_returning_transport_closes_and_propagates_close_failure() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let error = Server::new("returning-close-failure-test", "1.0.0")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ReturningProbeTransport {
+                    receive: ReturningProbeReceive::Closed,
+                    fail_send: false,
+                    fail_close: true,
+                    close_calls: Arc::clone(&close_calls),
+                },
+            )
+            .expect_err("transport close failure must propagate");
+
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["stage"].as_str()),
+            Some("close")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("io")
+        );
+    }
+
+    #[test]
+    fn reality_check_regression_returning_transport_preserves_run_and_close_failures() {
+        let error = Server::new("returning-combined-failure-test", "1.0.0")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ReturningProbeTransport {
+                    receive: ReturningProbeReceive::Timeout,
+                    fail_send: false,
+                    fail_close: true,
+                    close_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect_err("run and close failures must both propagate");
+
+        let data = error.data.expect("combined failure data");
+        assert_eq!(data["stage"], "run_and_close");
+        assert_eq!(data["kind"], "multiple_failures");
+        assert_eq!(data["run"]["data"]["stage"], "receive");
+        assert_eq!(data["run"]["data"]["kind"], "timeout");
+        assert_eq!(data["close"]["data"]["stage"], "close");
+        assert_eq!(data["close"]["data"]["kind"], "io");
     }
 
     #[test]
@@ -7238,7 +8231,7 @@ mod lib_unit_tests {
             .build()
             .run_loop_returning(
                 &Cx::for_testing(),
-                move |_| {
+                move |_, _worker_failed| {
                     receive_count.fetch_add(1, Ordering::Relaxed);
                     receive_steps
                         .lock()
@@ -7255,7 +8248,8 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
-            );
+            )
+            .expect("clean transport closure after a recoverable codec error must succeed");
 
         assert_eq!(receive_calls.load(Ordering::Relaxed), 2);
         let sent = sent
@@ -7292,7 +8286,7 @@ mod lib_unit_tests {
             .build()
             .run_loop_returning(
                 &Cx::for_testing(),
-                move |_| {
+                move |_, _worker_failed| {
                     receive_steps
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7308,7 +8302,8 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
-            );
+            )
+            .expect("clean transport closure after an invalid-request reply must succeed");
 
         let sent = sent
             .lock()
@@ -7332,11 +8327,11 @@ mod lib_unit_tests {
         let sent = Arc::new(AtomicUsize::new(0));
         let sent_count = Arc::clone(&sent);
 
-        Server::new("fatal-framing-error-test", "1.0.0")
+        let error = Server::new("fatal-framing-error-test", "1.0.0")
             .build()
             .run_loop_returning(
                 &Cx::for_testing(),
-                move |_| {
+                move |_, _worker_failed| {
                     receive_count.fetch_add(1, Ordering::Relaxed);
                     Err(TransportError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -7349,13 +8344,30 @@ mod lib_unit_tests {
                 },
                 Arc::new(|_| {}),
                 "test",
-            );
+            )
+            .expect_err("fatal framing failure must propagate from the returning loop");
 
         assert_eq!(receive_calls.load(Ordering::Relaxed), 1);
         assert_eq!(sent.load(Ordering::Relaxed), 0);
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["kind"].as_str()),
+            Some("pump_failure")
+        );
         assert_eq!(
             classify_receive_error(&TransportError::Timeout),
-            ReceiveErrorDisposition::Retry
+            ReceiveErrorDisposition::Terminate
+        );
+        assert_eq!(
+            classify_receive_error(&TransportError::ReceiveDeadlineExceeded),
+            ReceiveErrorDisposition::Terminate
+        );
+        assert_eq!(
+            classify_receive_error(&TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512,
+            }),
+            ReceiveErrorDisposition::Terminate
         );
         assert_eq!(
             classify_receive_error(&TransportError::Codec(
@@ -7363,6 +8375,56 @@ mod lib_unit_tests {
             )),
             ReceiveErrorDisposition::Terminate
         );
+    }
+
+    #[test]
+    fn receive_pump_terminates_each_fatal_transport_failure_without_retrying() {
+        use std::sync::atomic::AtomicUsize;
+
+        for error in [
+            TransportError::Timeout,
+            TransportError::ReceiveDeadlineExceeded,
+            TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512,
+            },
+            TransportError::Codec(fastmcp_transport::CodecError::MessageTooLarge(42)),
+        ] {
+            let error_label = format!("{error:?}");
+            let receive_calls = Arc::new(AtomicUsize::new(0));
+            let receive_count = Arc::clone(&receive_calls);
+            let sent = Arc::new(AtomicUsize::new(0));
+            let sent_count = Arc::clone(&sent);
+            let mut next_error = Some(error);
+
+            let exit_code = Server::new("fatal-receive-error-test", "1.0.0")
+                .build()
+                .run_loop_pump(
+                    &Cx::for_testing(),
+                    move |_, _worker_failed| {
+                        receive_count.fetch_add(1, Ordering::Relaxed);
+                        Err(next_error.take().unwrap_or(TransportError::Closed))
+                    },
+                    move |_, _| {
+                        sent_count.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    },
+                    Arc::new(|_| {}),
+                    "test",
+                );
+
+            assert_eq!(exit_code, 1, "fatal error must fail: {error_label}");
+            assert_eq!(
+                receive_calls.load(Ordering::Relaxed),
+                1,
+                "fatal error must not be retried: {error_label}"
+            );
+            assert_eq!(
+                sent.load(Ordering::Relaxed),
+                0,
+                "fatal error must not emit a response: {error_label}"
+            );
+        }
     }
 
     #[test]

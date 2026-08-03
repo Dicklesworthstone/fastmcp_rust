@@ -145,15 +145,21 @@ impl TestClient {
             client_info: self.client_info.clone(),
         };
 
-        let result: InitializeResult = self.send_request("initialize", params)?;
+        let result: InitializeResult =
+            self.send_request(fastmcp_protocol::methods::INITIALIZE, params)?;
 
         // Store server info
         self.server_info = Some(result.server_info.clone());
         self.server_capabilities = Some(result.capabilities.clone());
         self.protocol_version = Some(result.protocol_version.clone());
 
-        // Send initialized notification
-        self.send_notification("initialized", serde_json::json!({}))?;
+        // Complete the lifecycle with the exact MCP notification method.
+        self.transport
+            .send(
+                &self.cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+            )
+            .map_err(|error| McpError::internal_error(format!("Transport error: {error:?}")))?;
 
         self.initialized = true;
         Ok(result)
@@ -618,5 +624,59 @@ mod tests {
         let err = client.list_tools().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not initialized"), "error was: {msg}");
+    }
+
+    #[test]
+    fn initialize_emits_spec_correct_lifecycle_notification() {
+        let (client_transport, mut server_transport) = create_memory_transport_pair();
+        let server_cx = Cx::for_testing();
+        let response = InitializeResult {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            capabilities: ServerCapabilities::default(),
+            server_info: ServerInfo {
+                name: "test-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            instructions: None,
+        };
+
+        server_transport
+            .send(
+                &server_cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(1),
+                    serde_json::to_value(response).expect("serialize initialize response"),
+                )),
+            )
+            .expect("queue initialize response");
+
+        let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
+        client.initialize().expect("initialize test client");
+
+        let request = server_transport
+            .recv(&server_cx)
+            .expect("receive initialize request");
+        let request = match request {
+            JsonRpcMessage::Request(request) => Some(request),
+            JsonRpcMessage::Response(_) => None,
+        }
+        .expect("expected initialize request");
+        assert_eq!(request.method, fastmcp_protocol::methods::INITIALIZE);
+        assert_eq!(request.id, Some(RequestId::Number(1)));
+
+        let notification = server_transport
+            .recv(&server_cx)
+            .expect("receive initialized notification");
+        let notification = match notification {
+            JsonRpcMessage::Request(notification) => Some(notification),
+            JsonRpcMessage::Response(_) => None,
+        }
+        .expect("expected initialized notification");
+        assert_eq!(
+            notification.method,
+            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED
+        );
+        assert!(notification.id.is_none());
+        assert!(notification.params.is_none());
     }
 }

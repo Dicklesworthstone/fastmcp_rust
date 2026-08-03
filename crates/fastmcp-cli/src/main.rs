@@ -4,6 +4,7 @@
 //! - `run` - Run an MCP server
 //! - `inspect` - Inspect a server's capabilities
 //! - `install` - Install server config for Claude Desktop etc.
+//! - `test` - Exercise a local server with per-request idle/absolute timeouts
 //! - `tasks` - Probe quarantined legacy task RPCs for diagnostics
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
@@ -35,10 +36,17 @@ use clap::{Parser, Subcommand};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
+#[cfg(target_os = "linux")]
+use fastmcp_client::linux_process_group_has_live_member;
 use fastmcp_client::{Client, ListPageLimits, claude_desktop_config_path};
 use fastmcp_console::console::{is_credential_key, redact_free_text_credentials_with};
 use fastmcp_core::McpResult;
 use fastmcp_protocol::TaskStatus;
+
+const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
+const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
+const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
+const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
 
 /// FastMCP CLI - Run, inspect, and install MCP servers.
 #[derive(Parser)]
@@ -149,7 +157,10 @@ enum Commands {
 
     /// Test MCP server connectivity.
     ///
-    /// Spawns the server and tests initialization, capability listing, and ping functionality.
+    /// Spawns the server and tests initialization, capability listing, ping,
+    /// and verified subprocess cleanup. This command is currently Unix-only:
+    /// other platforms fail before spawning because no Job Object equivalent
+    /// is implemented yet.
     Test {
         /// Server command or path.
         server: String,
@@ -158,9 +169,31 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
-        /// Post-initialization response deadline in seconds (not a hard timeout for silent stdio).
-        #[arg(long, default_value = "30")]
-        timeout: u64,
+        /// Per-request idle timeout in seconds (1-300).
+        ///
+        /// Starts when initialization or a later MCP request is committed.
+        /// The current connectivity probes do not attach progress tokens, so
+        /// peer traffic does not reset their idle timers. It does not bound
+        /// the whole CLI or subprocess lifetime.
+        #[arg(
+            long,
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_TEST_IDLE_TIMEOUT_SECS)
+        )]
+        idle_timeout: u64,
+
+        /// Non-resettable per-request absolute timeout in seconds (1-900).
+        ///
+        /// Starts when initialization or a later MCP request is committed. It
+        /// does not bound the whole CLI or subprocess lifetime. On Unix child
+        /// stdio, the request timers bound silent and partial-frame reads;
+        /// blocking child-stdin writes cannot be preempted by these timers.
+        #[arg(
+            long,
+            default_value_t = 120,
+            value_parser = clap::value_parser!(u64).range(1..=MAX_TEST_ABSOLUTE_TIMEOUT_SECS)
+        )]
+        absolute_timeout: u64,
 
         /// Show detailed output.
         #[arg(long, short = 'v')]
@@ -439,10 +472,18 @@ fn main() -> ExitCode {
         Commands::Test {
             server,
             args,
-            timeout,
+            idle_timeout,
+            absolute_timeout,
             verbose,
             json,
-        } => cmd_test(&server, &args, timeout, verbose, json),
+        } => cmd_test(
+            &server,
+            &args,
+            idle_timeout,
+            absolute_timeout,
+            verbose,
+            json,
+        ),
         Commands::Dev {
             target,
             reload_dirs,
@@ -904,9 +945,7 @@ fn write_stdout_output(
     context: &str,
     append_newline: bool,
 ) -> McpResult<()> {
-    let total_bytes = output
-        .len()
-        .saturating_add(if append_newline { 1 } else { 0 });
+    let total_bytes = output.len().saturating_add(usize::from(append_newline));
     if total_bytes > CLI_OUTPUT_MAX_BYTES {
         return Err(output_too_large(context, total_bytes));
     }
@@ -1536,7 +1575,15 @@ fn read_destination_snapshot_at(
             ));
         }
     };
-    if !rustix::fs::FileType::from_raw_mode(before.st_mode).is_file() || before.st_size < 0 {
+    let before_type = rustix::fs::FileType::from_raw_mode(before.st_mode);
+    if before_type.is_symlink() {
+        return Err(invalid_bounded_file(
+            diagnostic_path,
+            context,
+            "symbolic links are not accepted",
+        ));
+    }
+    if !before_type.is_file() || before.st_size < 0 {
         return Err(invalid_bounded_file(
             diagnostic_path,
             context,
@@ -2211,10 +2258,215 @@ fn invalid_server_entry(
 ) -> fastmcp_core::McpError {
     fastmcp_core::McpError::invalid_params(format!(
         "Invalid MCP server entry {:?} in {} config at {}: {detail}",
-        sanitize_terminal_text(name),
-        sanitize_terminal_text(source_name),
+        sanitize_peer_text(name, PEER_FIELD_LIMIT),
+        sanitize_peer_text(source_name, PEER_FIELD_LIMIT),
         sanitize_config_path(path)
     ))
+}
+
+fn is_supported_server_config_field(field: &str) -> bool {
+    matches!(field, "command" | "args" | "env" | "cwd" | "disabled")
+}
+
+fn is_bounded_string_array(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.len() <= CLI_OUTPUT_MAX_ITEMS && items.iter().all(serde_json::Value::is_string)
+    })
+}
+
+fn is_bounded_string_map(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|entries| {
+        entries.len() <= CLI_OUTPUT_MAX_ITEMS && entries.values().all(serde_json::Value::is_string)
+    })
+}
+
+fn is_bounded_client_json(value: &serde_json::Value) -> bool {
+    const MAX_DEPTH: usize = 8;
+
+    fn visit(value: &serde_json::Value, depth: usize, remaining: &mut usize) -> bool {
+        if depth > MAX_DEPTH || *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        match value {
+            serde_json::Value::Array(items) => {
+                items.len() <= CLI_OUTPUT_MAX_ITEMS
+                    && items.iter().all(|item| visit(item, depth + 1, remaining))
+            }
+            serde_json::Value::Object(entries) => {
+                entries.len() <= CLI_OUTPUT_MAX_ITEMS
+                    && entries
+                        .values()
+                        .all(|item| visit(item, depth + 1, remaining))
+            }
+            _ => true,
+        }
+    }
+
+    let mut remaining = CLI_OUTPUT_MAX_ITEMS;
+    visit(value, 0, &mut remaining)
+}
+
+fn is_valid_cline_timeout(value: &serde_json::Value) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|seconds| seconds.is_finite() && (1.0..=3600.0).contains(&seconds))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientServerFieldClass {
+    Local,
+    Remote,
+    Unsupported,
+}
+
+fn is_remote_transport_name(value: &str) -> bool {
+    matches!(
+        value,
+        "http" | "streamable-http" | "streamableHttp" | "sse" | "ws"
+    )
+}
+
+fn classify_cline_transport(value: &serde_json::Value) -> ClientServerFieldClass {
+    let Some(transport) = value.as_object() else {
+        return ClientServerFieldClass::Unsupported;
+    };
+    let Some(transport_type) = transport.get("type").and_then(serde_json::Value::as_str) else {
+        return ClientServerFieldClass::Unsupported;
+    };
+    if is_remote_transport_name(transport_type) {
+        return if transport
+            .keys()
+            .all(|field| matches!(field.as_str(), "type" | "url" | "headers"))
+        {
+            ClientServerFieldClass::Remote
+        } else {
+            ClientServerFieldClass::Unsupported
+        };
+    }
+    if transport_type != "stdio"
+        || transport
+            .keys()
+            .any(|field| !matches!(field.as_str(), "type" | "command" | "args" | "cwd" | "env"))
+        || !transport
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| !command.trim().is_empty())
+        || transport
+            .get("args")
+            .is_some_and(|value| !is_bounded_string_array(value))
+        || transport.get("cwd").is_some_and(|value| !value.is_string())
+        || transport
+            .get("env")
+            .is_some_and(|value| !is_bounded_string_map(value))
+    {
+        return ClientServerFieldClass::Unsupported;
+    }
+    ClientServerFieldClass::Local
+}
+
+/// Classify every per-server field through the same target profile for both
+/// listing and same-name installation updates. Unsupported keys are refused
+/// instead of being preserved by install and then rejected by list.
+fn classify_client_server_field(
+    target: InstallTarget,
+    field: &str,
+    value: &serde_json::Value,
+) -> ClientServerFieldClass {
+    if is_supported_server_config_field(field) {
+        return ClientServerFieldClass::Local;
+    }
+    if matches!(field, "url" | "headers" | "auth") {
+        return ClientServerFieldClass::Remote;
+    }
+    if field == "type" {
+        return match value.as_str() {
+            Some("stdio") => ClientServerFieldClass::Local,
+            Some(kind) if is_remote_transport_name(kind) => ClientServerFieldClass::Remote,
+            _ => ClientServerFieldClass::Unsupported,
+        };
+    }
+    if field == "transportType" {
+        return match value.as_str() {
+            Some("stdio") if target == InstallTarget::Cline => ClientServerFieldClass::Local,
+            Some(kind) if is_remote_transport_name(kind) => ClientServerFieldClass::Remote,
+            _ => ClientServerFieldClass::Unsupported,
+        };
+    }
+
+    match (target, field) {
+        (InstallTarget::Cursor, "envFile")
+            if value.as_str().is_some_and(|path| !path.trim().is_empty()) =>
+        {
+            ClientServerFieldClass::Local
+        }
+        (InstallTarget::Cline, "transport") => classify_cline_transport(value),
+        (InstallTarget::Cline, "autoApprove") if is_bounded_string_array(value) => {
+            ClientServerFieldClass::Local
+        }
+        (InstallTarget::Cline, "timeout") if is_valid_cline_timeout(value) => {
+            ClientServerFieldClass::Local
+        }
+        (InstallTarget::Cline, "remoteConfigured") if value.is_boolean() => {
+            ClientServerFieldClass::Local
+        }
+        (InstallTarget::Cline, "oauth" | "metadata") if is_bounded_client_json(value) => {
+            ClientServerFieldClass::Local
+        }
+        (InstallTarget::Claude | InstallTarget::Cursor, "oauth") => ClientServerFieldClass::Remote,
+        _ => ClientServerFieldClass::Unsupported,
+    }
+}
+
+fn normalize_cline_nested_stdio_entry(
+    config: &serde_json::Value,
+) -> Result<serde_json::Value, &'static str> {
+    let outer = config.as_object().ok_or("schema validation failed")?;
+    let allowed_outer = [
+        "transport",
+        "disabled",
+        "autoApprove",
+        "timeout",
+        "remoteConfigured",
+        "oauth",
+        "metadata",
+    ];
+    if outer
+        .keys()
+        .any(|field| !allowed_outer.contains(&field.as_str()))
+        || outer.iter().any(|(field, value)| {
+            classify_client_server_field(InstallTarget::Cline, field, value)
+                == ClientServerFieldClass::Unsupported
+        })
+    {
+        return Err("schema validation failed");
+    }
+
+    let transport = outer
+        .get("transport")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("schema validation failed")?;
+    let transport_type = transport
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("schema validation failed")?;
+    if is_remote_transport_name(transport_type) {
+        return Err("remote MCP entries are not yet representable by fastmcp list");
+    }
+    if transport_type != "stdio" {
+        return Err("schema validation failed");
+    }
+
+    let mut normalized = serde_json::Map::new();
+    for field in ["command", "args", "cwd", "env"] {
+        if let Some(value) = transport.get(field) {
+            normalized.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(disabled) = outer.get("disabled") {
+        normalized.insert("disabled".to_owned(), disabled.clone());
+    }
+    Ok(serde_json::Value::Object(normalized))
 }
 
 fn parse_json_server_entry(
@@ -2222,7 +2474,55 @@ fn parse_json_server_entry(
     source_name: &str,
     name: &str,
     config: &serde_json::Value,
+    client_target: Option<InstallTarget>,
 ) -> McpResult<ServerEntry> {
+    let normalized = if client_target == Some(InstallTarget::Cline)
+        && config
+            .as_object()
+            .is_some_and(|fields| fields.contains_key("transport"))
+    {
+        Some(
+            normalize_cline_nested_stdio_entry(config)
+                .map_err(|detail| invalid_server_entry(path, source_name, name, detail))?,
+        )
+    } else {
+        None
+    };
+    let config = normalized.as_ref().unwrap_or(config);
+
+    if client_target.is_some_and(|target| {
+        config.as_object().is_some_and(|fields| {
+            fields.iter().any(|(field, value)| {
+                classify_client_server_field(target, field, value) == ClientServerFieldClass::Remote
+            })
+        })
+    }) {
+        return Err(invalid_server_entry(
+            path,
+            source_name,
+            name,
+            "remote MCP entries are not yet representable by fastmcp list",
+        ));
+    }
+    if config
+        .as_object()
+        .is_some_and(|fields| match client_target {
+            Some(target) => fields.iter().any(|(field, value)| {
+                classify_client_server_field(target, field, value)
+                    == ClientServerFieldClass::Unsupported
+            }),
+            None => fields
+                .keys()
+                .any(|field| !is_supported_server_config_field(field)),
+        })
+    {
+        return Err(invalid_server_entry(
+            path,
+            source_name,
+            name,
+            "schema validation failed",
+        ));
+    }
     let mcp_config = McpServerConfig::deserialize(config)
         .map_err(|_| invalid_server_entry(path, source_name, name, "schema validation failed"))?;
     validate_server_entry_counts(path, source_name, name, &mcp_config)?;
@@ -2242,6 +2542,7 @@ fn parse_json_server_entries(
     path: &std::path::Path,
     source_name: &str,
     map: &serde_json::Map<String, serde_json::Value>,
+    client_target: Option<InstallTarget>,
 ) -> McpResult<Vec<ServerEntry>> {
     if map.len() > CLI_OUTPUT_MAX_ITEMS {
         return Err(invalid_config_document(
@@ -2254,7 +2555,9 @@ fn parse_json_server_entries(
         ));
     }
     map.iter()
-        .map(|(name, config)| parse_json_server_entry(path, source_name, name, config))
+        .map(|(name, config)| {
+            parse_json_server_entry(path, source_name, name, config, client_target)
+        })
         .collect()
 }
 
@@ -2264,6 +2567,18 @@ fn parse_toml_server_entry(
     name: &str,
     config: &toml::Value,
 ) -> McpResult<ServerEntry> {
+    if config.as_table().is_some_and(|fields| {
+        fields
+            .keys()
+            .any(|field| !is_supported_server_config_field(field))
+    }) {
+        return Err(invalid_server_entry(
+            path,
+            source_name,
+            name,
+            "schema validation failed",
+        ));
+    }
     let mcp_config: McpServerConfig = config
         .clone()
         .try_into()
@@ -2287,6 +2602,14 @@ fn validate_server_entry_counts(
     name: &str,
     config: &McpServerConfig,
 ) -> McpResult<()> {
+    if config.command.trim().is_empty() {
+        return Err(invalid_server_entry(
+            path,
+            source_name,
+            name,
+            "schema validation failed",
+        ));
+    }
     if config.args.len() > CLI_OUTPUT_MAX_ITEMS {
         return Err(invalid_server_entry(
             path,
@@ -2329,10 +2652,7 @@ fn load_servers_from_client_config(
         .ok_or_else(|| invalid_config_document(path, source_name, "root must be a JSON object"))?;
 
     // Extract servers based on client type.
-    let registry_name = match target {
-        InstallTarget::Claude | InstallTarget::Cursor => "mcpServers",
-        InstallTarget::Cline => "cline.mcpServers",
-    };
+    let registry_name = "mcpServers";
 
     let registry = root.get(registry_name).ok_or_else(|| {
         invalid_config_document(path, source_name, "expected MCP server registry is missing")
@@ -2344,7 +2664,10 @@ fn load_servers_from_client_config(
             "MCP server registry must be a JSON object",
         )
     })?;
-    let parsed = parse_json_server_entries(path, source_name, map)?;
+    // Client-owned registries legitimately carry target-specific extension
+    // fields. Validate a narrow typed allowlist so supported metadata survives
+    // listing without turning every misspelled key into silently ignored data.
+    let parsed = parse_json_server_entries(path, source_name, map, Some(target))?;
     servers.extend(parsed);
 
     Ok(())
@@ -2433,7 +2756,7 @@ fn load_servers_from_path(
                     "MCP server registry must be a JSON object",
                 )
             })?;
-            let parsed = parse_json_server_entries(path, source_name, map)?;
+            let parsed = parse_json_server_entries(path, source_name, map, None)?;
             servers.extend(parsed);
         }
     }
@@ -2466,6 +2789,41 @@ fn load_project_local_servers(servers: &mut Vec<ServerEntry>) {
     }
 }
 
+/// Allowlisted timeout source exposed by machine-readable test reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TestTimeoutSource {
+    Idle,
+    Absolute,
+}
+
+impl TestTimeoutSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Absolute => "absolute",
+        }
+    }
+}
+
+fn allowlisted_test_timeout_source(error: &fastmcp_core::McpError) -> Option<TestTimeoutSource> {
+    if error.code != fastmcp_core::McpErrorCode::InternalError {
+        return None;
+    }
+    let source = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("timeoutSource"))
+        .and_then(serde_json::Value::as_str)?;
+    match (error.message.as_str(), source) {
+        ("Request timed out at the idle deadline", "idle") => Some(TestTimeoutSource::Idle),
+        ("Request timed out at the absolute deadline", "absolute") => {
+            Some(TestTimeoutSource::Absolute)
+        }
+        _ => None,
+    }
+}
+
 /// Test result for a single test.
 #[derive(Debug, Clone, Serialize)]
 struct TestResult {
@@ -2478,6 +2836,8 @@ struct TestResult {
     details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_source: Option<TestTimeoutSource>,
     #[serde(skip)]
     mutation: OutputMutationMetadata,
 }
@@ -2533,6 +2893,12 @@ fn bounded_test_report_value(report: &TestReport) -> serde_json::Value {
         if let Some(error) = error {
             test.insert("error".to_owned(), serde_json::Value::String(error));
         }
+        if let Some(timeout_source) = result.timeout_source {
+            test.insert(
+                "timeout_source".to_owned(),
+                serde_json::Value::String(timeout_source.as_str().to_owned()),
+            );
+        }
         tests.push(serde_json::Value::Object(test));
     }
     let (server, server_mutation) =
@@ -2549,15 +2915,155 @@ fn bounded_test_report_value(report: &TestReport) -> serde_json::Value {
     })
 }
 
+fn write_test_report(report: &TestReport, json_output: bool) -> McpResult<()> {
+    if json_output {
+        let json =
+            serde_json::to_string_pretty(&bounded_test_report_value(report)).map_err(|e| {
+                fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+            })?;
+        write_stdout(&json, "test output", true)
+    } else {
+        let summary = if report.success {
+            "\nAll tests passed!"
+        } else {
+            "\nSome tests failed."
+        };
+        write_stdout(summary, "test output", true)
+    }
+}
+
+fn failed_test_result(
+    name: &str,
+    duration: std::time::Duration,
+    error: &fastmcp_core::McpError,
+) -> TestResult {
+    let prefix = format!("[{}] ", i32::from(error.code));
+    let (message, mutation) = sanitize_peer_text_with_metadata(
+        &error.message,
+        PEER_DETAIL_LIMIT.saturating_sub(prefix.len()),
+    );
+    TestResult {
+        name: name.to_owned(),
+        success: false,
+        skipped: false,
+        duration_ms: duration.as_secs_f64() * 1000.0,
+        details: None,
+        error: Some(format!("{prefix}{message}")),
+        timeout_source: allowlisted_test_timeout_source(error),
+        mutation,
+    }
+}
+
+fn split_client_cleanup_failure(
+    error: &fastmcp_core::McpError,
+) -> Option<(
+    fastmcp_core::McpError,
+    fastmcp_core::McpError,
+    std::time::Duration,
+)> {
+    let data = error.data.as_ref()?.as_object()?;
+    if data
+        .get(CLIENT_CLEANUP_UNVERIFIED_DATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let operation = serde_json::from_value(data.get("operation")?.clone()).ok()?;
+    let cleanup = serde_json::from_value(data.get("cleanup")?.clone()).ok()?;
+    let duration_ms = data
+        .get(CLIENT_CLEANUP_DURATION_MS_DATA_KEY)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        .unwrap_or(0.0);
+    Some((
+        operation,
+        cleanup,
+        std::time::Duration::from_secs_f64(duration_ms / 1_000.0),
+    ))
+}
+
+/// Couples a failed post-connect test-output operation to explicit cleanup.
+///
+/// Successful incremental output must not close the still-active test client.
+/// Once output fails, however, the command cannot continue safely and must not
+/// rely on `Client::drop` to stop the owned subprocess group. Preserve both
+/// failures as structured data when cleanup cannot be verified.
+fn finish_test_output<T, F>(output: McpResult<T>, cleanup: F) -> McpResult<T>
+where
+    F: FnOnce() -> McpResult<()>,
+{
+    match output {
+        Ok(value) => Ok(value),
+        Err(output_error) => {
+            let cleanup_started = std::time::Instant::now();
+            match cleanup() {
+                Ok(()) => Err(output_error),
+                Err(cleanup_error) => Err(fastmcp_core::McpError::with_data(
+                    fastmcp_core::McpErrorCode::InternalError,
+                    format!(
+                        "Test output failed ({output_error}); client cleanup also failed ({cleanup_error})"
+                    ),
+                    serde_json::json!({
+                        CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
+                        "operation": output_error,
+                        "cleanup": cleanup_error,
+                        CLIENT_CLEANUP_DURATION_MS_DATA_KEY:
+                            cleanup_started.elapsed().as_secs_f64() * 1_000.0,
+                    }),
+                )),
+            }
+        }
+    }
+}
+
+/// Preserves a terminal connection failure when rendering its test report also
+/// fails.
+///
+/// There is no live [`fastmcp_client::Client`] to clean up in this path: the
+/// builder has already attempted cleanup and encoded any unverified outcome in
+/// `terminal_error`. Keep that error as the primary result, including its
+/// structured cleanup marker, while making the reporting failure observable.
+fn combine_test_failure_with_output(
+    mut terminal_error: fastmcp_core::McpError,
+    output_error: fastmcp_core::McpError,
+) -> fastmcp_core::McpError {
+    terminal_error.message = format!(
+        "{}; test-result reporting also failed ({output_error})",
+        terminal_error.message
+    );
+
+    let output_error = serde_json::json!(output_error);
+    match terminal_error.data.as_mut() {
+        Some(serde_json::Value::Object(data)) => {
+            data.insert("reporting".to_owned(), output_error);
+        }
+        Some(data) => {
+            let cause_data = std::mem::take(data);
+            *data = serde_json::json!({
+                "causeData": cause_data,
+                "reporting": output_error,
+            });
+        }
+        None => {
+            terminal_error.data = Some(serde_json::json!({
+                "reporting": output_error,
+            }));
+        }
+    }
+    terminal_error
+}
+
 /// Test command: Test MCP server connectivity.
 fn cmd_test(
     server: &str,
     args: &[String],
-    timeout_secs: u64,
+    idle_timeout_secs: u64,
+    absolute_timeout_secs: u64,
     verbose: bool,
     json_output: bool,
 ) -> McpResult<()> {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     let total_start = Instant::now();
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2575,12 +3081,64 @@ fn cmd_test(
 
     // Connect to server. Start timing before the initialization handshake.
     let init_start = Instant::now();
-    let timeout_ms = timeout_secs
-        .checked_mul(1_000)
-        .ok_or_else(|| fastmcp_core::McpError::invalid_params("Timeout in seconds is too large"))?;
-    let mut client = fastmcp_client::ClientBuilder::new()
-        .timeout_ms(timeout_ms)
-        .connect_stdio(server, &args_refs)?;
+    // This policy is snapshotted for initialization and each later request; it
+    // is deliberately not an end-to-end deadline for this CLI process.
+    let timeout_policy = fastmcp_client::RequestTimeoutPolicy::new(
+        Duration::from_secs(idle_timeout_secs),
+        Duration::from_secs(absolute_timeout_secs),
+    )?;
+    let client = fastmcp_client::ClientBuilder::new()
+        .request_timeout_policy(timeout_policy)
+        .owned_process_group(true)
+        .connect_stdio(server, &args_refs);
+    let mut client = match client {
+        Ok(client) => client,
+        Err(mut error) => {
+            let split_cleanup = split_client_cleanup_failure(&error);
+            let connection_duration = init_start.elapsed();
+            let initialize_duration = split_cleanup
+                .as_ref()
+                .map_or(connection_duration, |(_, _, cleanup_duration)| {
+                    connection_duration.saturating_sub(*cleanup_duration)
+                });
+            let init_result = failed_test_result(
+                "initialize",
+                initialize_duration,
+                split_cleanup
+                    .as_ref()
+                    .map_or(&error, |(operation, _, _)| operation),
+            );
+            let cleanup_result = split_cleanup
+                .as_ref()
+                .map(|(_, cleanup, duration)| failed_test_result("cleanup", *duration, cleanup))
+                .or_else(|| {
+                    fastmcp_client::is_cleanup_unverified(&error)
+                        .then(|| failed_test_result("cleanup", Duration::ZERO, &error))
+                });
+            if !json_output {
+                if let Err(output_error) = print_test_result(&init_result, verbose) {
+                    return Err(combine_test_failure_with_output(error, output_error));
+                }
+                if let Some(result) = &cleanup_result {
+                    if let Err(output_error) = print_test_result(result, verbose) {
+                        return Err(combine_test_failure_with_output(error, output_error));
+                    }
+                }
+            }
+            let mut tests = vec![init_result];
+            tests.extend(cleanup_result);
+            let report = TestReport {
+                server: server.to_owned(),
+                success: false,
+                tests,
+                total_duration_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            if let Err(output_error) = write_test_report(&report, json_output) {
+                error = combine_test_failure_with_output(error, output_error);
+            }
+            return Err(error);
+        }
+    };
 
     let mut results: Vec<TestResult> = Vec::new();
 
@@ -2592,10 +3150,11 @@ fn cmd_test(
         duration_ms: init_start.elapsed().as_secs_f64() * 1000.0,
         details: Some(format!("protocol {}", client.protocol_version())),
         error: None,
+        timeout_source: None,
         mutation: OutputMutationMetadata::default(),
     };
     if !json_output {
-        print_test_result(&init_result, verbose)?;
+        finish_test_output(print_test_result(&init_result, verbose), || client.close())?;
     }
     results.push(init_result);
 
@@ -2606,7 +3165,7 @@ fn cmd_test(
         Ok("server responded".to_owned())
     });
     if !json_output {
-        print_test_result(&ping_result, verbose)?;
+        finish_test_output(print_test_result(&ping_result, verbose), || client.close())?;
     }
     results.push(ping_result);
 
@@ -2629,7 +3188,7 @@ fn cmd_test(
         },
     );
     if !json_output {
-        print_test_result(&tools_result, verbose)?;
+        finish_test_output(print_test_result(&tools_result, verbose), || client.close())?;
     }
     results.push(tools_result);
 
@@ -2651,7 +3210,9 @@ fn cmd_test(
         },
     );
     if !json_output {
-        print_test_result(&resources_result, verbose)?;
+        finish_test_output(print_test_result(&resources_result, verbose), || {
+            client.close()
+        })?;
     }
     results.push(resources_result);
 
@@ -2673,12 +3234,35 @@ fn cmd_test(
         },
     );
     if !json_output {
-        print_test_result(&prompts_result, verbose)?;
+        finish_test_output(print_test_result(&prompts_result, verbose), || {
+            client.close()
+        })?;
     }
     results.push(prompts_result);
 
-    // Clean up
-    client.close();
+    // Explicit cleanup is part of the test result. A separate live Unix
+    // process-group anchor pins group identity while the requested MCP peer
+    // runs directly as its sibling; unsupported platforms fail during connect.
+    let cleanup_start = Instant::now();
+    let cleanup_result = match client.close() {
+        Ok(()) => TestResult {
+            name: "cleanup".to_owned(),
+            success: true,
+            skipped: false,
+            duration_ms: cleanup_start.elapsed().as_secs_f64() * 1000.0,
+            details: Some("owned subprocess group stopped".to_owned()),
+            error: None,
+            timeout_source: None,
+            mutation: OutputMutationMetadata::default(),
+        },
+        Err(error) => failed_test_result("cleanup", cleanup_start.elapsed(), &error),
+    };
+    if !json_output {
+        finish_test_output(print_test_result(&cleanup_result, verbose), || {
+            client.close()
+        })?;
+    }
+    results.push(cleanup_result);
 
     // Build report
     let all_passed = results.iter().all(|r| r.success);
@@ -2691,20 +3275,7 @@ fn cmd_test(
         total_duration_ms,
     };
 
-    if json_output {
-        let json =
-            serde_json::to_string_pretty(&bounded_test_report_value(&report)).map_err(|e| {
-                fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
-            })?;
-        write_stdout(&json, "test output", true)?;
-    } else {
-        let summary = if all_passed {
-            "\nAll tests passed!"
-        } else {
-            "\nSome tests failed."
-        };
-        write_stdout(summary, "test output", true)?;
-    }
+    finish_test_output(write_test_report(&report, json_output), || client.close())?;
 
     if all_passed {
         Ok(())
@@ -2729,25 +3300,11 @@ where
                 duration_ms: start.elapsed().as_secs_f64() * 1000.0,
                 details: (!details.is_empty()).then_some(details),
                 error: None,
+                timeout_source: None,
                 mutation,
             }
         }
-        Err(error) => {
-            let prefix = format!("[{}] ", i32::from(error.code));
-            let (message, mutation) = sanitize_peer_text_with_metadata(
-                &error.message,
-                PEER_DETAIL_LIMIT.saturating_sub(prefix.len()),
-            );
-            TestResult {
-                name: name.to_string(),
-                success: false,
-                skipped: false,
-                duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                details: None,
-                error: Some(format!("{prefix}{message}")),
-                mutation,
-            }
-        }
+        Err(error) => failed_test_result(name, start.elapsed(), &error),
     }
 }
 
@@ -2759,12 +3316,18 @@ fn skipped_test(name: &str, reason: &str) -> TestResult {
         duration_ms: 0.0,
         details: Some(reason.to_owned()),
         error: None,
+        timeout_source: None,
         mutation: OutputMutationMetadata::default(),
     }
 }
 
 /// Print a single test result.
 fn print_test_result(result: &TestResult, verbose: bool) -> McpResult<()> {
+    let line = render_test_result(result, verbose);
+    write_stdout(&line, "test output", true)
+}
+
+fn render_test_result(result: &TestResult, verbose: bool) -> String {
     let status = if result.skipped {
         "-"
     } else if result.success {
@@ -2802,7 +3365,7 @@ fn print_test_result(result: &TestResult, verbose: bool) -> McpResult<()> {
             PEER_DETAIL_LIMIT.saturating_add(PEER_FIELD_LIMIT),
         );
     }
-    write_stdout(&line, "test output", true)
+    line
 }
 
 // ============================================================================
@@ -2855,7 +3418,9 @@ const DEV_PROCESS_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_
 const DEV_PROCESS_REAP_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(unix)]
 const DEV_GROUP_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
-const DEV_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+#[cfg(target_os = "linux")]
+const DEV_GROUP_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const DEV_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
 const DEV_BUILD_CAPTURE_LIMIT: usize = 256 * 1024;
 const DEV_BUILD_RENDER_LIMIT: usize = 32 * 1024;
 const DEV_DIAGNOSTIC_MAX_SECRETS: usize = 128;
@@ -2864,34 +3429,46 @@ const DEV_DIAGNOSTIC_MAX_TOTAL_SECRET_BYTES: usize = 64 * 1024;
 const DEV_DIAGNOSTIC_MATCH_BUDGET: usize = 8 * 1024 * 1024;
 
 // The wrapper is the managed process-group leader. A signal-immune watchdog is
-// created before the actual command, so even an abrupt leader exit leaves an
-// anchor in the group. Once the leader has been reaped, the watchdog TERM-then-
-// KILLs the remaining group and itself. The anchor prevents pid/pgid reuse
-// during cleanup. After leader reap, Rust only performs bounded, read-only
-// group observation and never signals the remembered pgid.
+// created before the actual command and blocks on a private stdin control pipe
+// retained only by the CLI owner. Owner death or dropping the child handle
+// closes that pipe, so the watchdog TERM-then-KILLs the remaining group and
+// itself. The same watchdog remains an in-group identity anchor through normal
+// leader exit. After leader reap, Rust closes the control pipe and performs
+// only bounded, read-only group observation; Drop never signals a remembered
+// numeric PGID.
 #[cfg(unix)]
 const DEV_UNIX_GROUP_WRAPPER: &str = r#"
 trap 'exit 143' HUP INT TERM
 watchdog_ready=0
 trap 'watchdog_ready=1' USR1
 owned_group_leader=$$
+# POSIX permits an asynchronous list to receive /dev/null as stdin when job
+# control is disabled. Preserve the private control pipe on another descriptor
+# before starting the watchdog, then explicitly restore it as that subshell's
+# stdin. Close the duplicate everywhere before launching the managed command.
+exec 3<&0
 (
     trap '' HUP INT TERM
     kill -USR1 "$owned_group_leader" 2>/dev/null || exit 125
-    while kill -0 "$owned_group_leader" 2>/dev/null; do
-        sleep 0.05
-    done
-    kill -TERM -- "-$owned_group_leader" 2>/dev/null || :
+    # The CLI never writes control data. EOF proves that its only writer was
+    # closed normally or by owner death. The managed command receives
+    # /dev/null instead, so it cannot consume or retain the ownership channel.
+    IFS= read -r _ || :
+    # POSIX PID 0 targets this watchdog's current process group. The wrapper
+    # created that group exclusively for the managed command, and the
+    # watchdog ignores TERM so it can perform the forced-stop pass below.
+    kill -TERM 0 2>/dev/null || :
     sleep 1
-    kill -KILL -- "-$owned_group_leader" 2>/dev/null || :
-) </dev/null >/dev/null 2>&1 &
+    kill -KILL 0 2>/dev/null || :
+) <&3 3<&- >/dev/null 2>&1 &
 owned_group_watchdog=$!
+exec 3<&-
 while [ "$watchdog_ready" -eq 0 ]; do
     kill -0 "$owned_group_watchdog" 2>/dev/null || exit 125
     sleep 0.01
 done
 trap - USR1
-"$@" &
+"$@" </dev/null &
 owned_child=$!
 wait "$owned_child"
 exit $?
@@ -2919,18 +3496,22 @@ fn owned_dev_command(program: &str, arguments: &[String]) -> asupersync::process
         command
     };
 
-    // Keep the ownership guard armed until the exact child is observed as
-    // reaped. Explicit shutdown remains the normal path; kill-on-drop is the
-    // fail-safe for probe, signal, output, or reap errors and for a bounded
-    // cleanup deadline expiring while the child handle is still live. The
-    // wrapper's signal-immune watchdog anchors the process group until leader
-    // death, preventing the managed PGID from being reused during that window.
+    #[cfg(unix)]
+    {
+        // The private pipe is the fail-safe custody mechanism. Unlike
+        // asupersync's process-group kill-on-drop, closing it never signals a
+        // recycled numeric PGID: the live in-group watchdog acts on PID 0.
+        command
+            .stdin(asupersync::process::Stdio::Pipe)
+            .kill_on_drop(false);
+    }
+    #[cfg(not(unix))]
     command.kill_on_drop(true);
     command
 }
 
 #[cfg(unix)]
-fn managed_process_group_has_members(process_group_id: i32) -> McpResult<bool> {
+fn kernel_process_group_exists(process_group_id: i32) -> McpResult<bool> {
     let process_group_id = rustix::process::Pid::from_raw(process_group_id).ok_or_else(|| {
         fastmcp_core::McpError::internal_error(
             "Managed development process group has an invalid identifier",
@@ -2950,7 +3531,11 @@ fn managed_process_group_has_members(process_group_id: i32) -> McpResult<bool> {
     }
 }
 
-fn wait_for_owned_dev_group_cleanup(child: &asupersync::process::Child) -> McpResult<()> {
+fn wait_for_owned_dev_group_cleanup(child: &mut asupersync::process::Child) -> McpResult<()> {
+    // Closing the only owner-side writer releases the signal-immune watchdog.
+    // It targets its still-pinned current group, never a remembered numeric
+    // identifier. Repeated calls are harmless once the handle is taken.
+    drop(child.stdin());
     #[cfg(unix)]
     {
         let process_group_id = child.process_group_id().ok_or_else(|| {
@@ -2960,10 +3545,33 @@ fn wait_for_owned_dev_group_cleanup(child: &asupersync::process::Child) -> McpRe
         })?;
         let deadline = std::time::Instant::now() + DEV_GROUP_CLEANUP_TIMEOUT;
         loop {
-            if !managed_process_group_has_members(process_group_id)? {
+            if !kernel_process_group_exists(process_group_id)? {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
+                #[cfg(target_os = "linux")]
+                {
+                    // Linux `kill(-pgid, 0)` reports zombie-only groups as
+                    // present. Prove the group has no live member twice before
+                    // accepting that delayed orphan reaping is the only thing
+                    // keeping the numeric group visible.
+                    let inspection_deadline = std::time::Instant::now()
+                        .checked_add(DEV_GROUP_INSPECTION_TIMEOUT)
+                        .unwrap_or_else(std::time::Instant::now);
+                    if !linux_process_group_has_live_member(process_group_id, inspection_deadline)?
+                    {
+                        std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
+                        let second_inspection_deadline = std::time::Instant::now()
+                            .checked_add(DEV_GROUP_INSPECTION_TIMEOUT)
+                            .unwrap_or_else(std::time::Instant::now);
+                        if !linux_process_group_has_live_member(
+                            process_group_id,
+                            second_inspection_deadline,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                }
                 return Err(fastmcp_core::McpError::internal_error(
                     "Managed development process group remained live after leader reap",
                 ));
@@ -3297,7 +3905,6 @@ fn run_dev_build(
     command
         .current_dir(target_path)
         .envs(env_vars)
-        .stdin(asupersync::process::Stdio::Null)
         .stdout(asupersync::process::Stdio::Pipe)
         .stderr(asupersync::process::Stdio::Pipe);
     let mut child = command.spawn().map_err(|error| {
@@ -3361,7 +3968,7 @@ fn run_dev_build(
         if exit_status.is_none() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    wait_for_owned_dev_group_cleanup(&child)?;
+                    wait_for_owned_dev_group_cleanup(&mut child)?;
                     exit_status = Some(status);
                     post_exit_deadline = Some(std::time::Instant::now() + DEV_PROCESS_REAP_PERIOD);
                 }
@@ -3501,6 +4108,20 @@ fn write_dev_status(arguments: std::fmt::Arguments<'_>) -> McpResult<()> {
     write_stdout(&arguments.to_string(), "development status output", true)
 }
 
+fn return_dev_error_with_cleanup(
+    child: &mut Option<asupersync::process::Child>,
+    operation_error: fastmcp_core::McpError,
+) -> McpResult<()> {
+    if let Some(mut running_child) = child.take()
+        && let Err(cleanup_error) = stop_dev_server(&mut running_child)
+    {
+        return Err(fastmcp_core::McpError::internal_error(format!(
+            "{operation_error}; bounded server cleanup also failed: {cleanup_error}"
+        )));
+    }
+    Err(operation_error)
+}
+
 fn write_dev_status_with_cleanup(
     child: &mut Option<asupersync::process::Child>,
     arguments: std::fmt::Arguments<'_>,
@@ -3508,15 +4129,7 @@ fn write_dev_status_with_cleanup(
     let Err(output_error) = write_dev_status(arguments) else {
         return Ok(());
     };
-
-    if let Some(mut running_child) = child.take()
-        && let Err(cleanup_error) = stop_dev_server(&mut running_child)
-    {
-        return Err(fastmcp_core::McpError::internal_error(format!(
-            "{output_error}; bounded server cleanup also failed: {cleanup_error}"
-        )));
-    }
-    Err(output_error)
+    return_dev_error_with_cleanup(child, output_error)
 }
 
 /// Dev command: Run server in development mode with hot reloading.
@@ -3741,7 +4354,6 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
             let mut command = owned_dev_command(&cmd, &args);
             command
                 .envs(env_vars)
-                .stdin(asupersync::process::Stdio::Null)
                 .stdout(asupersync::process::Stdio::Inherit)
                 .stderr(asupersync::process::Stdio::Inherit);
             if is_cargo_project {
@@ -3801,11 +4413,11 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
             }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
-                    wait_for_owned_dev_group_cleanup(&child)?;
+                    wait_for_owned_dev_group_cleanup(&mut child)?;
                     return Ok(());
                 }
                 Ok(Some(status)) => {
-                    wait_for_owned_dev_group_cleanup(&child)?;
+                    wait_for_owned_dev_group_cleanup(&mut child)?;
                     return Err(child_exit_error("Development server", status.code()));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -3984,12 +4596,13 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
         }
 
         if take_due_dev_reload(&reload_wake, debounce_duration) {
-            if config.clear {
-                term.clear_screen().map_err(|_| {
+            if config.clear && term.clear_screen().is_err() {
+                return return_dev_error_with_cleanup(
+                    &mut child,
                     fastmcp_core::McpError::internal_error(
                         "Failed to clear the development-status terminal",
-                    )
-                })?;
+                    ),
+                );
             }
 
             write_dev_status_with_cleanup(
@@ -4066,6 +4679,20 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
 }
 
 /// Probe the quarantined legacy background-task RPC model.
+fn finish_client_operation<T>(mut client: Client, operation: McpResult<T>) -> McpResult<T> {
+    let cleanup = client.close();
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation_error), Err(cleanup_error)) => {
+            Err(fastmcp_core::McpError::internal_error(format!(
+                "Client operation failed ({operation_error}); cleanup also failed ({cleanup_error})"
+            )))
+        }
+    }
+}
+
+/// Probe the quarantined legacy background-task RPC model.
 fn cmd_tasks(action: TasksAction) -> McpResult<()> {
     match action {
         TasksAction::List {
@@ -4079,8 +4706,7 @@ fn cmd_tasks(action: TasksAction) -> McpResult<()> {
             let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut client = Client::stdio(&server, &args_refs)?;
             let result = cmd_tasks_list(&mut client, status, limit, json);
-            client.close();
-            result
+            finish_client_operation(client, result)
         }
         TasksAction::Show {
             server,
@@ -4091,8 +4717,7 @@ fn cmd_tasks(action: TasksAction) -> McpResult<()> {
             let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut client = Client::stdio(&server, &args_refs)?;
             let result = cmd_tasks_show(&mut client, &task_id, json);
-            client.close();
-            result
+            finish_client_operation(client, result)
         }
         TasksAction::Cancel {
             server,
@@ -4103,15 +4728,13 @@ fn cmd_tasks(action: TasksAction) -> McpResult<()> {
             let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut client = Client::stdio(&server, &args_refs)?;
             let result = cmd_tasks_cancel(&mut client, &task_id, reason.as_deref());
-            client.close();
-            result
+            finish_client_operation(client, result)
         }
         TasksAction::Stats { server, args, json } => {
             let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut client = Client::stdio(&server, &args_refs)?;
             let result = cmd_tasks_stats(&mut client, json);
-            client.close();
-            result
+            finish_client_operation(client, result)
         }
     }
 }
@@ -4582,7 +5205,7 @@ fn cmd_inspect(
     };
 
     // Close the client
-    client.close();
+    client.close()?;
 
     // Format output
     let output_text = match format {
@@ -5122,12 +5745,174 @@ fn server_configs_semantically_equal(left: &McpServerConfig, right: &McpServerCo
         && left.disabled == right.disabled
 }
 
+fn serialize_server_config_object(
+    config: &McpServerConfig,
+) -> McpResult<serde_json::Map<String, serde_json::Value>> {
+    serde_json::to_value(config)
+        .map_err(|_| {
+            fastmcp_core::McpError::internal_error("Failed to serialize installation config entry")
+        })?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "Serialized installation config entry was not a JSON object",
+            )
+        })
+}
+
+fn shape_install_server_entry(
+    target: InstallTarget,
+    mut server: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    match target {
+        InstallTarget::Claude | InstallTarget::Cursor => {
+            server.insert(
+                "type".to_owned(),
+                serde_json::Value::String("stdio".to_owned()),
+            );
+            server
+        }
+        InstallTarget::Cline => {
+            let disabled = server.remove("disabled");
+            server.insert(
+                "type".to_owned(),
+                serde_json::Value::String("stdio".to_owned()),
+            );
+            let mut outer = serde_json::Map::new();
+            outer.insert("transport".to_owned(), serde_json::Value::Object(server));
+            if let Some(disabled) = disabled {
+                outer.insert("disabled".to_owned(), disabled);
+            }
+            outer
+        }
+    }
+}
+
+fn install_entry_has_remote_transport(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    entry.contains_key("url")
+        || entry.contains_key("headers")
+        || entry.contains_key("auth")
+        || entry.contains_key("oauth")
+        || entry
+            .get("type")
+            .is_some_and(|kind| kind.as_str() != Some("stdio"))
+        || entry
+            .get("transportType")
+            .is_some_and(|kind| kind.as_str() != Some("stdio"))
+}
+
+fn has_valid_install_profile_fields(
+    target: InstallTarget,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    entry.iter().all(|(field, value)| {
+        classify_client_server_field(target, field, value) != ClientServerFieldClass::Unsupported
+    })
+}
+
+fn effective_installed_server_config(
+    target: InstallTarget,
+    entry: &serde_json::Value,
+) -> Option<McpServerConfig> {
+    let fields = entry.as_object()?;
+    // A FastMCP local install owns neither remote-sync membership nor OAuth
+    // state from the previous transport. Their presence must force a real
+    // rewrite so merge can clear them before a later semantic no-op.
+    if target == InstallTarget::Cline
+        && (fields.contains_key("remoteConfigured") || fields.contains_key("oauth"))
+    {
+        return None;
+    }
+    if target == InstallTarget::Cline && fields.contains_key("transport") {
+        if fields.keys().any(|field| {
+            matches!(
+                field.as_str(),
+                "type"
+                    | "transportType"
+                    | "command"
+                    | "args"
+                    | "env"
+                    | "cwd"
+                    | "url"
+                    | "headers"
+                    | "auth"
+            )
+        }) {
+            return None;
+        }
+        let transport = fields.get("transport")?.as_object()?;
+        if transport
+            .keys()
+            .any(|field| !matches!(field.as_str(), "type" | "command" | "args" | "cwd" | "env"))
+            || install_entry_has_remote_transport(transport)
+            || transport.get("type").and_then(serde_json::Value::as_str) != Some("stdio")
+        {
+            return None;
+        }
+        let mut normalized = serde_json::Map::new();
+        for field in ["command", "args", "cwd", "env"] {
+            if let Some(value) = transport.get(field) {
+                normalized.insert(field.to_owned(), value.clone());
+            }
+        }
+        if let Some(disabled) = fields.get("disabled") {
+            normalized.insert("disabled".to_owned(), disabled.clone());
+        }
+        return McpServerConfig::deserialize(serde_json::Value::Object(normalized)).ok();
+    }
+    if install_entry_has_remote_transport(fields) {
+        return None;
+    }
+    McpServerConfig::deserialize(entry.clone()).ok()
+}
+
+fn merge_install_server_entry(
+    target: InstallTarget,
+    existing: &mut serde_json::Map<String, serde_json::Value>,
+    desired: serde_json::Map<String, serde_json::Value>,
+) {
+    for owned_key in [
+        "transport",
+        "type",
+        "transportType",
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "disabled",
+        "url",
+        "headers",
+        "auth",
+        "oauth",
+        "remoteConfigured",
+    ] {
+        existing.remove(owned_key);
+    }
+    if target != InstallTarget::Cursor {
+        // `envFile` is Cursor-owned orthogonal metadata. It must survive a
+        // Cursor stdio update but is not meaningful in the other registries.
+        existing.remove("envFile");
+    }
+    existing.extend(desired);
+}
+
 fn generate_server_config(
     name: &str,
     server: &str,
     args: &[String],
     cwd: Option<&Path>,
 ) -> McpResult<(String, McpServerConfig)> {
+    if name.trim().is_empty() {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "Install server name cannot be empty or whitespace",
+        ));
+    }
+    if server.trim().is_empty() {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "Install server command cannot be empty or whitespace",
+        ));
+    }
     if args.len() > CLI_OUTPUT_MAX_ITEMS {
         return Err(fastmcp_core::McpError::invalid_params(format!(
             "Install argument list contains {} entries; maximum accepted count is {CLI_OUTPUT_MAX_ITEMS}",
@@ -5158,6 +5943,7 @@ fn generate_server_config(
 fn redacted_install_config_snippet(
     registry_name: &str,
     config: &(String, McpServerConfig),
+    target: InstallTarget,
 ) -> McpResult<String> {
     let mut server = serde_json::Map::new();
     server.insert(
@@ -5198,6 +5984,7 @@ fn redacted_install_config_snippet(
         server.insert("disabled".to_owned(), serde_json::Value::Bool(true));
     }
 
+    let server = shape_install_server_entry(target, server);
     let mut servers = serde_json::Map::new();
     servers.insert(
         sanitize_peer_text(&config.0, PEER_FIELD_LIMIT),
@@ -5425,6 +6212,9 @@ mod publication_durability {
 
 use publication_durability::DurablePublication;
 
+// The result is intentionally fallible at the cross-platform API boundary;
+// only the verified Linux implementation compiles to an unconditional `Ok`.
+#[cfg_attr(target_os = "linux", allow(clippy::unnecessary_wraps))]
 fn ensure_atomic_replace_supported() -> McpResult<()> {
     #[cfg(target_os = "linux")]
     {
@@ -6762,7 +7552,7 @@ fn validate_atomic_destination_name(path: &Path, context: &str) -> McpResult<()>
             )));
         }
     }
-    let Some(_name) = path.file_name() else {
+    let Some(name) = path.file_name() else {
         return Err(fastmcp_core::McpError::invalid_params(format!(
             "Cannot write {context}: destination has no file name"
         )));
@@ -6771,13 +7561,15 @@ fn validate_atomic_destination_name(path: &Path, context: &str) -> McpResult<()>
     {
         use std::os::unix::ffi::OsStrExt as _;
 
-        if _name.as_bytes().starts_with(b".fastmcp-stage-") {
+        if name.as_bytes().starts_with(b".fastmcp-stage-") {
             return Err(fastmcp_core::McpError::invalid_params(format!(
                 "Refusing to write {context} at {}: destination names beginning with the reserved .fastmcp-stage- prefix are not accepted",
                 sanitize_config_path(path)
             )));
         }
     }
+    #[cfg(not(unix))]
+    let _ = name;
     Ok(())
 }
 
@@ -8659,25 +9451,30 @@ fn validate_install_registry_counts(
         let Some(entry) = entry.as_object() else {
             continue;
         };
-        if entry
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|args| args.len() > CLI_OUTPUT_MAX_ITEMS)
-        {
-            return Err(fastmcp_core::McpError::invalid_params(format!(
-                "Refusing to update {registry_name} at {}: an existing argument list exceeds {CLI_OUTPUT_MAX_ITEMS} entries",
-                sanitize_config_path(config_path)
-            )));
-        }
-        if entry
-            .get("env")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|environment| environment.len() > CLI_OUTPUT_MAX_ITEMS)
-        {
-            return Err(fastmcp_core::McpError::invalid_params(format!(
-                "Refusing to update {registry_name} at {}: an existing environment exceeds {CLI_OUTPUT_MAX_ITEMS} entries",
-                sanitize_config_path(config_path)
-            )));
+        let nested_transport = entry
+            .get("transport")
+            .and_then(serde_json::Value::as_object);
+        for transport_fields in std::iter::once(entry).chain(nested_transport) {
+            if transport_fields
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| args.len() > CLI_OUTPUT_MAX_ITEMS)
+            {
+                return Err(fastmcp_core::McpError::invalid_params(format!(
+                    "Refusing to update {registry_name} at {}: an existing argument list exceeds {CLI_OUTPUT_MAX_ITEMS} entries",
+                    sanitize_config_path(config_path)
+                )));
+            }
+            if transport_fields
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|environment| environment.len() > CLI_OUTPUT_MAX_ITEMS)
+            {
+                return Err(fastmcp_core::McpError::invalid_params(format!(
+                    "Refusing to update {registry_name} at {}: an existing environment exceeds {CLI_OUTPUT_MAX_ITEMS} entries",
+                    sanitize_config_path(config_path)
+                )));
+            }
         }
     }
     Ok(())
@@ -8687,6 +9484,7 @@ fn install_json_registry(
     config_path: &Path,
     registry_name: &str,
     config: &(String, McpServerConfig),
+    target: InstallTarget,
 ) -> McpResult<()> {
     validate_atomic_destination_name(config_path, "installation target config")?;
     ensure_atomic_replace_supported()?;
@@ -8720,9 +9518,18 @@ fn install_json_registry(
     let name = sanitize_peer_text(&config.0, PEER_FIELD_LIMIT);
     let config_path_display = sanitize_config_path(config_path);
     let entry_existed = registry.contains_key(&config.0);
+    if registry
+        .get(&config.0)
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|entry| !has_valid_install_profile_fields(target, entry))
+    {
+        return Err(fastmcp_core::McpError::invalid_params(format!(
+            "Existing server entry '{name}' in {registry_name} at {config_path_display} contains unsupported or malformed per-server fields; refusing to preserve or discard them"
+        )));
+    }
     let semantic_noop = registry
         .get(&config.0)
-        .and_then(|existing| McpServerConfig::deserialize(existing.clone()).ok())
+        .and_then(|existing| effective_installed_server_config(target, existing))
         .is_some_and(|existing| server_configs_semantically_equal(&existing, &config.1));
     if semantic_noop {
         let current = read_destination_snapshot_at(
@@ -8756,14 +9563,7 @@ fn install_json_registry(
         ));
     }
     validate_install_registry_counts(config_path, registry_name, registry, &config.0)?;
-    let server = serde_json::to_value(&config.1).map_err(|_| {
-        fastmcp_core::McpError::internal_error("Failed to serialize installation config entry")
-    })?;
-    let server = server.as_object().cloned().ok_or_else(|| {
-        fastmcp_core::McpError::internal_error(
-            "Serialized installation config entry was not a JSON object",
-        )
-    })?;
+    let server = shape_install_server_entry(target, serialize_server_config_object(&config.1)?);
     if let Some(existing) = registry.get_mut(&config.0) {
         let existing = existing.as_object_mut().ok_or_else(|| {
             fastmcp_core::McpError::invalid_params(format!(
@@ -8771,10 +9571,7 @@ fn install_json_registry(
                 sanitize_peer_text(&config.0, PEER_FIELD_LIMIT)
             ))
         })?;
-        for owned_key in ["command", "args", "env", "cwd", "disabled"] {
-            existing.remove(owned_key);
-        }
-        existing.extend(server);
+        merge_install_server_entry(target, existing, server);
     } else {
         registry.insert(config.0.clone(), serde_json::Value::Object(server));
     }
@@ -8887,13 +9684,13 @@ fn install_claude_desktop(config: &(String, McpServerConfig), dry_run: bool) -> 
     let config_path = get_claude_desktop_config_path()?;
 
     if dry_run {
-        let snippet = redacted_install_config_snippet("mcpServers", config)?;
+        let snippet = redacted_install_config_snippet("mcpServers", config, InstallTarget::Claude)?;
         return write_install_stdout(&format!(
             "Dry-run: proposed update to {}:\n\n{snippet}",
             sanitize_config_path(&config_path)
         ));
     }
-    install_json_registry(&config_path, "mcpServers", config)
+    install_json_registry(&config_path, "mcpServers", config, InstallTarget::Claude)
 }
 
 fn get_claude_desktop_config_path() -> McpResult<PathBuf> {
@@ -8909,14 +9706,14 @@ fn install_cursor(config: &(String, McpServerConfig), dry_run: bool) -> McpResul
     let config_path = get_cursor_config_path()?;
 
     if dry_run {
-        let snippet = redacted_install_config_snippet("mcpServers", config)?;
+        let snippet = redacted_install_config_snippet("mcpServers", config, InstallTarget::Cursor)?;
         return write_install_stdout(&format!(
             "Dry-run: proposed update to {}:\n\n{snippet}",
             sanitize_config_path(&config_path)
         ));
     }
 
-    install_json_registry(&config_path, "mcpServers", config)
+    install_json_registry(&config_path, "mcpServers", config, InstallTarget::Cursor)
 }
 
 fn get_cursor_config_path() -> McpResult<PathBuf> {
@@ -8931,51 +9728,86 @@ fn get_cursor_config_path() -> McpResult<PathBuf> {
 }
 
 fn install_cline(config: &(String, McpServerConfig), dry_run: bool) -> McpResult<()> {
-    // Cline uses VSCode settings
     let config_path = get_cline_config_path()?;
 
     if dry_run {
-        let snippet = redacted_install_config_snippet("cline.mcpServers", config)?;
+        let snippet = redacted_install_config_snippet("mcpServers", config, InstallTarget::Cline)?;
         return write_install_stdout(&format!(
-            "Dry-run: proposed update to VS Code settings at {}:\n\n{snippet}",
+            "Dry-run: proposed update to Cline settings at {}:\n\n{snippet}",
             sanitize_config_path(&config_path)
         ));
     }
 
-    install_json_registry(&config_path, "cline.mcpServers", config)
+    install_json_registry(&config_path, "mcpServers", config, InstallTarget::Cline)
+}
+
+fn nonempty_environment_value(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(value) = value.to_str() {
+        let value = value.trim();
+        return (!value.is_empty()).then(|| std::ffi::OsString::from(value));
+    }
+    Some(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_cline_config_path(
+    settings_path: Option<std::ffi::OsString>,
+    data_dir: Option<std::ffi::OsString>,
+    cline_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+    home_drive: Option<std::ffi::OsString>,
+    home_path: Option<std::ffi::OsString>,
+) -> McpResult<PathBuf> {
+    if let Some(path) = nonempty_environment_value(settings_path) {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = nonempty_environment_value(data_dir) {
+        return Ok(PathBuf::from(path)
+            .join("settings")
+            .join("cline_mcp_settings.json"));
+    }
+    if let Some(path) = nonempty_environment_value(cline_dir) {
+        return Ok(PathBuf::from(path)
+            .join("data")
+            .join("settings")
+            .join("cline_mcp_settings.json"));
+    }
+
+    let home = nonempty_environment_value(home)
+        .filter(|home| home.as_os_str() != std::ffi::OsStr::new("~"))
+        .or_else(|| nonempty_environment_value(user_profile))
+        .or_else(|| {
+            let mut drive = nonempty_environment_value(home_drive)?;
+            drive.push(nonempty_environment_value(home_path)?);
+            Some(drive)
+        })
+        .ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "Cline configuration directory is unavailable: HOME and platform home-directory fallbacks are unset",
+            )
+        })?;
+    Ok(PathBuf::from(home)
+        .join(".cline")
+        .join("data")
+        .join("settings")
+        .join("cline_mcp_settings.json"))
 }
 
 fn get_cline_config_path() -> McpResult<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            fastmcp_core::McpError::internal_error("HOME environment variable not set")
-        })?;
-        Ok(PathBuf::from(home).join("Library/Application Support/Code/User/settings.json"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = env::var_os("APPDATA").ok_or_else(|| {
-            fastmcp_core::McpError::internal_error("APPDATA environment variable not set")
-        })?;
-        Ok(PathBuf::from(appdata).join("Code/User/settings.json"))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            fastmcp_core::McpError::internal_error("HOME environment variable not set")
-        })?;
-        Ok(PathBuf::from(home).join(".config/Code/User/settings.json"))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Err(fastmcp_core::McpError::internal_error(
-            "Cline configuration path is unsupported on this platform",
-        ))
-    }
+    resolve_cline_config_path(
+        env::var_os("CLINE_MCP_SETTINGS_PATH"),
+        env::var_os("CLINE_DATA_DIR"),
+        env::var_os("CLINE_DIR"),
+        env::var_os("HOME"),
+        env::var_os("USERPROFILE"),
+        env::var_os("HOMEDRIVE"),
+        env::var_os("HOMEPATH"),
+    )
 }
 
 #[cfg(test)]
@@ -9229,13 +10061,15 @@ mod tests {
             match cli.command {
                 Commands::Test {
                     server,
-                    timeout,
+                    idle_timeout,
+                    absolute_timeout,
                     verbose,
                     json,
                     ..
                 } => {
                     assert_eq!(server, "./server");
-                    assert_eq!(timeout, 30);
+                    assert_eq!(idle_timeout, 30);
+                    assert_eq!(absolute_timeout, 120);
                     assert!(!verbose);
                     assert!(!json);
                 }
@@ -9248,8 +10082,10 @@ mod tests {
             let cli = Cli::try_parse_from([
                 "fastmcp",
                 "test",
-                "--timeout",
-                "60",
+                "--idle-timeout",
+                "45",
+                "--absolute-timeout",
+                "180",
                 "-v",
                 "--json",
                 "./server",
@@ -9257,12 +10093,14 @@ mod tests {
             .unwrap();
             match cli.command {
                 Commands::Test {
-                    timeout,
+                    idle_timeout,
+                    absolute_timeout,
                     verbose,
                     json,
                     ..
                 } => {
-                    assert_eq!(timeout, 60);
+                    assert_eq!(idle_timeout, 45);
+                    assert_eq!(absolute_timeout, 180);
                     assert!(verbose);
                     assert!(json);
                 }
@@ -9661,6 +10499,19 @@ mod tests {
         }
 
         #[test]
+        fn generate_server_config_rejects_blank_names_and_commands() {
+            let blank_name = generate_server_config("  ", "server", &[], None)
+                .err()
+                .expect("blank server name must be rejected");
+            assert!(blank_name.message.contains("name"));
+
+            let blank_command = generate_server_config("server", "\t", &[], None)
+                .err()
+                .expect("blank server command must be rejected");
+            assert!(blank_command.message.contains("command"));
+        }
+
+        #[test]
         fn task_list_json_uses_an_explicit_pagination_envelope() {
             let task = fastmcp_protocol::TaskInfo {
                 id: fastmcp_protocol::TaskId::from_string("task-1"),
@@ -9716,25 +10567,461 @@ mod tests {
                 })
                 .collect::<serde_json::Map<_, _>>();
             let registry_error =
-                parse_json_server_entries(Path::new("config.json"), "test", &registry)
+                parse_json_server_entries(Path::new("config.json"), "test", &registry, None)
                     .expect_err("oversized registry must be rejected");
             assert!(registry_error.message.contains("registry contains"));
 
-            let nested = serde_json::Map::from_iter([(
+            let nested_arguments = serde_json::Map::from_iter([(
                 "server".to_owned(),
                 serde_json::json!({
-                    "command": "server",
-                    "args": vec!["value"; CLI_OUTPUT_MAX_ITEMS + 1],
+                    "transport": {
+                        "type": "stdio",
+                        "command": "server",
+                        "args": vec!["value"; CLI_OUTPUT_MAX_ITEMS + 1],
+                    },
                 }),
             )]);
-            let nested_error = validate_install_registry_counts(
+            let arguments_error = validate_install_registry_counts(
                 Path::new("config.json"),
                 "mcpServers",
-                &nested,
+                &nested_arguments,
                 "replacement",
             )
             .expect_err("oversized nested arguments must be rejected");
-            assert!(nested_error.message.contains("argument list exceeds"));
+            assert!(arguments_error.message.contains("argument list exceeds"));
+
+            let nested_environment = serde_json::Map::from_iter([(
+                "server".to_owned(),
+                serde_json::json!({
+                    "transport": {
+                        "type": "stdio",
+                        "command": "server",
+                        "env": (0..=CLI_OUTPUT_MAX_ITEMS)
+                            .map(|index| (format!("KEY_{index}"), "value".to_owned()))
+                            .collect::<HashMap<_, _>>(),
+                    },
+                }),
+            )]);
+            let environment_error = validate_install_registry_counts(
+                Path::new("config.json"),
+                "mcpServers",
+                &nested_environment,
+                "replacement",
+            )
+            .expect_err("oversized nested environment must be rejected");
+            assert!(environment_error.message.contains("environment exceeds"));
+        }
+
+        #[test]
+        fn install_profile_projection_rejects_conflicting_or_malformed_transport_state() {
+            let invalid_cursor_type = serde_json::json!({
+                "type": 7,
+                "command": "server",
+            });
+            assert!(
+                effective_installed_server_config(InstallTarget::Cursor, &invalid_cursor_type)
+                    .is_none()
+            );
+
+            let blank_env_file = serde_json::json!({
+                "type": "stdio",
+                "command": "server",
+                "envFile": "  ",
+            });
+            assert!(!has_valid_install_profile_fields(
+                InstallTarget::Cursor,
+                blank_env_file.as_object().expect("Cursor fixture object")
+            ));
+
+            let cline = serde_json::json!({
+                "transport": {"type": "stdio", "command": "server", "args": []},
+                "metadata": ["preserve", null],
+            });
+            assert!(has_valid_install_profile_fields(
+                InstallTarget::Cline,
+                cline.as_object().expect("Cline fixture object")
+            ));
+            assert_eq!(
+                effective_installed_server_config(InstallTarget::Cline, &cline)
+                    .expect("valid Cline transport")
+                    .command,
+                "server"
+            );
+
+            for transport_owned_state in [
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server"},
+                    "remoteConfigured": false,
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server"},
+                    "oauth": null,
+                }),
+            ] {
+                assert!(has_valid_install_profile_fields(
+                    InstallTarget::Cline,
+                    transport_owned_state
+                        .as_object()
+                        .expect("Cline transport-owned fixture object")
+                ));
+                assert!(
+                    effective_installed_server_config(InstallTarget::Cline, &transport_owned_state)
+                        .is_none(),
+                    "transport-owned state must force a cleanup rewrite"
+                );
+            }
+
+            let unsupported = serde_json::json!({
+                "command": "server",
+                "clientExtension": {"keep": true},
+            });
+            for target in [
+                InstallTarget::Claude,
+                InstallTarget::Cursor,
+                InstallTarget::Cline,
+            ] {
+                assert!(!has_valid_install_profile_fields(
+                    target,
+                    unsupported
+                        .as_object()
+                        .expect("unsupported extension fixture object")
+                ));
+            }
+
+            for conflicting in [
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server"},
+                    "command": "duplicate",
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server", "argz": []},
+                }),
+            ] {
+                assert!(
+                    effective_installed_server_config(InstallTarget::Cline, &conflicting).is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn list_entry_parsers_reject_unknown_fields_without_echoing_values() {
+            const SECRET: &str = "UNKNOWN_ENTRY_FIELD_SECRET";
+            const NAME_SECRET: &str = "UNKNOWN_ENTRY_NAME_SECRET";
+            const SOURCE_SECRET: &str = "UNKNOWN_ENTRY_SOURCE_SECRET";
+            let path = Path::new("config.json");
+            let json = serde_json::json!({
+                "command": "server",
+                "credential_typo": [SECRET],
+            });
+            let json_error = parse_json_server_entry(
+                path,
+                &format!("token={SOURCE_SECRET}"),
+                &format!("api_key={NAME_SECRET}"),
+                &json,
+                None,
+            )
+            .expect_err("unknown JSON entry fields must be rejected");
+            assert!(json_error.message.contains("schema validation failed"));
+            assert!(!json_error.message.contains(SECRET));
+            assert!(!json_error.message.contains(NAME_SECRET));
+            assert!(!json_error.message.contains(SOURCE_SECRET));
+            for target in [
+                InstallTarget::Claude,
+                InstallTarget::Cursor,
+                InstallTarget::Cline,
+            ] {
+                let client_error =
+                    parse_json_server_entry(path, "client", "server", &json, Some(target))
+                        .expect_err("client registries must reject unknown field names");
+                assert!(client_error.message.contains("schema validation failed"));
+                assert!(!client_error.message.contains(SECRET));
+            }
+
+            let toml_source = format!("command = \"server\"\ncredential_typo = [\"{SECRET}\"]\n");
+            let toml = toml::from_str::<toml::Value>(&toml_source).expect("valid TOML fixture");
+            let toml_error = parse_toml_server_entry(path, "test", "server", &toml)
+                .expect_err("unknown TOML entry fields must be rejected");
+            assert!(toml_error.message.contains("schema validation failed"));
+            assert!(!toml_error.message.contains(SECRET));
+        }
+
+        #[test]
+        fn list_entry_parsers_accept_only_typed_target_extensions() {
+            let path = Path::new("config.json");
+            let cases = [
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({"command": "server"}),
+                ),
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({
+                        "command": "server",
+                        "type": "stdio",
+                    }),
+                ),
+                (
+                    InstallTarget::Cursor,
+                    serde_json::json!({
+                        "command": "server",
+                        "type": "stdio",
+                        "envFile": ".env.local",
+                    }),
+                ),
+                (
+                    InstallTarget::Cline,
+                    serde_json::json!({
+                        "command": "server",
+                        "type": "stdio",
+                        "transportType": "stdio",
+                        "autoApprove": ["echo"],
+                        "timeout": 1.5,
+                        "remoteConfigured": false,
+                        "metadata": {"owner": "test"},
+                    }),
+                ),
+            ];
+
+            for (target, value) in cases {
+                let parsed =
+                    parse_json_server_entry(path, "client", "server", &value, Some(target))
+                        .expect("recognized typed client metadata must be accepted");
+                assert_eq!(parsed.command, "server");
+            }
+
+            for (target, value) in [
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({"command": "server", "type": "http"}),
+                ),
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({"command": "server", "url": "https://example.invalid/mcp"}),
+                ),
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({"command": "server", "tyep": "stdio"}),
+                ),
+                (
+                    InstallTarget::Cursor,
+                    serde_json::json!({"command": "server", "envFile": "  "}),
+                ),
+                (
+                    InstallTarget::Cursor,
+                    serde_json::json!({"command": "server", "headers": {"X-Test": "value"}}),
+                ),
+                (
+                    InstallTarget::Cline,
+                    serde_json::json!({"command": "server", "autoApprove": [7]}),
+                ),
+                (
+                    InstallTarget::Cline,
+                    serde_json::json!({"command": "server", "timeout": "sixty"}),
+                ),
+                (
+                    InstallTarget::Cline,
+                    serde_json::json!({"command": "server", "type": "sse"}),
+                ),
+                (
+                    InstallTarget::Claude,
+                    serde_json::json!({"command": "server", "envFile": ".env"}),
+                ),
+            ] {
+                let error = parse_json_server_entry(path, "client", "server", &value, Some(target))
+                    .expect_err("unsupported or malformed target fields must be rejected");
+                assert!(
+                    error.message.contains("schema validation failed")
+                        || error.message.contains("not yet representable")
+                );
+            }
+        }
+
+        #[test]
+        fn cline_nested_stdio_entries_are_projected_and_strictly_validated() {
+            const SECRET: &str = "NESTED_CLINE_SECRET_MUST_NOT_LEAK";
+            let path = Path::new("config.json");
+            let entry = serde_json::json!({
+                "transport": {
+                    "type": "stdio",
+                    "command": "server",
+                    "args": ["--mode", "test"],
+                    "cwd": "/srv/server",
+                    "env": {"MODE": "test"},
+                },
+                "disabled": true,
+                "autoApprove": ["echo"],
+                "timeout": 60,
+                "remoteConfigured": false,
+                "oauth": ["preserved", null],
+                "metadata": null,
+            });
+            let parsed = parse_json_server_entry(
+                path,
+                "Cline",
+                "server",
+                &entry,
+                Some(InstallTarget::Cline),
+            )
+            .expect("valid current Cline stdio entry");
+            assert_eq!(parsed.command, "server");
+            assert_eq!(parsed.args, ["--mode", "test"]);
+            assert_eq!(parsed.cwd.as_deref(), Some("/srv/server"));
+            assert_eq!(
+                parsed.env.as_ref().and_then(|env| env.get("MODE")),
+                Some(&"test".to_owned())
+            );
+            assert!(!parsed.enabled);
+
+            for malformed in [
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server"},
+                    "command": "duplicate",
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server"},
+                    "timeot": 60,
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "commnad": SECRET},
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": ""},
+                }),
+                serde_json::json!({
+                    "transport": {"type": "sse", "url": SECRET},
+                }),
+                serde_json::json!({
+                    "transport": {"type": "stdio", "command": "server", "args": [7]},
+                }),
+            ] {
+                let error = parse_json_server_entry(
+                    path,
+                    "Cline",
+                    "server",
+                    &malformed,
+                    Some(InstallTarget::Cline),
+                )
+                .expect_err("malformed nested Cline entries must be rejected");
+                assert!(!error.message.contains(SECRET));
+            }
+        }
+
+        #[test]
+        fn cline_unknown_oauth_and_metadata_values_accept_bounded_json_shapes() {
+            let path = Path::new("config.json");
+            for field in ["oauth", "metadata"] {
+                for value in [
+                    serde_json::Value::Null,
+                    serde_json::json!(true),
+                    serde_json::json!(17),
+                    serde_json::json!("opaque-state"),
+                    serde_json::json!(["opaque", null, 3]),
+                    serde_json::json!({"opaque": [true, null]}),
+                ] {
+                    let mut flat = serde_json::Map::from_iter([(
+                        "command".to_owned(),
+                        serde_json::json!("server"),
+                    )]);
+                    flat.insert(field.to_owned(), value.clone());
+                    parse_json_server_entry(
+                        path,
+                        "Cline",
+                        "flat-server",
+                        &serde_json::Value::Object(flat),
+                        Some(InstallTarget::Cline),
+                    )
+                    .expect("bounded flat Cline unknown value");
+
+                    let mut nested = serde_json::Map::from_iter([(
+                        "transport".to_owned(),
+                        serde_json::json!({"type": "stdio", "command": "server"}),
+                    )]);
+                    nested.insert(field.to_owned(), value);
+                    parse_json_server_entry(
+                        path,
+                        "Cline",
+                        "nested-server",
+                        &serde_json::Value::Object(nested),
+                        Some(InstallTarget::Cline),
+                    )
+                    .expect("bounded nested Cline unknown value");
+                }
+            }
+        }
+
+        #[test]
+        fn cline_extension_bounds_are_enforced() {
+            let path = Path::new("config.json");
+            for timeout in [
+                serde_json::json!(1),
+                serde_json::json!(1.5),
+                serde_json::json!(3600),
+            ] {
+                let entry = serde_json::json!({"command": "server", "timeout": timeout});
+                parse_json_server_entry(
+                    path,
+                    "Cline",
+                    "server",
+                    &entry,
+                    Some(InstallTarget::Cline),
+                )
+                .expect("bounded timeout");
+            }
+            for timeout in [
+                serde_json::json!(0),
+                serde_json::json!(3600.1),
+                serde_json::json!("60"),
+            ] {
+                let entry = serde_json::json!({"command": "server", "timeout": timeout});
+                parse_json_server_entry(
+                    path,
+                    "Cline",
+                    "server",
+                    &entry,
+                    Some(InstallTarget::Cline),
+                )
+                .expect_err("out-of-range timeout");
+            }
+
+            let oversized_approvals = serde_json::json!({
+                "command": "server",
+                "autoApprove": vec!["tool"; CLI_OUTPUT_MAX_ITEMS + 1],
+            });
+            parse_json_server_entry(
+                path,
+                "Cline",
+                "server",
+                &oversized_approvals,
+                Some(InstallTarget::Cline),
+            )
+            .expect_err("oversized auto-approval list");
+
+            let mut deep_metadata = serde_json::json!({"leaf": true});
+            for _ in 0..9 {
+                deep_metadata = serde_json::json!({"nested": deep_metadata});
+            }
+            for field in ["oauth", "metadata"] {
+                for unbounded in [
+                    deep_metadata.clone(),
+                    serde_json::json!({
+                        "nodes": vec![serde_json::Value::Null; CLI_OUTPUT_MAX_ITEMS],
+                    }),
+                ] {
+                    let mut entry = serde_json::Map::from_iter([(
+                        "command".to_owned(),
+                        serde_json::json!("server"),
+                    )]);
+                    entry.insert(field.to_owned(), unbounded);
+                    parse_json_server_entry(
+                        path,
+                        "Cline",
+                        "server",
+                        &serde_json::Value::Object(entry),
+                        Some(InstallTarget::Cline),
+                    )
+                    .expect_err("unbounded Cline unknown value");
+                }
+            }
         }
 
         #[test]
@@ -10083,7 +11370,7 @@ mod tests {
 
             assert!(rendered.contains("tokenCount=7"));
             assert!(rendered.contains("authorization: Bearer <redacted>"));
-            assert!(rendered.contains("api_key=<redacted>"));
+            assert!(rendered.contains("api_key='<redacted>'"));
             assert!(rendered.contains("[literal]"));
             assert!(!rendered.contains("PEER_SECRET"));
             assert!(!rendered.contains("SECOND_SECRET"));
@@ -10386,16 +11673,18 @@ mod tests {
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([
-                    ("\n".to_owned(), "first".to_owned()),
-                    ("\\x0A".to_owned(), "second".to_owned()),
+                    ("token=FIRST_SECRET".to_owned(), "first".to_owned()),
+                    ("token=SECOND_SECRET".to_owned(), "second".to_owned()),
                 ])),
                 cwd: None,
                 enabled: true,
             }]);
             let environment = colliding.servers[0].env.as_ref().unwrap();
+            let (redacted_key, _) = sanitize_display_key_with_metadata("token=FIRST_SECRET");
             assert_eq!(environment.len(), 2);
-            assert!(environment.contains_key("\\x0A"));
-            assert!(environment.contains_key("\\x0A~2"));
+            assert!(environment.contains_key(&redacted_key));
+            assert!(environment.contains_key(&format!("{redacted_key}~2")));
+            assert!(colliding.mutation.redacted);
             assert!(colliding.mutation.sanitized);
             assert!(!colliding.mutation.truncated);
         }
@@ -10444,6 +11733,7 @@ mod tests {
                     duration_ms: 1.0,
                     details: None,
                     error: Some(format!("Authorization: Bearer {SECRET}")),
+                    timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
                 }],
                 total_duration_ms: 1.0,
@@ -10477,6 +11767,7 @@ mod tests {
                     duration_ms: 1.0,
                     details: None,
                     error: None,
+                    timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
                 }],
                 total_duration_ms: 1.0,
@@ -10487,6 +11778,50 @@ mod tests {
             assert!(!test.contains_key("skipped"));
             assert!(!test.contains_key("details"));
             assert!(!test.contains_key("error"));
+            assert!(!test.contains_key("timeout_source"));
+        }
+
+        #[test]
+        fn test_report_timeout_source_is_closed_and_drops_other_error_data() {
+            const SECRET: &str = "TIMEOUT-DATA-SECRET-CANARY";
+            let timeout = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InternalError,
+                "Request timed out at the idle deadline",
+                serde_json::json!({"timeoutSource": "idle", "secret": SECRET}),
+            );
+            let result = failed_test_result("ping", std::time::Duration::ZERO, &timeout);
+            assert_eq!(result.timeout_source, Some(TestTimeoutSource::Idle));
+            let report = TestReport {
+                server: "server".to_owned(),
+                success: false,
+                tests: vec![result],
+                total_duration_ms: 0.0,
+            };
+
+            let value = bounded_test_report_value(&report);
+            assert_eq!(value["tests"][0]["timeout_source"], "idle");
+            assert!(!value.to_string().contains(SECRET));
+
+            let spoofed = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InternalError,
+                "peer supplied unrelated failure",
+                serde_json::json!({"timeoutSource": "idle"}),
+            );
+            assert_eq!(allowlisted_test_timeout_source(&spoofed), None);
+
+            let wrong_code = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InvalidParams,
+                "Request timed out at the idle deadline",
+                serde_json::json!({"timeoutSource": "idle"}),
+            );
+            assert_eq!(allowlisted_test_timeout_source(&wrong_code), None);
+
+            let unknown_source = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InternalError,
+                "Request timed out at the idle deadline",
+                serde_json::json!({"timeoutSource": "peer-defined"}),
+            );
+            assert_eq!(allowlisted_test_timeout_source(&unknown_source), None);
         }
 
         #[test]
@@ -10548,6 +11883,7 @@ mod tests {
                 duration_ms: 123.456,
                 details: Some("passed".to_string()),
                 error: None,
+                timeout_source: None,
                 mutation: OutputMutationMetadata::default(),
             };
 
@@ -10569,6 +11905,7 @@ mod tests {
                 duration_ms: 50.0,
                 details: None,
                 error: Some("Connection refused".to_string()),
+                timeout_source: None,
                 mutation: OutputMutationMetadata::default(),
             };
 
@@ -10576,6 +11913,23 @@ mod tests {
             assert!(json.contains("failing_test"));
             assert!(json.contains("false"));
             assert!(json.contains("Connection refused"));
+        }
+
+        #[test]
+        fn verbose_failure_renderer_emits_error_once() {
+            let result = TestResult {
+                name: "failing_test".to_owned(),
+                success: false,
+                skipped: false,
+                duration_ms: 50.0,
+                details: None,
+                error: Some("Connection refused".to_owned()),
+                timeout_source: None,
+                mutation: OutputMutationMetadata::default(),
+            };
+
+            let rendered = render_test_result(&result, true);
+            assert_eq!(rendered.matches("Connection refused").count(), 1);
         }
 
         #[test]
@@ -10590,6 +11944,7 @@ mod tests {
                     duration_ms: 10.0,
                     details: None,
                     error: None,
+                    timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
                 }],
                 total_duration_ms: 100.0,
@@ -10654,7 +12009,7 @@ mod tests {
         }
 
         #[test]
-        fn mcp_server_config_accepts_disabled_and_ignores_client_extensions() {
+        fn mcp_server_config_deserializer_is_only_a_semantic_projection() {
             let disabled: McpServerConfig = serde_json::from_str(
                 r#"{"command":"server","args":[],"cwd":"/srv/server","disabled":true}"#,
             )
@@ -10665,7 +12020,7 @@ mod tests {
             let extended = serde_json::from_str::<McpServerConfig>(
                 r#"{"command":"server","clientExtension":{"mode":"custom"}}"#,
             )
-            .expect("unknown client extension fields are preserved by registry merge logic");
+            .expect("direct projection ignores fields that the target profile validates first");
             assert_eq!(extended.command, "server");
         }
 
@@ -10689,8 +12044,9 @@ mod tests {
                 },
             );
 
-            let preview = redacted_install_config_snippet("mcpServers", &config)
-                .expect("serialize redacted preview");
+            let preview =
+                redacted_install_config_snippet("mcpServers", &config, InstallTarget::Cursor)
+                    .expect("serialize redacted preview");
 
             for secret in [
                 "POSITIONAL_PREVIEW_SECRET",
@@ -10713,6 +12069,7 @@ mod tests {
             );
             assert_eq!(server["env"]["API_TOKEN"], "<redacted>");
             assert_eq!(server["cwd"], "token=<redacted>\\x0A/srv/server");
+            assert_eq!(server["type"], "stdio");
         }
     }
 
@@ -11155,6 +12512,101 @@ mod tests {
         }
 
         #[test]
+        fn reality_check_regression_test_output_guard_closes_after_output_failure() {
+            let cleanup_calls = std::cell::Cell::new(0_u8);
+            let value = finish_test_output(Ok(17_u8), || {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                Err(fastmcp_core::McpError::internal_error(
+                    "cleanup must not run",
+                ))
+            })
+            .expect("successful incremental output keeps the client live");
+            assert_eq!(value, 17);
+            assert_eq!(cleanup_calls.get(), 0);
+
+            let output_error = fastmcp_core::McpError::internal_error("output sentinel");
+            let error = finish_test_output::<(), _>(Err(output_error), || {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                Ok(())
+            })
+            .expect_err("failed output must be returned after verified cleanup");
+            assert_eq!(error.message, "output sentinel");
+            assert_eq!(cleanup_calls.get(), 1);
+        }
+
+        #[test]
+        fn reality_check_regression_output_guard_preserves_output_and_cleanup_failures() {
+            let error = finish_test_output::<(), _>(
+                Err(fastmcp_core::McpError::internal_error(
+                    "output failure sentinel",
+                )),
+                || {
+                    Err(fastmcp_core::McpError::internal_error(
+                        "cleanup failure sentinel",
+                    ))
+                },
+            )
+            .expect_err("unverified cleanup must remain visible");
+
+            assert!(fastmcp_client::is_cleanup_unverified(&error));
+            assert!(error.message.contains("output failure sentinel"));
+            assert!(error.message.contains("cleanup failure sentinel"));
+            let data = error
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .expect("combined failure has structured data");
+            assert!(data.get("operation").is_some());
+            assert!(data.get("cleanup").is_some());
+            assert!(
+                data.get(CLIENT_CLEANUP_DURATION_MS_DATA_KEY)
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some_and(|duration| duration >= 0.0)
+            );
+        }
+
+        #[test]
+        fn reality_check_regression_failed_connection_output_preserves_cleanup_evidence() {
+            let terminal_error = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InternalError,
+                "initialization and cleanup failed",
+                serde_json::json!({
+                    CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
+                    "operation": fastmcp_core::McpError::internal_error(
+                        "initialization sentinel"
+                    ),
+                    "cleanup": fastmcp_core::McpError::internal_error("cleanup sentinel"),
+                    CLIENT_CLEANUP_DURATION_MS_DATA_KEY: 17.0,
+                }),
+            );
+            let combined = combine_test_failure_with_output(
+                terminal_error,
+                fastmcp_core::McpError::internal_error("reporting sentinel"),
+            );
+
+            assert!(fastmcp_client::is_cleanup_unverified(&combined));
+            assert!(
+                combined
+                    .message
+                    .contains("initialization and cleanup failed")
+            );
+            assert!(combined.message.contains("reporting sentinel"));
+            let data = combined
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .expect("combined failure retains structured data");
+            assert!(data.get("operation").is_some());
+            assert!(data.get("cleanup").is_some());
+            assert!(data.get("reporting").is_some());
+            assert_eq!(
+                data.get(CLIENT_CLEANUP_DURATION_MS_DATA_KEY)
+                    .and_then(serde_json::Value::as_f64),
+                Some(17.0)
+            );
+        }
+
+        #[test]
         fn shared_stdout_writer_rejects_oversized_aggregate_before_writing() {
             let mut writer = FailingWriter::default();
             let output = "x".repeat(CLI_OUTPUT_MAX_BYTES + 1);
@@ -11179,6 +12631,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
 
             const HEX: &[u8; 16] = b"0123456789abcdef";
+            let temp_root = std::fs::canonicalize(std::env::temp_dir())
+                .expect("resolve the test temporary directory without symlink components");
             for _ in 0..16 {
                 let identifier = fastmcp_core::draw_security_identifier()
                     .expect("operating-system randomness for atomic test fixture");
@@ -11187,7 +12641,7 @@ mod tests {
                     suffix.push(char::from(HEX[usize::from(*byte >> 4)]));
                     suffix.push(char::from(HEX[usize::from(*byte & 0x0f)]));
                 }
-                let directory = std::env::temp_dir().join(format!(
+                let directory = temp_root.join(format!(
                     "fastmcp-cli-{label}-{}-{suffix}",
                     std::process::id()
                 ));
@@ -12224,10 +13678,101 @@ mod tests {
 
         #[test]
         fn test_get_cline_config_path_format() {
-            let result = get_cline_config_path();
-            if let Ok(path) = result {
-                assert!(path.ends_with("settings.json"));
-            }
+            let path = resolve_cline_config_path(
+                None,
+                None,
+                None,
+                Some(std::ffi::OsString::from("/home/test")),
+                None,
+                None,
+                None,
+            )
+            .expect("default Cline config path");
+            assert_eq!(
+                path,
+                Path::new("/home/test/.cline/data/settings/cline_mcp_settings.json")
+            );
+        }
+
+        #[test]
+        fn cline_config_path_resolver_honors_precedence_and_empty_values() {
+            use std::ffi::OsString;
+
+            let resolved = resolve_cline_config_path(
+                Some(OsString::from("  /direct/cline.json  ")),
+                Some(OsString::from("/data-root")),
+                Some(OsString::from("/cline-root")),
+                Some(OsString::from("/home/user")),
+                None,
+                None,
+                None,
+            )
+            .expect("direct settings override");
+            assert_eq!(resolved, Path::new("/direct/cline.json"));
+
+            let data_dir = resolve_cline_config_path(
+                Some(OsString::from("  ")),
+                Some(OsString::from("/data-root")),
+                Some(OsString::from("/cline-root")),
+                Some(OsString::from("/home/user")),
+                None,
+                None,
+                None,
+            )
+            .expect("data-directory override");
+            assert_eq!(
+                data_dir,
+                Path::new("/data-root/settings/cline_mcp_settings.json")
+            );
+
+            let cline_dir = resolve_cline_config_path(
+                None,
+                Some(OsString::new()),
+                Some(OsString::from("/cline-root")),
+                Some(OsString::from("/home/user")),
+                None,
+                None,
+                None,
+            )
+            .expect("Cline-directory override");
+            assert_eq!(
+                cline_dir,
+                Path::new("/cline-root/data/settings/cline_mcp_settings.json")
+            );
+
+            let home = resolve_cline_config_path(
+                None,
+                None,
+                None,
+                Some(OsString::from("~")),
+                Some(OsString::from("/profile/user")),
+                None,
+                None,
+            )
+            .expect("user-profile fallback");
+            assert_eq!(
+                home,
+                Path::new("/profile/user/.cline/data/settings/cline_mcp_settings.json")
+            );
+
+            let drive_home = resolve_cline_config_path(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(OsString::from("C:")),
+                Some(OsString::from("\\Users\\test")),
+            )
+            .expect("drive-and-home-path fallback");
+            assert!(
+                drive_home
+                    .as_os_str()
+                    .to_string_lossy()
+                    .ends_with("C:\\Users\\test/.cline/data/settings/cline_mcp_settings.json")
+            );
+
+            assert!(resolve_cline_config_path(None, None, None, None, None, None, None).is_err());
         }
 
         #[cfg(unix)]
@@ -12437,10 +13982,75 @@ mod tests {
         }
 
         #[test]
-        fn test_invalid_timeout_value() {
-            let result =
-                Cli::try_parse_from(["fastmcp", "test", "--timeout", "not-a-number", "./server"]);
-            assert!(result.is_err());
+        fn test_invalid_timeout_values() {
+            for option in ["--idle-timeout", "--absolute-timeout"] {
+                let result =
+                    Cli::try_parse_from(["fastmcp", "test", option, "not-a-number", "./server"]);
+                assert!(result.is_err(), "{option} must reject non-numeric input");
+            }
+        }
+
+        #[test]
+        fn test_idle_timeout_seconds_enforces_documented_boundaries() {
+            for invalid in ["0", "301"] {
+                let result =
+                    Cli::try_parse_from(["fastmcp", "test", "--idle-timeout", invalid, "./server"]);
+                assert!(result.is_err(), "idle timeout {invalid} must be rejected");
+            }
+
+            for (valid, expected) in [("1", 1), ("300", 300)] {
+                let cli =
+                    Cli::try_parse_from(["fastmcp", "test", "--idle-timeout", valid, "./server"])
+                        .expect("idle timeout boundary must be accepted");
+                let Commands::Test { idle_timeout, .. } = cli.command else {
+                    panic!("expected test command");
+                };
+                assert_eq!(idle_timeout, expected);
+            }
+        }
+
+        #[test]
+        fn test_absolute_timeout_seconds_enforces_documented_boundaries() {
+            for invalid in ["0", "901"] {
+                let result = Cli::try_parse_from([
+                    "fastmcp",
+                    "test",
+                    "--absolute-timeout",
+                    invalid,
+                    "./server",
+                ]);
+                assert!(
+                    result.is_err(),
+                    "absolute timeout {invalid} must be rejected"
+                );
+            }
+
+            for (valid, expected) in [("1", 1), ("900", 900)] {
+                let cli = Cli::try_parse_from([
+                    "fastmcp",
+                    "test",
+                    "--absolute-timeout",
+                    valid,
+                    "./server",
+                ])
+                .expect("absolute timeout boundary must be accepted");
+                let Commands::Test {
+                    absolute_timeout, ..
+                } = cli.command
+                else {
+                    panic!("expected test command");
+                };
+                assert_eq!(absolute_timeout, expected);
+            }
+        }
+
+        #[test]
+        fn test_removed_single_timeout_option_is_rejected() {
+            let result = Cli::try_parse_from(["fastmcp", "test", "--timeout", "30", "./server"]);
+            assert!(
+                result.is_err(),
+                "removed --timeout option must not be aliased"
+            );
         }
 
         #[test]
@@ -12667,7 +14277,7 @@ mod tests {
                 &["-c".to_owned(), "trap '' HUP INT TERM; sleep 5".to_owned()],
             );
             command
-                .stdin(asupersync::process::Stdio::Null)
+                .stdin(asupersync::process::Stdio::Pipe)
                 .stdout(asupersync::process::Stdio::Null)
                 .stderr(asupersync::process::Stdio::Null);
             let child = command.spawn().expect("spawn guarded development child");
@@ -12675,7 +14285,7 @@ mod tests {
                 .process_group_id()
                 .expect("owned child must have a managed process group");
             assert!(
-                managed_process_group_has_members(process_group_id)
+                kernel_process_group_exists(process_group_id)
                     .expect("observe live managed process group")
             );
 
@@ -12683,9 +14293,15 @@ mod tests {
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {
-                if !managed_process_group_has_members(process_group_id)
-                    .expect("observe managed process-group cleanup")
-                {
+                #[cfg(target_os = "linux")]
+                let group_has_live_member =
+                    linux_process_group_has_live_member(process_group_id, deadline)
+                        .expect("inspect managed process-group cleanup");
+                #[cfg(not(target_os = "linux"))]
+                let group_has_live_member = kernel_process_group_exists(process_group_id)
+                    .expect("observe managed process-group cleanup");
+
+                if !group_has_live_member {
                     break;
                 }
                 assert!(
@@ -12694,6 +14310,83 @@ mod tests {
                 );
                 std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
             }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn reality_check_regression_dev_watchdog_preserves_private_stdin_pipe() {
+            let mut command = owned_dev_command("/bin/sh", &["-c".to_owned(), "exit 0".to_owned()]);
+            command
+                .stdout(asupersync::process::Stdio::Null)
+                .stderr(asupersync::process::Stdio::Null);
+            let mut child = command
+                .spawn()
+                .expect("spawn development watchdog readiness fixture");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
+                    }
+                    Ok(None) => {
+                        drop(child);
+                        panic!("development wrapper did not start and reap its managed command");
+                    }
+                    Err(error) => {
+                        drop(child);
+                        panic!("development wrapper readiness observation failed: {error}");
+                    }
+                }
+            };
+
+            assert!(
+                status.success(),
+                "the watchdog must not observe synthetic /dev/null EOF before owner cleanup"
+            );
+            wait_for_owned_dev_group_cleanup(&mut child)
+                .expect("release and reap the successful development watchdog");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn reality_check_regression_dev_error_cleanup_stops_owned_child() {
+            let mut command = owned_dev_command(
+                "/bin/sh",
+                &["-c".to_owned(), "trap '' HUP INT TERM; sleep 5".to_owned()],
+            );
+            command
+                .stdin(asupersync::process::Stdio::Pipe)
+                .stdout(asupersync::process::Stdio::Null)
+                .stderr(asupersync::process::Stdio::Null);
+            let child = command.spawn().expect("spawn managed development child");
+            let process_group_id = child
+                .process_group_id()
+                .expect("owned child must have a managed process group");
+            let mut child = Some(child);
+
+            let error = return_dev_error_with_cleanup(
+                &mut child,
+                fastmcp_core::McpError::internal_error("forced terminal operation failure"),
+            )
+            .expect_err("the original terminal error must be preserved");
+
+            assert!(child.is_none(), "cleanup must consume the owned child");
+            assert!(error.message.contains("forced terminal operation failure"));
+            #[cfg(target_os = "linux")]
+            assert!(
+                !linux_process_group_has_live_member(
+                    process_group_id,
+                    std::time::Instant::now() + DEV_GROUP_INSPECTION_TIMEOUT,
+                )
+                .expect("inspect explicitly cleaned process group")
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                !kernel_process_group_exists(process_group_id)
+                    .expect("observe explicitly cleaned process group")
+            );
         }
 
         #[test]

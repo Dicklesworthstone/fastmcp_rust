@@ -753,6 +753,12 @@ impl Default for HttpRequestHandler {
 /// In stateless mode, each HTTP request contains a single JSON-RPC message
 /// and receives a single response. This is suitable for simple integrations
 /// where session state is not needed.
+///
+/// Context-aware receive checks cancellation/budget state before and after
+/// every completed incremental read and again after parse/decode. The generic
+/// `R: Read` boundary cannot preempt an underlying synchronous read that is
+/// already blocked; callers requiring bounded cancellation while a peer is
+/// silent must supply a readiness-aware or asynchronous host boundary.
 pub struct HttpTransport<R, W> {
     reader: R,
     writer: W,
@@ -763,6 +769,56 @@ pub struct HttpTransport<R, W> {
     response_origin: Option<String>,
     /// Whether one admitted HTTP request is still awaiting its sole response.
     response_pending: bool,
+}
+
+fn read_retry_interrupted<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    cx: Option<&Cx>,
+) -> Result<usize, HttpError> {
+    loop {
+        if let Some(cx) = cx {
+            // Check again immediately before each potentially blocking read,
+            // including reads separated by parsing or buffer growth.
+            http_checkpoint(cx).map_err(HttpError::Transport)?;
+        }
+        match reader.read(buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if let Some(cx) = cx {
+                    http_checkpoint(cx).map_err(HttpError::Transport)?;
+                }
+            }
+            Ok(read) => {
+                if let Some(cx) = cx {
+                    // Incremental parsing can span many successful reads. A
+                    // single entry checkpoint is insufficient for a slow peer:
+                    // recheck after every completed read before another read
+                    // may block or newly consumed bytes can be admitted.
+                    http_checkpoint(cx).map_err(HttpError::Transport)?;
+                }
+                return Ok(read);
+            }
+            Err(error) => return Err(HttpError::Transport(error.into())),
+        }
+    }
+}
+
+fn read_exact_retry_interrupted<R: Read>(
+    reader: &mut R,
+    mut buffer: &mut [u8],
+    cx: Option<&Cx>,
+) -> Result<(), HttpError> {
+    while !buffer.is_empty() {
+        let read = read_retry_interrupted(reader, buffer, cx)?;
+        if read == 0 {
+            return Err(HttpError::Transport(
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into(),
+            ));
+        }
+        let (_, remaining) = buffer.split_at_mut(read);
+        buffer = remaining;
+    }
+    Ok(())
 }
 
 impl<R: Read, W: Write> HttpTransport<R, W> {
@@ -795,7 +851,29 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
     }
 
     /// Reads an HTTP request from the reader.
+    ///
+    /// Any error is terminal for this transport. The incremental parser may
+    /// already have consumed a request line, headers, chunk metadata, or a body
+    /// prefix, so the unread suffix can never be admitted as a new request.
     pub fn read_request(&mut self) -> Result<HttpRequest, HttpError> {
+        self.read_request_with_context(None)
+    }
+
+    fn read_request_with_context(&mut self, cx: Option<&Cx>) -> Result<HttpRequest, HttpError> {
+        if self.closed {
+            return Err(HttpError::Closed);
+        }
+
+        let result = self.read_request_inner(cx);
+        if result.is_err() {
+            self.closed = true;
+            self.response_pending = false;
+            self.response_origin = None;
+        }
+        result
+    }
+
+    fn read_request_inner(&mut self, cx: Option<&Cx>) -> Result<HttpRequest, HttpError> {
         const MAX_HEADERS_SIZE: usize = 64 * 1024;
         let max_body_size = self.config.max_body_size;
 
@@ -804,12 +882,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
         // Read headers until \r\n\r\n
         loop {
-            if self
-                .reader
-                .read(&mut byte)
-                .map_err(|e| HttpError::Transport(e.into()))?
-                == 0
-            {
+            if read_retry_interrupted(&mut self.reader, &mut byte, cx)? == 0 {
                 return Err(HttpError::Closed);
             }
             buffer.push(byte[0]);
@@ -927,12 +1000,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                     // Read chunk size line (hex), terminated by CRLF.
                     let mut line = Vec::new();
                     loop {
-                        if self
-                            .reader
-                            .read(&mut byte)
-                            .map_err(|e| HttpError::Transport(e.into()))?
-                            == 0
-                        {
+                        if read_retry_interrupted(&mut self.reader, &mut byte, cx)? == 0 {
                             return Err(HttpError::Closed);
                         }
                         line.push(byte[0]);
@@ -963,41 +1031,25 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                         .map_err(|_| HttpError::InvalidHeader("invalid chunk size".to_string()))?;
 
                     if size == 0 {
-                        // Read and discard trailer headers until CRLF.
+                        // Consume the empty line that terminates a chunked body.
+                        // Trailer fields are deliberately unsupported below.
                         let mut trailer = Vec::new();
-                        let mut trailer_bytes = 0_usize;
                         loop {
-                            trailer.clear();
-                            loop {
-                                if self
-                                    .reader
-                                    .read(&mut byte)
-                                    .map_err(|e| HttpError::Transport(e.into()))?
-                                    == 0
-                                {
-                                    return Err(HttpError::Closed);
-                                }
-                                trailer.push(byte[0]);
-                                if trailer.len() > MAX_HEADERS_SIZE {
-                                    return Err(HttpError::HeadersTooLarge {
-                                        size: trailer.len(),
-                                        max: MAX_HEADERS_SIZE,
-                                    });
-                                }
-                                if trailer.ends_with(b"\r\n") {
-                                    break;
-                                }
+                            if read_retry_interrupted(&mut self.reader, &mut byte, cx)? == 0 {
+                                return Err(HttpError::Closed);
                             }
-                            trailer_bytes = trailer_bytes.saturating_add(trailer.len());
-                            if trailer_bytes > MAX_HEADERS_SIZE {
+                            trailer.push(byte[0]);
+                            if trailer.len() > MAX_HEADERS_SIZE {
                                 return Err(HttpError::HeadersTooLarge {
-                                    size: trailer_bytes,
+                                    size: trailer.len(),
                                     max: MAX_HEADERS_SIZE,
                                 });
                             }
-                            if trailer == b"\r\n" {
+                            if trailer.ends_with(b"\r\n") {
                                 break;
                             }
+                        }
+                        if trailer != b"\r\n" {
                             return Err(HttpError::InvalidHeader(
                                 "HTTP trailer fields are not supported".to_string(),
                             ));
@@ -1018,15 +1070,11 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                         });
                     }
                     body.resize(projected_body_size, 0);
-                    self.reader
-                        .read_exact(&mut body[body_start..])
-                        .map_err(|e| HttpError::Transport(e.into()))?;
+                    read_exact_retry_interrupted(&mut self.reader, &mut body[body_start..], cx)?;
 
                     // Consume trailing CRLF after the chunk.
                     let mut crlf = [0u8; 2];
-                    self.reader
-                        .read_exact(&mut crlf)
-                        .map_err(|e| HttpError::Transport(e.into()))?;
+                    read_exact_retry_interrupted(&mut self.reader, &mut crlf, cx)?;
                     if &crlf != b"\r\n" {
                         return Err(HttpError::InvalidHeader(
                             "invalid chunk terminator".to_string(),
@@ -1061,10 +1109,14 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
 
             body.resize(content_length, 0);
             if content_length > 0 {
-                self.reader
-                    .read_exact(&mut body)
-                    .map_err(|e| HttpError::Transport(e.into()))?;
+                read_exact_retry_interrupted(&mut self.reader, &mut body, cx)?;
             }
+        }
+
+        if let Some(cx) = cx {
+            // Parsing and allocation follow the final read. Recheck once more
+            // before exposing the fully consumed request to the transport.
+            http_checkpoint(cx).map_err(HttpError::Transport)?;
         }
 
         Ok(HttpRequest {
@@ -1170,9 +1222,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        http_checkpoint(cx)?;
 
         let response = match message {
             JsonRpcMessage::Response(r) => r.clone(),
@@ -1220,9 +1270,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        http_checkpoint(cx)?;
         if self.response_pending {
             return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -1230,7 +1278,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
             )));
         }
 
-        let http_request = match self.read_request() {
+        let http_request = match self.read_request_with_context(Some(cx)) {
             Ok(request) => request,
             Err(error) => {
                 // The incremental HTTP parser may already have consumed a
@@ -1242,6 +1290,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
                 return Err(match error {
                     HttpError::Closed => TransportError::Closed,
                     HttpError::Timeout => TransportError::Timeout,
+                    HttpError::Transport(error) => error,
                     _ => TransportError::Io(std::io::Error::other(error.to_string())),
                 });
             }
@@ -1258,6 +1307,16 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         // Parse JSON-RPC from the complete HTTP body through the same bounded
         // admission policy used by every other transport.
         let json_rpc = self.codec.decode_complete_request(&http_request.body)?;
+
+        if let Err(error) = http_checkpoint(cx) {
+            // The complete HTTP exchange has already left the byte stream. A
+            // failed post-decode checkpoint is terminal rather than authority
+            // to retry and silently skip that request.
+            self.closed = true;
+            self.response_pending = false;
+            self.response_origin = None;
+            return Err(error);
+        }
 
         if json_rpc.is_notification() {
             // Streamable HTTP acknowledges notification POSTs at the HTTP
@@ -1545,7 +1604,7 @@ impl StreamableHttpResponseStream {
         #[cfg(test)]
         let mut entered_empty_wait = false;
         loop {
-            streamable_checkpoint(cx)?;
+            http_checkpoint(cx)?;
             match self.pop_response(request_id) {
                 Ok(Some(response)) => return Ok(response),
                 Ok(None) => {}
@@ -1642,7 +1701,7 @@ fn release_streamable_bytes(retained_bytes: &AtomicUsize, serialized_bytes: usiz
     });
 }
 
-fn streamable_checkpoint(cx: &Cx) -> Result<(), TransportError> {
+fn http_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
         use asupersync::{CancelKind, error::ErrorKind};
 
@@ -1711,7 +1770,7 @@ fn reserve_streamable_bytes(
             Ok(_) => return Ok(()),
             Err(observed) => {
                 current = observed;
-                streamable_checkpoint(cx)?;
+                http_checkpoint(cx)?;
             }
         }
     }
@@ -1730,14 +1789,14 @@ fn enqueue_streamable_request(
     if !admissions_open.load(Ordering::Acquire) {
         return Err(TransportError::Closed);
     }
-    streamable_checkpoint(cx)?;
+    http_checkpoint(cx)?;
     let _admission = begin_streamable_admission(admissions_open, active_admissions)?;
 
     let serialized_bytes = codec.encode_request(&request)?.len();
     // Encoding is bounded but can still be substantial. Re-check after that
     // CPU work so a deadline or cancellation raised during encoding wins
     // before the request acquires queue reservations.
-    streamable_checkpoint(cx)?;
+    http_checkpoint(cx)?;
     reserve_streamable_bytes(
         retained_bytes,
         max_queued_bytes,
@@ -2073,7 +2132,7 @@ impl Transport for StreamableHttpTransport {
         {
             return Err(TransportError::Closed);
         }
-        streamable_checkpoint(cx)?;
+        http_checkpoint(cx)?;
 
         match message {
             JsonRpcMessage::Response(response) => {
@@ -2087,7 +2146,7 @@ impl Transport for StreamableHttpTransport {
                 let serialized_bytes = self.codec.encode_response(response)?.len();
                 // Do not commit a response after cancellation or a deadline
                 // that became observable during bounded serialization.
-                streamable_checkpoint(cx)?;
+                http_checkpoint(cx)?;
                 let mut mailbox = match self.response_mailbox.try_lock() {
                     Ok(mailbox) => mailbox,
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -2141,7 +2200,7 @@ impl Transport for StreamableHttpTransport {
             if !self.owner_open.load(Ordering::Acquire) {
                 return Err(TransportError::Closed);
             }
-            streamable_checkpoint(cx)?;
+            http_checkpoint(cx)?;
 
             match self.request_receiver.try_recv() {
                 Ok(request) => {
@@ -2525,6 +2584,47 @@ fn generate_session_id() -> Result<String, HttpSessionError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    struct InterruptEveryOtherRead {
+        inner: Cursor<Vec<u8>>,
+        interrupt_next: bool,
+        interruptions: Arc<AtomicUsize>,
+        cancel_on_interrupt: Option<Cx>,
+    }
+
+    impl Read for InterruptEveryOtherRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                self.interruptions.fetch_add(1, Ordering::AcqRel);
+                if let Some(cx) = self.cancel_on_interrupt.as_ref() {
+                    cx.set_cancel_requested(true);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "deterministic transient read interruption",
+                ));
+            }
+            self.interrupt_next = true;
+            self.inner.read(buffer)
+        }
+    }
+
+    struct CancelAfterSuccessfulRead {
+        inner: Cursor<Vec<u8>>,
+        cx: Cx,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for CancelAfterSuccessfulRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            if read > 0 && self.reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.cx.set_cancel_requested(true);
+            }
+            Ok(read)
+        }
+    }
 
     #[derive(Debug)]
     struct FailingSerialize;
@@ -2960,6 +3060,52 @@ Transfer-Encoding: chunked\r\n\
     }
 
     #[test]
+    fn chunked_request_rejects_non_empty_trailer_fields_and_latches_closed() {
+        let raw = b"POST /mcp/v1 HTTP/1.1\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+0\r\n\
+X-Checksum: abc123\r\n\
+\r\n";
+        let mut transport = HttpTransport::new(Cursor::new(raw.to_vec()), Vec::new());
+
+        let error = transport.read_request().unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpError::InvalidHeader(detail)
+                if detail == "HTTP trailer fields are not supported"
+        ));
+        assert!(transport.closed);
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn chunked_request_bounds_oversized_trailer_before_line_termination() {
+        const HEADER_LIMIT: usize = 64 * 1024;
+        const PREFIX: &[u8] = b"X-Trailer: ";
+
+        let mut raw = b"POST /mcp/v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        raw.extend_from_slice(PREFIX);
+        raw.extend(vec![b'a'; HEADER_LIMIT + 1 - PREFIX.len()]);
+
+        let mut transport = HttpTransport::new(Cursor::new(raw), Vec::new());
+        let error = transport.read_request().unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpError::HeadersTooLarge {
+                size,
+                max: HEADER_LIMIT
+            } if size == HEADER_LIMIT + 1
+        ));
+        assert!(transport.closed);
+    }
+
+    #[test]
     fn chunked_request_rejects_oversized_declaration_before_body_read() {
         let declared_size = 10 * 1024 * 1024 + 1;
         let raw = format!(
@@ -3185,6 +3331,174 @@ Transfer-Encoding: chunked\r\n\
             transport.read_request(),
             Err(HttpError::BodyTooLarge { size: 9, max: 8 })
         ));
+    }
+
+    #[test]
+    fn reality_check_regression_http_retries_interrupted_header_and_body_reads() {
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut wire = head.into_bytes();
+        wire.extend_from_slice(body);
+        let interruptions = Arc::new(AtomicUsize::new(0));
+        let reader = InterruptEveryOtherRead {
+            inner: Cursor::new(wire),
+            interrupt_next: true,
+            interruptions: Arc::clone(&interruptions),
+            cancel_on_interrupt: None,
+        };
+        let mut transport = HttpTransport::new(reader, Vec::new());
+
+        let message = transport
+            .recv(&Cx::for_testing())
+            .expect("transient interruptions must not terminate HTTP framing");
+
+        assert!(matches!(
+            message,
+            JsonRpcMessage::Request(ref request) if request.method == "tools/list"
+        ));
+        assert!(interruptions.load(Ordering::Acquire) > body.len());
+        assert!(!transport.closed);
+        assert!(transport.response_pending);
+    }
+
+    #[test]
+    fn reality_check_regression_http_checks_context_between_interrupted_read_retries() {
+        let cx = Cx::for_testing();
+        let reader = InterruptEveryOtherRead {
+            inner: Cursor::new(b"POST /mcp/v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            interrupt_next: false,
+            interruptions: Arc::new(AtomicUsize::new(0)),
+            cancel_on_interrupt: Some(cx.clone()),
+        };
+        let mut transport = HttpTransport::new(reader, Vec::new());
+
+        assert!(matches!(
+            transport.recv(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(transport.closed);
+        assert!(!transport.response_pending);
+    }
+
+    #[test]
+    fn reality_check_regression_http_checks_context_after_successful_incremental_read() {
+        let cx = Cx::for_testing();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = CancelAfterSuccessfulRead {
+            inner: Cursor::new(
+                b"POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            ),
+            cx: cx.clone(),
+            reads: Arc::clone(&reads),
+        };
+        let mut transport = HttpTransport::new(reader, Vec::new());
+
+        assert!(matches!(
+            transport.recv(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(reads.load(Ordering::Acquire), 1);
+        assert!(transport.closed);
+        assert!(!transport.response_pending);
+    }
+
+    #[test]
+    fn reality_check_regression_http_recv_uses_full_checkpoint_and_preserves_masking() {
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut wire = head.into_bytes();
+        wire.extend_from_slice(body);
+        let mut transport = HttpTransport::new(Cursor::new(wire), Vec::new());
+
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            transport.recv(&deadline_cx),
+            Err(TransportError::Timeout)
+        ));
+
+        let poll_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        assert!(matches!(
+            transport.recv(&poll_cx),
+            Err(TransportError::Cancelled)
+        ));
+
+        let cost_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0));
+        assert!(matches!(
+            transport.recv(&cost_cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(!transport.closed);
+        assert!(!transport.response_pending);
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let message = cancelled_cx
+            .masked(|| transport.recv(&cancelled_cx))
+            .expect("masking defers explicit cancellation at HTTP receive admission");
+        assert!(matches!(
+            message,
+            JsonRpcMessage::Request(ref request) if request.method == "tools/list"
+        ));
+        assert!(transport.response_pending);
+    }
+
+    #[test]
+    fn reality_check_regression_http_send_uses_full_checkpoint_without_losing_response_ownership() {
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let head = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut wire = head.into_bytes();
+        wire.extend_from_slice(body);
+        let mut transport = HttpTransport::new(Cursor::new(wire), Vec::new());
+        transport
+            .recv(&Cx::for_testing())
+            .expect("establish one pending HTTP response");
+        let response = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::Value::Null,
+        ));
+
+        let deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(matches!(
+            transport.send(&deadline_cx, &response),
+            Err(TransportError::Timeout)
+        ));
+        let poll_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0));
+        assert!(matches!(
+            transport.send(&poll_cx, &response),
+            Err(TransportError::Cancelled)
+        ));
+        let cost_cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0));
+        assert!(matches!(
+            transport.send(&cost_cx, &response),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(transport.response_pending);
+        assert!(transport.writer.is_empty());
+
+        let masked_deadline_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        masked_deadline_cx.masked(|| {
+            transport
+                .send(&masked_deadline_cx, &response)
+                .expect("masking defers deadline enforcement at HTTP send admission");
+        });
+        assert!(!transport.response_pending);
+        assert!(transport.writer.starts_with(b"HTTP/1.1 200 OK\r\n"));
     }
 
     // =========================================================================

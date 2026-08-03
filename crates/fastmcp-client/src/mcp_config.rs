@@ -55,7 +55,10 @@ use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Serialize};
 
-use crate::{ChildGuard, Client, ClientSession, resolve_stdio_command};
+use crate::{
+    ChildGuard, Client, ClientSession, RequestTimeoutPolicy, combine_cleanup_results,
+    combine_operation_with_cleanup, resolve_stdio_command, transport_error_to_mcp,
+};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 
 // ============================================================================
@@ -321,9 +324,14 @@ impl McpConfig {
 
     /// Creates a client for a server by name.
     ///
+    /// Initialization and subsequent ordinary requests use
+    /// the default [`RequestTimeoutPolicy`]. Use
+    /// [`Self::client_with_timeout_policy`] to select different bounds.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
+    /// Returns an error if the server is not found, disabled, or fails to start
+    /// or initialize.
     pub fn client(&self, name: &str) -> Result<Client, ConfigError> {
         block_on(async {
             let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
@@ -331,12 +339,62 @@ impl McpConfig {
         })
     }
 
-    /// Creates a client with a provided Cx for cancellation support.
+    /// Creates a client using an explicit idle/absolute timeout policy.
+    ///
+    /// The policy applies to initialization as well as subsequent ordinary
+    /// requests. Use this path when the default 30-second idle and 120-second
+    /// absolute initialization limits are not appropriate.
     ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
+    /// Returns an error if the server is not found, disabled, or fails to
+    /// start or initialize.
+    pub fn client_with_timeout_policy(
+        &self,
+        name: &str,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<Client, ConfigError> {
+        timeout_policy
+            .validate()
+            .map_err(ConfigError::ClientError)?;
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.client_with_cx_and_timeout_policy(name, cx, timeout_policy)
+        })
+    }
+
+    /// Creates a client with a provided Cx for cancellation support.
+    ///
+    /// Initialization and subsequent ordinary requests use
+    /// the default [`RequestTimeoutPolicy`]. Use
+    /// [`Self::client_with_cx_and_timeout_policy`] to select different bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is not found, disabled, or fails to start
+    /// or initialize.
     pub fn client_with_cx(&self, name: &str, cx: Cx) -> Result<Client, ConfigError> {
+        self.client_with_cx_and_timeout_policy(name, cx, RequestTimeoutPolicy::default())
+    }
+
+    /// Creates a client with an explicit capability context and timeout policy.
+    ///
+    /// The policy applies to initialization as well as subsequent ordinary
+    /// requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is not found, disabled, or fails to
+    /// start or initialize.
+    pub fn client_with_cx_and_timeout_policy(
+        &self,
+        name: &str,
+        cx: Cx,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<Client, ConfigError> {
+        timeout_policy
+            .validate()
+            .map_err(ConfigError::ClientError)?;
         let config = self
             .mcp_servers
             .get(name)
@@ -346,7 +404,7 @@ impl McpConfig {
             return Err(ConfigError::ServerDisabled(name.to_string()));
         }
 
-        spawn_client_from_config(name, config, cx)
+        spawn_client_from_config(name, config, cx, timeout_policy)
     }
 
     /// Merges another configuration into this one.
@@ -362,6 +420,7 @@ fn spawn_client_from_config(
     name: &str,
     config: &ServerConfig,
     cx: Cx,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> Result<Client, ConfigError> {
     if cx.checkpoint().is_err() {
         return Err(ConfigError::ClientError(McpError::request_cancelled()));
@@ -421,6 +480,7 @@ fn spawn_client_from_config(
         cx,
         client_info,
         client_capabilities,
+        timeout_policy,
     )
     .map_err(ConfigError::ClientError)
 }
@@ -432,22 +492,26 @@ fn create_and_initialize_client(
     cx: Cx,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> McpResult<Client> {
     use fastmcp_transport::Transport;
 
-    let timeout_ms = 30_000;
     let child_guard = ChildGuard::new(child);
     let init_result = match crate::initialize_child_transport(
         &mut transport,
         &cx,
         &client_info,
         &client_capabilities,
-        timeout_ms,
+        timeout_policy,
     ) {
         Ok(result) => result,
         Err(error) => {
-            let _ = transport.close();
-            return Err(error);
+            return combine_operation_with_cleanup(Err(error), || {
+                combine_cleanup_results(
+                    transport.close().map_err(transport_error_to_mcp),
+                    child_guard.cleanup(),
+                )
+            });
         }
     };
 
@@ -466,7 +530,7 @@ fn create_and_initialize_client(
         transport,
         cx,
         session,
-        timeout_ms,
+        timeout_policy,
     ))
 }
 
@@ -1056,6 +1120,78 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn invalid_policy_precedes_config_lookup_and_process_creation() {
+        let mut config = McpConfig::new();
+        config.add_server("configured", ServerConfig::new("definitely-not-a-command"));
+        let invalid_policy = RequestTimeoutPolicy {
+            idle_timeout: std::time::Duration::ZERO,
+            absolute_timeout: std::time::Duration::from_secs(1),
+            reset_idle_on_matching_progress: true,
+        };
+
+        let error = match config.client_with_timeout_policy("missing", invalid_policy) {
+            Ok(_) => panic!("invalid timeout policy must fail before configuration lookup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let error = match config.client_with_cx_and_timeout_policy(
+            "configured",
+            cancelled_cx,
+            invalid_policy,
+        ) {
+            Ok(_) => panic!("invalid timeout policy must fail before checkpoint and spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_aware_config_client_applies_policy_to_initialization() {
+        let mut config = McpConfig::new();
+        config.add_server(
+            "silent",
+            ServerConfig::new("sh").with_args(["-c", "exec sleep 5"]),
+        );
+        let policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("custom initialization policy must validate");
+        let started = std::time::Instant::now();
+
+        let error = match config.client_with_timeout_policy("silent", policy) {
+            Ok(_) => panic!("silent initialization must honor the custom idle timeout"),
+            Err(error) => error,
+        };
+        let ConfigError::ClientError(error) = error else {
+            panic!("initialization timeout must remain a client lifecycle error");
+        };
+
+        assert_eq!(error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

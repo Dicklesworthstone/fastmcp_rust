@@ -85,8 +85,9 @@ pub trait Transport {
     ///
     /// # Cancel-Safety
     ///
-    /// This operation checks for cancellation before sending.
-    /// If cancelled, the message is not sent.
+    /// Implementations must document their cancellation checkpoints. A
+    /// transport backed by a generic blocking `Write` may check before the
+    /// write but cannot necessarily interrupt that write once it starts.
     ///
     /// # Errors
     ///
@@ -98,8 +99,10 @@ pub trait Transport {
     ///
     /// # Cancel-Safety
     ///
-    /// This operation checks for cancellation while waiting for data.
-    /// If cancelled, returns `TransportError::Cancelled`.
+    /// Implementations must document where they observe cancellation. A
+    /// transport backed by a generic blocking `Read` may only check at frame
+    /// boundaries; callers must not assume that every implementation can
+    /// interrupt an in-progress blocking read.
     ///
     /// # Errors
     ///
@@ -138,6 +141,29 @@ pub enum TransportError {
     Codec(CodecError),
     /// Connection timeout.
     Timeout,
+    /// A caller-supplied receive deadline elapsed before completion was
+    /// returned to that caller.
+    ///
+    /// This is distinct from [`Self::Timeout`], which can reflect exhaustion
+    /// of the capability context carried by the connection. Keeping the two
+    /// outcomes separate lets request owners preserve the result that was
+    /// selected at the I/O boundary without re-reading mutable context state.
+    /// Strict receive helpers may also report this after consuming a complete
+    /// frame that finished at or beyond the supplied deadline; their API docs
+    /// state whether that condition latches the transport closed.
+    ReceiveDeadlineExceeded,
+    /// A connection-control frame exceeds the transport's atomic-write bound.
+    ///
+    /// This is a local capacity failure, not a protocol codec failure: the
+    /// message can be valid JSON-RPC and still be too large for the direct
+    /// stdio adapter's single nonblocking pipe write. No bytes are committed
+    /// when this error is returned.
+    ControlFrameTooLarge {
+        /// Encoded control-frame size, including transport framing.
+        size: usize,
+        /// Maximum frame size this transport can commit atomically.
+        max: usize,
+    },
     /// Request was cancelled.
     Cancelled,
 }
@@ -163,6 +189,15 @@ impl std::fmt::Display for TransportError {
             TransportError::Closed => write!(f, "Transport closed"),
             TransportError::Codec(e) => write!(f, "Codec error: {e}"),
             TransportError::Timeout => write!(f, "Connection timeout"),
+            TransportError::ReceiveDeadlineExceeded => {
+                write!(f, "Receive deadline exceeded")
+            }
+            TransportError::ControlFrameTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Control frame requires {size} bytes but atomic capacity is {max} bytes"
+                )
+            }
             TransportError::Cancelled => write!(f, "Request cancelled"),
         }
     }
@@ -445,10 +480,18 @@ mod tests {
             !TransportError::Timeout.is_cancelled(),
             "timeout should not be cancelled",
         )?;
+        require(
+            !TransportError::ReceiveDeadlineExceeded.is_cancelled(),
+            "receive deadline should not be cancelled",
+        )?;
         require(TransportError::Closed.is_closed(), "closed flag mismatch")?;
         require(
             !TransportError::Timeout.is_closed(),
             "timeout should not be closed",
+        )?;
+        require(
+            !TransportError::ReceiveDeadlineExceeded.is_closed(),
+            "receive deadline should not be closed",
         )?;
         Ok(())
     }
@@ -486,6 +529,19 @@ mod tests {
         require(
             TransportError::Timeout.source().is_none(),
             "timeout should not have source",
+        )?;
+        require(
+            TransportError::ReceiveDeadlineExceeded.source().is_none(),
+            "receive deadline should not have source",
+        )?;
+        require(
+            TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512,
+            }
+            .source()
+            .is_none(),
+            "control-frame capacity should not have source",
         )?;
         require(
             TransportError::Closed.source().is_none(),
@@ -659,12 +715,32 @@ mod tests {
     fn transport_error_display_all_variants() {
         assert_eq!(TransportError::Closed.to_string(), "Transport closed");
         assert_eq!(TransportError::Timeout.to_string(), "Connection timeout");
+        assert_eq!(
+            TransportError::ReceiveDeadlineExceeded.to_string(),
+            "Receive deadline exceeded"
+        );
+        assert_eq!(
+            TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512
+            }
+            .to_string(),
+            "Control frame requires 513 bytes but atomic capacity is 512 bytes"
+        );
         assert_eq!(TransportError::Cancelled.to_string(), "Request cancelled");
     }
 
     #[test]
     fn transport_error_is_cancelled_false_for_other_variants() {
         assert!(!TransportError::Closed.is_cancelled());
+        assert!(!TransportError::ReceiveDeadlineExceeded.is_cancelled());
+        assert!(
+            !TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512
+            }
+            .is_cancelled()
+        );
         assert!(!TransportError::Io(std::io::Error::other("err")).is_cancelled());
         assert!(!TransportError::Codec(CodecError::MessageTooLarge(1)).is_cancelled());
     }
@@ -673,6 +749,14 @@ mod tests {
     fn transport_error_is_closed_false_for_other_variants() {
         assert!(!TransportError::Cancelled.is_closed());
         assert!(!TransportError::Timeout.is_closed());
+        assert!(!TransportError::ReceiveDeadlineExceeded.is_closed());
+        assert!(
+            !TransportError::ControlFrameTooLarge {
+                size: 513,
+                max: 512
+            }
+            .is_closed()
+        );
         assert!(!TransportError::Io(std::io::Error::other("err")).is_closed());
         assert!(!TransportError::Codec(CodecError::MessageTooLarge(1)).is_closed());
     }

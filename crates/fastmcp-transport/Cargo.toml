@@ -21,7 +21,7 @@ serde_json.workspace = true
 # FND-01 TRANSPORT-NO-GETRANDOM: WebSocket masking uses fastmcp-core crypto.
 
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["event", "std"] }
+rustix = { workspace = true, features = ["event", "fs", "std"] }
 
 [lints]
 workspace = true

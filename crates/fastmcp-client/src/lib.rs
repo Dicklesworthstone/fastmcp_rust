@@ -49,7 +49,15 @@ pub use session::ClientSession;
 
 use std::any::Any;
 use std::cell::Cell;
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Once;
@@ -78,10 +86,191 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>
 use fastmcp_transport::{StdioTransport, Transport, TransportError};
 
 const MIN_TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_mins(5);
+const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_TASK_POLL_CANCEL_SLICE: Duration = Duration::from_millis(10);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const LINUX_PROC_MOUNTS_MAX_BYTES: u64 = 256 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_PROC_STAT_MAX_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_PROC_STATUS_MAX_BYTES: u64 = 256 * 1024;
+const PROCESS_GROUP_ANCHOR_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
+const CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
+
+/// Idle and absolute limits for the response-wait phase of one ordinary client
+/// request.
+///
+/// Both timers start after the request send commits; they do not bound a
+/// blocking send or later connection teardown. Both limits are nonzero and
+/// bounded. The idle timer may be restarted by a valid, strictly increasing
+/// progress notification carrying the request's exact progress token when
+/// [`Self::reset_idle_on_matching_progress`] is enabled. The absolute timer
+/// never moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestTimeoutPolicy {
+    idle_timeout: Duration,
+    absolute_timeout: Duration,
+    reset_idle_on_matching_progress: bool,
+}
+
+impl RequestTimeoutPolicy {
+    /// Creates and validates an ordinary-request timeout policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-parameters error when idle is below 1 millisecond or
+    /// exceeds 5 minutes, or absolute is below 1 millisecond or exceeds
+    /// 15 minutes.
+    pub fn new(idle_timeout: Duration, absolute_timeout: Duration) -> McpResult<Self> {
+        let policy = Self {
+            idle_timeout,
+            absolute_timeout,
+            reset_idle_on_matching_progress: true,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Selects whether exact, valid, strictly increasing matching progress
+    /// restarts the idle timer. This never changes the absolute timer.
+    #[must_use]
+    pub const fn reset_idle_on_matching_progress(mut self, enabled: bool) -> Self {
+        self.reset_idle_on_matching_progress = enabled;
+        self
+    }
+
+    /// Returns the idle timeout.
+    #[must_use]
+    pub const fn idle_timeout(self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Returns the non-resettable absolute timeout.
+    #[must_use]
+    pub const fn absolute_timeout(self) -> Duration {
+        self.absolute_timeout
+    }
+
+    /// Returns whether valid matching progress restarts the idle timer.
+    #[must_use]
+    pub const fn resets_idle_on_matching_progress(self) -> bool {
+        self.reset_idle_on_matching_progress
+    }
+
+    fn validate(self) -> McpResult<()> {
+        validate_timeout_duration(
+            self.idle_timeout,
+            MAX_CLIENT_IDLE_TIMEOUT,
+            "Client request idle timeout must be between 1 millisecond and 5 minutes",
+        )?;
+        validate_timeout_duration(
+            self.absolute_timeout,
+            MAX_CLIENT_ABSOLUTE_TIMEOUT,
+            "Client request absolute timeout must be between 1 millisecond and 15 minutes",
+        )
+    }
+}
+
+impl Default for RequestTimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            idle_timeout: DEFAULT_CLIENT_IDLE_TIMEOUT,
+            absolute_timeout: DEFAULT_CLIENT_ABSOLUTE_TIMEOUT,
+            reset_idle_on_matching_progress: true,
+        }
+    }
+}
+
+/// The request-local timer that selected a timeout outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestTimeoutSource {
+    /// No valid request-owned activity arrived before the idle bound.
+    Idle,
+    /// The non-resettable post-commit response-wait lifetime elapsed.
+    Absolute,
+}
+
+fn request_timeout_error(source: RequestTimeoutSource) -> McpError {
+    let (message, source_name) = match source {
+        RequestTimeoutSource::Idle => ("Request timed out at the idle deadline", "idle"),
+        RequestTimeoutSource::Absolute => {
+            ("Request timed out at the absolute deadline", "absolute")
+        }
+    };
+    McpError::with_data(
+        McpErrorCode::InternalError,
+        message,
+        serde_json::json!({"timeoutSource": source_name}),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestDeadlines {
+    idle: Instant,
+    absolute: Instant,
+    idle_timeout: Duration,
+}
+
+impl RequestDeadlines {
+    fn start_at(policy: RequestTimeoutPolicy, committed_at: Instant) -> McpResult<Self> {
+        policy.validate()?;
+        let idle_timeout = policy.idle_timeout;
+        let idle = committed_at.checked_add(idle_timeout).ok_or_else(|| {
+            McpError::internal_error("Request idle timeout exceeds the clock range")
+        })?;
+        let absolute = committed_at
+            .checked_add(policy.absolute_timeout)
+            .ok_or_else(|| {
+                McpError::internal_error("Request absolute timeout exceeds the clock range")
+            })?;
+        Ok(Self {
+            idle,
+            absolute,
+            idle_timeout,
+        })
+    }
+
+    fn next(self) -> Instant {
+        self.idle.min(self.absolute)
+    }
+
+    fn next_kind(self) -> RequestTimeoutSource {
+        if self.absolute <= self.idle {
+            RequestTimeoutSource::Absolute
+        } else {
+            RequestTimeoutSource::Idle
+        }
+    }
+
+    fn expired_at(self, observed_at: Instant) -> Option<RequestTimeoutSource> {
+        if observed_at >= self.absolute && self.absolute <= self.idle {
+            Some(RequestTimeoutSource::Absolute)
+        } else if observed_at >= self.idle {
+            Some(RequestTimeoutSource::Idle)
+        } else if observed_at >= self.absolute {
+            Some(RequestTimeoutSource::Absolute)
+        } else {
+            None
+        }
+    }
+
+    fn reset_idle_at(&mut self, observed_at: Instant) -> McpResult<()> {
+        self.idle = observed_at.checked_add(self.idle_timeout).ok_or_else(|| {
+            McpError::internal_error("Request idle timeout exceeds the clock range")
+        })?;
+        Ok(())
+    }
+}
 
 /// Validates the caller-configured local fallback interval.
 ///
@@ -199,6 +388,261 @@ enum DirectChildStopDecision {
     DoNotSignal,
 }
 
+/// Defines the subprocess resource that a client is responsible for stopping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ChildOwnership {
+    /// Only the exact child handle is owned.
+    #[default]
+    DirectChild,
+    /// The peer is a member of a dedicated Unix process group whose separate
+    /// live anchor pins the PGID and owns an owner-death control pipe.
+    OwnedProcessGroup,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ClientChildCleanupPhase {
+    #[default]
+    Active,
+    #[cfg(unix)]
+    GroupKillAccepted(rustix::process::Pid),
+    #[cfg(unix)]
+    GroupChildrenReaped(rustix::process::Pid),
+    #[cfg(unix)]
+    GroupIdentityLost(rustix::process::Pid),
+    Complete,
+}
+
+#[cfg(unix)]
+const PROCESS_GROUP_ANCHOR_SCRIPT: &str = r#"
+trap '' HUP INT TERM
+printf R
+exec 1>&-
+while IFS= read -r _; do :; done
+kill -s KILL 0
+exit 127
+"#;
+
+/// A live process-group leader controlled by a close-on-exec pipe.
+///
+/// The requested MCP peer is spawned directly as this anchor's sibling, so
+/// the peer retains the exact executable, argv, environment, working
+/// directory, and stdio behavior requested by the caller. Only this owner
+/// process retains `control`; EOF therefore tells the anchor that the owner
+/// closed normally or died, at which point the anchor kills its own group.
+pub(crate) struct ProcessGroupAnchor {
+    #[cfg(unix)]
+    child: Option<Child>,
+    #[cfg(unix)]
+    control: Option<OwnedFd>,
+    #[cfg(unix)]
+    process_group: rustix::process::Pid,
+}
+
+impl ProcessGroupAnchor {
+    #[cfg(unix)]
+    pub(crate) fn spawn() -> McpResult<Self> {
+        if !Path::new("/bin/sh").is_file() {
+            return Err(McpError::internal_error(
+                "Owned subprocess groups require /bin/sh on this Unix platform",
+            ));
+        }
+
+        // Standard-library Unix sockets are marked close-on-exec and remain
+        // available on Apple targets, where rustix intentionally omits its
+        // atomic `pipe_with` API. Apple applies CLOEXEC after `socketpair`, so
+        // a concurrent host-side raw fork during this short setup window can
+        // retain a copy; the public ownership contract documents that limit.
+        // Each pair is used only as a one-way channel.
+        let (control_reader, control_writer) = UnixStream::pair().map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to create the process-group anchor control channel: {error}"
+            ))
+        })?;
+        let (ready_reader, ready_writer) = UnixStream::pair().map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to create the process-group anchor readiness channel: {error}"
+            ))
+        })?;
+        let control_reader = OwnedFd::from(control_reader);
+        let control_writer = OwnedFd::from(control_writer);
+        let ready_reader = OwnedFd::from(ready_reader);
+        let ready_writer = OwnedFd::from(ready_writer);
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(PROCESS_GROUP_ANCHOR_SCRIPT)
+            .arg("fastmcp-process-group-anchor")
+            .stdin(Stdio::from(control_reader))
+            .stdout(Stdio::from(ready_writer))
+            .stderr(Stdio::null())
+            .env_clear()
+            .process_group(0);
+        let child = command.spawn().map_err(|error| {
+            McpError::internal_error(format!("Failed to spawn the process-group anchor: {error}"))
+        })?;
+        let raw_group_id = i32::try_from(child.id()).map_err(|_| {
+            McpError::internal_error("Owned process-group identifier exceeds the platform range")
+        })?;
+        let process_group = rustix::process::Pid::from_raw(raw_group_id)
+            .ok_or_else(|| McpError::internal_error("Owned process-group identifier is invalid"))?;
+
+        let mut anchor = Self {
+            child: Some(child),
+            control: Some(control_writer),
+            process_group,
+        };
+        match Self::wait_until_ready(&ready_reader) {
+            Ok(()) => Ok(anchor),
+            Err(error) => combine_operation_with_cleanup(Err(error), || anchor.cleanup()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_until_ready(ready_reader: &OwnedFd) -> McpResult<()> {
+        let deadline = Instant::now() + PROCESS_GROUP_ANCHOR_READY_TIMEOUT;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(McpError::internal_error(
+                    "Process-group anchor did not become ready within the startup deadline",
+                ));
+            }
+            let timeout =
+                rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+                    .map_err(|_| {
+                        McpError::internal_error("Anchor readiness deadline is out of range")
+                    })?;
+            let mut poll_fds = [rustix::event::PollFd::new(
+                ready_reader,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut poll_fds, Some(&timeout)) {
+                Ok(0) => {
+                    return Err(McpError::internal_error(
+                        "Process-group anchor did not become ready within the startup deadline",
+                    ));
+                }
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => {
+                    return Err(McpError::internal_error(format!(
+                        "Failed while waiting for process-group anchor readiness: {error}"
+                    )));
+                }
+            }
+
+            let mut marker = [0_u8; 1];
+            match rustix::io::read(ready_reader, &mut marker) {
+                Ok(1) if marker[0] == b'R' => return Ok(()),
+                Ok(0) => {
+                    return Err(McpError::internal_error(
+                        "Process-group anchor exited before reporting readiness",
+                    ));
+                }
+                Ok(_) => {
+                    return Err(McpError::internal_error(
+                        "Process-group anchor emitted an invalid readiness marker",
+                    ));
+                }
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => {
+                    return Err(McpError::internal_error(format!(
+                        "Failed to read process-group anchor readiness: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_process_group(&self) -> i32 {
+        self.process_group.as_raw_nonzero().get()
+    }
+
+    #[cfg(unix)]
+    fn verify_live(&mut self) -> McpResult<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Err(McpError::internal_error(
+                "Process-group anchor handle is missing",
+            ));
+        };
+        match child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => {
+                self.child = None;
+                Err(McpError::internal_error(format!(
+                    "Process-group anchor exited unexpectedly with {status}"
+                )))
+            }
+            Err(error) => Err(McpError::internal_error(format!(
+                "Failed to verify process-group anchor liveness: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn verify_live(&mut self) -> McpResult<()> {
+        Err(McpError::internal_error(
+            "Owned subprocess groups are unavailable on this platform",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn request_shutdown(&mut self) {
+        // Closing the only post-exec writer produces EOF in the anchor and
+        // arms the owner-death fallback. Explicit cleanup first signals while
+        // the live anchor pins the PGID, so a stopped peer cannot also stop
+        // the only process capable of observing this EOF.
+        self.control.take();
+    }
+
+    #[cfg(unix)]
+    fn reap(&mut self) -> McpResult<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        reap_signalled_child(child)?;
+        self.child = None;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn cleanup(&mut self) -> McpResult<()> {
+        match request_anchored_group_shutdown(self)? {
+            AnchoredGroupShutdown::KillAccepted(process_group) => {
+                let reap_result = self.reap();
+                let group_result = wait_for_owned_process_group_quiescence(process_group);
+                combine_cleanup_results(reap_result, group_result)
+            }
+            AnchoredGroupShutdown::IdentityLost(process_group) => {
+                require_owned_process_group_absent(process_group)
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn cleanup(&mut self) -> McpResult<()> {
+        Err(McpError::internal_error(
+            "Owned subprocess groups are unavailable on this platform",
+        ))
+    }
+}
+
+impl Drop for ProcessGroupAnchor {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Err(error) = self.cleanup() {
+                // Dropping the control writer below still arms the anchor's
+                // owner-death kill fallback. Verification failures remain
+                // observable only through explicit `Client::close`; Drop
+                // cannot return an error or create an orphan cleanup task.
+                log::error!("Process-group anchor cleanup was not verified: {error}");
+            }
+        }
+    }
+}
+
 fn direct_child_stop_decision(
     probe: &std::io::Result<Option<ExitStatus>>,
 ) -> DirectChildStopDecision {
@@ -208,33 +652,32 @@ fn direct_child_stop_decision(
     }
 }
 
-/// Best-effort terminates and boundedly reaps the retained direct child process
-/// when its identity is still proven by a successful live-status probe.
-///
-/// Descendant-tree ownership is deliberately not claimed here. Implementing
-/// that safely and portably requires runtime support (including Windows Job
-/// Objects), not a PATH-resolved helper and a reusable PID.
-fn stop_direct_child(child: &mut Child) {
-    let probe = child.try_wait();
-    if direct_child_stop_decision(&probe) != DirectChildStopDecision::TerminateAndReap {
-        return;
-    }
-
-    // Signal exactly once while the unreaped child handle still pins the
-    // process identity. Whether signalling succeeds or fails, only observe
-    // afterwards: a failed signal is not authority to target a potentially
-    // recycled PID, and a blocking `wait` would defeat request deadlines.
-    let _ = child.kill();
+fn reap_signalled_child(child: &mut Child) -> McpResult<()> {
     let reap_deadline = Instant::now() + DIRECT_CHILD_REAP_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => {
+                // Once group shutdown has been requested, a process-wide
+                // reaper consuming this exact child is equivalent to a
+                // successful reap. This helper is never used to establish
+                // pre-signal identity.
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(McpError::internal_error(format!(
+                    "Failed to reap the owned subprocess: {error}"
+                )));
+            }
         }
 
         let now = Instant::now();
         if now >= reap_deadline {
-            return;
+            return Err(McpError::internal_error(
+                "Owned subprocess did not exit within the cleanup deadline",
+            ));
         }
         std::thread::park_timeout(
             reap_deadline
@@ -242,6 +685,594 @@ fn stop_direct_child(child: &mut Child) {
                 .min(DIRECT_CHILD_REAP_POLL_INTERVAL),
         );
     }
+}
+
+/// Terminates and boundedly reaps the retained direct child process when its
+/// identity is still proven by a successful live-status probe.
+///
+/// Descendant-tree ownership is deliberately not claimed here. Implementing
+/// that safely and portably requires runtime support (including Windows Job
+/// Objects), not a PATH-resolved helper and a reusable PID.
+fn stop_direct_child(child: &mut Child) -> McpResult<()> {
+    let probe = child.try_wait();
+    match (&probe, direct_child_stop_decision(&probe)) {
+        (Ok(Some(_)), DirectChildStopDecision::DoNotSignal) => return Ok(()),
+        (Err(error), DirectChildStopDecision::DoNotSignal) => {
+            return Err(McpError::internal_error(format!(
+                "Failed to establish owned subprocess state: {error}"
+            )));
+        }
+        (_, DirectChildStopDecision::TerminateAndReap) => {}
+        (Ok(None), DirectChildStopDecision::DoNotSignal) => unreachable!(),
+    }
+
+    // Signal exactly once while the unreaped child handle still pins the
+    // process identity. Whether signalling succeeds or fails, only observe
+    // afterwards: a failed signal is not authority to target a potentially
+    // recycled PID, and a blocking `wait` would defeat request deadlines.
+    if let Err(signal_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(McpError::internal_error(format!(
+                "Failed to terminate the owned subprocess: {signal_error}"
+            ))),
+            Err(probe_error) => Err(McpError::internal_error(format!(
+                "Failed to terminate the owned subprocess ({signal_error}) and could not re-check its state ({probe_error})"
+            ))),
+        };
+    }
+    reap_signalled_child(child)
+}
+
+#[cfg(unix)]
+fn owned_process_group_is_absent(process_group: rustix::process::Pid) -> McpResult<bool> {
+    match rustix::process::test_kill_process_group(process_group) {
+        Err(rustix::io::Errno::SRCH) => Ok(true),
+        Ok(()) => Ok(false),
+        Err(error) => Err(McpError::internal_error(format!(
+            "Failed to verify owned subprocess-group cleanup: {error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ascii_fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_group_and_thread_count(stat: &[u8]) -> Option<(char, i32, u64)> {
+    let command_end = stat.iter().rposition(|byte| *byte == b')')?;
+    let mut fields = linux_ascii_fields(stat.get(command_end + 1..)?);
+    let state = fields.next()?;
+    if state.len() != 1 {
+        return None;
+    }
+    let state = char::from(state[0]);
+    let _parent_process_id = fields.next()?;
+    let process_group_id = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+    let thread_count = std::str::from_utf8(fields.nth(14)?).ok()?.parse().ok()?;
+    Some((state, process_group_id, thread_count))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_stat_process_id(stat: &[u8]) -> Option<u32> {
+    let command_start = stat.iter().position(|byte| *byte == b'(')?;
+    let mut fields = linux_ascii_fields(stat.get(..command_start)?);
+    let process_id = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+    fields.next().is_none().then_some(process_id)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_status_has_single_current_namespace_pid(status: &[u8], process_id: u32) -> bool {
+    let mut observed = None;
+    for line in status.split(|byte| *byte == b'\n') {
+        let Some(values) = line.strip_prefix(b"NSpid:") else {
+            continue;
+        };
+        if observed.is_some() {
+            return false;
+        }
+        let mut fields = linux_ascii_fields(values);
+        let Some(field) = fields.next() else {
+            return false;
+        };
+        if fields.next().is_some() {
+            return false;
+        }
+        observed = std::str::from_utf8(field)
+            .ok()
+            .and_then(|field| field.parse::<u32>().ok());
+        if observed.is_none() {
+            return false;
+        }
+    }
+    observed == Some(process_id)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_is_live(state: char) -> bool {
+    !matches!(state, 'Z' | 'X' | 'x')
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_stat_proves_single_terminal_task(state: char, thread_count: u64) -> bool {
+    !linux_process_state_is_live(state) && thread_count == 1
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_mounts_allow_complete_process_view(mounts: &str) -> bool {
+    let mut proc_mount_options = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(_source) = fields.next() else {
+            continue;
+        };
+        let Some(mount_point) = fields.next() else {
+            continue;
+        };
+        let Some(file_system) = fields.next() else {
+            continue;
+        };
+        let Some(options) = fields.next() else {
+            continue;
+        };
+        if mount_point != "/proc" {
+            continue;
+        }
+        if file_system != "proc" || proc_mount_options.is_some() {
+            return false;
+        }
+        proc_mount_options = Some(options);
+    }
+
+    proc_mount_options.is_some_and(|options| {
+        !options
+            .split(',')
+            .any(|option| option.starts_with("hidepid=") && option != "hidepid=0")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_file_mount_id(file: &std::fs::File) -> McpResult<u64> {
+    let metadata = rustix::fs::statx(
+        file,
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    if metadata.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() == 0 || metadata.stx_mnt_id == 0 {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection requires procfs mount identity support",
+        ));
+    }
+    Ok(metadata.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_verify_proc_file_mount(file: &std::fs::File, proc_mount_id: u64) -> McpResult<()> {
+    if linux_proc_file_mount_id(file)? == proc_mount_id {
+        Ok(())
+    } else {
+        Err(McpError::internal_error(
+            "Process-group live-member inspection found an inconsistent procfs mount",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_bounded_proc_file(file: &std::fs::File, max_bytes: u64) -> McpResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    if length > max_bytes {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection exceeded a procfs record bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open_verified_proc_file(path: &str, proc_mount_id: u64) -> McpResult<std::fs::File> {
+    let file = std::fs::File::open(path)
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    linux_verify_proc_file_mount(&file, proc_mount_id)?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_procfs_process_view(deadline: Instant) -> McpResult<u64> {
+    if Instant::now() >= deadline {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection exceeded its deadline",
+        ));
+    }
+
+    let proc_root = std::fs::File::open("/proc")
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    let proc_mount_id = linux_proc_file_mount_id(&proc_root)?;
+
+    let mounts_file = linux_open_verified_proc_file("/proc/self/mounts", proc_mount_id)?;
+    let mounts = linux_read_bounded_proc_file(&mounts_file, LINUX_PROC_MOUNTS_MAX_BYTES)?;
+    let mounts = std::str::from_utf8(&mounts)
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    if !linux_proc_mounts_allow_complete_process_view(mounts) {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection requires an unrestricted procfs view",
+        ));
+    }
+
+    let self_stat_file = linux_open_verified_proc_file("/proc/self/stat", proc_mount_id)?;
+    let self_stat = linux_read_bounded_proc_file(&self_stat_file, LINUX_PROC_STAT_MAX_BYTES)?;
+    let process_id = std::process::id();
+    if linux_proc_stat_process_id(&self_stat) != Some(process_id) {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection found a mismatched procfs namespace",
+        ));
+    }
+
+    let self_status_file = linux_open_verified_proc_file("/proc/self/status", proc_mount_id)?;
+    let self_status = linux_read_bounded_proc_file(&self_status_file, LINUX_PROC_STATUS_MAX_BYTES)?;
+    if !linux_status_has_single_current_namespace_pid(&self_status, process_id) {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection requires procfs mounted in the current PID namespace",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection exceeded its deadline",
+        ));
+    }
+    Ok(proc_mount_id)
+}
+
+/// Observes whether a Linux process group currently has a live member.
+///
+/// This is a read-only workspace utility for process owners that already hold
+/// separate authority over the group. `false` means the group was absent or
+/// every observed member was a single-threaded terminal zombie for this
+/// snapshot; it does not establish ownership and never sends a signal. The
+/// scan fails closed for invalid identifiers, restricted or inconsistent
+/// procfs views, namespace mismatch, ambiguous dead thread-group leaders,
+/// observation races, and deadline expiry.
+///
+/// # Errors
+///
+/// Returns an error when a complete, unambiguous procfs snapshot cannot be
+/// established before `deadline`.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn linux_process_group_has_live_member(
+    process_group_id: i32,
+    deadline: Instant,
+) -> McpResult<bool> {
+    if process_group_id <= 0 {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection received an invalid identifier",
+        ));
+    }
+    let process_group = rustix::process::Pid::from_raw(process_group_id).ok_or_else(|| {
+        McpError::internal_error(
+            "Process-group live-member inspection received an invalid identifier",
+        )
+    })?;
+    let proc_mount_id = verify_linux_procfs_process_view(deadline)?;
+    let processes = std::fs::read_dir("/proc")
+        .map_err(|_| McpError::internal_error("Process-group live-member inspection failed"))?;
+    let mut observed_matching_member = false;
+    for entry in processes {
+        if Instant::now() >= deadline {
+            return Err(McpError::internal_error(
+                "Process-group live-member inspection exceeded its deadline",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(McpError::internal_error(
+                    "Process-group live-member inspection failed",
+                ));
+            }
+        };
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat_file = match std::fs::File::open(entry.path().join("stat")) {
+            Ok(file) => file,
+            Err(error) if linux_proc_process_disappeared(&error) => continue,
+            Err(_) => {
+                return Err(McpError::internal_error(
+                    "Process-group live-member inspection failed",
+                ));
+            }
+        };
+        linux_verify_proc_file_mount(&stat_file, proc_mount_id)?;
+        let stat = linux_read_bounded_proc_file(&stat_file, LINUX_PROC_STAT_MAX_BYTES)?;
+        let (state, observed_group_id, thread_count) =
+            linux_process_state_group_and_thread_count(&stat).ok_or_else(|| {
+                McpError::internal_error("Process-group live-member inspection failed")
+            })?;
+        if observed_group_id != process_group_id {
+            continue;
+        }
+        observed_matching_member = true;
+        if linux_process_state_is_live(state) {
+            return Ok(true);
+        }
+        if linux_process_stat_proves_single_terminal_task(state, thread_count) {
+            continue;
+        }
+        // `/proc` root enumeration exposes only thread-group leaders. A dead
+        // leader with any thread count other than exactly one is ambiguous:
+        // live siblings may exist even when `/proc/<tgid>/task` is unavailable.
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection found an ambiguous terminal member",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(McpError::internal_error(
+            "Process-group live-member inspection exceeded its deadline",
+        ));
+    }
+    if observed_matching_member || owned_process_group_is_absent(process_group)? {
+        Ok(false)
+    } else {
+        Err(McpError::internal_error(
+            "Process-group live-member inspection could not reconcile procfs with the kernel group probe",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn require_owned_process_group_absent(process_group: rustix::process::Pid) -> McpResult<()> {
+    if owned_process_group_is_absent(process_group)? {
+        Ok(())
+    } else {
+        Err(McpError::internal_error(
+            "Owned process-group identity was lost while the group remained present; refusing to signal an unpinned PGID",
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchoredGroupShutdown {
+    KillAccepted(rustix::process::Pid),
+    IdentityLost(rustix::process::Pid),
+}
+
+#[cfg(unix)]
+fn request_anchored_group_shutdown(
+    anchor: &mut ProcessGroupAnchor,
+) -> McpResult<AnchoredGroupShutdown> {
+    let process_group = anchor.process_group;
+    let Some(child) = anchor.child.as_mut() else {
+        anchor.request_shutdown();
+        return Ok(AnchoredGroupShutdown::IdentityLost(process_group));
+    };
+
+    match child.try_wait() {
+        Ok(None) => {
+            // The live anchor pins this PGID. Signal while that proof is held;
+            // closing the control pipe afterwards also arms owner-death
+            // fallback if the shell had not yet observed the signal.
+            rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL)
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Failed to terminate the anchored subprocess group: {error}"
+                    ))
+                })?;
+            anchor.request_shutdown();
+            Ok(AnchoredGroupShutdown::KillAccepted(process_group))
+        }
+        Ok(Some(_)) => {
+            anchor.child = None;
+            anchor.request_shutdown();
+            Ok(AnchoredGroupShutdown::IdentityLost(process_group))
+        }
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => {
+            anchor.child = None;
+            anchor.request_shutdown();
+            Ok(AnchoredGroupShutdown::IdentityLost(process_group))
+        }
+        Err(error) => Err(McpError::internal_error(format!(
+            "Failed to establish process-group anchor state: {error}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_owned_process_group_quiescence(process_group: rustix::process::Pid) -> McpResult<()> {
+    let deadline = Instant::now() + OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT;
+    loop {
+        if owned_process_group_is_absent(process_group)? {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            #[cfg(target_os = "linux")]
+            {
+                // Linux keeps zombie-only groups observable through
+                // `kill(-pgid, 0)`. After the anchored kill was accepted and
+                // both direct children were reaped, accept delayed orphan
+                // reaping only after two independent complete snapshots prove
+                // that no live member remains.
+                let process_group_id = process_group.as_raw_nonzero().get();
+                let first_deadline = Instant::now()
+                    .checked_add(OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
+                if !linux_process_group_has_live_member(process_group_id, first_deadline)? {
+                    std::thread::park_timeout(DIRECT_CHILD_REAP_POLL_INTERVAL);
+                    let second_deadline = Instant::now()
+                        .checked_add(OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT)
+                        .unwrap_or_else(Instant::now);
+                    if !linux_process_group_has_live_member(process_group_id, second_deadline)? {
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(McpError::internal_error(
+                "Owned subprocess group remained present after the cleanup deadline",
+            ));
+        }
+        std::thread::park_timeout(
+            deadline
+                .saturating_duration_since(now)
+                .min(DIRECT_CHILD_REAP_POLL_INTERVAL),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn stop_owned_process_group(child: &mut Child, anchor: &mut ProcessGroupAnchor) -> McpResult<()> {
+    match request_anchored_group_shutdown(anchor)? {
+        AnchoredGroupShutdown::KillAccepted(process_group) => {
+            // Reap both direct children before the final non-signalling probe
+            // so their zombies cannot keep the group observable.
+            let peer_result = reap_signalled_child(child);
+            let anchor_result = anchor.reap();
+            let group_result = wait_for_owned_process_group_quiescence(process_group);
+            combine_cleanup_results(
+                combine_cleanup_results(peer_result, anchor_result),
+                group_result,
+            )
+        }
+        AnchoredGroupShutdown::IdentityLost(process_group) => {
+            // Without a live anchor, signal only the exact retained peer. The
+            // old numeric PGID is now observation-only because it may be
+            // recycled for an unrelated group.
+            let peer_result = stop_direct_child(child);
+            let group_result = require_owned_process_group_absent(process_group);
+            combine_cleanup_results(peer_result, group_result)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_owned_process_group(_child: &mut Child, _anchor: &mut ProcessGroupAnchor) -> McpResult<()> {
+    Err(McpError::internal_error(
+        "Owned subprocess groups are unavailable on this platform",
+    ))
+}
+
+fn stop_child(
+    child: &mut Child,
+    ownership: ChildOwnership,
+    group_anchor: &mut Option<ProcessGroupAnchor>,
+) -> McpResult<()> {
+    match ownership {
+        ChildOwnership::DirectChild => stop_direct_child(child),
+        ChildOwnership::OwnedProcessGroup => group_anchor.as_mut().map_or_else(
+            || {
+                Err(McpError::internal_error(
+                    "Owned process-group anchor is missing",
+                ))
+            },
+            |anchor| stop_owned_process_group(child, anchor),
+        ),
+    }
+}
+
+fn combine_cleanup_errors(first: McpError, second: McpError) -> McpError {
+    McpError::internal_error(format!(
+        "Multiple client cleanup steps failed ({first}); ({second})"
+    ))
+}
+
+pub(crate) fn combine_cleanup_results(
+    first: McpResult<()>,
+    second: McpResult<()>,
+) -> McpResult<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(combine_cleanup_errors(first, second)),
+    }
+}
+
+pub(crate) fn combine_operation_and_cleanup<T>(
+    operation: McpResult<T>,
+    cleanup: McpResult<()>,
+) -> McpResult<T> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(mark_cleanup_unverified(cleanup_error)),
+        (Err(operation_error), Err(cleanup_error)) => Err(McpError::with_data(
+            McpErrorCode::InternalError,
+            format!("Client cleanup failed after an operation failure: {cleanup_error}"),
+            serde_json::json!({
+                CLEANUP_UNVERIFIED_DATA_KEY: true,
+                "operation": operation_error,
+                "cleanup": cleanup_error,
+            }),
+        )),
+    }
+}
+
+pub(crate) fn combine_operation_with_cleanup<T, F>(
+    operation: McpResult<T>,
+    cleanup: F,
+) -> McpResult<T>
+where
+    F: FnOnce() -> McpResult<()>,
+{
+    let started = Instant::now();
+    let mut result = combine_operation_and_cleanup(operation, cleanup());
+    if let Err(error) = &mut result
+        && is_cleanup_unverified(error)
+        && let Some(data) = error
+            .data
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        data.insert(
+            CLEANUP_DURATION_MS_DATA_KEY.to_owned(),
+            serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
+    result
+}
+
+fn mark_cleanup_unverified(mut error: McpError) -> McpError {
+    let prior_data = error.data.take();
+    error.data = Some(serde_json::json!({
+        CLEANUP_UNVERIFIED_DATA_KEY: true,
+        "causeData": prior_data,
+    }));
+    error
+}
+
+/// Returns whether a connection error includes an unverified subprocess
+/// cleanup outcome.
+///
+/// Callers that report lifecycle phases separately can use this marker to
+/// avoid presenting an initialization failure as though process cleanup was
+/// known to have succeeded.
+#[must_use]
+pub fn is_cleanup_unverified(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|data| data.get(CLEANUP_UNVERIFIED_DATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 pub(crate) fn resolve_stdio_command(
@@ -269,37 +1300,124 @@ pub(crate) fn resolve_stdio_command(
 /// `std::process::Child` does not terminate or reap a still-running process on
 /// drop. Keeping this guard armed across pipe extraction and the initialize
 /// handshake prevents failed connection attempts from leaking child processes.
-pub(crate) struct ChildGuard(Option<Child>);
+/// Explicit cleanup reports failures; Drop makes one final best-effort attempt
+/// but cannot return an error or detach an unstructured cleanup worker.
+pub(crate) struct ChildGuard {
+    child: Option<Child>,
+    ownership: ChildOwnership,
+    group_anchor: Option<ProcessGroupAnchor>,
+}
 
 impl ChildGuard {
     pub(crate) fn new(child: Child) -> Self {
-        Self(Some(child))
+        Self::with_ownership(child, ChildOwnership::DirectChild)
+    }
+
+    pub(crate) fn with_ownership(child: Child, ownership: ChildOwnership) -> Self {
+        Self {
+            child: Some(child),
+            ownership,
+            group_anchor: None,
+        }
+    }
+
+    pub(crate) fn with_process_group(child: Child, anchor: ProcessGroupAnchor) -> Self {
+        Self {
+            child: Some(child),
+            ownership: ChildOwnership::OwnedProcessGroup,
+            group_anchor: Some(anchor),
+        }
     }
 
     pub(crate) fn child_mut(&mut self) -> &mut Child {
-        self.0.as_mut().expect("ChildGuard already disarmed")
+        self.child.as_mut().expect("ChildGuard already disarmed")
+    }
+
+    pub(crate) fn verify_group_anchor(&mut self) -> McpResult<()> {
+        self.group_anchor
+            .as_mut()
+            .map_or(Ok(()), ProcessGroupAnchor::verify_live)
     }
 
     pub(crate) fn disarm(mut self) -> Child {
-        self.0.take().expect("ChildGuard already disarmed")
+        debug_assert!(self.group_anchor.is_none());
+        self.child.take().expect("ChildGuard already disarmed")
+    }
+
+    pub(crate) fn disarm_all(mut self) -> (Child, Option<ProcessGroupAnchor>) {
+        (
+            self.child.take().expect("ChildGuard already disarmed"),
+            self.group_anchor.take(),
+        )
+    }
+
+    fn try_cleanup(&mut self) -> McpResult<()> {
+        let result = match self.child.as_mut() {
+            Some(child) => stop_child(child, self.ownership, &mut self.group_anchor),
+            None => self
+                .group_anchor
+                .as_mut()
+                .map_or(Ok(()), ProcessGroupAnchor::cleanup),
+        };
+        if result.is_ok() {
+            self.child = None;
+            self.group_anchor = None;
+        }
+        result
+    }
+
+    pub(crate) fn cleanup(mut self) -> McpResult<()> {
+        self.try_cleanup()
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            stop_direct_child(&mut child);
+        if let Err(error) = self.try_cleanup() {
+            log::error!("Subprocess cleanup was not verified during guard drop: {error}");
         }
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientProgressParams {
     #[serde(rename = "progressTo\x6ben")]
     marker: ProgressMarker,
     progress: f64,
     total: Option<f64>,
     message: Option<String>,
+    #[serde(rename = "_meta")]
+    _meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ClientProgressParams {
+    fn is_semantically_valid_after(&self, previous: Option<f64>) -> bool {
+        self.progress.is_finite()
+            && self.total.is_none_or(f64::is_finite)
+            && previous.is_none_or(|previous| self.progress > previous)
+    }
+}
+
+fn parse_valid_client_progress(
+    params: &serde_json::Value,
+    previous: Option<f64>,
+) -> Option<ClientProgressParams> {
+    let object = params.as_object()?;
+    // Optional protocol members are absent or typed; explicit null is not an
+    // alternate spelling for omission and must not acquire timer authority.
+    if object.get("total").is_some_and(serde_json::Value::is_null)
+        || object
+            .get("message")
+            .is_some_and(serde_json::Value::is_null)
+        || object.get("_meta").is_some_and(serde_json::Value::is_null)
+    {
+        return None;
+    }
+    let progress = serde_json::from_value::<ClientProgressParams>(params.clone()).ok()?;
+    progress
+        .is_semantically_valid_after(previous)
+        .then_some(progress)
 }
 
 fn method_not_found_response(request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
@@ -391,6 +1509,23 @@ fn json_rpc_error_to_mcp(error: JsonRpcError) -> McpError {
     }
 }
 
+fn cancellation_control_message(
+    request_id: RequestId,
+    reason: Option<String>,
+    await_cleanup: Option<bool>,
+) -> McpResult<JsonRpcMessage> {
+    let params = serde_json::to_value(CancelledParams {
+        request_id,
+        reason,
+        await_cleanup,
+    })
+    .map_err(|_| McpError::invalid_params("Invalid cancellation control parameters"))?;
+    Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+        "notifications/cancelled",
+        Some(params),
+    )))
+}
+
 fn decode_response_payload<R: serde::de::DeserializeOwned>(
     value: serde_json::Value,
 ) -> McpResult<R> {
@@ -406,15 +1541,15 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
     Err(McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))
 }
 
-fn deadline_after(timeout_ms: u64) -> McpResult<Option<Instant>> {
-    if timeout_ms == 0 {
-        return Ok(None);
+fn validate_timeout_duration(
+    timeout: Duration,
+    maximum: Duration,
+    error: &'static str,
+) -> McpResult<()> {
+    if timeout < Duration::from_millis(1) || timeout > maximum {
+        return Err(McpError::invalid_params(error));
     }
-
-    Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms))
-        .map(Some)
-        .ok_or_else(|| McpError::internal_error("Request timeout exceeds the clock range"))
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -422,8 +1557,8 @@ fn recv_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
     cx: &Cx,
     deadline: Option<Instant>,
-) -> Result<JsonRpcMessage, TransportError> {
-    transport.recv_until(cx, deadline)
+) -> Result<(JsonRpcMessage, Instant), TransportError> {
+    transport.recv_until_with_completion(cx, deadline)
 }
 
 #[cfg(not(unix))]
@@ -431,14 +1566,37 @@ fn recv_child_transport(
     transport: &mut StdioTransport<ChildStdout, ChildStdin>,
     cx: &Cx,
     deadline: Option<Instant>,
-) -> Result<JsonRpcMessage, TransportError> {
+) -> Result<(JsonRpcMessage, Instant), TransportError> {
     // std::process::ChildStdout exposes no portable safe readiness primitive.
     // Keep the limitation explicit: non-Unix cancellation/deadlines are
     // observed at frame boundaries, but cannot interrupt a blocking pipe read.
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(TransportError::Timeout);
+        return Err(TransportError::ReceiveDeadlineExceeded);
     }
-    transport.recv(cx)
+    transport.recv_with_completion(cx)
+}
+
+#[cfg(unix)]
+fn send_child_server_response_during_receive(
+    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    _cx: &Cx,
+    message: &JsonRpcMessage,
+) -> McpResult<()> {
+    transport
+        .try_send_control_message(message)
+        .map_err(transport_error_to_mcp)
+}
+
+#[cfg(not(unix))]
+fn send_child_server_response_during_receive(
+    transport: &mut StdioTransport<ChildStdout, ChildStdin>,
+    cx: &Cx,
+    message: &JsonRpcMessage,
+) -> McpResult<()> {
+    // Standard child pipes expose no portable nonblocking write on this path.
+    // Preserve frame-boundary behavior explicitly; the caller abandons the
+    // connection if this send itself fails.
+    transport.send(cx, message).map_err(transport_error_to_mcp)
 }
 
 fn initialize_child_transport(
@@ -446,8 +1604,9 @@ fn initialize_child_transport(
     cx: &Cx,
     client_info: &ClientInfo,
     capabilities: &ClientCapabilities,
-    timeout_ms: u64,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> McpResult<InitializeResult> {
+    timeout_policy.validate()?;
     let params = InitializeParams {
         protocol_version: PROTOCOL_VERSION.to_string(),
         capabilities: capabilities.clone(),
@@ -460,16 +1619,23 @@ fn initialize_child_transport(
     transport
         .send(cx, &JsonRpcMessage::Request(request))
         .map_err(transport_error_to_mcp)?;
-    // The configured receive timeout starts only after the initialization
-    // frame has been committed. Synchronous stdio writes can still block at
-    // this host boundary and are governed by the caller's `Cx` checkpoints.
-    let deadline = deadline_after(timeout_ms)?;
+    // Both timers start at the observed successful commit boundary. The
+    // initialization exchange has no request-owned progress token, so its idle
+    // timer is never reset. Synchronous writes remain governed by the caller's
+    // `Cx` checkpoints before this commit.
+    let committed_at = Instant::now();
+    let deadlines = RequestDeadlines::start_at(timeout_policy, committed_at)?;
 
     let response = loop {
-        let message =
-            recv_child_transport(transport, cx, deadline).map_err(transport_error_to_mcp)?;
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(McpError::internal_error("Request timed out"));
+        let (message, received_at) = recv_child_transport(transport, cx, Some(deadlines.next()))
+            .map_err(|error| match error {
+                TransportError::ReceiveDeadlineExceeded => {
+                    request_timeout_error(deadlines.next_kind())
+                }
+                other => transport_error_to_mcp(other),
+            })?;
+        if let Some(source) = deadlines.expired_at(received_at) {
+            return Err(request_timeout_error(source));
         }
         validate_inbound_typed_message(&message)?;
         match message {
@@ -479,9 +1645,7 @@ fn initialize_child_transport(
             }
             JsonRpcMessage::Request(request) => {
                 if let Some(response) = server_request_response(&request) {
-                    transport
-                        .send(cx, &response)
-                        .map_err(transport_error_to_mcp)?;
+                    send_child_server_response_during_receive(transport, cx, &response)?;
                 }
             }
         }
@@ -514,6 +1678,18 @@ fn initialize_child_transport(
 const MAX_UNCORRELATED_RESPONSE_DIAGNOSTICS: u8 = 8;
 /// Default per-connection in-flight waiter bound from LIMIT-01.
 const MAX_IN_FLIGHT_RESPONSES: usize = 1_024;
+/// Default combined waiter and late-response tombstone bound from LIMIT-01.
+const MAX_RESPONSE_CORRELATIONS: usize = 4_096;
+/// Default late-response tombstone retention from LIMIT-01.
+const RESPONSE_TOMBSTONE_RETENTION: Duration = Duration::from_mins(10);
+/// Maximum retained at-most-once cancellation-control markers per connection.
+const MAX_CANCELLATION_CONTROL_IDS: usize = 4_096;
+/// Retention for an emitted or attempted ordinary-request cancellation ID.
+///
+/// This is at least the maximum ordinary request lifetime, so a still-live
+/// request generation cannot acquire a second control attempt after expiry.
+/// A successfully admitted new waiter generation clears its ID explicitly.
+const CANCELLATION_CONTROL_RETENTION: Duration = MAX_CLIENT_ABSOLUTE_TIMEOUT;
 /// Maximum pages followed by one automatic pagination operation.
 const MAX_AUTO_PAGINATION_PAGES: usize = 1_024;
 /// Maximum aggregate items retained by one automatic pagination operation.
@@ -540,6 +1716,7 @@ const PAGINATION_MEASUREMENT_ERROR: &str =
     "Automatic pagination response could not be measured safely";
 const LIST_PAGE_BYTE_LIMIT_ERROR: &str = "List page serialized-byte limit must be at least 2 bytes";
 const PROGRESS_CALLBACK_PANIC_ERROR: &str = "Client progress callback failed";
+const CONTROL_FRAME_CAPACITY_ERROR: &str = "MCP stdio control frame exceeds atomic capacity";
 const INVALID_RESPONSE_ENVELOPE_ERROR: &str = "Invalid JSON-RPC response";
 const INVALID_RESPONSE_PAYLOAD_ERROR: &str = "Invalid MCP response payload";
 const TRANSPORT_CODEC_ERROR: &str = "Invalid MCP transport frame";
@@ -986,6 +2163,7 @@ impl ResponseWaiter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseRoute {
     Delivered,
+    TombstoneRetired,
     InvalidEnvelope,
     UnknownId,
     MissingId,
@@ -995,14 +2173,22 @@ enum ResponseRoute {
 
 /// Correlation state owned by the single-reader stdio client.
 ///
-/// Only registered IDs can receive a response. Removing the sender before
-/// delivery makes the first matching terminal response authoritative;
-/// duplicate, late, and unknown-ID responses cannot replace or wake another
-/// waiter. This does not make the current `&mut Client` API concurrent; it
-/// makes correlation lossless for every ID registered with the one receive
-/// loop and provides the bounded state needed by a future multiplexed adapter.
+/// Only registered IDs can receive a response. A committed request timeout
+/// replaces its waiter with a bounded tombstone, so the exact late response is
+/// consumed without being misclassified or waking another owner. Duplicate
+/// and unknown-ID responses cannot replace a terminal outcome. This does not
+/// make the current `&mut Client` API concurrent; it makes correlation lossless
+/// for every ID registered with the one receive loop and provides bounded
+/// state for a future multiplexed adapter.
 struct ResponseRegistry {
     pending: std::collections::HashMap<RequestId, oneshot::Sender<CorrelatedResponse>>,
+    tombstones: std::collections::HashMap<RequestId, Instant>,
+    /// IDs whose one permitted cancellation control has been claimed.
+    ///
+    /// This state is intentionally separate from response tombstones: callers
+    /// may cancel an arbitrary peer-known ID, including one the local allocator
+    /// has not reached, without preventing a later local waiter registration.
+    cancellation_controls: std::collections::HashMap<RequestId, Instant>,
     terminal_error: Option<McpError>,
     uncorrelated_diagnostics: u8,
 }
@@ -1011,30 +2197,49 @@ impl ResponseRegistry {
     fn new() -> Self {
         Self {
             pending: std::collections::HashMap::new(),
+            tombstones: std::collections::HashMap::new(),
+            cancellation_controls: std::collections::HashMap::new(),
             terminal_error: None,
             uncorrelated_diagnostics: 0,
         }
     }
 
     fn register(&mut self, id: RequestId) -> McpResult<ResponseWaiter> {
+        self.prune_expired_retained_state(Instant::now());
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
         }
         if self.pending.contains_key(&id) {
             return Err(McpError::internal_error("Duplicate in-flight request ID"));
         }
+        if self.tombstones.contains_key(&id) {
+            return Err(McpError::internal_error(
+                "Retired request ID cannot be reused",
+            ));
+        }
         if self.pending.len() >= MAX_IN_FLIGHT_RESPONSES {
             return Err(McpError::internal_error(
                 "Client in-flight response limit reached",
             ));
         }
+        if self.pending.len().saturating_add(self.tombstones.len()) >= MAX_RESPONSE_CORRELATIONS {
+            return Err(McpError::internal_error(
+                "Client response correlation limit reached",
+            ));
+        }
 
         let (sender, receiver) = oneshot::channel();
+        // A public caller may have cancelled a peer-known ID before the local
+        // monotonic allocator reached it. Admission of a genuinely new waiter
+        // starts a new request generation with its own one-control allowance;
+        // unlike a response tombstone, the old control marker never blocks it.
+        self.cancellation_controls.remove(&id);
         self.pending.insert(id.clone(), sender);
         Ok(ResponseWaiter { id, receiver })
     }
 
     fn route(&mut self, response: JsonRpcResponse) -> ResponseRoute {
+        self.prune_expired_retained_state(Instant::now());
         if self.terminal_error.is_some() {
             self.note_uncorrelated_response("response received after connection failure");
             return ResponseRoute::ConnectionClosed;
@@ -1050,6 +2255,9 @@ impl ResponseRegistry {
             self.fail_all(error);
             return ResponseRoute::MissingId;
         };
+        if self.tombstones.remove(&id).is_some() {
+            return ResponseRoute::TombstoneRetired;
+        }
         let Some(sender) = self.pending.remove(&id) else {
             self.note_uncorrelated_response("response received for unknown or completed request");
             return ResponseRoute::UnknownId;
@@ -1072,7 +2280,71 @@ impl ResponseRegistry {
         true
     }
 
+    fn tombstone(&mut self, id: &RequestId, error: McpError) -> McpResult<bool> {
+        let now = Instant::now();
+        self.prune_expired_retained_state(now);
+        if let Some(terminal_error) = &self.terminal_error {
+            return Err(terminal_error.clone());
+        }
+        if self.tombstones.contains_key(id) || !self.pending.contains_key(id) {
+            return Ok(false);
+        }
+        if self.tombstones.len() >= MAX_RESPONSE_CORRELATIONS {
+            return Err(McpError::internal_error(
+                "Client response tombstone limit reached",
+            ));
+        }
+
+        let expires_at = now
+            .checked_add(RESPONSE_TOMBSTONE_RETENTION)
+            .ok_or_else(|| McpError::internal_error("Tombstone retention exceeds clock range"))?;
+        let Some(sender) = self.pending.remove(id) else {
+            return Ok(false);
+        };
+        self.tombstones.insert(id.clone(), expires_at);
+        let _ = sender.send_blocking(Err(error));
+        Ok(true)
+    }
+
+    /// Claims the sole cancellation-control attempt for `id`.
+    ///
+    /// The claim occurs before transport delivery. While the connection stays
+    /// live, retrying the public API or racing a later local timeout is therefore
+    /// an at-most-once no-op. Delivery failure terminates the connection, whose
+    /// terminal cleanup may then release all retained markers.
+    fn claim_cancellation_control(&mut self, id: &RequestId) -> McpResult<bool> {
+        let now = Instant::now();
+        self.prune_expired_retained_state(now);
+        if let Some(terminal_error) = &self.terminal_error {
+            return Err(terminal_error.clone());
+        }
+        if self.cancellation_controls.contains_key(id) {
+            return Ok(false);
+        }
+        if self.cancellation_controls.len() >= MAX_CANCELLATION_CONTROL_IDS {
+            return Err(McpError::internal_error(
+                "Client cancellation-control retention limit reached",
+            ));
+        }
+
+        let expires_at = now
+            .checked_add(CANCELLATION_CONTROL_RETENTION)
+            .ok_or_else(|| {
+                McpError::internal_error("Cancellation-control retention exceeds clock range")
+            })?;
+        self.cancellation_controls.insert(id.clone(), expires_at);
+        Ok(true)
+    }
+
+    fn prune_expired_retained_state(&mut self, now: Instant) {
+        self.tombstones.retain(|_, expires_at| *expires_at > now);
+        self.cancellation_controls
+            .retain(|_, expires_at| *expires_at > now);
+    }
+
     fn fail_all(&mut self, error: McpError) -> usize {
+        self.tombstones.clear();
+        self.cancellation_controls.clear();
         if self.terminal_error.is_some() {
             return 0;
         }
@@ -1101,6 +2373,16 @@ impl ResponseRegistry {
     fn pending_len(&self) -> usize {
         self.pending.len()
     }
+
+    #[cfg(test)]
+    fn tombstone_len(&self) -> usize {
+        self.tombstones.len()
+    }
+
+    #[cfg(test)]
+    fn cancellation_control_len(&self) -> usize {
+        self.cancellation_controls.len()
+    }
 }
 
 impl Default for ResponseRegistry {
@@ -1119,15 +2401,6 @@ fn invoke_tool_progress_callback(
         callback(progress, total, message);
     })
     .map_err(|_| McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR))
-}
-
-fn retire_panicked_progress_callback(
-    responses: &mut ResponseRegistry,
-    request_id: &RequestId,
-) -> McpError {
-    let error = McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
-    let _ = responses.fail(request_id, error.clone());
-    error
 }
 
 fn invoke_task_progress_callback<F>(
@@ -1152,6 +2425,18 @@ where
 pub struct Client {
     /// The subprocess running the MCP server.
     child: Option<Child>,
+    /// Live Unix group anchor and owner-death control descriptor.
+    group_anchor: Option<ProcessGroupAnchor>,
+    /// Scope that explicit shutdown must terminate and reap.
+    child_ownership: ChildOwnership,
+    /// Retry-safe cleanup phase for the retained subprocess identity.
+    child_cleanup_phase: ClientChildCleanupPhase,
+    /// Cleanup failure retained after a terminal connection error has already
+    /// consumed the child handle. Explicit `close` must still surface it.
+    cleanup_error: Option<McpError>,
+    /// Latest retryable process-cleanup failure. This is cleared when a later
+    /// close proves that the retained ownership scope is quiescent.
+    pending_process_cleanup_error: Option<McpError>,
     /// Transport for communication.
     transport: StdioTransport<ChildStdout, ChildStdin>,
     /// Capability context for cancellation.
@@ -1162,13 +2447,16 @@ pub struct Client {
     next_id: AtomicU64,
     /// Strict response correlation for every in-flight request.
     responses: ResponseRegistry,
-    /// Receive deadline for stdio responses (0 = disabled).
+    /// Idle/absolute policy for ordinary stdio responses.
     ///
     /// Unix child pipes use bounded readiness polling, including while a peer
     /// is silent or holds a partial frame. On non-Unix targets, the standard
     /// child pipe has no portable safe readiness primitive, so the deadline is
-    /// still observed only at complete-frame boundaries.
-    timeout_ms: u64,
+    /// still observed only at complete-frame boundaries; synchronous response
+    /// writes to child stdin are likewise not preemptible there. Bounded atomic
+    /// cancellation controls are also unavailable there, so a required cancel
+    /// or timeout control fails the connection explicitly.
+    timeout_policy: RequestTimeoutPolicy,
     /// Whether auto-initialization is enabled (for documentation/debugging).
     #[allow(dead_code)]
     auto_initialize: bool,
@@ -1180,6 +2468,122 @@ pub struct Client {
 }
 
 impl Client {
+    fn retain_cleanup_error(&mut self, error: McpError) {
+        self.cleanup_error = Some(match self.cleanup_error.take() {
+            Some(previous) => combine_cleanup_errors(previous, error),
+            None => error,
+        });
+    }
+
+    fn stop_direct_peer(&mut self) -> McpResult<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let result = stop_direct_child(&mut child);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) | Err(_) => {
+                    self.child = Some(child);
+                    Err(error)
+                }
+            },
+        }
+    }
+
+    fn stop_direct_owned_child(&mut self) -> McpResult<()> {
+        let result = self.stop_direct_peer();
+        if result.is_ok() {
+            self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn stop_owned_child_group(&mut self) -> McpResult<()> {
+        loop {
+            match self.child_cleanup_phase {
+                ClientChildCleanupPhase::Active => {
+                    let Some(anchor) = self.group_anchor.as_mut() else {
+                        let missing_anchor =
+                            McpError::internal_error("Owned process-group cleanup lost its anchor");
+                        let peer_result = self.stop_direct_peer();
+                        if peer_result.is_ok() {
+                            self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                        }
+                        return combine_cleanup_results(Err(missing_anchor), peer_result);
+                    };
+                    match request_anchored_group_shutdown(anchor)? {
+                        AnchoredGroupShutdown::KillAccepted(process_group) => {
+                            self.child_cleanup_phase =
+                                ClientChildCleanupPhase::GroupKillAccepted(process_group);
+                        }
+                        AnchoredGroupShutdown::IdentityLost(process_group) => {
+                            self.child_cleanup_phase =
+                                ClientChildCleanupPhase::GroupIdentityLost(process_group);
+                        }
+                    }
+                }
+                ClientChildCleanupPhase::GroupKillAccepted(process_group) => {
+                    let peer_result = self.child.as_mut().map_or(Ok(()), reap_signalled_child);
+                    if peer_result.is_ok() {
+                        self.child = None;
+                    }
+                    let anchor_result = self.group_anchor.as_mut().map_or_else(
+                        || {
+                            Err(McpError::internal_error(
+                                "Owned process-group cleanup lost its anchor",
+                            ))
+                        },
+                        ProcessGroupAnchor::reap,
+                    );
+                    combine_cleanup_results(peer_result, anchor_result)?;
+                    self.child_cleanup_phase =
+                        ClientChildCleanupPhase::GroupChildrenReaped(process_group);
+                }
+                ClientChildCleanupPhase::GroupChildrenReaped(process_group) => {
+                    wait_for_owned_process_group_quiescence(process_group)?;
+                    self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                    return Ok(());
+                }
+                ClientChildCleanupPhase::GroupIdentityLost(process_group) => {
+                    let peer_result = self.stop_direct_peer();
+                    let group_result = require_owned_process_group_absent(process_group);
+                    let result = combine_cleanup_results(peer_result, group_result);
+                    if result.is_ok() {
+                        self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                    }
+                    return result;
+                }
+                ClientChildCleanupPhase::Complete => return Ok(()),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn stop_owned_child_group(&mut self) -> McpResult<()> {
+        Err(McpError::internal_error(
+            "Owned subprocess groups are unavailable on this platform",
+        ))
+    }
+
+    fn stop_retained_child(&mut self) -> McpResult<()> {
+        if self.child_cleanup_phase == ClientChildCleanupPhase::Complete {
+            if self.child.is_none() {
+                return Ok(());
+            }
+            log::error!(
+                "Repairing an invalid completed-cleanup state that retained a direct child handle"
+            );
+            return self.stop_direct_peer();
+        }
+        match self.child_ownership {
+            ChildOwnership::DirectChild => self.stop_direct_owned_child(),
+            ChildOwnership::OwnedProcessGroup => self.stop_owned_child_group(),
+        }
+    }
+
     /// Creates a client connecting to a subprocess via stdio.
     ///
     /// # Arguments
@@ -1217,16 +2621,24 @@ impl Client {
         let mut child_guard = ChildGuard::new(child);
 
         // Get stdin/stdout handles
-        let stdin = child_guard
-            .child_mut()
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdin"))?;
-        let stdout = child_guard
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdout"))?;
+        let stdin = match child_guard.child_mut().stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return combine_operation_and_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdin")),
+                    child_guard.cleanup(),
+                );
+            }
+        };
+        let stdout = match child_guard.child_mut().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return combine_operation_and_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdout")),
+                    child_guard.cleanup(),
+                );
+            }
+        };
 
         // Create transport
         let transport = StdioTransport::new(stdout, stdin);
@@ -1241,6 +2653,11 @@ impl Client {
         // Create a temporary client for initialization
         let mut client = Self {
             child: Some(child_guard.disarm()),
+            group_anchor: None,
+            child_ownership: ChildOwnership::DirectChild,
+            child_cleanup_phase: ClientChildCleanupPhase::Active,
+            cleanup_error: None,
+            pending_process_cleanup_error: None,
             transport,
             cx,
             session: ClientSession::new(
@@ -1257,14 +2674,20 @@ impl Client {
             // allocator, leaving ID 2 as the first ordinary request ID.
             next_id: AtomicU64::new(1),
             responses: ResponseRegistry::new(),
-            timeout_ms: 30_000, // Default 30 second timeout
+            timeout_policy: RequestTimeoutPolicy::default(),
             auto_initialize: false,
             initialized: AtomicBool::new(false),
             initialization_error: None,
         };
 
         // Perform initialization handshake
-        let init_result = client.initialize(client_info, client_capabilities)?;
+        let init_result = match client.initialize(client_info, client_capabilities) {
+            Ok(result) => result,
+            Err(error) => {
+                let cleanup = client.close();
+                return combine_operation_and_cleanup(Err(error), cleanup);
+            }
+        };
 
         // Update session with server response
         client.session = ClientSession::new(
@@ -1276,7 +2699,10 @@ impl Client {
         );
 
         // Send the spec-correct `notifications/initialized` lifecycle notification.
-        client.send_initialized_notification()?;
+        if let Err(error) = client.send_initialized_notification() {
+            let cleanup = client.close();
+            return combine_operation_and_cleanup(Err(error), cleanup);
+        }
 
         // Mark as initialized
         client.initialized.store(true, Ordering::SeqCst);
@@ -1298,16 +2724,41 @@ impl Client {
         transport: StdioTransport<ChildStdout, ChildStdin>,
         cx: Cx,
         session: ClientSession,
-        timeout_ms: u64,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Self {
+        Self::from_parts_with_ownership(
+            child,
+            ChildOwnership::DirectChild,
+            None,
+            transport,
+            cx,
+            session,
+            timeout_policy,
+        )
+    }
+
+    pub(crate) fn from_parts_with_ownership(
+        child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
+        transport: StdioTransport<ChildStdout, ChildStdin>,
+        cx: Cx,
+        session: ClientSession,
+        timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
         Self {
             child: Some(child),
+            group_anchor,
+            child_ownership,
+            child_cleanup_phase: ClientChildCleanupPhase::Active,
+            cleanup_error: None,
+            pending_process_cleanup_error: None,
             transport,
             cx,
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
             responses: ResponseRegistry::new(),
-            timeout_ms,
+            timeout_policy,
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
@@ -1322,16 +2773,41 @@ impl Client {
         transport: StdioTransport<ChildStdout, ChildStdin>,
         cx: Cx,
         session: ClientSession,
-        timeout_ms: u64,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Self {
+        Self::from_parts_uninitialized_with_ownership(
+            child,
+            ChildOwnership::DirectChild,
+            None,
+            transport,
+            cx,
+            session,
+            timeout_policy,
+        )
+    }
+
+    pub(crate) fn from_parts_uninitialized_with_ownership(
+        child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
+        transport: StdioTransport<ChildStdout, ChildStdin>,
+        cx: Cx,
+        session: ClientSession,
+        timeout_policy: RequestTimeoutPolicy,
     ) -> Self {
         Self {
             child: Some(child),
+            group_anchor,
+            child_ownership,
+            child_cleanup_phase: ClientChildCleanupPhase::Active,
+            cleanup_error: None,
+            pending_process_cleanup_error: None,
             transport,
             cx,
             session,
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
             responses: ResponseRegistry::new(),
-            timeout_ms,
+            timeout_policy,
             auto_initialize: true,
             initialized: AtomicBool::new(false),
             initialization_error: None,
@@ -1404,9 +2880,19 @@ impl Client {
     fn terminate_connection(&mut self, error: McpError) -> McpError {
         self.initialized.store(false, Ordering::SeqCst);
         self.responses.fail_all(error.clone());
-        let _ = self.transport.close();
-        if let Some(mut child) = self.child.take() {
-            stop_direct_child(&mut child);
+        if let Err(cleanup_error) = self.transport.close().map_err(transport_error_to_mcp) {
+            self.retain_cleanup_error(cleanup_error);
+        }
+        if let Err(cleanup_error) = self.stop_retained_child() {
+            log::error!("Subprocess cleanup failed after terminal client error: {cleanup_error}");
+            if self.child_cleanup_phase == ClientChildCleanupPhase::Complete {
+                self.pending_process_cleanup_error = None;
+                self.retain_cleanup_error(cleanup_error);
+            } else {
+                self.pending_process_cleanup_error = Some(cleanup_error);
+            }
+        } else {
+            self.pending_process_cleanup_error = None;
         }
         error
     }
@@ -1471,6 +2957,24 @@ impl Client {
         self.session.protocol_version()
     }
 
+    /// Returns the timeout policy applied to subsequent ordinary requests.
+    #[must_use]
+    pub const fn request_timeout_policy(&self) -> RequestTimeoutPolicy {
+        self.timeout_policy
+    }
+
+    /// Replaces the timeout policy applied to subsequent ordinary requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-parameters error without changing the current policy
+    /// when either duration is below 1 millisecond or exceeds its hard ceiling.
+    pub fn set_request_timeout_policy(&mut self, policy: RequestTimeoutPolicy) -> McpResult<()> {
+        policy.validate()?;
+        self.timeout_policy = policy;
+        Ok(())
+    }
+
     /// Verifies that the initialized server can answer an MCP ping request.
     ///
     /// # Errors
@@ -1500,6 +3004,10 @@ impl Client {
         method: &str,
         params: P,
     ) -> McpResult<R> {
+        // Validate configuration before consuming an ID, registering a waiter,
+        // or committing any bytes to the peer.
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
         let id = self.next_request_id()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
@@ -1523,9 +3031,16 @@ impl Client {
             let error = self.record_send_failure(Some(&request_id), error);
             return Err(error);
         }
+        let committed_at = Instant::now();
+        let deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
+            Ok(deadlines) => deadlines,
+            Err(error) => {
+                return Err(self.finish_committed_request_locally(&request_id, error));
+            }
+        };
 
         // Receive response with ID validation
-        let response = self.recv_response(waiter)?;
+        let response = self.recv_response(waiter, deadlines)?;
 
         // Check for error response
         if let Some(error) = response.error {
@@ -1574,10 +3089,23 @@ impl Client {
         Ok(())
     }
 
-    /// Sends a cancellation notification for a previously issued request.
+    /// Sends a cancellation notification for a request ID known to the peer.
     ///
-    /// Set `await_cleanup` to request that the server wait for any cleanup
-    /// before acknowledging completion (best-effort; server-dependent).
+    /// Set `await_cleanup` to emit the provisional `awaitCleanup: true` wire
+    /// field. This call does not wait for, correlate, or validate a peer cleanup
+    /// acknowledgement; peer handling of the field remains server-dependent
+    /// and unverified.
+    /// The first call for an arbitrary request ID emits at most one bounded
+    /// control frame; repeated calls for that ID are retained no-ops through the
+    /// maximum ordinary-request lifetime. A successfully admitted later local
+    /// request with the same ID begins a new generation. If the ID currently
+    /// owns a local waiter, that waiter first receives local cancellation and
+    /// its late response is discarded through a tombstone.
+    ///
+    /// On Unix child pipes the control write is one bounded, nonblocking atomic
+    /// write. The standard library exposes no equivalent safe primitive for
+    /// child stdin on non-Unix targets, so cancellation there fails the
+    /// connection explicitly instead of risking an unbounded write.
     ///
     /// # Errors
     ///
@@ -1588,13 +3116,37 @@ impl Client {
         reason: Option<String>,
         await_cleanup: bool,
     ) -> McpResult<()> {
-        self.ensure_initialized()?;
-        let params = CancelledParams {
-            request_id: request_id.into(),
+        let request_id = request_id.into();
+        let control = cancellation_control_message(
+            request_id.clone(),
             reason,
-            await_cleanup: if await_cleanup { Some(true) } else { None },
+            await_cleanup.then_some(true),
+        )?;
+        self.ensure_initialized()?;
+
+        let claimed = match self.responses.claim_cancellation_control(&request_id) {
+            Ok(claimed) => claimed,
+            Err(error) => return Err(self.terminate_connection(error)),
         };
-        self.send_notification("notifications/cancelled", params)
+        if !claimed {
+            return Ok(());
+        }
+
+        if let Err(error) = self
+            .responses
+            .tombstone(&request_id, McpError::request_cancelled())
+        {
+            return Err(self.terminate_connection(error));
+        }
+        // Arbitrary peer-known, already-completed, and not-locally-owned IDs
+        // still receive their one public cancellation control. The independent
+        // marker does not poison future waiter registration for a locally
+        // not-yet-issued ID.
+        if let Err(control_error) = self.send_bounded_control_message(control) {
+            let terminal = self.terminate_connection(control_error);
+            return Err(terminal);
+        }
+        Ok(())
     }
 
     /// Records a transport send failure at the narrowest valid scope.
@@ -1620,25 +3172,169 @@ impl Client {
         error
     }
 
-    fn request_deadline(&self) -> McpResult<Option<Instant>> {
-        deadline_after(self.timeout_ms)
+    fn send_bounded_control_message(&mut self, message: JsonRpcMessage) -> McpResult<()> {
+        #[cfg(unix)]
+        {
+            self.transport
+                .try_send_control_message(&message)
+                .map_err(transport_error_to_mcp)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = message;
+            Err(McpError::internal_error(
+                "Nonblocking stdio control is unavailable on this platform",
+            ))
+        }
+    }
+
+    fn send_server_response_during_receive(&mut self, message: JsonRpcMessage) -> McpResult<()> {
+        // A peer-controlled server request must not turn the surrounding
+        // response deadline into an unbounded child-stdin write on platforms
+        // where child pipes expose the required nonblocking primitive.
+        send_child_server_response_during_receive(&mut self.transport, &self.cx, &message)
+    }
+
+    fn send_timeout_cancellation_control(&mut self, request_id: &RequestId) -> McpResult<()> {
+        let control = cancellation_control_message(request_id.clone(), None, None)?;
+        self.send_bounded_control_message(control)
+    }
+
+    fn finish_committed_request_locally(
+        &mut self,
+        request_id: &RequestId,
+        outcome: McpError,
+    ) -> McpError {
+        let cancellation_claim = self.responses.claim_cancellation_control(request_id);
+        match self.responses.tombstone(request_id, outcome.clone()) {
+            Ok(true) => match cancellation_claim {
+                Ok(true) => {
+                    if let Err(control_error) = self.send_timeout_cancellation_control(request_id)
+                        && self.responses.terminal_error().is_none()
+                    {
+                        let _ = self.terminate_connection(control_error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = self.terminate_connection(error);
+                }
+            },
+            Ok(false) => {}
+            Err(capacity_or_terminal_error) => {
+                let _ = self.terminate_connection(capacity_or_terminal_error);
+            }
+        }
+        outcome
+    }
+
+    fn timeout_committed_request(
+        &mut self,
+        request_id: &RequestId,
+        source: RequestTimeoutSource,
+    ) -> McpError {
+        self.finish_committed_request_locally(request_id, request_timeout_error(source))
+    }
+
+    fn finish_partial_frame_timeout(
+        &mut self,
+        request_id: &RequestId,
+        source: RequestTimeoutSource,
+    ) -> McpError {
+        let timeout = request_timeout_error(source);
+        // The explicit deadline still consumes this ID's sole cancellation
+        // marker. The transport has already failed closed on the partial frame,
+        // so no control write can be attempted without replacing the selected
+        // request-local timeout or violating frame alignment.
+        let cancellation_claim = self.responses.claim_cancellation_control(request_id);
+        // The peer supplied an incomplete NDJSON frame, so no aligned late
+        // response can retire a tombstone. Preserve the request-local timeout
+        // as first outcome, then fail the now-unusable connection with that
+        // same typed source.
+        let _ = self.responses.fail(request_id, timeout.clone());
+        match cancellation_claim {
+            Ok(_) => {
+                let _ = self.terminate_connection(timeout.clone());
+            }
+            Err(error) => {
+                let _ = self.terminate_connection(error);
+            }
+        }
+        timeout
+    }
+
+    fn finish_open_context_interruption(
+        &mut self,
+        request_id: &RequestId,
+        context_error: McpError,
+    ) -> McpError {
+        let outcome = self.finish_committed_request_locally(request_id, context_error);
+        // The stored context belongs to this direct connection and remains
+        // exhausted after the current request. Send the cancellation control
+        // first, then make that connection-wide terminal state explicit.
+        if self.responses.terminal_error().is_none() {
+            let _ = self.terminate_connection(outcome.clone());
+        }
+        outcome
+    }
+
+    fn finish_timeout_after_complete_message(
+        &mut self,
+        request_id: &RequestId,
+        message: JsonRpcMessage,
+        source: RequestTimeoutSource,
+    ) -> McpError {
+        let timeout = request_timeout_error(source);
+        if let Err(protocol_error) = validate_inbound_typed_message(&message) {
+            let _ = self.responses.fail(request_id, timeout.clone());
+            let _ = self.terminate_connection(protocol_error);
+            return timeout;
+        }
+
+        let timeout = self.timeout_committed_request(request_id, source);
+        if self.responses.terminal_error().is_some() {
+            return timeout;
+        }
+
+        match message {
+            JsonRpcMessage::Response(response) => {
+                let route = self.responses.route(response);
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let terminal_error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    let _ = self.terminate_connection(terminal_error);
+                }
+            }
+            JsonRpcMessage::Request(request) => {
+                if let Some(response) = server_request_response(&request) {
+                    if let Err(error) = self.send_bounded_control_message(response) {
+                        let _ = self.terminate_connection(error);
+                    }
+                } else if server_notification_kind(&request)
+                    == Some(ServerNotificationKind::LogMessage)
+                    && let Some(params) = request.params.as_ref()
+                    && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+                {
+                    self.emit_log_message(message);
+                }
+            }
+        }
+        timeout
     }
 
     /// Receives a response from the transport, validating the response ID.
     fn recv_response(
         &mut self,
         mut waiter: ResponseWaiter,
+        deadlines: RequestDeadlines,
     ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
         let expected_id = waiter.id.clone();
-        // Calculate the deadline after registration, retiring that registration
-        // if an invalid configured duration cannot be represented.
-        let deadline = match self.request_deadline() {
-            Ok(deadline) => deadline,
-            Err(error) => {
-                self.responses.fail(&expected_id, error.clone());
-                return Err(error);
-            }
-        };
 
         loop {
             if let Some(response) = waiter.try_response()? {
@@ -1646,26 +3342,45 @@ impl Client {
                 return Ok(response);
             }
 
-            // Check timeout before each recv attempt
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    let error = McpError::internal_error("Request timed out");
-                    self.responses.fail(&expected_id, error.clone());
-                    return Err(error);
-                }
+            if let Some(kind) = deadlines.expired_at(Instant::now()) {
+                return Err(self.timeout_committed_request(&expected_id, kind));
             }
 
-            let message = match recv_child_transport(&mut self.transport, &self.cx, deadline) {
-                Ok(message) => message,
-                Err(error) => {
-                    let error = transport_error_to_mcp(error);
-                    return Err(self.terminate_connection(error));
-                }
-            };
-            let received_at = Instant::now();
-            if deadline.is_some_and(|deadline| received_at >= deadline) {
-                let error = McpError::internal_error("Request timed out");
-                return Err(self.terminate_connection(error));
+            let (message, received_at) =
+                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                    Ok(received) => received,
+                    Err(TransportError::ReceiveDeadlineExceeded) => {
+                        let kind = deadlines
+                            .expired_at(Instant::now())
+                            .unwrap_or_else(|| deadlines.next_kind());
+                        if self.transport.is_closed() {
+                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
+                        }
+                        return Err(self.timeout_committed_request(&expected_id, kind));
+                    }
+                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::internal_error("Request timed out"),
+                        ));
+                    }
+                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::request_cancelled(),
+                        ));
+                    }
+                    Err(error) => {
+                        let error = transport_error_to_mcp(error);
+                        return Err(self.terminate_connection(error));
+                    }
+                };
+            if let Some(kind) = deadlines.expired_at(received_at) {
+                return Err(self.finish_timeout_after_complete_message(
+                    &expected_id,
+                    message,
+                    kind,
+                ));
             }
             if let Err(error) = validate_inbound_typed_message(&message) {
                 return Err(self.terminate_connection(error));
@@ -1691,9 +3406,8 @@ impl Client {
                 }
                 JsonRpcMessage::Request(request) => {
                     if let Some(response) = server_request_response(&request) {
-                        if let Err(error) = self.transport.send(&self.cx, &response) {
-                            let error = self.record_send_failure(Some(&expected_id), error);
-                            return Err(error);
+                        if let Err(error) = self.send_server_response_during_receive(response) {
+                            return Err(self.terminate_connection(error));
                         }
                         continue;
                     }
@@ -1839,6 +3553,11 @@ impl Client {
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<Vec<Content>> {
         self.ensure_initialized()?;
+        // Validate before allocating the ID that is also exposed as the
+        // progress token. The inner request path validates again immediately
+        // before registration so it remains safe when called directly.
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
         // Generate a unique request ID and reuse it as the progress token.
         let request_id = self.next_request_id()?;
         let progress_marker = ProgressMarker::Number(
@@ -1886,6 +3605,11 @@ impl Client {
         expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<R> {
+        // Validate configuration before serialization, waiter registration, or
+        // protocol commitment. The caller already owns `request_id`, so this
+        // specifically prevents an invalid duration from creating live state.
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
 
@@ -1903,9 +3627,22 @@ impl Client {
             let error = self.record_send_failure(Some(&request_id), error);
             return Err(error);
         }
+        let committed_at = Instant::now();
+        let deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
+            Ok(deadlines) => deadlines,
+            Err(error) => {
+                return Err(self.finish_committed_request_locally(&request_id, error));
+            }
+        };
 
         // Receive response, handling progress notifications
-        let response = self.recv_response_with_progress(waiter, expected_marker, on_progress)?;
+        let response = self.recv_response_with_progress(
+            waiter,
+            expected_marker,
+            on_progress,
+            timeout_policy,
+            deadlines,
+        )?;
 
         // Check for error response
         if let Some(error) = response.error {
@@ -1926,17 +3663,11 @@ impl Client {
         mut waiter: ResponseWaiter,
         expected_marker: &ProgressMarker,
         on_progress: ProgressCallback<'_>,
+        timeout_policy: RequestTimeoutPolicy,
+        mut deadlines: RequestDeadlines,
     ) -> McpResult<fastmcp_protocol::JsonRpcResponse> {
         let expected_id = waiter.id.clone();
-        // Calculate the deadline after registration, retiring that registration
-        // if an invalid configured duration cannot be represented.
-        let deadline = match self.request_deadline() {
-            Ok(deadline) => deadline,
-            Err(error) => {
-                self.responses.fail(&expected_id, error.clone());
-                return Err(error);
-            }
-        };
+        let mut last_progress = None;
 
         loop {
             if let Some(response) = waiter.try_response()? {
@@ -1944,26 +3675,45 @@ impl Client {
                 return Ok(response);
             }
 
-            // Check timeout before each recv attempt
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    let error = McpError::internal_error("Request timed out");
-                    self.responses.fail(&expected_id, error.clone());
-                    return Err(error);
-                }
+            if let Some(kind) = deadlines.expired_at(Instant::now()) {
+                return Err(self.timeout_committed_request(&expected_id, kind));
             }
 
-            let message = match recv_child_transport(&mut self.transport, &self.cx, deadline) {
-                Ok(message) => message,
-                Err(error) => {
-                    let error = transport_error_to_mcp(error);
-                    return Err(self.terminate_connection(error));
-                }
-            };
-            let received_at = Instant::now();
-            if deadline.is_some_and(|deadline| received_at >= deadline) {
-                let error = McpError::internal_error("Request timed out");
-                return Err(self.terminate_connection(error));
+            let (message, received_at) =
+                match recv_child_transport(&mut self.transport, &self.cx, Some(deadlines.next())) {
+                    Ok(received) => received,
+                    Err(TransportError::ReceiveDeadlineExceeded) => {
+                        let kind = deadlines
+                            .expired_at(Instant::now())
+                            .unwrap_or_else(|| deadlines.next_kind());
+                        if self.transport.is_closed() {
+                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
+                        }
+                        return Err(self.timeout_committed_request(&expected_id, kind));
+                    }
+                    Err(TransportError::Timeout) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::internal_error("Request timed out"),
+                        ));
+                    }
+                    Err(TransportError::Cancelled) if !self.transport.is_closed() => {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::request_cancelled(),
+                        ));
+                    }
+                    Err(error) => {
+                        let error = transport_error_to_mcp(error);
+                        return Err(self.terminate_connection(error));
+                    }
+                };
+            if let Some(kind) = deadlines.expired_at(received_at) {
+                return Err(self.finish_timeout_after_complete_message(
+                    &expected_id,
+                    message,
+                    kind,
+                ));
             }
             if let Err(error) = validate_inbound_typed_message(&message) {
                 return Err(self.terminate_connection(error));
@@ -1986,44 +3736,39 @@ impl Client {
                 }
                 JsonRpcMessage::Request(request) => {
                     if let Some(response) = server_request_response(&request) {
-                        if let Err(error) = self.transport.send(&self.cx, &response) {
-                            let error = self.record_send_failure(Some(&expected_id), error);
-                            return Err(error);
+                        if let Err(error) = self.send_server_response_during_receive(response) {
+                            return Err(self.terminate_connection(error));
                         }
                         continue;
                     }
 
                     if server_notification_kind(&request) == Some(ServerNotificationKind::Progress)
                     {
-                        if let Some(params) = request.params.as_ref() {
-                            if let Ok(progress) =
-                                serde_json::from_value::<ClientProgressParams>(params.clone())
+                        if let Some(params) = request.params.as_ref()
+                            && let Some(progress) =
+                                parse_valid_client_progress(params, last_progress)
+                            && progress.marker == *expected_marker
+                        {
+                            if invoke_tool_progress_callback(
+                                &mut *on_progress,
+                                progress.progress,
+                                progress.total,
+                                progress.message.as_deref(),
+                            )
+                            .is_err()
                             {
-                                // Only handle progress for our expected marker
-                                if progress.marker == *expected_marker {
-                                    if invoke_tool_progress_callback(
-                                        &mut *on_progress,
-                                        progress.progress,
-                                        progress.total,
-                                        progress.message.as_deref(),
-                                    )
-                                    .is_err()
-                                    {
-                                        let error = retire_panicked_progress_callback(
-                                            &mut self.responses,
-                                            &expected_id,
-                                        );
-                                        let _ = self.send_notification(
-                                            "notifications/cancelled",
-                                            CancelledParams {
-                                                request_id: expected_id.clone(),
-                                                reason: None,
-                                                await_cleanup: None,
-                                            },
-                                        );
-                                        return Err(error);
-                                    }
-                                }
+                                let error = McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR);
+                                return Err(
+                                    self.finish_committed_request_locally(&expected_id, error)
+                                );
+                            }
+                            last_progress = Some(progress.progress);
+                            if timeout_policy.reset_idle_on_matching_progress
+                                && let Err(error) = deadlines.reset_idle_at(received_at)
+                            {
+                                return Err(
+                                    self.finish_committed_request_locally(&expected_id, error)
+                                );
                             }
                         }
                     } else if server_notification_kind(&request)
@@ -2528,40 +4273,96 @@ impl Client {
         }
     }
 
-    /// Closes the client connection.
-    pub fn close(mut self) {
+    /// Closes the client connection and verifies bounded subprocess cleanup.
+    ///
+    /// Drop remains a best-effort safety net. Callers that need to prove that
+    /// an owned subprocess (or configured Unix process group) was stopped must
+    /// use this explicit method and handle its result. A successful close is
+    /// idempotent. Retryable process cleanup failures retain the child handle
+    /// and phase so callers may invoke `close` again without re-signalling a
+    /// process group after its leader has been reaped.
+    ///
+    /// Subprocess verification assumes this client exclusively reaps the
+    /// retained direct children. Process-wide `waitpid(-1)` consumers,
+    /// `SIGCHLD=SIG_IGN`, and `SA_NOCLDWAIT` can consume that evidence before
+    /// FastMCP observes it; in that case cleanup fails closed instead of
+    /// signalling an identity that is no longer proven. Unix process-group
+    /// ownership also cannot contain descendants that deliberately change
+    /// process group/session, or guarantee owner-death cleanup while a
+    /// host-side `fork` retains a copy of the private control descriptor
+    /// (including a concurrent setup-time fork on Unix targets without atomic
+    /// close-on-exec socket-pair creation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot be closed, process state
+    /// cannot be established, signalling fails, or the subprocess cannot be
+    /// reaped within the cleanup deadline.
+    pub fn close(&mut self) -> McpResult<()> {
+        self.initialized.store(false, Ordering::SeqCst);
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
 
-        // Close the transport
-        let _ = self.transport.close();
-
-        // Kill the subprocess if still running
-        if let Some(mut child) = self.child.take() {
-            stop_direct_child(&mut child);
+        // Transport teardown is one-shot. Preserve any failure because a
+        // consumed writer cannot make a later close prove that the earlier
+        // flush/close succeeded.
+        let transport_result = self.transport.close().map_err(transport_error_to_mcp);
+        if let Err(error) = transport_result {
+            self.retain_cleanup_error(error);
         }
+
+        // Process teardown is phaseful and retryable. Only an error from a
+        // terminal phase becomes sticky; a later successful quiescence proof
+        // clears the prior attempt's transient failure.
+        let process_result = self.stop_retained_child();
+        let retryable_process_result = match process_result {
+            Ok(()) => {
+                self.pending_process_cleanup_error = None;
+                Ok(())
+            }
+            Err(error) if self.child_cleanup_phase == ClientChildCleanupPhase::Complete => {
+                self.pending_process_cleanup_error = None;
+                self.retain_cleanup_error(error);
+                Ok(())
+            }
+            Err(error) => {
+                self.pending_process_cleanup_error = Some(error.clone());
+                Err(error)
+            }
+        };
+        let sticky_result = self.cleanup_error.clone().map_or(Ok(()), Err);
+        let result = combine_cleanup_results(sticky_result, retryable_process_result);
+        if result.is_ok() {
+            self.pending_process_cleanup_error = None;
+        }
+        result
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // Ensure subprocess is cleaned up even if close() wasn't called.
-        // Ignore errors since we're in drop - best effort cleanup.
+        // Drop cannot report cleanup failure or create an orphan cleanup task;
+        // callers requiring proof must call close() and handle its result.
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
         let _ = self.transport.close();
-        if let Some(mut child) = self.child.take() {
-            stop_direct_child(&mut child);
+        if let Err(error) = self.stop_retained_child() {
+            log::error!("Client drop could not verify subprocess cleanup: {error}");
         }
     }
 }
 
 /// Converts a TransportError to McpError.
-fn transport_error_to_mcp(e: TransportError) -> McpError {
+pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
     match e {
         TransportError::Cancelled => McpError::request_cancelled(),
         TransportError::Closed => McpError::internal_error("Transport closed"),
-        TransportError::Timeout => McpError::internal_error("Request timed out"),
+        TransportError::Timeout | TransportError::ReceiveDeadlineExceeded => {
+            McpError::internal_error("Request timed out")
+        }
+        TransportError::ControlFrameTooLarge { .. } => {
+            McpError::internal_error(CONTROL_FRAME_CAPACITY_ERROR)
+        }
         TransportError::Io(io_err) => McpError::internal_error(format!("I/O error: {io_err}")),
         // Typed codec failures can contain serde diagnostics that echo an
         // attacker-controlled enum value or control characters. The peer's
@@ -2620,6 +4421,235 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_proc_stat_parser_uses_final_command_delimiter() {
+        assert_eq!(
+            linux_process_state_group_and_thread_count(
+                b"123 (worker) with ) delimiters) S 45 678 6 7 8 9 10 11 12 13 14 15 16 17 18 19 4"
+            ),
+            Some(('S', 678, 4))
+        );
+        assert_eq!(
+            linux_process_state_group_and_thread_count(b"malformed"),
+            None
+        );
+        let mut non_utf8_name = b"123 (worker-".to_vec();
+        non_utf8_name.push(0xff);
+        non_utf8_name.extend_from_slice(b") S 45 678 6 7 8 9 10 11 12 13 14 15 16 17 18 19 4");
+        assert_eq!(
+            linux_process_state_group_and_thread_count(&non_utf8_name),
+            Some(('S', 678, 4))
+        );
+        assert_eq!(linux_proc_stat_process_id(&non_utf8_name), Some(123));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_status_requires_one_pid_namespace() {
+        assert!(linux_status_has_single_current_namespace_pid(
+            b"Name:\tworker\nNSpid:\t123\n",
+            123
+        ));
+        assert!(!linux_status_has_single_current_namespace_pid(
+            b"Name:\tworker\nNSpid:\t1\t123\n",
+            123
+        ));
+        assert!(!linux_status_has_single_current_namespace_pid(
+            b"Name:\tworker\nNSpid:\t123\t123\n",
+            123
+        ));
+        assert!(!linux_status_has_single_current_namespace_pid(
+            b"NSpid:\t123\nNSpid:\t123\n",
+            123
+        ));
+        assert!(!linux_status_has_single_current_namespace_pid(
+            b"Name:\tworker\n",
+            123
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_process_liveness_excludes_only_terminal_states() {
+        for state in ['R', 'S', 'D', 'T', 't', 'I'] {
+            assert!(linux_process_state_is_live(state), "state {state}");
+            assert!(!linux_process_stat_proves_single_terminal_task(state, 1));
+        }
+        for state in ['Z', 'X', 'x'] {
+            assert!(!linux_process_state_is_live(state), "state {state}");
+            assert!(linux_process_stat_proves_single_terminal_task(state, 1));
+            assert!(!linux_process_stat_proves_single_terminal_task(state, 0));
+            assert!(!linux_process_stat_proves_single_terminal_task(state, 2));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_proc_scan_accepts_only_disappearance_errors() {
+        assert!(linux_proc_process_disappeared(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(linux_proc_process_disappeared(
+            &std::io::Error::from_raw_os_error(rustix::io::Errno::SRCH.raw_os_error())
+        ));
+        assert!(!linux_proc_process_disappeared(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_proc_mount_policy_requires_unrestricted_view() {
+        assert!(linux_proc_mounts_allow_complete_process_view(
+            "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+        ));
+        assert!(linux_proc_mounts_allow_complete_process_view(
+            "proc /proc proc rw,hidepid=0 0 0\n"
+        ));
+        assert!(linux_proc_mounts_allow_complete_process_view(
+            "proc /proc proc rw,hidepid=0,subset=pid 0 0\n"
+        ));
+        assert!(!linux_proc_mounts_allow_complete_process_view(
+            "proc /proc proc rw,hidepid=2 0 0\n"
+        ));
+        assert!(!linux_proc_mounts_allow_complete_process_view(
+            "proc /proc proc rw 0 0\nproc /proc proc rw 0 0\n"
+        ));
+        assert!(!linux_proc_mounts_allow_complete_process_view(
+            "tmpfs /proc tmpfs rw 0 0\n"
+        ));
+        assert!(!linux_proc_mounts_allow_complete_process_view(""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_group_scanner_rejects_invalid_id_and_deadline() {
+        assert!(
+            linux_process_group_has_live_member(0, Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            linux_process_group_has_live_member(-1, Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(linux_process_group_has_live_member(1, Instant::now()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_group_scanner_observes_live_member() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec /bin/sleep 60"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live process-group member");
+        let mut guard = ChildGuard::new(child);
+        let process_group_id =
+            i32::try_from(guard.child_mut().id()).expect("PID fits process-group range");
+
+        let observed = linux_process_group_has_live_member(
+            process_group_id,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let cleanup = guard.cleanup();
+
+        assert!(observed.expect("complete live-group procfs scan"));
+        assert!(cleanup.is_ok(), "clean up live scan fixture: {cleanup:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_linux_group_scanner_distinguishes_zombie_from_absence() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn zombie-only process-group fixture");
+        let mut guard = ChildGuard::new(child);
+        let process_group_id =
+            i32::try_from(guard.child_mut().id()).expect("PID fits process-group range");
+        let zombie_deadline = Instant::now() + Duration::from_secs(2);
+        let observed_zombie = loop {
+            let state = std::fs::read(format!("/proc/{process_group_id}/stat"))
+                .ok()
+                .and_then(|stat| linux_process_state_group_and_thread_count(&stat))
+                .map(|(state, _, _)| state);
+            if state.is_some_and(|state| matches!(state, 'Z' | 'X' | 'x')) {
+                break true;
+            }
+            if Instant::now() >= zombie_deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let observed = linux_process_group_has_live_member(
+            process_group_id,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let process_group = rustix::process::Pid::from_raw(process_group_id)
+            .expect("positive process-group identifier");
+        let strict_absence = require_owned_process_group_absent(process_group);
+        let cleanup = guard.cleanup();
+
+        assert!(
+            observed_zombie,
+            "fixture must reach zombie state before inspection"
+        );
+        assert!(!observed.expect("complete zombie-only procfs scan"));
+        assert!(
+            strict_absence.is_err(),
+            "zombie-only observation must not weaken the identity-lost path"
+        );
+        assert!(
+            cleanup.is_ok(),
+            "reap zombie-only scan fixture: {cleanup:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reality_check_regression_anchored_cleanup_accepts_zombie_only_descendant_group() {
+        let anchor = ProcessGroupAnchor::spawn().expect("spawn process-group anchor");
+        let process_group_id = anchor.raw_process_group();
+        let peer = Command::new("/bin/sh")
+            .args(["-c", "exec /bin/sleep 60"])
+            .process_group(process_group_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn anchored peer");
+        let group_guard = ChildGuard::with_process_group(peer, anchor);
+        let retained_descendant = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(process_group_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn retained descendant fixture");
+        let retained_guard = ChildGuard::new(retained_descendant);
+
+        let cleanup = group_guard.cleanup();
+        let descendant_cleanup = retained_guard.cleanup();
+
+        assert!(
+            cleanup.is_ok(),
+            "zombie-only orphan must not fail cleanup: {cleanup:?}"
+        );
+        assert!(
+            descendant_cleanup.is_ok(),
+            "reap retained descendant fixture: {descendant_cleanup:?}"
+        );
+    }
+
     fn make_closed_client_with_cx(initialized: bool, cx: Cx) -> Client {
         let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
         let mut command = Command::new(rustc);
@@ -2648,9 +4678,23 @@ mod tests {
         );
 
         if initialized {
-            Client::from_parts(child, transport, cx, session, 100)
+            Client::from_parts(
+                child,
+                transport,
+                cx,
+                session,
+                RequestTimeoutPolicy::new(Duration::from_millis(100), Duration::from_millis(100))
+                    .unwrap(),
+            )
         } else {
-            Client::from_parts_uninitialized(child, transport, cx, session, 100)
+            Client::from_parts_uninitialized(
+                child,
+                transport,
+                cx,
+                session,
+                RequestTimeoutPolicy::new(Duration::from_millis(100), Duration::from_millis(100))
+                    .unwrap(),
+            )
         }
     }
 
@@ -2659,18 +4703,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn make_scripted_initialized_client(response: JsonRpcMessage) -> Client {
-        let response_line = serde_json::to_string(&response).expect("serialize scripted response");
-        assert!(
-            !response_line.contains('\''),
-            "the shell fixture requires a single-quote-free JSON line"
-        );
-        // Keep the peer alive briefly so the client can write its request, but
-        // make the fixture self-terminating without an orphanable watchdog.
-        let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
+    fn make_shell_scripted_initialized_client(script: &str, timeout: Duration) -> Client {
         let mut command = Command::new("sh");
         command
-            .args(["-c", script.as_str()])
+            .args(["-c", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -2691,11 +4727,30 @@ mod tests {
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         );
-        Client::from_parts(child, transport, Cx::for_request(), session, 1_000)
+        Client::from_parts(
+            child,
+            transport,
+            Cx::for_request(),
+            session,
+            RequestTimeoutPolicy::new(timeout, timeout).unwrap(),
+        )
     }
 
     #[cfg(unix)]
-    fn make_delayed_scripted_initialized_client(response: JsonRpcMessage) -> Client {
+    fn make_scripted_initialized_client(response: JsonRpcMessage) -> Client {
+        let response_line = serde_json::to_string(&response).expect("serialize scripted response");
+        assert!(
+            !response_line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        // Keep the peer alive briefly so the client can write its request, but
+        // make the fixture self-terminating without an orphanable watchdog.
+        let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
+        make_shell_scripted_initialized_client(&script, Duration::from_secs(1))
+    }
+
+    #[cfg(unix)]
+    fn make_peer_silent_past_deadline_client(response: JsonRpcMessage) -> Client {
         let response_line = serde_json::to_string(&response).expect("serialize scripted response");
         assert!(
             !response_line.contains('\''),
@@ -2705,59 +4760,170 @@ mod tests {
         // request deadline. The peer remains bounded even if client cleanup
         // regresses, and no background watchdog can outlive the fixture.
         let script = format!("sleep 1; printf '%s\\n' '{response_line}'; exec sleep 2");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", script.as_str()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn delayed scripted peer");
-        let stdin = child.stdin.take().expect("scripted peer stdin");
-        let stdout = child.stdout.take().expect("scripted peer stdout");
-        let transport = StdioTransport::new(stdout, stdin);
-        let session = ClientSession::new(
-            ClientInfo {
-                name: "test-client".to_string(),
-                version: "0.1.0".to_string(),
-            },
-            ClientCapabilities::default(),
-            ServerInfo {
-                name: "scripted-server".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            ServerCapabilities::default(),
-            PROTOCOL_VERSION.to_string(),
+        make_shell_scripted_initialized_client(&script, Duration::from_millis(5))
+    }
+
+    #[test]
+    fn request_timeout_policy_has_distinct_validated_bounds_and_named_reset() {
+        let default = RequestTimeoutPolicy::default();
+        assert_eq!(default.idle_timeout(), Duration::from_secs(30));
+        assert_eq!(default.absolute_timeout(), Duration::from_secs(120));
+        assert!(default.resets_idle_on_matching_progress());
+
+        for (idle, absolute) in [
+            (Duration::ZERO, Duration::from_millis(1)),
+            (Duration::from_nanos(999_999), Duration::from_millis(1)),
+            (
+                MAX_CLIENT_IDLE_TIMEOUT + Duration::from_nanos(1),
+                Duration::from_millis(1),
+            ),
+            (Duration::from_millis(1), Duration::ZERO),
+            (Duration::from_millis(1), Duration::from_nanos(999_999)),
+            (
+                Duration::from_millis(1),
+                MAX_CLIENT_ABSOLUTE_TIMEOUT + Duration::from_nanos(1),
+            ),
+        ] {
+            assert!(RequestTimeoutPolicy::new(idle, absolute).is_err());
+        }
+
+        let strict =
+            RequestTimeoutPolicy::new(Duration::from_millis(1), MAX_CLIENT_ABSOLUTE_TIMEOUT)
+                .unwrap()
+                .reset_idle_on_matching_progress(false);
+        assert_eq!(strict.idle_timeout(), Duration::from_millis(1));
+        assert_eq!(strict.absolute_timeout(), MAX_CLIENT_ABSOLUTE_TIMEOUT);
+        assert!(!strict.resets_idle_on_matching_progress());
+
+        let exact_bounds =
+            RequestTimeoutPolicy::new(MAX_CLIENT_IDLE_TIMEOUT, Duration::from_millis(1))
+                .expect("the exact idle maximum and absolute minimum are valid");
+        assert_eq!(exact_bounds.idle_timeout(), MAX_CLIENT_IDLE_TIMEOUT);
+        assert_eq!(exact_bounds.absolute_timeout(), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn request_deadline_idle_reset_never_moves_absolute() {
+        let committed_at = Instant::now();
+        let policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(100), Duration::from_millis(250))
+                .unwrap();
+        let mut deadlines = RequestDeadlines::start_at(policy, committed_at).unwrap();
+        let absolute = deadlines.absolute;
+
+        deadlines
+            .reset_idle_at(committed_at + Duration::from_millis(80))
+            .unwrap();
+
+        assert_eq!(deadlines.idle, committed_at + Duration::from_millis(180));
+        assert_eq!(deadlines.absolute, absolute);
+        assert_eq!(
+            deadlines.expired_at(committed_at + Duration::from_millis(181)),
+            Some(RequestTimeoutSource::Idle)
         );
-        Client::from_parts(child, transport, Cx::for_request(), session, 5)
+
+        let mut absolute_deadlines = RequestDeadlines::start_at(policy, committed_at).unwrap();
+        absolute_deadlines
+            .reset_idle_at(committed_at + Duration::from_millis(200))
+            .unwrap();
+        assert_eq!(absolute_deadlines.absolute, absolute);
+        assert_eq!(
+            absolute_deadlines.expired_at(committed_at + Duration::from_millis(250)),
+            Some(RequestTimeoutSource::Absolute)
+        );
+    }
+
+    #[test]
+    fn request_deadline_tie_selects_absolute_source() {
+        let committed_at = Instant::now();
+        let policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(100), Duration::from_millis(100))
+                .unwrap();
+        let deadlines = RequestDeadlines::start_at(policy, committed_at).unwrap();
+
+        assert_eq!(deadlines.next_kind(), RequestTimeoutSource::Absolute);
+        assert_eq!(
+            deadlines.expired_at(committed_at + Duration::from_millis(99)),
+            None
+        );
+        assert_eq!(
+            deadlines.expired_at(committed_at + Duration::from_millis(100)),
+            Some(RequestTimeoutSource::Absolute)
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn ordinary_response_completed_after_deadline_is_rejected() {
+    fn invalid_response_timeout_is_rejected_before_request_commit() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_millis(100));
+        client.timeout_policy = RequestTimeoutPolicy {
+            idle_timeout: Duration::ZERO,
+            absolute_timeout: Duration::from_secs(1),
+            reset_idle_on_matching_progress: true,
+        };
+
+        let result: McpResult<serde_json::Value> =
+            client.send_request("test/invalid-timeout", serde_json::json!({}));
+        let error = result.expect_err("invalid timeout must fail before request commitment");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+
+        let mut progress_events = Vec::new();
+        let mut on_progress = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            progress_events.push((progress, total, message.map(ToOwned::to_owned)));
+        };
+        let progress_error = client
+            .call_tool_with_progress(
+                "test/invalid-timeout",
+                serde_json::json!({}),
+                &mut on_progress,
+            )
+            .expect_err("invalid timeout must fail before progress-token allocation");
+        assert_eq!(progress_error.code, McpErrorCode::InvalidParams);
+        assert!(progress_events.is_empty());
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_none());
+        assert!(client.is_initialized());
+        assert!(client.child.is_some());
+        assert!(!client.transport.is_closed());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_peer_timeout_is_request_local() {
         let response = JsonRpcMessage::Response(JsonRpcResponse::success(
             RequestId::Number(2),
             serde_json::json!({"late": true}),
         ));
-        let mut client = make_delayed_scripted_initialized_client(response);
+        let mut client = make_peer_silent_past_deadline_client(response);
 
         let result: McpResult<serde_json::Value> =
             client.send_request("test/late", serde_json::json!({}));
-        let error = result.expect_err("a response completed after its deadline must time out");
+        let error = result.expect_err("a silent peer must time out the request");
 
         assert!(error.message.contains("timed out"));
+        assert!(client.is_initialized());
         assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert_eq!(client.responses.cancellation_control_len(), 1);
         assert!(client.responses.terminal_error().is_none());
-        client.close();
+        client.close().expect("client cleanup");
     }
 
     #[cfg(unix)]
     #[test]
-    fn terminal_response_completed_after_deadline_via_progress_api_is_rejected() {
+    fn silent_peer_timeout_via_progress_api_is_request_local() {
         let response = JsonRpcMessage::Response(JsonRpcResponse::success(
             RequestId::Number(2),
             serde_json::json!({"late": true}),
         ));
-        let mut client = make_delayed_scripted_initialized_client(response);
+        let mut client = make_peer_silent_past_deadline_client(response);
         let marker = ProgressMarker::Number(2);
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
@@ -2771,18 +4937,145 @@ mod tests {
             &marker,
             &mut callback,
         );
-        let error = result.expect_err("a late progress response must time out");
+        let error = result.expect_err("a silent peer must time out the progress request");
 
         assert!(error.message.contains("timed out"));
         assert!(progress_events.is_empty());
+        assert!(client.is_initialized());
         assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert_eq!(client.responses.cancellation_control_len(), 1);
         assert!(client.responses.terminal_error().is_none());
-        client.close();
+        client.close().expect("client cleanup");
     }
 
     #[cfg(unix)]
     #[test]
-    fn matching_progress_completed_after_deadline_has_no_callback_side_effect() {
+    fn public_cancellation_emits_for_arbitrary_id_without_poisoning_future_registration() {
+        let script = "IFS= read -r cancellation; IFS= read -r request; \
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*) method_ok=true;; *) method_ok=false;; esac; \
+            case \"$cancellation\" in *'\"requestId\":2'*) id_ok=true;; *) id_ok=false;; esac; \
+            case \"$cancellation\" in *'\"reason\":\"pre-cancel\"'*) reason_ok=true;; *) reason_ok=false;; esac; \
+            if [ \"$method_ok\" = true ] && [ \"$id_ok\" = true ] && [ \"$reason_ok\" = true ]; \
+              then cancellation_ok=true; else cancellation_ok=false; fi; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"cancellation\":%s,\"request\":%s}}\\n' \
+              \"$cancellation_ok\" \"$request_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+
+        client
+            .cancel_request(2_i64, Some("pre-cancel".to_string()), false)
+            .expect("an arbitrary peer-known ID receives one control frame");
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+        client
+            .cancel_request(2_i64, Some("duplicate".to_string()), true)
+            .expect("the same arbitrary ID is an at-most-once no-op");
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+
+        let evidence: serde_json::Value = client
+            .send_request("test/new-generation", serde_json::json!({}))
+            .expect("the later local request generation must not be poisoned");
+        assert_eq!(
+            evidence,
+            serde_json::json!({"cancellation": true, "request": true})
+        );
+        assert_eq!(client.responses.cancellation_control_len(), 0);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_cancellation_tombstones_once_and_uses_bounded_control() {
+        let script = "IFS= read -r first; IFS= read -r cancellation; IFS= read -r second; \
+            case \"$first\" in *'\"id\":20'*) first_ok=true;; *) first_ok=false;; esac; \
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*) method_ok=true;; *) method_ok=false;; esac; \
+            case \"$cancellation\" in *'\"requestId\":20'*) id_ok=true;; *) id_ok=false;; esac; \
+            case \"$cancellation\" in *'\"reason\":\"stop\"'*) reason_ok=true;; *) reason_ok=false;; esac; \
+            case \"$cancellation\" in *'\"awaitCleanup\":true'*) cleanup_ok=true;; *) cleanup_ok=false;; esac; \
+            if [ \"$method_ok\" = true ] && [ \"$id_ok\" = true ] && [ \"$reason_ok\" = true ] && [ \"$cleanup_ok\" = true ]; \
+              then cancellation_ok=true; else cancellation_ok=false; fi; \
+            case \"$second\" in *'\"id\":2'*) second_ok=true;; *) second_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":20,\"result\":{\"late\":true}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"first\":%s,\"cancellation\":%s,\"second\":%s}}\\n' \
+              \"$first_ok\" \"$cancellation_ok\" \"$second_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let request_id = RequestId::Number(20);
+        let request = JsonRpcRequest::new("test/cancel", Some(serde_json::json!({})), 20);
+        let mut waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("register cancellation owner");
+        client
+            .transport
+            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .expect("commit request before public cancellation");
+
+        client
+            .cancel_request(request_id.clone(), Some("stop".to_string()), true)
+            .expect("first public cancellation must commit one control frame");
+        client
+            .cancel_request(request_id, Some("duplicate".to_string()), false)
+            .expect("duplicate cancellation is an idempotent bounded no-op");
+
+        let waiter_error = waiter
+            .try_response()
+            .expect_err("the request owner receives local cancellation");
+        assert_eq!(waiter_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+
+        let evidence: serde_json::Value = client
+            .send_request("test/after-cancel", serde_json::json!({}))
+            .expect("late response retires the tombstone without misalignment");
+        assert_eq!(
+            evidence,
+            serde_json::json!({
+                "first": true,
+                "cancellation": true,
+                "second": true
+            })
+        );
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_public_cancellation_is_local_first_then_connection_terminal() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let request_id = RequestId::Number(20);
+        let request = JsonRpcRequest::new("test/cancel-large", Some(serde_json::json!({})), 20);
+        let mut waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("register oversized-cancellation owner");
+        client
+            .transport
+            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .expect("commit request before oversized cancellation");
+
+        let error = client
+            .cancel_request(request_id, Some("x".repeat(512)), false)
+            .expect_err("oversized atomic control must fail boundedly");
+
+        assert_eq!(error.message, CONTROL_FRAME_CAPACITY_ERROR);
+        let waiter_error = waiter
+            .try_response()
+            .expect_err("the first request-local outcome remains cancellation");
+        assert_eq!(waiter_error.code, McpErrorCode::RequestCancelled);
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        assert!(client.responses.terminal_error().is_some());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_peer_timeout_has_no_progress_callback_side_effect() {
         let progress = JsonRpcMessage::Request(JsonRpcRequest::notification(
             "notifications/progress",
             Some(serde_json::json!({
@@ -2792,7 +5085,7 @@ mod tests {
                 "message": "late"
             })),
         ));
-        let mut client = make_delayed_scripted_initialized_client(progress);
+        let mut client = make_peer_silent_past_deadline_client(progress);
         let marker = ProgressMarker::Number(2);
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
@@ -2806,13 +5099,596 @@ mod tests {
             &marker,
             &mut callback,
         );
-        let error = result.expect_err("late request-owned progress must time out");
+        let error = result.expect_err("a silent peer must time out without progress");
 
         assert!(error.message.contains("timed out"));
         assert!(progress_events.is_empty());
+        assert!(client.is_initialized());
         assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
         assert!(client.responses.terminal_error().is_none());
-        client.close();
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_valid_increasing_progress_resets_only_idle() {
+        let script = "IFS= read -r request; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.1,\"_meta\":{\"trace\":\"accepted\"}}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.2}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\\n'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+        client.timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_millis(800))
+                .unwrap();
+        let marker = ProgressMarker::Number(2);
+        let mut progress_events = Vec::new();
+        let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            progress_events.push(progress);
+        };
+
+        let result: serde_json::Value = client
+            .send_request_with_progress(
+                "test/progress-idle-reset",
+                serde_json::json!({}),
+                2,
+                &marker,
+                &mut callback,
+            )
+            .expect("matching progress must keep the request alive between idle windows");
+
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(progress_events, vec![0.1, 0.2]);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_progress_does_not_reset_idle_when_policy_disables_it() {
+        let script = "IFS= read -r request; \
+            sleep 0.20; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            sleep 0.30; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tooLate\":true}}\\n'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+        client.timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(400), Duration::from_millis(900))
+                .unwrap()
+                .reset_idle_on_matching_progress(false);
+        let marker = ProgressMarker::Number(2);
+        let mut progress_events = Vec::new();
+        let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            progress_events.push(progress);
+        };
+
+        let error = client
+            .send_request_with_progress::<_, serde_json::Value>(
+                "test/progress-reset-disabled",
+                serde_json::json!({}),
+                2,
+                &marker,
+                &mut callback,
+            )
+            .expect_err("accepted progress must not override a disabled idle reset");
+
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        assert_eq!(progress_events, vec![0.5]);
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_invalid_and_nonmonotonic_progress_do_not_reset_idle() {
+        let script = "IFS= read -r request; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":999,\"progress\":0.6}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.7,\"unknown\":true}}\\n'; \
+            sleep 0.05; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            sleep 0.20; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tooLate\":true}}\\n'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+        client.timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(300), Duration::from_secs(1)).unwrap();
+        let marker = ProgressMarker::Number(2);
+        let mut progress_events = Vec::new();
+        let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            progress_events.push(progress);
+        };
+
+        let error = client
+            .send_request_with_progress::<_, serde_json::Value>(
+                "test/progress-no-idle-authority",
+                serde_json::json!({}),
+                2,
+                &marker,
+                &mut callback,
+            )
+            .expect_err("non-authoritative progress must not extend idle");
+
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        assert_eq!(progress_events, vec![0.5]);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_progress_never_moves_absolute_deadline() {
+        let script = "IFS= read -r request; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.1}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.2}}\\n'; \
+            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.3}}\\n'; \
+            sleep 0.30; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tooLate\":true}}\\n'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+        client.timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(300), Duration::from_millis(500))
+                .unwrap();
+        let marker = ProgressMarker::Number(2);
+        let mut progress_events = Vec::new();
+        let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            progress_events.push(progress);
+        };
+
+        let error = client
+            .send_request_with_progress::<_, serde_json::Value>(
+                "test/progress-absolute-bound",
+                serde_json::json!({}),
+                2,
+                &marker,
+                &mut callback,
+            )
+            .expect_err("progress must not keep a request alive past absolute time");
+
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert_eq!(progress_events, vec![0.1, 0.2, 0.3]);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_timeout_keeps_connection_reusable_and_discards_late_activity() {
+        let late_progress = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({
+                "progressToken": 2,
+                "progress": 0.5,
+                "total": 1.0,
+                "message": "late"
+            })),
+        ));
+        let late_response = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(2),
+            serde_json::json!({"late": true}),
+        ));
+        let lines = [late_progress, late_response]
+            .map(|message| serde_json::to_string(&message).expect("serialize scripted message"));
+        assert!(
+            lines.iter().all(|line| !line.contains('\'')),
+            "the shell fixture requires single-quote-free JSON lines"
+        );
+        let script = format!(
+            "IFS= read -r first; sleep 1; IFS= read -r cancellation; \
+             IFS= read -r second; \
+             case \"$first\" in *'\"id\":2'*) first_ok=true;; *) first_ok=false;; esac; \
+             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \
+             case \"$second\" in *'\"id\":3'*) second_ok=true;; *) second_ok=false;; esac; \
+             printf '%s\\n' '{}' '{}'; \
+             printf '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"first\":%s,\"cancellation\":%s,\"second\":%s}}}}\\n' \
+             \"$first_ok\" \"$cancellation_ok\" \"$second_ok\"; exec sleep 2",
+            lines[0], lines[1]
+        );
+        let mut client = make_shell_scripted_initialized_client(&script, Duration::from_millis(5));
+        let first_marker = ProgressMarker::Number(2);
+        let mut first_progress = Vec::new();
+        let mut first_callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            first_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
+
+        let first: McpResult<serde_json::Value> = client.send_request_with_progress(
+            "test/first",
+            serde_json::json!({}),
+            2,
+            &first_marker,
+            &mut first_callback,
+        );
+        let first_error =
+            first.expect_err("the first request must time out while the peer is idle");
+        assert!(first_error.message.contains("timed out"));
+        assert!(first_progress.is_empty());
+        assert!(client.responses.terminal_error().is_none());
+
+        client.timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(3)).unwrap();
+        let second_marker = ProgressMarker::Number(3);
+        let mut second_progress = Vec::new();
+        let mut second_callback = |progress: f64, total: Option<f64>, message: Option<&str>| {
+            second_progress.push((progress, total, message.map(ToOwned::to_owned)));
+        };
+        let second: serde_json::Value = client
+            .send_request_with_progress(
+                "test/second",
+                serde_json::json!({}),
+                3,
+                &second_marker,
+                &mut second_callback,
+            )
+            .expect("the next request must use the still-aligned connection");
+
+        assert_eq!(
+            second,
+            serde_json::json!({
+                "first": true,
+                "cancellation": true,
+                "second": true
+            })
+        );
+        assert!(second_progress.is_empty());
+        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_time_server_request_response_cannot_block_request_deadline() {
+        let script = "IFS= read -r request; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":88}\\n'; \
+            IFS= read -r response; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            case \"$response\" in *'\"id\":88'*) response_ok=true;; *) response_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":%s,\"response\":%s}}\\n' \
+            \"$request_ok\" \"$response_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+
+        let result: serde_json::Value = client
+            .send_request("test/server-request", serde_json::json!({}))
+            .expect("an in-time server request must receive its bounded response");
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "request": true,
+                "response": true
+            })
+        );
+        assert!(client.is_initialized());
+        assert!(!client.transport.is_closed());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panicked_progress_callback_cancels_and_preserves_connection_alignment() {
+        let script = "IFS= read -r first; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            IFS= read -r cancellation; IFS= read -r second; \
+            case \"$first\" in *'\"id\":2'*) first_ok=true;; *) first_ok=false;; esac; \
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \
+            case \"$second\" in *'\"id\":3'*) second_ok=true;; *) second_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"late\":true}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"first\":%s,\"cancellation\":%s,\"second\":%s}}\\n' \
+            \"$first_ok\" \"$cancellation_ok\" \"$second_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(3));
+        let mut callback = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            panic!("progress callback panic canary");
+        };
+
+        let first = client.call_tool_with_progress(
+            "test/panicked-progress",
+            serde_json::json!({}),
+            &mut callback,
+        );
+        let first_error = first.expect_err("the callback panic must become a fixed local error");
+
+        assert_eq!(first_error.message, PROGRESS_CALLBACK_PANIC_ERROR);
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert!(client.responses.terminal_error().is_none());
+
+        let second: serde_json::Value = client
+            .send_request("test/after-panicked-progress", serde_json::json!({}))
+            .expect("the next request must remain aligned after callback cancellation");
+
+        assert_eq!(
+            second,
+            serde_json::json!({
+                "first": true,
+                "cancellation": true,
+                "second": true
+            })
+        );
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        assert!(client.responses.terminal_error().is_none());
+        assert!(client.is_initialized());
+        assert!(!client.transport.is_closed());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_frame_timeout_is_connection_terminal() {
+        let script = "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":2'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let result: McpResult<serde_json::Value> =
+            client.send_request("test/partial", serde_json::json!({}));
+        let error = result.expect_err("a timeout after partial-frame consumption must be terminal");
+
+        assert!(error.message.contains("timed out"));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        let terminal = client
+            .responses
+            .terminal_error()
+            .expect("the framing failure must be retained");
+        assert_eq!(terminal.code, error.code);
+        assert_eq!(terminal.message, error.message);
+        assert_eq!(terminal.data, error.data);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_context_deadline_after_commit_is_connection_terminal() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let request_id = RequestId::Number(2);
+        let request = JsonRpcRequest::new("test/context-deadline", Some(serde_json::json!({})), 2);
+        let waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("register committed request");
+        client
+            .transport
+            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .expect("commit request before expiring its stored context");
+        let deadlines = RequestDeadlines::start_at(client.timeout_policy, Instant::now()).unwrap();
+        client.cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+
+        let error = client
+            .recv_response(waiter, deadlines)
+            .expect_err("an exhausted stored context must terminate the owned connection");
+
+        assert!(error.message.contains("timed out"));
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_some());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_context_cancellation_after_commit_is_connection_terminal() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let request_id = RequestId::Number(2);
+        let request = JsonRpcRequest::new("test/context-cancel", Some(serde_json::json!({})), 2);
+        let waiter = client
+            .responses
+            .register(request_id)
+            .expect("register committed request");
+        client
+            .transport
+            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .expect("commit request before cancelling its stored context");
+        let deadlines = RequestDeadlines::start_at(client.timeout_policy, Instant::now()).unwrap();
+        client.cx.set_cancel_requested(true);
+
+        let error = client
+            .recv_response(waiter, deadlines)
+            .expect_err("a cancelled stored context must terminate the owned connection");
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        let terminal = client
+            .responses
+            .terminal_error()
+            .expect("the cancellation must be retained as connection-terminal");
+        assert_eq!(terminal.code, error.code);
+        assert_eq!(terminal.message, error.message);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_context_cancellation_after_progress_commit_is_terminal() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let request_id = RequestId::Number(2);
+        let request = JsonRpcRequest::new(
+            "test/context-cancel-progress",
+            Some(serde_json::json!({})),
+            2,
+        );
+        let waiter = client
+            .responses
+            .register(request_id)
+            .expect("register committed progress request");
+        client
+            .transport
+            .send(&client.cx, &JsonRpcMessage::Request(request))
+            .expect("commit progress request before cancelling its stored context");
+        let timeout_policy = client.timeout_policy;
+        let deadlines = RequestDeadlines::start_at(timeout_policy, Instant::now()).unwrap();
+        client.cx.set_cancel_requested(true);
+        let marker = ProgressMarker::Number(2);
+        let mut callback_invoked = false;
+        let mut callback = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {
+            callback_invoked = true;
+        };
+
+        let error = client
+            .recv_response_with_progress(waiter, &marker, &mut callback, timeout_policy, deadlines)
+            .expect_err("a cancelled stored context must terminate the progress connection");
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(!callback_invoked);
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_some());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_late_message_routes_unrelated_response_and_retires_tombstone() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let timed_out_id = RequestId::Number(20);
+        let unrelated_id = RequestId::Number(21);
+        let mut timed_out_waiter = client
+            .responses
+            .register(timed_out_id.clone())
+            .expect("register timed-out owner");
+        let mut unrelated_waiter = client
+            .responses
+            .register(unrelated_id.clone())
+            .expect("register unrelated owner");
+
+        let timeout = client.finish_timeout_after_complete_message(
+            &timed_out_id,
+            JsonRpcMessage::Response(JsonRpcResponse::success(
+                unrelated_id.clone(),
+                serde_json::json!({"owner": "unrelated"}),
+            )),
+            RequestTimeoutSource::Idle,
+        );
+
+        assert!(timeout.message.contains("timed out"));
+        let waiter_error = timed_out_waiter
+            .try_response()
+            .expect_err("the expired owner receives its local timeout");
+        assert_eq!(waiter_error.message, timeout.message);
+        let unrelated = unrelated_waiter
+            .try_response()
+            .expect("unrelated waiter remains valid")
+            .expect("the complete unrelated response is routed");
+        assert_eq!(unrelated.id, Some(unrelated_id));
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert_eq!(
+            client.responses.route(JsonRpcResponse::success(
+                timed_out_id,
+                serde_json::json!({"late": true}),
+            )),
+            ResponseRoute::TombstoneRetired
+        );
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.uncorrelated_diagnostics, 0);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_late_server_request_uses_bounded_control_writes() {
+        let script = "IFS= read -r cancellation; IFS= read -r response; \
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":20'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \
+            case \"$response\" in *'\"id\":88'*) response_ok=true;; *) response_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"cancellation\":%s,\"response\":%s}}\\n' \
+            \"$cancellation_ok\" \"$response_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+        let timed_out_id = RequestId::Number(20);
+        let mut waiter = client
+            .responses
+            .register(timed_out_id.clone())
+            .expect("register timeout owner");
+        let late_ping =
+            JsonRpcMessage::Request(JsonRpcRequest::new("ping", Some(serde_json::json!({})), 88));
+
+        let timeout = client.finish_timeout_after_complete_message(
+            &timed_out_id,
+            late_ping,
+            RequestTimeoutSource::Idle,
+        );
+
+        assert!(timeout.message.contains("timed out"));
+        let waiter_error = waiter
+            .try_response()
+            .expect_err("the expired owner receives its timeout");
+        assert_eq!(waiter_error.message, timeout.message);
+        let evidence = client
+            .transport
+            .recv_until(&client.cx, Some(Instant::now() + Duration::from_secs(2)))
+            .expect("the peer observes both bounded control frames");
+        let JsonRpcMessage::Response(evidence) = evidence else {
+            panic!("expected scripted evidence response");
+        };
+        assert_eq!(evidence.id, Some(RequestId::Number(99)));
+        assert_eq!(
+            evidence.result,
+            Some(serde_json::json!({
+                "cancellation": true,
+                "response": true
+            }))
+        );
+        assert!(!client.transport.is_closed());
+        assert_eq!(client.responses.tombstone_len(), 1);
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_complete_late_message_times_out_owner_and_closes_connection() {
+        let mut client =
+            make_shell_scripted_initialized_client("exec sleep 2", Duration::from_secs(1));
+        let request_id = RequestId::Number(30);
+        let mut waiter = client
+            .responses
+            .register(request_id.clone())
+            .expect("register timed-out owner");
+        let malformed = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Owned("1.0".to_string()),
+            result: Some(serde_json::Value::Null),
+            error: None,
+            id: Some(request_id.clone()),
+        });
+
+        let timeout = client.finish_timeout_after_complete_message(
+            &request_id,
+            malformed,
+            RequestTimeoutSource::Idle,
+        );
+
+        assert!(timeout.message.contains("timed out"));
+        let waiter_error = waiter
+            .try_response()
+            .expect_err("the expired owner receives its first local outcome");
+        assert_eq!(waiter_error.message, timeout.message);
+        assert!(!client.is_initialized());
+        assert!(client.transport.is_closed());
+        assert!(client.child.is_none());
+        assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_some());
+        client.close().expect("client cleanup");
     }
 
     #[test]
@@ -3183,6 +6059,41 @@ mod tests {
         assert_eq!(params.marker, ProgressMarker::String("tok-1".to_string()));
         assert!(params.total.is_none());
         assert!(params.message.is_none());
+        assert!(params._meta.is_none());
+    }
+
+    #[test]
+    fn progress_timer_authority_requires_closed_finite_strictly_increasing_params() {
+        let valid = serde_json::json!({
+            "progressToken": 42,
+            "progress": -1.5,
+            "total": -10.0,
+            "message": "still valid",
+            "_meta": {"trace": "accepted", "nested": {"open": true}}
+        });
+        let first =
+            parse_valid_client_progress(&valid, None).expect("first finite update is valid");
+        assert_eq!(first.progress, -1.5);
+        assert_eq!(
+            first._meta.as_ref().and_then(|meta| meta.get("trace")),
+            Some(&serde_json::json!("accepted"))
+        );
+        assert!(parse_valid_client_progress(&valid, Some(-1.5)).is_none());
+        assert!(parse_valid_client_progress(&valid, Some(0.0)).is_none());
+
+        let increasing = serde_json::json!({"progressToken": 42, "progress": -1.0});
+        assert!(parse_valid_client_progress(&increasing, Some(-1.5)).is_some());
+
+        for invalid in [
+            serde_json::json!({"progressToken": 42, "progress": 0.0, "unknown": true}),
+            serde_json::json!({"progressToken": 42, "progress": 0.0, "total": null}),
+            serde_json::json!({"progressToken": 42, "progress": 0.0, "message": null}),
+            serde_json::json!({"progressToken": 42, "progress": 0.0, "_meta": null}),
+            serde_json::json!({"progressToken": 42, "progress": 0.0, "_meta": "wrong"}),
+            serde_json::json!({"progressToken": 42, "progress": "0.0"}),
+        ] {
+            assert!(parse_valid_client_progress(&invalid, None).is_none());
+        }
     }
 
     #[test]
@@ -3506,12 +6417,7 @@ mod tests {
     }
 
     #[test]
-    fn panicked_tool_progress_callback_retires_exact_waiter_with_safe_error() {
-        let request_id = RequestId::Number(77);
-        let mut registry = ResponseRegistry::new();
-        let mut waiter = registry
-            .register(request_id.clone())
-            .expect("register progress owner");
+    fn panicked_tool_progress_callback_returns_fixed_safe_error() {
         let panic_canary = "PROGRESS-PANIC-SECRET\r\n\u{1b}";
         let mut callback = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {
             panic!("{panic_canary}");
@@ -3522,19 +6428,6 @@ mod tests {
         assert_eq!(callback_error.message, PROGRESS_CALLBACK_PANIC_ERROR);
         assert!(!callback_error.message.contains(panic_canary));
         assert!(!callback_error.message.chars().any(char::is_control));
-
-        let retired = retire_panicked_progress_callback(&mut registry, &request_id);
-        assert_eq!(retired.message, PROGRESS_CALLBACK_PANIC_ERROR);
-        assert_eq!(registry.pending_len(), 0);
-        let waiter_error = waiter
-            .try_response()
-            .expect_err("retired waiter receives the fixed callback error");
-        assert_eq!(waiter_error.message, PROGRESS_CALLBACK_PANIC_ERROR);
-
-        let replacement = registry
-            .register(request_id)
-            .expect("retirement immediately releases pending capacity");
-        drop(replacement);
     }
 
     #[test]
@@ -3640,6 +6533,153 @@ mod tests {
             .expect("expected waiter is valid")
             .expect("matching response arrives");
         assert_eq!(response.id, Some(expected_id));
+    }
+
+    #[test]
+    fn response_registry_tombstone_consumes_exact_late_response_without_diagnostic() {
+        let mut registry = ResponseRegistry::new();
+        let request_id = RequestId::Number(8);
+        let mut waiter = registry
+            .register(request_id.clone())
+            .expect("register timeout owner");
+        let timeout = McpError::internal_error("Request timed out");
+
+        assert!(
+            registry
+                .tombstone(&request_id, timeout.clone())
+                .expect("record tombstone")
+        );
+        assert_eq!(registry.pending_len(), 0);
+        assert_eq!(registry.tombstone_len(), 1);
+        let waiter_error = waiter
+            .try_response()
+            .expect_err("the waiter receives its timeout outcome");
+        assert_eq!(waiter_error.message, timeout.message);
+        let reuse_error = registry
+            .register(request_id.clone())
+            .expect_err("a tombstoned ID cannot acquire a new owner");
+        assert!(reuse_error.message.contains("Retired request ID"));
+
+        assert_eq!(
+            registry.route(JsonRpcResponse::success(
+                request_id,
+                serde_json::json!({"late": true}),
+            )),
+            ResponseRoute::TombstoneRetired
+        );
+        assert_eq!(registry.tombstone_len(), 0);
+        assert_eq!(registry.uncorrelated_diagnostics, 0);
+    }
+
+    #[test]
+    fn response_registry_combined_correlation_bound_includes_tombstones() {
+        let mut registry = ResponseRegistry::new();
+        let expires_at = Instant::now()
+            .checked_add(RESPONSE_TOMBSTONE_RETENTION)
+            .expect("test clock must admit the fixed retention interval");
+        registry.tombstones.extend(
+            (0..MAX_RESPONSE_CORRELATIONS)
+                .map(|id| (RequestId::String(format!("retired-{id}")), expires_at)),
+        );
+
+        let error = registry
+            .register(RequestId::String("over-capacity".to_string()))
+            .expect_err("tombstones must count against correlation capacity");
+
+        assert!(error.message.contains("correlation limit"));
+        assert_eq!(registry.pending_len(), 0);
+        assert_eq!(registry.tombstone_len(), MAX_RESPONSE_CORRELATIONS);
+        registry.fail_all(error);
+        assert_eq!(registry.tombstone_len(), 0);
+    }
+
+    #[test]
+    fn response_registry_expired_tombstones_release_correlation_capacity() {
+        let mut registry = ResponseRegistry::new();
+        registry.tombstones.extend(
+            (0..MAX_RESPONSE_CORRELATIONS)
+                .map(|id| (RequestId::String(format!("expired-{id}")), Instant::now())),
+        );
+
+        let waiter = registry
+            .register(RequestId::String("new-owner".to_string()))
+            .expect("expired tombstones must be pruned before admission");
+
+        assert_eq!(registry.tombstone_len(), 0);
+        assert_eq!(registry.pending_len(), 1);
+        drop(waiter);
+    }
+
+    #[test]
+    fn cancellation_control_marker_is_at_most_once_per_request_generation() {
+        let mut registry = ResponseRegistry::new();
+        let request_id = RequestId::Number(23);
+
+        assert!(
+            registry
+                .claim_cancellation_control(&request_id)
+                .expect("first arbitrary-ID control claim")
+        );
+        assert!(
+            !registry
+                .claim_cancellation_control(&request_id)
+                .expect("duplicate arbitrary-ID claim")
+        );
+        assert_eq!(registry.cancellation_control_len(), 1);
+
+        let waiter = registry
+            .register(request_id.clone())
+            .expect("a new waiter generation is not poisoned by the old marker");
+        assert_eq!(registry.cancellation_control_len(), 0);
+
+        assert!(
+            registry
+                .claim_cancellation_control(&request_id)
+                .expect("the admitted generation owns one fresh control claim")
+        );
+        assert!(
+            registry.register(request_id).is_err(),
+            "duplicate waiter admission must fail before clearing the live marker"
+        );
+        assert_eq!(registry.cancellation_control_len(), 1);
+        drop(waiter);
+    }
+
+    #[test]
+    fn cancellation_control_markers_have_bounded_absolute_lifetime() {
+        assert_eq!(
+            CANCELLATION_CONTROL_RETENTION, MAX_CLIENT_ABSOLUTE_TIMEOUT,
+            "one marker must cover the longest ordinary request generation"
+        );
+
+        let mut registry = ResponseRegistry::new();
+        let expired_id = RequestId::String("expired-control".to_string());
+        registry
+            .cancellation_controls
+            .insert(expired_id.clone(), Instant::now());
+        assert!(
+            registry
+                .claim_cancellation_control(&expired_id)
+                .expect("an exactly expired marker releases the ID")
+        );
+        assert_eq!(registry.cancellation_control_len(), 1);
+
+        let expires_at = Instant::now()
+            .checked_add(CANCELLATION_CONTROL_RETENTION)
+            .expect("test clock admits fixed control retention");
+        registry.cancellation_controls.clear();
+        registry.cancellation_controls.extend(
+            (0..MAX_CANCELLATION_CONTROL_IDS)
+                .map(|id| (RequestId::String(format!("control-{id}")), expires_at)),
+        );
+        let error = registry
+            .claim_cancellation_control(&RequestId::String("overflow".to_string()))
+            .expect_err("control retention has a deterministic hard bound");
+        assert!(error.message.contains("retention limit"));
+        assert_eq!(
+            registry.cancellation_control_len(),
+            MAX_CANCELLATION_CONTROL_IDS
+        );
     }
 
     #[test]
@@ -4313,12 +7353,50 @@ mod tests {
             .register(RequestId::Number(55))
             .expect("waiter");
 
-        client.close();
+        client.close().expect("client cleanup");
 
         let error = waiter
             .try_response()
             .expect_err("close must publish a terminal waiter outcome");
         assert_eq!(error.message, "Client connection closed");
+        assert!(!client.is_initialized());
+        assert!(client.ping().is_err());
+        client
+            .close()
+            .expect("repeated successful close must be idempotent");
+    }
+
+    #[test]
+    fn reality_check_regression_terminal_cleanup_failure_cannot_become_later_success() {
+        let mut client = make_closed_client(true);
+        client.cleanup_error = Some(McpError::internal_error(
+            "deterministic retained cleanup failure",
+        ));
+
+        let first = client
+            .close()
+            .expect_err("retained cleanup failure must be observable");
+        let second = client
+            .close()
+            .expect_err("terminal cleanup failure must remain sticky");
+
+        assert!(first.message.contains("cleanup failure"));
+        assert!(second.message.contains("cleanup failure"));
+    }
+
+    #[test]
+    fn reality_check_regression_completed_process_retry_clears_transient_failure() {
+        let mut client = make_closed_client(true);
+        client.pending_process_cleanup_error = Some(McpError::internal_error(
+            "previous retryable process-cleanup timeout",
+        ));
+        client.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+
+        client
+            .close()
+            .expect("completed cleanup must clear a transient prior attempt");
+        assert!(client.pending_process_cleanup_error.is_none());
+        assert!(!client.is_initialized());
     }
 
     #[test]
@@ -4479,9 +7557,9 @@ mod tests {
 
     #[test]
     fn close_handles_already_exited_subprocess() {
-        let client = make_closed_client(true);
+        let mut client = make_closed_client(true);
         std::thread::sleep(Duration::from_millis(50));
-        client.close();
+        client.close().expect("client cleanup");
     }
 
     // ========================================
@@ -4567,7 +7645,7 @@ mod tests {
         );
         let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
 
-        let client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_request())
+        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_request())
             .expect("direct stdio initialization succeeds");
         assert_eq!(
             client
@@ -4576,7 +7654,52 @@ mod tests {
             2,
             "initialize ID 1 must never be reused"
         );
-        client.close();
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eager_initialization_uses_bounded_server_response_writes() {
+        // The direct child control path intentionally accepts only frames that
+        // fit the POSIX minimum atomic pipe-write bound. An oversized
+        // peer-initiated invalid-notification response therefore gives us a
+        // deterministic proof that eager initialization uses that path; the
+        // ordinary blocking transport send would accept this frame and merely
+        // wait for the scripted peer until the request deadline. The request
+        // ID stays within its protocol bound; the long method is what makes
+        // the correlated error response exceed the atomic capacity.
+        let request =
+            JsonRpcRequest::new(format!("notifications/{}", "x".repeat(600)), None, 7_i64);
+        let response = server_request_response(&request)
+            .expect("an ID-bearing notification-shaped method receives an error response");
+        let response_size = serde_json::to_vec(&response)
+            .expect("serialize the bounded-write response precondition")
+            .len()
+            .checked_add(1)
+            .expect("newline cannot overflow the response size");
+        assert!(
+            response_size > 512,
+            "fixture response must exceed the POSIX minimum atomic pipe-write bound"
+        );
+        let request = JsonRpcMessage::Request(request);
+        let request_line = serde_json::to_string(&request).expect("serialize server request");
+        assert!(
+            !request_line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        let script = format!("printf '%s\\n' '{request_line}'; exec sleep 2");
+
+        let result = ClientBuilder::new()
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+            )
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request());
+        let error = result
+            .err()
+            .expect("oversized initialization control response must fail closed");
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, CONTROL_FRAME_CAPACITY_ERROR);
     }
 
     #[test]
@@ -4711,9 +7834,15 @@ mod tests {
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         );
-        let client = Client::from_parts(child, transport, Cx::for_request(), session, 0);
+        let mut client = Client::from_parts(
+            child,
+            transport,
+            Cx::for_request(),
+            session,
+            RequestTimeoutPolicy::default(),
+        );
 
-        client.close();
+        client.close().expect("client cleanup");
         wait_for_process_exit(pid);
     }
 
@@ -4735,7 +7864,13 @@ mod tests {
             ServerCapabilities::default(),
             PROTOCOL_VERSION.to_string(),
         );
-        let client = Client::from_parts(child, transport, Cx::for_request(), session, 0);
+        let client = Client::from_parts(
+            child,
+            transport,
+            Cx::for_request(),
+            session,
+            RequestTimeoutPolicy::default(),
+        );
 
         drop(client);
         wait_for_process_exit(pid);
@@ -4757,6 +7892,7 @@ mod tests {
             progress: 0.5,
             total: Some(1.0),
             message: Some("half".into()),
+            _meta: None,
         };
         let debug = format!("{:?}", params);
         assert!(debug.contains("progress"));
