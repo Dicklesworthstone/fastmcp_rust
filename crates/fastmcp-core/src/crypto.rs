@@ -1834,6 +1834,17 @@ mod tests {
                     "unterminated restricted visibility",
                 ));
             };
+            // `pub fn` / `pub const fn` callables are allowlisted by
+            // `SEALED_EXTERNAL_CALLABLES`; do not treat them as ambient entropy
+            // exports (statement_end also truncates at type-list commas).
+            if tokens[item_index].text == "fn"
+                || (tokens[item_index].text == "const"
+                    && tokens
+                        .get(item_index + 1)
+                        .is_some_and(|token| token.text == "fn"))
+            {
+                continue;
+            }
             let end = (item_index..tokens.len())
                 .find(|index| matches!(tokens[*index].text, ";" | ","))
                 .unwrap_or(tokens.len());
