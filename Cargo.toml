@@ -48,7 +48,7 @@ readme = "README.md"
 # resolved, we opt into `test-internals` to keep the constructors visible.
 # NOTE: `fastmcp-core::block_on` does NOT rely on this feature; it uses the
 # ambient `Cx` installed by `Runtime::block_on`.
-asupersync = { version = "=0.3.9", features = ["test-internals"] }
+asupersync = { version = "=0.3.10", features = ["test-internals"] }
 rich_rust = { version = "=0.2.2" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
