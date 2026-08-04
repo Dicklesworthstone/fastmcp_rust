@@ -90626,8 +90626,6 @@ fn fallible(value: Option<u8>) {
         let before = state.borrow().clone();
         let callback_state = std::rc::Rc::clone(&state);
         let emitter_state = std::rc::Rc::clone(&state);
-        let prior_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let code = ordinary_handoff_harness_core(
             vec![
                 std::ffi::OsString::from("/tmp/fnd01-harness"),
@@ -90638,7 +90636,7 @@ fn fallible(value: Option<u8>) {
             ],
             move |_| -> i32 {
                 callback_state.borrow_mut().callback_attempts += 1;
-                panic!("deterministic injected panic")
+                std::panic::resume_unwind(Box::new("deterministic injected panic"))
             },
             |mode, run_id, failure| {
                 let mut emitted = Vec::new();
@@ -90650,7 +90648,6 @@ fn fallible(value: Option<u8>) {
                     .push(String::from_utf8(emitted).expect("panic frame UTF-8"));
             },
         );
-        std::panic::set_hook(prior_hook);
         assert_eq!(code, 3, "panic must fail closed");
         let after = state.borrow();
         assert_eq!(after.callback_attempts, before.callback_attempts + 1);
