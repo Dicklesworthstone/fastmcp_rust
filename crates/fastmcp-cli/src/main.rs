@@ -32,6 +32,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+#[cfg(test)]
+use clap::CommandFactory;
 use clap::{Parser, Subcommand};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -47,18 +49,233 @@ const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
 const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
 const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
+const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
+    "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
+    "Public PROTOCOL_VERSION remains 2024-11-05; ModernOnly, Auto, and LegacyOnly are ",
+    "planned/unverified policy modes, not executable CLI profiles. MCP 2025-11-25 is ",
+    "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
+    "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
+    "or release evidence. Machine-readable diagnostics are separate from human-facing ",
+    "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
+    "failures rather than fabricating an empty catalog or selection."
+);
+
+/// Typed refusal emitted when the public Clap help pipeline cannot produce an
+/// exactly provisional documentation contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliDocumentationRefusal {
+    ExpectedDisplayHelp,
+    CanonicalPublicHelpMismatch,
+    HelpEmissionFailed,
+}
+
+impl CliDocumentationRefusal {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::ExpectedDisplayHelp => "DOC-01 CLI help request must reach Clap DisplayHelp",
+            Self::CanonicalPublicHelpMismatch => {
+                "DOC-01 CLI help must match the exact provisional public help frame"
+            }
+            Self::HelpEmissionFailed => "DOC-01 CLI help emission failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ConsumerVisibleCliHelp {
+    bytes: Vec<u8>,
+}
 
 /// FastMCP CLI - Run, inspect, and install MCP servers.
 #[derive(Parser)]
 #[command(name = "fastmcp")]
 #[command(version, about, long_about = None)]
-#[command(
-    after_help = "Protocol status: MCP 2026-07-28 support is under implementation and unverified. Public PROTOCOL_VERSION remains 2024-11-05; help, inspect output, and examples are not conformance or release evidence."
-)]
+#[command(after_help = CLI_PROTOCOL_STATUS_HELP)]
 #[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Collapse wrapping-only whitespace so the contract is independent of a
+/// terminal's width while preserving every non-whitespace byte sequence.
+fn normalize_cli_help_whitespace(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Validate the entire public help frame against a separately captured
+/// canonical `Cli::try_parse_from(["fastmcp", "--help"])` frame. This denies
+/// altered prefix, argument, or after-help claims without a phrase blacklist.
+fn validate_public_cli_help(bytes: &[u8]) -> Result<(), CliDocumentationRefusal> {
+    let candidate = normalize_cli_help_whitespace(bytes);
+    let canonical = normalize_cli_help_whitespace(&public_cli_help_bytes()?);
+
+    if candidate != canonical {
+        return Err(CliDocumentationRefusal::CanonicalPublicHelpMismatch);
+    }
+
+    Ok(())
+}
+
+fn display_help_bytes(error: clap::Error) -> Result<Vec<u8>, CliDocumentationRefusal> {
+    if error.kind() != clap::error::ErrorKind::DisplayHelp {
+        return Err(CliDocumentationRefusal::ExpectedDisplayHelp);
+    }
+    Ok(error.to_string().into_bytes())
+}
+
+/// Invoke the same `--help` parse path a CLI consumer receives. Clap returns
+/// the public help frame as `DisplayHelp` rather than parsing a command.
+fn public_cli_help_bytes() -> Result<Vec<u8>, CliDocumentationRefusal> {
+    match Cli::try_parse_from(["fastmcp", "--help"]) {
+        Ok(_) => Err(CliDocumentationRefusal::ExpectedDisplayHelp),
+        Err(error) => display_help_bytes(error),
+    }
+}
+
+/// Drive a configured Clap command through the same DisplayHelp handler.
+/// This exists only for the planted mutation of the actual Clap command input.
+#[cfg(test)]
+fn configured_command_help_bytes(
+    mut command: clap::Command,
+) -> Result<Vec<u8>, CliDocumentationRefusal> {
+    match command.try_get_matches_from_mut(["fastmcp", "--help"]) {
+        Ok(_) => Err(CliDocumentationRefusal::ExpectedDisplayHelp),
+        Err(error) => display_help_bytes(error),
+    }
+}
+
+/// Commit a consumer-visible help frame only after its full public contract
+/// validates. Rejected candidate bytes leave the previously accepted state
+/// untouched.
+fn admit_public_cli_help(
+    state: &mut ConsumerVisibleCliHelp,
+    candidate: Vec<u8>,
+) -> Result<(), CliDocumentationRefusal> {
+    validate_public_cli_help(&candidate)?;
+    state.bytes = candidate;
+    Ok(())
+}
+
+fn admit_display_help(
+    state: &mut ConsumerVisibleCliHelp,
+    error: clap::Error,
+) -> Result<(), CliDocumentationRefusal> {
+    admit_public_cli_help(state, display_help_bytes(error)?)
+}
+
+/// Emit precisely the previously admitted public bytes. The caller never
+/// re-renders help after admission, so the emitted frame is the validated one.
+fn emit_admitted_cli_help_to<W: Write>(
+    state: &ConsumerVisibleCliHelp,
+    writer: &mut W,
+) -> Result<(), CliDocumentationRefusal> {
+    writer
+        .write_all(&state.bytes)
+        .and_then(|()| writer.flush())
+        .map_err(|_| CliDocumentationRefusal::HelpEmissionFailed)
+}
+
+fn emit_admitted_cli_help(state: &ConsumerVisibleCliHelp) -> Result<(), CliDocumentationRefusal> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    emit_admitted_cli_help_to(state, &mut stdout)
+}
+
+/// DOC-01 owns only the exact root help request. Every subcommand, nested, or
+/// generated help path remains Clap's ordinary `DisplayHelp` behavior.
+fn is_exact_root_help_request(args: &[std::ffi::OsString]) -> bool {
+    matches!(
+        args,
+        [_, flag]
+            if flag.as_os_str() == std::ffi::OsStr::new("--help")
+                || flag.as_os_str() == std::ffi::OsStr::new("-h")
+    )
+}
+
+#[test]
+fn doc_01_b_positive() {
+    assert!(is_exact_root_help_request(
+        &["fastmcp", "--help"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+    ));
+    assert!(is_exact_root_help_request(
+        &["fastmcp", "-h"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+    ));
+
+    let public_help = public_cli_help_bytes().expect("--help must reach Clap DisplayHelp");
+    let mut state = ConsumerVisibleCliHelp::default();
+
+    assert_eq!(
+        admit_public_cli_help(&mut state, public_help.clone()),
+        Ok(())
+    );
+    assert_eq!(state.bytes, public_help);
+
+    let mut emitted = Vec::new();
+    assert_eq!(emit_admitted_cli_help_to(&state, &mut emitted), Ok(()));
+    assert_eq!(emitted, state.bytes);
+
+    let short_help = match Cli::try_parse_from(["fastmcp", "-h"]) {
+        Err(error) => display_help_bytes(error).expect("root -h must reach Clap DisplayHelp"),
+        Ok(_) => panic!("root -h must not parse a command"),
+    };
+    let mut short_state = ConsumerVisibleCliHelp::default();
+    assert_eq!(admit_public_cli_help(&mut short_state, short_help), Ok(()));
+
+    for args in [
+        &["fastmcp", "run", "--help"][..],
+        &["fastmcp", "tasks", "list", "--help"][..],
+        &["fastmcp", "help", "run"][..],
+    ] {
+        let error = match Cli::try_parse_from(args) {
+            Err(error) => error,
+            Ok(_) => panic!("subcommand and generated help must remain Clap DisplayHelp"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let argv = args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!is_exact_root_help_request(&argv));
+    }
+}
+
+#[test]
+fn doc_01_b_planted_negative() {
+    let mut state = ConsumerVisibleCliHelp::default();
+    admit_public_cli_help(
+        &mut state,
+        public_cli_help_bytes().expect("baseline public help must reach Clap DisplayHelp"),
+    )
+    .expect("baseline public help must be admitted");
+    let accepted_before = state.bytes.clone();
+    let planted_after_help = format!("{CLI_PROTOCOL_STATUS_HELP} ModernOnly is supported.");
+    let planted = configured_command_help_bytes(Cli::command().after_help(planted_after_help))
+        .expect("planted command must still reach Clap DisplayHelp");
+
+    assert_eq!(
+        admit_public_cli_help(&mut state, planted),
+        Err(CliDocumentationRefusal::CanonicalPublicHelpMismatch)
+    );
+    assert_eq!(
+        state.bytes, accepted_before,
+        "rejected public help must not mutate consumer-visible accepted bytes"
+    );
+    let mut emitted_after_rejection = Vec::new();
+    assert_eq!(
+        emit_admitted_cli_help_to(&state, &mut emitted_after_rejection),
+        Ok(())
+    );
+    assert_eq!(emitted_after_rejection, accepted_before);
 }
 
 #[derive(Subcommand)]
@@ -439,7 +656,25 @@ impl std::str::FromStr for InstallTarget {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args = env::args_os().collect::<Vec<_>>();
+    let is_exact_root_help = is_exact_root_help_request(&args);
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) if is_exact_root_help && error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            let mut admitted = ConsumerVisibleCliHelp::default();
+            if let Err(refusal) = admit_display_help(&mut admitted, error)
+                .and_then(|()| emit_admitted_cli_help(&admitted))
+            {
+                eprintln!(
+                    "FastMCP CLI documentation contract error: {}",
+                    refusal.diagnostic()
+                );
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => error.exit(),
+    };
     // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
 
     let result = match cli.command {
@@ -2348,10 +2583,10 @@ fn classify_cline_transport(value: &serde_json::Value) -> ClientServerFieldClass
         || transport
             .keys()
             .any(|field| !matches!(field.as_str(), "type" | "command" | "args" | "cwd" | "env"))
-        || !transport
+        || transport
             .get("command")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty())
+            .is_none_or(|command| command.trim().is_empty())
         || transport
             .get("args")
             .is_some_and(|value| !is_bounded_string_array(value))
