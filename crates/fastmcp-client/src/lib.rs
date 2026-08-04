@@ -89,8 +89,8 @@ const MIN_TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_LOCAL_TASK_POLL_INTERVAL: Duration = Duration::from_mins(5);
 const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(15);
 const MAX_TASK_POLL_CANCEL_SLICE: Duration = Duration::from_millis(10);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -413,14 +413,14 @@ enum ClientChildCleanupPhase {
 }
 
 #[cfg(unix)]
-const PROCESS_GROUP_ANCHOR_SCRIPT: &str = r#"
+const PROCESS_GROUP_ANCHOR_SCRIPT: &str = r"
 trap '' HUP INT TERM
 printf R
 exec 1>&-
 while IFS= read -r _; do :; done
 kill -s KILL 0
 exit 127
-"#;
+";
 
 /// A live process-group leader controlled by a close-on-exec pipe.
 ///
