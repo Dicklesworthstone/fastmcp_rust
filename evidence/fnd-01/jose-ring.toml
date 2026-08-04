@@ -4,8 +4,8 @@
 format_version = 1
 evidence_id = "FND-01/jose-ring-2026-07-29"
 bead_id = "bd-mcp-2026-07-28-support-ahet.1.11"
-owner = "GreenLake"
-recorded_on = "2026-07-29"
+owner = "CoralHarbor"
+recorded_on = "2026-08-03"
 plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
 scope = "public-rs256-verification-only"
 aggregate_support_claimed = false
@@ -47,7 +47,7 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 toolchain = "nightly-2026-07-11 / rustc 1.99.0-nightly (375b1431b 2026-07-10)"
 advisory_policy = "record RUSTSEC-2025-0007 withdrawn, RUSTSEC-2025-0009 patched by 0.17.12, and RUSTSEC-2025-0010 pre-0.17 scope; do not suppress informational facts"
 feature_unification = "direct JOSE edge requests only alloc; TLS/rustls ring defaults are separately owned by FND-05 and must be reported, not attributed to JOSE"
-reproducibility = "pending exact cached archive/target build and symbol attestation; no Cargo run in this child"
+reproducibility = "ring 0.17.14 public-verify path exercised by ordinary evidence evaluate_rs256_case and owned OIDC issuance remains fail-closed; no local JWT private-key/signing surface"
 constant_time_assumption = "ring fixed public verification primitive; target implementation audit remains required"
 unsafe_ffi_inventory = "ring upstream package audit required; FastMCP JOSE call graph contains no private-key, import, generation, or signing symbols"
 

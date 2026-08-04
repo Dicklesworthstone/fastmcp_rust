@@ -15364,6 +15364,23 @@ mod trust_std {
     }
 
     #[cfg(test)]
+    pub(super) fn outer_role_fixture(
+        mode: BootstrapMode,
+        run_id: &str,
+        phase: &str,
+        authoring_marker: &str,
+        integration_marker: Option<&str>,
+    ) -> OuterTransportRecord {
+        canonical_gate_tests::build_outer_role_fixture(
+            mode,
+            run_id,
+            phase,
+            authoring_marker,
+            integration_marker,
+        )
+    }
+
+    #[cfg(test)]
     mod canonical_gate_tests {
         use super::*;
 
@@ -16476,14 +16493,13 @@ mod trust_std {
             environment[3].1 = socket_path.to_owned();
         }
 
-        fn outer_role_fixture(
+        pub(super) fn build_outer_role_fixture(
             mode: BootstrapMode,
             run_id: &str,
             phase: &str,
+            authoring_marker: &str,
+            integration_marker: Option<&str>,
         ) -> OuterTransportRecord {
-            let authoring_marker = "authoring-marker";
-            let integration_marker =
-                (mode == BootstrapMode::Attest).then_some("integration-marker");
             let shell = expected_outer_shell(
                 mode,
                 run_id,
@@ -17185,7 +17201,13 @@ mod trust_std {
             let authoring_marker = "authoring-marker";
             let integration_marker = "integration-marker";
             let producer =
-                outer_role_fixture(BootstrapMode::Produce, run_id, "producer");
+                outer_role_fixture(
+                    BootstrapMode::Produce,
+                    run_id,
+                    "producer",
+                    "authoring-marker",
+                    None,
+                );
             validate_outer_role_record(
                 &producer,
                 BootstrapMode::Produce,
@@ -17196,7 +17218,13 @@ mod trust_std {
             .expect("producer socket assignment");
 
             let mut attester =
-                outer_role_fixture(BootstrapMode::Attest, run_id, "attester");
+                outer_role_fixture(
+                    BootstrapMode::Attest,
+                    run_id,
+                    "attester",
+                    "authoring-marker",
+                    Some("integration-marker"),
+                );
             set_outer_requested_worker(&mut attester, "preferred-worker");
             validate_outer_role_record(
                 &attester,
@@ -17208,7 +17236,13 @@ mod trust_std {
             .expect("attester socket assignment with optional worker");
 
             let mut wrong_phase =
-                outer_role_fixture(BootstrapMode::Produce, run_id, "producer");
+                outer_role_fixture(
+                    BootstrapMode::Produce,
+                    run_id,
+                    "producer",
+                    "authoring-marker",
+                    None,
+                );
             set_outer_socket_path(
                 &mut wrong_phase,
                 &format!(
@@ -26332,6 +26366,27 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(binding)
     }
 
+    /// Focused Attest-fixture adapter.  It deliberately delegates every
+    /// supply parse, semantic validation, authority derivation, space check,
+    /// and tree write to the production implementation; tests only provide a
+    /// fresh root and an already-encoded SUPPLYv4 byte object.
+    #[cfg(test)]
+    pub(super) fn materialize_attest_fixture_supply(
+        repository_root: &Path,
+        run_id: &str,
+        supply_bytes: &[u8],
+    ) -> TrustResult<TreeBinding> {
+        let supply = parse_supply_bundle(supply_bytes)?;
+        let validated = validate_supply_bundle_value(&supply)?;
+        let authority = compiled_produce_acquisition_authority();
+        let guard = PhaseBSpaceGuard::new(repository_root, run_id, authority.space_budget)?;
+        let admitted = bootstrap_input_authority(&validated, &bootstrap_manifest()?)?;
+        let relative_root = format!(
+            ".fnd01-run/independent-attester/{run_id}/local-registry"
+        );
+        materialize_supply(repository_root, &relative_root, &supply, &admitted, &guard)
+    }
+
     fn bind_existing_file(
         repository_root: &Path,
         path: &Path,
@@ -28620,6 +28675,61 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &space_guard,
             ExecutionBinAdmission::RequireExisting,
         )?;
+        let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
+        Ok(OrdinaryNativeToolInventory {
+            repository_root: repository_root.to_path_buf(),
+            execution_bin_relative,
+            tool_set_sha256,
+            execution_bin_sha256,
+            acquisition_tools,
+            selected_tools,
+        })
+    }
+
+    /// Fresh, runtime-selected ordinary subject used by the qualified live
+    /// matrix.  Unlike ordinary handoff, this helper is only for preparing a
+    /// new disposable fixture: it creates the exact 20-link execution-bin
+    /// under the caller's fresh root and returns the same inventory type that
+    /// the production handoff later reopens with `RequireExisting`.
+    #[cfg(test)]
+    pub(super) fn inventory_fresh_native_tools(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        closed_path: &str,
+    ) -> TrustResult<OrdinaryNativeToolInventory> {
+        if run_id.len() != 32
+            || !run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_TOOL_SET",
+                "fresh ordinary native-tool inventory requires a 32-hex run ID",
+            ));
+        }
+        let role = role_name(mode)?;
+        let execution_bin_relative =
+            format!(".fnd01-run/{role}/{run_id}/execution-bin");
+        validate_relative_path(
+            &execution_bin_relative,
+            "fresh ordinary execution-bin path",
+        )?;
+        let authority = compiled_produce_acquisition_authority();
+        let space_guard = PhaseBSpaceGuard::new(
+            repository_root,
+            run_id,
+            authority.space_budget,
+        )?;
+        let (tool_set_sha256, execution_bin_sha256, selected_tools) =
+            inventory_native_tools_with_admission(
+                repository_root,
+                closed_path,
+                &execution_bin_relative,
+                &authority,
+                &space_guard,
+                ExecutionBinAdmission::CreateFresh,
+            )?;
         let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
         Ok(OrdinaryNativeToolInventory {
             repository_root: repository_root.to_path_buf(),
@@ -32553,9 +32663,13 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use std::process::Command;
 use std::str::FromStr;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
@@ -76739,20 +76853,27 @@ fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VRe
 fn run_verifier() -> VResult<Report> {
     let root = repository_root();
     validate_repository_root_layout(&root)?;
-    let (policy, policy_bytes) = read_policy(&root)?;
+    run_verifier_at(&root)
+}
+
+/// Verify an explicitly admitted repository.  Ordinary handoff uses this
+/// rather than the compile-time facade root so an isolated role/run subject
+/// cannot silently validate the checkout that built the harness.
+fn run_verifier_at(root: &Path) -> VResult<Report> {
+    let (policy, policy_bytes) = read_policy(root)?;
     validate_policy_shape(&policy)?;
-    let marker = resolve_safe(&root, "Cargo.toml", "repository marker")?;
+    let marker = resolve_safe(root, "Cargo.toml", "repository marker")?;
     if !marker.is_file() {
         return Err(Diagnostic::error("E_REPOSITORY_ROOT", "Cargo.toml"));
     }
-    let files = load_sources(&root, &policy)?;
+    let files = load_sources(root, &policy)?;
     let source_tree = validate_source_tree(&files, &policy)?;
     validate_negative_inventory(&files, &policy)?;
     validate_mutation_dispatch(&files, &policy)?;
     validate_supplemental_contracts(&files, &policy)?;
     let mut report = Report::default();
     verify_outputs(
-        &root,
+        root,
         &policy,
         &policy_bytes,
         source_tree,
@@ -89622,6 +89743,643 @@ fn ordinary_sealed_produce_control_fixture()
     Ok((expectation, ledger_bytes, package_root, target_root))
 }
 
+/// Test-only Attest fixture producer edge. It uses the shared trust_std outer
+/// constructor, then binds the exact generated registry through the production
+/// integration-seal preimage and marker paths.
+#[cfg(test)]
+struct OrdinaryAttestFixtureIntegration {
+    producer_outer_bytes: Vec<u8>,
+    integration_marker: String,
+}
+
+#[cfg(test)]
+fn ordinary_attest_fixture_outer_and_integration(
+    run_id: &str,
+    authoring_marker: &str,
+    integration_records: [(&str, &[u8]); 5],
+) -> Result<OrdinaryAttestFixtureIntegration, String> {
+    let authoring = super::trust_std::parse_authoring_marker(authoring_marker)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: authoring marker: {error}"))?;
+    let run_id_bytes = super::trust_std::decode_lower_hex::<16>(
+        run_id,
+        "ordinary Attest fixture run ID",
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: run ID: {error}"))?;
+    for ((path, _), expected_path) in integration_records
+        .iter()
+        .zip(super::trust_std::INTEGRATION_SEAL_PATHS)
+    {
+        if *path != expected_path {
+            return Err(format!(
+                "E_ORDINARY_HANDOFF_PENDING: integration fixture registry path expected={expected_path} observed={path}"
+            ));
+        }
+    }
+
+    let producer_outer = super::trust_std::outer_role_fixture(
+        BootstrapMode::Produce,
+        run_id,
+        "producer",
+        authoring_marker,
+        None,
+    );
+    let producer_outer_bytes = super::trust_std::encode_outer_transport_record(
+        &producer_outer,
+        "ordinary Attest fixture producer outer",
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: producer outer: {error}"))?;
+    let mut records = [FileBinding {
+        byte_length: 0,
+        sha256: [0; 32],
+    }; 5];
+    for (index, (_, bytes)) in integration_records.iter().enumerate() {
+        records[index] = FileBinding {
+            byte_length: u64::try_from(bytes.len())
+                .map_err(|_| "Attest fixture integration record length".to_owned())?,
+            sha256: trust_sha256(bytes),
+        };
+    }
+    let mut seal = IntegrationSeal {
+        run_id: run_id_bytes,
+        records,
+        outer_transport: FileBinding {
+            byte_length: u64::try_from(producer_outer_bytes.len())
+                .map_err(|_| "Attest fixture producer outer length".to_owned())?,
+            sha256: trust_sha256(&producer_outer_bytes),
+        },
+        authoring_closure_sha256: authoring.closure_sha256,
+        seal_sha256: [0; 32],
+    };
+    seal.seal_sha256 = trust_sha256(
+        &super::trust_std::integration_seal_preimage(&seal).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: integration preimage: {error}")
+        })?,
+    );
+    let integration_marker = super::trust_std::integration_seal_marker(&seal);
+    let parsed = parse_integration_seal(
+        &integration_marker,
+        &authoring.closure_sha256,
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: integration marker: {error}"))?;
+    if parsed != seal {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: integration marker round trip".to_owned(),
+        );
+    }
+
+    Ok(OrdinaryAttestFixtureIntegration {
+        producer_outer_bytes,
+        integration_marker,
+    })
+}
+
+const ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID: &str =
+    "ordinary::ordinary_b_r2_sealed_production_e2e";
+
+const ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID: &str =
+    "ordinary::ordinary_b_r2_sealed_field_desync_fails_closed";
+
+const ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID: &str =
+    "ordinary::ordinary_b_r5_post_consume_runtime_uses_evidence_code";
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+struct OrdinaryAttestSelfReexecSubject {
+    root: PathBuf,
+    run_id: String,
+    authoring_marker: String,
+    integration_marker: String,
+    closed_path: String,
+    selected_executable: PathBuf,
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+struct OrdinaryAttestSelfReexecChild {
+    repository_root: PathBuf,
+    run_id: String,
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn ordinary_fixture_write_new(
+    root: &Path,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let path = root.join(relative);
+    let parent = path.parent().ok_or_else(|| {
+        format!("E_ORDINARY_HANDOFF_PENDING: fixture parent missing for {relative}")
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: create {relative}: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: create {relative}: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: write {relative}: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: sync {relative}: {error}"))
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn ordinary_attest_self_reexec_subject() -> Result<OrdinaryAttestSelfReexecSubject, String> {
+    use super::trust_std::{AUTHORING_PATHS, INTEGRATION_SEAL_PATHS};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_SUBJECT: AtomicU64 = AtomicU64::new(1);
+
+    let sequence = NEXT_SUBJECT.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: fixture clock: {error}"))?
+        .as_nanos();
+    let mut fresh = None;
+    for retry in 0..64u64 {
+        let run_id = format!(
+            "{:032x}",
+            now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence + retry),
+        );
+        if run_id == "00000000000000000000000000000000" {
+            continue;
+        }
+        let root = std::env::temp_dir().join(format!("fastmcp-fnd01-attest-{run_id}"));
+        match fs::create_dir(&root) {
+            Ok(()) => {
+                fresh = Some((run_id, root));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "E_ORDINARY_HANDOFF_PENDING: create fresh root: {error}"
+                ));
+            }
+        }
+    }
+    let (run_id, root) = fresh.ok_or_else(|| {
+        "E_ORDINARY_HANDOFF_PENDING: collision-safe fresh root allocation exhausted".to_owned()
+    })?;
+
+    let source_root = repository_root();
+    for path in AUTHORING_PATHS {
+        let bytes = fs::read(source_root.join(path)).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: read source authoring {path}: {error}")
+        })?;
+        ordinary_fixture_write_new(&root, path, &bytes)?;
+    }
+    ordinary_fixture_write_new(
+        &root,
+        "Cargo.toml",
+        b"[workspace]\nmembers = []\nresolver = \"3\"\n",
+    )?;
+    let authoring_marker = live_authoring_marker_text(&root);
+
+    let sysroot_output = Command::new("rustup")
+        .args(["run", "nightly-2026-07-11", "rustc", "--print", "sysroot"])
+        .output()
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: query rust sysroot: {error}"))?;
+    if !sysroot_output.status.success() {
+        return Err(format!(
+            "E_ORDINARY_HANDOFF_PENDING: query rust sysroot exit {:?}",
+            sysroot_output.status.code(),
+        ));
+    }
+    let sysroot = std::str::from_utf8(&sysroot_output.stdout)
+        .map_err(|_| "E_ORDINARY_HANDOFF_PENDING: rust sysroot is not UTF-8".to_owned())?
+        .strip_suffix('\n')
+        .ok_or_else(|| "E_ORDINARY_HANDOFF_PENDING: rust sysroot newline missing".to_owned())?;
+    let toolchain_bin = Path::new(sysroot).join("bin");
+    let closed_path = format!(
+        "{}:/usr/bin:/bin",
+        toolchain_bin.to_str().ok_or_else(|| {
+            "E_ORDINARY_HANDOFF_PENDING: rust toolchain bin is not UTF-8".to_owned()
+        })?,
+    );
+
+    let archive = test_gzip(&test_tar(&[(
+        "attest-fixture-1.0.0/src/lib.rs",
+        b"pub fn attest_fixture() {}\n",
+        0,
+    )]));
+    let supply_bytes = test_ordinary_supply_bundle(&[(
+        "attest-fixture-1.0.0.crate",
+        &archive,
+    )]);
+    let integration_rows = [
+        (INTEGRATION_SEAL_PATHS[0], b"# fixture Cargo.lock\n".as_slice()),
+        (INTEGRATION_SEAL_PATHS[1], b"fixture source snapshot\n".as_slice()),
+        (INTEGRATION_SEAL_PATHS[2], supply_bytes.as_slice()),
+        (INTEGRATION_SEAL_PATHS[3], b"fixture workspace receipt\n".as_slice()),
+        (INTEGRATION_SEAL_PATHS[4], b"fixture integration index\n".as_slice()),
+    ];
+    for (path, bytes) in integration_rows {
+        ordinary_fixture_write_new(&root, path, bytes)?;
+    }
+    let integration = ordinary_attest_fixture_outer_and_integration(
+        &run_id,
+        &authoring_marker,
+        integration_rows,
+    )?;
+    let producer_outer_relative =
+        format!(".fnd01-run/controller/{run_id}/producer-outer.bin");
+    ordinary_fixture_write_new(
+        &root,
+        &producer_outer_relative,
+        &integration.producer_outer_bytes,
+    )?;
+    super::phase_b_std::materialize_attest_fixture_supply(
+        &root,
+        &run_id,
+        &supply_bytes,
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: materialize Attest supply: {error}"))?;
+
+    let package_root = format!(
+        ".fnd01-run/independent-attester/{run_id}/bootstrap-control-package"
+    );
+    for (relative, bytes) in [
+        ("Cargo.toml", b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n".as_slice()),
+        ("Cargo.lock", b"version = 4\n".as_slice()),
+        ("cargo-config.toml", b"[net]\noffline = true\n".as_slice()),
+        ("src/main.rs", b"fn main() {}\n".as_slice()),
+        ("tests/fnd_01_dependency_evidence.rs", b"#[test]\nfn fixture() {}\n".as_slice()),
+    ] {
+        ordinary_fixture_write_new(
+            &root,
+            &format!("{package_root}/{relative}"),
+            bytes,
+        )?;
+    }
+
+    let selected_relative = format!(
+        ".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
+    );
+    let selected_executable = root.join(&selected_relative);
+    let selected_parent = selected_executable.parent().ok_or_else(|| {
+        "E_ORDINARY_HANDOFF_PENDING: selected executable parent missing".to_owned()
+    })?;
+    fs::create_dir_all(selected_parent).map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: create selected executable parent: {error}")
+    })?;
+    if selected_executable.exists() {
+        return Err("E_ORDINARY_HANDOFF_PENDING: selected executable already exists".to_owned());
+    }
+    let copied = fs::copy(
+        std::env::current_exe().map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: current test executable: {error}")
+        })?,
+        &selected_executable,
+    )
+    .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: copy selected executable: {error}"))?;
+    if copied == 0 {
+        return Err("E_ORDINARY_HANDOFF_PENDING: copied executable is empty".to_owned());
+    }
+    let mut permissions = fs::metadata(&selected_executable)
+        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: selected metadata: {error}"))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&selected_executable, permissions).map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: selected executable chmod: {error}")
+    })?;
+    let selected_metadata = fs::symlink_metadata(&selected_executable).map_err(|error| {
+        format!("E_ORDINARY_HANDOFF_PENDING: selected executable recheck: {error}")
+    })?;
+    if !selected_metadata.is_file()
+        || selected_metadata.nlink() != 1
+        || selected_metadata.mode() & 0o100 == 0
+    {
+        return Err(
+            "E_ORDINARY_HANDOFF_PENDING: selected executable identity is not sealed".to_owned(),
+        );
+    }
+
+    Ok(OrdinaryAttestSelfReexecSubject {
+        root,
+        run_id,
+        authoring_marker,
+        integration_marker: integration.integration_marker,
+        closed_path,
+        selected_executable,
+    })
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn ordinary_attest_self_reexec_child() -> Result<Option<OrdinaryAttestSelfReexecChild>, String> {
+    use super::trust_std::{
+        AUTHORING_MARKER_ENV, INTEGRATION_SEAL_ENV,
+        PRODUCER_OUTER_RECORD_PATH_ENV, RUN_ID_ENV,
+    };
+
+    let environment = std::env::vars().collect::<BTreeMap<_, _>>();
+    let role_keys = [
+        AUTHORING_MARKER_ENV,
+        INTEGRATION_SEAL_ENV,
+        PRODUCER_OUTER_RECORD_PATH_ENV,
+        RUN_ID_ENV,
+    ];
+    let required = [
+        AUTHORING_MARKER_ENV,
+        INTEGRATION_SEAL_ENV,
+        PRODUCER_OUTER_RECORD_PATH_ENV,
+        RUN_ID_ENV,
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TZ",
+    ];
+    let role_key_count = role_keys
+        .iter()
+        .filter(|name| environment.contains_key(**name))
+        .count();
+    if role_key_count == 0 {
+        return Ok(None);
+    }
+    if environment.len() != required.len()
+        || required.iter().any(|name| !environment.contains_key(*name))
+    {
+        return Err(
+            "E_HANDOFF_ENVIRONMENT: partial Attest self-reexec role environment".to_owned(),
+        );
+    }
+    let run_id = environment
+        .get(RUN_ID_ENV)
+        .expect("required Attest self-reexec run ID is present")
+        .clone();
+    if run_id.len() != 32
+        || run_id == "00000000000000000000000000000000"
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("E_HANDOFF_ARGUMENTS: invalid Attest self-reexec run ID".to_owned());
+    }
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe: {error}"))?;
+    let executable = current_executable.to_str().ok_or_else(|| {
+        "E_HANDOFF_EXECUTABLE: child current_exe must be UTF-8".to_owned()
+    })?;
+    let suffix = format!(
+        "/.fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
+    );
+    let root = executable.strip_suffix(&suffix).ok_or_else(|| {
+        "E_HANDOFF_EXECUTABLE: child executable does not match rigid Attest formula".to_owned()
+    })?;
+    if root.is_empty() || !Path::new(root).is_absolute() {
+        return Err("E_HANDOFF_EXECUTABLE: child formula root is not absolute".to_owned());
+    }
+    let repository_root = PathBuf::from(root);
+    let expected_executable = repository_root.join(suffix.trim_start_matches('/'));
+    if current_executable != expected_executable {
+        return Err("E_HANDOFF_EXECUTABLE: child formula reassembly differs".to_owned());
+    }
+    let current_directory = std::env::current_dir()
+        .map_err(|error| format!("E_HANDOFF_PATH: child current_dir: {error}"))?;
+    if current_directory != repository_root {
+        return Err("E_HANDOFF_PATH: child cwd differs from admitted role root".to_owned());
+    }
+    Ok(Some(OrdinaryAttestSelfReexecChild {
+        repository_root,
+        run_id,
+    }))
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn run_ordinary_attest_self_reexec_child(
+    child: OrdinaryAttestSelfReexecChild,
+    mutate_tool_set: bool,
+) -> Result<(), String> {
+    let OrdinaryAttestSelfReexecChild {
+        repository_root,
+        run_id,
+    } = child;
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe: {error}"))?;
+    let arguments = [
+        current_executable.into_os_string(),
+        std::ffi::OsString::from("attest"),
+        repository_root.into_os_string(),
+        std::ffi::OsString::from(&run_id),
+        std::ffi::OsString::from(format!(
+            ".fnd01-run/independent-attester/{}/control-ledger.bin",
+            run_id,
+        )),
+    ];
+    let invocation = parse_ordinary_handoff_arguments(arguments)
+        .map_err(|error| format!("E_HANDOFF_ARGUMENTS: child parse: {error}"))?;
+    if invocation.mode != BootstrapMode::Attest || invocation.run_id != run_id {
+        return Err("E_HANDOFF_ARGUMENTS: child Attest role/run drift".to_owned());
+    }
+    let environment = read_ordinary_handoff_environment(&invocation)
+        .map_err(|error| format!("E_HANDOFF_ENVIRONMENT: child environment: {error}"))?;
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe recheck: {error}"))?;
+
+    // The parent never writes a PID-bound ledger. The child creates the
+    // execution-bin once, derives the live expectation with its own PID, and
+    // seals exactly one ledger before re-entering the production continuation.
+    let mut authority = require_ordinary_execution_authority(
+        &invocation.repository_root,
+        invocation.mode,
+        &invocation.run_id,
+        &environment,
+    )?;
+    let non_tool = derive_ordinary_non_tool_expectation(
+        &mut authority,
+        &invocation,
+        &environment,
+        &current_executable,
+    )?;
+    let fresh_inventory = super::phase_b_std::inventory_fresh_native_tools(
+        &invocation.repository_root,
+        invocation.mode,
+        &invocation.run_id,
+        &environment.closed_path,
+    )
+    .map_err(|error| format!("E_HANDOFF_TOOL_SET: fresh runtime inventory: {error}"))?;
+    if fresh_inventory.native_tool_count() != ORDINARY_NATIVE_TOOL_COUNT
+        || fresh_inventory.tool_set_sha256() == [0; 32]
+        || fresh_inventory.execution_bin_sha256() == [0; 32]
+    {
+        return Err("E_HANDOFF_TOOL_SET: fresh runtime inventory is incomplete".to_owned());
+    }
+    let fresh_reprobe = OrdinaryToolReprobe {
+        tool_set_sha256: fresh_inventory.tool_set_sha256(),
+        execution_bin_sha256: fresh_inventory.execution_bin_sha256(),
+        acquisition_tools: fresh_inventory.acquisition_tools().clone(),
+        inventory: fresh_inventory,
+    };
+    let expectation = assemble_complete_ordinary_control_ledger_expectation(
+        &authority,
+        &non_tool,
+        &fresh_reprobe,
+        &invocation,
+        &environment,
+    );
+    let expected_tool_set_sha256 = expectation.tool_set_sha256;
+    let role = bootstrap_role_name(invocation.mode)
+        .map_err(|error| format!("E_HANDOFF_MODE: child role: {error}"))?;
+    let package_root = ordinary_role_absolute_path(
+        &invocation.repository_root,
+        role,
+        &invocation.run_id,
+        "bootstrap-control-package",
+    )?;
+    let target_root = ordinary_role_absolute_path(
+        &invocation.repository_root,
+        role,
+        &invocation.run_id,
+        "bootstrap-control-target",
+    )?;
+    let build_stdout = ordinary_sealed_control_build_stdout(
+        &package_root,
+        &target_root,
+        &expectation.selected_executable.path,
+    );
+    let mut ledger_expectation = expectation.clone();
+    if mutate_tool_set {
+        ledger_expectation.tool_set_sha256[0] ^= 0x80;
+    }
+    let observed_tool_set_sha256 = ledger_expectation.tool_set_sha256;
+    let ledger_bytes = ordinary_sealed_encode_control_ledger_bytes(
+        &ledger_expectation,
+        build_stdout.as_bytes(),
+    )?;
+    ordinary_fixture_write_new(
+        &invocation.repository_root,
+        &invocation.control_ledger_path,
+        &ledger_bytes,
+    )?;
+    let accepted_state = if mutate_tool_set {
+        use super::trust_std::INTEGRATION_SEAL_PATHS;
+
+        let mut relative_paths = INTEGRATION_SEAL_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<_>>();
+        relative_paths.push(format!(
+            ".fnd01-run/controller/{run_id}/producer-outer.bin",
+            run_id = invocation.run_id,
+        ));
+        relative_paths.push(invocation.control_ledger_path.clone());
+        relative_paths
+            .into_iter()
+            .map(|relative| {
+                let bytes = fs::read(invocation.repository_root.join(&relative)).map_err(|error| {
+                    format!("E_HANDOFF_LEDGER: capture accepted {relative}: {error}")
+                })?;
+                Ok((relative, bytes))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        Vec::new()
+    };
+    drop(fresh_reprobe);
+    drop(non_tool);
+    drop(authority);
+
+    let mut effects = OrdinaryPlatformRefusalEffects::default();
+    let error = validate_ordinary_handoff_entry_with_effects(
+        &invocation,
+        &environment,
+        true,
+        &mut effects,
+    )
+    .expect_err("the self-reexec entry must fail closed at its asserted terminal stage");
+    let expected_effects = if mutate_tool_set { (1, 0) } else { (1, 1) };
+    if (effects.ledger_open_attempts, effects.evidence_dispatch_attempts) != expected_effects {
+        return Err(format!(
+            "E_ORDINARY_EVIDENCE: expected ledger/evidence effects {:?}, observed ledger={} evidence={}",
+            expected_effects,
+            effects.ledger_open_attempts,
+            effects.evidence_dispatch_attempts,
+        ));
+    }
+    if mutate_tool_set {
+        if !error.starts_with("E_HANDOFF_LEDGER:")
+            || error.contains("E_ORDINARY_EVIDENCE")
+        {
+            return Err(format!(
+                "E_HANDOFF_LEDGER: mutated bound tool-set must stop before archive/evidence, observed {error}"
+            ));
+        }
+        let nested = format!(
+            "E_CONTROL_AUTHORITY: tool_set_sha256 expected={} observed={}",
+            encode_lower_hex(&expected_tool_set_sha256),
+            encode_lower_hex(&observed_tool_set_sha256),
+        );
+        if !error.contains(&nested) {
+            return Err(format!(
+                "E_HANDOFF_LEDGER: bound tool-set mismatch must retain nested digest proof {nested}, observed {error}"
+            ));
+        }
+        for (relative, accepted_bytes) in accepted_state {
+            let actual_bytes = fs::read(invocation.repository_root.join(&relative)).map_err(|read_error| {
+                format!("E_HANDOFF_LEDGER: reread accepted {relative}: {read_error}")
+            })?;
+            if actual_bytes != accepted_bytes {
+                return Err(format!(
+                    "E_HANDOFF_LEDGER: rejected tool-set mutation changed accepted state {relative}"
+                ));
+            }
+        }
+    } else {
+        let expected = "E_ORDINARY_EVIDENCE: FND01|Error|E_FILE_MISSING|evidence/fnd-01/dependency-verification.toml|metadata";
+        if error != expected {
+            return Err(format!(
+                "E_ORDINARY_EVIDENCE: child must reach fresh-root verifier E_FILE_MISSING policy subject, expected {expected}, observed {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn spawn_ordinary_attest_self_reexec(
+    subject: &OrdinaryAttestSelfReexecSubject,
+    test_id: &str,
+) {
+    let status = Command::new(&subject.selected_executable)
+        .args(["--exact", test_id, "--nocapture"])
+        .env_clear()
+        .env("FASTMCP_FND01_AUTHORING_CLOSURE", &subject.authoring_marker)
+        .env("FASTMCP_FND01_INTEGRATION_SEAL", &subject.integration_marker)
+        .env(
+            "FASTMCP_FND01_PRODUCER_OUTER_RECORD_PATH",
+            format!(".fnd01-run/controller/{}/producer-outer.bin", subject.run_id),
+        )
+        .env("FASTMCP_FND01_RUN_ID", &subject.run_id)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("PATH", &subject.closed_path)
+        .env("TZ", "UTC")
+        .current_dir(&subject.root)
+        .status()
+        .unwrap_or_else(|error| panic!("Attest self-reexec spawn: {error}"));
+    assert!(status.success(), "Attest self-reexec child status: {status}");
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+fn assert_ordinary_attest_self_reexec(test_id: &str, mutate_tool_set: bool) {
+    match ordinary_attest_self_reexec_child() {
+        Ok(Some(child)) => {
+            run_ordinary_attest_self_reexec_child(child, mutate_tool_set)
+                .unwrap_or_else(|error| panic!("Attest self-reexec child: {error}"));
+        }
+        Ok(None) => {
+            let subject = ordinary_attest_self_reexec_subject()
+                .unwrap_or_else(|error| panic!("Attest self-reexec subject: {error}"));
+            spawn_ordinary_attest_self_reexec(&subject, test_id);
+        }
+        Err(error) => panic!("Attest self-reexec child admission: {error}"),
+    }
+}
+
+#[cfg(not(all(test, target_os = "linux", target_arch = "x86_64")))]
+fn assert_ordinary_attest_self_reexec(_test_id: &str, _mutate_tool_set: bool) {
+    panic!("ordinary Attest self-reexec fixture requires Linux x86_64");
+}
+
 fn ordinary_utf8_path(path: &Path, subject: &str) -> Result<String, String> {
     path.to_str()
         .map(str::to_owned)
@@ -90018,6 +90776,42 @@ fn derive_ordinary_non_tool_expectation(
     })
 }
 
+fn assemble_complete_ordinary_control_ledger_expectation(
+    authority: &OrdinaryPreLedgerAuthority,
+    non_tool: &OrdinaryNonToolExpectation,
+    tool_reprobe: &OrdinaryToolReprobe,
+    invocation: &OrdinaryHandoffArguments,
+    environment: &BootstrapEnvironment,
+) -> ControlLedgerExpectation {
+    let integration_seal_sha256 = authority
+        .integration
+        .as_ref()
+        .map_or([0; 32], |integration| integration.seal.seal_sha256);
+    let build_environment = complete_ordinary_control_build_environment(
+        &non_tool.control_build_environment,
+        &tool_reprobe.acquisition_tools,
+    );
+    ControlLedgerExpectation {
+        mode: invocation.mode,
+        repository_root: invocation.repository_root.clone(),
+        run_id: invocation.run_id.clone(),
+        process_id: authority.control.process_id,
+        authoring_closure_sha256: authority.marker.closure_sha256,
+        integration_seal_sha256,
+        scratch_bindings: non_tool.scratch_bindings.clone(),
+        local_registry: non_tool.local_registry.clone(),
+        supply_bundle: non_tool.supply_bundle.clone(),
+        tool_set_sha256: tool_reprobe.tool_set_sha256,
+        environment_set_sha256: authority.control.environment_set_sha256,
+        cargo_executable: tool_reprobe.acquisition_tools.cargo.clone(),
+        build_environment,
+        target_snapshot: non_tool.target_snapshot.clone(),
+        selected_executable: non_tool.selected_executable.clone(),
+        bootstrap_environment: environment.clone(),
+        acquisition_spool_binding: non_tool.acquisition_spool_binding,
+    }
+}
+
 fn validate_probed_ordinary_ledger(
     mut probed: OrdinaryProbedAuthority,
     invocation: &OrdinaryHandoffArguments,
@@ -90043,34 +90837,13 @@ fn validate_probed_ordinary_ledger(
         );
     }
 
-    let integration_seal_sha256 = probed
-        .authority
-        .integration
-        .as_ref()
-        .map_or([0; 32], |integration| integration.seal.seal_sha256);
-    let build_environment = complete_ordinary_control_build_environment(
-        &probed.non_tool.control_build_environment,
-        &probed.tool_reprobe.acquisition_tools,
+    let expectation = assemble_complete_ordinary_control_ledger_expectation(
+        &probed.authority,
+        &probed.non_tool,
+        &probed.tool_reprobe,
+        invocation,
+        environment,
     );
-    let expectation = ControlLedgerExpectation {
-        mode: invocation.mode,
-        repository_root: invocation.repository_root.clone(),
-        run_id: invocation.run_id.clone(),
-        process_id: probed.authority.control.process_id,
-        authoring_closure_sha256: probed.authority.marker.closure_sha256,
-        integration_seal_sha256,
-        scratch_bindings: probed.non_tool.scratch_bindings.clone(),
-        local_registry: probed.non_tool.local_registry.clone(),
-        supply_bundle: probed.non_tool.supply_bundle.clone(),
-        tool_set_sha256: probed.tool_reprobe.tool_set_sha256,
-        environment_set_sha256: probed.authority.control.environment_set_sha256,
-        cargo_executable: probed.tool_reprobe.acquisition_tools.cargo.clone(),
-        build_environment,
-        target_snapshot: probed.non_tool.target_snapshot.clone(),
-        selected_executable: probed.non_tool.selected_executable.clone(),
-        bootstrap_environment: environment.clone(),
-        acquisition_spool_binding: probed.non_tool.acquisition_spool_binding,
-    };
     let ledger = validate_control_ledger_bytes(
         &probed.ledger_bytes,
         &expectation,
@@ -90315,67 +91088,228 @@ fn require_ordinary_execution_authority(
 /// untrusted diagnostic detail, except for the one shared executable code:
 /// pre-ledger current-executable admission is `authority`, while a parsed
 /// `selected_executable` mismatch is a `ledger` failure.
-fn ordinary_entry_diagnostic_stage(code: &str, detail: &str) -> &'static str {
-    if code == "E_ORDINARY_EVIDENCE" {
-        "evidence"
-    } else if code == "E_ENTRY_ARGUMENTS" || code == "E_ENTRY_PANIC" {
-        // Harness-boundary product failures stay first-class `authority` stages
-        // (B-R4): never collapse known ordinary entry failures to stage=ordinary.
-        "authority"
-    } else if code == "E_UNQUALIFIED_PLATFORM" {
-        if detail.contains("post-archive") || detail.contains("revalidation") {
-            "bookend"
-        } else if detail.contains("native-tool probes") {
-            "reprobe"
-        } else if detail.contains("control-tree rebind") {
-            "ledger"
-        } else {
-            "authority"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrdinaryProductStage { Authority, Reprobe, Ledger, Archive, Bookend, Evidence }
+
+impl OrdinaryProductStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authority => "authority", Self::Reprobe => "reprobe",
+            Self::Ledger => "ledger", Self::Archive => "archive",
+            Self::Bookend => "bookend", Self::Evidence => "evidence",
         }
-    } else if code == "E_HANDOFF_LEDGER_RECHECK" {
-        if detail.contains("post-archive") {
-            "bookend"
-        } else {
-            "ledger"
-        }
-    } else if code.contains("RECHECK") || code == "E_HANDOFF_SPOOL_PLAN" {
-        "bookend"
-    } else if code == "E_HANDOFF_ARCHIVE"
-        || code == "E_HANDOFF_SUPPLY_PARSE"
-    {
-        "archive"
-    } else if code.starts_with("E_HANDOFF_TOOL_SET") {
-        "reprobe"
-    } else if code.starts_with("E_HANDOFF_LEDGER")
-        || code == "E_HANDOFF_ARGV"
-        || code == "E_HANDOFF_ENVIRONMENT"
-        || code == "E_HANDOFF_SUPPLY"
-        || code == "E_HANDOFF_SPOOL"
-        || (code == "E_HANDOFF_EXECUTABLE"
-            && detail.contains("selected_executable"))
-    {
-        "ledger"
-    } else {
-        "authority"
     }
 }
 
+macro_rules! ordinary_failure_routes {
+    ($( $route:ident => ($id:literal, $code:literal, $stage:ident, $expected:literal) ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum OrdinaryFailureRoute { $( $route ),+ }
+        impl OrdinaryFailureRoute {
+            const ALL: &'static [Self] = &[ $( Self::$route ),+ ];
+            const fn id(self) -> &'static str { match self { $( Self::$route => $id ),+ } }
+            const fn code(self) -> &'static str { match self { $( Self::$route => $code ),+ } }
+            const fn stage(self) -> OrdinaryProductStage { match self { $( Self::$route => OrdinaryProductStage::$stage ),+ } }
+            const fn expected(self) -> &'static str { match self { $( Self::$route => $expected ),+ } }
+        }
+    };
+}
+
+ordinary_failure_routes! {
+    Arguments => ("entry.arguments", "E_ENTRY_ARGUMENTS", Authority, "valid ordinary handoff argv"),
+    Panic => ("entry.panic", "E_ENTRY_PANIC", Authority, "ordinary handoff must not panic"),
+    Authoring => ("entry.authoring", "E_HANDOFF_AUTHORING", Authority, "authoring authority"),
+    InitialPlatform => ("entry.platform", "E_UNQUALIFIED_PLATFORM", Authority, "qualified Linux x86_64"),
+    ToolPlatform => ("reprobe.platform", "E_UNQUALIFIED_PLATFORM", Reprobe, "qualified Linux x86_64"),
+    ToolSet => ("reprobe.tool-set", "E_HANDOFF_TOOL_SET", Reprobe, "twenty-tool reprobe"),
+    ToolSetRecheck => ("bookend.tool-set-recheck", "E_HANDOFF_TOOL_SET_RECHECK", Bookend, "unchanged post-archive tool inventory"),
+    LedgerOpen => ("ledger.open", "E_HANDOFF_LEDGER", Ledger, "opaque control ledger"),
+    LedgerValidate => ("ledger.validate", "E_HANDOFF_LEDGER", Ledger, "complete ControlLedgerExpectation"),
+    LedgerArguments => ("ledger.argv", "E_HANDOFF_ARGV", Ledger, "bound handoff argv"),
+    LedgerDigest => ("ledger.digest", "E_HANDOFF_DIGEST", Ledger, "validated ledger digest"),
+    LedgerRecheck => ("ledger.pre-archive-recheck", "E_HANDOFF_LEDGER_RECHECK", Ledger, "unchanged admitted ledger"),
+    LedgerRebind => ("ledger.rebind", "E_HANDOFF_LEDGER_REBIND", Ledger, "unchanged control trees"),
+    ExecutableAdmission => ("authority.executable", "E_HANDOFF_EXECUTABLE", Authority, "admitted current executable"),
+    LedgerExecutable => ("ledger.executable", "E_HANDOFF_EXECUTABLE", Ledger, "bound selected executable"),
+    EnvironmentAdmission => ("authority.environment", "E_HANDOFF_ENVIRONMENT", Authority, "closed role-specific environment"),
+    LedgerEnvironment => ("ledger.environment", "E_HANDOFF_ENVIRONMENT", Ledger, "bound handoff environment"),
+    LedgerEnvironmentSet => ("ledger.environment-set", "E_HANDOFF_ENVIRONMENT_SET", Ledger, "compiled environment digest"),
+    LedgerSpool => ("ledger.spool", "E_HANDOFF_SPOOL", Ledger, "bound acquisition spool"),
+    LedgerSupply => ("ledger.supply", "E_HANDOFF_SUPPLY", Ledger, "bound supply bundle"),
+    ArchiveFraming => ("archive.framing", "E_HANDOFF_SUPPLY_PARSE", Archive, "strict supply framing"),
+    ArchiveValidate => ("archive.validate", "E_HANDOFF_ARCHIVE", Archive, "validated crate archives"),
+    BookendLedger => ("bookend.ledger", "E_HANDOFF_LEDGER_RECHECK", Bookend, "unchanged post-archive ledger"),
+    BookendSupply => ("bookend.supply", "E_HANDOFF_SUPPLY_RECHECK", Bookend, "unchanged post-archive supply bundle"),
+    BookendSpoolPlan => ("bookend.spool-plan", "E_HANDOFF_SPOOL_PLAN", Bookend, "unchanged post-archive spool plan"),
+    BookendSpool => ("bookend.spool", "E_HANDOFF_SPOOL_RECHECK", Bookend, "unchanged post-archive spool"),
+    BookendEnvironment => ("bookend.environment", "E_HANDOFF_ENVIRONMENT", Bookend, "unchanged post-archive environment"),
+    BookendExecutable => ("bookend.executable", "E_HANDOFF_EXECUTABLE_RECHECK", Bookend, "unchanged post-archive executable"),
+    BookendPlatform => ("bookend.platform", "E_UNQUALIFIED_PLATFORM", Bookend, "qualified Linux x86_64"),
+    Evidence => ("evidence.dispatch", "E_ORDINARY_EVIDENCE", Evidence, "accepted evidence report"),
+    InternalUnclassified => ("internal.unclassified", "E_ORDINARY_HANDOFF", Authority, "registered ordinary failure route"),
+}
+
+struct OrdinaryEntryFailure {
+    route: OrdinaryFailureRoute,
+    route_id: &'static str,
+    expected: String,
+    observed: String,
+}
+
+impl OrdinaryEntryFailure {
+    fn new(route: OrdinaryFailureRoute, observed: impl Into<String>) -> Self {
+        Self::with_expected(route, route.expected(), observed)
+    }
+
+    fn with_expected(
+        route: OrdinaryFailureRoute,
+        expected: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self {
+            route,
+            route_id: route.id(),
+            expected: expected.into(),
+            observed: observed.into(),
+        }
+    }
+}
+
+/// Production-owned route selection for an already-normalized ordinary error
+/// code. Every emitted diagnostic consumes this registry; unknown codes are
+/// not silently staged as authority, but surface through the explicit frozen
+/// `InternalUnclassified` route.
+fn ordinary_failure_route_for_failure(
+    code: &str,
+    expected: &str,
+    observed: &str,
+) -> OrdinaryFailureRoute {
+    let route = match code {
+        "E_ENTRY_ARGUMENTS" | "E_HANDOFF_ARGUMENTS" => OrdinaryFailureRoute::Arguments,
+        "E_ENTRY_PANIC" => OrdinaryFailureRoute::Panic,
+        "E_HANDOFF_AUTHORING" | "E_HANDOFF_OUTER_RECORD" | "E_HANDOFF_PATH"
+        | "E_HANDOFF_PID" | "E_HANDOFF_MODE" => OrdinaryFailureRoute::Authoring,
+        "E_UNQUALIFIED_PLATFORM" if observed.contains("native-tool probes") => {
+            OrdinaryFailureRoute::ToolPlatform
+        }
+        "E_UNQUALIFIED_PLATFORM" if observed.contains("control-tree rebind") => {
+            OrdinaryFailureRoute::LedgerRebind
+        }
+        "E_UNQUALIFIED_PLATFORM"
+            if observed.contains("post-archive") || observed.contains("revalidation") =>
+        {
+            OrdinaryFailureRoute::BookendPlatform
+        }
+        "E_UNQUALIFIED_PLATFORM" => OrdinaryFailureRoute::InitialPlatform,
+        "E_HANDOFF_TOOL_SET" => OrdinaryFailureRoute::ToolSet,
+        "E_HANDOFF_TOOL_SET_RECHECK" => OrdinaryFailureRoute::ToolSetRecheck,
+        "E_HANDOFF_LEDGER" => OrdinaryFailureRoute::LedgerValidate,
+        "E_HANDOFF_ARGV" => OrdinaryFailureRoute::LedgerArguments,
+        "E_HANDOFF_DIGEST" => OrdinaryFailureRoute::LedgerDigest,
+        "E_HANDOFF_LEDGER_RECHECK"
+            if observed.contains("opaque post-probe")
+                || observed.contains("during the tool reprobe") =>
+        {
+            OrdinaryFailureRoute::LedgerRecheck
+        }
+        "E_HANDOFF_LEDGER_RECHECK" => OrdinaryFailureRoute::BookendLedger,
+        "E_HANDOFF_LEDGER_REBIND" => OrdinaryFailureRoute::LedgerRebind,
+        "E_HANDOFF_EXECUTABLE" if observed.contains("current executable differs from argv[0]") => {
+            OrdinaryFailureRoute::ExecutableAdmission
+        }
+        "E_HANDOFF_EXECUTABLE" => OrdinaryFailureRoute::LedgerExecutable,
+        "E_HANDOFF_ENVIRONMENT" if expected == "closed role-specific environment" => {
+            OrdinaryFailureRoute::EnvironmentAdmission
+        }
+        "E_HANDOFF_ENVIRONMENT" => OrdinaryFailureRoute::LedgerEnvironment,
+        "E_HANDOFF_ENVIRONMENT_SET" => OrdinaryFailureRoute::LedgerEnvironmentSet,
+        "E_HANDOFF_SPOOL" => OrdinaryFailureRoute::LedgerSpool,
+        "E_HANDOFF_SUPPLY" => OrdinaryFailureRoute::LedgerSupply,
+        "E_HANDOFF_SUPPLY_PARSE" => OrdinaryFailureRoute::ArchiveFraming,
+        "E_HANDOFF_ARCHIVE" => OrdinaryFailureRoute::ArchiveValidate,
+        "E_HANDOFF_SUPPLY_RECHECK" => OrdinaryFailureRoute::BookendSupply,
+        "E_HANDOFF_SPOOL_PLAN" => OrdinaryFailureRoute::BookendSpoolPlan,
+        "E_HANDOFF_SPOOL_RECHECK" => OrdinaryFailureRoute::BookendSpool,
+        "E_HANDOFF_EXECUTABLE_RECHECK" => OrdinaryFailureRoute::BookendExecutable,
+        "E_HANDOFF_ENVIRONMENT_RECHECK" => OrdinaryFailureRoute::BookendEnvironment,
+        "E_ORDINARY_EVIDENCE" => OrdinaryFailureRoute::Evidence,
+        _ => OrdinaryFailureRoute::InternalUnclassified,
+    };
+    debug_assert!(OrdinaryFailureRoute::ALL.contains(&route));
+    route
+}
+
+fn ordinary_entry_failure_frame_for_route(
+    mode: &str,
+    run_id: &str,
+    failure: &OrdinaryEntryFailure,
+) -> OrdinaryEntryFailureFrame {
+    debug_assert_eq!(failure.route_id, failure.route.id());
+    OrdinaryEntryFailureFrame {
+        stage: failure.route.stage().as_str(),
+        parts: ordinary_entry_failure_fields(mode, run_id, &failure.expected, &failure.observed),
+    }
+}
+
+fn ordinary_entry_diagnostic_stage(code: &str, detail: &str) -> &'static str {
+    ordinary_failure_route_for_failure(code, "stage contract satisfied", detail)
+        .stage()
+        .as_str()
+}
+
+struct OrdinaryEntryFailureFrame {
+    stage: &'static str,
+    parts: [String; 4],
+}
+
+/// Build the complete public ordinary-entry diagnostic frame before writing it
+/// to stderr.  Keeping stage selection and the required product fields in one
+/// production helper prevents a test-only diagnostic representation from
+/// drifting away from the emitted handoff failure.
+fn ordinary_entry_failure_frame(
+    mode: &str,
+    run_id: &str,
+    code: &str,
+    expected: &str,
+    observed: &str,
+) -> OrdinaryEntryFailureFrame {
+    ordinary_entry_failure_frame_for_route(
+        mode,
+        run_id,
+        &OrdinaryEntryFailure::with_expected(
+            ordinary_failure_route_for_failure(code, expected, observed),
+            expected,
+            observed,
+        ),
+    )
+}
+
 fn emit_ordinary_entry_failure(
-    stage: &str,
     mode: &str,
     run_id: &str,
     code: &str,
     expected: &str,
     observed: &str,
 ) {
-    let [role, run, expected, observed] =
-        ordinary_entry_failure_fields(mode, run_id, expected, observed);
+    let frame = ordinary_entry_failure_frame(mode, run_id, code, expected, observed);
+    let [role, run, expected, observed] = frame.parts;
     emit_entry_diagnostic_parts(
-        stage,
+        frame.stage,
         mode,
         code,
         &[&role, &run, &expected, &observed],
     );
+}
+
+fn emit_ordinary_entry_failure_route(
+    mode: &str,
+    run_id: &str,
+    failure: OrdinaryEntryFailure,
+) {
+    let code = failure.route.code();
+    let frame = ordinary_entry_failure_frame_for_route(mode, run_id, &failure);
+    let [role, run, expected, observed] = frame.parts;
+    emit_entry_diagnostic_parts(frame.stage, mode, code, &[&role, &run, &expected, &observed]);
 }
 
 /// The ordinary product diagnostic is structured rather than detail-parsed:
@@ -90420,6 +91354,31 @@ fn dispatch_ordinary_evidence(result: VResult<Report>) -> Result<(), String> {
     }
 }
 
+/// The only post-consume terminal continuation. It is reached after the
+/// permit, archive, and bookend checks in `validate_ordinary_handoff_entry`;
+/// verifier failure is deliberately translated here rather than allowing a
+/// later handoff-pending sentinel to escape that completed path.
+fn complete_ordinary_post_consume_continuation(
+    verifier: impl FnOnce() -> VResult<Report>,
+) -> Result<(), String> {
+    dispatch_ordinary_evidence(verifier())
+}
+
+/// Effect observation is deliberately injected only at the production entry
+/// seam.  It gives the planted ordering tests a machine-checkable way to prove
+/// that an admission failure occurred before ledger or evidence work, without
+/// introducing a second handoff validator.
+trait OrdinaryEntryEffects {
+    fn before_ledger_open(&mut self);
+    fn before_evidence_dispatch(&mut self);
+}
+
+impl OrdinaryEntryEffects for () {
+    fn before_ledger_open(&mut self) {}
+
+    fn before_evidence_dispatch(&mut self) {}
+}
+
 
 /// Ordinary same-PID handoff entry for produce/attest.
 ///
@@ -90442,14 +91401,9 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
     let invocation = match parse_ordinary_handoff_arguments(arguments) {
         Ok(invocation) => invocation,
         Err(error) => {
-            emit_ordinary_entry_failure(
-                "authority",
-                mode,
-                "unavailable",
-                error.code(),
-                "valid ordinary handoff argv",
-                error.detail(),
-            );
+            emit_ordinary_entry_failure_route(mode, "unavailable", OrdinaryEntryFailure::new(
+                OrdinaryFailureRoute::Arguments, error.detail(),
+            ));
             return 3;
         }
     };
@@ -90457,7 +91411,6 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
         Ok(environment) => environment,
         Err(error) => {
             emit_ordinary_entry_failure(
-                "authority",
                 mode,
                 &invocation.run_id,
                 error.code(),
@@ -90475,9 +91428,7 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
                 .split_once(": ")
                 .filter(|(code, _)| entry_diagnostic_code_is_valid(code))
                 .unwrap_or(("E_ORDINARY_HANDOFF", error.as_str()));
-            let stage = ordinary_entry_diagnostic_stage(code, detail);
             emit_ordinary_entry_failure(
-                stage,
                 mode,
                 &invocation.run_id,
                 code,
@@ -90492,6 +91443,25 @@ fn run_ordinary_handoff_entry(arguments: Vec<std::ffi::OsString>) -> i32 {
 fn validate_ordinary_handoff_entry(
     invocation: &OrdinaryHandoffArguments,
     environment: &BootstrapEnvironment,
+) -> Result<(), String> {
+    validate_ordinary_handoff_entry_with_effects(
+        invocation,
+        environment,
+        ordinary_platform_is_qualified(),
+        &mut (),
+    )
+}
+
+/// The sole ordinary production continuation.  The shipped entry uses the
+/// real platform predicate and no-op observer; focused tests inject only the
+/// predicate/effect observer needed to prove fail-closed ordering.  Once the
+/// permit is consumed, this same function owns ledger validation, archive
+/// validation, bookend rechecks, and the real evidence dispatch.
+fn validate_ordinary_handoff_entry_with_effects(
+    invocation: &OrdinaryHandoffArguments,
+    environment: &BootstrapEnvironment,
+    platform_qualified: bool,
+    effects: &mut impl OrdinaryEntryEffects,
 ) -> Result<(), String> {
     use std::io::Read;
 
@@ -90512,6 +91482,10 @@ fn validate_ordinary_handoff_entry(
             "E_HANDOFF_EXECUTABLE: current executable differs from argv[0]".to_owned(),
         );
     }
+    ordinary_require_qualified_platform(
+        "ordinary handoff requires Linux x86_64",
+        platform_qualified,
+    )?;
     // A self-described ledger or supply object cannot authorize its own use.
     // Require a grammar-valid FND01AUTHORv2 marker that rebinds the three
     // authoring paths on the live repository, plus independent twenty-tool
@@ -90552,6 +91526,7 @@ fn validate_ordinary_handoff_entry(
         environment,
         &current_executable,
     )?;
+    effects.before_ledger_open();
     let (opaque_ledger_snapshot, opaque_ledger_bytes) = checked_read(
         &invocation.repository_root,
         &invocation.control_ledger_path,
@@ -91308,7 +92283,10 @@ fn validate_ordinary_handoff_entry(
     // Integration receipts remain Severity::Pending (E_PENDING_GATE); only
     // Severity::Error fails closed as E_ORDINARY_EVIDENCE. This is not a
     // permanent E_ORDINARY_HANDOFF_PENDING stub on the happy path.
-    dispatch_ordinary_evidence(run_verifier())
+    effects.before_evidence_dispatch();
+    complete_ordinary_post_consume_continuation(|| {
+        run_verifier_at(&invocation.repository_root)
+    })
 }
 
 #[test]
@@ -91356,7 +92334,7 @@ fn ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
     // live fault tests by making an accidental effect reordering conspicuous.
     let source = include_str!("fnd_01_dependency_evidence.rs");
     let start = source
-        .find("fn validate_ordinary_handoff_entry(")
+        .find("fn validate_ordinary_handoff_entry_with_effects(")
         .expect("ordinary handoff entry must exist");
     let remainder = &source[start..];
     let end = remainder
@@ -91376,7 +92354,8 @@ fn ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
         "let ledger_recheck = validate_control_ledger_bytes(",
         "revalidate_ordinary_producer_acquisition(",
         "tool_reprobe.require_unchanged()?;",
-        "match run_verifier()",
+        "complete_ordinary_post_consume_continuation(|| {",
+        "run_verifier_at(&invocation.repository_root)",
     ];
     let mut cursor = 0;
     for token in ordered_tokens {
@@ -91547,7 +92526,9 @@ fn ordinary_evidence_dispatch_code_is_named_and_stable() {
 }
 
 #[test]
-fn ordinary_entry_failures_map_to_first_class_product_stages() {
+fn ordinary_b_r4_all_fail_closed_branches_emit_product_stage() {
+    let role = "produce";
+    let run_id = "0123456789abcdef0123456789abcdef";
     let cases = [
         (
             "E_ORDINARY_HANDOFF_PENDING",
@@ -91629,17 +92610,90 @@ fn ordinary_entry_failures_map_to_first_class_product_stages() {
             "panic payload suppressed",
             "authority",
         ),
-    ];
-    for (code, detail, expected) in cases {
-        assert_eq!(ordinary_entry_diagnostic_stage(code, detail), expected);
-    }
-    assert_eq!(
-        ordinary_entry_diagnostic_stage(
-            "E_HANDOFF_EXECUTABLE",
-            "current executable differs from argv[0]",
+        ("E_HANDOFF_AUTHORING", "empty authoring marker", "authority"),
+        (
+            "E_HANDOFF_ARGUMENTS",
+            "control-ledger path does not match role/run formula",
+            "authority",
         ),
-        "authority",
+        ("E_HANDOFF_PATH", "empty closed PATH", "authority"),
+        ("E_HANDOFF_PID", "process id must be nonzero", "authority"),
+        ("E_HANDOFF_MODE", "Gate cannot enter ordinary handoff", "authority"),
+        ("E_HANDOFF_ARGV", "argv desync", "ledger"),
+        ("E_HANDOFF_ENVIRONMENT", "environment desync", "ledger"),
+        ("E_HANDOFF_DIGEST", "validated ledger digest desync", "ledger"),
+        (
+            "E_HANDOFF_OUTER_RECORD",
+            "producer outer-record environment path mismatch",
+            "authority",
+        ),
+        (
+            "E_HANDOFF_ENVIRONMENT_SET",
+            "compiled environment digest desync",
+            "ledger",
+        ),
+        (
+            "E_HANDOFF_LEDGER_REBIND",
+            "control tree reobservation failed",
+            "ledger",
+        ),
+        ("E_HANDOFF_SUPPLY", "supply binding desync", "ledger"),
+        ("E_HANDOFF_SUPPLY_PARSE", "framing failed", "archive"),
+        ("E_HANDOFF_SPOOL", "spool binding desync", "ledger"),
+        ("E_HANDOFF_SPOOL_PLAN", "post-archive plan drift", "bookend"),
+        ("E_HANDOFF_SPOOL_RECHECK", "post-archive spool drift", "bookend"),
+        (
+            "E_HANDOFF_TOOL_SET_RECHECK",
+            "post-archive inventory drift",
+            "bookend",
+        ),
+        (
+            "E_HANDOFF_EXECUTABLE_RECHECK",
+            "post-archive executable drift",
+            "bookend",
+        ),
+        ("E_ORDINARY_HANDOFF", "unclassified ordinary handoff", "authority"),
+    ];
+    for (code, observed, expected_stage) in cases {
+        let frame = ordinary_entry_failure_frame(
+            role,
+            run_id,
+            code,
+            "stage contract satisfied",
+            observed,
+        );
+        assert!(
+            entry_diagnostic_code_is_valid(code) || code.starts_with("E_ORDINARY_"),
+            "ordinary failure code must remain stable: {code}",
+        );
+        assert_eq!(frame.stage, expected_stage, "code={code} observed={observed}");
+        assert_eq!(
+            frame.parts,
+            [
+                "role=produce".to_owned(),
+                format!("run_id={run_id}"),
+                "expected=stage contract satisfied".to_owned(),
+                format!("observed={observed}"),
+            ],
+            "all ordinary product failures must retain role/run/expected/observed",
+        );
+    }
+    let executable_admission = ordinary_entry_failure_frame(
+        role,
+        run_id,
+        "E_HANDOFF_EXECUTABLE",
+        "stage contract satisfied",
+        "current executable differs from argv[0]",
     );
+    assert_eq!(executable_admission.stage, "authority");
+    let executable_binding = ordinary_entry_failure_frame(
+        role,
+        run_id,
+        "E_HANDOFF_EXECUTABLE",
+        "stage contract satisfied",
+        "validated ledger differs from the independent executable binding",
+    );
+    assert_eq!(executable_binding.stage, "ledger");
 }
 
 #[test]
@@ -91848,149 +92902,25 @@ fn ordinary_sealed_control_ledger_expectation_joins_all_live_fields() {
     assert!(relative_cargo.contains("cargo_executable"), "{relative_cargo}");
 }
 
-/// B-R2 sealed production e2e: encode a synthetic FND01CONTROLv2 ledger from a
-/// sealed expectation, join the Cargo build stream via production
-/// `join_control_build_stream`, and fully validate with
-/// `validate_control_ledger_bytes` → `ValidatedControlLedger`.
-/// // B-R2-SEALED
+/// Frozen R2 acceptance: the parent copies the current libtest into a fresh,
+/// sealed Attest role root, and the exact selected executable re-enters this
+/// same test ID to consume the real production permit and ledger path.
 #[test]
 fn ordinary_b_r2_sealed_production_e2e() {
-    let (expectation, ledger_bytes, package_root, target_root) =
-        ordinary_sealed_produce_control_fixture()
-            .expect("sealed produce control fixture must encode");
-    assert!(!ledger_bytes.is_empty());
-    assert!(ledger_bytes.starts_with(CONTROL_LEDGER_PREFIX));
-    let joined = join_control_build_stream(
-        // Re-derive the same synthetic stdout that the fixture encoded.
-        ordinary_sealed_control_build_stdout(
-            &package_root,
-            &target_root,
-            &expectation.selected_executable.path,
-        )
-        .as_bytes(),
-        &package_root,
-        &target_root,
-        &expectation.selected_executable.path,
-    )
-    .expect("production join_control_build_stream must accept sealed cargo stdout");
-    assert_eq!(joined.message_count, 2);
-    assert_eq!(
-        joined.artifact.executable,
-        expectation.selected_executable.path
+    assert_ordinary_attest_self_reexec(
+        ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID,
+        false,
     );
-    assert!(joined.finished.success);
-    assert_eq!(joined.finished.line_ordinal, 2);
-    assert_eq!(
-        ordinary_entry_diagnostic_stage("E_HANDOFF_LEDGER", "complete validator"),
-        "ledger",
-    );
-    let validated = validate_control_ledger_bytes(&ledger_bytes, &expectation)
-        .expect("production validate_control_ledger_bytes must accept sealed ledger");
-    assert_eq!(validated.role, "integration-producer");
-    assert_eq!(validated.run_id, expectation.run_id);
-    assert_eq!(validated.process_id, expectation.process_id);
-    assert_eq!(
-        validated.authoring_closure_sha256,
-        expectation.authoring_closure_sha256
-    );
-    assert_eq!(validated.tool_set_sha256, expectation.tool_set_sha256);
-    assert_eq!(
-        validated.environment_set_sha256,
-        expectation.environment_set_sha256
-    );
-    assert_eq!(validated.cargo_message_count, joined.message_count);
-    assert_eq!(
-        validated.cargo_message_set_sha256,
-        joined.message_set_sha256
-    );
-    assert_eq!(validated.compiler_artifact, joined.artifact);
-    assert_eq!(validated.build_finished, joined.finished);
-    assert_eq!(validated.selected_executable, expectation.selected_executable);
-    assert_eq!(validated.target_snapshot, expectation.target_snapshot);
-    assert_eq!(validated.local_registry, expectation.local_registry);
-    assert_eq!(validated.supply_bundle, expectation.supply_bundle);
-    assert_eq!(validated.build_exit_code, 0);
-    assert_eq!(
-        validated.build_working_directory,
-        package_root
-    );
-    assert_eq!(
-        validated.handoff_argv,
-        expected_ordinary_handoff_argv(
-            BootstrapMode::Produce,
-            &expectation.selected_executable.path,
-            &expectation.run_id,
-        )
-        .expect("handoff argv")
-    );
-    // Fail-closed: empty / wrong-prefix / truncated ledgers never pass.
-    let empty_err = validate_control_ledger_bytes(b"", &expectation)
-        .expect_err("empty ledger must fail closed");
-    assert!(
-        empty_err.to_string().contains("E_")
-            || format!("{empty_err}").contains("control"),
-        "{empty_err}"
-    );
-    let mut wrong_prefix = ledger_bytes.clone();
-    wrong_prefix[0] = b'X';
-    assert!(
-        validate_control_ledger_bytes(&wrong_prefix, &expectation).is_err(),
-        "wrong prefix must fail closed"
-    );
-    // ordinary_archive_validation_rule surface stays production-wired in the
-    // handoff path (validate_ordinary_supply_archives after ledger admit). Empty
-    // archive sets validate with zero members; non-empty wrong digests fail closed
-    // (covered by existing ordinary supply archive unit tests).
-    let empty_archives = OrdinarySupplyFraming {
-        bootstrap_lock_payload_offset: 0,
-        bootstrap_lock_byte_length: 0,
-        bootstrap_lock_sha256: [0; 32],
-        acquisition_root_entry_count: 0,
-        acquisition_root_total_regular_file_bytes: 0,
-        acquisition_root_set_sha256: [0; 32],
-        sparse_config_path: String::new(),
-        sparse_config_payload_offset: 0,
-        sparse_config_byte_length: 0,
-        sparse_config_sha256: [0; 32],
-        lock_triples: Vec::new(),
-        entry_count: 0,
-        total_payload_bytes: 0,
-        inner_entry_set_sha256: [0; 32],
-        closure_bijection_sha256: [0; 32],
-        entries: Vec::new(),
-        closure_rows: Vec::new(),
-        archives: Vec::new(),
-    };
-    validate_ordinary_supply_archives(&[], &empty_archives)
-        .expect("empty supply archive set must validate with zero members");
 }
 
-/// B-R2 negative: a live expectation field is independently desynchronized
-/// after ledger sealing.  The production validator must preserve the stable
-/// authority code and expose the exact expected/observed digests.
+/// Frozen R2 negative: only the child-sealed bound tool-set digest differs;
+/// the production entry must fail before evidence and leave accepted state
+/// byte-for-byte unchanged.
 #[test]
 fn ordinary_b_r2_sealed_field_desync_fails_closed() {
-    let (mut expectation, ledger_bytes, _package_root, _target_root) =
-        ordinary_sealed_produce_control_fixture()
-            .expect("sealed fixture must encode before independent mutation");
-    let observed = expectation.tool_set_sha256;
-    expectation.tool_set_sha256[0] ^= 0x80;
-    let expected = expectation.tool_set_sha256;
-
-    let error = validate_control_ledger_bytes(&ledger_bytes, &expectation)
-        .expect_err("desynchronized live tool_set field must fail closed");
-    assert_eq!(error.code(), "E_CONTROL_AUTHORITY");
-    assert_eq!(
-        error.detail(),
-        format!(
-            "tool_set_sha256 expected={} observed={}",
-            encode_lower_hex(&expected),
-            encode_lower_hex(&observed),
-        )
-    );
-    assert_eq!(
-        ordinary_entry_diagnostic_stage("E_HANDOFF_LEDGER", error.detail()),
-        "ledger",
+    assert_ordinary_attest_self_reexec(
+        ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID,
+        true,
     );
 }
 
@@ -92055,51 +92985,69 @@ fn ordinary_b_r3_sealed_matrix() {
     );
 }
 
-/// B-R3 live tier: pure dual-path readiness then live reprobe residual that is
-/// either Ok(nonzero digests) on qualified hosts or fail-closed platform/tool codes.
+/// B-R3 live tier: on the qualified Linux executor, all twenty reprobes and
+/// both live digests are mandatory.  Other platforms prove the separately
+/// named pre-ledger platform negative below.
 /// // B-R3-LIVE
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn ordinary_b_r3_live_matrix() {
     let pure = ordinary_reprobe_dual_path_pure_authority()
         .expect("B-R3 live pure half first");
     assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
-    let repository_root = repository_root();
-    let result = ordinary_reprobe_tool_set_shared(
-        &repository_root,
-        BootstrapMode::Produce,
-        "0123456789abcdef0123456789abcdef",
-        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+    let subject = ordinary_attest_self_reexec_subject()
+        .expect("B-R3 live fresh Attest subject");
+    let fresh = super::phase_b_std::inventory_fresh_native_tools(
+        &subject.root,
+        BootstrapMode::Attest,
+        &subject.run_id,
+        &subject.closed_path,
+    )
+    .expect("B-R3 live CreateFresh inventory");
+    let reprobe = ordinary_reprobe_tool_set_shared(
+        &subject.root,
+        BootstrapMode::Attest,
+        &subject.run_id,
+        &subject.closed_path,
+    )
+    .expect("qualified Linux must complete all ordinary native-tool reprobes");
+    assert_eq!(reprobe.inventory.native_tool_count(), ORDINARY_NATIVE_TOOL_COUNT);
+    assert_eq!(reprobe.inventory.native_tool_count(), pure.native_tool_count);
+    assert_ne!(reprobe.tool_set_sha256, [0; 32]);
+    assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
+    assert_eq!(reprobe.tool_set_sha256, fresh.tool_set_sha256());
+    assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_HANDOFF_TOOL_SET", "digest"),
+        "reprobe",
     );
-    match result {
-        Ok(reprobe) => {
-            assert_ne!(reprobe.tool_set_sha256, [0; 32]);
-            assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
-            assert_eq!(
-                ordinary_entry_diagnostic_stage("E_HANDOFF_TOOL_SET", "digest"),
-                "reprobe",
-            );
-        }
-        Err(error) => {
-            assert!(
-                error.starts_with("E_UNQUALIFIED_PLATFORM:")
-                    || error.starts_with("E_HANDOFF_TOOL_SET:"),
-                "B-R3 live residual unexpected: {error}",
-            );
-            let code = if error.starts_with("E_UNQUALIFIED_PLATFORM:") {
-                "E_UNQUALIFIED_PLATFORM"
-            } else {
-                "E_HANDOFF_TOOL_SET"
-            };
-            let stage = ordinary_entry_diagnostic_stage(
-                code,
-                "ordinary native-tool probes require Linux x86_64",
-            );
-            assert!(
-                stage == "reprobe" || stage == "authority",
-                "live residual stage={stage} error={error}",
-            );
-        }
-    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[test]
+fn ordinary_b_r3_live_matrix() {
+    ordinary_reprobe_dual_path_pure_authority()
+        .expect("B-R3 live pure authority must precede the platform gate");
+    let run_id = format!("{:032x}", std::process::id());
+    let closed_path = format!(
+        "{}:/usr/bin:/bin",
+        std::env::temp_dir().join("fnd01-unqualified-toolchain").display(),
+    );
+    let error = ordinary_reprobe_tool_set_shared(
+        &repository_root(),
+        BootstrapMode::Produce,
+        &run_id,
+        &closed_path,
+    )
+    .expect_err("unqualified platforms must fail before live reprobe work");
+    assert_eq!(
+        error,
+        "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
+    );
+    assert_eq!(
+        ordinary_entry_diagnostic_stage("E_UNQUALIFIED_PLATFORM", &error),
+        "reprobe"
+    );
 }
 
 /// B-R1 qualified live half: only the qualified Linux executor is allowed to
@@ -92110,40 +93058,92 @@ fn ordinary_b_r3_live_matrix() {
 fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
     let pure = ordinary_reprobe_dual_path_pure_authority()
         .expect("qualified Linux pure dual-path authority");
+    let subject = ordinary_attest_self_reexec_subject()
+        .expect("B-R1 fresh Attest subject");
+    let fresh = super::phase_b_std::inventory_fresh_native_tools(
+        &subject.root,
+        BootstrapMode::Attest,
+        &subject.run_id,
+        &subject.closed_path,
+    )
+    .expect("B-R1 CreateFresh inventory");
     let reprobe = ordinary_reprobe_tool_set_shared(
-        &repository_root(),
-        BootstrapMode::Produce,
-        "0123456789abcdef0123456789abcdef",
-        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+        &subject.root,
+        BootstrapMode::Attest,
+        &subject.run_id,
+        &subject.closed_path,
     )
     .expect("qualified Linux must complete the ordinary twenty-tool reprobe");
     assert_eq!(reprobe.inventory.native_tool_count(), ORDINARY_NATIVE_TOOL_COUNT);
     assert_eq!(reprobe.inventory.native_tool_count(), pure.native_tool_count);
     assert_ne!(reprobe.tool_set_sha256, [0; 32]);
     assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
+    assert_eq!(reprobe.tool_set_sha256, fresh.tool_set_sha256());
+    assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
 }
 
 /// B-R3 ordering negative: an unqualified host reaches the platform gate
 /// before any ledger open, validator, archive, or evidence dispatch.
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[derive(Default)]
+struct OrdinaryPlatformRefusalEffects {
+    ledger_open_attempts: usize,
+    evidence_dispatch_attempts: usize,
+}
+
+impl OrdinaryEntryEffects for OrdinaryPlatformRefusalEffects {
+    fn before_ledger_open(&mut self) {
+        self.ledger_open_attempts += 1;
+    }
+
+    fn before_evidence_dispatch(&mut self) {
+        self.evidence_dispatch_attempts += 1;
+    }
+}
+
 #[test]
 fn ordinary_b_r3_unqualified_platform_fails_before_ledger_open() {
-    let error = match ordinary_reprobe_tool_set_shared(
-        &repository_root(),
-        BootstrapMode::Produce,
-        "0123456789abcdef0123456789abcdef",
-        "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
-    ) {
-        Ok(_) => panic!("unqualified platform must not reach ledger-open work"),
-        Err(error) => error,
+    let repository_root = repository_root();
+    let current_executable = std::env::current_exe().expect("current test executable");
+    let invocation = OrdinaryHandoffArguments {
+        mode: BootstrapMode::Produce,
+        executable_path: current_executable,
+        repository_root: repository_root.clone(),
+        run_root: repository_root.join(
+            ".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef",
+        ),
+        run_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        run_id_bytes: [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23,
+            0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        ],
+        control_ledger_path:
+            ".fnd01-run/does-not-exist/control-ledger.bin".to_owned(),
     };
+    let environment = BootstrapEnvironment {
+        authoring_marker: "unreached-platform-refusal".to_owned(),
+        closed_path: "/unreached-tool-bin".to_owned(),
+        integration_seal: None,
+        producer_outer_record_path: None,
+        attester_outer_record_path: None,
+        final_gate_seal: None,
+    };
+    let mut effects = OrdinaryPlatformRefusalEffects::default();
+    let error = validate_ordinary_handoff_entry_with_effects(
+        &invocation,
+        &environment,
+        false,
+        &mut effects,
+    )
+    .expect_err("the real ordinary entry seam must refuse before ledger work");
     assert_eq!(
         error,
-        "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
+        "E_UNQUALIFIED_PLATFORM: ordinary handoff requires Linux x86_64"
     );
+    assert_eq!(effects.ledger_open_attempts, 0);
+    assert_eq!(effects.evidence_dispatch_attempts, 0);
     assert_eq!(
         ordinary_entry_diagnostic_stage("E_UNQUALIFIED_PLATFORM", &error),
-        "reprobe"
+        "authority"
     );
 }
 
@@ -92200,6 +93200,22 @@ fn ordinary_reprobe_live_half_unqualified_or_execution_bin_fail_closed() {
 /// must not collapse ordinary fail-closed codes to the legacy "ordinary" stage.
 #[test]
 fn ordinary_product_stages_are_first_class_entry_tokens() {
+    let mut route_ids = BTreeSet::new();
+    for route in OrdinaryFailureRoute::ALL {
+        assert!(route_ids.insert(route.id()), "duplicate ordinary route id: {}", route.id());
+        let frame = ordinary_entry_failure_frame_for_route(
+            "attest",
+            "0123456789abcdef0123456789abcdef",
+            &OrdinaryEntryFailure::new(*route, "fixture observed"),
+        );
+        assert_eq!(frame.stage, route.stage().as_str());
+        assert_eq!(
+            frame.parts[2],
+            format!("expected={}", route.expected()),
+            "route {} must preserve its registry invariant",
+            route.id(),
+        );
+    }
     for stage in [
         "authority",
         "reprobe",
@@ -92247,9 +93263,8 @@ fn ordinary_product_stages_are_first_class_entry_tokens() {
 }
 
 /// B-R4 residual: production harness_main ordinary product branches must emit
-/// product stages via the mapper — never hard-code stage=ordinary for known
-/// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures. Unknown codes may still default
-/// to ordinary inside entry_diagnostic_stage itself.
+/// typed registry routes — never hard-code stage=ordinary for known
+/// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures.
 #[test]
 fn ordinary_harness_main_product_failures_emit_authority_stage() {
     let source = include_str!("fnd_01_dependency_evidence.rs");
@@ -92261,10 +93276,18 @@ fn ordinary_harness_main_product_failures_emit_authority_stage() {
         .find("} // mod ordinary")
         .expect("harness_main must end inside ordinary module");
     let body = &body[..end];
-    // Known product failures route through the product-stage mapper.
+    // Known product failures construct their typed production routes.
     assert!(
-        body.contains("ordinary_entry_diagnostic_stage(code, detail)"),
-        "harness_main must use ordinary_entry_diagnostic_stage for product failures",
+        body.contains("emit_ordinary_entry_failure_route("),
+        "harness_main must emit typed ordinary product failures",
+    );
+    assert!(
+        body.contains("OrdinaryFailureRoute::Arguments"),
+        "malformed arity must consume the Arguments route",
+    );
+    assert!(
+        body.contains("OrdinaryFailureRoute::Panic"),
+        "panic path must consume the Panic route",
     );
     assert!(
         body.contains("\"E_ENTRY_ARGUMENTS\""),
@@ -92287,52 +93310,13 @@ fn ordinary_harness_main_product_failures_emit_authority_stage() {
     assert_eq!(code, 3);
 }
 
-/// B-R5 residual: after OrdinaryProbePermit.consume and archive validation,
-/// happy-path terminal failures use E_ORDINARY_EVIDENCE — never reintroduce a
-/// permanent E_ORDINARY_HANDOFF_PENDING stub past consume.
+/// Frozen R5 acceptance: this exact selected child reaches the sole real
+/// post-consume dispatch and asserts its fresh-root verifier code and subject.
 #[test]
-fn ordinary_post_consume_terminal_uses_evidence_not_permanent_handoff() {
-    let source = include_str!("fnd_01_dependency_evidence.rs");
-    let start = source
-        .find("fn validate_ordinary_handoff_entry(")
-        .expect("ordinary handoff entry must exist");
-    let remainder = &source[start..];
-    let end = remainder
-        .find("\n#[test]\nfn ordinary_authority_sentinel_precedes_untrusted_artifact_reads()")
-        .expect("ordinary handoff entry must end before its first test");
-    let body = &remainder[..end];
-    let consume = body
-        .find(".consume()?;")
-        .expect("probe permit consume must exist");
-    let after_consume = &body[consume..];
-    // Evidence dispatch is the terminal happy-path failure surface after consume.
-    assert!(
-        after_consume.contains("match run_verifier()"),
-        "post-consume path must dispatch evidence matrix",
-    );
-    assert!(
-        after_consume.contains("E_ORDINARY_EVIDENCE"),
-        "post-consume evidence failures must use E_ORDINARY_EVIDENCE",
-    );
-    // Permanent HANDOFF_PENDING stubs must not appear as hard returns after consume
-    // on the happy path. Pre-consume HANDOFF_PENDING strings may still appear earlier.
-    let permanent_stub = after_consume
-        .lines()
-        .any(|line| {
-            let trimmed = line.trim_start();
-            (trimmed.starts_with("return Err(")
-                || trimmed.starts_with("Err(")
-                || trimmed.contains("return Err(format!"))
-                && line.contains("E_ORDINARY_HANDOFF_PENDING")
-                && !line.trim_start().starts_with("//")
-        });
-    assert!(
-        !permanent_stub,
-        "post-consume path must not reintroduce permanent E_ORDINARY_HANDOFF_PENDING returns",
-    );
-    assert_eq!(
-        ordinary_entry_diagnostic_stage("E_ORDINARY_EVIDENCE", "offline matrix failed"),
-        "evidence",
+fn ordinary_b_r5_post_consume_runtime_uses_evidence_code() {
+    assert_ordinary_attest_self_reexec(
+        ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID,
+        false,
     );
 }
 
@@ -92549,6 +93533,10 @@ fn ordinary_reprobe_tool_set_shared(
     // Pure dual-path readiness (20-row table + registry pin) runs before the
     // live inventory. No ledger-selected inputs, filesystem access, or children.
     let pure = ordinary_reprobe_dual_path_pure_authority()?;
+    ordinary_require_qualified_platform(
+        "ordinary native-tool probes require Linux x86_64",
+        ordinary_platform_is_qualified(),
+    )?;
     debug_assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -92593,10 +93581,19 @@ fn ordinary_reprobe_tool_set_shared(
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         let _ = (repository_root, mode, run_id, closed_path, pure);
-        Err(
-            "E_UNQUALIFIED_PLATFORM: ordinary native-tool probes require Linux x86_64"
-                .to_owned(),
-        )
+        unreachable!("the shared platform gate returns before this branch")
+    }
+}
+
+fn ordinary_platform_is_qualified() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+}
+
+fn ordinary_require_qualified_platform(subject: &str, qualified: bool) -> Result<(), String> {
+    if qualified {
+        Ok(())
+    } else {
+        Err(format!("E_UNQUALIFIED_PLATFORM: {subject}"))
     }
 }
 
@@ -93551,17 +94548,16 @@ where
                 run_ordinary_handoff_entry(arguments)
             }
             // Malformed arity is never conflated with role handoff or local verifier.
-            // B-R4: known ordinary product failure → stage=authority (not collapsed
-            // stage=ordinary). Unknown codes may still default to ordinary elsewhere.
+            // B-R4 consumes the typed ordinary route registry at the production edge.
             _ => {
                 branch.set(4);
-                let code = "E_ENTRY_ARGUMENTS";
-                let detail = "invalid argument count";
-                emit_entry_diagnostic(
-                    ordinary_entry_diagnostic_stage(code, detail),
+                emit_ordinary_entry_failure_route(
                     "unknown",
-                    code,
-                    detail,
+                    "unavailable",
+                    OrdinaryEntryFailure::new(
+                        OrdinaryFailureRoute::Arguments,
+                        "invalid argument count",
+                    ),
                 );
                 3
             }
@@ -93578,26 +94574,26 @@ where
                     "E_ENTRY_PANIC",
                     "panic payload suppressed",
                 ),
-                // Ordinary produce/attest handoff panic: product stage via mapper.
+                // Ordinary produce/attest handoff panic: typed product route.
                 3 => {
-                    let code = "E_ENTRY_PANIC";
-                    let detail = "panic payload suppressed";
-                    emit_entry_diagnostic(
-                        ordinary_entry_diagnostic_stage(code, detail),
+                    emit_ordinary_entry_failure_route(
                         mode.get(),
-                        code,
-                        detail,
+                        "unavailable",
+                        OrdinaryEntryFailure::new(
+                            OrdinaryFailureRoute::Panic,
+                            "panic payload suppressed",
+                        ),
                     );
                 }
-                // Malformed-arity panic: product stage authority, not stage=ordinary.
+                // Malformed-arity panic: typed product route.
                 4 => {
-                    let code = "E_ENTRY_PANIC";
-                    let detail = "panic payload suppressed";
-                    emit_entry_diagnostic(
-                        ordinary_entry_diagnostic_stage(code, detail),
+                    emit_ordinary_entry_failure_route(
                         "unknown",
-                        code,
-                        detail,
+                        "unavailable",
+                        OrdinaryEntryFailure::new(
+                            OrdinaryFailureRoute::Panic,
+                            "panic payload suppressed",
+                        ),
                     );
                 }
                 _ => {}
