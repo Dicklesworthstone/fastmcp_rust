@@ -55,3 +55,14 @@ storage.sqlite3*
 proptest-regressions/
 test_meminfo
 perf.data
+# br doctor per-run artifacts
+.doctor/
+
+# FND-01: exact active ignore for verifier/integration run scratch
+.fnd01-run/
+
+# Beads compliance audit artifacts (local only)
+beads_compliance_audit/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/

@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Fast, cancel-correct MCP framework for Rust"
+description = "Asupersync-based MCP framework for Rust"
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/fastmcp-rust"
 keywords = ["mcp", "json-rpc", "async", "ai", "protocol"]
 categories = ["network-programming", "api-bindings", "development-tools"]
+exclude = ["tests/fnd_01_dependency_evidence.rs.*"]
 
 [dependencies]
 fastmcp-core.workspace = true
@@ -25,10 +26,13 @@ serde_json.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# FND-01 FACADE-*-DEV evidence surface (exact root pins; no JWT/Redis)
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+ring = { workspace = true }
+proc-macro2 = { workspace = true }
 
 [lints]
 workspace = true
-
-[features]
-jwt = ["fastmcp-server/jwt"]

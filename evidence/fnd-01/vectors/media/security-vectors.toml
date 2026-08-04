@@ -1,0 +1,608 @@
+format_version = 1
+evidence_id = "FND-01/media-dependencies/security-vectors"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.12"
+recorded_on = "2026-07-29"
+case_count = 48
+literal_utf8_case_count = 37
+non_utf8_case_count = 11
+content_addressed_upstream_binary_case_count = 4
+content_address_reference_case_count = 4
+hex_case_count = 3
+runtime_results_claimed = false
+
+[outcomes]
+admit_to_authoring_gate = "The parser-input contract is satisfied; APP-01 must still perform complete authoring-conformance validation before View creation."
+reject_before_view_creation = "APP-01 must reject after bounded input admission and before View creation."
+admit_to_renderer_gate = "Static policy admission succeeds; PRT-02 still owns bounded decoder/renderer execution."
+reject_before_renderer_entry = "PRT-02 must reject without invoking image, usvg, resvg, a resolver, the network, the filesystem, or a font provider."
+
+[raster_limit_default]
+profile_id = "raster-default"
+fetched_bytes = 1048576
+width = 4096
+height = 4096
+pixels = 4194304
+output_plus_scratch_bytes = 67108864
+concurrency = 4
+data_uri_prefix_bytes = 256
+bound_case_ids = ["data-uri-prefix-N", "data-uri-prefix-N-plus-one", "width-pixels-N", "width-pixels-N-plus-one", "pixel-count-N", "pixel-count-N-plus-one", "output-bytes-N", "output-bytes-N-plus-one", "concurrency-N", "concurrency-N-plus-one"]
+
+[[case]]
+id = "html-minimal-document"
+family = "html"
+encoding = "utf-8"
+payload = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><title>x</title></head><body><main id="m">ok</main></body></html>'''
+byte_length = 124
+sha256 = "44bd75a29daef3d9a7cbc331979e5e738a3bec8435c5b6ff00c33d11e7f2488e"
+expected = "admit_to_authoring_gate"
+owner = "APP-01"
+
+[[case]]
+id = "html-truncated-attribute"
+family = "html"
+encoding = "utf-8"
+payload = '''<!doctype html><html><head><title>x</title></head><body><div a="'''
+byte_length = 64
+sha256 = "635fb1f4c2e2065d71094b67447fc47c1f8c06c33edc01f9b2af1857c87decbd"
+expected = "reject_before_view_creation"
+reason = "tokenizer-error-or-unexpected-eof"
+owner = "APP-01"
+
+[[case]]
+id = "html-document-fragment"
+family = "html"
+encoding = "utf-8"
+payload = '''<p>fragment</p>'''
+byte_length = 15
+sha256 = "6217270c895e52c71b6a13a495a0151cc3ed6fa601a5fa0cd7c6408e58b547b1"
+expected = "reject_before_view_creation"
+reason = "complete-document-required"
+owner = "APP-01"
+
+[[case]]
+id = "html-obsolete-font"
+family = "html"
+encoding = "utf-8"
+payload = '''<!doctype html><html><head><title>x</title></head><body><font>obsolete</font></body></html>'''
+byte_length = 91
+sha256 = "fd63a19e3008bd432919a9ad853e9f9492695ad781c0c7c6c3de68e6ed16220e"
+expected = "reject_before_view_creation"
+reason = "authoring-obsolete-element"
+owner = "APP-01"
+
+[[case]]
+id = "html-duplicate-id"
+family = "html"
+encoding = "utf-8"
+payload = '''<!doctype html><html><head><title>x</title></head><body><p id="a">x</p><p id="a">y</p></body></html>'''
+byte_length = 100
+sha256 = "4b82f3dbfe82573fc50c4513caf6abc4086b2afe7ebca3d110acbbe3e5145b00"
+expected = "reject_before_view_creation"
+reason = "authoring-id-uniqueness"
+owner = "APP-01"
+
+[[case]]
+id = "svg-minimal-path"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1"><path d="M0 0h1v1H0z" fill="#000"/></svg>'''
+byte_length = 120
+sha256 = "822a32d8471f00ebdac5ac896c94197063f70959b3a932936ab8896408923b9a"
+expected = "admit_to_renderer_gate"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-script"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'''
+byte_length = 71
+sha256 = "3f67c8be987aa1db0ef99ce330286efe1929e729f5f9d1695b5fd0b987246244"
+expected = "reject_before_renderer_entry"
+reason = "script"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-event-handler"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1" onclick="x()"/></svg>'''
+byte_length = 88
+sha256 = "1d5ca9f4c3a435b77097459d663fb8f3044191876b418749d06585b4634d37e1"
+expected = "reject_before_renderer_entry"
+reason = "event-handler"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-animation"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"><animate attributeName="x" to="1"/></rect></svg>'''
+byte_length = 115
+sha256 = "b249a484ae0b59268a94ed4c823192da69f578bab77d55a80b86b5909fa0be30"
+expected = "reject_before_renderer_entry"
+reason = "animation"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-network-link"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><a href="https://example.test/"><path d="M0 0h1v1H0z"/></a></svg>'''
+byte_length = 105
+sha256 = "4df5736a535b119d0b99ecf349b9e744433a3b2f614d3ba50a7e7e4109f1899f"
+expected = "reject_before_renderer_entry"
+reason = "link-or-network-reference"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-image-data"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,AA==" width="1" height="1"/></svg>'''
+byte_length = 109
+sha256 = "f0c91306b9de65945d8ba2029466388ca005bde83a25e90f6b4faa836ca11c7d"
+expected = "reject_before_renderer_entry"
+reason = "all-image-elements-rejected-even-when-embedded"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-foreign-object"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><foreignObject width="1" height="1"><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject></svg>'''
+byte_length = 147
+sha256 = "ac3726a8fe7df8aa451c49ac89d1bae3d610a12aa7a2ad60a8eae64f2f354f0a"
+expected = "reject_before_renderer_entry"
+reason = "foreignObject"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-external-use"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><use href="https://example.test/x.svg#p"/></svg>'''
+byte_length = 88
+sha256 = "2aaeeea5dafbff15bef8c5177916565c7dd1a37f98b73685f8360984a800fe66"
+expected = "reject_before_renderer_entry"
+reason = "external-use"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-filter-image"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><filter id="f"><feImage href="https://example.test/x.png"/></filter></svg>'''
+byte_length = 114
+sha256 = "a9c6223b2f468e52b5cae07cccb49f41a5990f3ee613622b431df59d73937bcb"
+expected = "reject_before_renderer_entry"
+reason = "feImage-network-reference"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-css-url"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1" fill="url(https://example.test/x.svg#p)"/></svg>'''
+byte_length = 115
+sha256 = "56ed7d851ab73d57676c44e28564a9074bfc4b9f3c69e768f928b2ec2a64925d"
+expected = "reject_before_renderer_entry"
+reason = "css-external-url"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-css-animation"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><style>@keyframes spin{from{x:0}to{x:1}}rect{animation:spin 1s infinite}</style><rect width="1" height="1"/></svg>'''
+byte_length = 154
+sha256 = "a751dc7101b63a086b6bedf491043ca2bb2a82d16cd6b11d7b36e8d4dc21de0d"
+expected = "reject_before_renderer_entry"
+reason = "css-animation"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-css-import"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><style>@import url("https://example.test/x.css");</style><rect width="1" height="1"/></svg>'''
+byte_length = 131
+sha256 = "897bf7d5b1f12ead32e583755c82d760346fe4c0b77d88bb44932fbf977c1962"
+expected = "reject_before_renderer_entry"
+reason = "css-import"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-css-font-face"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><style>@font-face{font-family:x;src:url("https://example.test/x.woff2")}</style><text font-family="x">x</text></svg>'''
+byte_length = 156
+sha256 = "6eab6baa8f236356f68be9c860a923bd63d06d318e3d52e42353faf2cd80f86d"
+expected = "reject_before_renderer_entry"
+reason = "css-font-face-external-font"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-external-stylesheet"
+family = "svg"
+encoding = "utf-8"
+payload = '''<?xml-stylesheet href="https://example.test/x.css"?><svg xmlns="http://www.w3.org/2000/svg"/>'''
+byte_length = 93
+sha256 = "03ded37af21255a29c47d9dabb068b0f4c1b8268bcb93e1125e72383d2659e58"
+expected = "reject_before_renderer_entry"
+reason = "external-stylesheet"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-external-entity"
+family = "svg"
+encoding = "utf-8"
+payload = '''<!DOCTYPE svg [<!ENTITY x SYSTEM "https://example.test/x">]><svg xmlns="http://www.w3.org/2000/svg"><text>&x;</text></svg>'''
+byte_length = 122
+sha256 = "26fd314547d25b6aecc1518641d21ea732c686f3a81d20fd6e9b6fa6f62a3b74"
+expected = "reject_before_renderer_entry"
+reason = "doctype-or-external-entity"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-system-font-text"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><text font-family="system-ui">x</text></svg>'''
+byte_length = 84
+sha256 = "5be676a913da2c78d7d7eb28115baa9a32952fc89a5ca265f37f61078b1872ae"
+expected = "reject_before_renderer_entry"
+reason = "text-and-system-fonts-disabled"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-internal-use"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><defs><path id="p" d="M0 0h1v1H0z"/></defs><use href="#p"/></svg>'''
+byte_length = 105
+sha256 = "3c2860bfe8f2245dde6e0c3133cf9a465ae90e897b9462378d02033c5b6855e2"
+expected = "reject_before_renderer_entry"
+reason = "closed-subset-rejects-all-use-elements-to-bound-reference-recursion"
+owner = "PRT-02"
+
+[[case]]
+id = "png-valid-upstream"
+family = "raster"
+encoding = "content-addressed-checked-in-binary"
+payload_url = "https://raw.githubusercontent.com/image-rs/image/76e57184f22772dad1138e96954e57945406b15e/tests/images/png/transparency/acid2.png"
+payload_path = "evidence/fnd-01/vectors/media/png-valid-upstream.png"
+byte_length = 110
+sha256 = "b95534c515880250a4d87a2dede9d39f086249c6d0b61d1d448da28ea43a444c"
+declared_mime = "image/png"
+expected = "admit_to_renderer_gate"
+body_checked_in = true
+owner = "PRT-02"
+
+[[case]]
+id = "jpeg-metadata-valid-upstream"
+family = "raster"
+encoding = "content-addressed-checked-in-binary"
+payload_url = "https://raw.githubusercontent.com/image-rs/image/76e57184f22772dad1138e96954e57945406b15e/tests/images/jpg/exif-xmp-metadata.jpg"
+payload_path = "evidence/fnd-01/vectors/media/jpeg-metadata-valid-upstream.jpg"
+byte_length = 4263
+sha256 = "5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751"
+declared_mime = "image/jpeg"
+expected = "admit_to_renderer_gate"
+metadata_policy = "EXIF/XMP/ICC and orientation are non-authoritative, not returned, and cause no network/filesystem access; no automatic orientation or color-profile transform"
+body_checked_in = true
+owner = "PRT-02"
+
+[[case]]
+id = "webp-static-valid-upstream"
+family = "raster"
+encoding = "content-addressed-checked-in-binary"
+payload_url = "https://raw.githubusercontent.com/image-rs/image/76e57184f22772dad1138e96954e57945406b15e/tests/images/webp/lossless_images/2-color.webp"
+payload_path = "evidence/fnd-01/vectors/media/webp-static-valid-upstream.webp"
+byte_length = 314
+sha256 = "284ddab37b3cf76424a5a9a32351a84e815a0972f4bffd68571f6f67874c38d3"
+declared_mime = "image/webp"
+expected = "admit_to_renderer_gate"
+body_checked_in = true
+owner = "PRT-02"
+
+[[case]]
+id = "webp-animated-upstream"
+family = "raster"
+encoding = "content-addressed-checked-in-binary"
+payload_url = "https://raw.githubusercontent.com/image-rs/image/76e57184f22772dad1138e96954e57945406b15e/tests/images/webp/extended_images/anim.webp"
+payload_path = "evidence/fnd-01/vectors/media/webp-animated-upstream.webp"
+byte_length = 10818
+sha256 = "459d0f8601844487cebd09dd11d0f50346fa45820bb7a7d817140dcc811496b4"
+declared_mime = "image/webp"
+expected = "reject_before_renderer_entry"
+reason = "animated-or-multiframe-webp"
+body_checked_in = true
+owner = "PRT-02"
+
+[[case]]
+id = "png-as-jpeg-mime"
+family = "raster"
+encoding = "content-address-reference"
+payload_ref = "png-valid-upstream"
+byte_length = 110
+sha256 = "b95534c515880250a4d87a2dede9d39f086249c6d0b61d1d448da28ea43a444c"
+declared_mime = "image/jpeg"
+expected = "reject_before_renderer_entry"
+reason = "mime-magic-mismatch"
+owner = "PRT-02"
+
+[[case]]
+id = "jpeg-as-png-mime"
+family = "raster"
+encoding = "content-address-reference"
+payload_ref = "jpeg-metadata-valid-upstream"
+byte_length = 4263
+sha256 = "5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751"
+declared_mime = "image/png"
+expected = "reject_before_renderer_entry"
+reason = "mime-magic-mismatch"
+owner = "PRT-02"
+
+[[case]]
+id = "jpeg-metadata-valid-jpg-alias"
+family = "raster"
+encoding = "content-address-reference"
+payload_ref = "jpeg-metadata-valid-upstream"
+byte_length = 4263
+sha256 = "5cf1b3a387429128dd5475175293fb9c8e3a2ea969740604abddec54ec176751"
+declared_mime = "image/jpg"
+expected = "admit_to_renderer_gate"
+metadata_policy = "EXIF/XMP/ICC and orientation are non-authoritative, not returned, and cause no network/filesystem access; no automatic orientation or color-profile transform"
+body_checked_in = true
+owner = "PRT-02"
+
+[[case]]
+id = "webp-as-jpeg-mime"
+family = "raster"
+encoding = "content-address-reference"
+payload_ref = "webp-static-valid-upstream"
+byte_length = 314
+sha256 = "284ddab37b3cf76424a5a9a32351a84e815a0972f4bffd68571f6f67874c38d3"
+declared_mime = "image/jpg"
+expected = "reject_before_renderer_entry"
+reason = "mime-magic-mismatch"
+owner = "PRT-02"
+
+[[case]]
+id = "gif-magic-rejected"
+family = "raster"
+encoding = "hex"
+payload = "474946383961"
+byte_length = 6
+sha256 = "610f5ae4d76e332636a17bd357fd6ce99029316a99d320280d4d77a746bf29e8"
+declared_mime = "image/gif"
+expected = "reject_before_renderer_entry"
+reason = "format-not-compiled-or-admitted"
+owner = "PRT-02"
+
+[[case]]
+id = "apng-two-frame-static-policy-negative"
+family = "raster"
+encoding = "hex"
+payload = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489000000086163544c0000000200000000f38d93700000001a6663544c0000000000000001000000010000000000000000000100010000562adf310000000d4944415478da63f8cfc0f01f00050001ff56c72f0d0000001a6663544c0000000100000001000000010000000000000000000100010000cd5935e500000011666441540000000278da63f8cfc0f01f00050001ff45cb81740000000049454e44ae426082"
+byte_length = 195
+sha256 = "f62ed7eb33fdf70be059963ecebe7b638b15eb751a717c4b19018cbc643166b0"
+declared_mime = "image/png"
+expected = "reject_before_renderer_entry"
+reason = "APNG-disallowed-static-one-frame-policy"
+body_checked_in = true
+fixture_provenance = "Compact two-frame APNG wire fixture synthesized from pinned PNG/APNG chunk structure; exact bytes are the policy vector, not an upstream-body provenance claim."
+source_url = "https://raw.githubusercontent.com/image-rs/image/76e57184f22772dad1138e96954e57945406b15e/src/codecs/png.rs"
+source_revision = "76e57184f22772dad1138e96954e57945406b15e"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-positive-image-svg+xml"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0h1v1H0z"/></svg>'''
+byte_length = 90
+sha256 = "6fea5023b29b51f5b8150feb02d85167d09347776ff921caa961672c7d0e3266"
+declared_mime = "image/svg+xml"
+expected = "admit_to_renderer_gate"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-as-png-mime"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"/>'''
+byte_length = 41
+sha256 = "900fbe934249ad120004bd24adf66aad8817d89586273c0cc50e187bddebb601"
+declared_mime = "image/png"
+expected = "reject_before_renderer_entry"
+reason = "mime-magic-mismatch"
+owner = "PRT-02"
+
+[[case]]
+id = "unknown-mime-png-magic"
+family = "raster"
+encoding = "hex"
+payload = "89504e470d0a1a0a"
+byte_length = 8
+sha256 = "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6"
+declared_mime = "application/octet-stream"
+expected = "reject_before_renderer_entry"
+reason = "unknown-mime-no-format-guessing"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-uppercase-script"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><SCRIPT>alert(1)</SCRIPT></svg>'''
+byte_length = 71
+sha256 = "3ac4789443bb76327eb8bb7416877970cd2b63654b63ff5af499e3210fbd7d08"
+expected = "reject_before_renderer_entry"
+reason = "namespace-and-case-insensitive-script"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-xlink-case-evasion"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg" xmlns:XLINK="http://www.w3.org/1999/xlink"><use XLINK:href="https://example.test/x.svg"/></svg>'''
+byte_length = 135
+sha256 = "1552d6702cf4b41b65f618ec83aebcaa50b1c0cc24fbf38e4ac6d46052a257d0"
+expected = "reject_before_renderer_entry"
+reason = "alternate-prefix-xlink-external-reference"
+owner = "PRT-02"
+
+[[case]]
+id = "svg-css-uppercase-import"
+family = "svg"
+encoding = "utf-8"
+payload = '''<svg xmlns="http://www.w3.org/2000/svg"><style>@IMPORT url("https://example.test/x.css");</style></svg>'''
+byte_length = 103
+sha256 = "6e2582000d7cc9441e04dc268b3b553d4f36456bc29d68bcb3d94d8b585cd832"
+expected = "reject_before_renderer_entry"
+reason = "case-insensitive-css-import"
+owner = "PRT-02"
+
+[[case]]
+id = "data-uri-prefix-N"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "data-uri-prefix-bytes:256"
+byte_length = 25
+sha256 = "1f59a4433f91880b72dc641d647f3125b2569842d4945488818e03f97508b073"
+expected = "admit_to_renderer_gate"
+reason = "data-uri-prefix-default-N-boundary"
+owner = "PRT-02"
+
+[[case]]
+id = "data-uri-prefix-N-plus-one"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "data-uri-prefix-bytes:257"
+byte_length = 25
+sha256 = "27c8887849d127e1d0a033bcfccf308601f695b61426ec10e507f89215d9b1df"
+expected = "reject_before_renderer_entry"
+reason = "data-uri-prefix-default-N-plus-one"
+owner = "PRT-02"
+
+[[case]]
+id = "width-pixels-N"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "width-pixels:4096x1024"
+byte_length = 22
+sha256 = "df59237c89df8729ab21c6759e4db33dc80e2798e6ce2387a521f9c0a54d1cec"
+expected = "admit_to_renderer_gate"
+reason = "width-N-at-pixel-cap"
+owner = "PRT-02"
+
+[[case]]
+id = "width-pixels-N-plus-one"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "width-pixels:4097x1023"
+byte_length = 22
+sha256 = "08db59c184c0861077447a3a832931cc572f10a9cd7bf8206d029ae26751a8cc"
+expected = "reject_before_renderer_entry"
+reason = "width-N-plus-one-below-pixel-cap"
+owner = "PRT-02"
+
+[[case]]
+id = "pixel-count-N"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "pixels:4194304"
+byte_length = 14
+sha256 = "f44419daa54fa0a1f63afdc8a85bb94966b13101cac6419bc63812d49d50e100"
+expected = "admit_to_renderer_gate"
+reason = "pixel-count-N-boundary"
+owner = "PRT-02"
+
+[[case]]
+id = "pixel-count-N-plus-one"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "pixels:4194305"
+byte_length = 14
+sha256 = "a8b59b9a2e2a489a4300e41c34d5009342c3bbf221032b394f97b6643da6ff9d"
+expected = "reject_before_renderer_entry"
+reason = "pixel-count-N-plus-one"
+owner = "PRT-02"
+
+[[case]]
+id = "output-bytes-N"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "output-bytes:67108864"
+byte_length = 21
+sha256 = "0fb2b3dff66cdc1732685afc1e45c8375a64b3c1fab01b2d2ef1996dbd01c757"
+expected = "admit_to_renderer_gate"
+reason = "output-N-boundary"
+owner = "PRT-02"
+
+[[case]]
+id = "output-bytes-N-plus-one"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "output-bytes:67108865"
+byte_length = 21
+sha256 = "b7b7f6d30ed06fefb6090a9cd582e71e942896cf45700ecbff9619b04f40c25d"
+expected = "reject_before_renderer_entry"
+reason = "output-N-plus-one"
+owner = "PRT-02"
+
+[[case]]
+id = "concurrency-N"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "concurrency:4"
+byte_length = 13
+sha256 = "d157d00078d31514cba7d705890964fcc39a3925ea98e42b45aced93a9488e15"
+expected = "admit_to_renderer_gate"
+reason = "concurrency-N-boundary"
+owner = "PRT-02"
+
+[[case]]
+id = "concurrency-N-plus-one"
+family = "raster-limit"
+limit_profile = "raster-default"
+encoding = "utf-8"
+payload = "concurrency:5"
+byte_length = 13
+sha256 = "a48f3dda9b496880181317941f7bc6e2a81a3479c2850a985bc051831ef0ee02"
+expected = "reject_before_renderer_entry"
+reason = "concurrency-N-plus-one"
+owner = "PRT-02"
+
+[runtime_boundary]
+stored_binary_bodies = true
+fixture_owner = "bd-mcp-2026-07-28-support-ahet.1.12"
+offline_verifier_author = "bd-mcp-2026-07-28-support-ahet.1.14"
+integration_execution_receipt_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+final_validation_owner = "bd-mcp-2026-07-28-support-ahet.1.15"
+execution_owner = "PRT-02"
+html_execution_owner = "APP-01"
+helper_contract_owner = "PRT-02 / APP-01"
+helper_must_kill_reap = true
+helper_cpu_deadline_enforced = true
+helper_memory_limit_enforced = true
+helper_io_denied_or_bounded = true
+generic_blocking_facility_owner = "FND-04"
+generic_blocking_facility_is_not_media_runtime_owner = true
+required_renderer_entry_count_for_every_rejection = 0
+required_network_calls_for_every_svg_case = 0
+required_filesystem_calls_for_every_svg_case = 0
+required_font_provider_calls_for_every_svg_case = 0
+result = "pending; this vector package freezes inputs and expected dispositions only"

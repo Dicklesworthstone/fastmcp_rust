@@ -40,6 +40,70 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Serde adapter for the finite JSON numbers used by trace timing and metric
+/// fields.
+///
+/// With serde_json's `arbitrary_precision` feature, decimal input is delivered
+/// through serde_json's private number carrier instead of `visit_f64`. Deriving
+/// `Deserialize` directly for an `f64` field therefore rejects otherwise valid
+/// trace output. Deserialize through the public [`serde_json::Number`] type so
+/// both representations are accepted, while serializing the `f64` directly to
+/// preserve the existing numeric JSON wire shape.
+mod json_f64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _, ser::Error as _};
+
+    pub(super) fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if value.is_finite() {
+            serializer.serialize_f64(*value)
+        } else {
+            Err(S::Error::custom("trace number must be finite"))
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        serde_json::Number::deserialize(deserializer)?
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| D::Error::custom("trace number is outside the finite f64 range"))
+    }
+}
+
+/// Optional counterpart to [`json_f64`].
+mod optional_json_f64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _, ser::Error as _};
+
+    pub(super) fn serialize<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) if value.is_finite() => serializer.serialize_some(value),
+            Some(_) => Err(S::Error::custom("trace number must be finite")),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<serde_json::Number>::deserialize(deserializer)?
+            .map(|number| {
+                number
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| D::Error::custom("trace number is outside the finite f64 range"))
+            })
+            .transpose()
+    }
+}
+
 /// Check if test tracing is enabled via environment variable.
 pub fn is_trace_enabled() -> bool {
     std::env::var("FASTMCP_TEST_TRACE")
@@ -177,6 +241,7 @@ pub enum TraceEntry {
         correlation_id: String,
         timestamp: String,
         method: String,
+        #[serde(with = "json_f64")]
         duration_ms: f64,
         result: Option<serde_json::Value>,
         error: Option<serde_json::Value>,
@@ -194,6 +259,7 @@ pub enum TraceEntry {
     SpanEnd {
         span_id: String,
         timestamp: String,
+        #[serde(with = "json_f64")]
         duration_ms: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -212,6 +278,7 @@ pub enum TraceEntry {
     Metric {
         timestamp: String,
         name: String,
+        #[serde(with = "json_f64")]
         value: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         unit: Option<String>,
@@ -267,7 +334,11 @@ pub struct TestTraceOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
     /// Total duration in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "optional_json_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub duration_ms: Option<f64>,
     /// All trace entries.
     pub entries: Vec<TraceEntry>,
@@ -303,12 +374,16 @@ pub struct MethodTiming {
     /// Number of calls.
     pub count: usize,
     /// Total duration in milliseconds.
+    #[serde(with = "json_f64")]
     pub total_ms: f64,
     /// Minimum duration.
+    #[serde(default, with = "optional_json_f64")]
     pub min_ms: Option<f64>,
     /// Maximum duration.
+    #[serde(default, with = "optional_json_f64")]
     pub max_ms: Option<f64>,
     /// Mean duration.
+    #[serde(default, with = "optional_json_f64")]
     pub mean_ms: Option<f64>,
 }
 
@@ -1551,6 +1626,135 @@ mod tests {
             let json2 = serde_json::to_string(&back).expect("re-serialize");
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn trace_float_fields_roundtrip_exactly_as_json_numbers() {
+        let trace_duration = f64::from_bits(0x3fd5_5555_5555_5555);
+        let response_duration = f64::from_bits(0x3fb9_9999_9999_999a);
+        let span_duration = f64::from_bits(0x3fc2_4924_9249_2492);
+        let metric_value = f64::from_bits(0x405e_dc28_f5c2_8f5c);
+        let min_duration = f64::from_bits(1);
+        let max_duration = f64::from_bits(0x408f_4000_0000_0000);
+        let mean_duration = f64::from_bits(0x4028_b0a3_d70a_3d71);
+
+        let output = TestTraceOutput {
+            name: "exact-floats".into(),
+            started_at: "start".into(),
+            ended_at: Some("end".into()),
+            duration_ms: Some(trace_duration),
+            entries: vec![
+                TraceEntry::Response {
+                    correlation_id: "response".into(),
+                    timestamp: "ts".into(),
+                    method: "tools/list".into(),
+                    duration_ms: response_duration,
+                    result: None,
+                    error: None,
+                    span_id: None,
+                },
+                TraceEntry::SpanEnd {
+                    span_id: "span".into(),
+                    timestamp: "ts".into(),
+                    duration_ms: span_duration,
+                    error: None,
+                },
+                TraceEntry::Metric {
+                    timestamp: "ts".into(),
+                    name: "latency".into(),
+                    value: metric_value,
+                    unit: Some("ms".into()),
+                    span_id: None,
+                },
+            ],
+            summary: TraceSummary {
+                method_timings: HashMap::from([(
+                    "tools/list".into(),
+                    MethodTiming {
+                        count: 1,
+                        total_ms: response_duration,
+                        min_ms: Some(min_duration),
+                        max_ms: Some(max_duration),
+                        mean_ms: Some(mean_duration),
+                    },
+                )]),
+                ..TraceSummary::default()
+            },
+            metadata: HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&output).expect("serialize trace floats");
+        assert!(!json.contains("$serde_json::private::Number"));
+
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("parse trace wire");
+        assert!(wire["duration_ms"].is_number());
+        assert!(wire["entries"][0]["duration_ms"].is_number());
+        assert!(wire["entries"][1]["duration_ms"].is_number());
+        assert!(wire["entries"][2]["value"].is_number());
+        assert!(wire["summary"]["method_timings"]["tools/list"]["total_ms"].is_number());
+
+        let decoded: TestTraceOutput =
+            serde_json::from_str(&json).expect("deserialize trace floats");
+        assert_eq!(
+            decoded.duration_ms.expect("trace duration").to_bits(),
+            trace_duration.to_bits()
+        );
+        let TraceEntry::Response { duration_ms, .. } = &decoded.entries[0] else {
+            panic!("expected response entry");
+        };
+        assert_eq!(duration_ms.to_bits(), response_duration.to_bits());
+        let TraceEntry::SpanEnd { duration_ms, .. } = &decoded.entries[1] else {
+            panic!("expected span-end entry");
+        };
+        assert_eq!(duration_ms.to_bits(), span_duration.to_bits());
+        let TraceEntry::Metric { value, .. } = &decoded.entries[2] else {
+            panic!("expected metric entry");
+        };
+        assert_eq!(value.to_bits(), metric_value.to_bits());
+
+        let timing = &decoded.summary.method_timings["tools/list"];
+        assert_eq!(timing.total_ms.to_bits(), response_duration.to_bits());
+        assert_eq!(
+            timing.min_ms.expect("minimum duration").to_bits(),
+            min_duration.to_bits()
+        );
+        assert_eq!(
+            timing.max_ms.expect("maximum duration").to_bits(),
+            max_duration.to_bits()
+        );
+        assert_eq!(
+            timing.mean_ms.expect("mean duration").to_bits(),
+            mean_duration.to_bits()
+        );
+    }
+
+    #[test]
+    fn optional_trace_float_fields_still_accept_absent_values() {
+        let timing: MethodTiming = serde_json::from_str(r#"{"count":0,"total_ms":0}"#)
+            .expect("deserialize omitted optional timing fields");
+
+        assert!(timing.min_ms.is_none());
+        assert!(timing.max_ms.is_none());
+        assert!(timing.mean_ms.is_none());
+    }
+
+    #[test]
+    fn trace_float_fields_reject_non_finite_values_in_both_directions() {
+        let mut output = TestTrace::new("non-finite").build_output();
+        output.duration_ms = Some(f64::INFINITY);
+        let serialize_error = serde_json::to_string(&output)
+            .expect_err("non-finite trace output must not silently serialize as null");
+        assert!(serialize_error.to_string().contains("must be finite"));
+
+        let deserialize_error = serde_json::from_str::<MethodTiming>(
+            r#"{"count":1,"total_ms":1e999,"min_ms":null,"max_ms":null,"mean_ms":null}"#,
+        )
+        .expect_err("out-of-range arbitrary-precision input must not become infinity");
+        assert!(
+            deserialize_error
+                .to_string()
+                .contains("outside the finite f64 range")
+        );
     }
 
     #[test]

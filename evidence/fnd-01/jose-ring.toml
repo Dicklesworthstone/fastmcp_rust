@@ -1,0 +1,70 @@
+# FND-01 JOSE qualification evidence for bd-mcp-2026-07-28-support-ahet.1.11.
+# This child records the fail-closed public-verification boundary only. It does
+# not claim a packageable workspace build, JWT/OIDC support, or FND-09 signing.
+format_version = 1
+evidence_id = "FND-01/jose-ring-2026-07-29"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.11"
+owner = "GreenLake"
+recorded_on = "2026-07-29"
+plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+scope = "public-rs256-verification-only"
+aggregate_support_claimed = false
+stable_jwt_oidc_support = false
+issuance_status = "fail-closed-until-FND-09-external-signer"
+
+[ring]
+package = "ring"
+version = "0.17.14"
+requirement = "=0.17.14"
+default_features = false
+features = ["alloc"]
+optional = true
+cached_archive_sha256 = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+registry_archive_url = "https://static.crates.io/crates/ring/ring-0.17.14.crate"
+api = "ring::signature::RsaPublicKeyComponents::verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signing_input, signature)"
+private_key_api_reachable = false
+signing_api_reachable = false
+key_generation_api_reachable = false
+ffi_or_unsafe_in_fastmcp_jose_path = false
+randomness_requested_by_public_verify = false
+
+[policy]
+allowed_modulus_bits = [2048, 3072, 4096]
+modulus_rule = "minimal unsigned big-endian modulus; exact admitted bit length"
+exponent = "65537"
+signature_rule = "exact modulus byte length; reject short, long, and malformed signatures before ring"
+algorithm_selector = "fixed RSA PKCS#1 v1.5 SHA-256; no generic selector"
+allowed_algorithms = ["RS256"]
+forbidden_algorithms = ["HS256", "none", "PS256", "ES256", "EdDSA"]
+private_key_inputs = []
+pem_inputs = []
+jwks_private_material = false
+ambient_provider_state = false
+ambient_rng = false
+
+[audit]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+toolchain = "nightly-2026-07-11 / rustc 1.99.0-nightly (375b1431b 2026-07-10)"
+advisory_policy = "record RUSTSEC-2025-0007 withdrawn, RUSTSEC-2025-0009 patched by 0.17.12, and RUSTSEC-2025-0010 pre-0.17 scope; do not suppress informational facts"
+feature_unification = "direct JOSE edge requests only alloc; TLS/rustls ring defaults are separately owned by FND-05 and must be reported, not attributed to JOSE"
+reproducibility = "pending exact cached archive/target build and symbol attestation; no Cargo run in this child"
+constant_time_assumption = "ring fixed public verification primitive; target implementation audit remains required"
+unsafe_ffi_inventory = "ring upstream package audit required; FastMCP JOSE call graph contains no private-key, import, generation, or signing symbols"
+
+[vectors]
+directory = "evidence/fnd-01/vectors/rs256"
+count = 2
+private_keys_checked_in = false
+cross_implementation_required = true
+vector_status = "public-input records present; independent ring/OpenSSL execution delegated to integration review"
+vector_files = ["rfc7515-a2.toml", "rfc7520-rs256.toml"]
+rejected_artifact_files = ["rfc8017-sha256.toml"]
+source_policy = "immutable standards/vector references only; no generated or private-key material"
+rejected_artifact_policy = "Inventory checks must preserve and reject every listed artifact, verify its duplicate_of and accepted_vector=false fields, and exclude it from vector count and all execution or mutation runners."
+
+[handoff]
+owned_source_paths = ["crates/fastmcp-server/src/auth.rs", "crates/fastmcp-server/src/oidc.rs"]
+excluded_shared_paths = ["Cargo.toml", "Cargo.lock", "crates/fastmcp-server/src/lib.rs", "crates/fastmcp/src/lib.rs"]
+excluded_work = ["FND-09 external signer", "AUTH-04 runtime evidence", "manifest/lock integration", "Cargo/build/test", "stable JWT/OIDC support claim"]
+fail_closed_behaviour = "The legacy JWT verifier/API is absent; only OIDC ID-token issuance remains and returns a bounded SigningError until public verification admission is handled by PRT-01/LIMIT-01/FND-09. No process-global provider, local HMAC/RS256 signer, PEM private-key path, JWKS signer path, or issuance-local key exists."
+legacy_source_inventory = "Local signing constructors, signer state, and legacy signing tests are physically absent from the owned source; .1.1 owns shared re-exports and end-to-end integration only."

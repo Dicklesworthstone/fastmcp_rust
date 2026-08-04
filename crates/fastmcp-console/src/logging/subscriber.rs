@@ -13,17 +13,97 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::console::{FastMcpConsole, strip_markup};
+use crate::console::{
+    DEFAULT_LOG_MESSAGE_MAX_CHARS, DEFAULT_TERMINAL_FIELD_MAX_CHARS, FastMcpConsole,
+    bounded_redacted_terminal_text, strip_markup,
+};
 use crate::detection::DisplayContext;
 use crate::theme::FastMcpTheme;
 
 use super::{LogEvent, LogLevel, RichLogFormatter};
 
+const MAX_CAPTURE_FIELDS: usize = 64;
+const LOG_SOURCE_CAPTURE_MULTIPLIER: usize = 4;
+
+struct BoundedValueWriter {
+    output: String,
+    remaining_chars: usize,
+    truncated: bool,
+}
+
+impl BoundedValueWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            output: String::with_capacity(max_chars.min(1_024)),
+            remaining_chars: max_chars,
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.output.push_str("...");
+        }
+        self.output
+    }
+}
+
+impl fmt::Write for BoundedValueWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.remaining_chars == 0 {
+            self.truncated |= !value.is_empty();
+            return if value.is_empty() {
+                Ok(())
+            } else {
+                Err(fmt::Error)
+            };
+        }
+
+        let mut characters = value.chars();
+        for character in characters.by_ref().take(self.remaining_chars) {
+            self.output.push(character);
+            self.remaining_chars -= 1;
+        }
+        if characters.next().is_some() {
+            self.truncated = true;
+            Err(fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn bounded_source_text(value: &str, max_chars: usize) -> String {
+    let mut writer = BoundedValueWriter::new(max_chars);
+    let _ = fmt::Write::write_str(&mut writer, value);
+    writer.finish()
+}
+
+fn bounded_debug_value(value: &dyn fmt::Debug, max_chars: usize) -> String {
+    let mut writer = BoundedValueWriter::new(max_chars);
+    let _ = fmt::write(&mut writer, format_args!("{value:?}"));
+    writer.finish()
+}
+
 /// A tracing layer that renders events using rich formatting.
 pub struct RichLayer {
     formatter: RichLogFormatter,
-    console: &'static FastMcpConsole,
+    console: LayerConsole,
     include_timestamps: bool,
+}
+
+enum LayerConsole {
+    Global(&'static FastMcpConsole),
+    Owned(Box<FastMcpConsole>),
+}
+
+impl LayerConsole {
+    fn get(&self) -> &FastMcpConsole {
+        match self {
+            Self::Global(console) => console,
+            Self::Owned(console) => console,
+        }
+    }
 }
 
 impl RichLayer {
@@ -32,9 +112,19 @@ impl RichLayer {
     pub fn new(formatter: RichLogFormatter, include_timestamps: bool) -> Self {
         Self {
             formatter,
-            console: crate::console::console(),
+            console: LayerConsole::Global(crate::console::console()),
             include_timestamps,
         }
+    }
+
+    /// Route this layer through an owned console instead of the global console.
+    ///
+    /// Owning the console keeps custom writers and explicit rich/plain modes
+    /// usable by global subscribers without requiring a leaked reference.
+    #[must_use]
+    pub fn with_console(mut self, console: FastMcpConsole) -> Self {
+        self.console = LayerConsole::Owned(Box::new(console));
+        self
     }
 
     fn timestamp_string(&self) -> Option<String> {
@@ -58,40 +148,60 @@ struct FieldCollector {
 }
 
 impl FieldCollector {
-    fn record_value(&mut self, field: &Field, value: String) {
+    fn record_value(&mut self, field: &Field, value: &str) {
+        let display_limit = if field.name() == "message" {
+            DEFAULT_LOG_MESSAGE_MAX_CHARS
+        } else {
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS
+        };
+        let capture_limit = display_limit.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER);
+        let value = bounded_source_text(value, capture_limit);
         if field.name() == "message" {
             if self.message.is_none() {
                 self.message = Some(value);
             }
-        } else {
-            self.fields.push((field.name().to_string(), value));
+        } else if self.fields.len() < MAX_CAPTURE_FIELDS {
+            let key = bounded_redacted_terminal_text(
+                field.name(),
+                DEFAULT_TERMINAL_FIELD_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+            );
+            self.fields.push((key, value));
         }
     }
 }
 
 impl Visit for FieldCollector {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.record_value(field, format!("{value:?}"));
+        let display_limit = if field.name() == "message" {
+            DEFAULT_LOG_MESSAGE_MAX_CHARS
+        } else {
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS
+        };
+        let value = bounded_debug_value(
+            value,
+            display_limit.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+        );
+        self.record_value(field, &value);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.record_value(field, value.to_string());
+        self.record_value(field, value);
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record_value(field, value.to_string());
+        self.record_value(field, if value { "true" } else { "false" });
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.record_value(field, value.to_string());
+        self.record_value(field, &value.to_string());
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.record_value(field, value.to_string());
+        self.record_value(field, &value.to_string());
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record_value(field, value.to_string());
+        self.record_value(field, &value.to_string());
     }
 }
 
@@ -107,9 +217,10 @@ where
         if let Some(scope) = ctx.event_scope(event) {
             let spans: Vec<String> = scope
                 .from_root()
-                .map(|span| span.name().to_string())
+                .take(MAX_CAPTURE_FIELDS)
+                .map(|span| bounded_source_text(span.name(), DEFAULT_TERMINAL_FIELD_MAX_CHARS))
                 .collect();
-            if !spans.is_empty() {
+            if !spans.is_empty() && collector.fields.len() < MAX_CAPTURE_FIELDS {
                 collector
                     .fields
                     .push(("span".to_string(), spans.join("::")));
@@ -117,38 +228,50 @@ where
         }
 
         let level = LogLevel::from(*metadata.level());
-        let message = collector
-            .message
-            .unwrap_or_else(|| metadata.name().to_string());
+        let message = collector.message.unwrap_or_else(|| {
+            bounded_redacted_terminal_text(
+                metadata.name(),
+                DEFAULT_LOG_MESSAGE_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+            )
+        });
 
-        let mut log_event = LogEvent::new(level, message).with_target(metadata.target());
+        let target = bounded_redacted_terminal_text(
+            metadata.target(),
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+        );
+        let mut log_event = LogEvent::new(level, message).with_target(target);
 
         if let Some(ts) = self.timestamp_string() {
             log_event = log_event.with_timestamp(ts);
         }
         if let Some(file) = metadata.file() {
-            log_event = log_event.with_file(file);
+            log_event = log_event.with_file(bounded_redacted_terminal_text(
+                file,
+                DEFAULT_TERMINAL_FIELD_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+            ));
         }
         if let Some(line) = metadata.line() {
             log_event = log_event.with_line(line);
         }
-        for (key, value) in collector.fields {
-            log_event = log_event.with_field(key, value);
-        }
+        log_event.fields = collector.fields;
 
         let line = self.formatter.format_line(&log_event);
-        if self.console.is_rich() {
-            self.console.print(&line);
+        let console = self.console.get();
+        if console.is_rich() && self.formatter.should_use_rich() {
+            console.print(&line);
+        } else if self.formatter.should_use_rich() {
+            console.print_plain(&strip_markup(&line));
         } else {
-            eprintln!("{}", strip_markup(&line));
+            console.print_plain(&line);
         }
     }
 }
 
 /// Builder for configuring a rich tracing subscriber.
-#[derive(Debug)]
 pub struct RichSubscriberBuilder {
     theme: Option<&'static FastMcpTheme>,
+    context: Option<DisplayContext>,
+    console: Option<FastMcpConsole>,
     show_timestamps: bool,
     show_targets: bool,
     show_file_line: bool,
@@ -168,6 +291,8 @@ impl RichSubscriberBuilder {
     pub fn new() -> Self {
         Self {
             theme: None,
+            context: None,
+            console: None,
             show_timestamps: true,
             show_targets: true,
             show_file_line: false,
@@ -180,6 +305,30 @@ impl RichSubscriberBuilder {
     #[must_use]
     pub fn with_theme(mut self, theme: &'static FastMcpTheme) -> Self {
         self.theme = Some(theme);
+        self
+    }
+
+    /// Set the display context used by both formatting and default output.
+    ///
+    /// When omitted, the context is auto-detected at build time and output is
+    /// routed through the global console. When set explicitly and no custom
+    /// console is supplied, the subscriber owns a stderr console configured
+    /// for the requested rich or plain mode.
+    #[must_use]
+    pub fn with_context(mut self, context: DisplayContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Route subscriber output through an owned console.
+    ///
+    /// If [`with_context`](Self::with_context) is omitted, the injected
+    /// console's rich/plain mode also selects the formatting context. If both
+    /// are supplied, the explicit context controls formatting while the
+    /// console controls final output rendering.
+    #[must_use]
+    pub fn with_console(mut self, console: FastMcpConsole) -> Self {
+        self.console = Some(console);
         self
     }
 
@@ -221,7 +370,26 @@ impl RichSubscriberBuilder {
     /// Build the subscriber without installing it.
     #[must_use]
     pub fn build(self) -> impl Subscriber {
-        let context = DisplayContext::detect();
+        let (level_filter, layer) = self.build_layer();
+
+        tracing_subscriber::registry()
+            .with(level_filter)
+            .with(layer)
+    }
+
+    fn build_layer(self) -> (LevelFilter, RichLayer) {
+        let explicit_context = self.context;
+        let context = explicit_context.unwrap_or_else(|| {
+            self.console
+                .as_ref()
+                .map_or_else(DisplayContext::detect, |console| {
+                    if console.is_rich() {
+                        DisplayContext::new_human()
+                    } else {
+                        DisplayContext::new_agent()
+                    }
+                })
+        });
         let theme = self.theme.unwrap_or_else(crate::theme::theme);
 
         let formatter = RichLogFormatter::new(theme, context)
@@ -230,11 +398,20 @@ impl RichSubscriberBuilder {
             .with_file_line(self.show_file_line)
             .with_max_width(self.max_width);
 
-        let layer = RichLayer::new(formatter, self.show_timestamps);
+        let console = if let Some(console) = self.console {
+            LayerConsole::Owned(Box::new(console))
+        } else if explicit_context.is_some() {
+            LayerConsole::Owned(Box::new(FastMcpConsole::with_enabled(context.is_human())))
+        } else {
+            LayerConsole::Global(crate::console::console())
+        };
+        let layer = RichLayer {
+            formatter,
+            console,
+            include_timestamps: self.show_timestamps,
+        };
 
-        tracing_subscriber::registry()
-            .with(self.level_filter)
-            .with(layer)
+        (self.level_filter, layer)
     }
 
     /// Build and install as the global subscriber.
@@ -244,14 +421,67 @@ impl RichSubscriberBuilder {
     }
 }
 
+impl fmt::Debug for RichSubscriberBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RichSubscriberBuilder")
+            .field("theme", &self.theme)
+            .field("context", &self.context)
+            .field(
+                "console_mode",
+                &self.console.as_ref().map(|console| {
+                    if console.is_rich() {
+                        DisplayContext::new_human()
+                    } else {
+                        DisplayContext::new_agent()
+                    }
+                }),
+            )
+            .field("show_timestamps", &self.show_timestamps)
+            .field("show_targets", &self.show_targets)
+            .field("show_file_line", &self.show_file_line)
+            .field("max_width", &self.max_width)
+            .field("level_filter", &self.level_filter)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::{Level, debug, event, info, info_span};
+
+    struct EndlessDebugIterator<'a> {
+        visits: &'a AtomicUsize,
+    }
+
+    impl fmt::Debug for EndlessDebugIterator<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for value in std::iter::repeat("x") {
+                self.visits.fetch_add(1, Ordering::Relaxed);
+                formatter.write_str(value)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_value_writer_short_circuits_adversarial_debug_iterator() {
+        let visits = AtomicUsize::new(0);
+        let value = EndlessDebugIterator { visits: &visits };
+
+        let captured = bounded_debug_value(&value, 8);
+
+        assert_eq!(visits.load(Ordering::Relaxed), 9);
+        assert_eq!(captured, "xxxxxxxx...");
+    }
 
     #[test]
     fn test_builder_defaults() {
         let builder = RichSubscriberBuilder::default();
+        assert_eq!(builder.context, None);
+        assert!(builder.console.is_none());
         assert!(builder.show_timestamps);
         assert!(builder.show_targets);
         assert!(!builder.show_file_line);
@@ -268,6 +498,7 @@ mod tests {
     fn test_builder_option_setters() {
         let builder = RichSubscriberBuilder::new()
             .with_theme(crate::theme::theme())
+            .with_context(DisplayContext::new_agent())
             .with_timestamps(false)
             .with_targets(false)
             .with_file_line(true)
@@ -275,11 +506,60 @@ mod tests {
             .with_level_filter(LevelFilter::DEBUG);
 
         assert!(builder.theme.is_some());
+        assert_eq!(builder.context, Some(DisplayContext::new_agent()));
         assert!(!builder.show_timestamps);
         assert!(!builder.show_targets);
         assert!(builder.show_file_line);
         assert_eq!(builder.max_width, Some(64));
         assert_eq!(builder.level_filter, LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn explicit_context_controls_formatter_and_output_without_global_console() {
+        for (context, rich) in [
+            (DisplayContext::new_agent(), false),
+            (DisplayContext::new_human(), true),
+        ] {
+            let (_, layer) = RichSubscriberBuilder::new()
+                .with_context(context)
+                .build_layer();
+
+            assert_eq!(layer.formatter.should_use_rich(), rich);
+            assert_eq!(layer.console.get().is_rich(), rich);
+            assert!(matches!(&layer.console, LayerConsole::Owned(_)));
+        }
+    }
+
+    #[test]
+    fn explicit_context_overrides_ambient_detection() {
+        let detected = DisplayContext::detect();
+        let forced = if detected.is_human() {
+            DisplayContext::new_agent()
+        } else {
+            DisplayContext::new_human()
+        };
+
+        let (_, layer) = RichSubscriberBuilder::new()
+            .with_context(forced)
+            .build_layer();
+
+        assert_eq!(layer.formatter.should_use_rich(), forced.is_human());
+        assert_eq!(layer.console.get().is_rich(), forced.is_human());
+        assert_ne!(layer.formatter.should_use_rich(), detected.is_human());
+        assert!(matches!(&layer.console, LayerConsole::Owned(_)));
+    }
+
+    #[test]
+    fn injected_console_selects_context_without_ambient_detection() {
+        for rich in [false, true] {
+            let (_, layer) = RichSubscriberBuilder::new()
+                .with_console(FastMcpConsole::with_enabled(rich))
+                .build_layer();
+
+            assert_eq!(layer.formatter.should_use_rich(), rich);
+            assert_eq!(layer.console.get().is_rich(), rich);
+            assert!(matches!(&layer.console, LayerConsole::Owned(_)));
+        }
     }
 
     #[test]
@@ -461,6 +741,8 @@ mod tests {
     fn builder_default_matches_new() {
         let def = RichSubscriberBuilder::default();
         let new = RichSubscriberBuilder::new();
+        assert_eq!(def.context, new.context);
+        assert_eq!(def.console.is_some(), new.console.is_some());
         assert_eq!(def.show_timestamps, new.show_timestamps);
         assert_eq!(def.show_targets, new.show_targets);
         assert_eq!(def.show_file_line, new.show_file_line);

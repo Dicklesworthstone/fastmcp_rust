@@ -189,7 +189,9 @@ fn setup_workflow_server() -> TestHarness {
         .build();
 
     let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
+        server
+            .run_transport_returning(server_transport)
+            .expect("workflow server loop");
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -438,7 +440,9 @@ fn workflow_two_independent_servers() {
         .build_server_builder();
     let server_a = builder_a.tool(EchoTool).build();
     let handle_a = spawn_thread(move || {
-        server_a.run_transport_returning(server_a_transport);
+        server_a
+            .run_transport_returning(server_a_transport)
+            .expect("server A loop");
     });
 
     // Server B: resources only
@@ -447,7 +451,9 @@ fn workflow_two_independent_servers() {
         .build_server_builder();
     let server_b = builder_b.resource(StatusResource).build();
     let handle_b = spawn_thread(move || {
-        server_b.run_transport_returning(server_b_transport);
+        server_b
+            .run_transport_returning(server_b_transport)
+            .expect("server B loop");
     });
 
     let _joins = ThreadJoins::new(vec![handle_a, handle_b]);
@@ -588,7 +594,9 @@ fn workflow_server_name_and_version() {
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
+        server
+            .run_transport_returning(server_transport)
+            .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
 
@@ -606,7 +614,9 @@ fn workflow_capabilities_match_handlers() {
 
     let server = builder.tool(EchoTool).resource(StatusResource).build();
     let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
+        server
+            .run_transport_returning(server_transport)
+            .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
 
@@ -630,7 +640,9 @@ fn workflow_custom_client_info_accepted() {
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
+        server
+            .run_transport_returning(server_transport)
+            .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
 
@@ -724,6 +736,15 @@ impl ContentExt for Content {
 // ============================================================================
 // Background Tasks E2E Tests (bd-og1)
 // ============================================================================
+
+// Network Tasks are quarantined pending TASK-01/TASK-02. Keep this historical
+// E2E source compile-inert so it cannot imply a supported or advertised RPC
+// surface while the replacement ownership and structured-concurrency design is
+// implemented.
+#[cfg(any())]
+#[rustfmt::skip]
+mod quarantined_network_tasks_e2e {
+use super::*;
 
 use fastmcp_rust::TaskManager;
 
@@ -1376,6 +1397,8 @@ fn workflow_task_type_preserved() {
 
         assert_eq!(get_result["task"]["taskType"].as_str().unwrap(), task_type);
     }
+}
+
 }
 
 // ============================================================================
@@ -2089,7 +2112,9 @@ fn session_multiple_clients_independent_lifecycle() {
             .tool(EchoTool)
             .build();
         let handle = spawn_thread(move || {
-            server.run_transport_returning(server_transport);
+            server
+                .run_transport_returning(server_transport)
+                .expect("lifecycle server loop");
         });
         server_handles.push(handle);
 
@@ -2138,7 +2163,9 @@ fn session_state_persists_across_operations() {
         .tool(EchoTool)
         .build();
     let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
+        server
+            .run_transport_returning(server_transport)
+            .expect("persistence server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
 

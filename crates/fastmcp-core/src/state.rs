@@ -1,7 +1,11 @@
 //! Session state storage for per-session key-value data.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+const CACHE_PARTITION_BYTES: usize = 32;
 
 /// Thread-safe session state container for per-session key-value storage.
 ///
@@ -13,6 +17,9 @@ use std::sync::{Arc, Mutex};
 ///
 /// SessionState is designed for concurrent access from multiple handlers.
 /// Operations are synchronized via an internal mutex.
+/// Its [`Debug`](std::fmt::Debug) output is deliberately redacted and reports
+/// entry counts and local-override presence only; it never renders keys or
+/// stored values.
 ///
 /// # Example
 ///
@@ -21,13 +28,73 @@ use std::sync::{Arc, Mutex};
 /// ctx.set_state("counter", 42);
 /// let count: Option<i32> = ctx.get_state("counter");
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct SessionState {
     inner: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     local: Option<Arc<Mutex<HashMap<String, serde_json::Value>>>>,
+    cache_partition: Option<[u8; CACHE_PARTITION_BYTES]>,
+    revision: Arc<AtomicU64>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::from_map(HashMap::new())
+    }
+}
+
+impl fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shared_entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let local_entries = self.local.as_ref().map_or(0, |local| {
+            local
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        });
+
+        f.debug_struct("SessionState")
+            .field("shared_entry_count", &shared_entries)
+            .field("has_local_overrides", &self.local.is_some())
+            .field("local_entry_count", &local_entries)
+            .finish()
+    }
 }
 
 impl SessionState {
+    fn from_map(values: HashMap<String, serde_json::Value>) -> Self {
+        Self::from_map_with_partition_draw(values, || {
+            crate::crypto::draw_security_identifier().map(|identifier| *identifier.as_bytes())
+        })
+    }
+
+    fn from_map_with_partition_draw<F, E>(
+        values: HashMap<String, serde_json::Value>,
+        draw: F,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,
+    {
+        let cache_partition = draw().ok();
+        Self {
+            inner: Arc::new(Mutex::new(values)),
+            local: None,
+            cache_partition,
+            revision: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record_mutation(&self) {
+        let _ = self
+            .revision
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            });
+    }
+
     /// Creates a new empty session state.
     #[must_use]
     pub fn new() -> Self {
@@ -48,6 +115,8 @@ impl SessionState {
                     .as_ref()
                     .map_or_else(|| Arc::new(Mutex::new(HashMap::new())), Arc::clone),
             ),
+            cache_partition: self.cache_partition,
+            revision: Arc::clone(&self.revision),
         }
     }
 
@@ -71,10 +140,7 @@ impl SessionState {
                     .clone(),
             );
         }
-        Self {
-            inner: Arc::new(Mutex::new(snapshot)),
-            local: None,
-        }
+        Self::from_map(snapshot)
     }
 
     /// Gets a value from session state by key.
@@ -117,10 +183,15 @@ impl SessionState {
         let Ok(json_value) = serde_json::to_value(value) else {
             return false;
         };
+        // `Into<String>` is extension code. Evaluate it before acquiring the
+        // shared-state mutex so a panicking conversion cannot poison every
+        // clone of this session state.
+        let key = key.into();
         let Ok(mut guard) = self.inner.lock() else {
             return false;
         };
-        guard.insert(key.into(), json_value);
+        guard.insert(key, json_value);
+        self.record_mutation();
         true
     }
 
@@ -128,10 +199,12 @@ impl SessionState {
     ///
     /// Returns `true` if the value was successfully stored.
     pub fn set_raw(&self, key: impl Into<String>, value: serde_json::Value) -> bool {
+        let key = key.into();
         let Ok(mut guard) = self.inner.lock() else {
             return false;
         };
-        guard.insert(key.into(), value);
+        guard.insert(key, value);
+        self.record_mutation();
         true
     }
 
@@ -142,10 +215,12 @@ impl SessionState {
         let Some(local) = &self.local else {
             return false;
         };
+        let key = key.into();
         let Ok(mut guard) = local.lock() else {
             return false;
         };
-        guard.insert(key.into(), value);
+        guard.insert(key, value);
+        self.record_mutation();
         true
     }
 
@@ -166,11 +241,16 @@ impl SessionState {
         if let Some(local) = &self.local {
             let mut guard = local.lock().ok()?;
             if let Some(value) = guard.remove(key) {
+                self.record_mutation();
                 return Some(value);
             }
         }
         let mut guard = self.inner.lock().ok()?;
-        guard.remove(key)
+        let removed = guard.remove(key);
+        if removed.is_some() {
+            self.record_mutation();
+        }
+        removed
     }
 
     /// Checks if a key exists in session state.
@@ -182,20 +262,22 @@ impl SessionState {
     /// Returns the number of entries in session state.
     #[must_use]
     pub fn len(&self) -> usize {
-        let shared_keys = self
+        let shared = self
             .inner
             .lock()
-            .map(|g| g.keys().cloned().collect::<std::collections::HashSet<_>>())
-            .unwrap_or_default();
-        if let Some(local) = &self.local {
-            let local_keys = local
-                .lock()
-                .map(|g| g.keys().cloned().collect::<std::collections::HashSet<_>>())
-                .unwrap_or_default();
-            shared_keys.union(&local_keys).count()
-        } else {
-            shared_keys.len()
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(local) = &self.local else {
+            return shared.len();
+        };
+        let local = local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        shared.len()
+            + local
+                .keys()
+                .filter(|key| !shared.contains_key(key.as_str()))
+                .count()
     }
 
     /// Returns true if session state is empty.
@@ -206,14 +288,48 @@ impl SessionState {
 
     /// Clears all session state.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.clear();
+        let Ok(mut shared) = self.inner.lock() else {
+            return;
+        };
+        let mut local = match &self.local {
+            Some(local) => match local.lock() {
+                Ok(local) => Some(local),
+                Err(_) => return,
+            },
+            None => None,
+        };
+        let changed = !shared.is_empty() || local.as_ref().is_some_and(|local| !local.is_empty());
+        shared.clear();
+        if let Some(local) = local.as_mut() {
+            local.clear();
         }
-        if let Some(local) = &self.local
-            && let Ok(mut guard) = local.lock()
-        {
-            guard.clear();
+        if changed {
+            self.record_mutation();
         }
+    }
+
+    /// Returns an opaque cache partition and its state revision.
+    ///
+    /// This internal integration hook fails closed for layered request-local
+    /// views, entropy acquisition failure, and a saturated revision counter.
+    /// Consumers must also partition by every response-relevant authorization
+    /// fact before sharing cached responses.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cache_partition(&self) -> Option<([u8; CACHE_PARTITION_BYTES], u64)> {
+        if self.local.is_some() {
+            return None;
+        }
+        // Synchronize partition sampling with shared-state writers. Without
+        // this lock, a reader could observe the old revision after a writer
+        // changed the map but before it published the revision increment, and
+        // incorrectly serve an old cached response.
+        let _state_guard = self.inner.lock().ok()?;
+        let revision = self.revision.load(Ordering::Acquire);
+        if revision == u64::MAX {
+            return None;
+        }
+        Some((self.cache_partition?, revision))
     }
 }
 
@@ -284,6 +400,8 @@ impl SessionState {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -377,6 +495,11 @@ mod tests {
 
         state.remove("a");
         assert_eq!(state.len(), 1);
+
+        let layered = state.with_local_overrides();
+        assert!(layered.set_local("b", 3));
+        assert!(layered.set_local("c", 4));
+        assert_eq!(layered.len(), 2, "overridden keys count exactly once");
     }
 
     #[test]
@@ -400,6 +523,197 @@ mod tests {
         cloned.set("key2", "value2");
 
         assert!(state.contains("key2"));
+    }
+
+    #[test]
+    fn panicking_key_conversion_does_not_poison_state_mutexes() {
+        struct PanickingKey;
+
+        impl From<PanickingKey> for String {
+            fn from(_value: PanickingKey) -> Self {
+                panic!("session-state-key-conversion-canary")
+            }
+        }
+
+        let typed = SessionState::new();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = typed.set(PanickingKey, true);
+        }))
+        .is_err());
+        assert!(typed.set("after-typed-panic", true));
+
+        let raw = SessionState::new();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = raw.set_raw(PanickingKey, serde_json::Value::Null);
+        }))
+        .is_err());
+        assert!(raw.set_raw("after-raw-panic", serde_json::Value::Null));
+
+        let layered = SessionState::new().with_local_overrides();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = layered.set_local_raw(PanickingKey, serde_json::Value::Null);
+        }))
+        .is_err());
+        assert!(layered.set_local_raw("after-local-panic", serde_json::Value::Null));
+    }
+
+    #[test]
+    fn cache_partition_is_clone_stable_and_mutation_versioned() {
+        let state = SessionState::new();
+        let initial = state
+            .cache_partition()
+            .expect("test platform must provide cache-partition entropy");
+        let cloned = state.clone();
+        assert_eq!(cloned.cache_partition(), Some(initial));
+
+        assert!(cloned.set("key", "value"));
+        let mutated = state
+            .cache_partition()
+            .expect("ordinary mutation keeps the partition available");
+        assert_eq!(mutated.0, initial.0);
+        assert_eq!(mutated.1, initial.1 + 1);
+    }
+
+    #[test]
+    fn cache_partition_injected_draw_stores_exact_partition_once() {
+        let expected = [0x5a; CACHE_PARTITION_BYTES];
+        let calls = Cell::new(0);
+        let state = SessionState::from_map_with_partition_draw(HashMap::new(), || {
+            calls.set(calls.get() + 1);
+            Ok::<[u8; CACHE_PARTITION_BYTES], &'static str>(expected)
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(state.cache_partition(), Some((expected, 0)));
+    }
+
+    #[test]
+    fn cache_partition_injected_draw_failure_is_rejected_once() {
+        let calls = Cell::new(0);
+        let state = SessionState::from_map_with_partition_draw(HashMap::new(), || {
+            calls.set(calls.get() + 1);
+            Err::<[u8; CACHE_PARTITION_BYTES], _>("deterministic RNG failure")
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(state.cache_partition(), None);
+    }
+
+    #[test]
+    fn snapshots_and_local_overrides_cannot_alias_a_cache_partition() {
+        let state = SessionState::new();
+        let live = state
+            .cache_partition()
+            .expect("test platform must provide cache-partition entropy");
+        let snapshot = state.snapshot();
+        let snapshot_partition = snapshot
+            .cache_partition()
+            .expect("snapshot must acquire an independent partition");
+
+        assert_ne!(snapshot_partition.0, live.0);
+        assert!(state.with_local_overrides().cache_partition().is_none());
+    }
+
+    #[test]
+    fn saturated_cache_revision_fails_closed() {
+        let state = SessionState::new();
+        state.revision.store(u64::MAX, Ordering::Release);
+
+        assert!(state.cache_partition().is_none());
+        assert!(state.set("still", "mutable"));
+        assert!(state.cache_partition().is_none());
+    }
+
+    #[test]
+    fn stable_revision_never_observes_a_different_concurrent_value() {
+        const WRITES: u64 = 2_000;
+        let state = SessionState::new();
+        assert!(state.set("counter", 0_u64));
+        let writer_state = state.clone();
+        let writer = std::thread::spawn(move || {
+            for value in 1..=WRITES {
+                assert!(writer_state.set("counter", value));
+            }
+        });
+
+        while !writer.is_finished() {
+            let before = state
+                .cache_partition()
+                .expect("test platform must provide cache-partition entropy");
+            let value: u64 = state.get("counter").expect("counter remains present");
+            let after = state.cache_partition().expect("revision remains available");
+            if before == after {
+                assert_eq!(before.1, value + 1);
+            }
+        }
+        writer.join().expect("writer thread");
+
+        let final_partition = state.cache_partition().expect("final partition");
+        assert_eq!(final_partition.1, WRITES + 1);
+        assert_eq!(state.get::<u64>("counter"), Some(WRITES));
+    }
+
+    #[test]
+    fn cache_partition_waits_for_in_flight_state_mutation_publication() {
+        let state = SessionState::new();
+        let mut writer_guard = state.inner.lock().expect("state mutex");
+        let sampler_state = state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel(0);
+        let sampler = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce sampler");
+            sample_tx
+                .send(sampler_state.cache_partition())
+                .expect("publish sample");
+        });
+        started_rx.recv().expect("sampler started");
+        assert!(
+            sample_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "partition sampling must wait while a state write is in flight"
+        );
+
+        writer_guard.insert("key".to_string(), serde_json::json!("value"));
+        state.record_mutation();
+        drop(writer_guard);
+
+        let partition = sample_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("sampler unblocked")
+            .expect("partition entropy available");
+        sampler.join().expect("sampler thread");
+        assert_eq!(partition.1, 1);
+    }
+
+    #[test]
+    fn session_state_debug_reports_only_safe_counts_and_booleans() {
+        const SECRET_KEY: &str = "authorization_bearer_canary_7f129";
+        const SECRET_VALUE: &str = "customer-pii-canary@example.invalid";
+        const LOCAL_SECRET_KEY: &str = "local-secret-key-canary-e81a";
+        const LOCAL_SECRET_VALUE: &str = "local-secret-value-canary-29bd";
+
+        let state = SessionState::new();
+        assert!(state.set(SECRET_KEY, SECRET_VALUE));
+        let layered = state.with_local_overrides();
+        assert!(layered.set_local(LOCAL_SECRET_KEY, LOCAL_SECRET_VALUE));
+
+        let debug = format!("{layered:?}");
+        assert!(debug.contains("SessionState"));
+        assert!(debug.contains("shared_entry_count: 1"));
+        assert!(debug.contains("has_local_overrides: true"));
+        assert!(debug.contains("local_entry_count: 1"));
+        for canary in [
+            SECRET_KEY,
+            SECRET_VALUE,
+            LOCAL_SECRET_KEY,
+            LOCAL_SECRET_VALUE,
+        ] {
+            assert!(
+                !debug.contains(canary),
+                "SessionState Debug leaked canary: {canary}"
+            );
+        }
     }
 
     #[test]

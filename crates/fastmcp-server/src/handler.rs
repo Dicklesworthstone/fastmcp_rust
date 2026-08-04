@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fastmcp_core::{
-    McpContext, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter, SessionState,
+    McpContext, McpError, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
+    SessionState,
 };
 use fastmcp_protocol::{
     Content, Icon, JsonRpcRequest, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
@@ -30,7 +31,12 @@ use fastmcp_protocol::{
 /// A notification sender that sends progress notifications via a callback.
 ///
 /// This is the server-side implementation used to send notifications back
-/// to the client during handler execution.
+/// to the client during handler execution. It rejects non-finite numeric
+/// fields and serialization failures, and contains callback panics so a
+/// reporting failure cannot unwind through the request handler.
+///
+/// This adapter does not provide monotonicity enforcement, rate limiting, or
+/// a bounded delivery queue.
 pub struct ProgressNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
@@ -57,6 +63,50 @@ where
     {
         ProgressReporter::new(Arc::new(self))
     }
+
+    fn send_progress_with_serializer<E>(
+        &self,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+        serialize: impl FnOnce(&ProgressParams) -> Result<serde_json::Value, E>,
+    ) {
+        if !progress.is_finite() || total.is_some_and(|value| !value.is_finite()) {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "progress notification rejected; reason=non_finite_numeric_value"
+            );
+            return;
+        }
+
+        let params = match total {
+            Some(value) => ProgressParams::with_total(self.marker.clone(), progress, value),
+            None => ProgressParams::new(self.marker.clone(), progress),
+        };
+
+        let params = if let Some(value) = message {
+            params.with_message(value)
+        } else {
+            params
+        };
+
+        let Ok(serialized_params) = serialize(&params) else {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "progress notification rejected; reason=serialization_failure"
+            );
+            return;
+        };
+
+        let notification =
+            JsonRpcRequest::notification("notifications/progress", Some(serialized_params));
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "progress notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+    }
 }
 
 impl<F> NotificationSender for ProgressNotificationSender<F>
@@ -64,24 +114,9 @@ where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
     fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
-        let params = match total {
-            Some(t) => ProgressParams::with_total(self.marker.clone(), progress, t),
-            None => ProgressParams::new(self.marker.clone(), progress),
-        };
-
-        let params = if let Some(msg) = message {
-            params.with_message(msg)
-        } else {
-            params
-        };
-
-        // Create a notification (request without id)
-        let notification = JsonRpcRequest::notification(
-            "notifications/progress",
-            Some(serde_json::to_value(&params).unwrap_or_default()),
-        );
-
-        (self.send_fn)(notification);
+        self.send_progress_with_serializer(progress, total, message, |params| {
+            serde_json::to_value(params)
+        });
     }
 }
 
@@ -91,7 +126,6 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressNotificationSender")
-            .field("marker", &self.marker)
             .finish_non_exhaustive()
     }
 }
@@ -259,11 +293,17 @@ pub trait ToolHandler: Send + Sync {
 
     /// Returns the tool's custom timeout duration.
     ///
-    /// Default implementation returns `None`, meaning the server's default
-    /// timeout applies. Override to specify a per-handler timeout.
+    /// Default implementation returns `None`, meaning no additional handler
+    /// ceiling is added. Override to specify a per-handler timeout.
     ///
-    /// When set, creates a child budget with the specified timeout that
-    /// overrides the server's default timeout for this handler.
+    /// A non-zero value tightens the ambient/request/server budget. It never
+    /// replaces or relaxes an earlier absolute deadline. A zero value is
+    /// treated like `None` and therefore cannot disable an outer timeout.
+    /// Pending async work is dropped when the legacy synchronous dispatcher's
+    /// timer observes a comparable deadline, and a late completion is rejected.
+    /// The dispatcher does not drive a caller's foreign virtual clock. This
+    /// cannot preempt a blocking synchronous `call()` or guarantee child-work
+    /// drain; handlers must still cooperate with [`McpContext::checkpoint`].
     fn timeout(&self) -> Option<Duration> {
         None
     }
@@ -307,8 +347,8 @@ pub trait ToolHandler: Send + Sync {
 ///
 /// By default, implement `read()` for synchronous execution. For async resources,
 /// override `read_async()` instead. The router uses `read_async_with_uri()` so
-/// implementations can access matched URI parameters when needed.
-/// which defaults to running `read()` in an async block.
+/// implementations can access matched URI parameters when needed; its default
+/// implementation delegates to `read_async()` or `read_with_uri()`.
 ///
 /// # Return Type
 ///
@@ -348,8 +388,11 @@ pub trait ResourceHandler: Send + Sync {
 
     /// Returns the resource's custom timeout duration.
     ///
-    /// Default implementation returns `None`, meaning the server's default
-    /// timeout applies. Override to specify a per-handler timeout.
+    /// Default implementation returns `None`, meaning no additional handler
+    /// ceiling is added. A non-zero value only tightens outer budgets; zero
+    /// cannot disable an ambient, request, or server deadline.
+    /// A blocking synchronous `read()` cannot be preempted; if it returns
+    /// after the deadline, its result is rejected.
     fn timeout(&self) -> Option<Duration> {
         None
     }
@@ -458,8 +501,11 @@ pub trait PromptHandler: Send + Sync {
 
     /// Returns the prompt's custom timeout duration.
     ///
-    /// Default implementation returns `None`, meaning the server's default
-    /// timeout applies. Override to specify a per-handler timeout.
+    /// Default implementation returns `None`, meaning no additional handler
+    /// ceiling is added. A non-zero value only tightens outer budgets; zero
+    /// cannot disable an ambient, request, or server deadline.
+    /// A blocking synchronous `get()` cannot be preempted; if it returns
+    /// after the deadline, its result is rejected.
     fn timeout(&self) -> Option<Duration> {
         None
     }
@@ -535,6 +581,14 @@ impl ToolHandler for MountedToolHandler {
         def
     }
 
+    fn icon(&self) -> Option<&Icon> {
+        self.inner.icon()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
     fn tags(&self) -> &[String] {
         self.inner.tags()
     }
@@ -569,16 +623,22 @@ impl ToolHandler for MountedToolHandler {
 /// Used by `mount()` to prefix resource URIs when mounting from another server.
 pub struct MountedResourceHandler {
     inner: BoxedResourceHandler,
+    source_uri: String,
     mounted_uri: String,
+    mount_prefix: Option<String>,
     mounted_template: Option<ResourceTemplate>,
 }
 
 impl MountedResourceHandler {
-    /// Creates a new mounted resource handler with the given URI.
-    pub fn new(inner: BoxedResourceHandler, mounted_uri: String) -> Self {
+    /// Creates a mounted resource handler from authoritative source and
+    /// destination registry keys.
+    pub fn new(inner: BoxedResourceHandler, source_uri: String, mounted_uri: String) -> Self {
+        let mount_prefix = Self::infer_mount_prefix(&source_uri, &mounted_uri);
         Self {
             inner,
+            source_uri,
             mounted_uri,
+            mount_prefix,
             mounted_template: None,
         }
     }
@@ -586,14 +646,54 @@ impl MountedResourceHandler {
     /// Creates a new mounted resource handler with a mounted template.
     pub fn with_template(
         inner: BoxedResourceHandler,
+        source_uri: String,
         mounted_uri: String,
         mounted_template: ResourceTemplate,
     ) -> Self {
+        let mount_prefix = Self::infer_mount_prefix(&source_uri, &mounted_uri);
         Self {
             inner,
+            source_uri,
             mounted_uri,
+            mount_prefix,
             mounted_template: Some(mounted_template),
         }
+    }
+
+    fn infer_mount_prefix(source_uri: &str, mounted_uri: &str) -> Option<String> {
+        mounted_uri
+            .strip_suffix(source_uri)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string)
+    }
+
+    fn translate_incoming_uri(&self, uri: &str) -> McpResult<String> {
+        if uri == self.mounted_uri {
+            return Ok(self.source_uri.clone());
+        }
+        match &self.mount_prefix {
+            Some(prefix) => uri.strip_prefix(prefix).map(str::to_string).ok_or_else(|| {
+                McpError::invalid_params("Resource URI does not match the mounted namespace")
+            }),
+            None if self.mounted_uri == self.source_uri => Ok(uri.to_string()),
+            None => Err(McpError::invalid_params(
+                "Resource URI does not match the mounted resource",
+            )),
+        }
+    }
+
+    fn translate_outgoing_contents(
+        &self,
+        mut contents: Vec<ResourceContent>,
+    ) -> Vec<ResourceContent> {
+        for content in &mut contents {
+            if let Some(prefix) = &self.mount_prefix {
+                content.uri = format!("{prefix}{}", content.uri);
+            } else if content.uri == self.source_uri {
+                content.uri.clone_from(&self.mounted_uri);
+            }
+        }
+        contents
     }
 }
 
@@ -608,6 +708,14 @@ impl ResourceHandler for MountedResourceHandler {
         self.mounted_template.clone()
     }
 
+    fn icon(&self) -> Option<&Icon> {
+        self.inner.icon()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
     fn tags(&self) -> &[String] {
         self.inner.tags()
     }
@@ -617,7 +725,9 @@ impl ResourceHandler for MountedResourceHandler {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        self.inner.read(ctx)
+        self.inner
+            .read(ctx)
+            .map(|contents| self.translate_outgoing_contents(contents))
     }
 
     fn read_with_uri(
@@ -626,7 +736,10 @@ impl ResourceHandler for MountedResourceHandler {
         uri: &str,
         params: &UriParams,
     ) -> McpResult<Vec<ResourceContent>> {
-        self.inner.read_with_uri(ctx, uri, params)
+        let source_uri = self.translate_incoming_uri(uri)?;
+        self.inner
+            .read_with_uri(ctx, &source_uri, params)
+            .map(|contents| self.translate_outgoing_contents(contents))
     }
 
     fn read_async_with_uri<'a>(
@@ -635,14 +748,28 @@ impl ResourceHandler for MountedResourceHandler {
         uri: &'a str,
         params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
-        self.inner.read_async_with_uri(ctx, uri, params)
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.inner
+                .read_async_with_uri(ctx, &source_uri, params)
+                .await
+                .map(|contents| self.translate_outgoing_contents(contents))
+        })
     }
 
     fn read_async<'a>(
         &'a self,
         ctx: &'a McpContext,
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
-        self.inner.read_async(ctx)
+        Box::pin(async move {
+            self.inner
+                .read_async(ctx)
+                .await
+                .map(|contents| self.translate_outgoing_contents(contents))
+        })
     }
 }
 
@@ -669,6 +796,14 @@ impl PromptHandler for MountedPromptHandler {
         let mut def = self.inner.definition();
         def.name.clone_from(&self.mounted_name);
         def
+    }
+
+    fn icon(&self) -> Option<&Icon> {
+        self.inner.icon()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
     }
 
     fn tags(&self) -> &[String] {
@@ -700,8 +835,12 @@ impl PromptHandler for MountedPromptHandler {
 mod tests {
     use super::*;
     use asupersync::Cx;
-    use fastmcp_core::McpError;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
+
+    fn custom_icon() -> &'static Icon {
+        static ICON: OnceLock<Icon> = OnceLock::new();
+        ICON.get_or_init(|| Icon::new("https://example.test/component.svg"))
+    }
 
     // ── ProgressNotificationSender ───────────────────────────────────
 
@@ -755,10 +894,70 @@ mod tests {
     }
 
     #[test]
-    fn progress_sender_debug_format() {
-        let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-dbg"), |_| {});
+    fn progress_sender_rejects_non_finite_progress_and_total() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender =
+            ProgressNotificationSender::new(ProgressMarker::from("finite-check"), move |request| {
+                sent_clone.lock().unwrap().push(request);
+            });
+
+        for (progress, total) in [
+            (f64::NAN, None),
+            (f64::INFINITY, None),
+            (f64::NEG_INFINITY, None),
+            (1.0, Some(f64::NAN)),
+            (1.0, Some(f64::INFINITY)),
+            (1.0, Some(f64::NEG_INFINITY)),
+        ] {
+            sender.send_progress(progress, total, Some("must not be sent"));
+        }
+
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_sender_rejects_serialization_failure() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let sender = ProgressNotificationSender::new(
+            ProgressMarker::from("serialization-check"),
+            move |request| {
+                sent_clone.lock().unwrap().push(request);
+            },
+        );
+
+        sender.send_progress_with_serializer(1.0, Some(2.0), None, |_| {
+            Result::<serde_json::Value, ()>::Err(())
+        });
+
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_sender_contains_callback_panic() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_attempts = Arc::clone(&attempts);
+        let sender =
+            ProgressNotificationSender::new(ProgressMarker::from("panic-check"), move |_request| {
+                callback_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("progress callback panic payload");
+            });
+
+        sender.send_progress(1.0, Some(2.0), None);
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn progress_sender_debug_redacts_marker() {
+        let canary = "progress-marker-debug-canary";
+        let sender = ProgressNotificationSender::new(ProgressMarker::from(canary), |_| {});
         let debug = format!("{:?}", sender);
+
         assert!(debug.contains("ProgressNotificationSender"));
+        assert!(!debug.contains(canary));
+        assert!(!debug.contains("marker"));
     }
 
     #[test]
@@ -1008,7 +1207,11 @@ mod tests {
     #[test]
     fn mounted_resource_handler_overrides_uri() {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///mounted".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "file:///stub".to_string(),
+            "file:///mounted".to_string(),
+        );
         let def = mounted.definition();
         assert_eq!(def.uri, "file:///mounted");
         assert_eq!(def.name, "stub");
@@ -1017,7 +1220,8 @@ mod tests {
     #[test]
     fn mounted_resource_handler_template_none_by_default() {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted =
+            MountedResourceHandler::new(inner, "file:///stub".to_string(), "file:///m".to_string());
         assert!(mounted.template().is_none());
     }
 
@@ -1033,8 +1237,12 @@ mod tests {
             version: None,
             tags: vec![],
         };
-        let mounted =
-            MountedResourceHandler::with_template(inner, "file:///items/{id}".to_string(), tmpl);
+        let mounted = MountedResourceHandler::with_template(
+            inner,
+            "file:///items/{id}".to_string(),
+            "file:///items/{id}".to_string(),
+            tmpl,
+        );
         let t = mounted.template().expect("template set");
         assert_eq!(t.uri_template, "file:///items/{id}");
     }
@@ -1042,17 +1250,20 @@ mod tests {
     #[test]
     fn mounted_resource_handler_delegates_read() {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted =
+            MountedResourceHandler::new(inner, "file:///stub".to_string(), "file:///m".to_string());
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
         let result = mounted.read(&ctx).unwrap();
         assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "file:///m");
     }
 
     #[test]
     fn mounted_resource_handler_delegates_tags() {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted =
+            MountedResourceHandler::new(inner, "file:///stub".to_string(), "file:///m".to_string());
         assert!(mounted.tags().is_empty());
     }
 
@@ -1264,7 +1475,7 @@ mod tests {
         }
 
         fn icon(&self) -> Option<&Icon> {
-            None // Still None but explicitly overridden
+            Some(custom_icon())
         }
 
         fn version(&self) -> Option<&str> {
@@ -1287,6 +1498,14 @@ mod tests {
     #[test]
     fn tool_handler_custom_version() {
         assert_eq!(CustomTool.version(), Some("2.0"));
+    }
+
+    #[test]
+    fn tool_handler_custom_icon() {
+        assert_eq!(
+            CustomTool.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
     }
 
     #[test]
@@ -1318,6 +1537,10 @@ mod tests {
 
         fn version(&self) -> Option<&str> {
             Some("1.5")
+        }
+
+        fn icon(&self) -> Option<&Icon> {
+            Some(custom_icon())
         }
 
         fn timeout(&self) -> Option<Duration> {
@@ -1352,6 +1575,14 @@ mod tests {
     #[test]
     fn resource_handler_custom_version() {
         assert_eq!(CustomResource.version(), Some("1.5"));
+    }
+
+    #[test]
+    fn resource_handler_custom_icon() {
+        assert_eq!(
+            CustomResource.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
     }
 
     #[test]
@@ -1390,6 +1621,10 @@ mod tests {
             Some("3.0")
         }
 
+        fn icon(&self) -> Option<&Icon> {
+            Some(custom_icon())
+        }
+
         fn timeout(&self) -> Option<Duration> {
             Some(Duration::from_secs(10))
         }
@@ -1409,11 +1644,30 @@ mod tests {
     }
 
     #[test]
+    fn prompt_handler_custom_icon() {
+        assert_eq!(
+            CustomPrompt.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
+    }
+
+    #[test]
     fn prompt_handler_custom_timeout() {
         assert_eq!(CustomPrompt.timeout(), Some(Duration::from_secs(10)));
     }
 
     // ── MountedToolHandler icon/version delegation ───────────────────
+
+    #[test]
+    fn mounted_tool_handler_delegates_icon_and_version() {
+        let inner = Box::new(CustomTool) as BoxedToolHandler;
+        let mounted = MountedToolHandler::new(inner, "m_custom".to_string());
+        assert_eq!(mounted.version(), Some("2.0"));
+        assert_eq!(
+            mounted.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
+    }
 
     #[test]
     fn mounted_tool_handler_delegates_timeout() {
@@ -1433,27 +1687,67 @@ mod tests {
     // ── MountedResourceHandler delegates ─────────────────────────────
 
     #[test]
+    fn mounted_resource_handler_delegates_icon_and_version() {
+        let inner = Box::new(CustomResource) as BoxedResourceHandler;
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "file:///custom".to_string(),
+            "ns/file:///custom".to_string(),
+        );
+        assert_eq!(mounted.version(), Some("1.5"));
+        assert_eq!(
+            mounted.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
+    }
+
+    #[test]
     fn mounted_resource_handler_delegates_read_with_uri() {
         let inner = Box::new(CustomResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///mounted".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "file:///custom".to_string(),
+            "ns/file:///custom".to_string(),
+        );
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
         let mut params = UriParams::new();
         params.insert("id".to_string(), "99".to_string());
         let result = mounted
-            .read_with_uri(&ctx, "file:///items/99", &params)
+            .read_with_uri(&ctx, "ns/file:///items/99", &params)
             .unwrap();
         assert_eq!(result[0].text.as_deref(), Some("item:99"));
+        assert_eq!(result[0].uri, "ns/file:///items/99");
+        assert!(
+            mounted
+                .read_with_uri(&ctx, "other/file:///items/99", &params)
+                .is_err()
+        );
     }
 
     #[test]
     fn mounted_resource_handler_delegates_timeout() {
         let inner = Box::new(CustomResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "file:///custom".to_string(),
+            "file:///m".to_string(),
+        );
         assert_eq!(mounted.timeout(), Some(Duration::from_secs(30)));
     }
 
     // ── MountedPromptHandler delegates ───────────────────────────────
+
+    #[test]
+    fn mounted_prompt_handler_delegates_icon_and_version() {
+        let inner = Box::new(CustomPrompt) as BoxedPromptHandler;
+        let mounted = MountedPromptHandler::new(inner, "ns_custom".to_string());
+        assert_eq!(mounted.version(), Some("3.0"));
+        assert_eq!(
+            mounted.icon().and_then(|icon| icon.src.as_deref()),
+            Some("https://example.test/component.svg")
+        );
+    }
 
     #[test]
     fn mounted_prompt_handler_delegates_timeout() {
@@ -1656,12 +1950,16 @@ mod tests {
     #[test]
     fn mounted_resource_handler_delegates_read_async() {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted =
+            MountedResourceHandler::new(inner, "file:///stub".to_string(), "file:///m".to_string());
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
         let outcome = fastmcp_core::block_on(mounted.read_async(&ctx));
         match outcome {
-            Outcome::Ok(content) => assert_eq!(content.len(), 1),
+            Outcome::Ok(content) => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].uri, "file:///m");
+            }
             other => panic!("expected Ok, got {:?}", other),
         }
     }
@@ -1669,16 +1967,93 @@ mod tests {
     #[test]
     fn mounted_resource_handler_delegates_read_async_with_uri() {
         let inner = Box::new(CustomResource) as BoxedResourceHandler;
-        let mounted = MountedResourceHandler::new(inner, "file:///m".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "file:///custom".to_string(),
+            "ns/file:///custom".to_string(),
+        );
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
         let mut params = UriParams::new();
         params.insert("id".to_string(), "5".to_string());
-        let outcome =
-            fastmcp_core::block_on(mounted.read_async_with_uri(&ctx, "file:///items/5", &params));
+        let outcome = fastmcp_core::block_on(mounted.read_async_with_uri(
+            &ctx,
+            "ns/file:///items/5",
+            &params,
+        ));
         match outcome {
-            Outcome::Ok(content) => assert_eq!(content[0].text.as_deref(), Some("item:5")),
+            Outcome::Ok(content) => {
+                assert_eq!(content[0].text.as_deref(), Some("item:5"));
+                assert_eq!(content[0].uri, "ns/file:///items/5");
+            }
             other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mounted_resource_template_translates_true_async_request_and_result_uri() {
+        struct AsyncTemplateResource;
+
+        impl ResourceHandler for AsyncTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "db://placeholder".to_string(),
+                    name: "async-template".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                panic!("the true-async override must be used")
+            }
+
+            fn read_async_with_uri<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                uri: &'a str,
+                params: &'a UriParams,
+            ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+                Box::pin(async move {
+                    Outcome::Ok(vec![ResourceContent {
+                        uri: uri.to_string(),
+                        mime_type: None,
+                        text: params.get("table").cloned(),
+                        blob: None,
+                    }])
+                })
+            }
+        }
+
+        let mounted = MountedResourceHandler::with_template(
+            Box::new(AsyncTemplateResource),
+            "db://{table}".to_string(),
+            "ns/db://{table}".to_string(),
+            ResourceTemplate {
+                uri_template: "ns/db://{table}".to_string(),
+                name: "async-template".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+        );
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let params = UriParams::from([("table".to_string(), "users".to_string())]);
+
+        let outcome =
+            fastmcp_core::block_on(mounted.read_async_with_uri(&ctx, "ns/db://users", &params));
+        match outcome {
+            Outcome::Ok(contents) => {
+                assert_eq!(contents[0].uri, "ns/db://users");
+                assert_eq!(contents[0].text.as_deref(), Some("users"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 

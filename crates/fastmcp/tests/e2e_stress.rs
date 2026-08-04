@@ -95,7 +95,9 @@ fn spawn_stress_server(
 
     let server_handle = std::thread::spawn(move || {
         let cx = Cx::for_testing();
-        server.run_transport_returning_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("stress server loop");
     });
 
     (client_transport, server_handle)

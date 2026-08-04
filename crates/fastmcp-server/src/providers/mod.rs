@@ -5,27 +5,27 @@
 //!
 //! # Available Providers
 //!
-//! - [`FilesystemProvider`]: Exposes files from a directory as resources
+//! - [`FilesystemProvider`]: Quarantined implementation for exposing files as
+//!   resources. Its public `build` method currently fails closed on every
+//!   target because the server does not yet provide a guaranteed non-inline,
+//!   bounded, owned-and-drained blocking-I/O capability.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use fastmcp_rust::prelude::*;
-//! use fastmcp_server::providers::FilesystemProvider;
+//! use fastmcp_rust::providers::{FilesystemProvider, FilesystemProviderError};
 //!
-//! let provider = FilesystemProvider::new("/data/docs")
+//! let result = FilesystemProvider::new("/data/docs")
 //!     .with_prefix("docs")
 //!     .with_patterns(&["**/*.md", "**/*.txt"])
-//!     .with_recursive(true);
-//!
-//! // Get all resource handlers from the provider
-//! for handler in provider.handlers() {
-//!     server_builder = server_builder.resource(handler);
-//! }
+//!     .with_recursive(true)
+//!     .build();
+//! assert!(matches!(result, Err(FilesystemProviderError::FeatureUnavailable { .. })));
 //! ```
 
 #![forbid(unsafe_code)]
 
 mod filesystem;
 
-pub use filesystem::{FilesystemProvider, FilesystemProviderError};
+pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};

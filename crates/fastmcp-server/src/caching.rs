@@ -1,39 +1,58 @@
 //! Response caching middleware for MCP servers.
 //!
-//! This module provides a caching middleware that can cache responses for
-//! various MCP methods to improve performance and reduce redundant processing.
+//! This module provides a bounded, process-local response cache for MCP methods
+//! whose results are safe to share between otherwise unrelated requests.
+//!
+//! Cache keys include the complete verified [`fastmcp_core::AuthContext`] plus
+//! its hidden stable owner key. Session-backed requests additionally include a
+//! cryptographically opaque session-state identity and monotonic mutation
+//! revision. Stateless authenticated contexts are therefore isolated by both
+//! handler-visible facts and provider-scoped ownership. Requests with
+//! uncommitted authentication, or session state whose partition cannot be
+//! obtained, bypass lookup and storage. Direct anonymous contexts remain in a
+//! separate stateless domain for standalone middleware use and tests.
 //!
 //! # Cached Methods
 //!
-//! By default, the middleware caches responses for:
+//! For a live context with a safe complete partition (or a standalone context
+//! with neither session nor auth), the default method policy permits caching:
 //! - `tools/list` - 5 minute TTL
 //! - `resources/list` - 5 minute TTL
 //! - `prompts/list` - 5 minute TTL
 //! - `resources/read` - 1 hour TTL
 //! - `prompts/get` - 1 hour TTL
-//! - `tools/call` - 1 hour TTL (configurable per tool)
+//! - `tools/call` - disabled unless individual tool names are explicitly
+//!   allowlisted with [`ResponseCachingMiddleware::include_tools`]
+//!
+//! Exclusions always override the `tools/call` allowlist. Tool-call caching is
+//! intended only for tools whose results are deterministic, side-effect free,
+//! and independent of external mutable state. Even an allowlisted tool is
+//! bypassed when a complete safe cache partition cannot be derived.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use fastmcp_rust::prelude::*;
-//! use fastmcp_server::caching::ResponseCachingMiddleware;
+//! use fastmcp_rust::caching::ResponseCachingMiddleware;
 //!
 //! let caching = ResponseCachingMiddleware::new()
 //!     .list_ttl_secs(600)  // 10 minute TTL for list operations
-//!     .call_ttl_secs(3600); // 1 hour TTL for call operations
+//!     .call_ttl_secs(3600) // 1 hour TTL for call/get/read operations
+//!     .include_tools(vec!["deterministic_lookup".to_string()]);
 //!
 //! Server::new("my-server", "1.0.0")
 //!     .middleware(caching)
+//!     .build()
 //!     .run_stdio();
 //! ```
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fastmcp_core::{McpContext, McpError, McpResult};
+use fastmcp_core::{McpContext, McpError, McpResult, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::JsonRpcRequest;
 
 use crate::{Middleware, MiddlewareDecision};
@@ -41,67 +60,346 @@ use crate::{Middleware, MiddlewareDecision};
 /// Default TTL for list operations (5 minutes).
 pub const DEFAULT_LIST_TTL_SECS: u64 = 300;
 
-/// Default TTL for call/get/read operations (1 hour).
+/// Default TTL for allowlisted call/get/read operations (1 hour).
 pub const DEFAULT_CALL_TTL_SECS: u64 = 3600;
 
 /// Maximum cache item size in bytes (1 MB).
 pub const DEFAULT_MAX_ITEM_SIZE: usize = 1024 * 1024;
 
+/// Maximum canonical input admitted while deriving one fixed-width cache key.
+const MAX_CACHE_KEY_INPUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum JSON nesting and aggregate nodes admitted to cache serialization.
+const MAX_CACHE_JSON_DEPTH: usize = 128;
+const MAX_CACHE_JSON_NODES: usize = 100_000;
+
+/// Small writes share an initial allocation and subsequent growth doubles the
+/// current capacity. Every target is still capped by the caller's logical byte
+/// limit, so fragmented serializer output cannot trigger one allocation per
+/// fragment or reserve beyond the configured bound.
+const CACHE_BYTES_GROWTH_CHUNK: usize = 4 * 1024;
+
+/// Conservative accounting for the entry, duplicate map/order keys, hash-table
+/// bucket/control storage, the `Arc` allocation header, and allocator metadata.
+/// The encoded payload length is added separately.
+const CACHE_ENTRY_METADATA_BYTES: usize = 512;
+
+/// Domain separators for cache request and authorization/session partitions.
+const CACHE_REQUEST_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-request-v2\0";
+const CACHE_PARTITION_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-partition-v2\0";
+const CACHE_STATELESS_PARTITION_DOMAIN: &[u8] = b"fastmcp-response-cache-stateless-partition-v1\0";
+
+static NEXT_CACHE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_cache_instance_id() -> u64 {
+    NEXT_CACHE_INSTANCE_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or(0)
+}
+
 /// A cached response with expiration time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CacheEntry {
-    value: serde_json::Value,
+    encoded: Arc<[u8]>,
     expires_at: Instant,
     size_bytes: usize,
 }
 
+impl std::fmt::Debug for CacheEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheEntry")
+            .field("payload_bytes", &self.encoded.len())
+            .field("expires_at", &self.expires_at)
+            .field("accounted_bytes", &self.size_bytes)
+            .finish()
+    }
+}
+
 impl CacheEntry {
-    fn new(value: serde_json::Value, ttl: Duration) -> Self {
-        let size_bytes = value.to_string().len();
-        Self {
-            value,
-            expires_at: Instant::now() + ttl,
-            size_bytes,
+    fn new(value: serde_json::Value, ttl: Duration, max_size_bytes: usize) -> Option<Self> {
+        let encoded = encode_json_bounded(&value, max_size_bytes)?;
+        Self::new_encoded(encoded, ttl)
+    }
+
+    fn new_encoded(encoded: Arc<[u8]>, ttl: Duration) -> Option<Self> {
+        if ttl.is_zero() {
+            return None;
         }
+        let expires_at = Instant::now().checked_add(ttl)?;
+        let size_bytes = encoded.len().checked_add(CACHE_ENTRY_METADATA_BYTES)?;
+        Some(Self {
+            encoded,
+            expires_at,
+            size_bytes,
+        })
     }
 
     fn is_expired(&self) -> bool {
-        Instant::now() > self.expires_at
+        Instant::now() >= self.expires_at
     }
 }
 
 /// Cache key derived from method and parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
-    method: String,
-    params_hash: u64,
+    request_digest: Sha256Digest,
+    partition_digest: Sha256Digest,
 }
 
 impl CacheKey {
-    fn new(method: &str, params: Option<&serde_json::Value>) -> Self {
-        let params_hash = match params {
-            Some(v) => hash_json_value(v),
-            None => 0,
-        };
-        Self {
-            method: method.to_string(),
-            params_hash,
+    fn try_request_digest(
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> Option<Sha256Digest> {
+        if params.is_some_and(|params| !cache_json_shape_is_bounded(params)) {
+            return None;
         }
+        let mut canonical = BoundedCacheBytes::new(MAX_CACHE_KEY_INPUT_BYTES);
+        canonical.write_all(CACHE_REQUEST_KEY_DOMAIN).ok()?;
+        let method_len = u64::try_from(method.len()).ok()?;
+        canonical.write_all(&method_len.to_be_bytes()).ok()?;
+        canonical.write_all(method.as_bytes()).ok()?;
+        match params {
+            None => canonical.write_all(&[0]).ok()?,
+            Some(params) => {
+                canonical.write_all(&[1]).ok()?;
+                serde_json::to_writer(&mut canonical, params).ok()?;
+            }
+        }
+        sha256_bounded(&canonical.bytes, MAX_CACHE_KEY_INPUT_BYTES).ok()
+    }
+
+    fn try_new_partitioned(
+        method: &str,
+        params: Option<&serde_json::Value>,
+        partition_digest: Sha256Digest,
+    ) -> Option<Self> {
+        Some(Self {
+            request_digest: Self::try_request_digest(method, params)?,
+            partition_digest,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_new(method: &str, params: Option<&serde_json::Value>) -> Option<Self> {
+        let partition_digest = sha256_bounded(
+            CACHE_STATELESS_PARTITION_DOMAIN,
+            CACHE_STATELESS_PARTITION_DOMAIN.len(),
+        )
+        .ok()?;
+        Self::try_new_partitioned(method, params, partition_digest)
+    }
+
+    #[cfg(test)]
+    fn new(method: &str, params: Option<&serde_json::Value>) -> Self {
+        Self::try_new(method, params).expect("test cache key must fit the fixed input bound")
     }
 }
 
-/// Computes a stable hash of a JSON value.
-fn hash_json_value(value: &serde_json::Value) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
+struct BoundedCacheBytes {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    #[cfg(test)]
+    growth_events: usize,
+}
 
-    let mut hasher = DefaultHasher::new();
+impl BoundedCacheBytes {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            #[cfg(test)]
+            growth_events: 0,
+        }
+    }
 
-    // Convert to canonical JSON string for consistent hashing
-    // This handles key ordering in objects
-    let json_str = serde_json::to_string(value).unwrap_or_default();
-    json_str.hash(&mut hasher);
+    fn ensure_capacity_for(&mut self, next_size: usize) -> std::io::Result<()> {
+        if next_size <= self.bytes.capacity() {
+            return Ok(());
+        }
 
-    hasher.finish()
+        let current_capacity = self.bytes.capacity();
+        let chunk_target = CACHE_BYTES_GROWTH_CHUNK.min(self.max_bytes);
+        let geometric_target = if current_capacity == 0 {
+            chunk_target
+        } else {
+            current_capacity
+                .checked_mul(2)
+                .unwrap_or(self.max_bytes)
+                .min(self.max_bytes)
+        };
+        let target_capacity = next_size.max(geometric_target).min(self.max_bytes);
+
+        // Allocate separately so even an allocator that reports more capacity
+        // than requested cannot leave this bounded writer above its logical
+        // limit. The existing buffer remains intact on every failure path.
+        let mut grown = Vec::new();
+        grown
+            .try_reserve_exact(target_capacity)
+            .map_err(|_| std::io::Error::other("cannot allocate bounded cache input"))?;
+        if grown.capacity() > self.max_bytes {
+            return Err(std::io::Error::other(
+                "cache input allocation exceeds configured limit",
+            ));
+        }
+        grown.extend_from_slice(&self.bytes);
+        self.bytes = grown;
+        #[cfg(test)]
+        {
+            self.growth_events = self.growth_events.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+impl Write for BoundedCacheBytes {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next_size = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .filter(|size| *size <= self.max_bytes)
+            .ok_or_else(|| std::io::Error::other("cache input exceeds configured limit"))?;
+        self.ensure_capacity_for(next_size)?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn cache_json_shape_is_bounded(value: &serde_json::Value) -> bool {
+    let mut stack = Vec::new();
+    if stack.try_reserve_exact(1).is_err() {
+        return false;
+    }
+    stack.push((value, 0_usize));
+    let mut admitted_nodes = 1_usize;
+
+    while let Some((node, depth)) = stack.pop() {
+        let child_depth = match depth.checked_add(1) {
+            Some(depth) => depth,
+            None => return false,
+        };
+        match node {
+            serde_json::Value::Array(values) => {
+                if !values.is_empty() && child_depth > MAX_CACHE_JSON_DEPTH {
+                    return false;
+                }
+                admitted_nodes = match admitted_nodes
+                    .checked_add(values.len())
+                    .filter(|nodes| *nodes <= MAX_CACHE_JSON_NODES)
+                {
+                    Some(nodes) => nodes,
+                    None => return false,
+                };
+                if stack.try_reserve(values.len()).is_err() {
+                    return false;
+                }
+                stack.extend(values.iter().map(|value| (value, child_depth)));
+            }
+            serde_json::Value::Object(values) => {
+                if !values.is_empty() && child_depth > MAX_CACHE_JSON_DEPTH {
+                    return false;
+                }
+                admitted_nodes = match admitted_nodes
+                    .checked_add(values.len())
+                    .filter(|nodes| *nodes <= MAX_CACHE_JSON_NODES)
+                {
+                    Some(nodes) => nodes,
+                    None => return false,
+                };
+                if stack.try_reserve(values.len()).is_err() {
+                    return false;
+                }
+                stack.extend(values.values().map(|value| (value, child_depth)));
+            }
+            _ => {}
+        }
+    }
+
+    true
+}
+
+fn encode_json_bounded(value: &serde_json::Value, max_bytes: usize) -> Option<Arc<[u8]>> {
+    if !cache_json_shape_is_bounded(value) {
+        return None;
+    }
+    let mut encoded = BoundedCacheBytes::new(max_bytes);
+    serde_json::to_writer(&mut encoded, value).ok()?;
+    Some(Arc::from(encoded.bytes.into_boxed_slice()))
+}
+
+fn decode_cached_json(encoded: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(encoded).ok()
+}
+
+#[derive(Clone, Copy)]
+enum CachePartitionPhase {
+    Request,
+    Response,
+}
+
+fn context_cache_partition(ctx: &McpContext, phase: CachePartitionPhase) -> Option<Sha256Digest> {
+    ctx.ensure_live().ok()?;
+    // Authentication admission is write-once. An uncommitted request must
+    // never consult or populate a cache merely because it has no session.
+    let auth_partition = ctx.cache_auth_partition()?;
+    let session_partition = match phase {
+        CachePartitionPhase::Request => ctx.begin_session_cache_partition(),
+        CachePartitionPhase::Response => ctx.complete_session_cache_partition(),
+    };
+    if let Some(auth) = auth_partition.as_ref() {
+        if auth.scopes.len() > MAX_CACHE_JSON_NODES
+            || auth
+                .claims
+                .as_ref()
+                .is_some_and(|claims| !cache_json_shape_is_bounded(claims))
+        {
+            return None;
+        }
+    }
+
+    let mut canonical = BoundedCacheBytes::new(MAX_CACHE_KEY_INPUT_BYTES);
+    canonical.write_all(CACHE_PARTITION_KEY_DOMAIN).ok()?;
+    match session_partition {
+        Some((opaque_session, state_revision)) => {
+            canonical.write_all(&[1]).ok()?;
+            canonical.write_all(&opaque_session).ok()?;
+            canonical.write_all(&state_revision.to_be_bytes()).ok()?;
+        }
+        None if ctx.has_session_state() => return None,
+        None => canonical.write_all(CACHE_STATELESS_PARTITION_DOMAIN).ok()?,
+    }
+    match auth_partition {
+        None => canonical.write_all(&[0]).ok()?,
+        Some(auth) => {
+            canonical.write_all(&[1]).ok()?;
+            match auth.session_owner() {
+                None => canonical.write_all(&[0]).ok()?,
+                Some(owner) => {
+                    canonical.write_all(&[1]).ok()?;
+                    canonical.write_all(owner.as_bytes()).ok()?;
+                }
+            }
+            serde_json::to_writer(&mut canonical, &auth).ok()?;
+        }
+    }
+    sha256_bounded(&canonical.bytes, MAX_CACHE_KEY_INPUT_BYTES).ok()
+}
+
+fn context_cache_commit_is_admissible(ctx: &McpContext) -> bool {
+    // Check the session partition before the final liveness read. In
+    // particular, `has_session_state()` intentionally reports false after a
+    // request lease closes; the final `ensure_live()` prevents that transition
+    // from being mistaken for a genuinely stateless request.
+    let session_partition_is_current =
+        !ctx.has_session_state() || ctx.complete_session_cache_partition().is_some();
+    session_partition_is_current && ctx.ensure_live().is_ok()
 }
 
 /// Configuration for caching specific methods.
@@ -123,11 +421,15 @@ impl Default for MethodCacheConfig {
 }
 
 /// Configuration for `tools/call` caching.
+///
+/// A tool is cacheable only when [`MethodCacheConfig::enabled`] is `true`, its
+/// name appears in [`Self::included_tools`], and its name does not appear in
+/// [`Self::excluded_tools`].
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallCacheConfig {
     /// Base configuration.
     pub base: MethodCacheConfig,
-    /// Tools to include (if empty, include all).
+    /// Tools explicitly allowlisted for caching (empty disables tool caching).
     pub included_tools: Vec<String>,
     /// Tools to exclude (takes precedence over included).
     pub excluded_tools: Vec<String>,
@@ -141,17 +443,13 @@ impl ToolCallCacheConfig {
         }
 
         // Check exclusions first (takes precedence)
-        if self.excluded_tools.contains(&tool_name.to_string()) {
+        if self.excluded_tools.iter().any(|name| name == tool_name) {
             return false;
         }
 
-        // If include list is specified, tool must be in it
-        if !self.included_tools.is_empty() {
-            return self.included_tools.contains(&tool_name.to_string());
-        }
-
-        // Default: include all
-        true
+        // Tool calls are stateful by default. Only an explicit allowlist entry
+        // can opt a tool into caching.
+        self.included_tools.iter().any(|name| name == tool_name)
     }
 }
 
@@ -184,7 +482,7 @@ impl LruCache {
         }
     }
 
-    fn get(&mut self, key: &CacheKey) -> Option<serde_json::Value> {
+    fn get_encoded(&mut self, key: &CacheKey) -> Option<Arc<[u8]>> {
         // Check if entry exists and is not expired
         if let Some(entry) = self.entries.get(key) {
             if entry.is_expired() {
@@ -199,19 +497,54 @@ impl LruCache {
                 self.order.push(k);
             }
 
-            return Some(entry.value.clone());
+            return Some(Arc::clone(&entry.encoded));
         }
         None
     }
 
-    fn insert(&mut self, key: CacheKey, value: serde_json::Value, ttl: Duration) {
-        let entry = CacheEntry::new(value, ttl);
+    #[cfg(test)]
+    fn get_value(&mut self, key: &CacheKey) -> Option<serde_json::Value> {
+        self.get_encoded(key)
+            .and_then(|encoded| decode_cached_json(&encoded))
+    }
 
-        // Check item size limit
-        if entry.size_bytes > self.max_item_size {
-            // Silently skip oversized items (matching Python behavior)
+    fn insert(&mut self, key: CacheKey, value: serde_json::Value, ttl: Duration) {
+        let admission_limit = self.max_item_size.min(
+            self.max_size_bytes
+                .saturating_sub(CACHE_ENTRY_METADATA_BYTES),
+        );
+        let Some(entry) = CacheEntry::new(value, ttl, admission_limit) else {
+            // An unrepresentable expiration must not turn into a panic or an
+            // accidentally immortal entry.
+            return;
+        };
+        self.insert_entry(key, entry);
+    }
+
+    fn insert_encoded(&mut self, key: CacheKey, encoded: Arc<[u8]>, ttl: Duration) {
+        if encoded.len() > self.max_item_size {
             return;
         }
+        let Some(entry) = CacheEntry::new_encoded(encoded, ttl) else {
+            return;
+        };
+        self.insert_entry(key, entry);
+    }
+
+    fn insert_entry(&mut self, key: CacheKey, entry: CacheEntry) {
+        // Reject impossible configurations and entries that can never fit.
+        // These checks happen before replacing an existing value, so a rejected
+        // replacement cannot destroy a valid cached entry.
+        if self.max_entries == 0
+            || self.max_size_bytes == 0
+            || entry.encoded.len() > self.max_item_size
+            || entry.size_bytes > self.max_size_bytes
+        {
+            return;
+        }
+
+        // Expired entries should not force eviction of live entries.
+        self.evict_expired();
 
         // Remove old entry if it exists
         if self.entries.contains_key(&key) {
@@ -220,47 +553,74 @@ impl LruCache {
 
         // Evict entries if needed to make room
         while self.entries.len() >= self.max_entries
-            || self.current_size_bytes + entry.size_bytes > self.max_size_bytes
+            || self
+                .current_size_bytes
+                .checked_add(entry.size_bytes)
+                .is_none_or(|size| size > self.max_size_bytes)
         {
             if self.order.is_empty() {
-                break;
+                // An inconsistent accounting state must fail closed instead of
+                // admitting an entry beyond a configured bound.
+                return;
             }
             // Evict least recently used (first in order)
             let oldest_key = self.order.remove(0);
             if let Some(old_entry) = self.entries.remove(&oldest_key) {
-                self.current_size_bytes -= old_entry.size_bytes;
+                self.current_size_bytes =
+                    self.current_size_bytes.saturating_sub(old_entry.size_bytes);
             }
         }
 
-        // Also remove expired entries opportunistically
-        self.evict_expired();
+        let Some(new_size) = self.current_size_bytes.checked_add(entry.size_bytes) else {
+            return;
+        };
+        if new_size > self.max_size_bytes || self.entries.len() >= self.max_entries {
+            return;
+        }
 
-        // Insert new entry
-        self.current_size_bytes += entry.size_bytes;
+        // Insert new entry only after all bounds have been rechecked.
+        self.current_size_bytes = new_size;
         self.entries.insert(key.clone(), entry);
         self.order.push(key);
     }
 
     fn remove(&mut self, key: &CacheKey) {
         if let Some(entry) = self.entries.remove(key) {
-            self.current_size_bytes -= entry.size_bytes;
+            self.current_size_bytes = self.current_size_bytes.saturating_sub(entry.size_bytes);
             if let Some(pos) = self.order.iter().position(|k| k == key) {
                 self.order.remove(pos);
             }
         }
     }
 
-    fn evict_expired(&mut self) {
-        let expired_keys: Vec<CacheKey> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.is_expired())
-            .map(|(key, _)| key.clone())
-            .collect();
+    fn remove_request_digest(&mut self, request_digest: Sha256Digest) {
+        let mut retained_size = self.current_size_bytes;
+        self.entries.retain(|key, entry| {
+            if key.request_digest == request_digest {
+                retained_size = retained_size.saturating_sub(entry.size_bytes);
+                false
+            } else {
+                true
+            }
+        });
+        self.order
+            .retain(|key| key.request_digest != request_digest);
+        self.current_size_bytes = retained_size;
+    }
 
-        for key in expired_keys {
-            self.remove(&key);
-        }
+    fn evict_expired(&mut self) {
+        let mut retained_size = self.current_size_bytes;
+        self.entries.retain(|_, entry| {
+            if entry.is_expired() {
+                retained_size = retained_size.saturating_sub(entry.size_bytes);
+                false
+            } else {
+                true
+            }
+        });
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
+        self.current_size_bytes = retained_size;
     }
 
     fn clear(&mut self) {
@@ -282,9 +642,12 @@ impl LruCache {
 /// Cache statistics.
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
-    /// Number of cache hits.
+    /// Number of hits from cache-eligible partitioned or standalone lookups.
     pub hits: u64,
-    /// Number of cache misses.
+    /// Number of misses from cache-eligible partitioned or standalone lookups.
+    ///
+    /// Requests bypassed due to an incomplete partition or method policy are
+    /// not counted as misses.
     pub misses: u64,
     /// Number of entries currently in cache.
     pub entries: usize,
@@ -296,25 +659,33 @@ impl CacheStats {
     /// Returns the hit rate as a percentage.
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
+        let hits = self.hits as f64;
+        let total = hits + self.misses as f64;
+        if total == 0.0 {
             0.0
         } else {
-            (self.hits as f64 / total as f64) * 100.0
+            (hits / total) * 100.0
         }
     }
 }
 
 /// Response caching middleware for MCP servers.
 ///
-/// Caches responses for list and call operations with configurable TTL.
-/// Uses an LRU eviction strategy when the cache is full.
+/// Caches eligible responses with configurable TTL and bounded LRU eviction.
+///
+/// Production contexts are isolated by opaque session-state identity, state
+/// mutation revision, and complete verified authentication facts. An
+/// incomplete partition fails closed. `tools/call` is additionally disabled by
+/// default and requires an explicit per-tool allowlist entry via
+/// [`Self::include_tools`].
 pub struct ResponseCachingMiddleware {
+    /// Process-local identity used only for per-request hit bookkeeping.
+    instance_id: u64,
     /// Cache storage.
     cache: Mutex<LruCache>,
     /// TTL for list operations.
     list_ttl: Duration,
-    /// TTL for call/get/read operations.
+    /// TTL for allowlisted call/get/read operations.
     call_ttl: Duration,
     /// Configuration for tools/list caching.
     tools_list_config: MethodCacheConfig,
@@ -335,6 +706,7 @@ pub struct ResponseCachingMiddleware {
 impl std::fmt::Debug for ResponseCachingMiddleware {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResponseCachingMiddleware")
+            .field("instance_available", &(self.instance_id != 0))
             .field("list_ttl", &self.list_ttl)
             .field("call_ttl", &self.call_ttl)
             .finish_non_exhaustive()
@@ -348,10 +720,13 @@ impl Default for ResponseCachingMiddleware {
 }
 
 impl ResponseCachingMiddleware {
-    /// Creates a new response caching middleware with default settings.
+    /// Creates response caching middleware with default bounds and TTLs.
+    ///
+    /// `tools/call` caching remains off until [`Self::include_tools`] is used.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            instance_id: next_cache_instance_id(),
             cache: Mutex::new(LruCache::new(
                 1000,
                 100 * 1024 * 1024,
@@ -371,14 +746,7 @@ impl ResponseCachingMiddleware {
                 enabled: true,
                 ttl_secs: DEFAULT_LIST_TTL_SECS,
             },
-            tools_call_config: ToolCallCacheConfig {
-                base: MethodCacheConfig {
-                    enabled: true,
-                    ttl_secs: DEFAULT_CALL_TTL_SECS,
-                },
-                included_tools: Vec::new(),
-                excluded_tools: Vec::new(),
-            },
+            tools_call_config: ToolCallCacheConfig::default(),
             resources_read_config: MethodCacheConfig {
                 enabled: true,
                 ttl_secs: DEFAULT_CALL_TTL_SECS,
@@ -391,7 +759,7 @@ impl ResponseCachingMiddleware {
         }
     }
 
-    /// Sets the maximum number of cache entries.
+    /// Sets the maximum number of cache entries (`0` disables storage).
     #[must_use]
     pub fn max_entries(self, max: usize) -> Self {
         let max_size = {
@@ -414,7 +782,7 @@ impl ResponseCachingMiddleware {
         }
     }
 
-    /// Sets the maximum cache size in bytes.
+    /// Sets the maximum cache size in bytes (`0` disables storage).
     #[must_use]
     pub fn max_size_bytes(self, max: usize) -> Self {
         let max_entries = {
@@ -437,7 +805,7 @@ impl ResponseCachingMiddleware {
         }
     }
 
-    /// Sets the maximum size per cache item in bytes.
+    /// Sets the maximum size per cache item in bytes (`0` disables storage).
     #[must_use]
     pub fn max_item_size(self, max: usize) -> Self {
         let max_entries = {
@@ -470,7 +838,7 @@ impl ResponseCachingMiddleware {
         self
     }
 
-    /// Sets the TTL for call/get/read operations.
+    /// Sets the TTL for read/get operations and explicitly allowlisted calls.
     #[must_use]
     pub fn call_ttl_secs(mut self, secs: u64) -> Self {
         self.call_ttl = Duration::from_secs(secs);
@@ -522,14 +890,17 @@ impl ResponseCachingMiddleware {
         self
     }
 
-    /// Sets the list of tools to include in caching (empty = all).
+    /// Explicitly allowlists tools for `tools/call` caching.
+    ///
+    /// An empty list disables `tools/call` caching. Exclusions configured with
+    /// [`Self::exclude_tools`] take precedence over this allowlist.
     #[must_use]
     pub fn include_tools(mut self, tools: Vec<String>) -> Self {
         self.tools_call_config.included_tools = tools;
         self
     }
 
-    /// Sets the list of tools to exclude from caching.
+    /// Excludes tools from `tools/call` caching, overriding the allowlist.
     #[must_use]
     pub fn exclude_tools(mut self, tools: Vec<String>) -> Self {
         self.tools_call_config.excluded_tools = tools;
@@ -562,14 +933,16 @@ impl ResponseCachingMiddleware {
         cache.clear();
     }
 
-    /// Invalidates a specific cache entry by method and params.
+    /// Invalidates every session/auth partition for a method and params pair.
     pub fn invalidate(&self, method: &str, params: Option<&serde_json::Value>) {
-        let key = CacheKey::new(method, params);
+        let Some(request_digest) = CacheKey::try_request_digest(method, params) else {
+            return;
+        };
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.remove(&key);
+        cache.remove_request_digest(request_digest);
     }
 
     /// Checks if a method should be cached.
@@ -614,7 +987,7 @@ impl ResponseCachingMiddleware {
             .stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stats.hits += 1;
+        stats.hits = stats.hits.saturating_add(1);
     }
 
     fn record_miss(&self) {
@@ -622,31 +995,68 @@ impl ResponseCachingMiddleware {
             .stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stats.misses += 1;
+        stats.misses = stats.misses.saturating_add(1);
     }
 }
 
 impl Middleware for ResponseCachingMiddleware {
     fn on_request(
         &self,
-        _ctx: &McpContext,
+        ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> McpResult<MiddlewareDecision> {
+        if self.instance_id == 0 {
+            return Ok(MiddlewareDecision::Continue);
+        }
         // Check if this method should be cached
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
             return Ok(MiddlewareDecision::Continue);
         }
 
-        // Try to get cached response
-        let key = CacheKey::new(&request.method, request.params.as_ref());
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(partition_digest) = context_cache_partition(ctx, CachePartitionPhase::Request)
+        else {
+            return Ok(MiddlewareDecision::Continue);
+        };
 
-        if let Some(value) = cache.get(&key) {
-            self.record_hit();
-            return Ok(MiddlewareDecision::Respond(value));
+        // Try to get cached response
+        let Some(key) = CacheKey::try_new_partitioned(
+            &request.method,
+            request.params.as_ref(),
+            partition_digest,
+        ) else {
+            return Ok(MiddlewareDecision::Continue);
+        };
+        let encoded = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get_encoded(&key)
+        };
+
+        if let Some(encoded) = encoded {
+            if let Some(value) = decode_cached_json(&encoded) {
+                // Session state can change while this request waits for the
+                // cache mutex or decodes a cached payload. Revalidate after
+                // both operations so a hit linearizes against the admitted
+                // revision instead of serving an entry made stale before the
+                // lookup completed. The final liveness check applies the same
+                // completion rule to cancellation and request-lease closure.
+                if !context_cache_commit_is_admissible(ctx) {
+                    return Ok(MiddlewareDecision::Continue);
+                }
+                if !ctx.mark_response_cache_hit(self.instance_id) {
+                    self.record_miss();
+                    return Ok(MiddlewareDecision::Continue);
+                }
+                self.record_hit();
+                return Ok(MiddlewareDecision::Respond(value));
+            }
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.remove(&key);
         }
 
         self.record_miss();
@@ -655,25 +1065,62 @@ impl Middleware for ResponseCachingMiddleware {
 
     fn on_response(
         &self,
-        _ctx: &McpContext,
+        ctx: &McpContext,
         request: &JsonRpcRequest,
         response: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
+        if self.instance_id == 0 {
+            return Ok(response);
+        }
         // Only cache if this method is cacheable
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
             return Ok(response);
         }
+        if ctx.response_was_cache_hit(self.instance_id) {
+            return Ok(response);
+        }
+
+        let Some(partition_digest) = context_cache_partition(ctx, CachePartitionPhase::Response)
+        else {
+            return Ok(response);
+        };
 
         // Store in cache
-        let key = CacheKey::new(&request.method, request.params.as_ref());
+        let Some(key) = CacheKey::try_new_partitioned(
+            &request.method,
+            request.params.as_ref(),
+            partition_digest,
+        ) else {
+            return Ok(response);
+        };
         let ttl = self.get_ttl(&request.method);
 
+        let admission_limit = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.max_item_size.min(
+                cache
+                    .max_size_bytes
+                    .saturating_sub(CACHE_ENTRY_METADATA_BYTES),
+            )
+        };
+        let Some(encoded) = encode_json_bounded(&response, admission_limit) else {
+            return Ok(response);
+        };
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        cache.insert(key, response.clone(), ttl);
+        // Encoding and waiting for the cache mutex may both be non-trivial for
+        // a response near the configured limits. Revalidate at the commit
+        // boundary so cancellation, lease closure, or session mutation cannot
+        // populate the cache after winning either race.
+        if !context_cache_commit_is_admissible(ctx) {
+            return Ok(response);
+        }
+        cache.insert_encoded(key, encoded, ttl);
 
         Ok(response)
     }
@@ -688,10 +1135,38 @@ impl Middleware for ResponseCachingMiddleware {
 mod tests {
     use super::*;
     use asupersync::Cx;
+    use fastmcp_core::{AuthContext, SessionState};
+
+    fn maximum_geometric_growth_events(max_bytes: usize) -> usize {
+        if max_bytes == 0 {
+            return 0;
+        }
+
+        let mut capacity = CACHE_BYTES_GROWTH_CHUNK.min(max_bytes);
+        let mut events = 1_usize;
+        while capacity < max_bytes {
+            capacity = capacity.checked_mul(2).unwrap_or(max_bytes).min(max_bytes);
+            events = events.saturating_add(1);
+        }
+        events
+    }
 
     fn test_context() -> McpContext {
         let cx = Cx::for_testing();
-        McpContext::new(cx, 1)
+        let ctx = McpContext::new(cx, 1);
+        assert!(ctx.commit_anonymous_auth());
+        ctx
+    }
+
+    fn partitioned_context(state: &SessionState, request_id: u64, auth: AuthContext) -> McpContext {
+        McpContext::with_state(Cx::for_testing(), request_id, state.clone()).with_auth(auth)
+    }
+
+    fn anonymous_partitioned_context(state: &SessionState, request_id: u64) -> McpContext {
+        let ctx = McpContext::with_state(Cx::for_testing(), request_id, state.clone());
+        assert!(ctx.commit_anonymous_auth());
+        assert!(ctx.auth().is_none());
+        ctx
     }
 
     fn test_request(method: &str, params: Option<serde_json::Value>) -> JsonRpcRequest {
@@ -716,7 +1191,7 @@ mod tests {
 
         // Insert and retrieve
         cache.insert(key.clone(), value.clone(), Duration::from_secs(60));
-        let retrieved = cache.get(&key);
+        let retrieved = cache.get_value(&key);
         assert_eq!(retrieved, Some(value));
     }
 
@@ -734,7 +1209,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Should be expired
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get_value(&key).is_none());
     }
 
     #[test]
@@ -763,15 +1238,14 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        assert!(cache.get(&key1).is_none());
-        assert!(cache.get(&key2).is_some());
-        assert!(cache.get(&key3).is_some());
+        assert!(cache.get_value(&key1).is_none());
+        assert!(cache.get_value(&key2).is_some());
+        assert!(cache.get_value(&key3).is_some());
     }
 
     #[test]
     fn test_lru_cache_size_limit() {
-        // Very small size limit
-        let mut cache = LruCache::new(100, 50, 1024);
+        let mut cache = LruCache::new(100, CACHE_ENTRY_METADATA_BYTES + 16, 1024);
 
         let key1 = CacheKey::new("test1", None);
         let key2 = CacheKey::new("test2", None);
@@ -790,8 +1264,8 @@ mod tests {
             serde_json::json!("another"),
             Duration::from_secs(60),
         );
-        // Cache should have evicted the first entry to make room
-        assert!(cache.len() <= 2);
+        assert!(cache.get_value(&key1).is_none());
+        assert_eq!(cache.get_value(&key2), Some(serde_json::json!("another")));
     }
 
     #[test]
@@ -804,7 +1278,96 @@ mod tests {
         cache.insert(key.clone(), large_value, Duration::from_secs(60));
 
         // Should not be stored
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get_value(&key).is_none());
+    }
+
+    #[test]
+    fn lru_cache_zero_entry_limit_rejects_every_insert() {
+        let mut cache = LruCache::new(0, 1024, 1024);
+        let key = CacheKey::new("test", None);
+
+        cache.insert(
+            key.clone(),
+            serde_json::json!("value"),
+            Duration::from_secs(60),
+        );
+
+        assert!(cache.get_value(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_zero_total_size_rejects_every_insert() {
+        let mut cache = LruCache::new(10, 0, 1024);
+        let key = CacheKey::new("test", None);
+
+        cache.insert(
+            key.clone(),
+            serde_json::json!("value"),
+            Duration::from_secs(60),
+        );
+
+        assert!(cache.get_value(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_item_larger_than_total_capacity_is_rejected() {
+        let value = serde_json::json!("larger than capacity");
+        let value_size = value.to_string().len();
+        let mut cache = LruCache::new(10, value_size - 1, value_size + 100);
+        let key = CacheKey::new("test", None);
+
+        cache.insert(key.clone(), value, Duration::from_secs(60));
+
+        assert!(cache.get_value(&key).is_none());
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_rejected_replacement_preserves_existing_entry_and_accounting() {
+        let mut cache = LruCache::new(10, 1024, 12);
+        let key = CacheKey::new("test", None);
+        let original = serde_json::json!("small");
+
+        cache.insert(key.clone(), original.clone(), Duration::from_secs(60));
+        let original_size = cache.current_size_bytes;
+
+        cache.insert(
+            key.clone(),
+            serde_json::json!("this replacement is too large"),
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(cache.get_value(&key), Some(original));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.current_size_bytes, original_size);
+    }
+
+    #[test]
+    fn lru_cache_unrepresentable_ttl_is_rejected_without_mutation() {
+        let mut cache = LruCache::new(10, 1024, 1024);
+        let key = CacheKey::new("test", None);
+
+        cache.insert(key.clone(), serde_json::json!("value"), Duration::MAX);
+
+        assert!(cache.get_value(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_size_bytes, 0);
+    }
+
+    #[test]
+    fn lru_cache_zero_ttl_is_never_observable() {
+        let mut cache = LruCache::new(10, 1024, 1024);
+        let key = CacheKey::new("test", None);
+
+        cache.insert(key.clone(), serde_json::json!("value"), Duration::ZERO);
+
+        assert!(cache.get_value(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.current_size_bytes, 0);
     }
 
     // ========================================
@@ -845,6 +1408,86 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_response_does_not_refresh_absolute_expiration() {
+        let middleware = ResponseCachingMiddleware::new().list_ttl_secs(60);
+        let ctx = test_context();
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": []});
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&ctx, &request, response.clone())
+            .unwrap();
+        let key = CacheKey::new("tools/list", None);
+        let expires_before_hit = middleware
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&key)
+            .expect("cached entry")
+            .expires_at;
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Respond(_)
+        ));
+        middleware.on_response(&ctx, &request, response).unwrap();
+
+        let expires_after_hit = middleware
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&key)
+            .expect("cache hit must retain the original entry")
+            .expires_at;
+        assert_eq!(expires_after_hit, expires_before_hit);
+    }
+
+    #[test]
+    fn downstream_cache_hit_does_not_prevent_upstream_cache_warming() {
+        let upstream = ResponseCachingMiddleware::new();
+        let downstream = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": ["warm"]});
+
+        let prewarm = test_context();
+        assert!(matches!(
+            downstream.on_request(&prewarm, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        downstream
+            .on_response(&prewarm, &request, response.clone())
+            .unwrap();
+
+        let shared_request = test_context();
+        assert!(matches!(
+            upstream.on_request(&shared_request, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let MiddlewareDecision::Respond(cached) =
+            downstream.on_request(&shared_request, &request).unwrap()
+        else {
+            panic!("downstream cache was not prewarmed");
+        };
+        downstream
+            .on_response(&shared_request, &request, cached.clone())
+            .unwrap();
+        upstream
+            .on_response(&shared_request, &request, cached)
+            .unwrap();
+
+        assert!(matches!(
+            upstream.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Respond(value) if value == response
+        ));
+    }
+
+    #[test]
     fn test_caching_middleware_skips_non_cacheable_methods() {
         let middleware = ResponseCachingMiddleware::new();
         let ctx = test_context();
@@ -865,7 +1508,8 @@ mod tests {
 
     #[test]
     fn test_caching_middleware_different_params_different_keys() {
-        let middleware = ResponseCachingMiddleware::new();
+        let middleware = ResponseCachingMiddleware::new()
+            .include_tools(vec!["tool_a".to_string(), "tool_b".to_string()]);
         let ctx = test_context();
 
         let request1 = test_request(
@@ -902,8 +1546,12 @@ mod tests {
 
     #[test]
     fn test_caching_middleware_tool_exclusion() {
-        let middleware =
-            ResponseCachingMiddleware::new().exclude_tools(vec!["excluded_tool".to_string()]);
+        let middleware = ResponseCachingMiddleware::new()
+            .include_tools(vec![
+                "excluded_tool".to_string(),
+                "included_tool".to_string(),
+            ])
+            .exclude_tools(vec!["excluded_tool".to_string()]);
         let ctx = test_context();
 
         let excluded_request = test_request(
@@ -956,6 +1604,423 @@ mod tests {
 
         let decision = middleware.on_request(&ctx, &request).unwrap();
         assert!(matches!(decision, MiddlewareDecision::Continue));
+    }
+
+    #[test]
+    fn tools_call_is_not_cached_without_an_explicit_allowlist() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "stateful_tool", "arguments": {}})),
+        );
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(
+                &ctx,
+                &request,
+                serde_json::json!({"result": "must not be stored"}),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert_eq!(middleware.stats().entries, 0);
+    }
+
+    #[test]
+    fn explicitly_allowlisted_tool_can_cache_in_unpartitioned_context() {
+        let middleware =
+            ResponseCachingMiddleware::new().include_tools(vec!["pure_tool".to_string()]);
+        let ctx = test_context();
+        let request = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "pure_tool", "arguments": {"x": 1}})),
+        );
+        let response = serde_json::json!({"result": 2});
+
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&ctx, &request, response.clone())
+            .unwrap();
+
+        let MiddlewareDecision::Respond(cached) = middleware.on_request(&ctx, &request).unwrap()
+        else {
+            panic!("explicitly allowlisted tool did not produce a cache hit");
+        };
+        assert_eq!(cached, response);
+    }
+
+    #[test]
+    fn stateless_cache_partitions_anonymous_and_authenticated_requests() {
+        let middleware = ResponseCachingMiddleware::new();
+        let anonymous_ctx = test_context();
+        let authenticated_ctx = McpContext::new(Cx::for_testing(), 2)
+            .with_auth(AuthContext::with_subject("principal-a"));
+        let request = test_request("tools/list", None);
+        let public_response = serde_json::json!({"tools": ["public"]});
+        let private_response = serde_json::json!({"tools": ["private"]});
+        assert!(authenticated_ctx.auth().is_some());
+
+        middleware
+            .on_response(&anonymous_ctx, &request, public_response.clone())
+            .unwrap();
+
+        // An authenticated request must not read an anonymous entry.
+        assert!(matches!(
+            middleware.on_request(&authenticated_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+
+        // Its response receives a separate stateless authorization partition.
+        middleware
+            .on_response(&authenticated_ctx, &request, private_response.clone())
+            .unwrap();
+        let MiddlewareDecision::Respond(cached) =
+            middleware.on_request(&anonymous_ctx, &request).unwrap()
+        else {
+            panic!("authenticated response unexpectedly replaced the public entry");
+        };
+        assert_eq!(cached, public_response);
+
+        let authenticated_retry = McpContext::new(Cx::for_testing(), 3)
+            .with_auth(AuthContext::with_subject("principal-a"));
+        let MiddlewareDecision::Respond(cached) = middleware
+            .on_request(&authenticated_retry, &request)
+            .unwrap()
+        else {
+            panic!("same authenticated stateless partition did not hit");
+        };
+        assert_eq!(cached, private_response);
+        assert_eq!(middleware.stats().entries, 2);
+    }
+
+    #[test]
+    fn stateless_cache_partitions_identical_auth_facts_by_session_owner() {
+        let middleware = ResponseCachingMiddleware::new();
+        let first_auth = AuthContext::with_subject("same-display")
+            .with_session_owner(Sha256Digest::from_bytes([1; 32]));
+        let second_auth = AuthContext::with_subject("same-display")
+            .with_session_owner(Sha256Digest::from_bytes([2; 32]));
+        let first_ctx = McpContext::new(Cx::for_testing(), 1).with_auth(first_auth.clone());
+        let second_ctx = McpContext::new(Cx::for_testing(), 2).with_auth(second_auth);
+        let request = test_request("tools/list", None);
+        let first_response = serde_json::json!({"tools": ["owner-one"]});
+
+        middleware
+            .on_response(&first_ctx, &request, first_response.clone())
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(&second_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+
+        let same_owner_retry = McpContext::new(Cx::for_testing(), 3).with_auth(first_auth);
+        let MiddlewareDecision::Respond(cached) =
+            middleware.on_request(&same_owner_retry, &request).unwrap()
+        else {
+            panic!("the same stateless owner partition did not hit");
+        };
+        assert_eq!(cached, first_response);
+    }
+
+    #[test]
+    fn stateless_cache_frames_absent_owner_separately_from_zero_owner() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ownerless_auth = AuthContext::with_subject("same-display");
+        let zero_owner_auth = ownerless_auth
+            .clone()
+            .with_session_owner(Sha256Digest::from_bytes([0; 32]));
+        let ownerless_ctx = McpContext::new(Cx::for_testing(), 1).with_auth(ownerless_auth);
+        let zero_owner_ctx = McpContext::new(Cx::for_testing(), 2).with_auth(zero_owner_auth);
+        let request = test_request("tools/list", None);
+        let ownerless_response = serde_json::json!({"tools": ["ownerless"]});
+
+        middleware
+            .on_response(&ownerless_ctx, &request, ownerless_response.clone())
+            .unwrap();
+
+        assert!(matches!(
+            middleware.on_request(&zero_owner_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let MiddlewareDecision::Respond(cached) =
+            middleware.on_request(&ownerless_ctx, &request).unwrap()
+        else {
+            panic!("the ownerless cache partition was no longer retrievable");
+        };
+        assert_eq!(cached, ownerless_response);
+        assert_eq!(middleware.stats().entries, 1);
+    }
+
+    #[test]
+    fn session_without_committed_auth_bypasses_lookup_and_storage() {
+        let middleware = ResponseCachingMiddleware::new();
+        let anonymous_ctx = test_context();
+        let session_ctx = McpContext::with_state(Cx::for_testing(), 2, SessionState::new());
+        let request = test_request("resources/list", None);
+        let public_response = serde_json::json!({"resources": ["public"]});
+        assert!(session_ctx.has_session_state());
+
+        middleware
+            .on_response(&anonymous_ctx, &request, public_response.clone())
+            .unwrap();
+
+        // A session-backed request must not read an unpartitioned entry.
+        assert!(matches!(
+            middleware.on_request(&session_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+
+        // Its response must not overwrite the unpartitioned entry either.
+        middleware
+            .on_response(
+                &session_ctx,
+                &request,
+                serde_json::json!({"resources": ["session-private"]}),
+            )
+            .unwrap();
+        let MiddlewareDecision::Respond(cached) =
+            middleware.on_request(&anonymous_ctx, &request).unwrap()
+        else {
+            panic!("session response unexpectedly replaced the public entry");
+        };
+        assert_eq!(cached, public_response);
+        assert_eq!(middleware.stats().entries, 1);
+    }
+
+    #[test]
+    fn allowlisted_tool_still_bypasses_uncommitted_context_partitions() {
+        let middleware =
+            ResponseCachingMiddleware::new().include_tools(vec!["pure_tool".to_string()]);
+        let stateless_ctx = McpContext::new(Cx::for_testing(), 1);
+        let session_ctx = McpContext::with_state(Cx::for_testing(), 2, SessionState::new());
+        let request = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "pure_tool", "arguments": {}})),
+        );
+
+        for ctx in [&stateless_ctx, &session_ctx] {
+            assert!(matches!(
+                middleware.on_request(ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            middleware
+                .on_response(ctx, &request, serde_json::json!({"result": "private"}))
+                .unwrap();
+        }
+
+        assert_eq!(middleware.stats().entries, 0);
+        assert!(matches!(
+            middleware.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn production_context_caches_within_one_session_and_auth_partition() {
+        let middleware = ResponseCachingMiddleware::new();
+        let state = SessionState::new();
+        let first = anonymous_partitioned_context(&state, 10);
+        let second = anonymous_partitioned_context(&state, 11);
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": ["session-tool"]});
+
+        assert!(matches!(
+            middleware.on_request(&first, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&first, &request, response.clone())
+            .unwrap();
+
+        let MiddlewareDecision::Respond(cached) = middleware.on_request(&second, &request).unwrap()
+        else {
+            panic!("same session/auth partition did not produce a cache hit");
+        };
+        assert_eq!(cached, response);
+    }
+
+    #[test]
+    fn production_cache_isolates_sessions_and_complete_auth_facts() {
+        let middleware = ResponseCachingMiddleware::new();
+        let first_state = SessionState::new();
+        let second_state = SessionState::new();
+        let mut alice_auth = AuthContext::with_subject("alice");
+        alice_auth.scopes = vec!["read".to_string()];
+        alice_auth.claims = Some(serde_json::json!({"tenant": "one"}));
+        let mut changed_claims = alice_auth.clone();
+        changed_claims.claims = Some(serde_json::json!({"tenant": "two"}));
+        let alice = partitioned_context(&first_state, 20, alice_auth.clone());
+        let other_session = partitioned_context(&second_state, 21, alice_auth);
+        let other_claims = partitioned_context(&first_state, 22, changed_claims);
+        let request = test_request("resources/list", None);
+
+        assert!(matches!(
+            middleware.on_request(&alice, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(
+                &alice,
+                &request,
+                serde_json::json!({"resources": ["alice-only"]}),
+            )
+            .unwrap();
+
+        for isolated in [&other_session, &other_claims] {
+            assert!(matches!(
+                middleware.on_request(isolated, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+        }
+        assert_eq!(middleware.stats().entries, 1);
+    }
+
+    #[test]
+    fn session_state_mutation_invalidates_prior_revision() {
+        let middleware = ResponseCachingMiddleware::new();
+        let state = SessionState::new();
+        let before = anonymous_partitioned_context(&state, 30);
+        let request = test_request("prompts/list", None);
+
+        assert!(matches!(
+            middleware.on_request(&before, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(
+                &before,
+                &request,
+                serde_json::json!({"prompts": ["before"]}),
+            )
+            .unwrap();
+        assert!(state.set("feature", "changed"));
+        let after = anonymous_partitioned_context(&state, 31);
+
+        assert!(matches!(
+            middleware.on_request(&after, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn response_is_not_cached_when_state_changes_during_dispatch() {
+        let middleware = ResponseCachingMiddleware::new();
+        let state = SessionState::new();
+        let mutating_request = anonymous_partitioned_context(&state, 35);
+        let request = test_request("resources/read", Some(serde_json::json!({"uri": "x"})));
+
+        assert!(matches!(
+            middleware.on_request(&mutating_request, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert!(state.set("handler-mutation", true));
+        middleware
+            .on_response(
+                &mutating_request,
+                &request,
+                serde_json::json!({"contents": ["computed-before-or-during-mutation"]}),
+            )
+            .unwrap();
+
+        assert_eq!(middleware.stats().entries, 0);
+        let next = anonymous_partitioned_context(&state, 36);
+        assert!(matches!(
+            middleware.on_request(&next, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
+    fn cache_hit_is_rejected_if_state_changes_while_lookup_waits() {
+        let middleware = Arc::new(ResponseCachingMiddleware::new());
+        let state = SessionState::new();
+        let populate = anonymous_partitioned_context(&state, 37);
+        let request = test_request("resources/list", None);
+        let response = serde_json::json!({"resources": ["before-mutation"]});
+
+        assert!(matches!(
+            middleware.on_request(&populate, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&populate, &request, response)
+            .unwrap();
+
+        let lookup_ctx = anonymous_partitioned_context(&state, 38);
+        let admission_observer = lookup_ctx.clone();
+        let lookup_middleware = Arc::clone(&middleware);
+        let lookup_request = request.clone();
+        let cache_guard = middleware
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lookup = std::thread::spawn(move || {
+            lookup_middleware
+                .on_request(&lookup_ctx, &lookup_request)
+                .expect("cache lookup should not fail")
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while admission_observer
+            .complete_session_cache_partition()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "lookup did not capture its session partition"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(state.set("changed-while-cache-locked", true));
+        drop(cache_guard);
+
+        let decision = lookup.join().expect("cache lookup thread");
+        assert!(matches!(decision, MiddlewareDecision::Continue));
+        assert_eq!(middleware.stats().hits, 0);
+    }
+
+    #[test]
+    fn invalidate_removes_every_partition_for_request_identity() {
+        let middleware = ResponseCachingMiddleware::new();
+        let first_state = SessionState::new();
+        let second_state = SessionState::new();
+        let first = anonymous_partitioned_context(&first_state, 40);
+        let second = anonymous_partitioned_context(&second_state, 41);
+        let request = test_request("tools/list", Some(serde_json::json!({"cursor": "same"})));
+
+        for (ctx, response) in [
+            (&first, serde_json::json!({"tools": ["first"]})),
+            (&second, serde_json::json!({"tools": ["second"]})),
+        ] {
+            assert!(matches!(
+                middleware.on_request(ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            middleware.on_response(ctx, &request, response).unwrap();
+        }
+        assert_eq!(middleware.stats().entries, 2);
+
+        middleware.invalidate("tools/list", request.params.as_ref());
+
+        assert_eq!(middleware.stats().entries, 0);
+        for ctx in [&first, &second] {
+            assert!(matches!(
+                middleware.on_request(ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+        }
     }
 
     #[test]
@@ -1023,6 +2088,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_stats_hit_rate_does_not_overflow_saturated_counters() {
+        let stats = CacheStats {
+            hits: u64::MAX,
+            misses: u64::MAX,
+            entries: 0,
+            size_bytes: 0,
+        };
+        assert!((stats.hit_rate() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn cache_stats_debug() {
         let stats = CacheStats::default();
         let debug = format!("{:?}", stats);
@@ -1046,35 +2122,116 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_none_params_hash_is_zero() {
-        let k = CacheKey::new("test", None);
-        assert_eq!(k.params_hash, 0);
+    fn cache_key_method_and_param_presence_are_domain_separated() {
+        let no_params = CacheKey::new("test", None);
+        let null_params = CacheKey::new("test", Some(&serde_json::Value::Null));
+        let other_method = CacheKey::new("other", None);
+        assert_ne!(no_params, null_params);
+        assert_ne!(no_params, other_method);
     }
 
     #[test]
     fn cache_key_debug_and_clone() {
         let k = CacheKey::new("test", None);
         let debug = format!("{:?}", k);
-        assert!(debug.contains("test"));
+        assert!(debug.contains("CacheKey"));
+        assert!(!debug.contains("test"));
         let cloned = k.clone();
         assert_eq!(k, cloned);
     }
 
-    // ── hash_json_value ────────────────────────────────────────────────
+    // ── bounded cache-key derivation ───────────────────────────────────
 
     #[test]
-    fn hash_json_value_deterministic() {
+    fn cache_key_derivation_is_deterministic() {
         let v = serde_json::json!({"key": "value", "num": 42});
-        let h1 = hash_json_value(&v);
-        let h2 = hash_json_value(&v);
+        let h1 = CacheKey::new("tools/list", Some(&v));
+        let h2 = CacheKey::new("tools/list", Some(&v));
         assert_eq!(h1, h2);
     }
 
     #[test]
-    fn hash_json_value_different_values_differ() {
-        let h1 = hash_json_value(&serde_json::json!(1));
-        let h2 = hash_json_value(&serde_json::json!(2));
+    fn cache_key_derivation_distinguishes_values() {
+        let h1 = CacheKey::new("tools/list", Some(&serde_json::json!(1)));
+        let h2 = CacheKey::new("tools/list", Some(&serde_json::json!(2)));
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn cache_key_derivation_rejects_oversized_input_before_retention() {
+        let oversized_method = "x".repeat(MAX_CACHE_KEY_INPUT_BYTES + 1);
+        assert!(CacheKey::try_new(&oversized_method, None).is_none());
+
+        let mut exact = BoundedCacheBytes::new(4);
+        exact.write_all(b"1234").expect("exact boundary fits");
+        assert!(exact.write_all(b"5").is_err());
+        assert_eq!(exact.bytes, b"1234");
+        assert!(exact.bytes.capacity() <= exact.max_bytes);
+    }
+
+    #[test]
+    fn bounded_cache_bytes_fragmented_writes_grow_geometrically_within_limit() {
+        const LIMIT: usize = 128 * 1024 + 37;
+        let mut encoded = BoundedCacheBytes::new(LIMIT);
+
+        for _ in 0..LIMIT {
+            encoded
+                .write_all(b"x")
+                .expect("each byte remains inside the logical limit");
+        }
+
+        assert_eq!(encoded.bytes.len(), LIMIT);
+        assert!(encoded.bytes.capacity() <= LIMIT);
+        assert!(
+            encoded.growth_events <= maximum_geometric_growth_events(LIMIT),
+            "{} growth events exceeded the logarithmic bound",
+            encoded.growth_events
+        );
+        assert_eq!(encoded.bytes[0], b'x');
+        assert_eq!(encoded.bytes[LIMIT - 1], b'x');
+
+        let length_before_rejection = encoded.bytes.len();
+        let capacity_before_rejection = encoded.bytes.capacity();
+        let growth_before_rejection = encoded.growth_events;
+        assert!(encoded.write_all(b"x").is_err());
+        assert_eq!(encoded.bytes.len(), length_before_rejection);
+        assert_eq!(encoded.bytes.capacity(), capacity_before_rejection);
+        assert_eq!(encoded.growth_events, growth_before_rejection);
+    }
+
+    #[test]
+    fn bounded_cache_bytes_large_flat_json_has_bounded_growth() {
+        let value = serde_json::json!({"data": "x".repeat(768 * 1024)});
+        let expected = serde_json::to_vec(&value).expect("test JSON serializes");
+        let logical_limit = expected.len();
+        let mut encoded = BoundedCacheBytes::new(logical_limit);
+
+        serde_json::to_writer(&mut encoded, &value).expect("flat JSON fits exact limit");
+
+        assert_eq!(encoded.bytes, expected);
+        assert!(encoded.bytes.capacity() <= logical_limit);
+        assert!(
+            encoded.growth_events <= maximum_geometric_growth_events(logical_limit),
+            "{} growth events exceeded the logarithmic bound",
+            encoded.growth_events
+        );
+    }
+
+    #[test]
+    fn cache_entry_size_measurement_stops_at_item_limit() {
+        let value = serde_json::json!("0123456789");
+        assert!(encode_json_bounded(&value, value.to_string().len()).is_some());
+        assert!(encode_json_bounded(&value, value.to_string().len() - 1).is_none());
+    }
+
+    #[test]
+    fn cache_serialization_rejects_excessive_json_depth() {
+        let mut value = serde_json::Value::Null;
+        for _ in 0..=MAX_CACHE_JSON_DEPTH {
+            value = serde_json::Value::Array(vec![value]);
+        }
+
+        assert!(encode_json_bounded(&value, DEFAULT_MAX_ITEM_SIZE).is_none());
     }
 
     // ── LruCache additional tests ──────────────────────────────────────
@@ -1124,13 +2281,13 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get(&key), Some(serde_json::json!("v2")));
+        assert_eq!(cache.get_value(&key), Some(serde_json::json!("v2")));
     }
 
     #[test]
     fn lru_cache_get_miss_returns_none() {
         let mut cache = LruCache::new(10, 1024 * 1024, 1024);
-        assert!(cache.get(&CacheKey::new("missing", None)).is_none());
+        assert!(cache.get_value(&CacheKey::new("missing", None)).is_none());
     }
 
     #[test]
@@ -1142,14 +2299,14 @@ mod tests {
         cache.insert(k2.clone(), serde_json::json!(2), Duration::from_secs(60));
 
         // Access k1, making k2 the LRU
-        let _ = cache.get(&k1);
+        let _ = cache.get_value(&k1);
 
         // Insert k3, should evict k2 (LRU)
         let k3 = CacheKey::new("c", None);
         cache.insert(k3.clone(), serde_json::json!(3), Duration::from_secs(60));
-        assert!(cache.get(&k1).is_some()); // k1 was accessed recently
-        assert!(cache.get(&k2).is_none()); // k2 was evicted
-        assert!(cache.get(&k3).is_some());
+        assert!(cache.get_value(&k1).is_some()); // k1 was accessed recently
+        assert!(cache.get_value(&k2).is_none()); // k2 was evicted
+        assert!(cache.get_value(&k3).is_some());
     }
 
     // ── ToolCallCacheConfig ────────────────────────────────────────────
@@ -1174,7 +2331,7 @@ mod tests {
                 ttl_secs: 60,
             },
             excluded_tools: vec!["excluded".to_string()],
-            included_tools: vec![],
+            included_tools: vec!["excluded".to_string(), "other".to_string()],
         };
         assert!(!config.should_cache_tool("excluded"));
         assert!(config.should_cache_tool("other"));
@@ -1474,16 +2631,35 @@ mod tests {
 
     #[test]
     fn cache_entry_debug_and_clone() {
-        let entry = CacheEntry::new(serde_json::json!(42), Duration::from_secs(60));
+        let value = serde_json::json!("CACHE-SECRET-CANARY");
+        let entry = CacheEntry::new(
+            value.clone(),
+            Duration::from_secs(60),
+            DEFAULT_MAX_ITEM_SIZE,
+        )
+        .expect("short test TTL must be representable");
         let debug = format!("{:?}", entry);
         assert!(debug.contains("CacheEntry"));
+        assert!(
+            !debug.contains("CACHE-SECRET-CANARY"),
+            "cached payloads must stay out of Debug"
+        );
         let cloned = entry.clone();
-        assert_eq!(cloned.value, serde_json::json!(42));
+        assert_eq!(decode_cached_json(&cloned.encoded), Some(value));
+        assert_eq!(
+            cloned.size_bytes,
+            cloned.encoded.len() + CACHE_ENTRY_METADATA_BYTES
+        );
     }
 
     #[test]
     fn cache_entry_not_expired_initially() {
-        let entry = CacheEntry::new(serde_json::json!(1), Duration::from_secs(60));
+        let entry = CacheEntry::new(
+            serde_json::json!(1),
+            Duration::from_secs(60),
+            DEFAULT_MAX_ITEM_SIZE,
+        )
+        .expect("short test TTL must be representable");
         assert!(!entry.is_expired());
     }
 
@@ -1597,7 +2773,7 @@ mod tests {
     }
 
     #[test]
-    fn should_cache_tool_empty_lists_allows_all() {
+    fn should_cache_tool_empty_allowlist_disables_all() {
         let config = ToolCallCacheConfig {
             base: MethodCacheConfig {
                 enabled: true,
@@ -1606,7 +2782,7 @@ mod tests {
             included_tools: vec![],
             excluded_tools: vec![],
         };
-        assert!(config.should_cache_tool("any_tool"));
-        assert!(config.should_cache_tool("another_tool"));
+        assert!(!config.should_cache_tool("any_tool"));
+        assert!(!config.should_cache_tool("another_tool"));
     }
 }

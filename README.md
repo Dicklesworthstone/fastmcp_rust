@@ -1,27 +1,72 @@
 <p align="center">
-  <img src="fastmcp_rust_illustration.webp" alt="FastMCP Rust - High-performance MCP framework" width="800">
+  <img src="fastmcp_rust_illustration.webp" alt="FastMCP Rust - cancel-aware MCP framework" width="800">
 </p>
 
 <h1 align="center">FastMCP Rust</h1>
 
 <p align="center">
-  <strong>High-performance Model Context Protocol (MCP) framework for Rust</strong>
+  <strong>Cancel-aware Model Context Protocol (MCP) framework for Rust</strong>
 </p>
 
 <p align="center">
-  <em>A Rust port of <a href="https://github.com/jlowin/fastmcp">jlowin/fastmcp</a> (Python), extended with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for structured concurrency and cancel-correct async.</em>
+  <em>A Rust port of <a href="https://github.com/jlowin/fastmcp">jlowin/fastmcp</a> (Python), extended with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> capability contexts and cooperative-cancellation primitives.</em>
 </p>
 
 <p align="center">
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B_(nightly)-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/License-review%20required-yellow.svg" alt="License review required">
+  <img src="https://img.shields.io/badge/rust-nightly--2026--07--11-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
+  <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
+
+> **Protocol status (2026-08-02):** MCP 2026-07-28 support is under
+> implementation and remains unverified. The current public
+> `PROTOCOL_VERSION` is `2024-11-05`. Source presence, examples, and historical
+> parity rows are not conformance or release evidence. Release publication
+> remains quarantined; source edits alone do not prove historical workflow
+> identities, queued runs, or credentials inert, so provider-side evidence is
+> still required.
+
+### Current qualification boundaries
+
+- **Wire cancellation is only partially qualified:** on Unix, the primary
+  stdio path keeps receiving while one bounded worker serializes dispatch, so
+  it can route a cancellation while a handler is running. Non-Unix stdio and
+  custom/SSE/WebSocket entry points retain sequential or blocking boundaries,
+  and independently owned request `Cx` lifetimes plus reliable `awaitCleanup`
+  semantics remain unverified.
+- **Bidirectional calls are not qualified:** the Unix stdio receive pump can
+  route sampling, elicitation, and roots responses while its dispatch worker
+  is occupied. Non-Unix stdio and custom/SSE/WebSocket paths reject or lack
+  that split routing, public HTTP is fail-closed, and end-to-end
+  lifecycle/cancellation evidence is incomplete.
+- **Response caching is conservatively partitioned:** eligible production
+  requests are keyed by committed authentication facts plus opaque session
+  identity and revision. Uncommitted authentication, local-only state views,
+  allocation failure, or state mutation during a request cause cache admission
+  to fail closed rather than sharing an entry.
+- **Authentication admission is incomplete:** recognized credentials in JSON-RPC
+  params are supported only as a legacy fallback and are stripped before
+  extension middleware and handlers. The quarantined private HTTP helper now
+  carries its native `Authorization` field separately through pre-dispatch
+  admission, but the public turnkey HTTP path remains fail-closed and no
+  complete transport-boundary admission/challenge integration is qualified.
+- **Tasks are quarantined:** `tasks/list`, `tasks/get`, `tasks/submit`, and
+  `tasks/cancel` are not advertised and return JSON-RPC `MethodNotFound`.
+- **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
+  remain available for development, but production security/profile
+  conformance is unverified and no production-support claim is made for them.
+- **Subprocess cleanup is explicit and platform-bounded:**
+  `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
+  `fastmcp test` is Unix-only and fails before spawn elsewhere. It uses a live
+  anchor plus an owner-death channel, but cannot contain descendants that
+  change group/session, withstand a competing global child reaper, or close a
+  control descriptor copied by a host-side fork. Drop is best effort.
 
 ---
 
 ```bash
-# Add to your project (crates.io)
+# Historical published package; it does not contain unverified in-tree work
 cargo add fastmcp-rust
 
 # Or use the git dependency for bleeding-edge changes
@@ -34,28 +79,31 @@ cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
 
 ### The Problem
 
-Building MCP servers in Rust is painful:
-- No first-class async support with proper cancellation
-- Manual JSON-RPC boilerplate for every tool
-- No structured concurrency—orphan tasks and resource leaks
-- Request timeouts are afterthoughts, not guarantees
+MCP server implementations need to solve several recurring problems:
+
+- Handler schemas and JSON-RPC dispatch
+- Cooperative cancellation and request budgets
+- Ownership of concurrent child work
+- Transport framing and session lifecycle
 
 ### The Solution
 
-**FastMCP Rust** is a batteries-included MCP framework with cancel-correct async, attribute macros, and structured concurrency baked in:
+**FastMCP Rust** is an MCP framework with asupersync capability contexts, attribute macros, and explicit cancellation/budget surfaces:
 
 ```rust
 use fastmcp_rust::prelude::*;
 
 #[tool]
-async fn greet(ctx: &McpContext, name: String) -> String {
+async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
     ctx.checkpoint()?;  // Cancellation point
-    format!("Hello, {name}!")
+    Ok(format!("Hello, {name}!"))
 }
 
 fn main() {
     Server::new("my-server", "1.0.0")
-        .tool(greet)
+        // Attribute macros generate PascalCase handler values.
+        .tool(Greet)
+        .build()
         .run_stdio();
 }
 ```
@@ -64,12 +112,12 @@ fn main() {
 
 | Feature | FastMCP Rust | Manual Implementation |
 |---------|--------------|----------------------|
-| **Async handlers** | `#[tool] async fn` | Manual Future boxing |
-| **Cancellation** | `ctx.checkpoint()` | Hope for the best |
-| **Timeouts** | Budget-based, automatic | Roll your own |
-| **Structured concurrency** | Region-scoped tasks | Orphan task leaks |
+| **Async handler API** | `#[tool] async fn` plus handler trait hooks | Manual Future boxing |
+| **Cancellation** | Local request checkpoints; live wire interruption remains unverified | Application-specific checks |
+| **Timeouts** | Request and handler budget surfaces | Application-specific timers |
+| **Concurrent-future ownership** | Context combinators poll caller-owned futures | Manual ownership |
 | **Error handling** | 4-valued Outcome | 2-valued Result |
-| **Boilerplate** | Zero (macros) | 100+ lines per tool |
+| **Boilerplate** | Generated handler/schema implementations | Handwritten handler/schema implementations |
 
 ---
 
@@ -78,9 +126,12 @@ fn main() {
 This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI coding agents. Key points:
 
 - **Porting methodology:** Extract spec from legacy → implement from spec → never translate line-by-line
-- **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for cancel-correct async (not tokio directly)
+- **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) exclusively; Tokio and Tokio-based adapters are unsupported
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-- **Toolchain:** Rust 2024 edition, nightly required
+- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`)
+- **MCP 2026-07-28 support is under implementation and remains unverified.**
+- **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
+- **The current public `PROTOCOL_VERSION` is still `2024-11-05`; newer in-tree types are not proof of negotiated 2026-07-28 support.**
 
 ---
 
@@ -91,31 +142,36 @@ use fastmcp_rust::prelude::*;
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
-async fn add(ctx: &McpContext, a: i64, b: i64) -> i64 {
-    ctx.checkpoint()?;  // Check for client disconnect
-    a + b
+async fn add(ctx: &McpContext, a: i64, b: i64) -> McpResult<String> {
+    ctx.checkpoint()?;  // Check the local cancellation token and budget
+    Ok((a + b).to_string())
 }
 
-// Define a resource
-#[resource(uri = "file://config.json", description = "Application config")]
-async fn read_config(ctx: &McpContext) -> String {
+// Define an in-memory resource. Potentially blocking filesystem work is not
+// performed inline on the dispatch worker.
+#[resource(uri = "config://settings", description = "Application config")]
+fn config(ctx: &McpContext) -> McpResult<String> {
     ctx.checkpoint()?;
-    std::fs::read_to_string("config.json").unwrap_or_default()
+    Ok(r#"{"theme":"dark"}"#.to_owned())
 }
 
 // Define a prompt template
 #[prompt(description = "Generate a greeting message")]
-async fn greeting_prompt(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
+async fn greeting(ctx: &McpContext, name: String) -> McpResult<Vec<PromptMessage>> {
     ctx.checkpoint()?;
-    vec![PromptMessage::user(format!("Please greet {name} warmly."))]
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text(format!("Please greet {name} warmly.")),
+    }])
 }
 
 fn main() {
     Server::new("example-server", "1.0.0")
-        .tool(add)
-        .resource(read_config)
-        .prompt(greeting_prompt)
+        .tool(Add)
+        .resource(ConfigResource)
+        .prompt(GreetingPrompt)
         .request_timeout(30)  // 30-second budget per request
+        .build()
         .run_stdio();
 }
 ```
@@ -123,66 +179,69 @@ fn main() {
 Run it:
 
 ```bash
-cargo run --example server
+cargo run -p fastmcp-rust --example echo_server
 ```
 
 ---
 
 ## Design Philosophy
 
-### 1. Cancel-Correctness Over Convenience
+### 1. Explicit Cooperative Cancellation
 
-Every async operation must be cancellable. Silent drops cause data loss. FastMCP uses checkpoints:
+Handlers should check cancellation at natural suspension or iteration boundaries. FastMCP exposes cooperative checkpoints. These local context semantics do not, by themselves, make cancellation interruptible over a live connection; see the qualification boundaries above.
 
 ```rust
 #[tool]
-async fn process_items(ctx: &McpContext, items: Vec<Item>) -> Vec<Result> {
+async fn process_items(
+    ctx: &McpContext,
+    items: Vec<String>,
+) -> McpResult<Vec<Content>> {
     let mut results = vec![];
     for item in items {
         ctx.checkpoint()?;  // Allow graceful cancellation between items
-        results.push(process(item).await);
+        results.push(Content::text(process(item).await?));
     }
-    results
+    Ok(results)
 }
 ```
 
 ### 2. Budgets, Not Timeouts
 
-Timeouts are "we gave up." Budgets are "you have X resources." The Budget type tracks deadline, poll quota, and cost quota as a product semiring:
+Timeouts are "we gave up." Budgets are "you have X resources." The `Budget` type represents deadline, poll-quota, and cost-quota dimensions:
 
 ```rust
-// Server enforces 30-second budget per request
+// Configure a 30-second server-owned request ceiling
 Server::new("server", "1.0.0")
     .request_timeout(30)
-    .tool(my_tool)
+    .tool(MyTool)
+    .build()
     .run_stdio();
 
 // Handler can check remaining budget
 #[tool]
-async fn my_tool(ctx: &McpContext) -> String {
-    if ctx.budget().is_exhausted() {
-        return "Budget exhausted".to_string();
-    }
+async fn my_tool(ctx: &McpContext) -> McpResult<String> {
+    ctx.checkpoint()?;
     // ... work ...
+    Ok("work completed".to_string())
 }
 ```
 
 ### 3. Four-Valued Outcomes
 
-`Result<T, E>` conflates "operation failed" with "operation was cancelled" and "operation panicked." FastMCP uses `Outcome<T, E>`:
+`Result<T, E>` has no distinct cancellation or panic variants. FastMCP's asynchronous handler boundary uses `Outcome<T, E>`:
 
 ```rust
 enum Outcome<T, E> {
-    Ok(T),           // Success
-    Err(E),          // Expected failure
-    Cancelled(Why),  // External interruption
-    Panicked(Msg),   // Internal failure
+    Ok(T),                    // Success
+    Err(E),                   // Expected failure
+    Cancelled(CancelReason),  // External interruption
+    Panicked(PanicPayload),   // Internal failure
 }
 ```
 
-### 4. Capability Security
+### 4. Capability-oriented handlers
 
-No ambient authority. All effects flow through explicit `McpContext`:
+Request authority flows through `McpContext`; application dependencies should likewise be passed explicitly instead of hidden in globals:
 
 ```rust
 // BAD: Global state access
@@ -196,48 +255,62 @@ async fn good_tool(ctx: &McpContext, db: &DbHandle) {
 }
 ```
 
-### 5. Structured Concurrency
+### 5. Owned Concurrent Futures
 
-All spawned tasks belong to regions. When a region closes, all children complete or drain. No orphan tasks:
+Concurrent child futures remain owned by the request handler and are polled together by context combinators:
 
 ```rust
+use std::future::Future;
+use std::pin::Pin;
+
 #[tool]
-async fn parallel_fetch(ctx: &McpContext, urls: Vec<String>) -> Vec<String> {
-    // All spawned tasks are scoped to this request's region
-    let handles: Vec<_> = urls.iter()
-        .map(|url| ctx.spawn(fetch(url.clone())))
+async fn parallel_fetch(
+    ctx: &McpContext,
+    urls: Vec<String>,
+) -> McpResult<Vec<Content>> {
+    type FetchFuture = Pin<Box<dyn Future<Output = McpResult<String>> + Send>>;
+
+    let futures: Vec<FetchFuture> = urls
+        .into_iter()
+        .map(|url| Box::pin(fetch(url)) as FetchFuture)
         .collect();
 
-    // Region waits for all children before returning
-    join_all(handles).await
+    let results = ctx.join_all(futures).await?;
+    results
+        .into_iter()
+        .map(|result| result.map(Content::text))
+        .collect()
 }
 ```
 
 ---
 
-## Comparison vs Alternatives
+## Design Positioning
 
-| Feature | FastMCP Rust | rmcp | jsonrpc-core |
-|---------|-------------|------|--------------|
-| **MCP-native** | Yes | Yes | No (generic) |
-| **Async handlers** | Native | Native | Native |
-| **Cancellation** | Checkpoints + masks | Manual | None |
-| **Timeouts** | Budget-based | Timer-based | Manual |
-| **Macros** | `#[tool]`, `#[resource]`, `#[prompt]` | Manual impl | Manual impl |
-| **Runtime** | asupersync (cancel-correct) | tokio | tokio |
-| **Outcome type** | 4-valued | 2-valued | 2-valued |
-| **Structured concurrency** | Region-scoped | Manual | Manual |
-| **Unsafe code** | Forbidden | Allowed | Allowed |
+These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-28 conformance certificate. Competing projects change independently and should be evaluated from their current documentation rather than a static comparison table.
+
+| Area | FastMCP Rust design |
+|------|---------------------|
+| **Handler API** | `#[tool]`, `#[resource]`, and `#[prompt]` macros plus explicit handler traits |
+| **Cancellation** | `McpContext` checkpoints and masks backed by asupersync |
+| **Timeouts** | Request and handler budget surfaces |
+| **Runtime** | asupersync only; Tokio adapters are unsupported |
+| **Outcomes** | Four-valued `Outcome`: success, expected error, cancellation, or panic |
+| **Unsafe code** | Forbidden in workspace crates with `#![forbid(unsafe_code)]` |
 
 ---
 
 ## Installation
 
-### From crates.io
+### From crates.io (historical 0.3.2 package)
+
+The published `0.3.2` package predates the current in-tree hardening work. Do
+not treat installing it as evidence for the source-tree examples or MCP
+2026-07-28 support.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.1"
+fastmcp-rust = "0.3.2"
 ```
 
 ### As a Git Dependency
@@ -255,15 +328,53 @@ cd fastmcp_rust
 cargo build --release
 ```
 
-### CLI (optional)
+### CLI (optional; historical 0.3.2 package)
 
 ```bash
 cargo install fastmcp-cli
 ```
 
+### Client request deadlines (current source tree)
+
+Ordinary client requests use separate idle and absolute response-wait
+deadlines. Both begin after the request send commits. The idle deadline
+defaults to 30 seconds; the non-resettable absolute deadline defaults to 120
+seconds. Serialization, a blocking send, and teardown are outside these
+timers. Only a valid matching progress notification on a request that actually
+supplied a progress token can reset idle.
+
+```rust
+use std::time::Duration;
+
+use fastmcp_rust::prelude::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
+
+fn connect() -> McpResult<Client> {
+    let policy = RequestTimeoutPolicy::new(
+        Duration::from_secs(20),
+        Duration::from_secs(90),
+    )?;
+    ClientBuilder::new()
+        .request_timeout_policy(policy)
+        .connect_stdio("my-mcp-server", &[])
+}
+```
+
+The published 0.3.2 CLI predates these flags. From a current source checkout,
+run the CLI through the workspace to configure the two limits independently:
+
+```bash
+cargo run -p fastmcp-cli -- test --idle-timeout 30 --absolute-timeout 120 my-mcp-server
+```
+
+The current `fastmcp test` subprocess runner is Unix-only because success
+includes verified owned-process-group cleanup. Library callers should likewise
+call `client.close()` and handle its `McpResult`; dropping a client is only a
+best-effort safety net. The group anchor protects its numeric PGID while it is
+live and closes an owner-death channel when the host exits, but this is not
+portable process-tree containment or a substitute for Windows Job Objects.
+
 **Requirements:**
-- Rust 1.85+ (nightly) for Edition 2024 features
-- [asupersync](https://github.com/Dicklesworthstone/asupersync) as a sibling directory (or adjust path in `Cargo.toml`)
+- Rust nightly-2026-07-11 (see `rust-toolchain.toml`) for Edition 2024 + the provisional FND-01 toolchain contract
 
 ---
 
@@ -291,15 +402,16 @@ fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 use fastmcp_rust::prelude::*;
 
 #[tool(description = "Echo the input message")]
-async fn echo(ctx: &McpContext, message: String) -> String {
+async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
     ctx.checkpoint()?;
-    message
+    Ok(message)
 }
 
 fn main() {
     Server::new("echo-server", "1.0.0")
-        .tool(echo)
+        .tool(Echo)
         .instructions("A simple echo server for testing")
+        .build()
         .run_stdio();
 }
 ```
@@ -313,7 +425,7 @@ cargo run
 ### 5. Test with MCP Inspector
 
 ```bash
-npx @anthropic-ai/mcp-inspector cargo run
+npx @modelcontextprotocol/inspector cargo run
 ```
 
 ---
@@ -379,10 +491,12 @@ fastmcp_rust/
 │   ├── fastmcp/           # Facade crate (published as fastmcp-rust)
 │   ├── fastmcp-core/      # McpContext, errors, runtime helpers
 │   ├── fastmcp-protocol/  # MCP types, JSON-RPC messages
-│   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket)
+│   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket, HTTP, memory)
 │   ├── fastmcp-server/    # Server builder, router, handlers
 │   ├── fastmcp-client/    # Client implementation
-│   └── fastmcp-derive/    # #[tool], #[resource], #[prompt] macros
+│   ├── fastmcp-macros/    # Proc-macro crate, published as fastmcp-derive
+│   ├── fastmcp-console/   # Console rendering and statistics
+│   └── fastmcp-cli/       # fastmcp command-line interface
 ```
 
 | Crate | Purpose |
@@ -390,25 +504,31 @@ fastmcp_rust/
 | `fastmcp-rust` | Convenience re-exports for simple `use fastmcp_rust::prelude::*` |
 | `fastmcp-core` | `McpContext` wrapper, error types, `block_on` helper |
 | `fastmcp-protocol` | MCP message types, capabilities, JSON-RPC framing |
-| `fastmcp-transport` | Transport trait, stdio/SSE/WebSocket implementations |
+| `fastmcp-transport` | Transport trait and stdio/SSE/WebSocket/HTTP/memory implementations |
 | `fastmcp-server` | `Server`, `ServerBuilder`, routing, handler traits |
-| `fastmcp-client` | `Client` for calling MCP servers |
+| `fastmcp-client` | Subprocess-stdio `Client`; lower-level SSE/WebSocket transport types are not wired into this public client |
 | `fastmcp-derive` | Procedural macros for handler generation |
 
 ---
 
 ## Handler Traits
 
+The signatures below are abridged; asynchronous trait methods return four-valued `McpOutcome` values, not ordinary `McpResult` values.
+
 ### ToolHandler
 
 ```rust
 pub trait ToolHandler: Send + Sync {
     fn definition(&self) -> Tool;
-    fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>>;
+    fn call(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>>;
 
     // Override for true async (default delegates to call())
-    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpResult<Vec<Content>>>;
+    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: serde_json::Value)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<Content>>> + Send + 'a>>;
 }
 ```
 
@@ -421,7 +541,7 @@ pub trait ResourceHandler: Send + Sync {
 
     // Override for true async
     fn read_async<'a>(&'a self, ctx: &'a McpContext)
-        -> BoxFuture<'a, McpResult<Vec<ResourceContent>>>;
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<ResourceContent>>> + Send + 'a>>;
 }
 ```
 
@@ -430,12 +550,16 @@ pub trait ResourceHandler: Send + Sync {
 ```rust
 pub trait PromptHandler: Send + Sync {
     fn definition(&self) -> Prompt;
-    fn get(&self, ctx: &McpContext, arguments: HashMap<String, String>)
+    fn get(&self, ctx: &McpContext, arguments: std::collections::HashMap<String, String>)
         -> McpResult<Vec<PromptMessage>>;
 
     // Override for true async
-    fn get_async<'a>(&'a self, ctx: &'a McpContext, arguments: HashMap<String, String>)
-        -> BoxFuture<'a, McpResult<Vec<PromptMessage>>>;
+    fn get_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<PromptMessage>>> + Send + 'a>>;
 }
 ```
 
@@ -445,22 +569,28 @@ pub trait PromptHandler: Send + Sync {
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `McpError::MethodNotFound("tool: my_tool")` | Tool not registered | Add `.tool(my_tool)` to server builder |
-| Request cancelled mid-operation | Client disconnect or timeout | Use `ctx.masked()` for critical sections |
-| Budget exhausted errors | Timeout too short | Increase `.request_timeout(120)` |
-| `#[tool]` macro compilation error | Missing trait bounds | Ensure handler returns `McpResult<T>` or `Into<Vec<Content>>` |
+| JSON-RPC `MethodNotFound` for `tools/call` | Tool not registered | Register the generated handler, for example `.tool(MyTool)` |
+| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio has a continuous receive pump, but non-Unix stdio, custom/SSE/WebSocket loops, and request-owned cleanup semantics remain unqualified |
+| Budget exhausted errors | Deadline, poll, or cost dimension exhausted | Inspect the exhausted dimension; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
+| `#[tool]` macro compilation error | Unsupported return conversion or argument schema | Prefer `String`, `Vec<Content>`, `McpResult<String>`, or `McpResult<Vec<Content>>` and ensure custom argument types implement `JsonSchema` |
 | `TransportError::Io` on startup | stdin unavailable | Ensure nothing else reads stdin |
 
 ### Critical Section Example
 
 ```rust
-#[tool]
-async fn critical_write(ctx: &McpContext, data: String) -> String {
-    // This section won't be interrupted
-    ctx.masked(|| {
-        fs::write("important.txt", &data).unwrap();
-    });
-    "Written".to_string()
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// A handler that owns `committed` can call this helper after validation.
+fn commit_revision(
+    ctx: &McpContext,
+    revision: u64,
+    committed: &AtomicU64,
+) -> McpResult<()> {
+    // Mask only a small, non-blocking atomic commit. Masking does not make
+    // synchronous filesystem or device I/O bounded or cancel-safe.
+    ctx.masked(|| committed.store(revision, Ordering::Release))
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    Ok(())
 }
 ```
 
@@ -470,46 +600,75 @@ async fn critical_write(ctx: &McpContext, data: String) -> String {
 
 | Limitation | Details |
 |------------|---------|
-| **Nightly Required** | Uses Rust 2024 edition features |
-| **Network Transports** | SSE and WebSocket transports are implemented at the transport layer, but HTTP/WS server integration is external |
+| **Pinned Nightly Required** | The project contract pins `nightly-2026-07-11`; do not substitute a different toolchain merely because it supports Edition 2024 |
+| **Protocol Modernization** | The public protocol constant remains `2024-11-05`; MCP 2026-07-28 implementation and verification are incomplete |
+| **Runtime-context migration** | The workspace still enables asupersync `test-internals` as a stopgap while synchronous entry points are migrated to runtime-managed contexts |
+| **Network Transports** | HTTP parsing/framing primitives exist, but the turnkey `run_http*` entry points fail closed before binding until stateless per-request dispatch is qualified; SSE and WebSocket entry points require caller-provided I/O integration |
+| **Client Transport Coverage** | The public `fastmcp-client::Client` currently connects only to subprocess stdio; lower-level SSE and WebSocket transport types do not constitute client integration |
 | **No Built-in TLS** | Transport encryption must be handled externally |
-| **Single-threaded Loop** | Main server loop is sequential |
-| **Sibling Dependency** | Requires asupersync at `../asupersync` |
+| **HTTP Dispatch Qualification** | The old sessionful listener is private and unreachable; public `run_http*` calls fail closed before binding. Modern `LatestOnly` still needs immutable stateless per-request dispatch and an owned request execution; a bounded owner-bound Session registry belongs only to the feature-gated LEG-02 MCP 2025-11-25 adapter |
+| **Wire Cancellation** | On Unix, stdio has a continuous receive pump plus serialized dispatch worker and can route `notifications/cancelled` during handler execution. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while request-owned `Cx` isolation and reliable `awaitCleanup` semantics remain unverified |
+| **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv`, non-Unix child-pipe reads, and blocking writes retain their documented frame/I/O-boundary limitation; these deadlines are therefore not a portable end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
+| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit; shutdown hooks are skipped unless worker quiescence is proven |
+| **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
+| **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
+| **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` remains fail-closed |
+| **Returning transport runners** | `run_transport_returning*` returns fatal receive/send/close errors and preserves simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still uses one ambient `Cx` and does not prove request-owned isolation |
+| **Request Cancellation Ownership** | Request work does not yet have an independently owned child `Cx`; cancellation must not be treated as a sibling-isolated guarantee |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while its dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing, public HTTP is fail-closed, and end-to-end lifecycle qualification remains open |
+| **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
+| **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. The quarantined private HTTP helper carries native `Authorization` metadata separately, but public turnkey HTTP remains fail-closed and no complete transport-boundary admission/challenge path is qualified |
+| **Tasks RPC** | Task methods are not advertised and return `MethodNotFound`; client/task source presence is not a usable server capability |
+| **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
 
 ---
 
 ## FAQ
 
-**Q: Why not use tokio directly?**
+**Q: Why is Tokio unsupported?**
 
-A: Tokio doesn't provide cancel-correctness out of the box. Dropping a Future silently discards work. asupersync provides checkpoints, masks, and 4-valued outcomes that make cancellation explicit and safe.
+A: FastMCP Rust is built around asupersync capability contexts, budgets, and cooperative-cancellation surfaces. Tokio and Tokio-based adapters are outside the supported runtime model.
 
 **Q: Can I use this with Claude Desktop?**
 
-A: Yes! FastMCP servers speak standard MCP protocol over stdio. Configure Claude Desktop to spawn your server binary.
+A: Stdio integration exists, but compatibility must be checked against the client because the current public protocol constant is `2024-11-05` and MCP 2026-07-28 support is not yet verified.
 
 **Q: How do I add authentication?**
 
-A: MCP doesn't define authentication at the protocol level. For Claude Desktop, the process is already trusted. For network transports, wrap the connection with TLS and implement auth at the transport layer.
+A: Static-token, OAuth, and OIDC implementation code exists, but OAuth/OIDC
+production security and profile conformance remain unverified. Recognized
+credentials in JSON-RPC params are only a legacy fallback; FastMCP authenticates
+them and strips those fields before extension middleware and handlers. The
+quarantined private HTTP helper carries native `Authorization` metadata through
+pre-dispatch admission, but a public transport integration still needs a
+qualified admission/challenge boundary, TLS, and profile-specific validation.
 
 **Q: What's the performance overhead of checkpoints?**
 
-A: Checkpoints are a simple flag check (atomic load). The overhead is negligible—typically < 1 nanosecond per call.
+A: Checkpoints perform cancellation and budget checks. No project benchmark currently supports a universal per-call latency claim; measure them in the target workload if the cost matters.
 
 **Q: Can I use other async runtimes?**
 
-A: FastMCP is designed around asupersync's structured concurrency model. While you could theoretically swap runtimes, you'd lose cancel-correctness guarantees.
+A: No. The current API and implementation require asupersync; other async runtimes are not supported.
 
 **Q: How do I test my handlers?**
 
-A: Use `McpContext::for_testing()` to create a test context:
+A: Construct `McpContext` from an asupersync testing context and a request ID:
 ```rust
+use fastmcp_rust::{Cx, McpContext, McpResult, tool};
+
+#[tool]
+fn my_tool(ctx: &McpContext, input: String) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok(input)
+}
+
 #[test]
 fn test_my_tool() {
-    let ctx = McpContext::for_testing();
+    let ctx = McpContext::new(Cx::for_testing(), 1);
     let result = my_tool(&ctx, "input".to_string());
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "input");
 }
 ```
 
@@ -523,10 +682,15 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-FastMCP Rust is licensed under the MIT License (with OpenAI/Anthropic Rider). See [LICENSE-MIT](LICENSE-MIT).
+The release-license representation is unresolved: workspace Cargo metadata
+declares `MIT`, [LICENSE](LICENSE) contains an additional OpenAI/Anthropic
+rider, and [LICENSE-MIT](LICENSE-MIT) contains plain MIT text. Do not infer
+authoritative release terms from one of these inputs in isolation. Publication
+remains blocked until the explicit release-license decision required by the
+implementation plan is reviewed and applied consistently.
 
 ---
 
 <p align="center">
-  <sub>Built with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for cancel-correct async</sub>
+  <sub>Built with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for context-aware async</sub>
 </p>

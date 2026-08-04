@@ -6,7 +6,7 @@
 //!
 //! # Overview
 //!
-//! The [`MemoryTransport`] uses crossbeam channels to enable bidirectional
+//! The [`MemoryTransport`] uses asupersync channels to enable bidirectional
 //! message passing between client and server. Create a pair using
 //! [`create_memory_transport_pair`] which returns connected client and server
 //! transports.
@@ -54,16 +54,26 @@
 //! assert!(matches!(response, JsonRpcMessage::Response(_)));
 //! ```
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use asupersync::Cx;
+use asupersync::{Cx, channel::mpsc};
 use fastmcp_protocol::JsonRpcMessage;
 
 use crate::{Codec, Transport, TransportError};
 
 /// Default timeout for recv operations when polling for cancellation.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Smallest polling interval admitted by the synchronous transport adapter.
+///
+/// A zero interval turns an empty receive loop into a hot spin. The transport
+/// remains a compatibility adapter until the async transport boundary lands,
+/// so keep its cancellation polling bounded away from zero in the meantime.
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+fn normalize_poll_interval(interval: Duration) -> Duration {
+    interval.max(MIN_POLL_INTERVAL)
+}
 
 /// In-memory transport using channels for message passing.
 ///
@@ -84,10 +94,10 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// cancellation mechanism.
 pub struct MemoryTransport {
     /// Channel for sending messages to the peer.
-    sender: Sender<JsonRpcMessage>,
+    sender: Option<mpsc::Sender<JsonRpcMessage>>,
     /// Channel for receiving messages from the peer.
-    receiver: Receiver<JsonRpcMessage>,
-    /// Codec for validation (not used for serialization in memory transport).
+    receiver: mpsc::Receiver<JsonRpcMessage>,
+    /// Codec for typed validation and serialized-size admission.
     codec: Codec,
     /// Whether the transport has been closed.
     closed: bool,
@@ -109,9 +119,9 @@ impl MemoryTransport {
     ///
     /// This is an internal constructor. Use [`create_memory_transport_pair`]
     /// to create a connected pair of transports.
-    fn new(sender: Sender<JsonRpcMessage>, receiver: Receiver<JsonRpcMessage>) -> Self {
+    fn new(sender: mpsc::Sender<JsonRpcMessage>, receiver: mpsc::Receiver<JsonRpcMessage>) -> Self {
         Self {
-            sender,
+            sender: Some(sender),
             receiver,
             codec: Codec::new(),
             closed: false,
@@ -122,10 +132,11 @@ impl MemoryTransport {
     /// Sets the poll interval for cancellation checks during recv.
     ///
     /// Lower values provide faster cancellation response but use more CPU.
-    /// Default is 50ms.
+    /// Default is 50ms. Values below 1ms are clamped to 1ms so an idle
+    /// receiver cannot busy-spin.
     #[must_use]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = normalize_poll_interval(interval);
         self
     }
 
@@ -138,53 +149,92 @@ impl MemoryTransport {
 
 impl Transport for MemoryTransport {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        // Check for cancellation before send
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        // Check for cancellation before send.
         if cx.is_cancel_requested() {
             return Err(TransportError::Cancelled);
         }
 
-        if self.closed {
-            return Err(TransportError::Closed);
-        }
+        // Count-bounded channels are not byte-bounded. Serialize through the
+        // codec's bounded sink before cloning so directly constructed typed
+        // values cannot retain an arbitrarily large payload in the queue.
+        let validated_frame = match message {
+            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+        };
+        drop(validated_frame);
 
-        // Clone and send the message through the channel
-        self.sender
-            .send(message.clone())
-            .map_err(|_| TransportError::Closed)
+        let send_result = self
+            .sender
+            .as_ref()
+            .ok_or(TransportError::Closed)?
+            .try_send(message.clone());
+        match send_result {
+            Ok(()) => Ok(()),
+            Err(mpsc::SendError::Disconnected(_)) => {
+                // A disconnected peer is terminal. Drop our sender now so
+                // subsequent calls deterministically report Closed without
+                // revalidating or cloning another message.
+                self.closed = true;
+                self.sender.take();
+                Err(TransportError::Closed)
+            }
+            Err(mpsc::SendError::Cancelled(_)) => Err(TransportError::Cancelled),
+            Err(mpsc::SendError::Full(_)) => Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "memory transport queue is full",
+            ))),
+        }
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        // Check for cancellation before receive
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        // Check for cancellation before receive.
         if cx.is_cancel_requested() {
             return Err(TransportError::Cancelled);
         }
 
-        if self.closed {
-            return Err(TransportError::Closed);
-        }
-
-        // Poll with timeout to allow cancellation checks
+        // Poll the bounded asupersync channel while retaining this synchronous
+        // transport trait's cancellation responsiveness.
         loop {
-            match self.receiver.recv_timeout(self.poll_interval) {
-                Ok(message) => return Ok(message),
-                Err(RecvTimeoutError::Timeout) => {
+            match self.receiver.try_recv() {
+                Ok(message) => {
+                    message.validate().map_err(|_| {
+                        TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid typed JSON-RPC message",
+                        ))
+                    })?;
+                    return Ok(message);
+                }
+                Err(mpsc::RecvError::Empty) => {
                     // Check for cancellation between polls
                     if cx.is_cancel_requested() {
                         return Err(TransportError::Cancelled);
                     }
-                    // Continue polling
+                    std::thread::sleep(self.poll_interval);
                 }
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(mpsc::RecvError::Disconnected) => {
                     self.closed = true;
                     return Err(TransportError::Closed);
                 }
+                Err(mpsc::RecvError::Cancelled) => return Err(TransportError::Cancelled),
             }
         }
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
         self.closed = true;
-        // Dropping sender will signal disconnection to the peer
+        self.sender.take();
+        self.receiver.close();
+        // asupersync channel closure intentionally retains queued values for
+        // receivers that want to finish draining. A transport close is a hard
+        // terminal boundary, so release those potentially large messages now.
+        while self.receiver.try_recv().is_ok() {}
         Ok(())
     }
 }
@@ -232,7 +282,10 @@ pub fn create_memory_transport_pair() -> (MemoryTransport, MemoryTransport) {
 /// # Arguments
 ///
 /// * `capacity` - Maximum number of messages that can be buffered in each direction.
-///   If 0, creates unbounded channels (not recommended for production use).
+///
+/// # Panics
+///
+/// Panics if `capacity` is zero. Memory transports are always bounded.
 ///
 /// # Example
 ///
@@ -244,13 +297,10 @@ pub fn create_memory_transport_pair() -> (MemoryTransport, MemoryTransport) {
 /// ```
 #[must_use]
 pub fn create_memory_transport_pair_with_capacity(
-    _capacity: usize,
+    capacity: usize,
 ) -> (MemoryTransport, MemoryTransport) {
-    // Note: std::sync::mpsc doesn't have bounded channels, so we use unbounded.
-    // For bounded behavior, users should use the crossbeam crate.
-    // This is a simplification for the initial implementation.
-    let (client_to_server_tx, client_to_server_rx) = mpsc::channel();
-    let (server_to_client_tx, server_to_client_rx) = mpsc::channel();
+    let (client_to_server_tx, client_to_server_rx) = mpsc::channel(capacity);
+    let (server_to_client_tx, server_to_client_rx) = mpsc::channel(capacity);
 
     let client = MemoryTransport::new(client_to_server_tx, server_to_client_rx);
     let server = MemoryTransport::new(server_to_client_tx, client_to_server_rx);
@@ -273,6 +323,7 @@ pub fn create_memory_transport_pair_with_capacity(
 #[derive(Debug, Clone)]
 pub struct MemoryTransportBuilder {
     poll_interval: Duration,
+    max_message_size: usize,
 }
 
 impl Default for MemoryTransportBuilder {
@@ -287,13 +338,22 @@ impl MemoryTransportBuilder {
     pub fn new() -> Self {
         Self {
             poll_interval: DEFAULT_POLL_INTERVAL,
+            max_message_size: Codec::new().max_message_size(),
         }
     }
 
     /// Sets the poll interval for cancellation checks during recv.
+    /// Values below 1ms are clamped to 1ms.
     #[must_use]
     pub fn poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = normalize_poll_interval(interval);
+        self
+    }
+
+    /// Sets the maximum serialized bytes admitted for one typed message.
+    #[must_use]
+    pub fn max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = max_message_size;
         self
     }
 
@@ -303,6 +363,8 @@ impl MemoryTransportBuilder {
         let (mut client, mut server) = create_memory_transport_pair();
         client.poll_interval = self.poll_interval;
         server.poll_interval = self.poll_interval;
+        client.codec.set_max_message_size(self.max_message_size);
+        server.codec.set_max_message_size(self.max_message_size);
         (client, server)
     }
 }
@@ -312,6 +374,72 @@ mod tests {
     use super::*;
     use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse, RequestId};
     use std::thread;
+
+    #[test]
+    fn zero_poll_interval_is_clamped_away_from_busy_spin() {
+        let (client, server) = MemoryTransportBuilder::new()
+            .poll_interval(Duration::ZERO)
+            .build();
+        assert_eq!(client.poll_interval, MIN_POLL_INTERVAL);
+        assert_eq!(server.poll_interval, MIN_POLL_INTERVAL);
+
+        let (client, _) = create_memory_transport_pair();
+        let client = client.with_poll_interval(Duration::ZERO);
+        assert_eq!(client.poll_interval, MIN_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn memory_send_and_builder_enforce_exact_serialized_byte_boundary() {
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"payload": "bounded"})),
+            1_i64,
+        );
+        let frame_size = serde_json::to_vec(&request).unwrap().len();
+
+        let (mut exact, mut exact_peer) = MemoryTransportBuilder::new()
+            .max_message_size(frame_size)
+            .build();
+        assert_eq!(exact.codec.max_message_size(), frame_size);
+        assert_eq!(exact_peer.codec.max_message_size(), frame_size);
+        exact.send_request(&cx, &request).unwrap();
+        assert!(matches!(
+            exact_peer.recv(&cx).unwrap(),
+            JsonRpcMessage::Request(_)
+        ));
+
+        let (mut one_past, one_past_peer) = MemoryTransportBuilder::new()
+            .max_message_size(frame_size - 1)
+            .build();
+        let error = one_past
+            .send_request(&cx, &request)
+            .expect_err("a frame one byte past the configured limit must be rejected");
+        assert!(matches!(
+            error,
+            TransportError::Codec(crate::CodecError::MessageTooLarge(size))
+                if size >= frame_size
+        ));
+        assert_eq!(one_past_peer.receiver.len(), 0);
+    }
+
+    #[test]
+    fn memory_send_rejects_invalid_typed_message_before_queueing() {
+        let (mut client, server) = MemoryTransportBuilder::new().max_message_size(1024).build();
+        let cx = Cx::for_testing();
+        let invalid = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: Some(RequestId::Number(1)),
+        };
+
+        assert!(matches!(
+            client.send(&cx, &JsonRpcMessage::Response(invalid)),
+            Err(TransportError::Codec(crate::CodecError::Json(_)))
+        ));
+        assert_eq!(server.receiver.len(), 0);
+    }
 
     #[test]
     fn test_basic_send_receive() {
@@ -585,6 +713,14 @@ mod tests {
         let request = JsonRpcRequest::new("test", None, 1i64);
         let result = client.send_request(&cx, &request);
         assert!(matches!(result, Err(TransportError::Closed)));
+        assert!(client.is_closed());
+        assert!(client.sender.is_none());
+
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            client.send_request(&cx, &request),
+            Err(TransportError::Closed)
+        ));
     }
 
     #[test]
@@ -605,11 +741,43 @@ mod tests {
         let (mut client, mut server) = create_memory_transport_pair_with_capacity(2);
         let cx = Cx::for_testing();
 
-        // Should still work - capacity is advisory since std mpsc is unbounded
-        let request = JsonRpcRequest::new("test", None, 1i64);
-        client.send_request(&cx, &request).unwrap();
-        let msg = server.recv(&cx).unwrap();
-        assert!(matches!(msg, JsonRpcMessage::Request(_)));
+        client
+            .send_request(&cx, &JsonRpcRequest::new("first", None, 1i64))
+            .unwrap();
+        client
+            .send_request(&cx, &JsonRpcRequest::new("second", None, 2i64))
+            .unwrap();
+
+        let full = client
+            .send_request(&cx, &JsonRpcRequest::new("rejected", None, 3i64))
+            .expect_err("the third message must exceed capacity two");
+        assert!(matches!(
+            full,
+            TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        let JsonRpcMessage::Request(first) = server.recv(&cx).unwrap() else {
+            panic!("expected first request");
+        };
+        assert_eq!(first.method, "first");
+
+        client
+            .send_request(&cx, &JsonRpcRequest::new("third", None, 3i64))
+            .unwrap();
+        let JsonRpcMessage::Request(second) = server.recv(&cx).unwrap() else {
+            panic!("expected second request");
+        };
+        let JsonRpcMessage::Request(third) = server.recv(&cx).unwrap() else {
+            panic!("expected third request");
+        };
+        assert_eq!(second.method, "second");
+        assert_eq!(third.method, "third");
+    }
+
+    #[test]
+    #[should_panic(expected = "channel capacity must be non-zero")]
+    fn test_create_pair_rejects_zero_capacity() {
+        let _ = create_memory_transport_pair_with_capacity(0);
     }
 
     #[test]
@@ -628,6 +796,29 @@ mod tests {
         // Close again - should not panic
         client.close().unwrap();
         assert!(client.is_closed());
+    }
+
+    #[test]
+    fn close_discards_queued_messages_and_closed_precedes_cancellation() {
+        let (mut client, mut server) = create_memory_transport_pair_with_capacity(2);
+        let cx = Cx::for_testing();
+        client
+            .send_request(&cx, &JsonRpcRequest::new("first", None, 1_i64))
+            .unwrap();
+        client
+            .send_request(&cx, &JsonRpcRequest::new("second", None, 2_i64))
+            .unwrap();
+        assert_eq!(server.receiver.len(), 2);
+
+        server.close().unwrap();
+
+        assert_eq!(server.receiver.len(), 0);
+        cx.set_cancel_requested(true);
+        assert!(matches!(server.recv(&cx), Err(TransportError::Closed)));
+        assert!(matches!(
+            server.send_request(&cx, &JsonRpcRequest::new("closed", None, 3_i64)),
+            Err(TransportError::Closed)
+        ));
     }
 
     #[test]

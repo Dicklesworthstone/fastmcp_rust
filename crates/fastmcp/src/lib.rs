@@ -1,15 +1,26 @@
-//! FastMCP: Fast, cancel-correct MCP framework for Rust.
+//! FastMCP: cancel-aware MCP framework for Rust.
 //!
 //! FastMCP is a Rust implementation of the Model Context Protocol (MCP),
-//! providing a high-performance, cancel-correct framework for building
-//! MCP servers and clients.
+//! providing explicit cancellation, budget, server, and client surfaces.
 //!
 //! # Features
 //!
-//! - **Fast**: Zero-copy parsing, minimal allocations
-//! - **Cancel-correct**: Built on asupersync for structured concurrency
+//! - **Cancellation-aware**: Built on asupersync contexts and checkpoints
 //! - **Simple**: Familiar API inspired by FastMCP (Python)
-//! - **Complete**: Tools, resources, prompts, and all MCP features
+//! - **MCP tools/resources/prompts**: ergonomic macros and handler APIs
+//!
+//! # Protocol status (FND-01)
+//!
+//! **MCP 2026-07-28 support is under implementation and remains unverified.**  
+//! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+//! The current public `PROTOCOL_VERSION` remains `2024-11-05`; newer in-tree
+//! types are not proof of negotiated MCP 2026-07-28 support.
+//! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
+//! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
+//! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
+//! this façade alone.
+//! Release publication remains quarantined; these crate docs do not supply
+//! publication authority or provider-side release-safety evidence.
 //!
 //! # Quick Start
 //!
@@ -17,13 +28,15 @@
 //! use fastmcp_rust::prelude::*;
 //!
 //! #[tool]
-//! async fn greet(ctx: &McpContext, name: String) -> String {
-//!     format!("Hello, {name}!")
+//! async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
+//!     ctx.checkpoint()?;
+//!     Ok(format!("Hello, {name}!"))
 //! }
 //!
 //! fn main() {
 //!     Server::new("my-server", "1.0.0")
-//!         .tool(greet)
+//!         .tool(Greet)
+//!         .build()
 //!         .run_stdio();
 //! }
 //! ```
@@ -68,20 +81,58 @@
 //!
 //! FastMCP uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for:
 //!
-//! - **Structured concurrency**: All tasks belong to regions
-//! - **Cancel-correctness**: Graceful cancellation via checkpoints
-//! - **Budgeted timeouts**: Resource limits for requests
-//! - **Deterministic testing**: Lab runtime for reproducible tests
+//! - **Context propagation**: Requests carry an asupersync capability context
+//! - **Cooperative cancellation**: Explicit checkpoints surface cancellation
+//! - **Request budgets**: Deadline, poll, and cost limits travel with the context
+//! - **Deterministic test support**: Asupersync's lab runtime is available to tests
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+// `proc-macro-crate` reports `FoundCrate::Itself` for every target belonging
+// to this package, including examples and integration tests. Keep one
+// canonical absolute self-name so macro expansion is correct in all of them.
+extern crate self as fastmcp_rust;
+
+/// Implementation paths used by FastMCP's procedural macros.
+///
+/// This is public because macro expansions live in downstream crates. It is
+/// deliberately hidden from the supported application API: users should use
+/// the facade re-exports above rather than couple themselves to these names.
+#[doc(hidden)]
+pub mod __private {
+    pub use fastmcp_core as core;
+    pub use fastmcp_protocol as protocol;
+    pub use fastmcp_server as server;
+    pub use serde_json;
+}
+
 // Re-export core types
 pub use fastmcp_core::{
-    AUTH_STATE_KEY, AccessToken, AuthContext, Budget, CancelledError, Cx, IntoOutcome, LabConfig,
-    LabRuntime, McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt,
-    RegionId, ResultExt, Scope, TaskId, cancelled, err, ok,
+    AccessToken, AuthContext, Budget, CancelledError, Cx, IntoOutcome, LabConfig, LabRuntime,
+    McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome, OutcomeExt, RegionId,
+    ResultExt, Scope, TaskId, cancelled, err, ok,
 };
+
+// FND-01: sealed crypto + URI primitives live in core (no ambient sha2/hmac/getrandom edges).
+pub use fastmcp_core::{
+    ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
+    AbsoluteUriScheme, AuthorityErrorKind, CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES,
+    CanonicalHttpUrl, CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
+    CanonicalResourceIdPolicy, CanonicalUrlPolicy, CryptoInputTooLongError,
+    DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES, DefaultPortPolicy,
+    DotSegmentPolicy, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial, FragmentPolicy,
+    HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
+    HmacVerificationError, IdnaPolicy, NONCE_DOMAIN_MATERIAL_BYTES, NonceDomainMaterial,
+    PercentEncodingPolicy, QueryPolicy, RandomDrawError, ResourceEndpointPathPolicy,
+    SECURITY_IDENTIFIER_BYTES, SHA256_DIGEST_BYTES, SchemeHostCasePolicy, SecurityIdentifier,
+    Sha256Digest, SyntaxViolationPolicy, TrailingSlashPolicy, UriComponentState, UserinfoPolicy,
+    WEBSOCKET_MASK_BYTES, WebSocketMask, draw_ephemeral_key_material, draw_hmac_sha256_key,
+    draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, sha256_bounded,
+};
+
+// Module re-exports for namespaced access (`fastmcp_rust::crypto`, `fastmcp_rust::uri`).
+pub use fastmcp_core::{crypto, uri};
 
 // Re-export logging module
 pub use fastmcp_core::logging;
@@ -105,24 +156,27 @@ pub use fastmcp_transport::{Codec, StdioTransport, Transport, TransportError};
 pub use fastmcp_transport::{event_store, http, memory};
 
 // Re-export server types
-#[cfg(feature = "jwt")]
-pub use fastmcp_server::JwtTokenVerifier;
+// FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, HttpServerConfig, NotificationSender,
     PendingRequests, PromptHandler, ProxyBackend, ProxyCatalog, ProxyClient, RequestSender,
-    ResourceHandler, Router, Server, ServerBuilder, Session, SharedTaskManager,
-    StaticTokenVerifier, TaskManager, TokenAuthProvider, TokenVerifier, ToolHandler,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    ResourceHandler, Router, Server, ServerBuilder, Session, StaticTokenVerifier,
+    TokenAuthProvider, TokenVerifier, ToolHandler, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender,
 };
 
 // Re-export bidirectional module for namespaced access (e.g. bidirectional::RequestSender)
 pub use fastmcp_server::bidirectional;
 
-// Re-export server middleware modules
-pub use fastmcp_server::{caching, docket, oauth, oidc, rate_limiting, transform};
+// Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+pub use fastmcp_server::providers;
+pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
-pub use fastmcp_client::{Client, ClientBuilder, ClientSession};
+pub use fastmcp_client::{
+    BoundedListPage, Client, ClientBuilder, ClientSession, ListPageLimits, RequestTimeoutPolicy,
+    RequestTimeoutSource,
+};
 
 // Re-export client configuration module
 pub use fastmcp_client::mcp_config;
@@ -144,10 +198,14 @@ pub mod prelude {
         AccessToken,
         AuthContext,
         // Client
+        BoundedListPage,
         Client,
+        ClientBuilder,
+        ClientSession,
         // Protocol types
         Content,
         JsonSchema,
+        ListPageLimits,
         McpContext,
         McpError,
         McpOutcome,
@@ -162,6 +220,8 @@ pub mod prelude {
         ProxyBackend,
         ProxyCatalog,
         ProxyClient,
+        RequestTimeoutPolicy,
+        RequestTimeoutSource,
         Resource,
         ResourceContent,
         ResultExt,
@@ -176,7 +236,42 @@ pub mod prelude {
         ok,
         // Macros
         prompt,
+        providers::FilesystemProvider,
         resource,
         tool,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{RequestTimeoutPolicy, RequestTimeoutSource};
+
+    #[test]
+    fn facade_reexports_client_timeout_types() {
+        let policy = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
+            .expect("facade timeout policy must validate");
+
+        assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
+        assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
+        assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[test]
+    fn prelude_reexports_client_timeout_configuration_surface() {
+        use super::prelude::{
+            Client, ClientBuilder, ClientSession, RequestTimeoutPolicy, RequestTimeoutSource,
+        };
+
+        let _: ClientBuilder = Client::builder();
+        let policy = RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(7))
+            .expect("prelude timeout policy must validate");
+
+        assert_eq!(policy.idle_timeout(), Duration::from_secs(3));
+        assert_eq!(policy.absolute_timeout(), Duration::from_secs(7));
+        let source: RequestTimeoutSource = RequestTimeoutSource::Idle;
+        assert!(matches!(source, RequestTimeoutSource::Idle));
+        let _ = std::mem::size_of::<ClientSession>();
+    }
 }

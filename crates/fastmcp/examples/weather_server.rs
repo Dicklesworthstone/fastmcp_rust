@@ -9,12 +9,12 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example weather_server
+//! cargo run -p fastmcp-rust --example weather_server
 //! ```
 //!
 //! Test with MCP Inspector:
 //! ```bash
-//! npx @anthropic-ai/mcp-inspector cargo run --example weather_server
+//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --example weather_server
 //! ```
 //!
 //! Note: This is a mock server - all weather data is simulated.

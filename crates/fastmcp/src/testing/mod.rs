@@ -2,7 +2,7 @@
 //!
 //! This module provides utilities for writing comprehensive tests without mocks:
 //!
-//! - [`TestContext`]: Wrapper around `Cx::for_testing()` with helper methods
+//! - [`TestContext`]: Wrapper around a runtime-provided `Cx` with helper methods
 //! - [`TestServer`]: Builder for creating test servers with real handlers
 //! - [`TestClient`]: Client for in-process testing with MemoryTransport
 //! - Assertion helpers for validating JSON-RPC and MCP compliance

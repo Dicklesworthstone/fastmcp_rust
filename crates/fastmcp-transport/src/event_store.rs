@@ -13,6 +13,7 @@
 //!
 //! - **TTL-based event retention**: Events automatically expire after a configurable duration
 //! - **Per-stream event limits**: Prevents unbounded memory growth
+//! - **Global retention limits**: Bounds streams, identifier bytes, and retained payload bytes
 //! - **Cursor-based resumption**: Replay events from any point using event IDs
 //! - **Thread-safe**: Safe for concurrent access from multiple handlers
 //!
@@ -26,11 +27,15 @@
 //! let store = EventStore::with_config(EventStoreConfig {
 //!     max_events_per_stream: 100,
 //!     ttl: Some(Duration::from_secs(3600)), // 1 hour
-//! });
+//!     ..EventStoreConfig::default()
+//! })
+//! .expect("valid event-store configuration");
 //!
 //! // Store an event
 //! let stream_id = "session-123";
-//! let event_id = store.store_event(stream_id, Some(serde_json::json!({"method": "test"})));
+//! let event_id = store
+//!     .store_event(stream_id, Some(serde_json::json!({"method": "test"})))
+//!     .expect("event fits configured retention limits");
 //!
 //! // Replay events after a specific ID
 //! let events = store.get_events_after(stream_id, None); // Get all events
@@ -44,6 +49,18 @@ use std::time::{Duration, Instant};
 /// Default maximum events per stream.
 pub const DEFAULT_MAX_EVENTS_PER_STREAM: usize = 100;
 
+/// Default maximum number of retained streams.
+pub const DEFAULT_MAX_STREAMS: usize = 1_024;
+
+/// Default maximum UTF-8 byte length of a retained stream identifier.
+pub const DEFAULT_MAX_STREAM_ID_BYTES: usize = 256;
+
+/// Default maximum compact-JSON payload size of one event (1 MiB).
+pub const DEFAULT_MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Default maximum compact-JSON payload bytes retained across all streams (64 MiB).
+pub const DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default TTL for events (1 hour).
 pub const DEFAULT_TTL_SECS: u64 = 3600;
 
@@ -52,6 +69,72 @@ pub type EventId = String;
 
 /// Unique identifier for a stream (session).
 pub type StreamId = String;
+
+/// Errors produced by event-store configuration or admission checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventStoreError {
+    /// A configured retention limit was zero.
+    InvalidZeroLimit {
+        /// Name of the invalid configuration field.
+        field: &'static str,
+    },
+    /// The stream identifier exceeded its configured UTF-8 byte limit.
+    StreamIdTooLong {
+        /// Configured maximum number of bytes.
+        max_bytes: usize,
+    },
+    /// The compact JSON encoding of one event exceeded its configured limit.
+    EventPayloadTooLarge {
+        /// Configured maximum number of bytes.
+        max_bytes: usize,
+    },
+    /// A new stream could not be retained without exceeding the stream limit.
+    StreamLimitReached {
+        /// Configured maximum number of streams.
+        max_streams: usize,
+    },
+    /// An event could not be retained without exceeding the aggregate payload limit.
+    AggregatePayloadLimitExceeded {
+        /// Configured maximum aggregate number of bytes.
+        max_bytes: usize,
+    },
+    /// A JSON value could not be measured using its compact wire encoding.
+    PayloadMeasurementFailed,
+}
+
+impl std::fmt::Display for EventStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidZeroLimit { field } => {
+                write!(
+                    formatter,
+                    "event-store limit `{field}` must be greater than zero"
+                )
+            }
+            Self::StreamIdTooLong { max_bytes } => write!(
+                formatter,
+                "stream identifier exceeds the configured {max_bytes}-byte limit"
+            ),
+            Self::EventPayloadTooLarge { max_bytes } => write!(
+                formatter,
+                "event payload exceeds the configured {max_bytes}-byte limit"
+            ),
+            Self::StreamLimitReached { max_streams } => write!(
+                formatter,
+                "event store has reached its configured {max_streams}-stream limit"
+            ),
+            Self::AggregatePayloadLimitExceeded { max_bytes } => write!(
+                formatter,
+                "event store would exceed its configured {max_bytes}-byte aggregate payload limit"
+            ),
+            Self::PayloadMeasurementFailed => {
+                formatter.write_str("event payload size could not be measured")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EventStoreError {}
 
 /// A stored event with metadata.
 #[derive(Debug, Clone)]
@@ -91,6 +174,14 @@ impl EventEntry {
 pub struct EventStoreConfig {
     /// Maximum number of events to retain per stream.
     pub max_events_per_stream: usize,
+    /// Maximum number of streams to retain.
+    pub max_streams: usize,
+    /// Maximum UTF-8 byte length of a retained stream identifier.
+    pub max_stream_id_bytes: usize,
+    /// Maximum compact-JSON payload bytes retained for one event.
+    pub max_event_payload_bytes: usize,
+    /// Maximum compact-JSON payload bytes retained across all streams.
+    pub max_total_event_payload_bytes: usize,
     /// Time-to-live for events. `None` means events never expire.
     pub ttl: Option<Duration>,
 }
@@ -99,6 +190,10 @@ impl Default for EventStoreConfig {
     fn default() -> Self {
         Self {
             max_events_per_stream: DEFAULT_MAX_EVENTS_PER_STREAM,
+            max_streams: DEFAULT_MAX_STREAMS,
+            max_stream_id_bytes: DEFAULT_MAX_STREAM_ID_BYTES,
+            max_event_payload_bytes: DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
+            max_total_event_payload_bytes: DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES,
             ttl: Some(Duration::from_secs(DEFAULT_TTL_SECS)),
         }
     }
@@ -121,6 +216,34 @@ impl EventStoreConfig {
         self
     }
 
+    /// Sets the maximum number of retained streams.
+    #[must_use]
+    pub fn max_streams(mut self, max: usize) -> Self {
+        self.max_streams = max;
+        self
+    }
+
+    /// Sets the maximum UTF-8 byte length of retained stream identifiers.
+    #[must_use]
+    pub fn max_stream_id_bytes(mut self, max: usize) -> Self {
+        self.max_stream_id_bytes = max;
+        self
+    }
+
+    /// Sets the maximum compact-JSON payload bytes retained for one event.
+    #[must_use]
+    pub fn max_event_payload_bytes(mut self, max: usize) -> Self {
+        self.max_event_payload_bytes = max;
+        self
+    }
+
+    /// Sets the maximum compact-JSON payload bytes retained across all streams.
+    #[must_use]
+    pub fn max_total_event_payload_bytes(mut self, max: usize) -> Self {
+        self.max_total_event_payload_bytes = max;
+        self
+    }
+
     /// Sets the TTL for events.
     #[must_use]
     pub fn ttl(mut self, ttl: Duration) -> Self {
@@ -134,13 +257,94 @@ impl EventStoreConfig {
         self.ttl = None;
         self
     }
+
+    fn validate(&self) -> Result<(), EventStoreError> {
+        for (field, limit) in [
+            ("max_events_per_stream", self.max_events_per_stream),
+            ("max_streams", self.max_streams),
+            ("max_stream_id_bytes", self.max_stream_id_bytes),
+            ("max_event_payload_bytes", self.max_event_payload_bytes),
+            (
+                "max_total_event_payload_bytes",
+                self.max_total_event_payload_bytes,
+            ),
+        ] {
+            if limit == 0 {
+                return Err(EventStoreError::InvalidZeroLimit { field });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct PayloadByteCounter {
+    bytes: usize,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl PayloadByteCounter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: 0,
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for PayloadByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next_bytes) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("event payload size overflow"));
+        };
+
+        if next_bytes > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "event payload exceeds configured limit",
+            ));
+        }
+
+        self.bytes = next_bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_event_payload(
+    data: Option<&serde_json::Value>,
+    max_bytes: usize,
+) -> Result<usize, EventStoreError> {
+    let Some(data) = data else {
+        return Ok(0);
+    };
+
+    let mut counter = PayloadByteCounter::new(max_bytes);
+    match serde_json::to_writer(&mut counter, data) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(EventStoreError::EventPayloadTooLarge { max_bytes }),
+        Err(_) => Err(EventStoreError::PayloadMeasurementFailed),
+    }
+}
+
+/// Internal event representation with precomputed retention accounting.
+#[derive(Debug)]
+struct StoredEvent {
+    entry: EventEntry,
+    payload_bytes: usize,
 }
 
 /// Internal storage for a single stream's events.
 #[derive(Debug)]
 struct StreamEvents {
     /// Events in insertion order (oldest first).
-    events: VecDeque<EventEntry>,
+    events: VecDeque<StoredEvent>,
     /// Map from event ID to index for fast lookup.
     index: HashMap<EventId, usize>,
 }
@@ -153,12 +357,34 @@ impl StreamEvents {
         }
     }
 
-    /// Adds an event, enforcing max events limit.
-    fn push(&mut self, entry: EventEntry, max_events: usize) {
+    /// Returns the payload bytes that would be evicted by one insertion.
+    fn prospective_evicted_payload_bytes(&self, max_events: usize) -> Option<usize> {
+        let remove_count = self.events.len().checked_add(1)?.saturating_sub(max_events);
+        self.events
+            .iter()
+            .take(remove_count)
+            .try_fold(0usize, |total, event| {
+                total.checked_add(event.payload_bytes)
+            })
+    }
+
+    /// Adds an event, enforcing the per-stream event limit.
+    fn push(
+        &mut self,
+        entry: EventEntry,
+        payload_bytes: usize,
+        max_events: usize,
+    ) -> Result<(), EventStoreError> {
+        if max_events == 0 {
+            return Err(EventStoreError::InvalidZeroLimit {
+                field: "max_events_per_stream",
+            });
+        }
+
         // Remove oldest if at capacity
         while self.events.len() >= max_events {
             if let Some(oldest) = self.events.pop_front() {
-                self.index.remove(&oldest.id);
+                self.index.remove(&oldest.entry.id);
             }
             // Rebuild index after removal (indices shifted)
             self.rebuild_index();
@@ -166,7 +392,11 @@ impl StreamEvents {
 
         let idx = self.events.len();
         self.index.insert(entry.id.clone(), idx);
-        self.events.push_back(entry);
+        self.events.push_back(StoredEvent {
+            entry,
+            payload_bytes,
+        });
+        Ok(())
     }
 
     /// Removes expired events.
@@ -177,9 +407,9 @@ impl StreamEvents {
 
         let mut removed = false;
         while let Some(front) = self.events.front() {
-            if front.is_expired(ttl) {
+            if front.entry.is_expired(ttl) {
                 if let Some(entry) = self.events.pop_front() {
-                    self.index.remove(&entry.id);
+                    self.index.remove(&entry.entry.id);
                     removed = true;
                 }
             } else {
@@ -196,17 +426,31 @@ impl StreamEvents {
     fn rebuild_index(&mut self) {
         self.index.clear();
         for (idx, entry) in self.events.iter().enumerate() {
-            self.index.insert(entry.id.clone(), idx);
+            self.index.insert(entry.entry.id.clone(), idx);
         }
+    }
+
+    fn total_payload_bytes(&self) -> Option<usize> {
+        self.events.iter().try_fold(0usize, |total, event| {
+            total.checked_add(event.payload_bytes)
+        })
     }
 
     /// Gets events after the specified ID (exclusive).
     fn events_after(&self, after_id: Option<&str>) -> Vec<EventEntry> {
         match after_id {
-            None => self.events.iter().cloned().collect(),
+            None => self
+                .events
+                .iter()
+                .map(|event| event.entry.clone())
+                .collect(),
             Some(id) => {
                 if let Some(&idx) = self.index.get(id) {
-                    self.events.iter().skip(idx + 1).cloned().collect()
+                    self.events
+                        .iter()
+                        .skip(idx + 1)
+                        .map(|event| event.entry.clone())
+                        .collect()
                 } else {
                     // ID not found, return empty (client should reconnect fresh)
                     Vec::new()
@@ -250,12 +494,20 @@ impl EventStore {
     /// Creates a new event store with default configuration.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_config(EventStoreConfig::default())
+        Self::from_validated_config(EventStoreConfig::default())
     }
 
     /// Creates a new event store with custom configuration.
-    #[must_use]
-    pub fn with_config(config: EventStoreConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any configured retention limit is zero.
+    pub fn with_config(config: EventStoreConfig) -> Result<Self, EventStoreError> {
+        config.validate()?;
+        Ok(Self::from_validated_config(config))
+    }
+
+    fn from_validated_config(config: EventStoreConfig) -> Self {
         Self {
             config,
             streams: RwLock::new(HashMap::new()),
@@ -279,6 +531,21 @@ impl EventStore {
         format!("{timestamp}-{counter}")
     }
 
+    fn cleanup_streams(streams: &mut HashMap<StreamId, StreamEvents>, ttl: Option<Duration>) {
+        if ttl.is_some() {
+            for stream in streams.values_mut() {
+                stream.remove_expired(ttl);
+            }
+        }
+        streams.retain(|_, stream| !stream.events.is_empty());
+    }
+
+    fn total_payload_bytes(streams: &HashMap<StreamId, StreamEvents>) -> Option<usize> {
+        streams.values().try_fold(0usize, |total, stream| {
+            total.checked_add(stream.total_payload_bytes()?)
+        })
+    }
+
     /// Stores an event and returns its ID.
     ///
     /// # Arguments
@@ -289,33 +556,86 @@ impl EventStore {
     /// # Returns
     ///
     /// The unique event ID that can be used for resumption.
-    pub fn store_event(&self, stream_id: &str, data: Option<serde_json::Value>) -> EventId {
-        let event_id = self.generate_event_id();
-        let entry = EventEntry::new(event_id.clone(), stream_id.to_string(), data);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without retaining the event if an input or aggregate
+    /// retention limit would be exceeded.
+    pub fn store_event(
+        &self,
+        stream_id: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<EventId, EventStoreError> {
+        if stream_id.len() > self.config.max_stream_id_bytes {
+            return Err(EventStoreError::StreamIdTooLong {
+                max_bytes: self.config.max_stream_id_bytes,
+            });
+        }
+
+        let payload_bytes =
+            measure_event_payload(data.as_ref(), self.config.max_event_payload_bytes)?;
 
         let mut streams = self
             .streams
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        Self::cleanup_streams(&mut streams, self.config.ttl);
+
+        if !streams.contains_key(stream_id) && streams.len() >= self.config.max_streams {
+            return Err(EventStoreError::StreamLimitReached {
+                max_streams: self.config.max_streams,
+            });
+        }
+
+        let total_payload_bytes = Self::total_payload_bytes(&streams).ok_or(
+            EventStoreError::AggregatePayloadLimitExceeded {
+                max_bytes: self.config.max_total_event_payload_bytes,
+            },
+        )?;
+        let evicted_payload_bytes = streams
+            .get(stream_id)
+            .map_or(Some(0), |stream| {
+                stream.prospective_evicted_payload_bytes(self.config.max_events_per_stream)
+            })
+            .ok_or(EventStoreError::AggregatePayloadLimitExceeded {
+                max_bytes: self.config.max_total_event_payload_bytes,
+            })?;
+        let retained_payload_bytes = total_payload_bytes
+            .checked_sub(evicted_payload_bytes)
+            .and_then(|retained| retained.checked_add(payload_bytes))
+            .ok_or(EventStoreError::AggregatePayloadLimitExceeded {
+                max_bytes: self.config.max_total_event_payload_bytes,
+            })?;
+
+        if retained_payload_bytes > self.config.max_total_event_payload_bytes {
+            return Err(EventStoreError::AggregatePayloadLimitExceeded {
+                max_bytes: self.config.max_total_event_payload_bytes,
+            });
+        }
+
+        let event_id = self.generate_event_id();
+        let entry = EventEntry::new(event_id.clone(), stream_id.to_string(), data);
+
         let stream = streams
             .entry(stream_id.to_string())
             .or_insert_with(StreamEvents::new);
 
-        // Clean up expired events first
-        stream.remove_expired(self.config.ttl);
+        stream.push(entry, payload_bytes, self.config.max_events_per_stream)?;
 
-        // Add the new event
-        stream.push(entry, self.config.max_events_per_stream);
-
-        event_id
+        Ok(event_id)
     }
 
     /// Stores a priming event (empty data) for SSE initialization.
     ///
     /// Per SSE spec, servers should send an event with just an ID to prime
     /// the client's `Last-Event-ID` tracking.
-    pub fn store_priming_event(&self, stream_id: &str) -> EventId {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without retaining the event if the stream identifier
+    /// or store-wide retention limits would be exceeded.
+    pub fn store_priming_event(&self, stream_id: &str) -> Result<EventId, EventStoreError> {
         self.store_event(stream_id, None)
     }
 
@@ -336,9 +656,9 @@ impl EventStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(stream) = streams.get_mut(stream_id) {
-            // Clean up expired events first
-            stream.remove_expired(self.config.ttl);
+        Self::cleanup_streams(&mut streams, self.config.ttl);
+
+        if let Some(stream) = streams.get(stream_id) {
             stream.events_after(after_id)
         } else {
             Vec::new()
@@ -362,23 +682,25 @@ impl EventStore {
     where
         F: FnMut(&EventEntry),
     {
-        let streams = self
-            .streams
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replay = {
+            let mut streams = self
+                .streams
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Find which stream contains this event
-        for (stream_id, stream) in streams.iter() {
-            if stream.contains(last_event_id) {
-                let events = stream.events_after(Some(last_event_id));
-                for event in events {
-                    callback(&event);
-                }
-                return Some(stream_id.clone());
-            }
+            Self::cleanup_streams(&mut streams, self.config.ttl);
+            streams.iter().find_map(|(stream_id, stream)| {
+                stream
+                    .contains(last_event_id)
+                    .then(|| (stream_id.clone(), stream.events_after(Some(last_event_id))))
+            })
+        };
+
+        let (stream_id, events) = replay?;
+        for event in events {
+            callback(&event);
         }
-
-        None
+        Some(stream_id)
     }
 
     /// Looks up the stream ID for a given event ID.
@@ -388,10 +710,12 @@ impl EventStore {
     /// The stream ID if the event exists, `None` otherwise.
     #[must_use]
     pub fn find_stream_for_event(&self, event_id: &str) -> Option<StreamId> {
-        let streams = self
+        let mut streams = self
             .streams
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Self::cleanup_streams(&mut streams, self.config.ttl);
 
         for (stream_id, stream) in streams.iter() {
             if stream.contains(event_id) {
@@ -418,57 +742,56 @@ impl EventStore {
     /// This is called automatically during operations, but you can call
     /// it manually for cleanup.
     pub fn cleanup_expired(&self) {
-        if self.config.ttl.is_none() {
-            return;
-        }
-
         let mut streams = self
             .streams
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Remove expired events from each stream
-        for stream in streams.values_mut() {
-            stream.remove_expired(self.config.ttl);
-        }
-
-        // Remove empty streams
-        streams.retain(|_, stream| !stream.events.is_empty());
+        Self::cleanup_streams(&mut streams, self.config.ttl);
     }
 
     /// Returns the number of streams currently stored.
     #[must_use]
     pub fn stream_count(&self) -> usize {
-        let streams = self
+        let mut streams = self
             .streams
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::cleanup_streams(&mut streams, self.config.ttl);
         streams.len()
     }
 
     /// Returns the total number of events across all streams.
     #[must_use]
     pub fn event_count(&self) -> usize {
-        let streams = self
+        let mut streams = self
             .streams
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::cleanup_streams(&mut streams, self.config.ttl);
         streams.values().map(|s| s.events.len()).sum()
     }
 
     /// Returns statistics about the event store.
     #[must_use]
     pub fn stats(&self) -> EventStoreStats {
-        let streams = self
+        let mut streams = self
             .streams
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::cleanup_streams(&mut streams, self.config.ttl);
         let total_events: usize = streams.values().map(|s| s.events.len()).sum();
+        let total_event_payload_bytes = Self::total_payload_bytes(&streams)
+            .unwrap_or(self.config.max_total_event_payload_bytes);
 
         EventStoreStats {
             stream_count: streams.len(),
             total_events,
+            total_event_payload_bytes,
             max_events_per_stream: self.config.max_events_per_stream,
+            max_streams: self.config.max_streams,
+            max_stream_id_bytes: self.config.max_stream_id_bytes,
+            max_event_payload_bytes: self.config.max_event_payload_bytes,
+            max_total_event_payload_bytes: self.config.max_total_event_payload_bytes,
             ttl: self.config.ttl,
         }
     }
@@ -481,8 +804,18 @@ pub struct EventStoreStats {
     pub stream_count: usize,
     /// Total events across all streams.
     pub total_events: usize,
+    /// Compact-JSON payload bytes retained across all streams.
+    pub total_event_payload_bytes: usize,
     /// Configured max events per stream.
     pub max_events_per_stream: usize,
+    /// Configured maximum number of retained streams.
+    pub max_streams: usize,
+    /// Configured maximum stream identifier byte length.
+    pub max_stream_id_bytes: usize,
+    /// Configured maximum compact-JSON bytes for one event payload.
+    pub max_event_payload_bytes: usize,
+    /// Configured maximum compact-JSON bytes retained across all events.
+    pub max_total_event_payload_bytes: usize,
     /// Configured TTL.
     pub ttl: Option<Duration>,
 }
@@ -497,9 +830,14 @@ pub fn create_shared_event_store() -> SharedEventStore {
 }
 
 /// Creates a shared event store with custom configuration.
-#[must_use]
-pub fn create_shared_event_store_with_config(config: EventStoreConfig) -> SharedEventStore {
-    Arc::new(EventStore::with_config(config))
+///
+/// # Errors
+///
+/// Returns an error if any configured retention limit is zero.
+pub fn create_shared_event_store_with_config(
+    config: EventStoreConfig,
+) -> Result<SharedEventStore, EventStoreError> {
+    EventStore::with_config(config).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -510,7 +848,9 @@ mod tests {
     fn test_store_and_retrieve_event() {
         let store = EventStore::new();
 
-        let event_id = store.store_event("stream1", Some(serde_json::json!({"test": true})));
+        let event_id = store
+            .store_event("stream1", Some(serde_json::json!({"test": true})))
+            .unwrap();
         assert!(!event_id.is_empty());
 
         let events = store.get_events_after("stream1", None);
@@ -523,7 +863,7 @@ mod tests {
     fn test_store_priming_event() {
         let store = EventStore::new();
 
-        let event_id = store.store_priming_event("stream1");
+        let event_id = store.store_priming_event("stream1").unwrap();
         assert!(!event_id.is_empty());
 
         let events = store.get_events_after("stream1", None);
@@ -535,9 +875,15 @@ mod tests {
     fn test_events_after_id() {
         let store = EventStore::new();
 
-        let id1 = store.store_event("stream1", Some(serde_json::json!({"n": 1})));
-        let id2 = store.store_event("stream1", Some(serde_json::json!({"n": 2})));
-        let id3 = store.store_event("stream1", Some(serde_json::json!({"n": 3})));
+        let id1 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 1})))
+            .unwrap();
+        let id2 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 2})))
+            .unwrap();
+        let id3 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 3})))
+            .unwrap();
 
         // Get events after id1 (should return id2 and id3)
         let events = store.get_events_after("stream1", Some(&id1));
@@ -559,8 +905,12 @@ mod tests {
     fn test_multiple_streams() {
         let store = EventStore::new();
 
-        let id1 = store.store_event("stream1", Some(serde_json::json!({"stream": 1})));
-        let id2 = store.store_event("stream2", Some(serde_json::json!({"stream": 2})));
+        let id1 = store
+            .store_event("stream1", Some(serde_json::json!({"stream": 1})))
+            .unwrap();
+        let id2 = store
+            .store_event("stream2", Some(serde_json::json!({"stream": 2})))
+            .unwrap();
 
         let events1 = store.get_events_after("stream1", None);
         let events2 = store.get_events_after("stream2", None);
@@ -575,12 +925,20 @@ mod tests {
     #[test]
     fn test_max_events_limit() {
         let config = EventStoreConfig::default().max_events(3);
-        let store = EventStore::with_config(config);
+        let store = EventStore::with_config(config).unwrap();
 
-        let _id1 = store.store_event("stream1", Some(serde_json::json!({"n": 1})));
-        let _id2 = store.store_event("stream1", Some(serde_json::json!({"n": 2})));
-        let id3 = store.store_event("stream1", Some(serde_json::json!({"n": 3})));
-        let id4 = store.store_event("stream1", Some(serde_json::json!({"n": 4})));
+        let _id1 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 1})))
+            .unwrap();
+        let _id2 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 2})))
+            .unwrap();
+        let id3 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 3})))
+            .unwrap();
+        let id4 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 4})))
+            .unwrap();
 
         // Should only have 3 events (oldest removed)
         let events = store.get_events_after("stream1", None);
@@ -597,9 +955,15 @@ mod tests {
     fn test_replay_events() {
         let store = EventStore::new();
 
-        let id1 = store.store_event("stream1", Some(serde_json::json!({"n": 1})));
-        let id2 = store.store_event("stream1", Some(serde_json::json!({"n": 2})));
-        let id3 = store.store_event("stream1", Some(serde_json::json!({"n": 3})));
+        let id1 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 1})))
+            .unwrap();
+        let id2 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 2})))
+            .unwrap();
+        let id3 = store
+            .store_event("stream1", Some(serde_json::json!({"n": 3})))
+            .unwrap();
 
         let mut replayed = Vec::new();
         let stream_id = store.replay_events_after(&id1, |event| {
@@ -613,7 +977,9 @@ mod tests {
     #[test]
     fn test_replay_unknown_event_id() {
         let store = EventStore::new();
-        store.store_event("stream1", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
 
         let mut replayed = Vec::new();
         let stream_id = store.replay_events_after("nonexistent", |event| {
@@ -628,8 +994,12 @@ mod tests {
     fn test_find_stream_for_event() {
         let store = EventStore::new();
 
-        let id1 = store.store_event("stream1", Some(serde_json::json!({})));
-        let id2 = store.store_event("stream2", Some(serde_json::json!({})));
+        let id1 = store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
+        let id2 = store
+            .store_event("stream2", Some(serde_json::json!({})))
+            .unwrap();
 
         assert_eq!(
             store.find_stream_for_event(&id1),
@@ -646,8 +1016,12 @@ mod tests {
     fn test_clear_stream() {
         let store = EventStore::new();
 
-        store.store_event("stream1", Some(serde_json::json!({})));
-        store.store_event("stream2", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
+        store
+            .store_event("stream2", Some(serde_json::json!({})))
+            .unwrap();
 
         assert_eq!(store.stream_count(), 2);
 
@@ -662,10 +1036,13 @@ mod tests {
         let config = EventStoreConfig {
             max_events_per_stream: 100,
             ttl: Some(Duration::from_millis(10)),
+            ..EventStoreConfig::default()
         };
-        let store = EventStore::with_config(config);
+        let store = EventStore::with_config(config).unwrap();
 
-        store.store_event("stream1", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
 
         // Events should exist initially
         assert_eq!(store.get_events_after("stream1", None).len(), 1);
@@ -681,9 +1058,11 @@ mod tests {
     #[test]
     fn test_no_expiration() {
         let config = EventStoreConfig::no_expiry();
-        let store = EventStore::with_config(config);
+        let store = EventStore::with_config(config).unwrap();
 
-        store.store_event("stream1", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
 
         // Even after cleanup, events should remain
         store.cleanup_expired();
@@ -694,13 +1073,20 @@ mod tests {
     fn test_stats() {
         let store = EventStore::new();
 
-        store.store_event("stream1", Some(serde_json::json!({})));
-        store.store_event("stream1", Some(serde_json::json!({})));
-        store.store_event("stream2", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
+        store
+            .store_event("stream2", Some(serde_json::json!({})))
+            .unwrap();
 
         let stats = store.stats();
         assert_eq!(stats.stream_count, 2);
         assert_eq!(stats.total_events, 3);
+        assert_eq!(stats.total_event_payload_bytes, 6);
     }
 
     #[test]
@@ -711,8 +1097,12 @@ mod tests {
         let store1 = Arc::clone(&store);
         let store2 = Arc::clone(&store);
 
-        store1.store_event("stream1", Some(serde_json::json!({"from": 1})));
-        store2.store_event("stream1", Some(serde_json::json!({"from": 2})));
+        store1
+            .store_event("stream1", Some(serde_json::json!({"from": 1})))
+            .unwrap();
+        store2
+            .store_event("stream1", Some(serde_json::json!({"from": 2})))
+            .unwrap();
 
         assert_eq!(store.event_count(), 2);
     }
@@ -721,9 +1111,9 @@ mod tests {
     fn test_unique_event_ids() {
         let store = EventStore::new();
 
-        let id1 = store.store_event("stream1", None);
-        let id2 = store.store_event("stream1", None);
-        let id3 = store.store_event("stream2", None);
+        let id1 = store.store_event("stream1", None).unwrap();
+        let id2 = store.store_event("stream1", None).unwrap();
+        let id3 = store.store_event("stream2", None).unwrap();
 
         // All IDs should be unique
         assert_ne!(id1, id2);
@@ -735,13 +1125,194 @@ mod tests {
     fn test_config_builder() {
         let config = EventStoreConfig::default()
             .max_events(50)
+            .max_streams(25)
+            .max_stream_id_bytes(128)
+            .max_event_payload_bytes(4096)
+            .max_total_event_payload_bytes(8192)
             .ttl(Duration::from_secs(300));
 
         assert_eq!(config.max_events_per_stream, 50);
+        assert_eq!(config.max_streams, 25);
+        assert_eq!(config.max_stream_id_bytes, 128);
+        assert_eq!(config.max_event_payload_bytes, 4096);
+        assert_eq!(config.max_total_event_payload_bytes, 8192);
         assert_eq!(config.ttl, Some(Duration::from_secs(300)));
 
         let config = config.no_ttl();
         assert!(config.ttl.is_none());
+    }
+
+    #[test]
+    fn zero_max_events_is_rejected_without_entering_retention_loop() {
+        let error = EventStore::with_config(EventStoreConfig::default().max_events(0))
+            .expect_err("zero max_events_per_stream must be rejected");
+
+        assert_eq!(
+            error,
+            EventStoreError::InvalidZeroLimit {
+                field: "max_events_per_stream"
+            }
+        );
+    }
+
+    #[test]
+    fn all_other_zero_retention_limits_are_rejected() {
+        let cases = [
+            ("max_streams", EventStoreConfig::default().max_streams(0)),
+            (
+                "max_stream_id_bytes",
+                EventStoreConfig::default().max_stream_id_bytes(0),
+            ),
+            (
+                "max_event_payload_bytes",
+                EventStoreConfig::default().max_event_payload_bytes(0),
+            ),
+            (
+                "max_total_event_payload_bytes",
+                EventStoreConfig::default().max_total_event_payload_bytes(0),
+            ),
+        ];
+
+        for (field, config) in cases {
+            let error =
+                EventStore::with_config(config).expect_err("zero retention limit must be rejected");
+            assert_eq!(error, EventStoreError::InvalidZeroLimit { field });
+        }
+    }
+
+    #[test]
+    fn stream_id_byte_limit_accepts_exact_boundary_and_rejects_one_more() {
+        let store = EventStore::with_config(
+            EventStoreConfig::default()
+                .max_streams(2)
+                .max_stream_id_bytes(4),
+        )
+        .unwrap();
+
+        store.store_priming_event("éé").unwrap();
+        let error = store
+            .store_priming_event("ééx")
+            .expect_err("five-byte stream identifier must be rejected");
+
+        assert_eq!(error, EventStoreError::StreamIdTooLong { max_bytes: 4 });
+        assert_eq!(store.stream_count(), 1);
+    }
+
+    #[test]
+    fn stream_limit_accepts_exact_boundary_and_rejects_one_more() {
+        let store = EventStore::with_config(EventStoreConfig::default().max_streams(2)).unwrap();
+
+        store.store_priming_event("one").unwrap();
+        store.store_priming_event("two").unwrap();
+        let error = store
+            .store_priming_event("three")
+            .expect_err("third retained stream must be rejected");
+
+        assert_eq!(
+            error,
+            EventStoreError::StreamLimitReached { max_streams: 2 }
+        );
+        assert_eq!(store.stream_count(), 2);
+        assert_eq!(store.event_count(), 2);
+    }
+
+    #[test]
+    fn event_payload_limit_accepts_exact_boundary_and_rejects_one_more() {
+        let store = EventStore::with_config(
+            EventStoreConfig::default()
+                .max_event_payload_bytes(4)
+                .max_total_event_payload_bytes(8),
+        )
+        .unwrap();
+
+        store
+            .store_event("stream", Some(serde_json::json!(1234)))
+            .unwrap();
+        let error = store
+            .store_event("stream", Some(serde_json::json!(12345)))
+            .expect_err("five-byte compact JSON payload must be rejected");
+
+        assert_eq!(
+            error,
+            EventStoreError::EventPayloadTooLarge { max_bytes: 4 }
+        );
+        assert_eq!(store.event_count(), 1);
+        assert_eq!(store.stats().total_event_payload_bytes, 4);
+    }
+
+    #[test]
+    fn aggregate_payload_limit_accepts_exact_boundary_and_rejects_one_more() {
+        let store = EventStore::with_config(
+            EventStoreConfig::default()
+                .max_event_payload_bytes(4)
+                .max_total_event_payload_bytes(8),
+        )
+        .unwrap();
+
+        store
+            .store_event("stream", Some(serde_json::json!(1234)))
+            .unwrap();
+        store
+            .store_event("stream", Some(serde_json::json!(5678)))
+            .unwrap();
+        let error = store
+            .store_event("stream", Some(serde_json::json!(0)))
+            .expect_err("ninth retained payload byte must be rejected");
+
+        assert_eq!(
+            error,
+            EventStoreError::AggregatePayloadLimitExceeded { max_bytes: 8 }
+        );
+        let stats = store.stats();
+        assert_eq!(stats.total_events, 2);
+        assert_eq!(stats.total_event_payload_bytes, 8);
+    }
+
+    #[test]
+    fn per_stream_eviction_releases_aggregate_payload_capacity() {
+        let store = EventStore::with_config(
+            EventStoreConfig::default()
+                .max_events(1)
+                .max_event_payload_bytes(4)
+                .max_total_event_payload_bytes(4),
+        )
+        .unwrap();
+
+        store
+            .store_event("stream", Some(serde_json::json!(1234)))
+            .unwrap();
+        store
+            .store_event("stream", Some(serde_json::json!(5678)))
+            .unwrap();
+
+        let events = store.get_events_after("stream", None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, Some(serde_json::json!(5678)));
+        assert_eq!(store.stats().total_event_payload_bytes, 4);
+    }
+
+    #[test]
+    fn store_admission_opportunistically_reclaims_expired_stream_and_payload() {
+        let store = EventStore::with_config(
+            EventStoreConfig::default()
+                .max_streams(1)
+                .max_event_payload_bytes(4)
+                .max_total_event_payload_bytes(4)
+                .ttl(Duration::from_millis(5)),
+        )
+        .unwrap();
+
+        store
+            .store_event("old", Some(serde_json::json!(1234)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        store
+            .store_event("new", Some(serde_json::json!(5678)))
+            .unwrap();
+
+        assert!(store.get_events_after("old", None).is_empty());
+        assert_eq!(store.stream_count(), 1);
+        assert_eq!(store.stats().total_event_payload_bytes, 4);
     }
 
     // =========================================================================
@@ -752,6 +1323,16 @@ mod tests {
     fn event_store_config_default_values() {
         let config = EventStoreConfig::default();
         assert_eq!(config.max_events_per_stream, DEFAULT_MAX_EVENTS_PER_STREAM);
+        assert_eq!(config.max_streams, DEFAULT_MAX_STREAMS);
+        assert_eq!(config.max_stream_id_bytes, DEFAULT_MAX_STREAM_ID_BYTES);
+        assert_eq!(
+            config.max_event_payload_bytes,
+            DEFAULT_MAX_EVENT_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            config.max_total_event_payload_bytes,
+            DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES
+        );
         assert_eq!(config.ttl, Some(Duration::from_secs(DEFAULT_TTL_SECS)));
     }
 
@@ -769,7 +1350,7 @@ mod tests {
     #[test]
     fn event_store_config_accessor() {
         let config = EventStoreConfig::no_expiry().max_events(42);
-        let store = EventStore::with_config(config);
+        let store = EventStore::with_config(config).unwrap();
         assert_eq!(store.config().max_events_per_stream, 42);
         assert!(store.config().ttl.is_none());
     }
@@ -777,7 +1358,9 @@ mod tests {
     #[test]
     fn get_events_after_nonexistent_stream_returns_empty() {
         let store = EventStore::new();
-        store.store_event("stream1", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
         let events = store.get_events_after("no-such-stream", None);
         assert!(events.is_empty());
     }
@@ -785,7 +1368,9 @@ mod tests {
     #[test]
     fn get_events_after_unknown_id_returns_empty() {
         let store = EventStore::new();
-        store.store_event("stream1", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
         // An unknown after_id returns empty per SSE spec (client should reconnect fresh)
         let events = store.get_events_after("stream1", Some("bogus-id"));
         assert!(events.is_empty());
@@ -794,7 +1379,7 @@ mod tests {
     #[test]
     fn create_shared_event_store_with_config_works() {
         let config = EventStoreConfig::no_expiry().max_events(5);
-        let store = create_shared_event_store_with_config(config);
+        let store = create_shared_event_store_with_config(config).unwrap();
         assert_eq!(store.config().max_events_per_stream, 5);
         assert!(store.config().ttl.is_none());
     }
@@ -804,11 +1389,16 @@ mod tests {
         let config = EventStoreConfig {
             max_events_per_stream: 100,
             ttl: Some(Duration::from_millis(10)),
+            ..EventStoreConfig::default()
         };
-        let store = EventStore::with_config(config);
+        let store = EventStore::with_config(config).unwrap();
 
-        store.store_event("stream1", Some(serde_json::json!({})));
-        store.store_event("stream2", Some(serde_json::json!({})));
+        store
+            .store_event("stream1", Some(serde_json::json!({})))
+            .unwrap();
+        store
+            .store_event("stream2", Some(serde_json::json!({})))
+            .unwrap();
         assert_eq!(store.stream_count(), 2);
 
         std::thread::sleep(Duration::from_millis(20));
@@ -822,13 +1412,24 @@ mod tests {
     #[test]
     fn event_store_stats_includes_config_fields() {
         let config = EventStoreConfig::no_expiry().max_events(77);
-        let store = EventStore::with_config(config);
-        store.store_event("s1", None);
+        let store = EventStore::with_config(config).unwrap();
+        store.store_event("s1", None).unwrap();
 
         let stats = store.stats();
         assert_eq!(stats.stream_count, 1);
         assert_eq!(stats.total_events, 1);
+        assert_eq!(stats.total_event_payload_bytes, 0);
         assert_eq!(stats.max_events_per_stream, 77);
+        assert_eq!(stats.max_streams, DEFAULT_MAX_STREAMS);
+        assert_eq!(stats.max_stream_id_bytes, DEFAULT_MAX_STREAM_ID_BYTES);
+        assert_eq!(
+            stats.max_event_payload_bytes,
+            DEFAULT_MAX_EVENT_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            stats.max_total_event_payload_bytes,
+            DEFAULT_MAX_TOTAL_EVENT_PAYLOAD_BYTES
+        );
         assert!(stats.ttl.is_none());
     }
 
@@ -870,7 +1471,7 @@ mod tests {
     #[test]
     fn event_store_stats_debug_and_clone() {
         let store = EventStore::new();
-        store.store_event("s1", None);
+        store.store_event("s1", None).unwrap();
         let stats = store.stats();
         let debug = format!("{stats:?}");
         assert!(debug.contains("EventStoreStats"));
@@ -889,9 +1490,9 @@ mod tests {
     #[test]
     fn cleanup_expired_noop_with_no_ttl() {
         let config = EventStoreConfig::no_expiry();
-        let store = EventStore::with_config(config);
-        store.store_event("s1", Some(serde_json::json!(1)));
-        store.store_event("s2", Some(serde_json::json!(2)));
+        let store = EventStore::with_config(config).unwrap();
+        store.store_event("s1", Some(serde_json::json!(1))).unwrap();
+        store.store_event("s2", Some(serde_json::json!(2))).unwrap();
         store.cleanup_expired();
         // Nothing should be removed
         assert_eq!(store.event_count(), 2);
@@ -899,9 +1500,25 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_empty_stream_even_without_ttl() {
+        let store = EventStore::with_config(EventStoreConfig::no_expiry()).unwrap();
+        {
+            let mut streams = store
+                .streams
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            streams.insert("empty".to_string(), StreamEvents::new());
+        }
+
+        store.cleanup_expired();
+
+        assert_eq!(store.stream_count(), 0);
+    }
+
+    #[test]
     fn clear_stream_nonexistent_is_noop() {
         let store = EventStore::new();
-        store.store_event("s1", None);
+        store.store_event("s1", None).unwrap();
         store.clear_stream("no-such-stream");
         assert_eq!(store.stream_count(), 1);
     }
@@ -909,7 +1526,7 @@ mod tests {
     #[test]
     fn event_id_format_contains_dash() {
         let store = EventStore::new();
-        let id = store.store_event("s1", None);
+        let id = store.store_event("s1", None).unwrap();
         assert!(id.contains('-'), "event ID should contain a dash: {id}");
     }
 }

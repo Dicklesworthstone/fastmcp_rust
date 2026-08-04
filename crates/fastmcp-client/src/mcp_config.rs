@@ -41,21 +41,24 @@
 //! Config files are searched in order:
 //! - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 //! - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-//! - Linux: `~/.config/claude/config.json`
+//! - Linux and other non-macOS Unix: `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`
+//!   (falling back to `~/.config/Claude/claude_desktop_config.json`)
 //!
 //! Project-specific configs can be in `.vscode/mcp.json` or `.mcp/config.json`.
 
 use std::collections::HashMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Serialize};
 
-use crate::{Client, ClientSession};
+use crate::{
+    ChildGuard, Client, ClientSession, RequestTimeoutPolicy, combine_cleanup_results,
+    combine_operation_with_cleanup, resolve_stdio_command, transport_error_to_mcp,
+};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 
 // ============================================================================
@@ -63,7 +66,7 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 // ============================================================================
 
 /// MCP configuration file containing server definitions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConfig {
     /// Server configurations keyed by name.
@@ -71,8 +74,26 @@ pub struct McpConfig {
     pub mcp_servers: HashMap<String, ServerConfig>,
 }
 
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let enabled_server_count = self
+            .mcp_servers
+            .values()
+            .filter(|config| !config.disabled)
+            .count();
+        f.debug_struct("McpConfig")
+            .field("server_count", &self.mcp_servers.len())
+            .field("enabled_server_count", &enabled_server_count)
+            .field(
+                "disabled_server_count",
+                &self.mcp_servers.len().saturating_sub(enabled_server_count),
+            )
+            .finish()
+    }
+}
+
 /// Configuration for a single MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     /// Command to execute (e.g., "npx", "uvx", "python").
@@ -93,6 +114,18 @@ pub struct ServerConfig {
     /// Whether the server is disabled.
     #[serde(default)]
     pub disabled: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("command_set", &!self.command.is_empty())
+            .field("arg_count", &self.args.len())
+            .field("env_var_count", &self.env.len())
+            .field("cwd_set", &self.cwd.is_some())
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -156,6 +189,8 @@ pub enum ConfigError {
     ServerDisabled(String),
     /// Failed to spawn server process.
     SpawnError(String),
+    /// Server process started, but the MCP client lifecycle failed.
+    ClientError(McpError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -167,6 +202,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::ServerNotFound(name) => write!(f, "Server not found: {name}"),
             ConfigError::ServerDisabled(name) => write!(f, "Server is disabled: {name}"),
             ConfigError::SpawnError(e) => write!(f, "Failed to spawn server: {e}"),
+            ConfigError::ClientError(e) => write!(f, "MCP client lifecycle failed: {e}"),
         }
     }
 }
@@ -175,6 +211,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::ReadError(e) => Some(e),
+            ConfigError::ClientError(e) => Some(e),
             _ => None,
         }
     }
@@ -221,7 +258,8 @@ impl McpConfig {
     ///
     /// Returns an error if parsing fails.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
-        serde_json::from_str(json).map_err(|e| ConfigError::ParseError(e.to_string()))
+        serde_json::from_str(json)
+            .map_err(|_| ConfigError::ParseError("Invalid JSON configuration".to_string()))
     }
 
     /// Parses configuration from a TOML string.
@@ -241,7 +279,8 @@ impl McpConfig {
     ///
     /// Returns an error if parsing fails.
     pub fn from_toml(toml: &str) -> Result<Self, ConfigError> {
-        toml::from_str(toml).map_err(|e| ConfigError::ParseError(e.to_string()))
+        toml::from_str(toml)
+            .map_err(|_| ConfigError::ParseError("Invalid TOML configuration".to_string()))
     }
 
     /// Serializes configuration to JSON.
@@ -285,19 +324,77 @@ impl McpConfig {
 
     /// Creates a client for a server by name.
     ///
+    /// Initialization and subsequent ordinary requests use
+    /// the default [`RequestTimeoutPolicy`]. Use
+    /// [`Self::client_with_timeout_policy`] to select different bounds.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
+    /// Returns an error if the server is not found, disabled, or fails to start
+    /// or initialize.
     pub fn client(&self, name: &str) -> Result<Client, ConfigError> {
-        self.client_with_cx(name, Cx::for_request())
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.client_with_cx(name, cx)
+        })
+    }
+
+    /// Creates a client using an explicit idle/absolute timeout policy.
+    ///
+    /// The policy applies to initialization as well as subsequent ordinary
+    /// requests. Use this path when the default 30-second idle and 120-second
+    /// absolute initialization limits are not appropriate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is not found, disabled, or fails to
+    /// start or initialize.
+    pub fn client_with_timeout_policy(
+        &self,
+        name: &str,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<Client, ConfigError> {
+        timeout_policy
+            .validate()
+            .map_err(ConfigError::ClientError)?;
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.client_with_cx_and_timeout_policy(name, cx, timeout_policy)
+        })
     }
 
     /// Creates a client with a provided Cx for cancellation support.
     ///
+    /// Initialization and subsequent ordinary requests use
+    /// the default [`RequestTimeoutPolicy`]. Use
+    /// [`Self::client_with_cx_and_timeout_policy`] to select different bounds.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
+    /// Returns an error if the server is not found, disabled, or fails to start
+    /// or initialize.
     pub fn client_with_cx(&self, name: &str, cx: Cx) -> Result<Client, ConfigError> {
+        self.client_with_cx_and_timeout_policy(name, cx, RequestTimeoutPolicy::default())
+    }
+
+    /// Creates a client with an explicit capability context and timeout policy.
+    ///
+    /// The policy applies to initialization as well as subsequent ordinary
+    /// requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is not found, disabled, or fails to
+    /// start or initialize.
+    pub fn client_with_cx_and_timeout_policy(
+        &self,
+        name: &str,
+        cx: Cx,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<Client, ConfigError> {
+        timeout_policy
+            .validate()
+            .map_err(ConfigError::ClientError)?;
         let config = self
             .mcp_servers
             .get(name)
@@ -307,7 +404,7 @@ impl McpConfig {
             return Err(ConfigError::ServerDisabled(name.to_string()));
         }
 
-        spawn_client_from_config(name, config, cx)
+        spawn_client_from_config(name, config, cx, timeout_policy)
     }
 
     /// Merges another configuration into this one.
@@ -323,9 +420,16 @@ fn spawn_client_from_config(
     name: &str,
     config: &ServerConfig,
     cx: Cx,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> Result<Client, ConfigError> {
+    if cx.checkpoint().is_err() {
+        return Err(ConfigError::ClientError(McpError::request_cancelled()));
+    }
+
     // Build the command
-    let mut cmd = Command::new(&config.command);
+    let executable = resolve_stdio_command(&config.command, config.cwd.as_deref().map(Path::new))
+        .map_err(ConfigError::ClientError)?;
+    let mut cmd = Command::new(executable);
     cmd.args(&config.args);
 
     // Set environment variables
@@ -342,17 +446,20 @@ fn spawn_client_from_config(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
-
     // Spawn the process
-    let mut child = cmd.spawn().map_err(|e| {
-        ConfigError::SpawnError(format!("Failed to spawn {}: {}", config.command, e))
+    let child = cmd.spawn().map_err(|error| {
+        ConfigError::SpawnError(format!(
+            "Configured server process could not be started ({:?})",
+            error.kind()
+        ))
     })?;
+    let mut child_guard = ChildGuard::new(child);
 
     // Get stdin/stdout handles
-    let stdin = child.stdin.take().ok_or_else(|| {
+    let stdin = child_guard.child_mut().stdin.take().ok_or_else(|| {
         ConfigError::SpawnError(format!("Failed to get stdin for server '{name}'"))
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child_guard.child_mut().stdout.take().ok_or_else(|| {
         ConfigError::SpawnError(format!("Failed to get stdout for server '{name}'"))
     })?;
 
@@ -367,8 +474,15 @@ fn spawn_client_from_config(
     let client_capabilities = ClientCapabilities::default();
 
     // Create client and initialize
-    create_and_initialize_client(child, transport, cx, client_info, client_capabilities)
-        .map_err(|e| ConfigError::SpawnError(format!("Initialization failed: {e}")))
+    create_and_initialize_client(
+        child_guard.disarm(),
+        transport,
+        cx,
+        client_info,
+        client_capabilities,
+        timeout_policy,
+    )
+    .map_err(ConfigError::ClientError)
 }
 
 /// Creates a client and performs initialization handshake.
@@ -378,58 +492,28 @@ fn create_and_initialize_client(
     cx: Cx,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> McpResult<Client> {
-    use fastmcp_protocol::{
-        InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, PROTOCOL_VERSION,
-    };
     use fastmcp_transport::Transport;
 
-    // Send initialize request
-    let params = InitializeParams {
-        protocol_version: PROTOCOL_VERSION.to_string(),
-        capabilities: client_capabilities.clone(),
-        client_info: client_info.clone(),
-    };
-
-    let params_value = serde_json::to_value(&params)
-        .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-
-    let request = JsonRpcRequest::new("initialize", Some(params_value), 1);
-
-    transport
-        .send(&cx, &JsonRpcMessage::Request(request))
-        .map_err(crate::transport_error_to_mcp)?;
-
-    // Receive response
-    let response = loop {
-        let message = transport.recv(&cx).map_err(crate::transport_error_to_mcp)?;
-        if let JsonRpcMessage::Response(resp) = message {
-            break resp;
+    let child_guard = ChildGuard::new(child);
+    let init_result = match crate::initialize_child_transport(
+        &mut transport,
+        &cx,
+        &client_info,
+        &client_capabilities,
+        timeout_policy,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return combine_operation_with_cleanup(Err(error), || {
+                combine_cleanup_results(
+                    transport.close().map_err(transport_error_to_mcp),
+                    child_guard.cleanup(),
+                )
+            });
         }
     };
-
-    // Check for error
-    if let Some(error) = response.error {
-        return Err(McpError::new(
-            fastmcp_core::McpErrorCode::from(error.code),
-            error.message,
-        ));
-    }
-
-    // Parse result
-    let result_value = response
-        .result
-        .ok_or_else(|| McpError::internal_error("No result in initialize response"))?;
-
-    let init_result: InitializeResult = serde_json::from_value(result_value)
-        .map_err(|e| McpError::internal_error(format!("Failed to parse initialize result: {e}")))?;
-
-    // Send the spec-correct `notifications/initialized` lifecycle notification.
-    let notification = JsonRpcRequest::initialized_notification();
-
-    transport
-        .send(&cx, &JsonRpcMessage::Request(notification))
-        .map_err(crate::transport_error_to_mcp)?;
 
     // Create session
     let session = ClientSession::new(
@@ -441,7 +525,13 @@ fn create_and_initialize_client(
     );
 
     // Return client
-    Ok(Client::from_parts(child, transport, cx, session, 30_000))
+    Ok(Client::from_parts(
+        child_guard.disarm(),
+        transport,
+        cx,
+        session,
+        timeout_policy,
+    ))
 }
 
 // ============================================================================
@@ -515,18 +605,21 @@ impl ConfigLoader {
     /// Loads and merges all existing configuration files.
     ///
     /// Later files override earlier ones.
-    pub fn load_all(&self) -> McpConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns the first read or parse error instead of silently omitting an
+    /// existing configuration file from the merged result.
+    pub fn load_all(&self) -> Result<McpConfig, ConfigError> {
         let mut config = McpConfig::new();
 
         for path in &self.search_paths {
             if path.exists() {
-                if let Ok(loaded) = McpConfig::from_file(path) {
-                    config.merge(loaded);
-                }
+                config.merge(McpConfig::from_file(path)?);
             }
         }
 
-        config
+        Ok(config)
     }
 
     /// Returns all search paths.
@@ -546,94 +639,127 @@ impl ConfigLoader {
 // Default Config Paths
 // ============================================================================
 
-/// Returns platform-specific default configuration paths.
-#[must_use]
-pub fn default_config_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+#[derive(Debug, Clone)]
+struct ConfigLocations {
+    home: Option<PathBuf>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unix_config: Option<PathBuf>,
+    #[cfg(target_os = "windows")]
+    windows_data: Option<PathBuf>,
+}
 
-    // Project-specific configs (current directory)
-    paths.push(PathBuf::from(".mcp/config.json"));
-    paths.push(PathBuf::from(".vscode/mcp.json"));
-
-    // User-level configs
-    if let Some(home) = dirs::home_dir() {
-        #[cfg(target_os = "macos")]
-        {
-            // Claude Desktop on macOS
-            paths.push(home.join("Library/Application Support/Claude/claude_desktop_config.json"));
-            // Generic MCP config
-            paths.push(home.join(".config/mcp/config.json"));
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // Claude Desktop on Windows
-            if let Some(appdata) = dirs::data_dir() {
-                paths.push(appdata.join("Claude/claude_desktop_config.json"));
-            }
-            // Generic MCP config
-            paths.push(home.join(".mcp/config.json"));
-        }
-
+impl ConfigLocations {
+    fn from_environment() -> Self {
+        let home = dirs::home_dir();
         #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            // XDG config directory — applies to Linux and every other
-            // non-macOS Unix (FreeBSD, NetBSD, OpenBSD, Illumos, etc.).
-            // Mirrors the same broadening done in
-            // `claude_desktop_config_path` so callers iterating both
-            // surfaces don't see a Linux/BSD asymmetry.
-            //
-            // Per XDG Base Directory Specification: empty XDG_CONFIG_HOME
-            // is equivalent to unset (`env::var` returns Ok("") for an
-            // empty value, so check `is_empty` explicitly to avoid
-            // emitting relative `mcp/config.json` / `claude/config.json`
-            // paths against the caller's CWD).
-            if let Some(xdg_config) = env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()) {
-                let xdg_path = PathBuf::from(xdg_config);
-                paths.push(xdg_path.join("mcp/config.json"));
-                paths.push(xdg_path.join("claude/config.json"));
-            } else {
-                paths.push(home.join(".config/mcp/config.json"));
-                paths.push(home.join(".config/claude/config.json"));
-            }
+        let unix_config = unix_config_home(
+            home.as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        );
+
+        Self {
+            home,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            unix_config,
+            #[cfg(target_os = "windows")]
+            windows_data: dirs::data_dir(),
         }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_config_home(
+    home: Option<&Path>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .map(Path::new)
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|path| path.join(".config")))
+}
+
+fn claude_desktop_config_path_from(locations: &ConfigLocations) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        locations
+            .home
+            .as_ref()
+            .map(|home| home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        locations
+            .windows_data
+            .as_ref()
+            .map(|data| data.join("Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        locations
+            .unix_config
+            .as_ref()
+            .map(|config| config.join("Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        let _ = locations;
+        None
+    }
+}
+
+fn default_config_paths_from(locations: &ConfigLocations) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(".mcp/config.json"),
+        PathBuf::from(".vscode/mcp.json"),
+    ];
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(claude_path) = claude_desktop_config_path_from(locations) {
+        paths.push(claude_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = &locations.home {
+        paths.push(home.join(".config/mcp/config.json"));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(home) = &locations.home {
+        paths.push(home.join(".mcp/config.json"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(config) = &locations.unix_config {
+        paths.push(config.join("mcp/config.json"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(claude_path) = claude_desktop_config_path_from(locations) {
+        paths.push(claude_path);
     }
 
     paths
 }
 
+/// Returns platform-specific default configuration paths.
+#[must_use]
+pub fn default_config_paths() -> Vec<PathBuf> {
+    default_config_paths_from(&ConfigLocations::from_environment())
+}
+
 /// Returns the Claude Desktop configuration path for the current platform.
+///
+/// macOS and Windows use Claude Desktop's native locations. Claude Desktop is
+/// not officially distributed for Linux; on non-macOS Unix, FastMCP retains a
+/// desktop-compatible config convention beneath the XDG configuration
+/// directory so its installer, lister, and configuration loader agree.
 #[must_use]
 pub fn claude_desktop_config_path() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        dirs::data_dir().map(|d| d.join("Claude/claude_desktop_config.json"))
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // Per the XDG Base Directory Specification: "If $XDG_CONFIG_HOME
-        // is either not set or empty, a default equal to $HOME/.config
-        // should be used." `env::var` returns Ok("") for an empty value,
-        // so check `is_empty` explicitly to avoid emitting a relative
-        // `claude/config.json` path.
-        if let Some(xdg_config) = env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()) {
-            Some(PathBuf::from(xdg_config).join("claude/config.json"))
-        } else {
-            dirs::home_dir().map(|h| h.join(".config/claude/config.json"))
-        }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
-    {
-        None
-    }
+    claude_desktop_config_path_from(&ConfigLocations::from_environment())
 }
 
 // ============================================================================
@@ -727,6 +853,58 @@ mod tests {
     }
 
     #[test]
+    fn server_config_debug_redacts_environment_and_argument_values() {
+        let env_value_canary = "server-config-env-value-canary";
+        let argument_canary = "server-config-api-argument-canary";
+        let command_canary = "server-config-command-secret-canary";
+        let config = ServerConfig::new(command_canary)
+            .with_args(["-m", "safe_module", "--api-key", argument_canary])
+            .with_env("SERVICE_API_TOKEN", env_value_canary)
+            .with_cwd("/private/server/path");
+
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("ServerConfig"));
+        assert!(debug.contains("command_set: true"));
+        assert!(debug.contains("arg_count: 4"));
+        assert!(debug.contains("env_var_count: 1"));
+        assert!(debug.contains("cwd_set: true"));
+        assert!(debug.contains("disabled: false"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains(argument_canary));
+        assert!(!debug.contains(command_canary));
+        assert!(!debug.contains("SERVICE_API_TOKEN"));
+        assert!(!debug.contains("/private/server/path"));
+
+        let serialized = serde_json::to_value(&config).expect("server config must serialize");
+        assert_eq!(serialized["command"], command_canary);
+        assert_eq!(serialized["args"][3], argument_canary);
+        assert_eq!(serialized["env"]["SERVICE_API_TOKEN"], env_value_canary);
+    }
+
+    #[test]
+    fn mcp_config_debug_is_a_redacted_aggregate_summary() {
+        let env_value_canary = "aggregate-env-value-canary";
+        let argument_canary = "aggregate-api-argument-canary";
+        let mut config = McpConfig::new();
+        config.add_server(
+            "enabled-server",
+            ServerConfig::new("runner")
+                .with_args(["--credential", argument_canary])
+                .with_env("API_TOKEN", env_value_canary),
+        );
+        config.add_server("disabled-server", ServerConfig::new("other").disabled());
+
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("McpConfig"));
+        assert!(debug.contains("server_count: 2"));
+        assert!(debug.contains("enabled_server_count: 1"));
+        assert!(debug.contains("disabled_server_count: 1"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains(argument_canary));
+        assert!(!debug.contains("API_TOKEN"));
+    }
+
+    #[test]
     fn test_config_add_and_get_server() {
         let mut config = McpConfig::new();
 
@@ -815,6 +993,74 @@ mod tests {
     }
 
     #[test]
+    fn default_loader_includes_the_authoritative_claude_desktop_path() {
+        let Some(claude_path) = claude_desktop_config_path() else {
+            return;
+        };
+
+        let loader = ConfigLoader::default();
+        assert!(loader.search_paths().contains(&claude_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_loader_and_resolver_share_isolated_xdg_path() {
+        let home = Path::new("/isolated/home");
+        let xdg = std::ffi::OsStr::new("/isolated/xdg");
+        let locations = ConfigLocations {
+            home: Some(home.to_path_buf()),
+            unix_config: unix_config_home(Some(home), Some(xdg)),
+        };
+        let expected = PathBuf::from("/isolated/xdg/Claude/claude_desktop_config.json");
+
+        assert_eq!(
+            claude_desktop_config_path_from(&locations),
+            Some(expected.clone())
+        );
+
+        let loader = ConfigLoader {
+            search_paths: default_config_paths_from(&locations),
+        };
+        assert!(loader.search_paths().contains(&expected));
+        assert!(
+            loader
+                .search_paths()
+                .contains(&PathBuf::from("/isolated/xdg/mcp/config.json"))
+        );
+        assert!(
+            !loader
+                .search_paths()
+                .contains(&PathBuf::from("/isolated/xdg/claude/config.json"))
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_empty_missing_or_relative_xdg_falls_back_to_isolated_home() {
+        let home = Path::new("/isolated/home");
+        let expected = home.join(".config");
+        let xdg_values = [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("relative/config")),
+        ];
+
+        for xdg in xdg_values {
+            assert_eq!(unix_config_home(Some(home), xdg), Some(expected.clone()));
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_absolute_xdg_does_not_require_home() {
+        let xdg = std::ffi::OsStr::new("/isolated/xdg");
+        assert_eq!(
+            unix_config_home(None, Some(xdg)),
+            Some(PathBuf::from("/isolated/xdg"))
+        );
+    }
+
+    #[test]
     fn test_config_error_display() {
         let errors = vec![
             (ConfigError::NotFound("path".into()), "not found"),
@@ -824,6 +1070,10 @@ mod tests {
             ),
             (ConfigError::ServerDisabled("name".into()), "disabled"),
             (ConfigError::ParseError("msg".into()), "parse"),
+            (
+                ConfigError::ClientError(McpError::request_cancelled()),
+                "lifecycle",
+            ),
         ];
 
         for (error, expected) in errors {
@@ -847,6 +1097,101 @@ mod tests {
 
         let parse_err = ConfigError::ParseError("bad".into());
         assert!(std::error::Error::source(&parse_err).is_none());
+
+        let client_err = ConfigError::ClientError(McpError::request_cancelled());
+        assert!(std::error::Error::source(&client_err).is_some());
+    }
+
+    #[test]
+    fn cancelled_context_rejects_config_client_before_spawn() {
+        let mut config = McpConfig::new();
+        config.add_server("cancelled", ServerConfig::new("definitely-not-a-command"));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        let error = match config.client_with_cx("cancelled", cx) {
+            Ok(_) => panic!("cancelled context must be rejected before spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::RequestCancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_policy_precedes_config_lookup_and_process_creation() {
+        let mut config = McpConfig::new();
+        config.add_server("configured", ServerConfig::new("definitely-not-a-command"));
+        let invalid_policy = RequestTimeoutPolicy {
+            idle_timeout: std::time::Duration::ZERO,
+            absolute_timeout: std::time::Duration::from_secs(1),
+            reset_idle_on_matching_progress: true,
+        };
+
+        let error = match config.client_with_timeout_policy("missing", invalid_policy) {
+            Ok(_) => panic!("invalid timeout policy must fail before configuration lookup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let error = match config.client_with_cx_and_timeout_policy(
+            "configured",
+            cancelled_cx,
+            invalid_policy,
+        ) {
+            Ok(_) => panic!("invalid timeout policy must fail before checkpoint and spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_aware_config_client_applies_policy_to_initialization() {
+        let mut config = McpConfig::new();
+        config.add_server(
+            "silent",
+            ServerConfig::new("sh").with_args(["-c", "exec sleep 5"]),
+        );
+        let policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("custom initialization policy must validate");
+        let started = std::time::Instant::now();
+
+        let error = match config.client_with_timeout_policy("silent", policy) {
+            Ok(_) => panic!("silent initialization must honor the custom idle timeout"),
+            Err(error) => error,
+        };
+        let ConfigError::ClientError(error) = error else {
+            panic!("initialization timeout must remain a client lifecycle error");
+        };
+
+        assert_eq!(error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -900,14 +1245,20 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_json() {
-        let result = McpConfig::from_json("not json {{{");
-        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+        let canary = "JSON-CONFIG-SECRET-CANARY";
+        let error = McpConfig::from_json(&format!(r#"{{"secret":"{canary}",}}"#))
+            .expect_err("invalid JSON must fail");
+        assert!(matches!(&error, ConfigError::ParseError(_)));
+        assert!(!error.to_string().contains(canary));
     }
 
     #[test]
     fn test_parse_invalid_toml() {
-        let result = McpConfig::from_toml("[invalid toml = = =");
-        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+        let canary = "TOML-CONFIG-SECRET-CANARY";
+        let error = McpConfig::from_toml(&format!("secret = \"{canary}\"\n[invalid toml = = ="))
+            .expect_err("invalid TOML must fail");
+        assert!(matches!(&error, ConfigError::ParseError(_)));
+        assert!(!error.to_string().contains(canary));
     }
 
     #[test]
@@ -946,8 +1297,18 @@ mod tests {
     #[test]
     fn test_config_loader_load_all_no_files() {
         let loader = ConfigLoader::from_path("/nonexistent/a.json");
-        let config = loader.load_all();
+        let config = loader.load_all().expect("missing paths are skipped");
         assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn config_loader_load_all_surfaces_an_existing_malformed_file() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let error = ConfigLoader::from_path(manifest)
+            .load_all()
+            .expect_err("an existing non-JSON file must not be silently omitted");
+
+        assert!(matches!(error, ConfigError::ParseError(_)));
     }
 
     #[test]
@@ -972,10 +1333,10 @@ mod tests {
 
     #[test]
     fn test_claude_desktop_config_path_is_some() {
-        // On all supported platforms, this should return Some when home dir is available
+        // On supported/configured platforms, this should return Some when the
+        // required platform directory is available.
         let path = claude_desktop_config_path();
-        // Home dir is usually available in CI and dev environments
-        if dirs::home_dir().is_some() {
+        if dirs::home_dir().is_some() || dirs::data_dir().is_some() {
             assert!(path.is_some());
         }
     }

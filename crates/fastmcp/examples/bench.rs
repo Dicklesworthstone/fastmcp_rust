@@ -1,7 +1,7 @@
 //! FastMCP Performance Benchmarks
 //!
 //! Simple benchmarks using std::time::Instant to measure performance characteristics.
-//! Run with: `cargo run --example bench --release`
+//! Run with: `cargo run -p fastmcp-rust --example bench --release`
 //!
 //! Measurements:
 //! - Server creation time
@@ -9,7 +9,7 @@
 //! - Protocol message encoding/decoding
 //! - Handler invocation overhead
 //!
-//! Note: For accurate results, always run with --release flag.
+//! Note: Use `--release` for representative optimized local measurements.
 
 use std::time::{Duration, Instant};
 
@@ -484,7 +484,7 @@ fn main() {
     println!("==============================");
     println!();
     println!("Note: Run with --release for accurate results!");
-    println!("      cargo run --example bench --release");
+    println!("      cargo run -p fastmcp-rust --example bench --release");
 
     bench_server_creation();
     bench_json_serialization();

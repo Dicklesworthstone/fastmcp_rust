@@ -3,11 +3,18 @@
 //! Displays a banner when the server starts, showing server info,
 //! capabilities, and ready status.
 
-use crate::console::FastMcpConsole;
+use crate::console::{
+    FastMcpConsole, bounded_redacted_rich_fragment, bounded_redacted_terminal_text,
+};
 use crate::theme::FastMcpTheme;
 use rich_rust::r#box::ROUNDED;
 use rich_rust::markup;
 use rich_rust::prelude::*;
+
+const SERVER_NAME_MAX_CHARS: usize = 128;
+const SERVER_VERSION_MAX_CHARS: usize = 64;
+const SERVER_DESCRIPTION_MAX_CHARS: usize = 512;
+const TRANSPORT_NAME_MAX_CHARS: usize = 128;
 
 /// ASCII art logo for FastMCP.
 const LOGO_FULL: &str = r"
@@ -33,7 +40,7 @@ const LOGO_FULL: &str = r"
 const LOGO_COMPACT: &str = r"
 ╭──────────────────────────╮
 │  ⚡ FastMCP Rust         │
-│  High-Performance MCP    │
+│  MCP Framework for Rust  │
 ╰──────────────────────────╯
 ";
 
@@ -58,6 +65,10 @@ pub struct StartupBanner {
     transport: String,
     /// Whether to show the logo
     show_logo: bool,
+    /// Whether to show the capabilities table/counts.
+    show_capabilities: bool,
+    /// Whether to render the single-line minimal form.
+    minimal: bool,
 }
 
 impl StartupBanner {
@@ -73,6 +84,8 @@ impl StartupBanner {
             prompts_count: 0,
             transport: "stdio".to_string(),
             show_logo: true,
+            show_capabilities: true,
+            minimal: false,
         }
     }
 
@@ -118,10 +131,30 @@ impl StartupBanner {
         self
     }
 
+    /// Set whether the banner includes registered capability counts.
+    #[must_use]
+    pub fn show_capabilities(mut self, show: bool) -> Self {
+        self.show_capabilities = show;
+        self
+    }
+
+    /// Render a single-line startup banner.
+    #[must_use]
+    pub fn minimal(mut self) -> Self {
+        self.minimal = true;
+        self.show_logo = false;
+        self.show_capabilities = false;
+        self
+    }
+
     /// Render the complete banner.
     pub fn render(&self, console: &FastMcpConsole) {
+        if self.minimal {
+            self.render_minimal(console);
+            return;
+        }
         if !console.is_rich() {
-            self.render_plain();
+            self.render_plain(console);
             return;
         }
 
@@ -138,8 +171,10 @@ impl StartupBanner {
         console.newline();
 
         // 3. Capabilities table
-        self.render_capabilities_table(console, theme);
-        console.newline();
+        if self.show_capabilities {
+            self.render_capabilities_table(console, theme);
+            console.newline();
+        }
 
         // 4. Ready status
         self.render_ready_status(console, theme);
@@ -148,24 +183,61 @@ impl StartupBanner {
         console.rule(None);
     }
 
+    fn render_minimal(&self, console: &FastMcpConsole) {
+        if console.is_rich() {
+            let server_name =
+                bounded_redacted_rich_fragment(&self.server_name, SERVER_NAME_MAX_CHARS);
+            let version = bounded_redacted_rich_fragment(&self.version, SERVER_VERSION_MAX_CHARS);
+            let transport =
+                bounded_redacted_rich_fragment(&self.transport, TRANSPORT_NAME_MAX_CHARS);
+            let theme = console.theme();
+            console.print(&format!(
+                "[{}]FastMCP[/] {} [{}]v{}[/] [{}]{}[/] [{}]ready[/]",
+                color_hex(&theme.primary),
+                server_name,
+                color_hex(&theme.text_muted),
+                version,
+                color_hex(&theme.accent),
+                transport,
+                color_hex(&theme.success)
+            ));
+        } else {
+            let server_name =
+                bounded_redacted_terminal_text(&self.server_name, SERVER_NAME_MAX_CHARS);
+            let version = bounded_redacted_terminal_text(&self.version, SERVER_VERSION_MAX_CHARS);
+            let transport =
+                bounded_redacted_terminal_text(&self.transport, TRANSPORT_NAME_MAX_CHARS);
+            console.print_plain(&format!(
+                "FastMCP {server_name} v{version} {transport} ready"
+            ));
+        }
+    }
+
     fn render_info_panel(&self, console: &FastMcpConsole, theme: &FastMcpTheme) {
+        let server_name = bounded_redacted_rich_fragment(&self.server_name, SERVER_NAME_MAX_CHARS);
+        let version = bounded_redacted_rich_fragment(&self.version, SERVER_VERSION_MAX_CHARS);
         let title_line = format!(
             "[{}]{}[/] [{}]v{}[/]",
             color_hex(&theme.primary),
-            self.server_name,
+            server_name,
             color_hex(&theme.text_muted),
-            self.version
+            version
         );
 
         let mut content = String::new();
         content.push_str(&title_line);
 
         if let Some(desc) = &self.description {
-            content.push_str(&format!("\n[{}]{}[/]", color_hex(&theme.text_dim), desc));
+            let description = bounded_redacted_rich_fragment(desc, SERVER_DESCRIPTION_MAX_CHARS);
+            content.push_str(&format!(
+                "\n[{}]{}[/]",
+                color_hex(&theme.text_dim),
+                description
+            ));
         }
 
         content.push_str(&format!(
-            "\n[{}]High-performance Model Context Protocol framework[/]",
+            "\n[{}]Model Context Protocol framework for Rust[/]",
             color_hex(&theme.text_dim)
         ));
 
@@ -212,25 +284,32 @@ impl StartupBanner {
     }
 
     fn render_ready_status(&self, console: &FastMcpConsole, theme: &FastMcpTheme) {
+        let transport = bounded_redacted_rich_fragment(&self.transport, TRANSPORT_NAME_MAX_CHARS);
         console.print(&format!(
             "[{}]✓[/] Server ready on [{}]{}[/]",
             color_hex(&theme.success),
             color_hex(&theme.accent),
-            self.transport
+            transport
         ));
     }
 
     /// Plain text fallback for agent/CI contexts.
-    fn render_plain(&self) {
-        eprintln!("FastMCP Server: {} v{}", self.server_name, self.version);
+    fn render_plain(&self, console: &FastMcpConsole) {
+        let server_name = bounded_redacted_terminal_text(&self.server_name, SERVER_NAME_MAX_CHARS);
+        let version = bounded_redacted_terminal_text(&self.version, SERVER_VERSION_MAX_CHARS);
+        let transport = bounded_redacted_terminal_text(&self.transport, TRANSPORT_NAME_MAX_CHARS);
+        console.print_plain(&format!("FastMCP Server: {server_name} v{version}"));
         if let Some(desc) = &self.description {
-            eprintln!("  {desc}");
+            let description = bounded_redacted_terminal_text(desc, SERVER_DESCRIPTION_MAX_CHARS);
+            console.print_plain(&format!("  {description}"));
         }
-        eprintln!("  Tools: {}", self.tools_count);
-        eprintln!("  Resources: {}", self.resources_count);
-        eprintln!("  Prompts: {}", self.prompts_count);
-        eprintln!("  Transport: {}", self.transport);
-        eprintln!("Server ready.");
+        if self.show_capabilities {
+            console.print_plain(&format!("  Tools: {}", self.tools_count));
+            console.print_plain(&format!("  Resources: {}", self.resources_count));
+            console.print_plain(&format!("  Prompts: {}", self.prompts_count));
+        }
+        console.print_plain(&format!("  Transport: {transport}"));
+        console.print_plain("Server ready.");
     }
 }
 
@@ -320,7 +399,7 @@ mod tests {
 
     #[test]
     fn startup_banner_renders_rich_output() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let console = tc.console();
 
         StartupBanner::new("test-server", "1.2.3")
@@ -344,13 +423,108 @@ mod tests {
 
     #[test]
     fn startup_banner_no_logo() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let console = tc.console();
 
         StartupBanner::new("srv", "0.1.0").no_logo().render(console);
 
-        // Should still render server info, just no ASCII logo
+        // The information panel still renders, but none of the width-selected
+        // logo variants may appear.
         assert!(tc.contains("srv"));
+        assert!(!tc.contains("███"));
+        assert!(!tc.contains("⚡ FastMCP Rust"));
+        assert!(!tc.contains("FastMCP Rust"));
+    }
+
+    #[test]
+    fn startup_banner_can_hide_capabilities() {
+        let tc = TestConsole::new_rich();
+
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .show_capabilities(false)
+            .no_logo()
+            .render(tc.console());
+
+        assert!(tc.contains("srv"));
+        assert!(!tc.contains("Capabilities"));
+        assert!(!tc.contains("Tools"));
+    }
+
+    #[test]
+    fn startup_banner_plain_can_hide_capabilities() {
+        let tc = TestConsole::new();
+
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .show_capabilities(false)
+            .render(tc.console());
+
+        assert!(tc.contains("srv"));
+        assert!(tc.contains("Transport: stdio"));
+        assert!(!tc.contains("Tools:"));
+        assert!(!tc.contains("Resources:"));
+        assert!(!tc.contains("Prompts:"));
+    }
+
+    #[test]
+    fn minimal_startup_banner_is_one_line() {
+        let tc = TestConsole::new_rich();
+
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .transport("stdio")
+            .minimal()
+            .render(tc.console());
+
+        let nonempty_lines = tc
+            .output()
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(nonempty_lines, 1);
+        assert!(tc.contains("srv"));
+        assert!(tc.contains("ready"));
+        assert!(!tc.contains("Capabilities"));
+    }
+
+    #[test]
+    fn minimal_startup_banner_plain_is_one_line_without_capabilities() {
+        let tc = TestConsole::new();
+
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .resources(2)
+            .prompts(1)
+            .transport("sse")
+            .minimal()
+            .render(tc.console());
+
+        let nonempty_lines = tc
+            .output()
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(nonempty_lines, 1);
+        assert!(tc.contains("FastMCP srv v0.1.0 sse ready"));
+        assert!(!tc.contains("Tools:"));
+        assert!(!tc.contains("Resources:"));
+        assert!(!tc.contains("Prompts:"));
+    }
+
+    #[test]
+    fn startup_banner_plain_shows_capability_counts() {
+        let tc = TestConsole::new();
+
+        StartupBanner::new("srv", "0.1.0")
+            .tools(3)
+            .resources(2)
+            .prompts(1)
+            .render(tc.console());
+
+        assert!(tc.contains("Tools: 3"));
+        assert!(tc.contains("Resources: 2"));
+        assert!(tc.contains("Prompts: 1"));
     }
 
     #[test]
@@ -465,7 +639,7 @@ mod tests {
 
     #[test]
     fn capabilities_table_shows_registered_and_none() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         StartupBanner::new("srv", "0.1.0")
             .tools(3)
             .resources(0)
@@ -510,10 +684,52 @@ mod tests {
 
     #[test]
     fn render_logo_does_not_panic() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let theme = tc.console().theme();
         render_logo(tc.console(), theme);
         // Just verify it produced some output
         assert!(!tc.output_string().is_empty());
+    }
+
+    #[test]
+    fn hostile_banner_metadata_is_bounded_redacted_and_terminal_safe() {
+        let banner = StartupBanner::new(
+            "server[prod] [bold]literal[/]\n\u{001b}\u{202e} token=name-canary",
+            format!("1.0 password=version-canary {}", "v".repeat(1_000)),
+        )
+        .description(format!(
+            "[red]description[/]\r Authorization: Bearer description-canary {}",
+            "d".repeat(4_000)
+        ))
+        .transport("stdio[peer]\n api_key=transport-canary")
+        .no_logo();
+
+        let plain = TestConsole::new();
+        banner.render_plain(plain.console());
+        let rich = TestConsole::new_rich();
+        banner.render(rich.console());
+
+        for output in [plain.output_string(), rich.output_string()] {
+            assert!(
+                output.contains("server[prod]"),
+                "brackets were corrupted: {output}"
+            );
+            assert!(
+                output.contains("[bold]literal[/]"),
+                "markup was executed: {output}"
+            );
+            assert!(output.contains("\\n"));
+            assert!(output.contains("\\u{1b}"));
+            assert!(output.contains("\\u{202e}"));
+            for canary in [
+                "name-canary",
+                "version-canary",
+                "description-canary",
+                "transport-canary",
+            ] {
+                assert!(!output.contains(canary), "leaked {canary}: {output}");
+            }
+            assert!(output.chars().count() < 1_500, "unbounded output: {output}");
+        }
     }
 }

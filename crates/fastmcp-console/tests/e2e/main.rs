@@ -15,6 +15,8 @@
 //! - `error_display.rs` - Error formatting tests
 //! - `configuration.rs` - Environment variable configuration tests
 
+#![cfg(unix)]
+
 mod helpers;
 
 mod agent_mode;

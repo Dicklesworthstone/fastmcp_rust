@@ -5,6 +5,7 @@
 
 use fastmcp_protocol::{Prompt, Resource, Tool};
 
+use crate::config::ConsoleConfig;
 use crate::console::FastMcpConsole;
 use crate::detection::DisplayContext;
 use crate::tables::{PromptTableRenderer, ResourceTableRenderer, ToolTableRenderer};
@@ -88,6 +89,21 @@ impl HandlerRegistryRenderer {
             tool_renderer: ToolTableRenderer::new(context.clone()),
             resource_renderer: ResourceTableRenderer::new(context.clone()),
             prompt_renderer: PromptTableRenderer::new(context),
+        }
+    }
+
+    /// Create a renderer from centralized console configuration.
+    ///
+    /// This propagates the resolved display context and table limits to every
+    /// child renderer.
+    #[must_use]
+    pub fn from_config(config: &ConsoleConfig) -> Self {
+        Self {
+            theme: crate::theme::theme(),
+            context: config.resolve_context(),
+            tool_renderer: ToolTableRenderer::from_config(config),
+            resource_renderer: ResourceTableRenderer::from_config(config),
+            prompt_renderer: PromptTableRenderer::from_config(config),
         }
     }
 
@@ -526,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_render_empty_capabilities_rich_context() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
         let caps = ServerCapabilities::new();
 
@@ -537,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_render_summary_rich_with_none_and_counts() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
 
         let empty = ServerCapabilities::new();
@@ -557,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_render_header_and_footer_pluralization_paths() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = HandlerRegistryRenderer::new(DisplayContext::new_human());
 
         let single_each = ServerCapabilities::with(
@@ -612,5 +628,26 @@ mod tests {
     fn test_default_and_detect_construction() {
         let _default = HandlerRegistryRenderer::default();
         let _detect = HandlerRegistryRenderer::detect();
+    }
+
+    #[test]
+    fn from_config_propagates_context_and_limits_to_child_renderers() {
+        let config = ConsoleConfig::new()
+            .with_context(DisplayContext::new_human())
+            .force_color(false)
+            .with_max_table_rows(1);
+        let renderer = HandlerRegistryRenderer::from_config(&config);
+
+        assert_eq!(renderer.context, DisplayContext::Agent);
+        assert_eq!(renderer.tool_renderer.max_rows, 1);
+        assert_eq!(renderer.resource_renderer.max_rows, 1);
+        assert_eq!(renderer.prompt_renderer.max_rows, 1);
+
+        let capabilities = ServerCapabilities::with(sample_tools(), vec![], vec![]);
+        let console = TestConsole::new();
+        renderer.render(&capabilities, console.console());
+        console.assert_contains("calculate");
+        console.assert_contains("1 more omitted");
+        console.assert_not_contains("search");
     }
 }

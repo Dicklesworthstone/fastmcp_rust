@@ -13,9 +13,13 @@ fn test_banner_style_none() {
 
     result.print_diagnostics();
 
-    // With banner=none, should not show the fancy FastMCP banner
-    // (though may still have log output)
     assert_eq!(result.exit_code, 0, "Server should exit cleanly");
+    assert!(result.stderr_contains("[test_server] Banner style: None"));
+    assert!(!result.stderr_contains("FastMCP Server:"));
+    assert!(!result.stderr_contains("FastMCP test-server"));
+    assert!(!result.stderr_contains("Server ready."));
+    assert!(!result.stderr_contains("Transport: stdio"));
+    assert!(!result.stderr_contains("Tools: 1"));
 }
 
 #[test]
@@ -28,6 +32,13 @@ fn test_banner_style_compact() {
     result.print_diagnostics();
 
     assert_eq!(result.exit_code, 0, "Server should exit cleanly");
+    assert!(result.stderr_contains("[test_server] Banner style: Compact"));
+    assert!(result.stderr_contains("FastMCP Server: test-server v1.0.0"));
+    assert!(result.stderr_contains("Tools: 1"));
+    assert!(result.stderr_contains("Resources: 0"));
+    assert!(result.stderr_contains("Prompts: 0"));
+    assert!(result.stderr_contains("Transport: stdio"));
+    assert!(result.stderr_contains("Server ready."));
 }
 
 #[test]
@@ -40,6 +51,12 @@ fn test_banner_style_minimal() {
     result.print_diagnostics();
 
     assert_eq!(result.exit_code, 0, "Server should exit cleanly");
+    assert!(result.stderr_contains("[test_server] Banner style: Minimal"));
+    assert!(result.stderr_contains("FastMCP test-server v1.0.0 stdio ready"));
+    assert!(!result.stderr_contains("FastMCP Server:"));
+    assert!(!result.stderr_contains("Tools: 1"));
+    assert!(!result.stderr_contains("Resources: 0"));
+    assert!(!result.stderr_contains("Prompts: 0"));
 }
 
 #[test]
@@ -55,6 +72,11 @@ fn test_no_banner_env() {
         result.exit_code, 0,
         "Server should exit cleanly with no banner"
     );
+    assert!(!result.stderr_contains("FastMCP Server:"));
+    assert!(!result.stderr_contains("FastMCP test-server"));
+    assert!(!result.stderr_contains("Server ready."));
+    assert!(!result.stderr_contains("Transport: stdio"));
+    assert!(!result.stderr_contains("Tools: 1"));
 }
 
 #[test]
@@ -136,6 +158,11 @@ fn test_rich_overrides_agent_env() {
     result.print_diagnostics();
 
     // Protocol should still be correct
+    result.assert_human_context();
+    assert!(
+        result.stderr_has_ansi_codes(),
+        "FASTMCP_RICH override must produce rich ANSI output"
+    );
     result.assert_stdout_valid_jsonrpc();
     result.assert_stdout_no_ansi();
 }
@@ -152,6 +179,7 @@ fn test_agent_mode_with_all_options() {
     result.print_diagnostics();
 
     // Must maintain protocol integrity
+    result.assert_agent_context();
     result.assert_stdout_valid_jsonrpc();
     result.assert_stdout_no_ansi();
 }

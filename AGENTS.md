@@ -2,6 +2,10 @@
 
 > Guidelines for AI coding agents working in this Rust codebase.
 
+**MCP 2026-07-28 support is under implementation and remains unverified.**  
+**Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+Toolchain: pinned `nightly-2026-07-11` (rustc 1.99.0-nightly) with workspace `rust-version = "1.99"`.
+
 ---
 
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
@@ -49,7 +53,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (pinned `nightly-2026-07-11` — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
@@ -80,14 +84,17 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `clap` | CLI argument parsing |
 | `notify` + `glob` | File watching for dev mode |
 | `getrandom` | Cryptographic RNG (WebSocket masking) |
-| `sha2` + `hmac` | Cryptography (OAuth PKCE, OIDC signing) |
+| `sha2` + `hmac` | Bounded SHA-256 and HMAC primitives for credential digests, partitioning, and protocol security |
 | `regex` | JSON Schema `pattern` validation |
 | `base64` | Opaque cursor encoding for pagination |
-| `semver` + `ureq` | Update checking (CLI) |
-| `redis` | Optional distributed backend (Docket) |
-| `jsonwebtoken` | Optional JWT authentication |
+| `semver` | Version parsing (evidence / gates; no CLI network update client) |
 | `log` | Logging facade (zero-cost when disabled) |
 | `proc-macro2` + `quote` + `syn` | Procedural macros (`#[tool]`, `#[resource]`, `#[prompt]`) |
+
+`redis` and `jsonwebtoken` are intentionally absent from the current workspace
+dependency graph. The retained Docket source is excluded from the server crate,
+and Redis Tasks / enterprise JWT are deferred profiles rather than current
+features.
 
 ### Release Profile
 
@@ -133,6 +140,137 @@ We do not care about backwards compatibility—we're in early development with n
 - Never create "compatibility shims"
 - Never create wrapper functions for deprecated APIs
 - Just fix the code directly
+
+---
+
+## MCP Campaign Execution: Honest Credit and Batch Verification
+
+These rules govern the MCP 2026-07-28 + MCP 2024-11-05 implementation
+campaign and every multi-agent coding wave in this repository.
+
+### Capability Credit, Not Ceremony
+
+- The objective is working, deployable capability. A process artifact may be
+  created only when it is a hard gate for a named capability and records its
+  concrete consumer, enforced gate, observed defect class, and retirement
+  condition. Process work earns zero capability credit.
+- Product-emitted state that running code consumes, enforces, or replays is
+  feature work. Human-only certificates, ledgers, dashboards, and reports are
+  ceremony unless they satisfy the hard-gate rule above.
+- Real implementation and its real positive and near-identical negative tests
+  belong to the same executable Bead. No placeholder implementations,
+  scope-split test follow-ups, or refusal-only closure of positive capability.
+- Every executable leaf freezes its acceptance IDs, exact test targets,
+  proof class, named consumers, no-claim boundary, and ownership/reservation
+  card before coding starts. Essential unmet acceptance remains on the same
+  Bead; it is never laundered into a future follow-up to permit closure.
+- Individual agents never close their own or a peer's implementation Bead.
+  Only the designated batch-verification orchestrator may close it, using
+  evidence bound to the exact verified revision. Incomplete work stays open,
+  in progress, or open with the `rework` label and an explicit comment.
+- A false close is reopened with an incident comment. Silent reopening is
+  forbidden because it erases the evidence needed to deter recurrence.
+
+### Code-First / Central Batch-Verify Pump
+
+1. A coding agent claims one ready Bead, writes the real code and its tests,
+  records the touched scope, and submits it for batch verification. Per-agent
+  full builds and test runs are forbidden; the orchestrator owns the single
+   serialized RCH build/test lane. A narrowly scoped syntax check is allowed
+   only when the orchestrator explicitly assigns it and it also runs via RCH.
+2. Pending verification earns no capability credit. In this repository the
+   conceptual `batch_pending` state is encoded as tracker status `review` plus
+   label `batch-pending`; conceptual `rework` is status `open` plus label
+   `rework`, because the pinned BV release does not recognize those custom
+   statuses. Verification begins at
+   the earliest bounded trigger: ready-pool depletion, verification-debt cap,
+   an articulation point becoming verifiable, touched-scope frontier,
+   elapsed-time/risk bound, or commit-rate dip.
+3. The orchestrator derives verification scope from the revision diff plus
+   reverse dependents, compiles before interpreting test counts, retains every
+   failed attempt, and maps every closing Bead to the exact tests/proofs that
+   exercised its behavior.
+4. A verification receipt binds HEAD/tree identity, dirty-file inventory,
+   lockfile/toolchain/profile/target/features, exact commands, discovered and
+   executed test IDs, seeds/subjects, results, and Bead IDs. Relevant source
+   movement invalidates it. Zero-test, filtered, ignored, or early-aborted
+   green output is failure, not proof.
+5. Failures return to the same assignee with the exact diagnostic and remain
+   verification debt. Only a fully compiling, fully mapped green RCH batch may
+   be centrally closed. Closure does not automatically promote maturity or
+   establish aggregate MCP conformance.
+6. `br` 0.2.16 gate-provider names are not authorization boundaries: any
+   provider PASS can satisfy a named gate, verdicts are not revision-scoped,
+   and one provider's FAIL does not cancel another provider's PASS. Before
+   every verification cycle, the orchestrator lists the full gate ledger and
+   overwrites every observed `batch_verify` provider to FAIL. After a green
+   run it records the sole effective PASS as provider `batch_verify`, confirms
+   there is no other effective PASS, and closes immediately against the bound
+   revision. Any unauthorized PASS is an incident, not evidence.
+
+### Named Reward-Hacking Controls
+
+The stable identifiers below must be cited in dispatches, Beads, incidents,
+and verification when applicable:
+
+- **RH-1 Gate self-weakening:** validator/test relaxations have a separate
+  owner and revision-scoped planted-mutation review.
+- **RH-2 Proof-class inflation:** static, unit/planted-red, replay, live, and
+  field proofs are distinct; a lower class never substitutes for a higher one.
+- **RH-3 Golden regeneration reflex:** golden changes require an explicit
+  semantic review; never regenerate around broken behavior.
+- **RH-4 Commit-stream pumping:** commit count and churn earn no credit;
+  `todo!()`/`unimplemented!()` and equivalent placeholders are forbidden.
+- **RH-5 Tautological tests:** each feature has a positive and a near-identical
+  planted negative differing only in the forbidden dimension, including
+  unchanged-state proof where mutation is rejected.
+- **RH-6 Easy-Bead cherry-picking:** BV critical-path/blocker ranking outranks
+  repeated low-risk work.
+- **RH-7 Close-pump abuse:** only the batch orchestrator closes; violations are
+  reopened with an incident comment.
+- **RH-8 Scope-splitting:** implementation and tests are one credit unit.
+- **RH-9 Follow-up laundering:** in-scope unmet acceptance keeps the original
+  work open or blocked.
+- **RH-10 Spec-editing as progress:** plan edits earn no feature credit and may
+  not weaken frozen capability requirements.
+- **RH-11 Dependency smuggling:** verification mechanically enforces the banned
+  dependency and runtime lists.
+- **RH-12 Demo-path hardcoding:** runtime-selected conformance subjects must
+  differ from development fixtures; environment-sniffed success paths are
+  forbidden.
+
+### Swarm and Proof Integrity Controls
+
+- **SM-1..SM-3:** commit metrics are saturation signals only; verification
+  debt is bounded; BV reserves work for blockers and positive capability so
+  an infinite ready pool or cheap ceremony cannot starve the critical path.
+- **SM-4..SM-7:** every green batch maps tests to Beads; shared contracts have
+  one owner per wave; committed-but-unverified work remains visible debt; tests
+  exercise the public binary/handler and shipped feature set.
+- **SM-8..SM-12:** claims retain failures, retries, tails, subgroup floors,
+  named consumers, first-attempt results, and fresh-checkout isolation. Pure
+  schema/type producers prove real consumer compilation without ceremonial
+  wrappers.
+- **PL-1 Exact test-set equality:** required test IDs must equal passed test
+  IDs; zero-run green is red.
+- **PL-2 Positive observables:** exit status alone is not evidence; each
+  positive declares evaluator, observed field, predicate, and minimum count.
+- **PL-3 Proof-configuration binding:** profile, target, features, and public
+  execution surface are recorded; `cfg(test)` behavior cannot prove shipped
+  behavior.
+- **PL-4 No automatic promotion:** task closure, capability credit, and maturity
+  promotion are separate revision-bound decisions.
+- **PL-5 Structured proof:** live/effect proofs record machine-checkable
+  frame, seed, runtime-selected subject, lineage, clocks, and digests; prose
+  claims are insufficient.
+
+Every tracker mutation uses an explicit `--actor`. Only the batch orchestrator
+may report the `batch_verify` gate. The campaign has one structure owner and
+one batch-verification orchestrator. Tracker policy is
+treated as untrusted until illegal-transition, missing-gate, double-claim, and
+stale-evidence canaries prove the intended enforcement. Where the installed
+tracker cannot enforce a rule mechanically, the orchestrator must enforce and
+audit it; unsupported policy fields must not be added as decorative YAML.
 
 ---
 
@@ -197,7 +335,7 @@ cargo test --workspace --all-features
 | `fastmcp-core` | McpContext lifecycle, error types, budget/cancellation semantics, auth context, combinators, duration parsing, session state |
 | `fastmcp-protocol` | JSON-RPC message parsing/serialization, MCP types round-trip, JSON Schema generation/validation, protocol version negotiation |
 | `fastmcp-transport` | Stdio framing, SSE event streaming, WebSocket frame encode/decode, HTTP request/response, memory transport, codec correctness, event store persistence |
-| `fastmcp-server` | Handler dispatch, router registration, tool/resource/prompt lifecycle, builder API, middleware chains, caching, rate limiting, OAuth/OIDC flows, JWT auth, proxy client, session management, Docket distributed backend, bidirectional communication, task management |
+| `fastmcp-server` | Handler dispatch, router registration, tool/resource/prompt lifecycle, builder API, middleware chains, caching, rate limiting, OAuth/OIDC code paths, proxy client, session management, bidirectional communication, task management (no FND-01 Docket/Redis production edge) |
 | `fastmcp-client` | Client connection lifecycle, session management, tool calling, resource reading, MCP config file parsing |
 | `fastmcp-derive` | `#[tool]` macro expansion, `#[resource]` macro expansion, `#[prompt]` macro expansion, JsonSchema derive |
 | `fastmcp-console` | Rich console output formatting, log level filtering |
@@ -214,11 +352,11 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## FastMCP Rust — This Project
 
-**This is the project you're working on.** FastMCP Rust is a Rust port of the Python FastMCP framework, providing a fast, cancel-correct implementation of the Model Context Protocol (MCP) for building AI tool servers and clients.
+**This is the project you're working on.** FastMCP Rust is an early-development Rust port of the Python FastMCP framework. It provides server and client building blocks with explicit asupersync cancellation and deadline surfaces; complete or aggregate MCP 2026-07-28 conformance is not yet claimed.
 
 ### What It Does
 
-Provides a complete MCP framework with server and client APIs, procedural macros for ergonomic handler definitions (`#[tool]`, `#[resource]`, `#[prompt]`), multiple transports (stdio, SSE, WebSocket, HTTP, memory), middleware (caching, rate limiting, transforms), authentication (OAuth 2.1, OIDC, JWT, static tokens), a proxy/gateway system, and a rich CLI for running, inspecting, and installing MCP servers.
+Current implementation surfaces include server and client APIs, procedural macros for tools/resources/prompts, stdio/SSE/WebSocket/HTTP/memory transports, middleware, authentication and proxy code paths, and CLI commands for running, inspecting, and installing servers. Availability and verification vary by profile: static/custom-token, OAuth, and fail-closed OIDC code paths are present; JWT/jsonwebtoken and Redis are absent from the workspace graph, while Docket source is retained but excluded from compilation. This inventory is not an aggregate conformance or production-readiness claim.
 
 ### Architecture
 
@@ -229,7 +367,7 @@ User Code → #[tool] / #[resource] / #[prompt] macros
          ServerBuilder → Router (handler dispatch)
                 │
                 ├─ Middleware: Caching, Rate Limiting, Transform
-                ├─ Auth: OAuth 2.1, OIDC, JWT, Static Token
+                ├─ Auth: OAuth/OIDC code paths, Static/Custom Token
                 ├─ Proxy: ProxyClient → remote MCP servers
                 │
                 ▼
@@ -253,11 +391,11 @@ User Code → #[tool] / #[resource] / #[prompt] macros
 fastmcp_rust/
 ├── Cargo.toml                         # Workspace root
 ├── crates/
-│   ├── fastmcp/                       # Facade crate (published as fastmcp-rust, re-exports everything)
+│   ├── fastmcp/                       # Facade crate (published as fastmcp-rust, selected supported re-exports)
 │   ├── fastmcp-core/                  # Core types: McpContext, errors, budget, auth, combinators
 │   ├── fastmcp-protocol/             # MCP protocol types, JSON-RPC, JSON Schema
 │   ├── fastmcp-transport/            # Transports: stdio, SSE, WebSocket, HTTP, memory
-│   ├── fastmcp-server/               # Server: router, handlers, middleware, auth, proxy, Docket
+│   ├── fastmcp-server/               # Server: router, handlers, middleware, auth, proxy
 │   ├── fastmcp-client/               # Client: connection, session, MCP config parsing
 │   ├── fastmcp-macros/               # Proc macros: #[tool], #[resource], #[prompt], JsonSchema
 │   ├── fastmcp-console/              # Rich console output (rich_rust integration)
@@ -295,13 +433,13 @@ fastmcp_rust/
 | `fastmcp-server` | `src/caching.rs` | Response caching layer |
 | `fastmcp-server` | `src/rate_limiting.rs` | Rate limiting middleware |
 | `fastmcp-server` | `src/transform.rs` | Request/response transformation middleware |
-| `fastmcp-server` | `src/auth.rs` | Auth providers (static token, JWT, token verifier) |
+| `fastmcp-server` | `src/auth.rs` | Static/custom token providers, token verifier traits, principal admission |
 | `fastmcp-server` | `src/oauth.rs` | OAuth 2.1 authorization server implementation |
-| `fastmcp-server` | `src/oidc.rs` | OpenID Connect provider integration |
+| `fastmcp-server` | `src/oidc.rs` | OpenID Connect metadata/UserInfo paths; ID-token issuance remains fail-closed |
 | `fastmcp-server` | `src/proxy.rs` | `ProxyClient` for forwarding to remote MCP servers |
 | `fastmcp-server` | `src/bidirectional.rs` | Bidirectional server-to-client communication (sampling, elicitation) |
 | `fastmcp-server` | `src/session.rs` | Per-client session management |
-| `fastmcp-server` | `src/docket.rs` | Distributed backend via Redis |
+| `fastmcp-server` | `src/docket.rs` | Retained deferred Redis backend source; excluded from the compiled server crate |
 | `fastmcp-server` | `src/tasks.rs` | Background task management |
 | `fastmcp-server` | `src/providers/filesystem.rs` | Filesystem resource provider |
 | `fastmcp-client` | `src/lib.rs` | `Client`, `ClientBuilder`, `ClientSession`, MCP config loading |
@@ -313,12 +451,8 @@ fastmcp_rust/
 
 ```toml
 [features]
-# fastmcp-rust (facade crate)
-jwt = ["fastmcp-server/jwt"]         # JWT authentication support
-
-# fastmcp-server
-jwt = ["dep:jsonwebtoken"]           # JWT token verification
-redis = ["dep:redis"]                # Docket distributed backend via Redis
+# FND-01: no jwt/jsonwebtoken or redis features on the default graph.
+# Redis Tasks / enterprise JWT are deferred packages, not current workspace features.
 
 # fastmcp-console
 full = ["rich_rust/full"]            # Full rich_rust features
@@ -341,15 +475,15 @@ json = ["rich_rust/json"]            # JSON pretty-printing
 | `ToolHandler` | Trait for tool implementations (auto-derived by `#[tool]`) |
 | `ResourceHandler` | Trait for resource implementations (auto-derived by `#[resource]`) |
 | `PromptHandler` | Trait for prompt implementations (auto-derived by `#[prompt]`) |
-| `Client` | MCP client — connects to servers, calls tools, reads resources |
-| `ClientSession` | Active client connection with message correlation |
+| `Client` | MCP client — owns the transport, response correlation registry, and request APIs |
+| `ClientSession` | Negotiated protocol version, capabilities, and peer metadata |
 | `ProxyClient` | Forwards requests to a remote MCP server |
 | `Session` | Per-client server session with state |
 | `SessionState` | Key-value state bag per client session |
 | `Transport` | Trait for message transport (stdio, SSE, WebSocket, HTTP, memory) |
 | `Codec` | JSON-RPC message framing and parsing |
 | `AuthProvider` | Trait for pluggable authentication |
-| `TokenVerifier` | Trait for token validation (static, JWT) |
+| `TokenVerifier` | Trait for static or custom token validation |
 | `TaskManager` | Background task lifecycle management |
 | `Cx` | asupersync capability context — passed to all async operations |
 | `Outcome<T, E>` | Four-valued result: Ok, Err, Cancelled, Panicked |
@@ -377,14 +511,14 @@ json = ["rich_rust/json"]            # JSON pretty-printing
 
 - **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
 - **`McpContext` wraps `Cx`** — every handler receives `&McpContext` which wraps asupersync's capability context
-- **Cancel-correct lifecycle** — handlers use checkpoints for graceful cancellation, `masked()` for critical sections
+- **Cancellation-aware lifecycle** — handlers expose checkpoints and masking surfaces; request-owned execution/cancellation closure is still being verified
 - **4-valued `Outcome`** — Ok, Err, Cancelled, Panicked propagated throughout the stack
 - **Proc macros for ergonomics** — `#[tool]`, `#[resource]`, `#[prompt]` generate schema and handler boilerplate at compile time
-- **Facade crate pattern** — `fastmcp-rust` re-exports everything; most users depend on a single crate
+- **Facade crate pattern** — `fastmcp-rust` re-exports the selected supported surface; most users depend on a single crate
 - **Middleware pipeline** — caching, rate limiting, transforms compose as chainable middleware
-- **Multiple auth strategies** — OAuth 2.1, OIDC, JWT, static tokens; `AuthProvider` trait for custom schemes
+- **Multiple auth surfaces** — static/custom tokens and OAuth/OIDC code paths; JWT remains a deferred profile
 - **Proxy gateway** — `ProxyClient` + `ProxyCatalog` for aggregating multiple remote MCP servers
-- **Docket distributed backend** — optional Redis-backed distributed task queue
+- **Docket distributed backend** — deferred; not a FND-01 production edge (TASKR-01 later)
 - **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
 - **Structured tracing** via `log` facade — zero-cost when disabled
 - **`#![forbid(unsafe_code)]`** throughout all crates

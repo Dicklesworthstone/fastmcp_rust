@@ -1,0 +1,1474 @@
+# FND-01 immutable dependency evidence for:
+#   bd-mcp-2026-07-28-support-ahet.1.13
+#
+# This artifact freezes direct registry provenance and three isolated,
+# resolver-3 consumer locks assembled only from locally cached crates.io
+# archives. No Cargo command, compilation, test, network request, or shared
+# workspace edit was used to produce this child artifact. Consequently every
+# build-, target-, advisory-execution-, and support-level gate remains false
+# until its named downstream owner verifies it. The 2026-08-03 rematerialized
+# contract adds source-level positive and planted-negative tests without
+# executing Cargo or changing a manifest or lock.
+
+format_version = 1
+evidence_id = "FND-01/state-capability-dependencies"
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.13"
+recorded_at_utc = "2026-07-29T22:50:43Z"
+recorded_by = "CopperGlacier"
+plan = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+registry_index = "https://index.crates.io/"
+registry_archive = "https://static.crates.io/crates"
+retrieval_mode = "offline local cache only"
+
+[toolchain]
+channel = "nightly-2026-07-11"
+rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
+cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
+host = "aarch64-apple-darwin"
+resolver = "3"
+authority = "evidence/fnd-01/toolchain-asupersync.toml"
+commands_executed_for_this_child = false
+
+[advisory_snapshot]
+repository = "https://github.com/RustSec/advisory-db"
+local_path = "/Users/jemanuel/.cargo/advisory-db"
+commit = "7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
+commit_time_utc = "2026-07-29T15:17:10Z"
+worktree_clean = true
+advisory_count_from_frozen_fnd01_evidence = 1173
+audit_executed_for_these_locks = false
+audit_result = "pending bd-mcp-2026-07-28-support-ahet.1.1 RCH execution; .1.13 owns only the local hard-gate test source; .1.15 independently attests receipts; no clean claim"
+ignore_list = []
+known_relevant_records = [
+  "RUSTSEC-2019-0029 chacha20 counter overflow; patched >=0.2.3; selected 0.10.1",
+  "RUSTSEC-2024-0445 cap-primitives Windows superscript device-name sandbox bypass; patched >=3.4.1; selected 4.0.2",
+  "RUSTSEC-2026-0003 cmov ARM32 non-constant-time code generation; patched >=0.4.4; selected 0.5.4; supported targets exclude ARM32",
+]
+known_relevant_record_hashes = [
+  "RUSTSEC-2019-0029 f02361318232aa3202c954fd9cde3e2a688b0842f137d16ee22d042fac691c4c",
+  "RUSTSEC-2024-0445 4e514b50d277c08caae1d01003aa26c6c0c2122cb796b07319cb4c92d598fcf3",
+  "RUSTSEC-2026-0003 a78d8ba6c0ac1de3da9f0b94a771dcb24e0c8f02c8536b89e9f3268e082579d7",
+]
+redis_direct_text_match = "none observed in the pinned local database; this is not a full-lock audit result"
+
+[policy]
+supported_targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+profile_boundary = "XC20P and capability-filesystem dependencies are foundation inputs; redis is evidence for the separately promotable redis-tasks profile and does not activate core or base Tasks support."
+semantic_owners = [
+  "FND-07 owns capability-root retention, iterative path traversal, race resistance, enumeration/reopen, Windows path policy, and filesystem support claims.",
+  "FND-08 owns FMCPBOX/FMCPENV formats, entropy, keys, nonces, epochs, application limits, restore behavior, and zeroization.",
+  "TASKR-01 owns the bounded Redis connector/parser, peer identity, ACL/script DSL, durability, local-only topology, and Redis support claims.",
+]
+prohibited_active_packages = [
+  "tokio",
+  "smol",
+  "async-std",
+  "rand",
+  "rand_core",
+  "getrandom",
+  "native-tls",
+  "rustls",
+  "hyper",
+  "reqwest",
+]
+package_name_matching = "exact package identity; sha1_smol is allowed and must never be classified as the smol async runtime"
+
+[rematerialized_hard_gate]
+recorded_at_utc = "2026-08-03T05:19:44Z"
+owner = "bd-mcp-2026-07-28-support-ahet.1.13"
+test_source = "evidence/fnd-01/probes/redis/src/lib.rs"
+test_ids = [
+  "tests::fnd_01_state_capability_dependencies_positive",
+  "tests::fnd_01_state_capability_dependencies_planted_negative",
+]
+positive_contract = "One bounded leaf-local validator consumes a supplied immutable state/manifests/locks/source bundle. It exact-checks manifest metadata and dependency-key sets, recorded manifest/lock/source byte+SHA-256 bindings (except the test file itself, which is deliberately not self-proved), package counts/full registry tuples/dependency-edge reachability, package-keyed registry license/MSRV tuples bound to lock source/checksum, requested/allowed/prohibited features and package absences, the complete recorded advisory snapshot, exact target rows, bounds, and all gate values. Frozen provenance evidence is not an execution, archive-live, semantic-support, or aggregate conformance claim."
+planted_negative_contract = "The negative deep-clones the immutable bundle, changes exactly one Redis direct feature by adding tokio-comp, then derives only that virtual probe's manifest byte/hash mirror from the changed manifest before calling the same full validator. It requires the typed StructuredEvidenceError::ForbiddenFeature subject=redis requested_features feature=tokio-comp stable diagnostic, proves exactly one semantic input change and no state change beyond the derived mirror, observes the domain-separated bundle digest change, and freshly reaccepts the unmodified baseline."
+execution_status = "not executed locally: this child must not invoke Cargo, a compiler, a build, or a test; CopperShore and CreamLotus own serialized verification."
+historical_negative_rows = "Earlier NEG-*-mutation_test_status values name a broader .1.14 policy effort. They are not execution receipts for this rematerialized .1.13 contract and do not make any additional negative pass."
+coverage = [
+  "envelope: exact manifest selection; frozen candidate checksum/license/MSRV/features; lock count/direct checksum/registry checksum shape; RNG absence; frozen target union",
+  "capability-filesystem: exact cap-fs-ext and cap-std selections; frozen checksums/licenses/MSRVs/features; lock count/direct checksum/registry checksum shape; Tokio/smol/aio absence; frozen target union",
+  "redis: exact acl+script selection; all frozen prohibited Redis features including cluster/aio/Tokio/smol/TLS/connection-manager; frozen checksum/license/MSRV; lock count/direct checksum/registry checksum shape; prohibited package absence; advisory/target/persistence boundaries",
+]
+unverified_required_facts = [
+  "archive bytes are unavailable at the recorded local cache paths, so current archive rehash and full transitive license/MSRV provenance remain unverified",
+  "canonical normal/build/feature/dev graph receipts, target compilation, and advisory execution remain false pending the serialized owners",
+  "constant-time target qualification, filesystem semantics, bounded Redis connector/parser, peer identity, and Redis profile support remain false",
+]
+
+[current_revalidation]
+checked_at_utc = "2026-08-03T06:20:00Z"
+as_of_utc = "2026-08-03T06:20:00Z"
+method = "read-only exact-path inspection plus source-level hard-gate test refresh; no Cargo, compiler, build, test, manifest, lock, or shared-workspace mutation"
+archive_cache_paths_available_now = false
+archive_availability = [
+  "chacha20poly1305-0.11.0: absent",
+  "cap-std-4.0.2: present",
+  "cap-fs-ext-4.0.2: present",
+  "redis-1.4.1: absent",
+]
+archive_cache_risk = "Only the two capability archive paths appeared during this recheck; chacha20poly1305 and redis remained absent. No aggregate archive claim is promoted: current archive-byte rehash, full transitive provenance, and all execution/support gates remain unverified."
+primary_registry_records = "https://index.crates.io/ remains the registry authority named by the frozen evidence; no network or resolver result is treated as a verification receipt."
+
+[[crate]]
+role = "envelope primitive"
+name = "chacha20poly1305"
+version = "0.11.0"
+requirement = "=0.11.0"
+default_features = false
+requested_features = ["alloc", "zeroize"]
+resolved_features_expected = ["alloc", "zeroize"]
+allowed_features = ["alloc", "zeroize"]
+prohibited_features = [
+  "default",
+  "arrayvec",
+  "bytes",
+  "getrandom",
+  "rand_core",
+  "reduced-round",
+]
+checksum_sha256 = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+archive_bytes = 71012
+archive_cache_path = "/Users/jemanuel/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/chacha20poly1305-0.11.0.crate"
+archive_url = "https://static.crates.io/crates/chacha20poly1305/chacha20poly1305-0.11.0.crate"
+index_cache_path = "/Users/jemanuel/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ch/ac/chacha20poly1305"
+index_record_bytes = 1175
+index_record_sha256 = "e75fb2b795f84968a05d11266cee2da9fb613df49a422fb54c75a0da8118e35b"
+published_at_utc = "2026-06-28T17:41:38Z"
+yanked = false
+license = "Apache-2.0 OR MIT"
+license_files = [
+  "LICENSE-APACHE 10849 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+  "LICENSE-MIT 1082 b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0",
+]
+rust_version = "1.85"
+repository = "https://github.com/RustCrypto/AEADs"
+vcs_revision = "e37a978ccf0992d9053fbc039470d6527108e393"
+vcs_path = "chacha20poly1305"
+tag = ""
+tag_status = "not verified; no cached upstream Git mirror"
+normalized_manifest_bytes = 3352
+normalized_manifest_sha256 = "7ec6e52abfdaf2440a83823ab022b76c366319bc4c610dd51e8b9d0b533b12dc"
+original_manifest_bytes = 1523
+original_manifest_sha256 = "3b17182be9bcc2b818b6214a4a6fe18d0fa22492d23cdcaab4fc41251c3f9bed"
+vcs_info_bytes = 110
+vcs_info_sha256 = "6c640f7d3c4b878f5efaee675685f09bbca18b84880d4b55f7b676165a81e33f"
+publisher_lock_bytes = 5067
+publisher_lock_sha256 = "a66fb2e2410eaa5f94660d30cfad3eb172b43571f2bf4995b036ac237051063d"
+normal_dependencies = [
+  "aead ^0.6 default-features=false",
+  "chacha20 ^0.10 features=xchacha default-features=false",
+  "cipher ^0.5",
+  "poly1305 ^0.9",
+  "zeroize ^1.8 optional default-features=false",
+]
+build_dependencies = []
+dev_dependencies = ["aead ^0.6 features=dev default-features=false"]
+publisher_dev_graph_note = "The publisher dev feature adds blobby/alloc test support. It is not propagated into the FastMCP probe."
+
+[[crate]]
+role = "capability filesystem root"
+name = "cap-std"
+version = "4.0.2"
+requirement = "=4.0.2"
+default_features = false
+requested_features = []
+resolved_features_expected = ["default"]
+allowed_features = ["default"]
+prohibited_features = ["arf_strings", "fs_utf8"]
+empty_default_feature_note = "cap-fs-ext's std feature activates its optional cap-std edge with default features; cap-std's default feature is empty and adds no dependency."
+checksum_sha256 = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+archive_bytes = 36968
+archive_cache_path = "/Users/jemanuel/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/cap-std-4.0.2.crate"
+archive_url = "https://static.crates.io/crates/cap-std/cap-std-4.0.2.crate"
+index_cache_path = "/Users/jemanuel/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ca/p-/cap-std"
+index_record_bytes = 1001
+index_record_sha256 = "3bf56116c3be0e7369a6bc66b7a7b33cda19887ed38f13e3d8a9a2b3990ff476"
+published_at_utc = "2026-02-15T23:23:06Z"
+yanked = false
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+license_files = [
+  "LICENSE-APACHE 10847 a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+  "LICENSE-Apache-2.0_WITH_LLVM-exception 12243 268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",
+  "LICENSE-MIT 1023 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+]
+rust_version = ""
+rust_version_status = "not declared; exact dated-nightly target verification pending"
+repository = "https://github.com/bytecodealliance/cap-std"
+vcs_revision = "715e4ed607ae9a93c7446b0fa63296f7898831c2"
+vcs_path = "cap-std"
+tag = ""
+tag_status = "not verified; no cached upstream Git mirror"
+normalized_manifest_bytes = 1674
+normalized_manifest_sha256 = "c967f076ca4aecad477a02d3cd3ae20ea6da4fda1a49b526f136c3949824ec68"
+original_manifest_bytes = 980
+original_manifest_sha256 = "5ae83315343a311b5bdcedc681fca6c5db87f188265198a343089f5b4ec40267"
+vcs_info_bytes = 101
+vcs_info_sha256 = "46313be1e90f7ee7e12b3d300c60c41a7ab3cd09f58204209e27f6b4565a4417"
+publisher_lock_bytes = 9503
+publisher_lock_sha256 = "6f76ffa4da7a05419ef66ca422e22ef849b7cc75ba8b3ee169f9b3ef35c42ce0"
+normal_dependencies = [
+  "cap-primitives ^4.0.2",
+  "io-extras ^0.19.0",
+  "io-lifetimes ^3.0.1 default-features=false",
+  "rustix ^1.0.0 features=fs target=cfg(not(windows))",
+  "arf-strings ^0.7.0 optional prohibited",
+  "camino ^1.0.5 optional prohibited",
+]
+build_dependencies = ["build.rs probes compiler library features with the target rustc"]
+dev_dependencies = []
+
+[[crate]]
+role = "capability filesystem extensions"
+name = "cap-fs-ext"
+version = "4.0.2"
+requirement = "=4.0.2"
+default_features = false
+requested_features = ["std"]
+resolved_features_expected = ["std"]
+allowed_features = ["std"]
+prohibited_features = ["default", "arf_strings", "fs_utf8"]
+checksum_sha256 = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+archive_bytes = 17002
+archive_cache_path = "/Users/jemanuel/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/cap-fs-ext-4.0.2.crate"
+archive_url = "https://static.crates.io/crates/cap-fs-ext/cap-fs-ext-4.0.2.crate"
+index_cache_path = "/Users/jemanuel/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ca/p-/cap-fs-ext"
+index_record_bytes = 1092
+index_record_sha256 = "d24ce54cd09b50e14943536c7531709766c389935ade52d8fec85ec632f3ef59"
+published_at_utc = "2026-02-15T23:23:08Z"
+yanked = false
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+license_files = [
+  "LICENSE-APACHE 10847 a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+  "LICENSE-Apache-2.0_WITH_LLVM-exception 12243 268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",
+  "LICENSE-MIT 1023 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+]
+rust_version = ""
+rust_version_status = "not declared; exact dated-nightly target verification pending"
+repository = "https://github.com/bytecodealliance/cap-std"
+vcs_revision = "715e4ed607ae9a93c7446b0fa63296f7898831c2"
+vcs_path = "cap-fs-ext"
+tag = ""
+tag_status = "not verified; no cached upstream Git mirror"
+normalized_manifest_bytes = 1657
+normalized_manifest_sha256 = "41677a1ee1ccf1a11b634b97bb6c0f537b2c439130e101804871d395fb8265db"
+original_manifest_bytes = 1055
+original_manifest_sha256 = "8a015d3a26ad529e7a9bc33e5c54fced1ed2546138ae5a2c845ff2f03103600b"
+vcs_info_bytes = 104
+vcs_info_sha256 = "11ad2840b1a748a2eb02dfa91b861c28672db55205708b14d7ea5aa693c1ae4d"
+publisher_lock_bytes = 9820
+publisher_lock_sha256 = "6c492e94279426d4512a89c3e5257d8ce3f92700290e6e35332ee07a5ed18d3b"
+normal_dependencies = [
+  "cap-primitives =4.0.2",
+  "cap-std =4.0.2 optional, activated by std",
+  "io-lifetimes ^3.0.1 default-features=false",
+  "windows-sys >=0.60,<0.62 features=Win32_Storage_FileSystem target=cfg(windows)",
+  "arf-strings ^0.7.0 optional prohibited",
+  "camino ^1.0.5 optional prohibited",
+]
+build_dependencies = ["build.rs probes windows_by_handle with the target rustc"]
+dev_dependencies = []
+
+[[crate]]
+role = "Redis protocol/client candidate"
+name = "redis"
+version = "1.4.1"
+requirement = "=1.4.1"
+default_features = false
+requested_features = ["acl", "script"]
+resolved_features_expected = ["acl", "script"]
+allowed_features = ["acl", "script"]
+prohibited_features = [
+  "default",
+  "ahash",
+  "aio",
+  "bb8",
+  "bigdecimal",
+  "bloom",
+  "bytes",
+  "cache-aio",
+  "cluster",
+  "cluster-async",
+  "connection-manager",
+  "entra-id",
+  "geospatial",
+  "hashbrown",
+  "json",
+  "num-bigint",
+  "r2d2",
+  "rust_decimal",
+  "sentinel",
+  "smol-comp",
+  "smol-native-tls-comp",
+  "smol-rustls-comp",
+  "streams",
+  "tls-native-tls",
+  "tls-rustls",
+  "tls-rustls-insecure",
+  "tls-rustls-webpki-roots",
+  "token-based-authentication",
+  "tokio-comp",
+  "tokio-native-tls-comp",
+  "tokio-rustls-comp",
+  "uuid",
+  "vector-sets",
+]
+checksum_sha256 = "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a"
+archive_bytes = 471613
+archive_cache_path = "/Users/jemanuel/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/redis-1.4.1.crate"
+archive_url = "https://static.crates.io/crates/redis/redis-1.4.1.crate"
+index_cache_path = "/Users/jemanuel/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/re/di/redis"
+index_record_bytes = 9719
+index_record_sha256 = "99f79d342d3121797eea994c0601d2c7fc8f534e86a6a27c65a3695ab859a05e"
+published_at_utc = "2026-07-17T06:19:06Z"
+yanked = false
+license = "BSD-3-Clause"
+license_files = [
+  "LICENSE 1564 500d6bc35e93b68ea9c8b41c37ba2de9357b19f701e1e0acb66a13e92b88144d",
+]
+rust_version = "1.88"
+repository = "https://github.com/redis-rs/redis-rs"
+vcs_revision = "37f4cad379fd8a05d058416356640f10160a4755"
+vcs_path = "redis"
+tag = ""
+tag_status = "not verified; no cached upstream Git mirror"
+normalized_manifest_bytes = 10975
+normalized_manifest_sha256 = "a1cda4e28841e4da94695e6c8a060911a40a137e778e4e43ec6c3dd4f6582158"
+original_manifest_bytes = 8079
+original_manifest_sha256 = "7b43831c5efff1245fbb4dcb50c98ec5195a0fcb7dadd2c50b1dceada661e8a7"
+vcs_info_bytes = 99
+vcs_info_sha256 = "9ee682f46707343d0b09f60aa33bf5a81085bae20ded7696dec91427b4eabf24"
+publisher_lock_bytes = 95523
+publisher_lock_sha256 = "e20c87a72822e9dd240be5f3495c56e58f01f6906ef79374e3803cef370e4915"
+normal_dependencies = [
+  "arcstr ^1.2.0",
+  "combine ^4.6 features=std default-features=false",
+  "itoa ^1.0",
+  "percent-encoding ^2.3",
+  "ryu ^1.0",
+  "sha1_smol ^1.0 optional, activated only by script",
+  "url ^2.5",
+  "xxhash-rust ^0.8 features=xxh3",
+  "socket2 ^0.6 features=all target=cfg(not(target_family=wasm))",
+]
+build_dependencies = []
+dev_dependencies = [
+  "publisher-only dev graph includes Tokio, rand, rustls, futures, partial-io, quickcheck, criterion, rstest, and tempfile",
+]
+publisher_dev_graph_note = "Publisher dev dependencies are recorded as negative context but do not propagate to the isolated consumer lock."
+
+[probe.envelope]
+manifest_path = "evidence/fnd-01/probes/envelope/Cargo.toml"
+manifest_bytes = 272
+manifest_sha256 = "bf66b37a0e2822b965f2a4d42b84cd3dffff14a7342bbdddcd853319a4732268"
+source_path = "evidence/fnd-01/probes/envelope/src/lib.rs"
+source_bytes = 2757
+source_sha256 = "8b245c7428f0041d65ec38592aaf6d5d2dcf1cde57e0426c1d95c250e9ab78b1"
+lock_path = "evidence/fnd-01/probes/envelope/Cargo.lock"
+lock_bytes = 4046
+lock_sha256 = "f60c46fe85004ade47468d2b93441ab87551cd6a1cc6a9481eb75b199614c1e5"
+lock_version = 4
+package_count = 18
+registry_package_count = 17
+all_archives_present = true
+all_archive_checksums_match = true
+lock_origin = "manual normal/build projection using cached immutable registry manifests and archives; Cargo regeneration comparison pending"
+active_features_expected = [
+  "chacha20poly1305/alloc",
+  "chacha20poly1305/zeroize",
+  "aead/alloc",
+  "chacha20/xchacha",
+  "chacha20/zeroize",
+  "cipher/stream-wrapper",
+]
+prohibited_packages_absent_from_lock = ["getrandom", "rand", "rand_core"]
+package_projection = [
+  "aead 0.6.1 1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99",
+  "block-buffer 0.12.1 d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa",
+  "cfg-if 1.0.4 9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801",
+  "chacha20 0.10.1 d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81",
+  "chacha20poly1305 0.11.0 9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb",
+  "cipher 0.5.2 e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c",
+  "cmov 0.5.4 0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a",
+  "cpufeatures 0.3.0 8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201",
+  "crypto-common 0.2.2 ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453",
+  "ctutils 0.4.2 7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e",
+  "fastmcp-fnd01-envelope-probe 0.0.0 path",
+  "hybrid-array 0.4.13 818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c",
+  "inout 0.2.2 4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7",
+  "libc 0.2.189 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+  "poly1305 0.9.1 6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c",
+  "typenum 1.20.1 b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20",
+  "universal-hash 0.6.1 f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96",
+  "zeroize 1.9.0 e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e",
+]
+license_msrv_projection = [
+  "aead 0.6.1 | MIT OR Apache-2.0 | 1.85",
+  "block-buffer 0.12.1 | MIT OR Apache-2.0 | 1.85",
+  "cfg-if 1.0.4 | MIT OR Apache-2.0 | 1.32",
+  "chacha20 0.10.1 | MIT OR Apache-2.0 | 1.85",
+  "chacha20poly1305 0.11.0 | Apache-2.0 OR MIT | 1.85",
+  "cipher 0.5.2 | MIT OR Apache-2.0 | 1.85",
+  "cmov 0.5.4 | Apache-2.0 OR MIT | 1.85",
+  "cpufeatures 0.3.0 | MIT OR Apache-2.0 | 1.85",
+  "crypto-common 0.2.2 | MIT OR Apache-2.0 | 1.85",
+  "ctutils 0.4.2 | Apache-2.0 OR MIT | 1.85",
+  "hybrid-array 0.4.13 | MIT OR Apache-2.0 | 1.85",
+  "inout 0.2.2 | MIT OR Apache-2.0 | 1.85",
+  "libc 0.2.189 | MIT OR Apache-2.0 | 1.65",
+  "poly1305 0.9.1 | Apache-2.0 OR MIT | 1.85",
+  "typenum 1.20.1 | MIT OR Apache-2.0 | 1.41.0",
+  "universal-hash 0.6.1 | MIT OR Apache-2.0 | 1.85",
+  "zeroize 1.9.0 | Apache-2.0 OR MIT | 1.85",
+]
+
+[probe.capability_fs]
+manifest_path = "evidence/fnd-01/probes/capability-fs/Cargo.toml"
+manifest_bytes = 316
+manifest_sha256 = "55079b44bc44108739223f54b53f42741bbe6c18d256d448effb11b90a5f6fae"
+source_path = "evidence/fnd-01/probes/capability-fs/src/lib.rs"
+source_bytes = 2470
+source_sha256 = "b5405f2df4e07db90cb9326b8ebc9c95d5045a9d7d99c8294fb16879b6e09188"
+lock_path = "evidence/fnd-01/probes/capability-fs/Cargo.lock"
+lock_bytes = 9614
+lock_sha256 = "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c"
+lock_version = 4
+package_count = 41
+registry_package_count = 40
+all_archives_present = true
+all_archive_checksums_match = true
+lock_origin = "manual normal/build projection from the 4.0.2 publisher locks, replacing five missing compressed transitive archives with semver-compatible cached versions"
+publisher_lock_replacements = [
+  "ipnet 2.11.0 -> 2.12.0",
+  "libc 0.2.182 -> 0.2.189",
+  "linux-raw-sys 0.11.0 -> 0.12.1 through rustix 1.1.4",
+  "once_cell 1.21.3 -> 1.21.4",
+  "rustix 1.1.3 -> 1.1.4",
+]
+active_features_expected = [
+  "cap-fs-ext/std",
+  "cap-std/default (empty feature, activated by cap-fs-ext's optional dependency edge)",
+  "rustix/default,fs,process,termios,time",
+]
+prohibited_packages_absent_from_lock = [
+  "arf-strings",
+  "camino",
+  "tokio",
+  "async-std",
+  "smol",
+]
+package_projection = [
+  "ambient-authority 0.0.2 e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b",
+  "bitflags 2.11.0 843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af",
+  "cap-fs-ext 4.0.2 d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b",
+  "cap-primitives 4.0.2 cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0",
+  "cap-std 4.0.2 7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608",
+  "errno 0.3.14 39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+  "fastmcp-fnd01-capability-fs-probe 0.0.0 path",
+  "fs-set-times 0.20.3 94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a",
+  "io-extras 0.19.0 20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f",
+  "io-lifetimes 2.0.4 06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983",
+  "io-lifetimes 3.0.1 2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96",
+  "ipnet 2.12.0 d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2",
+  "libc 0.2.189 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+  "linux-raw-sys 0.12.1 32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+  "maybe-owned 0.3.4 4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4",
+  "once_cell 1.21.4 9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50",
+  "rustix 1.1.4 b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190",
+  "rustix-linux-procfs 0.1.1 2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056",
+  "windows-link 0.2.1 f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+  "windows-sys 0.59.0 1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b",
+  "windows-sys 0.60.2 f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb",
+  "windows-sys 0.61.2 ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+  "windows-targets 0.52.6 9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973",
+  "windows-targets 0.53.5 4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3",
+  "windows_aarch64_gnullvm 0.52.6 32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3",
+  "windows_aarch64_gnullvm 0.53.1 a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53",
+  "windows_aarch64_msvc 0.52.6 09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469",
+  "windows_aarch64_msvc 0.53.1 b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006",
+  "windows_i686_gnu 0.52.6 8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b",
+  "windows_i686_gnu 0.53.1 960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3",
+  "windows_i686_gnullvm 0.52.6 0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66",
+  "windows_i686_gnullvm 0.53.1 fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c",
+  "windows_i686_msvc 0.52.6 240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66",
+  "windows_i686_msvc 0.53.1 1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2",
+  "windows_x86_64_gnu 0.52.6 147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78",
+  "windows_x86_64_gnu 0.53.1 9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499",
+  "windows_x86_64_gnullvm 0.52.6 24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d",
+  "windows_x86_64_gnullvm 0.53.1 0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1",
+  "windows_x86_64_msvc 0.52.6 589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec",
+  "windows_x86_64_msvc 0.53.1 d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650",
+  "winx 0.36.4 3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d",
+]
+license_msrv_projection = [
+  "ambient-authority 0.0.2 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | UNDECLARED",
+  "bitflags 2.11.0 | MIT OR Apache-2.0 | 1.56.0",
+  "cap-fs-ext 4.0.2 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | UNDECLARED",
+  "cap-primitives 4.0.2 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | UNDECLARED",
+  "cap-std 4.0.2 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | UNDECLARED",
+  "errno 0.3.14 | MIT OR Apache-2.0 | 1.56",
+  "fs-set-times 0.20.3 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | UNDECLARED",
+  "io-extras 0.19.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.70",
+  "io-lifetimes 2.0.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.63",
+  "io-lifetimes 3.0.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.70",
+  "ipnet 2.12.0 | MIT OR Apache-2.0 | UNDECLARED",
+  "libc 0.2.189 | MIT OR Apache-2.0 | 1.65",
+  "linux-raw-sys 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.63",
+  "maybe-owned 0.3.4 | MIT OR Apache-2.0 | UNDECLARED",
+  "once_cell 1.21.4 | MIT OR Apache-2.0 | 1.65",
+  "rustix 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.63",
+  "rustix-linux-procfs 0.1.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.63",
+  "windows-link 0.2.1 | MIT OR Apache-2.0 | 1.71",
+  "windows-sys 0.59.0 | MIT OR Apache-2.0 | 1.60",
+  "windows-sys 0.60.2 | MIT OR Apache-2.0 | 1.60",
+  "windows-sys 0.61.2 | MIT OR Apache-2.0 | 1.71",
+  "windows-targets 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows-targets 0.53.5 | MIT OR Apache-2.0 | 1.60",
+  "windows_aarch64_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_aarch64_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_aarch64_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_aarch64_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_gnu 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_gnu 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_i686_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_i686_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_gnu 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_gnu 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_gnullvm 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_gnullvm 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "windows_x86_64_msvc 0.52.6 | MIT OR Apache-2.0 | 1.56",
+  "windows_x86_64_msvc 0.53.1 | MIT OR Apache-2.0 | 1.60",
+  "winx 0.36.4 | Apache-2.0 WITH LLVM-exception | 1.63",
+]
+
+[probe.redis]
+manifest_path = "evidence/fnd-01/probes/redis/Cargo.toml"
+manifest_bytes = 254
+manifest_sha256 = "62ed2704f3c878d08dba3e48c42df07bdea9325ce3e570a975795bc47fbe880b"
+source_path = "evidence/fnd-01/probes/redis/src/lib.rs"
+source_bytes = 110480
+source_sha256 = "b37b792d04e3b6dc31d4464b34d9d3a89b84acf15f06d2bb7d4e02dca62a642b"
+lock_path = "evidence/fnd-01/probes/redis/Cargo.lock"
+lock_bytes = 10699
+lock_sha256 = "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45"
+lock_version = 4
+package_count = 46
+registry_package_count = 45
+all_archives_present = true
+all_archive_checksums_match = true
+lock_origin = "manual normal/build projection from cached redis 1.4.1/current compatible registry records; default num-bigint and publisher dev graph removed"
+active_features_expected = [
+  "redis/acl",
+  "redis/script",
+  "combine/std",
+  "socket2/all",
+  "url/default,std",
+  "idna/alloc,compiled_data,std",
+  "xxhash-rust/xxh3",
+]
+allowed_name_collision = "sha1_smol is the allowed script hash implementation, not the prohibited smol runtime"
+allowed_transitive_bytes_note = "bytes is activated by combine/std; redis's optional bytes feature remains disabled"
+prohibited_packages_absent_from_lock = [
+  "ahash",
+  "arc-swap",
+  "async-io",
+  "async-lock",
+  "async-native-tls",
+  "backon",
+  "bb8",
+  "crc16",
+  "futures-channel",
+  "futures-rustls",
+  "futures-util",
+  "native-tls",
+  "num-bigint",
+  "rand",
+  "rustls",
+  "smol",
+  "smol-timeout",
+  "tokio",
+  "tokio-native-tls",
+  "tokio-rustls",
+  "tokio-util",
+]
+package_projection = [
+  "arcstr 1.2.0 03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d",
+  "bytes 1.12.1 fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04",
+  "combine 4.6.7 ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd",
+  "displaydoc 0.2.6 1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f",
+  "fastmcp-fnd01-redis-probe 0.0.0 path",
+  "form_urlencoded 1.2.2 cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf",
+  "icu_collections 2.2.0 2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c",
+  "icu_locale_core 2.2.0 92219b62b3e2b4d88ac5119f8904c10f8f61bf7e95b640d25ba3075e6cac2c29",
+  "icu_normalizer 2.2.0 c56e5ee99d6e3d33bd91c5d85458b6005a22140021cc324cea84dd0e72cff3b4",
+  "icu_normalizer_data 2.2.0 da3be0ae77ea334f4da67c12f149704f19f81d1adf7c51cf482943e84a2bad38",
+  "icu_properties 2.2.0 bee3b67d0ea5c2cca5003417989af8996f8604e34fb9ddf96208a033901e70de",
+  "icu_properties_data 2.2.0 8e2bbb201e0c04f7b4b3e14382af113e17ba4f63e2c9d2ee626b720cbce54a14",
+  "icu_provider 2.2.0 139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421",
+  "idna 1.1.0 3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de",
+  "idna_adapter 1.2.2 cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714",
+  "itoa 1.0.18 8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682",
+  "libc 0.2.189 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+  "litemap 0.8.2 92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0",
+  "memchr 2.8.3 cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+  "percent-encoding 2.3.2 9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220",
+  "potential_utf 0.1.5 0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564",
+  "proc-macro2 1.0.107 985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+  "quote 1.0.47 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+  "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
+  "ryu 1.0.23 9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f",
+  "sha1_smol 1.0.1 bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d",
+  "smallvec 1.15.2 8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90",
+  "socket2 0.6.5 c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
+  "stable_deref_trait 1.2.1 6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596",
+  "syn 2.0.119 872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297",
+  "synstructure 0.13.2 728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2",
+  "tinystr 0.8.3 c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d",
+  "unicode-ident 1.0.24 e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75",
+  "url 2.5.8 ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+  "utf8_iter 1.0.4 b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be",
+  "windows-link 0.2.1 f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+  "windows-sys 0.61.2 ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+  "writeable 0.6.3 1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4",
+  "xxhash-rust 0.8.18 aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6",
+  "yoke 0.8.3 709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5",
+  "yoke-derive 0.8.2 de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e",
+  "zerofrom 0.1.8 0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272",
+  "zerofrom-derive 0.1.7 11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1",
+  "zerotrie 0.2.4 0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf",
+  "zerovec 0.11.6 90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239",
+  "zerovec-derive 0.11.3 625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555",
+]
+license_msrv_projection = [
+  "arcstr 1.2.0 | Apache-2.0 OR MIT OR Zlib | 1.57.0",
+  "bytes 1.12.1 | MIT | 1.57",
+  "combine 4.6.7 | MIT | UNDECLARED",
+  "displaydoc 0.2.6 | MIT OR Apache-2.0 | 1.56.0",
+  "form_urlencoded 1.2.2 | MIT OR Apache-2.0 | 1.51",
+  "icu_collections 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_locale_core 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_normalizer 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_normalizer_data 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_properties 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_properties_data 2.2.0 | Unicode-3.0 | 1.86",
+  "icu_provider 2.2.0 | Unicode-3.0 | 1.86",
+  "idna 1.1.0 | MIT OR Apache-2.0 | 1.57",
+  "idna_adapter 1.2.2 | Apache-2.0 OR MIT | 1.86",
+  "itoa 1.0.18 | MIT OR Apache-2.0 | 1.68",
+  "libc 0.2.189 | MIT OR Apache-2.0 | 1.65",
+  "litemap 0.8.2 | Unicode-3.0 | 1.82",
+  "memchr 2.8.3 | Unlicense OR MIT | 1.61",
+  "percent-encoding 2.3.2 | MIT OR Apache-2.0 | 1.51",
+  "potential_utf 0.1.5 | Unicode-3.0 | 1.82",
+  "proc-macro2 1.0.107 | MIT OR Apache-2.0 | 1.71",
+  "quote 1.0.47 | MIT OR Apache-2.0 | 1.71",
+  "redis 1.4.1 | BSD-3-Clause | 1.88",
+  "ryu 1.0.23 | Apache-2.0 OR BSL-1.0 | 1.71",
+  "sha1_smol 1.0.1 | BSD-3-Clause | UNDECLARED",
+  "smallvec 1.15.2 | MIT OR Apache-2.0 | UNDECLARED",
+  "socket2 0.6.5 | MIT OR Apache-2.0 | 1.70",
+  "stable_deref_trait 1.2.1 | MIT OR Apache-2.0 | UNDECLARED",
+  "syn 2.0.119 | MIT OR Apache-2.0 | 1.71",
+  "synstructure 0.13.2 | MIT | UNDECLARED",
+  "tinystr 0.8.3 | Unicode-3.0 | 1.82",
+  "unicode-ident 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | 1.71",
+  "url 2.5.8 | MIT OR Apache-2.0 | 1.63",
+  "utf8_iter 1.0.4 | Apache-2.0 OR MIT | UNDECLARED",
+  "windows-link 0.2.1 | MIT OR Apache-2.0 | 1.71",
+  "windows-sys 0.61.2 | MIT OR Apache-2.0 | 1.71",
+  "writeable 0.6.3 | Unicode-3.0 | 1.82",
+  "xxhash-rust 0.8.18 | BSL-1.0 | UNDECLARED",
+  "yoke 0.8.3 | Unicode-3.0 | 1.82",
+  "yoke-derive 0.8.2 | Unicode-3.0 | UNDECLARED",
+  "zerofrom 0.1.8 | Unicode-3.0 | 1.71.1",
+  "zerofrom-derive 0.1.7 | Unicode-3.0 | 1.71.1",
+  "zerotrie 0.2.4 | Unicode-3.0 | 1.82",
+  "zerovec 0.11.6 | Unicode-3.0 | 1.83",
+  "zerovec-derive 0.11.3 | Unicode-3.0 | UNDECLARED",
+]
+
+[[target_projection]]
+candidate = "envelope"
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
+static_delta = "cpufeatures is reachable through the x86-only chacha20 and poly1305 edges, but its libc edges are a lock-only false cross-product because they require aarch64/loongarch64. Ordinary x86 runtime dispatch reaches AVX512 when chacha20_avx512 is set; forced AVX512 additionally requires chacha20_backend=avx512 plus compile-time avx512f and avx512vl. AVX2/SSE2, poly1305 AVX2/autodetect, and cmov x86 assembly are also reachable; exact native cfg/codegen verification remains pending."
+compile_verified = false
+
+[[target_projection]]
+candidate = "envelope"
+targets = ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+static_delta = "chacha20 AArch64/NEON and cmov AArch64 assembly are statically reachable. cpufeatures and libc are not reachable because both parent cpufeatures edges are x86-only; exact native cfg/codegen and constant-time verification remains pending."
+compile_verified = false
+
+[[target_projection]]
+candidate = "envelope"
+targets = ["x86_64-pc-windows-msvc"]
+static_delta = "cpufeatures, chacha20 AVX2/SSE2 and ordinary-runtime AVX512 dispatch (when chacha20_avx512 is set) form the static target surface; forced AVX512 additionally requires chacha20_backend=avx512 plus avx512f and avx512vl. Poly1305 AVX2/autodetect and cmov x86 assembly are also reachable. libc is lock-only and unreachable because cpufeatures has no x86/Windows libc edge; exact native cfg/codegen and symbol inventory remains pending."
+compile_verified = false
+
+[[target_projection]]
+candidate = "capability-fs"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+static_delta = "rustix, rustix-linux-procfs, libc, linux-raw-sys, and target-rustc feature probes are reachable."
+compile_verified = false
+
+[[target_projection]]
+candidate = "capability-fs"
+targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"]
+static_delta = "rustix/libc and target-rustc feature probes are reachable; rustix-linux-procfs is Linux-only."
+compile_verified = false
+
+[[target_projection]]
+candidate = "capability-fs"
+targets = ["x86_64-pc-windows-msvc"]
+static_delta = "windows-sys/winx plus windows_by_handle/windows_file_type_ext feature probes are reachable; ReFS identity and reparse behavior remain unqualified."
+compile_verified = false
+
+[[target_projection]]
+candidate = "redis"
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+static_delta = "socket2/libc and the unconditional TCP plus ambient Unix connector surfaces are reachable."
+compile_verified = false
+
+[[target_projection]]
+candidate = "redis"
+targets = ["x86_64-pc-windows-msvc"]
+static_delta = "socket2/windows-sys and unconditional TCP surface are reachable; Unix variant is unavailable. TASKR-01 Redis support remains unavailable on Windows."
+compile_verified = false
+
+[[build_script]]
+candidate = "envelope"
+package = "libc 0.2.189"
+sha256 = "e47f4a6762799b6e69cefc7acdb3291df828010e4de20609f7378f9c94ea29e6"
+target_reachable = false
+classification = "lock-only/non-executing for the envelope on every supported target: chacha20/poly1305 select cpufeatures only on x86/x86_64, while cpufeatures selects libc only on aarch64 Android/Linux/Apple or loongarch64 Linux. No supported target satisfies both edges; .1.1 must confirm this static result in canonical target graphs, and .1.15 independently attests the receipt."
+
+[[build_script]]
+candidate = "capability-fs"
+package = "cap-std 4.0.2"
+sha256 = "52095c9665cb3fa8b875401d163d635b2ae92ebdea5145716f328ae26d93d27f"
+classification = "spawns RUSTC or RUSTC_WRAPPER for target metadata probes; honors CARGO_ENCODED_RUSTFLAGS; unwrap/expect paths present"
+
+[[build_script]]
+candidate = "capability-fs"
+package = "cap-fs-ext 4.0.2"
+sha256 = "834c55ea7545af06ad1c4952a894e69a8302dc6ca118bace2ce1ddc30be0fb89"
+classification = "spawns target rustc to probe windows_by_handle; emitted cfg is toolchain/target dependent"
+
+[[build_script]]
+candidate = "capability-fs"
+package = "cap-primitives 4.0.2"
+sha256 = "365ae39a954e11990678471bb55b08df48651ba1ff46cc85bc6ea7411824fab9"
+classification = "spawns target rustc for five library-feature probes; emitted cfg is toolchain/target dependent"
+
+[[build_script]]
+candidate = "capability-fs"
+package = "remaining target closure"
+sha256 = ""
+classification = "io-extras, io-lifetimes 2/3, libc, rustix, and target-selected windows leaf crates declare build.rs; exact per-target execution/output inventory is .1.1 RCH work, with .1.15 independent receipt attestation"
+
+[[build_script]]
+candidate = "redis"
+package = "selected closure"
+sha256 = ""
+classification = "icu data crates, libc, proc-macro2, and quote declare build.rs; exact per-target execution/output inventory is .1.1 RCH work, with .1.15 independent receipt attestation"
+
+[[source_finding]]
+id = "XC20P-BOUND"
+candidate = "envelope"
+path = "chacha20poly1305-0.11.0/src/cipher.rs"
+line_range = "13-18,58-60,81-83,100-108"
+sha256 = "96c6c14e10f0c81b78b743a2f8f74db2c9325e78119f7ff81a467af2f65958ad"
+finding = "64-byte blocks and u32::MAX block ceiling are enforced; length fields convert to u64. Dependency structural ceiling is not the FastMCP application limit."
+owner = "FND-08"
+
+[[source_finding]]
+id = "XC20P-CONSTANT-TIME"
+candidate = "envelope"
+path = "chacha20poly1305-0.11.0/README.md"
+line_range = "35-45"
+sha256 = "3ef6cfd941096d8ce8dda11058eb59cb0252fa08ebc4dfbc7adb44e33c5f60ea"
+finding = "Upstream cites one NCC audit but makes constant-time behavior conditional on processor multiplication. Audit bytes/scope and exact release-target CPU assumptions are not yet verified."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-UNSAFE-TCB"
+candidate = "envelope"
+path = "chacha20-0.10.1/src/backends.rs"
+line_range = "5-31"
+sha256 = "a5b51ab7b20fdb7d99c29b231bfbc8fc643f1002ad2155f4e6757be9cc990105"
+finding = "The dispatcher selects soft, AVX2, SSE2, NEON, and AVX512 implementations. On ordinary x86 runtime dispatch, chacha20_avx512 alone enables cpufeatures detection and reaches AVX512; only forced chacha20_backend=avx512 additionally requires compile-time avx512f and avx512vl. This source_finding is one component of the complete 26-path XC20P union; the separate TCB table is not alone complete."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14"
+
+[[source_finding]]
+id = "XC20P-POLY1305-X86-SELECTOR"
+candidate = "envelope"
+path = "poly1305-0.9.1/src/backend.rs"
+line_range = "3-13"
+sha256 = "c884e8e31eec2507cc5f4fdea998d78ccc57895437d280ba5b305ed011c8cbc4"
+finding = "On x86/x86_64, absent the non-default poly1305_backend=soft cfg, Poly1305 selects both its AVX2 implementation and runtime autodetection module."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-POLY1305-AUTODETECT-UNSAFE"
+candidate = "envelope"
+path = "poly1305-0.9.1/src/backend/autodetect.rs"
+line_range = "9,16-19,21-84"
+sha256 = "d252020485c0c55ba5867df7d178289bdc7c9873630efbae27b15824df0b6dd9"
+finding = "Poly1305's x86 runtime selector stores AVX2 and soft states in a union and uses unsafe union-field access after cpufeatures AVX2 detection."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-POLY1305-AVX2-UNSAFE"
+candidate = "envelope"
+path = "poly1305-0.9.1/src/backend/avx2.rs"
+line_range = "17,52-56,73-83,103-122,186-192"
+sha256 = "f42c9d044adae2dd11456fcc1fb4d77858d03257d83922286ab0c192ebe01f76"
+finding = "The x86 Poly1305 AVX2 state machine contains target_feature-gated unsafe entry points and calls into its intrinsic helper implementation."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-POLY1305-AVX2-HELPERS"
+candidate = "envelope"
+path = "poly1305-0.9.1/src/backend/avx2/helpers.rs"
+line_range = "2,53-54,82,104-133,203-1988"
+sha256 = "e9d45c886b0eacc04ffa2eb84cdf9cf7a07d69a4e266f6550751c4f9bc27445a"
+finding = "Poly1305's AVX2 helper implementation contains the target-feature intrinsic and unsafe arithmetic/load/store boundary exercised by the AVX2 state machine."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-TAG-VERIFY-UNIVERSAL-HASH"
+candidate = "envelope"
+path = "universal-hash-0.6.1/src/lib.rs"
+line_range = "21,127-142"
+sha256 = "cad44f5f1d638794920c22884981eacf259bda876231491042acf42d1bc0d60f"
+finding = "Poly1305 tag verification calls ctutils::CtEq over the finalized tag; the selected constant-time comparison path therefore includes ctutils and cmov."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-TAG-VERIFY-CTUTILS"
+candidate = "envelope"
+path = "ctutils-0.4.2/src/traits/ct_eq.rs"
+line_range = "42-109,153-160"
+sha256 = "dfd4ea492d3f34909fe3028e12055c432ba2ba8e2f5377bc6fdf87a378f32238"
+finding = "ctutils implements tag-array/slice equality through cmov::CmovEq rather than a pure safe-Rust comparison."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-CMOV-BACKEND-SELECTOR"
+candidate = "envelope"
+path = "cmov-0.5.4/src/backends.rs"
+line_range = "1-17"
+sha256 = "bdd03fdd6bff16ee428200bf7eae586e220a88bf58eff5b27b57f396379e12d3"
+finding = "cmov selects architecture-specific predication backends on x86/x86_64 and AArch64, with a portable best-effort fallback only on other targets or under Miri."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-CMOV-X86-UNSAFE-ASM"
+candidate = "envelope"
+path = "cmov-0.5.4/src/backends/x86.rs"
+line_range = "10-45,48-220"
+sha256 = "db21dfca86f27d4c333e521ead6309fde8f27d2e4319047cbc8a3e9be8975ead"
+finding = "The selected x86/x86_64 cmov backend implements conditional moves and equality with unsafe inline assembly; it is part of authentication-tag verification on x86 supported targets."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "XC20P-CMOV-AARCH64-UNSAFE-ASM"
+candidate = "envelope"
+path = "cmov-0.5.4/src/backends/aarch64.rs"
+line_range = "1-43,45-181"
+sha256 = "85bb0412d6d387b9ff7112a9969a3e4432fd517db4b263e9a5ad8b43fb32d0e7"
+finding = "The selected AArch64 cmov backend implements conditional selection and equality with unsafe inline assembly; it is part of authentication-tag verification on AArch64 supported targets."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-08"
+
+[[source_finding]]
+id = "CAP-FINAL-COMPONENT-ONLY"
+candidate = "capability-fs"
+path = "cap-primitives-4.0.2/src/fs/follow_symlinks.rs"
+line_range = "1-16"
+sha256 = "6653891a49b44a34bff1a14277aba4ef7c87ff2e217ad54693bfe7fa1c316a0c"
+finding = "FollowSymlinks::No applies only to the final component; intermediate symlinks are always followed by a multicomponent open."
+owner = "FND-07"
+
+[xc20p_tcb_gate]
+content_addressed_path_inventory_complete = true
+cfg_reachability_classified = true
+unsafe_constant_time_classification_complete = true
+universal_hash_reviewed_clean = true
+native_target_execution_receipt = false
+constant_time_target_attestation = false
+avx512_cfg_reachability = "ordinary x86 runtime route is reachable with chacha20_avx512 alone through cpufeatures dispatch; forced-backend route requires chacha20_backend=avx512 plus target_feature=avx512f and target_feature=avx512vl"
+source_finding_path_count = 12
+tcb_table_path_count = 14
+inventory_unique_path_count = 26
+inventory_union_contract = "Complete XC20P inventory is the exact set union of the 12 distinct paths in XC20P source_finding rows (IDs beginning XC20P-) and the 14 distinct paths in xc20p_tcb_path rows; the sets are disjoint, with no duplicate IDs or paths."
+classification_rule = "source_finding rows carry candidate, finding, line_range, and full SHA-256 classification; xc20p_tcb_path rows carry explicit cfg_reachability, unsafe_constant_time, and full SHA-256 classification. Non-executable README/limit evidence is descriptive evidence, not a cfg claim. False execution/attestation gates remain downstream RCH work."
+
+[xc20p_tcb_assertion]
+method = "read-only exact-set assertion over parsed TOML and cached source bytes"
+source_finding_ids = ["XC20P-BOUND", "XC20P-CONSTANT-TIME", "XC20P-UNSAFE-TCB", "XC20P-POLY1305-X86-SELECTOR", "XC20P-POLY1305-AUTODETECT-UNSAFE", "XC20P-POLY1305-AVX2-UNSAFE", "XC20P-POLY1305-AVX2-HELPERS", "XC20P-TAG-VERIFY-UNIVERSAL-HASH", "XC20P-TAG-VERIFY-CTUTILS", "XC20P-CMOV-BACKEND-SELECTOR", "XC20P-CMOV-X86-UNSAFE-ASM", "XC20P-CMOV-AARCH64-UNSAFE-ASM"]
+source_finding_paths = ["chacha20poly1305-0.11.0/src/cipher.rs", "chacha20poly1305-0.11.0/README.md", "chacha20-0.10.1/src/backends.rs", "poly1305-0.9.1/src/backend.rs", "poly1305-0.9.1/src/backend/autodetect.rs", "poly1305-0.9.1/src/backend/avx2.rs", "poly1305-0.9.1/src/backend/avx2/helpers.rs", "universal-hash-0.6.1/src/lib.rs", "ctutils-0.4.2/src/traits/ct_eq.rs", "cmov-0.5.4/src/backends.rs", "cmov-0.5.4/src/backends/x86.rs", "cmov-0.5.4/src/backends/aarch64.rs"]
+tcb_table_ids = ["XC20P-TCB-CHACHA-LIB", "XC20P-TCB-CHACHA-XCHACHA", "XC20P-TCB-CHACHA-VARIANTS", "XC20P-TCB-CHACHA-AVX512", "XC20P-TCB-CHACHA-CORE", "XC20P-TCB-CHACHA-AVX2", "XC20P-TCB-CHACHA-SSE2", "XC20P-TCB-CHACHA-NEON", "XC20P-TCB-CHACHA-SOFT", "XC20P-TCB-POLY1305-LIB", "XC20P-TCB-POLY1305-SOFT", "XC20P-TCB-CTUTILS-CHOICE", "XC20P-TCB-CMOV-LIB", "XC20P-TCB-CMOV-SLICE"]
+tcb_table_paths = ["chacha20-0.10.1/src/lib.rs", "chacha20-0.10.1/src/xchacha.rs", "chacha20-0.10.1/src/variants.rs", "chacha20-0.10.1/src/backends/avx512.rs", "chacha20-0.10.1/src/chacha.rs", "chacha20-0.10.1/src/backends/avx2.rs", "chacha20-0.10.1/src/backends/sse2.rs", "chacha20-0.10.1/src/backends/neon.rs", "chacha20-0.10.1/src/backends/soft.rs", "poly1305-0.9.1/src/lib.rs", "poly1305-0.9.1/src/backend/soft.rs", "ctutils-0.4.2/src/choice.rs", "cmov-0.5.4/src/lib.rs", "cmov-0.5.4/src/slice.rs"]
+source_finding_ids_exact = true
+tcb_table_ids_exact = true
+source_finding_paths_unique = true
+tcb_table_paths_unique = true
+component_path_overlap_count = 0
+inventory_hash_count = 26
+source_finding_hashes_complete = true
+tcb_table_hashes_complete = true
+all_inventory_hashes_present = true
+all_required_classification_fields_present = true
+assertion_passed = true
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-LIB"
+path = "chacha20-0.10.1/src/lib.rs"
+sha256 = "b539477230a58abfa2e2ab8dd62c017ffc84f3a7680971c5496973185c543c20"
+cfg_reachability = "cipher/rng feature; ordinary x86/x86_64 runtime selector reaches avx512 when chacha20_avx512 is set, while forced backend requires chacha20_backend=avx512 plus avx512f and avx512vl; otherwise avx2/sse2/runtime dispatch; aarch64+neon reaches neon; soft backend is explicit fallback"
+unsafe_constant_time = "unsafe backend calls and target-feature dispatch; constant-time claim requires downstream native-target execution/attestation"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-XCHACHA"
+path = "chacha20-0.10.1/src/xchacha.rs"
+sha256 = "86de92973ea8701003c97994fb95fe33099dc0fe0938c27d10f20e95d4b94000"
+cfg_reachability = "xchacha module is feature-gated by xchacha; zeroize methods additionally require zeroize"
+unsafe_constant_time = "safe wrapper/state setup; delegates to ChaCha core, so backend TCB remains applicable"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-VARIANTS"
+path = "chacha20-0.10.1/src/variants.rs"
+sha256 = "79bb423dd0ef0ac690334915baea48db17f055797175c22b1bcbed0714dd9f88"
+cfg_reachability = "cipher feature exposes variant implementation; legacy/rng variants are separately feature-gated"
+unsafe_constant_time = "safe variant/state indexing; delegates block work to selected backend"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-AVX512"
+path = "chacha20-0.10.1/src/backends/avx512.rs"
+sha256 = "b4e945d887f0fb11e2dc6a757f7dc01e7553d486ae8d381964defaf8857d9ab6"
+cfg_reachability = "ordinary x86 runtime route when chacha20_avx512 is set; forced route additionally requires chacha20_backend=avx512 with target_feature avx512f and avx512vl"
+unsafe_constant_time = "unsafe AVX512 target-feature entry points and SIMD intrinsics; constant-time arithmetic requires native target receipt"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-CORE"
+path = "chacha20-0.10.1/src/chacha.rs"
+sha256 = "323b76530ad49db28cb1764dbee7843908af21ae85918e4ade04abad8a4614bb"
+cfg_reachability = "gated only by feature cipher; this 38-line file contains type aliases and KeyIvInit setup, with no backend call and no unsafe boundary"
+unsafe_constant_time = "types/aliases and KeyIvInit setup only; no unsafe code or backend boundary in this file"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-AVX2"
+path = "chacha20-0.10.1/src/backends/avx2.rs"
+sha256 = "c44c34d86ab9d896ac8b863e611f496cda31b5d731b1c860f70c0772426da918"
+cfg_reachability = "x86/x86_64 forced chacha20_backend=avx2 with target_feature avx2, or ordinary runtime selector fallback after cpufeatures"
+unsafe_constant_time = "unsafe SIMD entry points, intrinsics, transmute/load-store helpers; constant-time arithmetic requires target receipt"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-SSE2"
+path = "chacha20-0.10.1/src/backends/sse2.rs"
+sha256 = "04c4ff27778e6123a0669b8975376c7aed705b783a17525db9552962896eae39"
+cfg_reachability = "x86/x86_64 forced chacha20_backend=sse2 with target_feature sse2, or ordinary runtime selector fallback on x86"
+unsafe_constant_time = "unsafe SIMD entry points/intrinsics and target-feature helpers; constant-time arithmetic requires target receipt"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-NEON"
+path = "chacha20-0.10.1/src/backends/neon.rs"
+sha256 = "5d29e3c2da18ea649f6e19fc339bb6253611db18cafcba4993155b70d096f102"
+cfg_reachability = "aarch64 plus target_feature neon; cipher/rng entry points are separately feature-gated"
+unsafe_constant_time = "unsafe NEON entry points/intrinsics; constant-time arithmetic requires AArch64 target receipt"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CHACHA-SOFT"
+path = "chacha20-0.10.1/src/backends/soft.rs"
+sha256 = "120bcf4bc535c3fbcc3b4e2bdc0f021e44fae553bf5bb3a532271b2a08dc2149"
+cfg_reachability = "explicit chacha20_backend=soft; ordinary x86 runtime fallback when AVX2/SSE2 tests fail; AArch64 fallback when NEON is unavailable; other architectures also use soft"
+unsafe_constant_time = "safe portable arithmetic; no unsafe blocks observed in this file, but target-level constant-time receipt remains pending"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-POLY1305-LIB"
+path = "poly1305-0.9.1/src/lib.rs"
+sha256 = "aab11339114db50e77acd82dc5c154ae1dae60089bba72d49e9f08d9b10a60dc"
+cfg_reachability = "x86/x86_64 AVX2 cfg and autodetect; poly1305_backend=soft bypasses AVX2 selector"
+unsafe_constant_time = "zeroize drop unsafe block is cfg(feature=zeroize) and unreachable in this projection because poly1305/zeroize is not enabled; chacha20poly1305/zeroize enables only its own zeroize dependency plus chacha20/zeroize. Backend selection and tag verification feed the constant-time path"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-POLY1305-SOFT"
+path = "poly1305-0.9.1/src/backend/soft.rs"
+sha256 = "526aeb114b6eb575452dbd5def4674f59524444f5d7024e850e02afb34834ba0"
+cfg_reachability = "selected by poly1305_backend=soft and as autodetect fallback"
+unsafe_constant_time = "portable limb arithmetic and tag accumulation; no unsafe blocks observed in this file"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CTUTILS-CHOICE"
+path = "ctutils-0.4.2/src/choice.rs"
+sha256 = "cb0cdfa8c7154c0a646945abf7784475f48291f378fd12a8227e2cc05a3cff88"
+cfg_reachability = "always compiled; optional subtle integration is feature-gated"
+unsafe_constant_time = "Choice is a u8 mask with bitwise operators; Choice->bool conversion is an explicit barrier and must not steer secret-dependent computation"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CMOV-LIB"
+path = "cmov-0.5.4/src/lib.rs"
+sha256 = "7a4205a03b64b6d1f162fe9a9a5c56d542e67819ad5ececda815566af435564c"
+cfg_reachability = "architecture backends selected by target cfg; portable fallback under unsupported targets/Miri"
+unsafe_constant_time = "unsafe nonzero construction and primitive casts; conditional-move API is intended constant-time but ARM32 advisory remains audit-pending"
+
+[[xc20p_tcb_path]]
+id = "XC20P-TCB-CMOV-SLICE"
+path = "cmov-0.5.4/src/slice.rs"
+sha256 = "9321be8948d1995b0f536e5316e454cc2c7d555a8dc2113b4e2765407de9d2b3"
+cfg_reachability = "included by cmov lib on all supported targets"
+unsafe_constant_time = "unsafe slice casts/reinterpretation implement element-wise conditional moves; caller must uphold slice layout/type invariants"
+
+[[source_finding]]
+id = "CAP-UNIX-CONNECT-TODO"
+candidate = "capability-fs"
+path = "cap-std-4.0.2/src/fs/dir.rs"
+line_range = "553-570"
+sha256 = "27eed147c16f744140773a26b2645b65eeb16645e3c4fc5429c8217f9079c0f5"
+finding = "Dir::connect_unix_stream is explicitly unimplemented and panics through todo!(). It cannot implement TASKR-01's capability-relative connector."
+owner = "TASKR-01"
+
+[[source_finding]]
+id = "CAP-WINDOWS-IDENTITY"
+candidate = "capability-fs"
+path = "cap-fs-ext-4.0.2/src/metadata_ext.rs"
+line_range = "14-22,51-110"
+sha256 = "353afa0221129885799769a31f3db05351d91c0df299b3a7d1d17ffe2606c040"
+finding = "ReFS file IDs are 128-bit while ino() returns u64; Windows metadata accessors contain expect paths requiring metadata from an opened File."
+owner = "FND-07"
+
+[[source_finding]]
+id = "CAP-UNSAFE-FFI-TCB"
+candidate = "capability-fs"
+path = "cap-std/cap-primitives/rustix/io-lifetimes/windows-sys selected closure"
+line_range = "closure-wide"
+sha256 = ""
+finding = "cap-fs-ext forbids unsafe code, but cap-std raw descriptor/handle implementations and its transitive OS bindings form an unsafe/FFI TCB. Full cfg-reachable inventory is pending."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and FND-07"
+
+[[source_finding]]
+id = "REDIS-PUBLIC-TRANSPORTS"
+candidate = "redis"
+path = "redis-1.4.1/src/connection.rs"
+line_range = "109-140,242-306,865-909,1028-1047"
+sha256 = "8ea3b478ee7358e6e8c4842b80eac22456df2d7ca544a2191545e71a9be5cba4"
+finding = "TCP/TLS/Unix address variants, cloneable ArcStr credentials, DNS/TCP connection logic, and ambient UnixStream::connect remain compiled independently of prohibited optional features."
+owner = "TASKR-01"
+
+[[source_finding]]
+id = "REDIS-UNBOUNDED-PARSER"
+candidate = "redis"
+path = "redis-1.4.1/src/parser.rs"
+line_range = "30,83-162,181-231"
+sha256 = "d7f6c55036d281219b9fd19629ed7cb58b946140fb6615ac6542691e190e9532"
+finding = "Only recursion is capped at 100; line length, declared bulk length, array/map/set counts, aggregate bytes, and allocations remain unbounded."
+owner = "TASKR-01"
+
+[[source_finding]]
+id = "REDIS-SCRIPT"
+candidate = "redis"
+path = "redis-1.4.1/src/script.rs"
+line_range = "1-50"
+sha256 = "831237be36a79c86dcf1a7a5700d58c850eb000c00851b2acb50fff51f736bb4"
+finding = "script activates sha1_smol and computes the SHA-1 locally; no async runtime edge is required."
+owner = "TASKR-01"
+
+[[source_finding]]
+id = "REDIS-PANIC-UNSAFE"
+candidate = "redis"
+path = "redis-1.4.1/src"
+line_range = "parser.rs:34,197; pipeline.rs:354; connection.rs:961; cmd.rs/types.rs bytes-feature blocks"
+sha256 = ""
+finding = "Selected synchronous parser/pipeline source contains unwrap/panic sites requiring reachability analysis. Direct unsafe BufMut implementations are behind redis's disabled optional bytes feature, while socket2/libc remain unsafe/FFI TCB."
+owner = "bd-mcp-2026-07-28-support-ahet.1.14 and TASKR-01"
+
+[bounds.envelope]
+key_bytes = 32
+nonce_bytes = 24
+tag_bytes = 16
+block_bytes = 64
+maximum_blocks_rejection_threshold = 4294967295
+largest_dependency_buffer_accepted_bytes = 274877906879
+application_limit = "not supplied by this artifact; FND-08/LIMITS must impose a much smaller bound before allocation or crypto"
+associated_data_limit = "u64 conversion only at dependency layer; FND-08 bound pending"
+audit_report_verified = false
+constant_time_targets_verified = false
+
+[bounds.capability_fs]
+path_component_bound = "not supplied by these dependencies; FND-07 must admit and bound one normal relative component at a time"
+symlink_scope = "no-follow only controls final component"
+blocking_boundary = "all filesystem operations are synchronous and must run only through FND-04's guaranteed non-inline bounded blocking facility"
+windows_identity = "u64 projection is insufficient to claim ReFS identity correctness"
+
+[bounds.redis]
+recursion_depth_constant = 100
+line_bytes_bound = "absent"
+bulk_bytes_bound = "absent"
+collection_count_bound = "absent"
+aggregate_frame_bytes_bound = "absent"
+scratch_bytes_bound = "absent"
+resolver_address_count_bound = "absent"
+connect_setup_retry_bound = "absent"
+blocking_boundary = "synchronous crate; unmodified connector/parser cannot cross the TASKR-01 support gate"
+
+[[negative_evidence]]
+id = "NEG-ENVELOPE-RNG"
+method = "isolated lock projection"
+result = "getrandom, rand, and rand_core are absent; the probe accepts caller-provided bytes and selects neither RNG feature"
+mutation_test_status = "pending bd-.1.14"
+
+[[negative_evidence]]
+id = "NEG-ENVELOPE-ALGORITHMS"
+method = "direct manifest plus selected lock"
+result = "arrayvec, bytes, getrandom, rand_core, and reduced-round are not selected"
+mutation_test_status = "pending bd-.1.14"
+
+[[negative_evidence]]
+id = "NEG-CAP-OPTIONALS"
+method = "isolated lock projection"
+result = "arf-strings and camino are absent; no async runtime package is present"
+mutation_test_status = "pending bd-.1.14"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURES"
+method = "isolated lock projection"
+result = "TLS, cluster, aio, Tokio, smol, connection-manager, Sentinel, pool, rand, and num-bigint packages are absent"
+mutation_test_status = "pending bd-.1.14"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-AHASH"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/ahash to the otherwise exact acl,script feature request"
+result = "ahash is an implicit optional-dependency feature and is prohibited even though its package is absent from the selected lock"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-BIGDECIMAL"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/bigdecimal to the otherwise exact acl,script feature request"
+result = "bigdecimal is an implicit optional-dependency feature and is prohibited"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-BLOOM"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/bloom to the otherwise exact acl,script feature request"
+result = "bloom is an explicit empty feature and remains prohibited even if enabling it produces no package delta"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-BYTES"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/bytes to the otherwise exact acl,script feature request"
+result = "redis's implicit optional bytes feature is prohibited even though combine/std already selects the bytes package transitively"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal feature graph must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-HASHBROWN"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/hashbrown to the otherwise exact acl,script feature request"
+result = "hashbrown is an implicit optional-dependency feature and is prohibited"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-RUST_DECIMAL"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/rust_decimal to the otherwise exact acl,script feature request"
+result = "rust_decimal is an implicit optional-dependency feature and is prohibited"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-UUID"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/uuid to the otherwise exact acl,script feature request"
+result = "uuid is an implicit optional-dependency feature and is prohibited"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; the literal allowed-feature gate must reject this mutation uniquely"
+
+# One independent mutation is required for each remaining denied feature in the
+# 33-item universe. The seven rows above (ahash,bigdecimal,bloom,bytes,hashbrown,
+# rust_decimal,uuid) are retained; `tls` is not a redis feature and is therefore
+# intentionally not fabricated as an extra non-universe entry.
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-DEFAULT"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/default to the otherwise exact acl,script feature request"
+result = "default is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-AIO"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/aio to the otherwise exact acl,script feature request"
+result = "aio is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-BB8"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/bb8 to the otherwise exact acl,script feature request"
+result = "bb8 is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-CACHE-AIO"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/cache-aio to the otherwise exact acl,script feature request"
+result = "cache-aio is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-CLUSTER"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/cluster to the otherwise exact acl,script feature request"
+result = "cluster is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-CLUSTER-ASYNC"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/cluster-async to the otherwise exact acl,script feature request"
+result = "cluster-async is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-CONNECTION-MANAGER"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/connection-manager to the otherwise exact acl,script feature request"
+result = "connection-manager is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-ENTRA-ID"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/entra-id to the otherwise exact acl,script feature request"
+result = "entra-id is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-GEOSPATIAL"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/geospatial to the otherwise exact acl,script feature request"
+result = "geospatial is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-JSON"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/json to the otherwise exact acl,script feature request"
+result = "json is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-NUM-BIGINT"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/num-bigint to the otherwise exact acl,script feature request"
+result = "num-bigint is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-R2D2"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/r2d2 to the otherwise exact acl,script feature request"
+result = "r2d2 is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-SENTINEL"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/sentinel to the otherwise exact acl,script feature request"
+result = "sentinel is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-SMOL-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/smol-comp to the otherwise exact acl,script feature request"
+result = "smol-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-SMOL-NATIVE-TLS-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/smol-native-tls-comp to the otherwise exact acl,script feature request"
+result = "smol-native-tls-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-SMOL-RUSTLS-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/smol-rustls-comp to the otherwise exact acl,script feature request"
+result = "smol-rustls-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-STREAMS"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/streams to the otherwise exact acl,script feature request"
+result = "streams is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TLS-NATIVE-TLS"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tls-native-tls to the otherwise exact acl,script feature request"
+result = "tls-native-tls is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TLS-RUSTLS"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tls-rustls to the otherwise exact acl,script feature request"
+result = "tls-rustls is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TLS-RUSTLS-INSECURE"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tls-rustls-insecure to the otherwise exact acl,script feature request"
+result = "tls-rustls-insecure is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TLS-RUSTLS-WEBPKI-ROOTS"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tls-rustls-webpki-roots to the otherwise exact acl,script feature request"
+result = "tls-rustls-webpki-roots is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TOKEN-BASED-AUTHENTICATION"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/token-based-authentication to the otherwise exact acl,script feature request"
+result = "token-based-authentication is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TOKIO-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tokio-comp to the otherwise exact acl,script feature request"
+result = "tokio-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TOKIO-NATIVE-TLS-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tokio-native-tls-comp to the otherwise exact acl,script feature request"
+result = "tokio-native-tls-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-TOKIO-RUSTLS-COMP"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/tokio-rustls-comp to the otherwise exact acl,script feature request"
+result = "tokio-rustls-comp is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-FEATURE-VECTOR-SETS"
+method = "direct-manifest single-feature mutation"
+mutation = "add redis/vector-sets to the otherwise exact acl,script feature request"
+result = "vector-sets is denied; mutation must fail before resolution"
+mutation_test_status = "pending bd-mcp-2026-07-28-support-ahet.1.14; unique mutation required"
+
+[[negative_evidence]]
+id = "NEG-REDIS-SMOL-NAME"
+method = "exact package identity"
+result = "sha1_smol is present and allowed; package smol is absent"
+mutation_test_status = "pending bd-.1.14"
+
+[[negative_evidence]]
+id = "NEG-REDIS-SUPPORT"
+method = "static source evidence"
+result = "feature minimization does not remove TCP/DNS/ambient Unix APIs or introduce parser/connector/peer-identity bounds; persistence support remains false"
+mutation_test_status = "known fail-closed fact, not a future positive expectation"
+
+[current_workspace_gap]
+observed_at_utc = "2026-08-03T06:12:00Z"
+root_manifest_sha256 = "972dfd2adc52a2fb93dda2c86c2f72a8f0a3cae75e226542edbf833f33210189"
+workspace_lock_sha256 = "5dec0d659736b87c4cb93af2c0c6d9960624c10e1d062ebab469ae546a1f3ab3"
+core_manifest_sha256 = "24f0d3cd57de87a57f87637ee9fae24f5f61dace7eeae2562809243e2a5cc22c"
+server_manifest_sha256 = "d5991bc8532e0524dd714d4882870936016cb23e55a938390667a876dc00559d"
+chacha20poly1305 = "workspace lock contains 0.10.1 through asupersync; direct 0.11.0 envelope edge is absent. Coexistence must be preserved/scoped unless the asupersync owner changes it."
+capability_fs = "root and server manifests now carry the exact cap-std/cap-fs-ext 4.0.2 selections. This observation is not a candidate graph regeneration, target receipt, or filesystem-support claim."
+redis = "no root or server redis declaration was observed, while the shared workspace lock still contains unrelated num-bigint 0.4.8. Neither fact proves or enables a Redis profile."
+shared_files_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+
+[gate]
+direct_archive_checksums_verified = true
+direct_index_records_verified = true
+direct_license_files_verified = true
+direct_vcs_info_verified = true
+upstream_tags_verified = false
+isolated_lock_toml_parsed = true
+isolated_lock_archives_present = true
+isolated_lock_archive_checksums_verified = true
+cargo_lock_regeneration_verified = false
+canonical_normal_build_graphs_captured = false
+canonical_feature_graphs_captured = false
+canonical_dev_graphs_captured = false
+target_compilation_verified = false
+full_transitive_license_files_verified = false
+full_cfg_reachable_unsafe_ffi_panic_inventory_verified = false
+advisory_locks_audited = false
+constant_time_targets_verified = false
+xc20p_application_bounds_verified = false
+capability_filesystem_semantics_supported = false
+bounded_redis_connector = false
+bounded_redis_parser = false
+redis_peer_identity_proven = false
+redis_profile_supported = false
+workspace_manifests_integrated = false
+workspace_lock_integrated = false
+rch_compile_verified = false
+claim = "Direct immutable provenance and offline isolated lock/archive projections are frozen. All execution, target, semantic-support, bounded-Redis, and workspace integration gates remain fail-closed."
+
+[reproduction]
+network_policy = "offline only for verification of these checked-in probes"
+lock_parse = "yq -p toml -o json '.' evidence/fnd-01/probes/<candidate>/Cargo.lock"
+archive_projection = "For every package with source=registry in each lock, require the local <name>-<version>.crate SHA-256 to equal the lock checksum."
+cargo_regeneration = "bd-mcp-2026-07-28-support-ahet.1.1 alone performs manifest/lock regeneration through the authorized RCH/offline coordinator and records regenerated bytes and hashes; .1.13 supplies only source-level hard-gate tests and no regeneration."
+target_graph = "bd-mcp-2026-07-28-support-ahet.1.1 alone captures canonical normal/build/features/dev output, target/package/symbol inventories, and hashes through RCH; .1.15 independently rehashes, validates, and attests those receipts."
+advisory_check = "bd-mcp-2026-07-28-support-ahet.1.1 alone executes pinned no-fetch advisory/license checks through RCH and preserves full JSON bytes/hash; .1.13 supplies the local hard-gate test source and .1.15 independently attests the receipts."
+negative_mutations = "The rematerialized .1.13 test changes exactly one direct Redis feature (tokio-comp) and rejects it at a typed boundary. Earlier NEG-REDIS-FEATURE-* rows remain enumerated risk, not test receipts; grouped or package-only checks cannot substitute for any future per-feature gate."
+
+[handoff]
+verification_owner = "bd-mcp-2026-07-28-support-ahet.1.13 (source-level hard-gate tests only; execution remains serialized)"
+verification_pending = [
+  "run the exact rematerialized positive and planted-negative test IDs only through the serialized verification owner and preserve the receipt",
+  "rehash the four archive bytes when the recorded cache inputs are available again",
+  "leave manifest/lock regeneration, canonical graphs, advisory/license/symbol/target/package inventories, and all RCH execution to .1.1",
+  "leave independent receipt rehash/validation/attestation to .1.15",
+]
+integration_owner = "bd-mcp-2026-07-28-support-ahet.1.1"
+integration_pending = [
+  "alone perform manifest/lock regeneration and canonical normal/build/dev/feature graphs",
+  "alone execute advisory, license, symbol, target, package, isolated-consumer, and packaged-consumer RCH checks and preserve receipts",
+  "apply exact = requirements/default-features/allowed features only in shared manifests",
+  "preserve and scope the existing transitive chacha20poly1305 0.10.1 edge",
+  "converge the shared Cargo.lock and profile feature topology",
+  "keep Redis optional and unsupported until TASKR-01 separately passes",
+]
+receipt_attestation_owner = "bd-mcp-2026-07-28-support-ahet.1.15"
+receipt_attestation_pending = [
+  "independently rehash, validate, and attest .1.1's manifest/lock/graph/advisory/license/symbol/target/package/RCH receipts",
+]
+filesystem_owner = "FND-07"
+filesystem_pending = "iterative handle-relative traversal, symlink/race/reparse/UNC/ADS/case/identity behavior, secure atomic replacement, and native target qualification"
+envelope_owner = "FND-08"
+envelope_pending = "FMCPBOX/FMCPENV format, framework-owned entropy/key/nonce/epoch state, strict application bounds, zeroization, restore behavior, and constant-time target qualification"
+redis_owner = "TASKR-01"
+redis_pending = "exact published bounded connector/parser alternative, local Unix peer proof, non-cloneable credential handling, ACL/script restrictions, durability, operational bounds, and platform availability"
+closure_boundary = "This evidence child is not complete until independent fresh-eyes review. Its eventual closure cannot make any workspace, filesystem, envelope, Tasks, Redis, or aggregate FND-01 support gate pass."

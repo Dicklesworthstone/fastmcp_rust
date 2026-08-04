@@ -69,8 +69,14 @@ pub fn is_agent_context() -> bool {
 pub fn should_enable_rich() -> bool {
     use std::io::IsTerminal;
 
-    // Explicit enable always wins
-    if std::env::var("FASTMCP_RICH").is_ok() {
+    // Explicit plain mode and the standard NO_COLOR contract take precedence
+    // over color-enabling knobs. This matches ConsoleConfig::resolve_context.
+    if std::env::var("FASTMCP_PLAIN").is_ok() || std::env::var("NO_COLOR").is_ok() {
+        return false;
+    }
+
+    // Support both the legacy rich flag and ConsoleConfig's documented flag.
+    if std::env::var("FASTMCP_RICH").is_ok() || std::env::var("FASTMCP_FORCE_COLOR").is_ok() {
         return true;
     }
 
@@ -158,10 +164,13 @@ mod tests {
     #[test]
     fn is_agent_context_and_should_enable_rich_are_consistent() {
         // If is_agent_context() returns true, should_enable_rich() should return
-        // false (unless FASTMCP_RICH is set, which it shouldn't be in tests)
+        // false unless an explicit color flag is present.
         if is_agent_context() {
-            // agent context -> rich should be disabled (unless FASTMCP_RICH override)
-            if std::env::var("FASTMCP_RICH").is_err() {
+            let force_plain =
+                std::env::var("FASTMCP_PLAIN").is_ok() || std::env::var("NO_COLOR").is_ok();
+            let force_rich = std::env::var("FASTMCP_RICH").is_ok()
+                || std::env::var("FASTMCP_FORCE_COLOR").is_ok();
+            if force_plain || !force_rich {
                 assert!(!should_enable_rich());
             }
         }

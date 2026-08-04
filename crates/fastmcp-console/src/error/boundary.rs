@@ -31,7 +31,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fastmcp_core::McpError;
 
-use crate::console::FastMcpConsole;
+use crate::config::ConsoleConfig;
+use crate::console::{
+    DEFAULT_TERMINAL_FIELD_MAX_CHARS, FastMcpConsole, bounded_redacted_rich_fragment,
+    bounded_redacted_terminal_text,
+};
 use crate::diagnostics::RichErrorRenderer;
 
 /// Wraps operations and displays errors beautifully on failure.
@@ -75,6 +79,20 @@ impl<'a> ErrorBoundary<'a> {
         Self {
             console,
             renderer: RichErrorRenderer::new(),
+            exit_on_error: false,
+            error_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates an `ErrorBoundary` from centralized console configuration.
+    ///
+    /// Error-code, suggestion, and explicit panic-backtrace policy are
+    /// propagated to the boundary's diagnostic renderer.
+    #[must_use]
+    pub fn from_config(console: &'a FastMcpConsole, config: &ConsoleConfig) -> Self {
+        Self {
+            console,
+            renderer: RichErrorRenderer::from_config(config),
             exit_on_error: false,
             error_count: AtomicUsize::new(0),
         }
@@ -157,7 +175,7 @@ impl<'a> ErrorBoundary<'a> {
             Ok(value) => Some(value),
             Err(e) => {
                 let error = e.into();
-                self.console.print(&format!("[dim]Context: {}[/]", context));
+                self.render_context(context);
                 self.handle_error(&error);
                 None
             }
@@ -211,7 +229,7 @@ impl<'a> ErrorBoundary<'a> {
             Ok(value) => Ok(value),
             Err(e) => {
                 let error = e.into();
-                self.console.print(&format!("[dim]Context: {}[/]", context));
+                self.render_context(context);
                 self.handle_error(&error);
                 Err(error)
             }
@@ -258,6 +276,16 @@ impl<'a> ErrorBoundary<'a> {
     /// where you want to track errors separately.
     pub fn reset_count(&self) {
         self.error_count.store(0, Ordering::Relaxed);
+    }
+
+    fn render_context(&self, context: &str) {
+        if self.console.is_rich() {
+            let context = bounded_redacted_rich_fragment(context, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            self.console.print(&format!("[dim]Context: {context}[/]"));
+        } else {
+            let context = bounded_redacted_terminal_text(context, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            self.console.print_plain(&format!("Context: {context}"));
+        }
     }
 
     /// Handles an error by rendering it and optionally exiting.
@@ -337,7 +365,21 @@ macro_rules! try_display_result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TestConsole;
     use fastmcp_core::McpErrorCode;
+
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_console() -> FastMcpConsole {
         // Create a console with rich output disabled for testing
@@ -364,6 +406,26 @@ mod tests {
         assert_eq!(boundary.wrap(result), None);
         assert_eq!(boundary.error_count(), 1);
         assert!(boundary.has_errors());
+    }
+
+    #[test]
+    fn from_config_propagates_error_code_and_suggestion_policy() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(CaptureWriter(output.clone()), false);
+        let mut config = ConsoleConfig::new().without_suggestions();
+        config.show_error_codes = false;
+        let boundary = ErrorBoundary::from_config(&console, &config);
+
+        boundary.display_error(&McpError::new(
+            McpErrorCode::MethodNotFound,
+            "missing method",
+        ));
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("ERROR: missing method"), "{output}");
+        assert!(!output.contains("-32601"), "{output}");
+        assert!(!output.contains("Suggestions"), "{output}");
+        assert_eq!(boundary.error_count(), 1);
+        assert!(!boundary.exit_on_error);
     }
 
     #[test]
@@ -518,5 +580,50 @@ mod tests {
         assert!(wrapped.is_err());
         assert_eq!(wrapped.unwrap_err().code, McpErrorCode::InternalError);
         assert_eq!(boundary.error_count(), 1);
+    }
+
+    #[test]
+    fn plain_context_is_bounded_redacted_and_terminal_safe() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(CaptureWriter(buffer.clone()), false);
+        let boundary = ErrorBoundary::new(&console);
+        let context = format!(
+            "\u{1b}\u{202e}[bold red]owned[/] access_token=context-secret-canary {}",
+            "x".repeat(20_000)
+        );
+        let result: Result<(), McpError> = Err(McpError::internal_error("failure"));
+
+        assert_eq!(boundary.wrap_with_context(result, &context), None);
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Context:"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+        assert!(!output.contains("context-secret-canary"), "{output}");
+        assert!(!output.contains('\u{1b}'), "{output}");
+        assert!(!output.contains('\u{202e}'), "{output}");
+        assert!(output.contains("\\u{1b}"), "{output}");
+        assert!(
+            output.chars().count() <= 600,
+            "context output was unbounded"
+        );
+    }
+
+    #[test]
+    fn rich_context_escapes_markup_and_redacts_credentials() {
+        let console = TestConsole::new_rich();
+        let boundary = ErrorBoundary::new(console.console());
+        let result: Result<(), McpError> = Err(McpError::internal_error("failure"));
+
+        assert!(
+            boundary
+                .wrap_result_with_context(
+                    result,
+                    "[bold red]owned[/] Authorization: Bearer rich-context-secret"
+                )
+                .is_err()
+        );
+        let output = console.output_string();
+        assert!(output.contains("[bold red]owned[/]"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+        assert!(!output.contains("rich-context-secret"), "{output}");
     }
 }

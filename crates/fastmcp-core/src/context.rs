@@ -5,13 +5,154 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use asupersync::sync::Notify;
+use asupersync::types::{CancelReason, MAX_MASK_DEPTH};
+use asupersync::{Budget, Cx, Outcome, RegionId, TaskId, Time};
+
+#[cfg(test)]
 use asupersync::time::wall_now;
-use asupersync::types::CancelReason;
-use asupersync::{Budget, CancelKind, Cx, Outcome, RegionId, TaskId};
 
 use crate::{AuthContext, SessionState};
+
+const REQUEST_LEASE_UNMANAGED: u8 = 0;
+const REQUEST_LEASE_ACTIVE: u8 = 1;
+const REQUEST_LEASE_CLOSED: u8 = 2;
+const REQUEST_CANCELLATION_ACTIVE: u8 = 0;
+const REQUEST_CANCELLATION_CANCELLED: u8 = 1;
+const REQUEST_CANCELLATION_FINALIZING: u8 = 2;
+const REQUEST_AUTH_UNCOMMITTED: u8 = 0;
+const REQUEST_AUTH_ANONYMOUS: u8 = 1;
+const REQUEST_AUTH_AUTHENTICATED: u8 = 2;
+
+/// Clone-shared cooperative cancellation state for one FastMCP request.
+///
+/// This is an internal cross-crate integration type. It deliberately does not
+/// cancel the caller-owned [`Cx`], because that context may be shared by a
+/// connection loop or sibling requests. Request-owned runtime cancellation and
+/// drain still require the child-region primitive tracked by FND-04.
+#[derive(Debug, Default)]
+struct McpRequestCancellationInner {
+    state: AtomicU8,
+    notify: Notify,
+}
+
+#[derive(Clone, Debug, Default)]
+#[doc(hidden)]
+pub struct McpRequestCancellation {
+    inner: Arc<McpRequestCancellationInner>,
+}
+
+impl McpRequestCancellation {
+    /// Creates an independent FastMCP request-cancellation domain.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cooperative cancellation without mutating the ambient [`Cx`].
+    pub fn cancel(&self) -> bool {
+        let cancelled = self
+            .inner
+            .state
+            .compare_exchange(
+                REQUEST_CANCELLATION_ACTIVE,
+                REQUEST_CANCELLATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.notify_terminal_waiters();
+        }
+        cancelled
+    }
+
+    fn notify_terminal_waiters(&self) {
+        // A user-supplied waker is allowed to panic. Terminal state is already
+        // authoritative at this point, so contain that panic after Notify has
+        // attempted to wake the registered waiter set.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.notify.notify_waiters();
+        }));
+    }
+
+    /// Returns whether cooperative request cancellation has been requested.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == REQUEST_CANCELLATION_CANCELLED
+    }
+
+    /// Returns whether cancellation or response finalization owns the request.
+    ///
+    /// This deliberately uses one atomic snapshot. Combining separate
+    /// cancellation and finalization reads can miss an `ACTIVE -> CANCELLED`
+    /// transition that occurs between those reads.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) != REQUEST_CANCELLATION_ACTIVE
+    }
+
+    /// Waits until request-local cancellation wins the terminal race.
+    ///
+    /// The wait is cancel-safe and uses an armed notification followed by a
+    /// state recheck, so cancellation cannot be lost between observing the
+    /// atomic state and parking the current task.
+    pub async fn cancelled(&self) {
+        self.inner
+            .notify
+            .wait_until(|| self.is_cancel_requested())
+            .await;
+    }
+
+    /// Waits until cancellation or response finalization owns the request.
+    ///
+    /// Reverse requests use this terminal wait so retained work cannot remain
+    /// parked after the owning incoming request has begun finalization.
+    pub async fn terminated(&self) {
+        self.inner.notify.wait_until(|| self.is_terminal()).await;
+    }
+
+    /// Atomically closes the cancellation race before response finalization.
+    ///
+    /// Returns `false` only when cancellation linearized first. Once this
+    /// returns `true`, later cancellation attempts are rejected. Repeated calls
+    /// by the response path are idempotent.
+    #[must_use]
+    pub fn begin_finalization(&self) -> bool {
+        loop {
+            match self.inner.state.load(Ordering::Acquire) {
+                REQUEST_CANCELLATION_ACTIVE => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            REQUEST_CANCELLATION_ACTIVE,
+                            REQUEST_CANCELLATION_FINALIZING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.notify_terminal_waiters();
+                        return true;
+                    }
+                }
+                REQUEST_CANCELLATION_CANCELLED => return false,
+                REQUEST_CANCELLATION_FINALIZING => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Returns whether response finalization already owns the terminal race.
+    #[must_use]
+    pub fn is_finalizing(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == REQUEST_CANCELLATION_FINALIZING
+    }
+}
 
 // ============================================================================
 // Notification Sender
@@ -553,7 +694,7 @@ pub trait ResourceReader: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `cx` - The asupersync context
+    /// * `context` - The originating MCP request context
     /// * `uri` - The resource URI to read
     /// * `depth` - Current recursion depth (to prevent infinite loops)
     ///
@@ -561,13 +702,12 @@ pub trait ResourceReader: Send + Sync {
     ///
     /// The resource contents, or an error if the resource doesn't exist
     /// or reading fails.
-    fn read_resource(
-        &self,
-        cx: &Cx,
-        uri: &str,
-        auth: Option<AuthContext>,
+    fn read_resource<'a>(
+        &'a self,
+        context: &'a McpContext,
+        uri: &'a str,
         depth: u32,
-    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ResourceReadResult>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ResourceReadResult>> + Send + 'a>>;
 }
 
 // ============================================================================
@@ -695,7 +835,7 @@ pub trait ToolCaller: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `cx` - The asupersync context
+    /// * `context` - The originating MCP request context
     /// * `name` - The tool name to call
     /// * `args` - The arguments as a JSON value
     /// * `depth` - Current recursion depth (to prevent infinite loops)
@@ -704,14 +844,13 @@ pub trait ToolCaller: Send + Sync {
     ///
     /// The tool result, or an error if the tool doesn't exist
     /// or execution fails.
-    fn call_tool(
-        &self,
-        cx: &Cx,
-        name: &str,
+    fn call_tool<'a>(
+        &'a self,
+        context: &'a McpContext,
+        name: &'a str,
         args: serde_json::Value,
-        auth: Option<AuthContext>,
         depth: u32,
-    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ToolCallResult>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = crate::McpResult<ToolCallResult>> + Send + 'a>>;
 }
 
 // ============================================================================
@@ -882,11 +1021,16 @@ impl std::fmt::Debug for ProgressReporter {
 /// `McpContext` provides access to:
 /// - Request-scoped identity (request ID, trace context)
 /// - Cancellation checkpoints for cancel-safe handlers
-/// - Budget/deadline awareness for timeout enforcement
-/// - Region-scoped spawning for background work
+/// - Cooperative budget/deadline visibility and checkpoints
+/// - Access to the caller-supplied `Cx` for runtime primitives
 /// - Sampling capability for LLM completions (if client supports it)
 /// - Elicitation capability for user input requests (if client supports it)
 /// - Cross-component resource reading (if router is attached)
+///
+/// Every constructor establishes a new request-accounting domain. Derive
+/// another context for the same request by cloning the originating
+/// `McpContext` and applying consuming builders; constructing a new context
+/// around a cloned [`Cx`] would reset FastMCP's request-local accounting.
 ///
 /// # Example
 ///
@@ -918,14 +1062,52 @@ impl std::fmt::Debug for ProgressReporter {
 pub struct McpContext {
     /// The underlying capability context.
     cx: Cx,
+    /// An optional framework-owned ceiling applied to the ambient budget.
+    ///
+    /// This is composed with `cx.budget()` on every read so an inner operation
+    /// can tighten, but never relax, the caller's current budget.
+    budget_state: Arc<Mutex<FrameworkBudgetState>>,
+    /// Mask depth for framework-owned ceilings. The underlying Cx tracks its
+    /// own cancellation mask, but it cannot see a ceiling held only here.
+    framework_mask_depth: Arc<AtomicU32>,
+    /// Serializes transitions between the Cx mask and the framework mask.
+    ///
+    /// Checkpoint and cost-accounting operations take this lock while they
+    /// observe both layers, so they cannot see a half-entered or half-exited
+    /// mask when another clone enters [`McpContext::masked`].
+    mask_transition: Arc<Mutex<()>>,
+    /// Operation-local absolute deadline inherited by ordinary clones.
+    ///
+    /// Unlike the request budget ledger, this value is intentionally not
+    /// shared when a consuming builder tightens a derived context. A nested
+    /// handler timeout must bound that handler without permanently shortening
+    /// its parent's remaining request lifetime.
+    operation_deadline: Option<Time>,
+    /// Clone-shared request capability lease.
+    ///
+    /// Server dispatch closes this lease when the request finishes. FastMCP
+    /// capability calls begun after closure are rejected. This is not a drain
+    /// barrier for an already-running call and cannot revoke direct access to
+    /// the caller-owned [`Cx`]; request-owned runtime isolation remains a
+    /// separate lifecycle requirement.
+    request_lease: Arc<AtomicU8>,
+    /// FastMCP-owned cooperative cancellation for this request domain.
+    request_cancellation: McpRequestCancellation,
     /// Unique request identifier for tracing (from JSON-RPC id).
     request_id: u64,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
     state: Option<SessionState>,
+    /// Session cache partition captured when cache lookup is admitted.
+    cache_admission_partition: Arc<Mutex<Option<([u8; 32], u64)>>>,
+    /// Cache middleware instances that short-circuited response generation.
+    response_cache_hits: Arc<Mutex<Vec<u64>>>,
     /// Request-scoped authentication context.
     auth: Arc<Mutex<Option<AuthContext>>>,
+    /// Write-once authentication admission state, including committed anonymous
+    /// requests whose handler-visible [`Self::auth`] value remains `None`.
+    auth_state: Arc<AtomicU8>,
     /// Optional sampling sender for LLM completions.
     sampling_sender: Option<Arc<dyn SamplingSender>>,
     /// Optional elicitation sender for user input requests.
@@ -946,11 +1128,45 @@ pub struct McpContext {
 
 impl std::fmt::Debug for McpContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let budget_state = *self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("McpContext")
             .field("cx", &self.cx)
+            .field("budget_ceiling", &budget_state.ceiling)
+            .field("ambient_poll_debits", &budget_state.ambient_poll_debits)
+            .field("ambient_cost_debits", &budget_state.ambient_cost_debits)
+            .field("deferred_overrun", &budget_state.deferred_overrun)
+            .field(
+                "framework_mask_depth",
+                &self.framework_mask_depth.load(Ordering::Relaxed),
+            )
+            .field("operation_deadline", &self.operation_deadline)
+            .field("request_lease_active", &self.request_scope_is_active())
+            .field(
+                "request_cancel_requested",
+                &self.request_cancellation.is_cancel_requested(),
+            )
             .field("request_id", &self.request_id)
             .field("progress_reporter", &self.progress_reporter)
             .field("state", &self.state.is_some())
+            .field(
+                "cache_admission_partition",
+                &self
+                    .cache_admission_partition
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            )
+            .field(
+                "response_cache_hit_count",
+                &self
+                    .response_cache_hits
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
             .field(
                 "auth",
                 &self
@@ -958,6 +1174,10 @@ impl std::fmt::Debug for McpContext {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .is_some(),
+            )
+            .field(
+                "auth_committed",
+                &(self.auth_state.load(Ordering::Acquire) != REQUEST_AUTH_UNCOMMITTED),
             )
             .field("sampling_sender", &self.sampling_sender.is_some())
             .field("elicitation_sender", &self.elicitation_sender.is_some())
@@ -971,19 +1191,104 @@ impl std::fmt::Debug for McpContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameworkBudgetState {
+    ceiling: Option<Budget>,
+    /// Cumulative request-local poll units charged against the ambient Cx
+    /// snapshot without mutating its clone-shared runtime budget.
+    ambient_poll_debits: u32,
+    /// Cumulative request-local cost charged against the ambient Cx snapshot.
+    ///
+    /// Asupersync 0.3.9 exposes the ambient budget as a read-only snapshot, so
+    /// FastMCP cannot mutate the supplied Cx's internal quota. Keeping the
+    /// cumulative debit here makes admission real and clone-shared without
+    /// claiming ownership of, or cancelling, that ambient context.
+    ambient_cost_debits: u64,
+    /// A masked admission attempted to exceed a finite framework/ambient
+    /// dimension. Exact depletion to zero is valid; only an actual overrun
+    /// sets this terminal request-local condition.
+    deferred_overrun: bool,
+}
+
+impl FrameworkBudgetState {
+    fn adjusted_ambient(self, mut ambient: Budget) -> Budget {
+        if ambient.poll_quota != u32::MAX {
+            ambient.poll_quota = ambient.poll_quota.saturating_sub(self.ambient_poll_debits);
+        }
+        if let Some(remaining) = ambient.cost_quota.as_mut() {
+            *remaining = remaining.saturating_sub(self.ambient_cost_debits);
+        }
+        ambient
+    }
+
+    fn effective(self, ambient: Budget) -> Budget {
+        let ambient = self.adjusted_ambient(ambient);
+        self.ceiling
+            .map_or(ambient, |ceiling| ambient.meet(ceiling))
+    }
+}
+
+struct FrameworkMaskGuard<'a> {
+    depth: &'a AtomicU32,
+}
+
+/// RAII owner for a server-installed [`McpContext`] request lease.
+///
+/// This is an internal cross-crate integration type. Dropping it rejects new
+/// FastMCP capability calls from every context clone in the request domain.
+#[doc(hidden)]
+pub struct McpContextLeaseGuard {
+    lease: Arc<AtomicU8>,
+}
+
+impl std::fmt::Debug for McpContextLeaseGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpContextLeaseGuard")
+            .field(
+                "active",
+                &(self.lease.load(Ordering::Acquire) == REQUEST_LEASE_ACTIVE),
+            )
+            .finish()
+    }
+}
+
+impl Drop for McpContextLeaseGuard {
+    fn drop(&mut self) {
+        self.lease.store(REQUEST_LEASE_CLOSED, Ordering::Release);
+    }
+}
+
+impl Drop for FrameworkMaskGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl McpContext {
     /// Creates a new MCP context from an asupersync Cx.
     ///
-    /// This is typically called by the server when processing a new request,
-    /// creating a new region for the request lifecycle.
+    /// This wraps the supplied context; it does not create or own a child
+    /// region. Request-owned cancellation/drain must come from the caller's
+    /// runtime lifecycle. This constructor establishes a new request-accounting
+    /// domain even when `cx` is itself a clone. Same-request derivations must
+    /// clone the resulting `McpContext` and use its consuming builders.
     #[must_use]
     pub fn new(cx: Cx, request_id: u64) -> Self {
         Self {
             cx,
+            budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            mask_transition: Arc::new(Mutex::new(())),
+            operation_deadline: None,
+            request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
+            request_cancellation: McpRequestCancellation::new(),
             request_id,
             progress_reporter: None,
             state: None,
+            cache_admission_partition: Arc::new(Mutex::new(None)),
+            response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
+            auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -998,14 +1303,25 @@ impl McpContext {
     /// Creates a new MCP context with session state.
     ///
     /// Use this constructor when session state should be accessible to handlers.
+    /// It establishes a new request-accounting domain; clone an existing
+    /// `McpContext` when deriving another context for the same request.
     #[must_use]
     pub fn with_state(cx: Cx, request_id: u64, state: SessionState) -> Self {
         Self {
             cx,
+            budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            mask_transition: Arc::new(Mutex::new(())),
+            operation_deadline: None,
+            request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
+            request_cancellation: McpRequestCancellation::new(),
             request_id,
             progress_reporter: None,
             state: Some(state),
+            cache_admission_partition: Arc::new(Mutex::new(None)),
+            response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
+            auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1020,15 +1336,26 @@ impl McpContext {
     /// Creates a new MCP context with progress reporting enabled.
     ///
     /// Use this constructor when the client has provided a progress token
-    /// and expects progress notifications.
+    /// and expects progress notifications. It establishes a new
+    /// request-accounting domain; use [`Self::with_progress_reporter`] on a
+    /// clone when attaching progress reporting within an existing request.
     #[must_use]
     pub fn with_progress(cx: Cx, request_id: u64, reporter: ProgressReporter) -> Self {
         Self {
             cx,
+            budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            mask_transition: Arc::new(Mutex::new(())),
+            operation_deadline: None,
+            request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
+            request_cancellation: McpRequestCancellation::new(),
             request_id,
             progress_reporter: Some(reporter),
             state: None,
+            cache_admission_partition: Arc::new(Mutex::new(None)),
+            response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
+            auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1041,6 +1368,10 @@ impl McpContext {
     }
 
     /// Creates a new MCP context with both state and progress reporting.
+    ///
+    /// This constructor establishes a new request-accounting domain. Clone an
+    /// existing `McpContext` and apply consuming builders when deriving another
+    /// context for the same request.
     #[must_use]
     pub fn with_state_and_progress(
         cx: Cx,
@@ -1050,10 +1381,19 @@ impl McpContext {
     ) -> Self {
         Self {
             cx,
+            budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            mask_transition: Arc::new(Mutex::new(())),
+            operation_deadline: None,
+            request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
+            request_cancellation: McpRequestCancellation::new(),
             request_id,
             progress_reporter: Some(reporter),
             state: Some(state),
+            cache_admission_partition: Arc::new(Mutex::new(None)),
+            response_cache_hits: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
+            auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
             resource_reader: None,
@@ -1063,6 +1403,18 @@ impl McpContext {
             client_capabilities: None,
             server_capabilities: None,
         }
+    }
+
+    /// Attaches a progress reporter without changing the request-accounting domain.
+    ///
+    /// This consuming builder preserves the shared budget, mask, authentication,
+    /// and other request-scoped state inherited from the context being consumed.
+    /// Use it on a clone when deriving a progress-enabled context for the same
+    /// request.
+    #[must_use]
+    pub fn with_progress_reporter(mut self, reporter: ProgressReporter) -> Self {
+        self.progress_reporter = Some(reporter);
+        self
     }
 
     /// Sets the sampling sender for this context.
@@ -1085,6 +1437,94 @@ impl McpContext {
         self
     }
 
+    /// Tightens the budget visible through this MCP context.
+    ///
+    /// The supplied ceiling is met with both the ambient [`Cx`] budget and
+    /// any ceiling already installed on the context. Consequently,
+    /// `Budget::INFINITE`, an absent deadline, or a later deadline cannot
+    /// relax a tighter caller-owned limit. The ceiling and its remaining
+    /// quotas are request-owned and shared by every clone of this context;
+    /// tightening one clone is therefore visible to all of them.
+    #[must_use]
+    pub fn with_budget_ceiling(self, ceiling: Budget) -> Self {
+        {
+            let mut current = self
+                .budget_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            current.ceiling = Some(
+                current
+                    .ceiling
+                    .map_or(ceiling, |budget| budget.meet(ceiling)),
+            );
+        }
+        self
+    }
+
+    /// Tightens only this derived operation's absolute deadline.
+    ///
+    /// Ordinary clones inherit the resulting deadline, but the context from
+    /// which this consuming builder was derived is unchanged. This is the
+    /// correct boundary for handler-local timeout metadata: nested work sees
+    /// the tighter deadline while its parent request retains its own lifetime.
+    /// `None` adds no deadline and can never relax an inherited one.
+    #[must_use]
+    pub fn with_operation_deadline(mut self, deadline: Option<Time>) -> Self {
+        if let Some(deadline) = deadline {
+            self.operation_deadline = Some(
+                self.operation_deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            );
+        }
+        self
+    }
+
+    /// Installs the server-created cooperative cancellation domain.
+    ///
+    /// This must be done before request dispatch begins. Ordinary context
+    /// clones preserve the same domain.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_request_cancellation(mut self, cancellation: McpRequestCancellation) -> Self {
+        // Request cancellation authority is installed exactly once, before
+        // the server activates the request lease. A handler holding an active
+        // clone cannot swap in a fresh token and escape peer cancellation.
+        if self.request_lease.load(Ordering::Acquire) == REQUEST_LEASE_UNMANAGED {
+            self.request_cancellation = cancellation;
+        }
+        self
+    }
+
+    /// Installs a clone-shared request lease and returns the scoped context
+    /// with its RAII owner.
+    ///
+    /// The server keeps the guard for exactly one dispatch. Once the guard is
+    /// dropped, retained context clones fail liveness checks and FastMCP
+    /// capability calls begun afterward are rejected. A context that already
+    /// belongs to a request scope returns `None`, so an expired clone cannot
+    /// mint fresh authority. This lease does not drain calls already in
+    /// progress or revoke the caller-owned [`Cx`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_request_scope(self) -> Option<(Self, McpContextLeaseGuard)> {
+        if self
+            .request_lease
+            .compare_exchange(
+                REQUEST_LEASE_UNMANAGED,
+                REQUEST_LEASE_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let guard = McpContextLeaseGuard {
+            lease: Arc::clone(&self.request_lease),
+        };
+        Some((self, guard))
+    }
+
     /// Sets the resource reader for this context.
     ///
     /// This enables the `read_resource()` methods to read resources from
@@ -1101,7 +1541,7 @@ impl McpContext {
     /// resources from within resource handlers.
     #[must_use]
     pub fn with_resource_read_depth(mut self, depth: u32) -> Self {
-        self.resource_read_depth = depth;
+        self.resource_read_depth = self.resource_read_depth.max(depth);
         self
     }
 
@@ -1121,7 +1561,7 @@ impl McpContext {
     /// tools from within tool handlers.
     #[must_use]
     pub fn with_tool_call_depth(mut self, depth: u32) -> Self {
-        self.tool_call_depth = depth;
+        self.tool_call_depth = self.tool_call_depth.max(depth);
         self
     }
 
@@ -1148,7 +1588,7 @@ impl McpContext {
     /// Returns whether progress reporting is enabled for this context.
     #[must_use]
     pub fn has_progress_reporter(&self) -> bool {
-        self.progress_reporter.is_some()
+        self.ensure_live().is_ok() && self.progress_reporter.is_some()
     }
 
     /// Reports progress on the current operation.
@@ -1174,7 +1614,9 @@ impl McpContext {
     /// }
     /// ```
     pub fn report_progress(&self, progress: f64, message: Option<&str>) {
-        if let Some(ref reporter) = self.progress_reporter {
+        if self.ensure_live().is_ok()
+            && let Some(ref reporter) = self.progress_reporter
+        {
             reporter.report(progress, message);
         }
     }
@@ -1202,7 +1644,9 @@ impl McpContext {
     /// }
     /// ```
     pub fn report_progress_with_total(&self, progress: f64, total: f64, message: Option<&str>) {
-        if let Some(ref reporter) = self.progress_reporter {
+        if self.ensure_live().is_ok()
+            && let Some(ref reporter) = self.progress_reporter
+        {
             reporter.report_with_total(progress, total, message);
         }
     }
@@ -1218,9 +1662,10 @@ impl McpContext {
 
     /// Returns the underlying region ID from asupersync.
     ///
-    /// The region represents the request's lifecycle scope - all spawned
-    /// tasks belong to this region and will be cleaned up when the
-    /// request completes or is cancelled.
+    /// This is the region of the caller-supplied [`Cx`]. FastMCP does not
+    /// currently create a request-owned child region, so this identifier must
+    /// not be interpreted as proof that spawned work is scoped to, cancelled
+    /// with, or drained before completion of this MCP request.
     #[must_use]
     pub fn region_id(&self) -> RegionId {
         self.cx.region_id()
@@ -1232,14 +1677,31 @@ impl McpContext {
         self.cx.task_id()
     }
 
+    fn apply_operation_deadline(&self, budget: Budget) -> Budget {
+        self.operation_deadline.map_or(budget, |deadline| {
+            budget.meet(Budget::new().with_deadline(deadline))
+        })
+    }
+
+    fn request_scope_is_active(&self) -> bool {
+        self.request_lease.load(Ordering::Acquire) != REQUEST_LEASE_CLOSED
+    }
+
     /// Returns the current budget.
     ///
-    /// The budget represents the remaining computational resources (time, polls)
-    /// available for this request. When exhausted, the request should be
-    /// cancelled gracefully.
+    /// The budget is a remaining-balance snapshot. A zero poll or cost balance
+    /// records exact depletion; it does not retroactively fail the operation
+    /// that consumed the final unit. Use [`ensure_live`](Self::ensure_live) for
+    /// terminal liveness and [`checkpoint`](Self::checkpoint) or
+    /// [`consume_cost`](Self::consume_cost) for dimension-specific admission.
     #[must_use]
     pub fn budget(&self) -> Budget {
-        self.cx.budget()
+        let ambient = self.cx.budget();
+        let state = *self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.apply_operation_deadline(state.effective(ambient))
     }
 
     /// Checks if cancellation has been requested.
@@ -1248,10 +1710,50 @@ impl McpContext {
     /// Handlers should check this periodically and exit early if true.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        let budget = self.cx.budget();
-        self.cx.is_cancel_requested()
-            || budget.is_exhausted()
-            || budget.is_past_deadline(wall_now())
+        self.ensure_live().is_err()
+    }
+
+    /// Checks terminal request liveness without charging a poll or cost unit.
+    ///
+    /// A finite quota that was exactly depleted is not itself a failed
+    /// operation. The next dimension-specific admission fails when it asks for
+    /// unavailable work. This method rejects only explicit cancellation, an
+    /// expired effective deadline, or a real overrun deferred by
+    /// [`masked`](Self::masked). Explicit cancellation includes both the
+    /// caller-owned [`Cx`] signal and FastMCP's request-local cooperative
+    /// signal; the latter never mutates the ambient context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CancelledError`] when a terminal liveness condition is
+    /// observable outside a cancellation mask.
+    pub fn ensure_live(&self) -> Result<(), CancelledError> {
+        if !self.request_scope_is_active() {
+            return Err(CancelledError);
+        }
+        let _mask_transition = self
+            .mask_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.framework_mask_depth.load(Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+
+        let ambient = self.cx.budget();
+        let now = self.cx.now();
+        let state = *self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effective = self.apply_operation_deadline(state.effective(ambient));
+        if self.request_cancellation.is_cancel_requested()
+            || self.cx.is_cancel_requested()
+            || effective.is_past_deadline(now)
+            || state.deferred_overrun
+        {
+            return Err(CancelledError);
+        }
+        Ok(())
     }
 
     /// Cooperative cancellation checkpoint.
@@ -1262,7 +1764,17 @@ impl McpContext {
     /// # Errors
     ///
     /// Returns an error if the request has been cancelled and cancellation
-    /// is not currently masked.
+    /// is not currently masked. Each admitted checkpoint consumes one unit
+    /// from both a finite framework-owned poll ceiling and a finite ambient
+    /// [`Cx`] poll snapshot. FastMCP records ambient debits in a clone-shared
+    /// request ledger; it does not mutate or cancel the caller-owned context.
+    ///
+    /// This method intentionally does not call [`Cx::checkpoint`]. In the
+    /// pinned runtime that API treats a zero cost balance as aggregate budget
+    /// exhaustion and mutates the clone-shared cancellation state, even though
+    /// this operation admits only the poll dimension. FastMCP observes the
+    /// supplied context's cancellation flag and deadline without poisoning a
+    /// caller-owned context shared by other request domains.
     ///
     /// # Example
     ///
@@ -1276,17 +1788,126 @@ impl McpContext {
     /// }
     /// ```
     pub fn checkpoint(&self) -> Result<(), CancelledError> {
-        self.cx.checkpoint().map_err(|_| CancelledError)?;
-        let budget = self.cx.budget();
-        if budget.is_exhausted() {
+        if !self.request_scope_is_active() {
             return Err(CancelledError);
         }
-        if budget.is_past_deadline(wall_now()) {
-            // Ensure subsequent checkpoints observe cancellation even if the caller doesn't
-            // keep checking wall clock time.
-            self.cx.cancel_fast(CancelKind::Deadline);
+        let _mask_transition = self
+            .mask_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let masked = self.framework_mask_depth.load(Ordering::SeqCst) > 0;
+        let ambient = self.cx.budget();
+        let now = self.cx.now();
+        let mut state = self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adjusted_ambient = state.adjusted_ambient(ambient);
+        let effective = self.apply_operation_deadline(
+            state
+                .ceiling
+                .map_or(adjusted_ambient, |ceiling| adjusted_ambient.meet(ceiling)),
+        );
+        let poll_unavailable = effective.poll_quota == 0;
+        let past_deadline = effective.is_past_deadline(now);
+        let cancelled =
+            self.request_cancellation.is_cancel_requested() || self.cx.is_cancel_requested();
+        let deferred_overrun = state.deferred_overrun;
+
+        if !masked && (cancelled || poll_unavailable || past_deadline || deferred_overrun) {
             return Err(CancelledError);
         }
+
+        if poll_unavailable {
+            debug_assert!(masked);
+            state.deferred_overrun = true;
+        }
+
+        if adjusted_ambient.poll_quota != u32::MAX {
+            state.ambient_poll_debits = state.ambient_poll_debits.saturating_add(1);
+        }
+
+        if let Some(budget) = state.ceiling.as_mut()
+            && budget.poll_quota != u32::MAX
+        {
+            if budget.consume_poll().is_none() {
+                debug_assert!(masked);
+                state.deferred_overrun = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Debits abstract cost units from the request budget.
+    ///
+    /// Cost is application-defined and is deliberately separate from poll
+    /// accounting: [`checkpoint`](Self::checkpoint) never guesses an
+    /// operation's cost. A successful debit is visible through
+    /// [`budget`](Self::budget) and every clone of this context. If the
+    /// request is explicitly cancelled or expired, or the effective ambient/
+    /// ceiling cost budget has fewer than `cost` units remaining, this returns
+    /// [`CancelledError`] without a partial debit. Poll accounting remains the
+    /// responsibility of [`checkpoint`](Self::checkpoint); this method does
+    /// not acknowledge cancellation or consume a poll checkpoint.
+    ///
+    /// Asupersync exposes the supplied [`Cx`] budget as a read-only snapshot.
+    /// FastMCP therefore records cumulative, clone-shared request-local debits
+    /// and subtracts them from the current ambient snapshot without mutating or
+    /// cancelling the caller-owned Cx. A framework cost ceiling, when present,
+    /// is debited independently under the same lock. A zero-unit debit succeeds
+    /// at a zero cost quota, but still observes explicit cancellation and an
+    /// expired deadline.
+    ///
+    /// Inside [`masked`](Self::masked), enforcement remains deferred just as
+    /// it is for checkpoints. Affordable debits are still recorded, while an
+    /// over-budget debit leaves the effective cost budget exhausted so the
+    /// exhaustion is observed as soon as the mask is released. A nonbinding
+    /// underlying cost dimension can still retain a positive balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the debit cannot be admitted and cancellation is
+    /// not currently masked.
+    pub fn consume_cost(&self, cost: u64) -> Result<(), CancelledError> {
+        if !self.request_scope_is_active() {
+            return Err(CancelledError);
+        }
+        let _mask_transition = self
+            .mask_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let masked = self.framework_mask_depth.load(Ordering::SeqCst) > 0;
+        let ambient = self.cx.budget();
+        let now = self.cx.now();
+        let mut state = self
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effective = self.apply_operation_deadline(state.effective(ambient));
+        let enough_cost = effective
+            .cost_quota
+            .is_none_or(|remaining| remaining >= cost);
+        let past_deadline = effective.is_past_deadline(now);
+        let cancelled =
+            self.request_cancellation.is_cancel_requested() || self.cx.is_cancel_requested();
+
+        if !masked && (cancelled || past_deadline || state.deferred_overrun || !enough_cost) {
+            return Err(CancelledError);
+        }
+
+        if !enough_cost {
+            debug_assert!(masked);
+            state.deferred_overrun = true;
+        }
+        state.ambient_cost_debits = state.ambient_cost_debits.saturating_add(cost);
+        if let Some(budget) = state.ceiling.as_mut()
+            && !budget.consume_cost(cost)
+        {
+            debug_assert!(masked);
+            budget.cost_quota = Some(0);
+        }
+
         Ok(())
     }
 
@@ -1296,20 +1917,83 @@ impl McpContext {
     /// cancellation is pending. Use this for critical sections that
     /// must complete atomically.
     ///
+    /// Masking is request-context-wide: this context and all of its clones
+    /// share both the underlying [`Cx`] mask and the framework ceiling mask.
+    /// Independently cancellable concurrent work therefore requires distinct
+    /// runtime-owned child contexts rather than clones of one `McpContext`.
+    ///
+    /// This method masks only the synchronous execution of `f`. Passing an
+    /// async block merely constructs a future while masked; polling that future
+    /// after this method returns is not protected. Asynchronous critical
+    /// sections require a runtime-owned structured cancellation scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CancelledError`] if this context's request lease has already
+    /// closed or the framework mask depth cannot be incremented.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// // Commit transaction - must not be interrupted
-    /// ctx.masked(|| {
-    ///     db.commit().await?;
-    ///     Ok(())
-    /// })
+    /// ctx.masked(|| db.commit_synchronously())?;
     /// ```
-    pub fn masked<F, R>(&self, f: F) -> R
+    pub fn masked<F, R>(&self, f: F) -> Result<R, CancelledError>
     where
         F: FnOnce() -> R,
     {
-        self.cx.masked(f)
+        if !self.request_scope_is_active() {
+            return Err(CancelledError);
+        }
+        let entry_transition = self
+            .mask_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.framework_mask_depth.load(Ordering::SeqCst) >= MAX_MASK_DEPTH {
+            return Err(CancelledError);
+        }
+        if self
+            .framework_mask_depth
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+                depth.checked_add(1)
+            })
+            .is_err()
+        {
+            return Err(CancelledError);
+        }
+        let framework_mask = FrameworkMaskGuard {
+            depth: &self.framework_mask_depth,
+        };
+        let masked_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cx.masked(|| {
+                drop(entry_transition);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                let exit_transition = self
+                    .mask_transition
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (outcome, exit_transition)
+            })
+        }));
+        let (outcome, exit_transition) = match masked_outcome {
+            Ok(result) => result,
+            Err(_runtime_mask_failure) => {
+                let exit_transition = self
+                    .mask_transition
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(framework_mask);
+                drop(exit_transition);
+                return Err(CancelledError);
+            }
+        };
+        drop(framework_mask);
+        drop(exit_transition);
+
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Records a trace event for this request.
@@ -1317,13 +2001,23 @@ impl McpContext {
     /// Events are associated with the request's trace context and can be
     /// used for debugging and observability.
     pub fn trace(&self, message: &str) {
-        self.cx.trace(message);
+        if self.ensure_live().is_ok() {
+            self.cx.trace(message);
+        }
     }
 
     /// Returns a reference to the underlying asupersync Cx.
     ///
     /// Use this when you need direct access to asupersync primitives,
-    /// such as spawning tasks or using combinators.
+    /// such as spawning tasks or using combinators. Direct Cx checkpoints and
+    /// budget snapshots do not observe FastMCP's framework ceiling, cumulative
+    /// cost ledger, or two-layer mask transition; request admission code must
+    /// use [`checkpoint`](Self::checkpoint), [`consume_cost`](Self::consume_cost),
+    /// and [`budget`](Self::budget) instead. Conversely, masking the raw `Cx`
+    /// does not mask FastMCP admission checks: code that calls back into this
+    /// context must use [`masked`](Self::masked). The raw handle also cannot be
+    /// revoked when the FastMCP request lease closes, so it must not be retained
+    /// or used as an independently owned request capability.
     #[must_use]
     pub fn cx(&self) -> &Cx {
         &self.cx
@@ -1353,33 +2047,123 @@ impl McpContext {
     /// ```
     #[must_use]
     pub fn get_state<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        if !self.request_scope_is_active() {
+            return None;
+        }
         self.state.as_ref()?.get(key)
     }
 
     /// Returns the authentication context for this request, if available.
     #[must_use]
     pub fn auth(&self) -> Option<AuthContext> {
+        if !self.request_scope_is_active() {
+            return None;
+        }
         self.auth
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Stores authentication context for this request.
+    /// Commits authentication context for this request if the slot is empty.
     ///
-    /// Returns `true` once the request-scoped auth context has been recorded.
+    /// The slot is write-once across all context clones. Authentication
+    /// providers may use an isolated staging context, and the server commits
+    /// the successful result to the shared request context. Middleware,
+    /// handlers, and nested dispatch cannot replace that committed principal.
+    /// Returns `false` if the request lease is closed or an identity has
+    /// already been committed.
     pub fn set_auth(&self, auth: AuthContext) -> bool {
-        *self
+        if self.ensure_live().is_err() {
+            return false;
+        }
+        let mut slot = self
             .auth
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.auth_state.load(Ordering::Acquire) != REQUEST_AUTH_UNCOMMITTED {
+            return false;
+        }
+        *slot = Some(auth);
+        self.auth_state
+            .store(REQUEST_AUTH_AUTHENTICATED, Ordering::Release);
         true
+    }
+
+    /// Commits this request as unauthenticated without exposing an empty
+    /// [`AuthContext`] to handlers.
+    ///
+    /// This is a write-once internal admission marker. It prevents later
+    /// middleware from forging handler-visible authentication while allowing
+    /// cache middleware to distinguish admitted anonymous traffic from an
+    /// authentication flow that has not completed.
+    #[doc(hidden)]
+    pub fn commit_anonymous_auth(&self) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
+        let slot = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.auth_state.load(Ordering::Acquire) != REQUEST_AUTH_UNCOMMITTED || slot.is_some() {
+            return false;
+        }
+        self.auth_state
+            .store(REQUEST_AUTH_ANONYMOUS, Ordering::Release);
+        true
+    }
+
+    /// Returns the committed cache authorization partition.
+    ///
+    /// The outer `Option` distinguishes incomplete admission from a committed
+    /// request. The inner `Option` is `None` for anonymous admission and
+    /// contains the complete handler-visible authenticated facts otherwise.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cache_auth_partition(&self) -> Option<Option<AuthContext>> {
+        if !self.request_scope_is_active() {
+            return None;
+        }
+        let slot = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.auth_state.load(Ordering::Acquire) {
+            REQUEST_AUTH_ANONYMOUS => Some(None),
+            REQUEST_AUTH_AUTHENTICATED => slot.clone().map(Some),
+            _ => None,
+        }
     }
 
     /// Returns a cloned context with request-local auth attached.
     #[must_use]
     pub fn with_auth(self, auth: AuthContext) -> Self {
         let _ = self.set_auth(auth);
+        self
+    }
+
+    /// Returns a derived context with an isolated authentication staging slot.
+    ///
+    /// Only budget accounting, cancellation, masking, and request identity
+    /// remain shared. Session state, nested dispatch, progress, sampling, and
+    /// elicitation are removed from the staging view so authentication code
+    /// cannot exercise handler authority and a handler cannot use this method
+    /// to forge a principal for nested dispatch.
+    #[must_use]
+    pub fn with_isolated_auth(mut self) -> Self {
+        let already_committed = self.auth_state.load(Ordering::Acquire) != REQUEST_AUTH_UNCOMMITTED;
+        if already_committed {
+            return self;
+        }
+        self.auth = Arc::new(Mutex::new(None));
+        self.auth_state = Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED));
+        self.state = None;
+        self.progress_reporter = None;
+        self.sampling_sender = None;
+        self.elicitation_sender = None;
+        self.resource_reader = None;
+        self.tool_caller = None;
         self
     }
 
@@ -1400,6 +2184,9 @@ impl McpContext {
     /// }
     /// ```
     pub fn set_state<T: serde::Serialize>(&self, key: impl Into<String>, value: T) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
         match &self.state {
             Some(state) => state.set(key, value),
             None => false,
@@ -1412,6 +2199,9 @@ impl McpContext {
     /// - Session state is not available
     /// - The key didn't exist
     pub fn remove_state(&self, key: &str) -> Option<serde_json::Value> {
+        if self.ensure_live().is_err() {
+            return None;
+        }
         self.state.as_ref()?.remove(key)
     }
 
@@ -1420,13 +2210,104 @@ impl McpContext {
     /// Returns `false` if session state is not available.
     #[must_use]
     pub fn has_state(&self, key: &str) -> bool {
-        self.state.as_ref().is_some_and(|s| s.contains(key))
+        self.request_scope_is_active() && self.state.as_ref().is_some_and(|s| s.contains(key))
     }
 
     /// Returns whether session state is available in this context.
     #[must_use]
     pub fn has_session_state(&self) -> bool {
-        self.state.is_some()
+        self.request_scope_is_active() && self.state.is_some()
+    }
+
+    /// Returns the opaque cache partition and mutation revision for this
+    /// request's session state.
+    ///
+    /// This is an internal cross-crate integration hook. It returns `None`
+    /// when the request is no longer live or the state cannot provide a safe
+    /// stable partition. Cache implementations must additionally partition by
+    /// all response-relevant authenticated facts.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_cache_partition(&self) -> Option<([u8; 32], u64)> {
+        if !self.request_scope_is_active() {
+            return None;
+        }
+        self.state.as_ref()?.cache_partition()
+    }
+
+    /// Captures the current session cache partition for this request.
+    ///
+    /// Repeated callers receive the same partition only while session state has
+    /// not changed. This lets cache middleware prove that a response completed
+    /// against the same state revision used for lookup.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_session_cache_partition(&self) -> Option<([u8; 32], u64)> {
+        let current = self.session_cache_partition()?;
+        let mut admitted = self
+            .cache_admission_partition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *admitted {
+            None => {
+                *admitted = Some(current);
+                Some(current)
+            }
+            Some(existing) if existing == current => Some(existing),
+            Some(_) => None,
+        }
+    }
+
+    /// Returns the admitted cache partition only if the state revision is
+    /// unchanged at response completion.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn complete_session_cache_partition(&self) -> Option<([u8; 32], u64)> {
+        if !self.request_scope_is_active() {
+            return None;
+        }
+        let admitted = *self
+            .cache_admission_partition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let admitted = admitted?;
+        (self.state.as_ref()?.cache_partition() == Some(admitted)).then_some(admitted)
+    }
+
+    /// Marks that one middleware instance produced this request's response from
+    /// a cache hit.
+    #[doc(hidden)]
+    pub fn mark_response_cache_hit(&self, cache_id: u64) -> bool {
+        const MAX_CACHE_MIDDLEWARE_PER_REQUEST: usize = 64;
+        if !self.request_scope_is_active() || cache_id == 0 {
+            return false;
+        }
+        let mut hits = self
+            .response_cache_hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hits.contains(&cache_id) {
+            return true;
+        }
+        if hits.len() >= MAX_CACHE_MIDDLEWARE_PER_REQUEST || hits.try_reserve(1).is_err() {
+            return false;
+        }
+        hits.push(cache_id);
+        true
+    }
+
+    /// Returns whether a specific middleware instance produced this request's
+    /// response from cache.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn response_was_cache_hit(&self, cache_id: u64) -> bool {
+        self.request_scope_is_active()
+            && cache_id != 0
+            && self
+                .response_cache_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&cache_id)
     }
 
     // ========================================================================
@@ -1541,7 +2422,7 @@ impl McpContext {
     /// Tools are enabled by default unless explicitly disabled.
     #[must_use]
     pub fn is_tool_enabled(&self, name: &str) -> bool {
-        !self.is_in_disabled_set(Self::DISABLED_TOOLS_KEY, name)
+        self.request_scope_is_active() && !self.is_in_disabled_set(Self::DISABLED_TOOLS_KEY, name)
     }
 
     /// Disables a resource for this session.
@@ -1566,7 +2447,8 @@ impl McpContext {
     /// Resources are enabled by default unless explicitly disabled.
     #[must_use]
     pub fn is_resource_enabled(&self, uri: &str) -> bool {
-        !self.is_in_disabled_set(Self::DISABLED_RESOURCES_KEY, uri)
+        self.request_scope_is_active()
+            && !self.is_in_disabled_set(Self::DISABLED_RESOURCES_KEY, uri)
     }
 
     /// Disables a prompt for this session.
@@ -1591,7 +2473,7 @@ impl McpContext {
     /// Prompts are enabled by default unless explicitly disabled.
     #[must_use]
     pub fn is_prompt_enabled(&self, name: &str) -> bool {
-        !self.is_in_disabled_set(Self::DISABLED_PROMPTS_KEY, name)
+        self.request_scope_is_active() && !self.is_in_disabled_set(Self::DISABLED_PROMPTS_KEY, name)
     }
 
     /// Returns the set of disabled tools for this session.
@@ -1614,6 +2496,9 @@ impl McpContext {
 
     // Helper: Add a name to a disabled set
     fn add_to_disabled_set(&self, key: &str, name: String) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
         let Some(state) = self.state.as_ref() else {
             return false;
         };
@@ -1624,6 +2509,9 @@ impl McpContext {
 
     // Helper: Remove a name from a disabled set
     fn remove_from_disabled_set(&self, key: &str, name: &str) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
         let Some(state) = self.state.as_ref() else {
             return false;
         };
@@ -1634,6 +2522,9 @@ impl McpContext {
 
     // Helper: Check if a name is in a disabled set
     fn is_in_disabled_set(&self, key: &str, name: &str) -> bool {
+        if !self.request_scope_is_active() {
+            return false;
+        }
         let Some(state) = self.state.as_ref() else {
             return false;
         };
@@ -1643,6 +2534,9 @@ impl McpContext {
 
     // Helper: Get the full disabled set
     fn get_disabled_set(&self, key: &str) -> std::collections::HashSet<String> {
+        if !self.request_scope_is_active() {
+            return std::collections::HashSet::new();
+        }
         self.state
             .as_ref()
             .and_then(|s| s.get(key))
@@ -1659,7 +2553,7 @@ impl McpContext {
     /// capability and a sampling sender has been configured.
     #[must_use]
     pub fn can_sample(&self) -> bool {
-        self.sampling_sender.is_some()
+        self.ensure_live().is_ok() && self.sampling_sender.is_some()
     }
 
     /// Requests an LLM completion from the client.
@@ -1730,6 +2624,8 @@ impl McpContext {
         &self,
         request: SamplingRequest,
     ) -> crate::McpResult<SamplingResponse> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
         let sender = self.sampling_sender.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InvalidRequest,
@@ -1737,7 +2633,10 @@ impl McpContext {
             )
         })?;
 
-        sender.create_message(request).await
+        let response = sender.create_message(request).await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(response)
     }
 
     // ========================================================================
@@ -1750,7 +2649,7 @@ impl McpContext {
     /// capability and an elicitation sender has been configured.
     #[must_use]
     pub fn can_elicit(&self) -> bool {
-        self.elicitation_sender.is_some()
+        self.ensure_live().is_ok() && self.elicitation_sender.is_some()
     }
 
     /// Requests user input via a form.
@@ -1857,6 +2756,8 @@ impl McpContext {
         &self,
         request: ElicitationRequest,
     ) -> crate::McpResult<ElicitationResponse> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
         let sender = self.elicitation_sender.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InvalidRequest,
@@ -1864,7 +2765,10 @@ impl McpContext {
             )
         })?;
 
-        sender.elicit(request).await
+        let response = sender.elicit(request).await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(response)
     }
 
     // ========================================================================
@@ -1877,7 +2781,7 @@ impl McpContext {
     /// been attached to this context.
     #[must_use]
     pub fn can_read_resources(&self) -> bool {
-        self.resource_reader.is_some()
+        self.ensure_live().is_ok() && self.resource_reader.is_some()
     }
 
     /// Returns the current resource read depth.
@@ -1917,6 +2821,8 @@ impl McpContext {
     /// }
     /// ```
     pub async fn read_resource(&self, uri: &str) -> crate::McpResult<ResourceReadResult> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
         // Check if we have a resource reader
         let reader = self.resource_reader.as_ref().ok_or_else(|| {
             crate::McpError::new(
@@ -1925,8 +2831,11 @@ impl McpContext {
             )
         })?;
 
-        // Check recursion depth
-        if self.resource_read_depth >= MAX_RESOURCE_READ_DEPTH {
+        // Use one effective nesting depth across both cross-component APIs so
+        // alternating tool -> resource -> tool cycles cannot reset either
+        // type-specific counter.
+        let nested_dispatch_depth = self.resource_read_depth.max(self.tool_call_depth);
+        if nested_dispatch_depth >= MAX_RESOURCE_READ_DEPTH {
             return Err(crate::McpError::new(
                 crate::McpErrorCode::InternalError,
                 format!(
@@ -1937,9 +2846,12 @@ impl McpContext {
         }
 
         // Read the resource with incremented depth
-        reader
-            .read_resource(&self.cx, uri, self.auth(), self.resource_read_depth + 1)
-            .await
+        let result = reader
+            .read_resource(self, uri, nested_dispatch_depth + 1)
+            .await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(result)
     }
 
     /// Reads a resource and extracts the text content.
@@ -2015,7 +2927,7 @@ impl McpContext {
     /// been attached to this context.
     #[must_use]
     pub fn can_call_tools(&self) -> bool {
-        self.tool_caller.is_some()
+        self.ensure_live().is_ok() && self.tool_caller.is_some()
     }
 
     /// Returns the current tool call depth.
@@ -2058,6 +2970,8 @@ impl McpContext {
         name: &str,
         args: serde_json::Value,
     ) -> crate::McpResult<ToolCallResult> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
         // Check if we have a tool caller
         let caller = self.tool_caller.as_ref().ok_or_else(|| {
             crate::McpError::new(
@@ -2066,8 +2980,10 @@ impl McpContext {
             )
         })?;
 
-        // Check recursion depth
-        if self.tool_call_depth >= MAX_TOOL_CALL_DEPTH {
+        // Share the effective depth with resource reads so alternating cycles
+        // are bounded just like same-kind recursion.
+        let nested_dispatch_depth = self.resource_read_depth.max(self.tool_call_depth);
+        if nested_dispatch_depth >= MAX_TOOL_CALL_DEPTH {
             return Err(crate::McpError::new(
                 crate::McpErrorCode::InternalError,
                 format!(
@@ -2078,9 +2994,12 @@ impl McpContext {
         }
 
         // Call the tool with incremented depth
-        caller
-            .call_tool(&self.cx, name, args, self.auth(), self.tool_call_depth + 1)
-            .await
+        let result = caller
+            .call_tool(self, name, args, nested_dispatch_depth + 1)
+            .await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(result)
     }
 
     /// Calls a tool and extracts the text content.
@@ -2180,19 +3099,26 @@ impl McpContext {
     ///     Box::pin(fetch_user(2)),
     ///     Box::pin(fetch_user(3)),
     /// ];
-    /// let users = ctx.join_all(futures).await;
+    /// let users = ctx.join_all(futures).await?;
     /// ```
     pub async fn join_all<T: Send + 'static>(
         &self,
         futures: Vec<crate::combinator::BoxFuture<'_, T>>,
-    ) -> Vec<T> {
-        crate::combinator::join_all(&self.cx, futures).await
+    ) -> crate::McpResult<Vec<T>> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let results = crate::combinator::join_all(&self.cx, futures).await;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(results)
     }
 
     /// Races multiple futures, returning the first to complete.
     ///
     /// This is the 1-of-N combinator: the first future to complete wins,
-    /// and all others are cancelled and drained.
+    /// and all other supplied futures are dropped. Dropping a future does not
+    /// cancel or drain work that it spawned independently; such work must live
+    /// in a caller-owned structured scope with an explicit join obligation.
     ///
     /// # Example
     ///
@@ -2207,13 +3133,19 @@ impl McpContext {
         &self,
         futures: Vec<crate::combinator::BoxFuture<'_, T>>,
     ) -> crate::McpResult<T> {
-        crate::combinator::race(&self.cx, futures).await
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let result = crate::combinator::race(&self.cx, futures).await;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        result
     }
 
     /// Waits for M of N futures to complete successfully.
     ///
     /// Returns when `required` futures have completed successfully.
-    /// Remaining futures are cancelled.
+    /// Remaining supplied futures are dropped. Independently spawned work is
+    /// neither cancelled nor drained by dropping its parent future.
     ///
     /// # Example
     ///
@@ -2230,13 +3162,20 @@ impl McpContext {
         required: usize,
         futures: Vec<crate::combinator::BoxFuture<'_, crate::McpResult<T>>>,
     ) -> crate::McpResult<crate::combinator::QuorumResult<T>> {
-        crate::combinator::quorum(&self.cx, required, futures).await
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let result = crate::combinator::quorum(&self.cx, required, futures).await;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        result
     }
 
     /// Races futures and returns the first successful result.
     ///
     /// Unlike `race` which returns the first to complete (success or failure),
-    /// `first_ok` returns the first to complete successfully.
+    /// `first_ok` returns the first to complete successfully. Once a result is
+    /// selected, the remaining supplied futures are dropped; independently
+    /// spawned work is not cancelled or drained.
     ///
     /// # Example
     ///
@@ -2251,7 +3190,12 @@ impl McpContext {
         &self,
         futures: Vec<crate::combinator::BoxFuture<'_, crate::McpResult<T>>>,
     ) -> crate::McpResult<T> {
-        crate::combinator::first_ok(&self.cx, futures).await
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let result = crate::combinator::first_ok(&self.cx, futures).await;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        result
     }
 }
 
@@ -2341,6 +3285,179 @@ mod tests {
     }
 
     #[test]
+    fn request_local_cancellation_does_not_cancel_shared_ambient_context() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let request =
+            McpContext::new(cx.clone(), 1).with_request_cancellation(cancellation.clone());
+        let sibling = McpContext::new(cx.clone(), 2);
+
+        cancellation.cancel();
+
+        assert!(request.ensure_live().is_err());
+        assert!(request.checkpoint().is_err());
+        assert!(sibling.ensure_live().is_ok());
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn request_local_cancelled_future_registers_and_is_woken_without_polling() {
+        use std::sync::atomic::AtomicBool;
+
+        struct WakeFlag(AtomicBool);
+
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let cancellation = McpRequestCancellation::new();
+        let wake_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&wake_flag));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let mut future = Box::pin(cancellation.cancelled());
+
+        assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_pending());
+        assert!(cancellation.cancel());
+        assert!(wake_flag.0.load(Ordering::Acquire));
+        assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_ready());
+    }
+
+    #[test]
+    fn request_local_cancelled_future_observes_preexisting_cancellation() {
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+
+        let mut future = Box::pin(cancellation.cancelled());
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+
+        assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_ready());
+    }
+
+    #[test]
+    fn request_terminal_future_is_woken_when_finalization_wins() {
+        use std::sync::atomic::AtomicBool;
+
+        struct WakeFlag(AtomicBool);
+
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let cancellation = McpRequestCancellation::new();
+        let wake_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&wake_flag));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let mut future = Box::pin(cancellation.terminated());
+
+        assert!(!cancellation.is_terminal());
+        assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_pending());
+        assert!(cancellation.begin_finalization());
+        assert!(cancellation.is_terminal());
+        assert!(wake_flag.0.load(Ordering::Acquire));
+        assert!(std::future::Future::poll(future.as_mut(), &mut task_cx).is_ready());
+    }
+
+    #[test]
+    fn request_local_cancellation_is_deferred_inside_framework_mask() {
+        let cancellation = McpRequestCancellation::new();
+        let ctx =
+            McpContext::new(Cx::for_testing(), 1).with_request_cancellation(cancellation.clone());
+
+        let checkpoint = ctx
+            .masked(|| {
+                cancellation.cancel();
+                ctx.checkpoint()
+            })
+            .expect("framework mask should be admitted");
+
+        assert!(checkpoint.is_ok());
+        assert!(ctx.ensure_live().is_err());
+    }
+
+    #[test]
+    fn request_local_cancellation_stops_state_and_capability_effects() {
+        let state = SessionState::new();
+        assert!(state.set("existing", 1_u32));
+        let cancellation = McpRequestCancellation::new();
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, state.clone())
+            .with_sampling(Arc::new(NoOpSamplingSender))
+            .with_elicitation(Arc::new(NoOpElicitationSender))
+            .with_request_cancellation(cancellation.clone());
+
+        assert!(ctx.can_sample());
+        assert!(ctx.can_elicit());
+        assert!(cancellation.cancel());
+
+        assert!(!ctx.set_state("late", 2_u32));
+        assert!(ctx.remove_state("existing").is_none());
+        assert!(!ctx.disable_tool("late-tool"));
+        assert!(!ctx.disable_resource("late://resource"));
+        assert!(!ctx.disable_prompt("late-prompt"));
+        assert!(!ctx.can_sample());
+        assert!(!ctx.can_elicit());
+        assert_eq!(state.get::<u32>("existing"), Some(1));
+        assert!(!state.contains("late"));
+    }
+
+    #[test]
+    fn admitted_mask_allows_critical_state_commit_before_cancellation_surfaces() {
+        let state = SessionState::new();
+        let cancellation = McpRequestCancellation::new();
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, state.clone())
+            .with_request_cancellation(cancellation.clone());
+
+        let committed = ctx
+            .masked(|| {
+                assert!(cancellation.cancel());
+                ctx.set_state("critical-commit", true)
+            })
+            .expect("mask should be admitted before cancellation");
+
+        assert!(committed);
+        assert_eq!(state.get::<bool>("critical-commit"), Some(true));
+        assert!(ctx.ensure_live().is_err());
+    }
+
+    #[test]
+    fn active_request_clone_cannot_replace_cancellation_authority() {
+        let original = McpRequestCancellation::new();
+        let replacement = McpRequestCancellation::new();
+        let root =
+            McpContext::new(Cx::for_testing(), 1).with_request_cancellation(original.clone());
+        let (scoped, _guard) = root
+            .begin_request_scope()
+            .expect("new context should activate one request lease");
+        let attempted_escape = scoped
+            .clone()
+            .with_request_cancellation(replacement.clone());
+
+        assert!(original.cancel());
+        assert!(attempted_escape.ensure_live().is_err());
+        assert!(!replacement.is_cancel_requested());
+    }
+
+    #[test]
+    fn request_finalization_and_cancellation_have_one_atomic_winner() {
+        let cancellation_wins = McpRequestCancellation::new();
+        assert!(cancellation_wins.cancel());
+        assert!(!cancellation_wins.begin_finalization());
+        assert!(cancellation_wins.is_cancel_requested());
+        assert!(cancellation_wins.is_terminal());
+
+        let finalization_wins = McpRequestCancellation::new();
+        assert!(finalization_wins.begin_finalization());
+        assert!(finalization_wins.is_finalizing());
+        assert!(finalization_wins.is_terminal());
+        assert!(!finalization_wins.cancel());
+        assert!(!finalization_wins.is_cancel_requested());
+    }
+
+    #[test]
     fn test_mcp_context_checkpoint_budget_exhausted() {
         let cx = Cx::for_testing_with_budget(Budget::ZERO);
         let ctx = McpContext::new(cx, 1);
@@ -2350,12 +3467,48 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_does_not_treat_zero_cost_as_poll_exhaustion() {
+        let budget = Budget::new().with_poll_quota(2).with_cost_quota(0);
+        let cx = Cx::for_testing_with_budget(budget);
+        let ctx = McpContext::new(cx.clone(), 1);
+
+        assert!(ctx.checkpoint().is_ok());
+        assert!(!cx.is_cancel_requested());
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+    }
+
+    #[test]
+    fn closed_request_lease_cannot_be_revived_or_use_framework_capabilities() {
+        let state = SessionState::new();
+        let root = McpContext::with_state(Cx::for_testing(), 1, state);
+        let clone_created_before_scope = root.clone();
+        let (scoped, guard) = root
+            .begin_request_scope()
+            .expect("new context should create one request lease");
+        let escaped = scoped.clone();
+        drop(guard);
+
+        assert!(escaped.ensure_live().is_err());
+        assert!(escaped.checkpoint().is_err());
+        assert!(escaped.consume_cost(0).is_err());
+        assert!(escaped.masked(|| 42).is_err());
+        assert!(!escaped.set_auth(AuthContext::with_subject("late")));
+        assert!(!escaped.set_state("late", true));
+        assert!(escaped.auth().is_none());
+        assert!(!escaped.can_call_tools());
+        assert!(!escaped.can_read_resources());
+        assert!(clone_created_before_scope.ensure_live().is_err());
+
+        assert!(clone_created_before_scope.begin_request_scope().is_none());
+    }
+
+    #[test]
     fn test_mcp_context_masked_section() {
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
 
         // masked() should execute the closure and return its value
-        let result = ctx.masked(|| 42);
+        let result = ctx.masked(|| 42).expect("mask should be admitted");
         assert_eq!(result, 42);
     }
 
@@ -2368,6 +3521,386 @@ mod tests {
         let budget = ctx.budget();
         // For testing Cx, budget should not be exhausted
         assert!(!budget.is_exhausted());
+    }
+
+    #[test]
+    fn budget_ceiling_is_monotone_and_visible_to_checkpoints() {
+        let ambient_deadline = wall_now().saturating_add_nanos(5_000_000_000);
+        let tighter_deadline = ambient_deadline.saturating_sub_nanos(1_000_000_000);
+        let later_deadline = ambient_deadline.saturating_add_nanos(1_000_000_000);
+        let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(ambient_deadline));
+        let ctx = McpContext::new(cx, 1)
+            .with_budget_ceiling(Budget::new().with_deadline(tighter_deadline))
+            .with_budget_ceiling(Budget::new().with_deadline(later_deadline));
+
+        assert_eq!(ctx.budget().deadline, Some(tighter_deadline));
+        assert!(ctx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn operation_deadline_tightens_child_without_leaking_to_parent() {
+        let parent_deadline = wall_now().saturating_add_nanos(5_000_000_000);
+        let child_deadline = parent_deadline.saturating_sub_nanos(1_000_000_000);
+        let parent = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_deadline(parent_deadline));
+        let child = parent.clone().with_operation_deadline(Some(child_deadline));
+        let grandchild = child.clone().with_operation_deadline(None);
+
+        assert_eq!(parent.budget().deadline, Some(parent_deadline));
+        assert_eq!(child.budget().deadline, Some(child_deadline));
+        assert_eq!(grandchild.budget().deadline, Some(child_deadline));
+    }
+
+    #[test]
+    fn framework_poll_ceiling_drains_across_clones_at_n_plus_one() {
+        const LIMIT: u32 = 3;
+
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(LIMIT));
+        let clone = ctx.clone();
+
+        for admitted in 0..LIMIT {
+            let result = if admitted % 2 == 0 {
+                ctx.checkpoint()
+            } else {
+                clone.checkpoint()
+            };
+            assert!(result.is_ok(), "checkpoint {} should fit", admitted + 1);
+            let expected = LIMIT - admitted - 1;
+            assert_eq!(ctx.budget().poll_quota, expected);
+            assert_eq!(clone.budget().poll_quota, expected);
+        }
+
+        assert!(clone.checkpoint().is_err(), "checkpoint N+1 must fail");
+        assert_eq!(ctx.budget().poll_quota, 0);
+        assert!(!ctx.cx().is_cancel_requested());
+    }
+
+    #[test]
+    fn ambient_poll_budget_drains_across_clones_without_mutating_cx() {
+        const LIMIT: u32 = 3;
+
+        let cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(LIMIT));
+        let ctx = McpContext::new(cx.clone(), 1);
+        let clone = ctx.clone();
+
+        for admitted in 0..LIMIT {
+            let result = if admitted % 2 == 0 {
+                ctx.checkpoint()
+            } else {
+                clone.checkpoint()
+            };
+            assert!(
+                result.is_ok(),
+                "ambient checkpoint {} should fit",
+                admitted + 1
+            );
+            assert_eq!(ctx.budget().poll_quota, LIMIT - admitted - 1);
+        }
+
+        let debits_before_rejection = ctx
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ambient_poll_debits;
+        assert!(
+            clone.checkpoint().is_err(),
+            "ambient checkpoint N+1 must fail"
+        );
+        assert_eq!(
+            ctx.budget_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ambient_poll_debits,
+            debits_before_rejection,
+            "a rejected checkpoint must not partially debit the ledger"
+        );
+        assert_eq!(ctx.budget().poll_quota, 0);
+        assert_eq!(cx.budget().poll_quota, LIMIT);
+        assert!(!cx.is_cancel_requested());
+        assert!(ctx.ensure_live().is_ok());
+    }
+
+    #[test]
+    fn tighter_ambient_poll_limit_does_not_debit_looser_ceiling_on_rejection() {
+        let cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(2));
+        let ctx =
+            McpContext::new(cx.clone(), 1).with_budget_ceiling(Budget::new().with_poll_quota(3));
+
+        assert!(ctx.checkpoint().is_ok());
+        assert!(ctx.checkpoint().is_ok());
+        assert!(ctx.checkpoint().is_err());
+
+        let state = *ctx
+            .budget_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.ambient_poll_debits, 2);
+        assert_eq!(state.ceiling.map(|budget| budget.poll_quota), Some(1));
+        assert_eq!(cx.budget().poll_quota, 2);
+    }
+
+    #[test]
+    fn framework_cost_ceiling_drains_across_clones_at_n_plus_one() {
+        const LIMIT: u64 = 3;
+
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(LIMIT));
+        let clone = ctx.clone();
+
+        for admitted in 0..LIMIT {
+            let result = if admitted % 2 == 0 {
+                ctx.consume_cost(1)
+            } else {
+                clone.consume_cost(1)
+            };
+            assert!(result.is_ok(), "cost debit {} should fit", admitted + 1);
+            let expected = Some(LIMIT - admitted - 1);
+            assert_eq!(ctx.budget().cost_quota, expected);
+            assert_eq!(clone.budget().cost_quota, expected);
+        }
+
+        assert!(clone.consume_cost(1).is_err(), "cost debit N+1 must fail");
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert!(!ctx.cx().is_cancel_requested());
+        assert!(
+            ctx.ensure_live().is_ok(),
+            "an exactly admitted final debit is not an overrun"
+        );
+    }
+
+    #[test]
+    fn framework_poll_and_cost_debits_are_independent() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(2).with_cost_quota(2));
+
+        assert!(ctx.checkpoint().is_ok());
+        assert_eq!(ctx.budget().poll_quota, 1);
+        assert_eq!(ctx.budget().cost_quota, Some(2));
+
+        assert!(ctx.consume_cost(1).is_ok());
+        assert_eq!(ctx.budget().poll_quota, 1);
+        assert_eq!(ctx.budget().cost_quota, Some(1));
+    }
+
+    #[test]
+    fn exact_poll_depletion_is_live_until_the_next_poll_admission() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(1));
+
+        assert!(ctx.checkpoint().is_ok());
+        assert_eq!(ctx.budget().poll_quota, 0);
+        assert!(ctx.ensure_live().is_ok());
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn zero_framework_quotas_fail_without_cancelling_ambient_context() {
+        let poll_ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(0));
+        let cost_ctx = McpContext::new(Cx::for_testing(), 2)
+            .with_budget_ceiling(Budget::new().with_cost_quota(0));
+
+        assert!(poll_ctx.checkpoint().is_err());
+        assert_eq!(poll_ctx.budget().poll_quota, 0);
+        assert!(!poll_ctx.cx().is_cancel_requested());
+
+        assert!(cost_ctx.consume_cost(0).is_ok());
+        assert!(cost_ctx.consume_cost(1).is_err());
+        assert_eq!(cost_ctx.budget().cost_quota, Some(0));
+        assert!(!cost_ctx.cx().is_cancel_requested());
+    }
+
+    #[test]
+    fn oversized_framework_cost_debit_is_atomic() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(2));
+
+        assert!(ctx.consume_cost(3).is_err());
+        assert_eq!(ctx.budget().cost_quota, Some(2));
+        assert!(ctx.consume_cost(2).is_ok());
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert!(ctx.consume_cost(1).is_err());
+    }
+
+    #[test]
+    fn zero_ambient_cost_quota_prevents_framework_cost_debit() {
+        let ambient = Budget::new().with_cost_quota(0);
+        let ctx = McpContext::new(Cx::for_testing_with_budget(ambient), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(3));
+
+        assert!(ctx.consume_cost(1).is_err());
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+    }
+
+    #[test]
+    fn positive_ambient_cost_quota_drains_cumulatively_across_clones() {
+        const LIMIT: u64 = 3;
+        let ambient = Budget::new().with_cost_quota(LIMIT);
+        let ctx = McpContext::new(Cx::for_testing_with_budget(ambient), 1);
+        let clone = ctx.clone();
+
+        for admitted in 0..LIMIT {
+            let result = if admitted % 2 == 0 {
+                ctx.consume_cost(1)
+            } else {
+                clone.consume_cost(1)
+            };
+            assert!(result.is_ok(), "ambient debit {} should fit", admitted + 1);
+            assert_eq!(ctx.budget().cost_quota, Some(LIMIT - admitted - 1));
+        }
+
+        assert!(
+            clone.consume_cost(1).is_err(),
+            "ambient debit N+1 must fail"
+        );
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert_eq!(
+            ctx.cx().budget().cost_quota,
+            Some(LIMIT),
+            "request-local accounting must not mutate the caller-owned Cx"
+        );
+    }
+
+    #[test]
+    fn rejected_cost_debit_does_not_record_an_ambient_checkpoint() {
+        let cx = Cx::for_testing_with_budget(Budget::new().with_cost_quota(2));
+        let ctx = McpContext::new(cx, 1);
+        let before = ctx.cx().checkpoint_state().checkpoint_count;
+
+        assert!(ctx.consume_cost(3).is_err());
+        assert_eq!(ctx.cx().checkpoint_state().checkpoint_count, before);
+        assert_eq!(ctx.budget().cost_quota, Some(2));
+    }
+
+    #[test]
+    fn zero_cost_debit_observes_explicit_cancellation() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let ctx = McpContext::new(cx, 1);
+
+        assert!(ctx.consume_cost(0).is_err());
+    }
+
+    #[test]
+    fn expired_request_ceiling_fails_without_cancelling_ambient_context() {
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1)
+            .with_budget_ceiling(Budget::new().with_deadline(asupersync::Time::ZERO));
+
+        assert!(ctx.is_cancelled());
+        assert!(ctx.checkpoint().is_err());
+        assert!(!ctx.cx().is_cancel_requested());
+    }
+
+    #[test]
+    fn framework_budget_ceiling_is_deferred_while_masked() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_deadline(asupersync::Time::ZERO));
+
+        assert!(
+            ctx.masked(|| ctx.checkpoint())
+                .expect("mask should be admitted")
+                .is_ok()
+        );
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn framework_poll_debits_continue_while_enforcement_is_masked() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(1));
+
+        ctx.masked(|| {
+            assert!(ctx.checkpoint().is_ok());
+            assert_eq!(ctx.budget().poll_quota, 0);
+            assert!(ctx.checkpoint().is_ok());
+        })
+        .expect("mask should be admitted");
+
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn masked_cost_overage_saturates_framework_ceiling() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(2));
+
+        assert!(
+            ctx.masked(|| ctx.consume_cost(3))
+                .expect("mask should be admitted")
+                .is_ok()
+        );
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert!(ctx.ensure_live().is_err());
+        assert!(ctx.consume_cost(1).is_err());
+    }
+
+    #[test]
+    fn masked_exact_cost_depletion_does_not_become_a_deferred_overrun() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(2));
+
+        assert!(
+            ctx.masked(|| ctx.consume_cost(2))
+                .expect("mask should be admitted")
+                .is_ok()
+        );
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert!(ctx.ensure_live().is_ok());
+        assert!(ctx.consume_cost(0).is_ok());
+        assert!(ctx.consume_cost(1).is_err());
+    }
+
+    #[test]
+    fn masked_cost_overage_saturates_tighter_ambient_quota() {
+        let ambient = Budget::new().with_cost_quota(2);
+        let ctx = McpContext::new(Cx::for_testing_with_budget(ambient), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(10));
+
+        assert!(
+            ctx.masked(|| ctx.consume_cost(3))
+                .expect("mask should be admitted")
+                .is_ok()
+        );
+        assert_eq!(ctx.budget().cost_quota, Some(0));
+        assert_eq!(
+            ctx.budget_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ceiling
+                .and_then(|budget| budget.cost_quota),
+            Some(7),
+            "the looser framework ceiling is still debited independently"
+        );
+        assert!(ctx.consume_cost(1).is_err());
+    }
+
+    #[test]
+    fn framework_mask_is_shared_with_clones_and_restored_after_exit() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_poll_quota(0));
+        let clone = ctx.clone();
+
+        assert!(
+            ctx.masked(|| clone.checkpoint())
+                .expect("mask should be admitted")
+                .is_ok()
+        );
+        assert!(clone.checkpoint().is_err());
+    }
+
+    #[test]
+    fn framework_mask_depth_is_restored_after_unwind() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_deadline(asupersync::Time::ZERO));
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ctx.masked(|| panic!("test-only masked-section panic"));
+        }));
+
+        assert!(ctx.checkpoint().is_err());
+        assert_eq!(ctx.framework_mask_depth.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2404,6 +3937,77 @@ mod tests {
         let reporter = ProgressReporter::new(sender);
         let ctx = McpContext::with_progress(cx, 1, reporter);
         assert!(ctx.has_progress_reporter());
+    }
+
+    #[test]
+    fn progress_reporter_builder_preserves_request_accounting_domain() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_budget_ceiling(Budget::new().with_cost_quota(5));
+        let reporter = ProgressReporter::new(Arc::new(NoOpNotificationSender));
+        let derived = ctx.clone().with_progress_reporter(reporter);
+
+        assert!(derived.has_progress_reporter());
+        assert!(!ctx.has_progress_reporter());
+        assert!(ctx.consume_cost(3).is_ok());
+        assert_eq!(derived.budget().cost_quota, Some(2));
+    }
+
+    #[test]
+    fn isolated_auth_stages_identity_without_handler_capabilities() {
+        let root = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
+            .with_budget_ceiling(Budget::new().with_cost_quota(2))
+            .with_sampling(Arc::new(NoOpSamplingSender))
+            .with_elicitation(Arc::new(NoOpElicitationSender));
+        let staged = root.clone().with_isolated_auth();
+
+        assert!(staged.auth().is_none());
+        assert!(!staged.has_session_state());
+        assert!(!staged.can_sample());
+        assert!(!staged.can_elicit());
+        assert!(!staged.can_read_resources());
+        assert!(!staged.can_call_tools());
+        assert!(staged.set_auth(AuthContext::with_subject("tentative")));
+        assert_eq!(
+            staged.auth().and_then(|auth| auth.subject),
+            Some("tentative".to_string())
+        );
+        assert_eq!(root.auth().and_then(|auth| auth.subject), None);
+
+        assert!(root.set_auth(AuthContext::with_subject("committed")));
+        let attempted_reisolation = root.clone().with_isolated_auth();
+        assert_eq!(
+            attempted_reisolation.auth().and_then(|auth| auth.subject),
+            Some("committed".to_string())
+        );
+
+        assert!(staged.consume_cost(1).is_ok());
+        assert_eq!(root.budget().cost_quota, Some(1));
+    }
+
+    #[test]
+    fn committed_anonymous_auth_is_hidden_and_write_once() {
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new());
+
+        assert!(ctx.commit_anonymous_auth());
+        assert!(ctx.auth().is_none());
+        assert!(matches!(ctx.cache_auth_partition(), Some(None)));
+        assert!(!ctx.set_auth(AuthContext::with_subject("forged")));
+        assert!(!ctx.commit_anonymous_auth());
+
+        let clone = ctx.clone();
+        assert!(clone.auth().is_none());
+        assert!(matches!(clone.cache_auth_partition(), Some(None)));
+    }
+
+    #[test]
+    fn authenticated_cache_partition_contains_committed_facts() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(ctx.set_auth(AuthContext::with_subject("alice")));
+
+        let Some(Some(auth)) = ctx.cache_auth_partition() else {
+            panic!("authenticated admission must expose cache partition facts");
+        };
+        assert_eq!(auth.subject.as_deref(), Some("alice"));
     }
 
     #[test]
@@ -2444,6 +4048,36 @@ mod tests {
     }
 
     #[test]
+    fn request_local_cancellation_suppresses_subsequent_progress() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingSender {
+            count: AtomicU32,
+        }
+
+        impl NotificationSender for CountingSender {
+            fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sender = Arc::new(CountingSender {
+            count: AtomicU32::new(0),
+        });
+        let cancellation = McpRequestCancellation::new();
+        let ctx =
+            McpContext::with_progress(Cx::for_testing(), 1, ProgressReporter::new(sender.clone()))
+                .with_request_cancellation(cancellation.clone());
+
+        ctx.report_progress(0.25, Some("before cancellation"));
+        assert!(cancellation.cancel());
+        ctx.report_progress(0.5, Some("after cancellation"));
+
+        assert_eq!(sender.count.load(Ordering::SeqCst), 1);
+        assert!(!ctx.has_progress_reporter());
+    }
+
+    #[test]
     fn test_progress_reporter_debug() {
         let sender = Arc::new(NoOpNotificationSender);
         let reporter = ProgressReporter::new(sender);
@@ -2472,6 +4106,29 @@ mod tests {
         let state = SessionState::new();
         let ctx = McpContext::with_state(cx, 1, state);
         assert!(ctx.has_session_state());
+    }
+
+    #[test]
+    fn cache_admission_fails_if_session_state_changes_before_completion() {
+        let state = SessionState::new();
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, state.clone());
+        let admitted = ctx
+            .begin_session_cache_partition()
+            .expect("test platform must provide cache-partition entropy");
+        assert_eq!(ctx.complete_session_cache_partition(), Some(admitted));
+
+        assert!(state.set("changed", true));
+        assert!(ctx.complete_session_cache_partition().is_none());
+        assert!(ctx.begin_session_cache_partition().is_none());
+    }
+
+    #[test]
+    fn response_cache_hit_markers_are_middleware_specific() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(ctx.mark_response_cache_hit(10));
+        assert!(ctx.response_was_cache_hit(10));
+        assert!(!ctx.response_was_cache_hit(11));
+        assert!(!ctx.mark_response_cache_hit(0));
     }
 
     #[test]
@@ -2552,9 +4209,8 @@ mod tests {
             ctx.auth().and_then(|auth| auth.subject),
             Some("alice".to_string())
         );
-        let stored: Option<AuthContext> = state.get(crate::AUTH_STATE_KEY);
         assert!(
-            stored.is_none(),
+            state.is_empty(),
             "request auth must not be persisted into session state"
         );
     }
@@ -2570,6 +4226,19 @@ mod tests {
         assert_eq!(
             ctx.auth().and_then(|auth| auth.subject),
             Some("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn committed_request_auth_is_write_once_across_clones() {
+        let ctx =
+            McpContext::new(Cx::for_testing(), 1).with_auth(AuthContext::with_subject("verified"));
+        let clone = ctx.clone();
+
+        assert!(!clone.set_auth(AuthContext::with_subject("replacement")));
+        assert_eq!(
+            ctx.auth().and_then(|auth| auth.subject),
+            Some("verified".to_string())
         );
     }
 
@@ -3219,6 +4888,10 @@ mod tests {
             .with_tool_call_depth(5);
         assert_eq!(ctx.resource_read_depth(), 3);
         assert_eq!(ctx.tool_call_depth(), 5);
+
+        let attempted_reset = ctx.with_resource_read_depth(0).with_tool_call_depth(0);
+        assert_eq!(attempted_reset.resource_read_depth(), 3);
+        assert_eq!(attempted_reset.tool_call_depth(), 5);
     }
 
     #[test]

@@ -1,23 +1,203 @@
 //! Error/warning formatting
 
-use crate::console::FastMcpConsole;
+use std::collections::HashSet;
+
+use crate::config::ConsoleConfig;
+use crate::console::{
+    DEFAULT_LOG_MESSAGE_MAX_CHARS, FastMcpConsole, REDACTED_VALUE, bounded_redacted_rich_fragment,
+    bounded_redacted_rich_text, bounded_redacted_terminal_text, is_credential_key,
+    redact_free_text_credentials,
+};
 use crate::theme::FastMcpTheme;
 use fastmcp_core::{McpError, McpErrorCode};
+use rich_rust::markup;
 use rich_rust::prelude::*;
+use serde_json::Value;
+
+const ERROR_DATA_MAX_DEPTH: usize = 24;
+const ERROR_DATA_MAX_NODES: usize = 1_024;
+const ERROR_DATA_MAX_SOURCE_BYTES: usize = 16 * 1_024;
+const ERROR_DATA_MAX_DISPLAY_CHARS: usize = 2_048;
+const BACKTRACE_MAX_CHARS: usize = 4_096;
+const ERROR_DATA_OMITTED: &str = "<error data omitted: diagnostic budget exceeded>";
+const ERROR_DATA_SERIALIZATION_FAILED: &str = "<error data omitted: serialization failed>";
+
+fn error_data_preview(data: &Value, rich: bool) -> String {
+    if !error_data_is_within_budget(data) {
+        return ERROR_DATA_OMITTED.to_owned();
+    }
+
+    let redacted = redact_error_data_prevalidated(data);
+    let serialized = serde_json::to_string(&redacted)
+        .unwrap_or_else(|_| ERROR_DATA_SERIALIZATION_FAILED.to_owned());
+    if rich {
+        bounded_redacted_rich_text(&serialized, ERROR_DATA_MAX_DISPLAY_CHARS)
+    } else {
+        bounded_redacted_terminal_text(&serialized, ERROR_DATA_MAX_DISPLAY_CHARS)
+    }
+}
+
+fn error_data_is_within_budget(data: &Value) -> bool {
+    let mut remaining_bytes = ERROR_DATA_MAX_SOURCE_BYTES;
+    let mut scheduled_nodes = 1usize;
+    let mut stack = vec![(data, 0usize)];
+
+    while let Some((value, depth)) = stack.pop() {
+        if depth > ERROR_DATA_MAX_DEPTH || !charge_error_data_bytes(&mut remaining_bytes, 1) {
+            return false;
+        }
+
+        match value {
+            Value::Null => {
+                if !charge_error_data_bytes(&mut remaining_bytes, 4) {
+                    return false;
+                }
+            }
+            Value::Bool(_) => {
+                if !charge_error_data_bytes(&mut remaining_bytes, 5) {
+                    return false;
+                }
+            }
+            Value::Number(number) => {
+                if !charge_error_data_bytes(&mut remaining_bytes, number.as_str().len()) {
+                    return false;
+                }
+            }
+            Value::String(string) => {
+                if !charge_error_data_bytes(&mut remaining_bytes, string.len()) {
+                    return false;
+                }
+            }
+            Value::Array(values) => {
+                if !schedule_error_data_children(
+                    &mut stack,
+                    &mut scheduled_nodes,
+                    values.iter(),
+                    depth,
+                ) {
+                    return false;
+                }
+            }
+            Value::Object(object) => {
+                for key in object.keys() {
+                    if !charge_error_data_bytes(&mut remaining_bytes, key.len()) {
+                        return false;
+                    }
+                }
+                if !schedule_error_data_children(
+                    &mut stack,
+                    &mut scheduled_nodes,
+                    object.values(),
+                    depth,
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn schedule_error_data_children<'a>(
+    stack: &mut Vec<(&'a Value, usize)>,
+    scheduled_nodes: &mut usize,
+    children: impl ExactSizeIterator<Item = &'a Value>,
+    parent_depth: usize,
+) -> bool {
+    let child_count = children.len();
+    let Some(total_nodes) = scheduled_nodes.checked_add(child_count) else {
+        return false;
+    };
+    let Some(child_depth) = parent_depth.checked_add(1) else {
+        return false;
+    };
+    if total_nodes > ERROR_DATA_MAX_NODES || stack.try_reserve(child_count).is_err() {
+        return false;
+    }
+
+    *scheduled_nodes = total_nodes;
+    stack.extend(children.map(|child| (child, child_depth)));
+    true
+}
+
+fn charge_error_data_bytes(remaining: &mut usize, amount: usize) -> bool {
+    let Some(after) = remaining.checked_sub(amount) else {
+        return false;
+    };
+    *remaining = after;
+    true
+}
+
+fn redact_error_data_prevalidated(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut used_display_keys = HashSet::new();
+            Value::Object(
+                object
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = if is_credential_key(key) {
+                            Value::String(REDACTED_VALUE.to_owned())
+                        } else {
+                            redact_error_data_prevalidated(value)
+                        };
+                        let key = collision_safe_display_key(
+                            redact_free_text_credentials(key),
+                            &mut used_display_keys,
+                        );
+                        (key, value)
+                    })
+                    .collect(),
+            )
+        }
+        Value::Array(values) => {
+            Value::Array(values.iter().map(redact_error_data_prevalidated).collect())
+        }
+        Value::String(string) => Value::String(redact_free_text_credentials(string)),
+        _ => value.clone(),
+    }
+}
+
+fn collision_safe_display_key(base: String, used: &mut HashSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+
+    // Error-data objects are preflight-limited, so this deterministic suffix
+    // search is bounded while preserving every member whose display key
+    // collides after credential redaction.
+    for suffix in 2..=ERROR_DATA_MAX_NODES {
+        let candidate = format!("{base}#{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    // This requires more colliding keys than the preflight currently admits.
+    // Still guarantee uniqueness if those limits are ever changed separately.
+    let mut candidate = format!("{base}#overflow");
+    while !used.insert(candidate.clone()) {
+        candidate.push('#');
+    }
+    candidate
+}
 
 /// Renders errors in a beautiful, informative format
 pub struct RichErrorRenderer {
     show_suggestions: bool,
-    show_backtrace: bool,
     show_error_code: bool,
+    show_backtrace: bool,
 }
 
 impl Default for RichErrorRenderer {
     fn default() -> Self {
         Self {
             show_suggestions: true,
-            show_backtrace: std::env::var("RUST_BACKTRACE").is_ok(),
             show_error_code: true,
+            // Supplying a backtrace through the direct API is an explicit
+            // request. `from_config` applies the centralized policy instead.
+            show_backtrace: true,
         }
     }
 }
@@ -25,6 +205,16 @@ impl Default for RichErrorRenderer {
 impl RichErrorRenderer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a renderer from centralized console configuration.
+    #[must_use]
+    pub fn from_config(config: &ConsoleConfig) -> Self {
+        Self {
+            show_suggestions: config.show_suggestions,
+            show_error_code: config.show_error_codes,
+            show_backtrace: config.show_backtrace,
+        }
     }
 
     /// Render an error with full context
@@ -48,12 +238,6 @@ impl RichErrorRenderer {
             if let Some(suggestions) = self.get_suggestions(error) {
                 self.render_suggestions(&suggestions, theme, console);
             }
-        }
-
-        // Context/backtrace
-        if self.show_backtrace {
-            // Fallback: reuse render_panic when McpError doesn't carry a backtrace.
-            self.render_panic(&error.message, None, console);
         }
     }
 
@@ -95,27 +279,28 @@ impl RichErrorRenderer {
     }
 
     fn render_error_panel(&self, error: &McpError, theme: &FastMcpTheme, console: &FastMcpConsole) {
-        let message = &error.message;
+        let message = bounded_redacted_rich_text(&error.message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
         let code = i32::from(error.code);
 
         let content = if self.show_error_code {
             format!("[bold]{}[/]\n\n{}", code, message)
         } else {
-            message.clone()
+            message
         };
 
         // Add data context if present
         let content = if let Some(data) = &error.data {
-            if let Ok(pretty) = serde_json::to_string_pretty(data) {
-                format!("{}\n\n[dim]Context:[/]\n{}", content, pretty)
-            } else {
-                content
-            }
+            let preview = error_data_preview(data, true);
+            format!("{}\n\n[dim]Context:[/]\n{}", content, preview)
         } else {
             content
         };
 
-        let panel = Panel::from_text(&content)
+        // `Panel::from_text` deliberately treats markup as literal. Parse the
+        // trusted framing tags once; all peer-controlled fragments were
+        // parity-safe escaped before interpolation above.
+        let text = markup::render_or_plain(&content);
+        let panel = Panel::from_rich_text(&text, console.width())
             .style(theme.border_style.clone()) // Use border style for panel
             .padding(1);
 
@@ -154,36 +339,55 @@ impl RichErrorRenderer {
     }
 
     fn render_plain(&self, error: &McpError, console: &FastMcpConsole) {
-        console.print_plain(&format!(
-            "ERROR [{}]: {}",
-            i32::from(error.code),
-            error.message
-        ));
+        let message = bounded_redacted_terminal_text(&error.message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
+        if self.show_error_code {
+            console.print_plain(&format!("ERROR [{}]: {}", i32::from(error.code), message));
+        } else {
+            console.print_plain(&format!("ERROR: {message}"));
+        }
         if let Some(data) = &error.data {
-            console.print_plain(&format!("Context: {:?}", data));
+            console.print_plain(&format!("Context: {}", error_data_preview(data, false)));
+        }
+        if self.show_suggestions {
+            if let Some(suggestions) = self.get_suggestions(error) {
+                console.print_plain("Suggestions:");
+                for (index, suggestion) in suggestions.iter().enumerate() {
+                    console.print_plain(&format!("  {}. {suggestion}", index + 1));
+                }
+            }
         }
     }
 
     pub fn render_panic(&self, message: &str, backtrace: Option<&str>, console: &FastMcpConsole) {
         let theme = console.theme();
         if !console.is_rich() {
-            eprintln!("PANIC: {}", message);
-            if let Some(bt) = backtrace {
-                eprintln!("Backtrace:\n{}", bt);
+            let message = bounded_redacted_terminal_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
+            console.print_plain(&format!("PANIC: {message}"));
+            if self.show_backtrace
+                && let Some(bt) = backtrace
+            {
+                let backtrace = bounded_redacted_terminal_text(bt, BACKTRACE_MAX_CHARS);
+                console.print_plain(&format!("Backtrace: {backtrace}"));
             }
             return;
         }
 
+        // Panel text is not markup-aware, so retain literal brackets without
+        // inserting rich escape backslashes into the visible output.
+        let message = bounded_redacted_terminal_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
+
         // Main error panel
-        let panel = Panel::from_text(message)
-            .title("[bold red]PANIC[/]")
+        let panel = Panel::from_text(message.as_str())
+            .title_from_markup("[bold red]PANIC[/]")
             .border_style(theme.error_style.clone())
             .rounded();
 
         console.render(&panel);
 
         // Backtrace if available
-        if let Some(bt) = backtrace {
+        if self.show_backtrace
+            && let Some(bt) = backtrace
+        {
             // Fix hex call
             let label_color = theme
                 .label_style
@@ -196,7 +400,8 @@ impl RichErrorRenderer {
             // Syntax-highlight the backtrace (if syntax feature enabled)
             #[cfg(feature = "syntax")]
             {
-                let syntax = Syntax::new(bt, "rust")
+                let backtrace = bounded_redacted_terminal_text(bt, BACKTRACE_MAX_CHARS);
+                let syntax = Syntax::new(&backtrace, "rust")
                     .line_numbers(true)
                     .theme("base16-ocean.dark");
                 console.render(&syntax);
@@ -204,11 +409,10 @@ impl RichErrorRenderer {
 
             #[cfg(not(feature = "syntax"))]
             {
-                for line in bt.lines() {
-                    // Fix hex call
-                    let text_color = theme.text_dim.triplet.unwrap_or_default().hex();
-                    console.print(&format!("  [{}]{}[/]", text_color, line));
-                }
+                let backtrace = bounded_redacted_rich_fragment(bt, BACKTRACE_MAX_CHARS);
+                // Fix hex call
+                let text_color = theme.text_dim.triplet.unwrap_or_default().hex();
+                console.print(&format!("  [{}]{}[/]", text_color, backtrace));
             }
         }
     }
@@ -234,6 +438,7 @@ pub fn render_error(error: &McpError, console: &FastMcpConsole) {
 /// Render a warning
 pub fn render_warning(message: &str, console: &FastMcpConsole) {
     if console.is_rich() {
+        let message = bounded_redacted_rich_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
         console.print(&format!(
             "[{}]⚠[/] [{}]Warning:[/] {}",
             console.theme().warning.triplet.unwrap_or_default().hex(),
@@ -241,20 +446,23 @@ pub fn render_warning(message: &str, console: &FastMcpConsole) {
             message
         ));
     } else {
-        eprintln!("[WARN] {}", message);
+        let message = bounded_redacted_terminal_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
+        console.print_plain(&format!("[WARN] {message}"));
     }
 }
 
 /// Render an info message
 pub fn render_info(message: &str, console: &FastMcpConsole) {
     if console.is_rich() {
+        let message = bounded_redacted_rich_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
         console.print(&format!(
             "[{}]ℹ[/] {}",
             console.theme().info.triplet.unwrap_or_default().hex(),
             message
         ));
     } else {
-        eprintln!("[INFO] {}", message);
+        let message = bounded_redacted_terminal_text(message, DEFAULT_LOG_MESSAGE_MAX_CHARS);
+        console.print_plain(&format!("[INFO] {message}"));
     }
 }
 
@@ -298,7 +506,7 @@ mod tests {
 
     #[test]
     fn rich_error_renderer_renders_error_message() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let err = McpError::new(McpErrorCode::MethodNotFound, "missing method");
         RichErrorRenderer::default().render(&err, tc.console());
         assert!(tc.contains("missing method"));
@@ -351,7 +559,7 @@ mod tests {
 
     #[test]
     fn render_header_renders_all_categories() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer::default();
         let theme = tc.console().theme();
 
@@ -369,11 +577,11 @@ mod tests {
 
     #[test]
     fn render_error_panel_and_suggestions_include_expected_text() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer {
             show_suggestions: true,
-            show_backtrace: false,
             show_error_code: true,
+            show_backtrace: true,
         };
 
         let err = McpError::with_data(
@@ -398,16 +606,16 @@ mod tests {
 
     #[test]
     fn render_respects_show_error_code_flag() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let with_code = RichErrorRenderer {
             show_suggestions: false,
-            show_backtrace: false,
             show_error_code: true,
+            show_backtrace: true,
         };
         let without_code = RichErrorRenderer {
             show_suggestions: false,
-            show_backtrace: false,
             show_error_code: false,
+            show_backtrace: true,
         };
         let err = McpError::new(McpErrorCode::InvalidParams, "invalid params");
 
@@ -421,8 +629,39 @@ mod tests {
     }
 
     #[test]
+    fn renderer_from_config_honors_diagnostic_and_backtrace_controls() {
+        let mut config = ConsoleConfig::new().without_suggestions();
+        config.show_error_codes = false;
+        config.show_backtrace = false;
+        let renderer = RichErrorRenderer::from_config(&config);
+
+        assert!(!renderer.show_suggestions);
+        assert!(!renderer.show_error_code);
+        assert!(!renderer.show_backtrace);
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(output.clone()), false);
+        let error = McpError::new(McpErrorCode::MethodNotFound, "missing method");
+        renderer.render(&error, &console);
+        renderer.render_panic("panic", Some("hidden frame"), &console);
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("ERROR: missing method"), "{output}");
+        assert!(!output.contains("-32601"), "{output}");
+        assert!(!output.contains("Suggestions"), "{output}");
+        assert!(!output.contains("hidden frame"), "{output}");
+
+        config.show_backtrace = true;
+        let renderer = RichErrorRenderer::from_config(&config);
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(output.clone()), false);
+        renderer.render_panic("panic", Some("visible frame"), &console);
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("visible frame"), "{output}");
+    }
+
+    #[test]
     fn render_panic_with_backtrace_and_helper_wrapper() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer::default();
 
         renderer.render_panic("panic happened", Some("frame1\nframe2"), tc.console());
@@ -475,7 +714,7 @@ mod tests {
 
     #[test]
     fn render_header_remaining_categories() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer::new();
         let theme = tc.console().theme();
 
@@ -530,8 +769,55 @@ mod tests {
     }
 
     #[test]
+    fn render_plain_respects_code_and_suggestion_flags() {
+        let error = McpError::new(McpErrorCode::MethodNotFound, "missing method");
+
+        let without_extras = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(without_extras.clone()), false);
+        RichErrorRenderer {
+            show_suggestions: false,
+            show_error_code: false,
+            show_backtrace: true,
+        }
+        .render(&error, &console);
+        let output = String::from_utf8(
+            without_extras
+                .lock()
+                .expect("plain diagnostic output lock poisoned")
+                .clone(),
+        )
+        .expect("plain diagnostic output must be UTF-8");
+        assert!(output.contains("ERROR: missing method"), "{output}");
+        assert!(!output.contains("-32601"), "{output}");
+        assert!(!output.contains("Suggestions"), "{output}");
+        assert!(!output.contains("PANIC"), "{output}");
+
+        let with_extras = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(with_extras.clone()), false);
+        RichErrorRenderer {
+            show_suggestions: true,
+            show_error_code: true,
+            show_backtrace: true,
+        }
+        .render(&error, &console);
+        let output = String::from_utf8(
+            with_extras
+                .lock()
+                .expect("plain diagnostic output lock poisoned")
+                .clone(),
+        )
+        .expect("plain diagnostic output must be UTF-8");
+        assert!(
+            output.contains("ERROR [-32601]: missing method"),
+            "{output}"
+        );
+        assert!(output.contains("Suggestions:"), "{output}");
+        assert!(output.contains("Verify the method name"), "{output}");
+    }
+
+    #[test]
     fn render_panic_without_backtrace() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer::new();
         renderer.render_panic("oops", None, tc.console());
         assert!(tc.contains("PANIC"));
@@ -541,15 +827,14 @@ mod tests {
 
     #[test]
     fn render_warning_and_info_plain_mode() {
-        // Warning and info in plain mode write to stderr via eprintln!, which
-        // we cannot capture through the writer. We just verify the non-rich
-        // branch doesn't panic by constructing a non-rich console.
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
         assert!(!console.is_rich());
         render_warning("disk full", &console);
         render_info("started", &console);
-        // No panic = success; output goes to stderr, not our buffer
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("[WARN] disk full"));
+        assert!(output.contains("[INFO] started"));
     }
 
     #[test]
@@ -564,11 +849,11 @@ mod tests {
 
     #[test]
     fn render_error_panel_without_data() {
-        let tc = TestConsole::new();
+        let tc = TestConsole::new_rich();
         let renderer = RichErrorRenderer {
             show_suggestions: false,
-            show_backtrace: false,
             show_error_code: true,
+            show_backtrace: true,
         };
         let err = McpError::new(McpErrorCode::ParseError, "bad json");
         renderer.render_error_panel(&err, tc.console().theme(), tc.console());
@@ -582,5 +867,192 @@ mod tests {
         let err = McpError::new(McpErrorCode::InternalError, "boom");
         render_error(&err, tc.console());
         assert!(tc.contains("boom"));
+    }
+
+    #[test]
+    fn error_data_preflight_rejects_deep_wide_and_oversized_values() {
+        let mut too_deep = serde_json::json!("leaf");
+        for _ in 0..=ERROR_DATA_MAX_DEPTH {
+            too_deep = serde_json::json!({"nested": too_deep});
+        }
+        assert!(!error_data_is_within_budget(&too_deep));
+
+        let too_wide = Value::Array((0..ERROR_DATA_MAX_NODES).map(|_| Value::Null).collect());
+        assert!(!error_data_is_within_budget(&too_wide));
+
+        let too_large = Value::String("x".repeat(ERROR_DATA_MAX_SOURCE_BYTES + 1));
+        assert!(!error_data_is_within_budget(&too_large));
+        assert!(error_data_is_within_budget(&serde_json::json!({
+            "ordinary": [1, 2, 3]
+        })));
+    }
+
+    #[test]
+    fn redacted_error_data_preserves_members_with_colliding_display_keys() {
+        let data = serde_json::json!({
+            "https://alice:first-secret@example.test": "first value",
+            "https://alice:second-secret@example.test": "second value"
+        });
+        let redacted = redact_error_data_prevalidated(&data);
+        let object = redacted.as_object().expect("redacted object");
+
+        assert_eq!(object.len(), 2);
+        assert!(object.keys().any(|key| key.ends_with("#2")), "{object:?}");
+        assert!(
+            object
+                .values()
+                .any(|value| value.as_str() == Some("first value"))
+        );
+        assert!(
+            object
+                .values()
+                .any(|value| value.as_str() == Some("second value"))
+        );
+        for key in object.keys() {
+            assert!(!key.contains("first-secret"), "{key}");
+            assert!(!key.contains("second-secret"), "{key}");
+        }
+
+        let preview = error_data_preview(&data, false);
+        assert!(preview.contains("first value"), "{preview}");
+        assert!(preview.contains("second value"), "{preview}");
+        assert!(!preview.contains("first-secret"), "{preview}");
+        assert!(!preview.contains("second-secret"), "{preview}");
+    }
+
+    #[test]
+    fn rich_error_output_redacts_credentials_and_escapes_hostile_text() {
+        let tc = TestConsole::new_rich();
+        let renderer = RichErrorRenderer {
+            show_suggestions: false,
+            show_error_code: true,
+            show_backtrace: true,
+        };
+        let error = McpError::with_data(
+            McpErrorCode::InternalError,
+            "failure [bold red]owned[/] Authorization: Bearer message-secret-canary \u{1b}\u{202e}",
+            serde_json::json!({
+                "client_secret": "structured-secret-canary",
+                "ordinary": "still useful",
+                "nested": {"detail": "password=free-text-secret-canary"}
+            }),
+        );
+
+        renderer.render(&error, tc.console());
+        let output = tc.output_string();
+        assert!(output.contains("[bold red]owned[/]"), "{output}");
+        assert!(output.contains("still useful"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+        for secret in [
+            "message-secret-canary",
+            "structured-secret-canary",
+            "free-text-secret-canary",
+        ] {
+            assert!(!output.contains(secret), "leaked {secret}: {output}");
+        }
+        assert!(!output.contains('\u{202e}'), "{output}");
+    }
+
+    #[test]
+    fn plain_error_output_is_bounded_redacted_and_terminal_safe() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        let renderer = RichErrorRenderer {
+            show_suggestions: false,
+            show_error_code: true,
+            show_backtrace: true,
+        };
+        let message = format!(
+            "\u{1b}\u{202e} Authorization: Bearer plain-message-secret {}",
+            "x".repeat(20_000)
+        );
+        let error = McpError::with_data(
+            McpErrorCode::InternalError,
+            message,
+            serde_json::json!({
+                "access_token": "plain-data-secret",
+                "ordinary": "visible"
+            }),
+        );
+
+        renderer.render(&error, &console);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("visible"), "{output}");
+        assert!(output.contains(REDACTED_VALUE), "{output}");
+        assert!(!output.contains("plain-message-secret"), "{output}");
+        assert!(!output.contains("plain-data-secret"), "{output}");
+        assert!(!output.contains('\u{1b}'), "{output}");
+        assert!(!output.contains('\u{202e}'), "{output}");
+        assert!(output.contains("\\u{1b}"), "{output}");
+        assert!(output.chars().count() <= 4_200, "output was unbounded");
+    }
+
+    #[test]
+    fn over_budget_error_data_is_omitted_before_serialization() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        let renderer = RichErrorRenderer {
+            show_suggestions: false,
+            show_error_code: true,
+            show_backtrace: true,
+        };
+        let secret = "oversized-data-secret-canary";
+        let error = McpError::with_data(
+            McpErrorCode::InternalError,
+            "bounded message",
+            serde_json::json!({"ordinary": format!("{secret}{}", "x".repeat(20_000))}),
+        );
+
+        renderer.render(&error, &console);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(ERROR_DATA_OMITTED), "{output}");
+        assert!(!output.contains(secret), "{output}");
+    }
+
+    #[test]
+    fn panic_output_redacts_and_bounds_message_and_backtrace() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let console = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        let message = format!("password=panic-message-secret \u{1b}{}", "m".repeat(20_000));
+        let backtrace = format!(
+            "Authorization: Bearer backtrace-secret \u{202e}{}",
+            "b".repeat(20_000)
+        );
+
+        RichErrorRenderer::new().render_panic(&message, Some(&backtrace), &console);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("panic-message-secret"), "{output}");
+        assert!(!output.contains("backtrace-secret"), "{output}");
+        assert!(!output.contains('\u{1b}'), "{output}");
+        assert!(!output.contains('\u{202e}'), "{output}");
+        assert!(output.contains(REDACTED_VALUE), "{output}");
+        assert!(output.chars().count() <= 6_200, "output was unbounded");
+    }
+
+    #[test]
+    fn warning_and_info_redact_hostile_peer_text_in_both_modes() {
+        let message = "[bold red]owned[/] token=diagnostic-secret \u{1b}\u{202e} ordinary detail";
+
+        let rich = TestConsole::new_rich();
+        render_warning(message, rich.console());
+        render_info(message, rich.console());
+        let rich_output = rich.output_string();
+        assert!(rich_output.contains("[bold red]owned[/]"), "{rich_output}");
+        assert!(rich_output.contains("ordinary detail"), "{rich_output}");
+        assert!(!rich_output.contains("diagnostic-secret"), "{rich_output}");
+        assert!(!rich_output.contains('\u{202e}'), "{rich_output}");
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let plain = FastMcpConsole::with_writer(PlainWriter(buf.clone()), false);
+        render_warning(message, &plain);
+        render_info(message, &plain);
+        let plain_output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(plain_output.contains("ordinary detail"), "{plain_output}");
+        assert!(
+            !plain_output.contains("diagnostic-secret"),
+            "{plain_output}"
+        );
+        assert!(!plain_output.contains('\u{1b}'), "{plain_output}");
+        assert!(!plain_output.contains('\u{202e}'), "{plain_output}");
     }
 }

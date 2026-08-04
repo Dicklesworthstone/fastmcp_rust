@@ -48,6 +48,7 @@ pub trait ProxyBackend: Send {
 
 impl ProxyBackend for Client {
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+        self.ensure_initialized()?;
         if self.server_capabilities().tools.is_none() {
             return Ok(Vec::new());
         }
@@ -55,6 +56,7 @@ impl ProxyBackend for Client {
     }
 
     fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+        self.ensure_initialized()?;
         if self.server_capabilities().resources.is_none() {
             return Ok(Vec::new());
         }
@@ -62,6 +64,7 @@ impl ProxyBackend for Client {
     }
 
     fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+        self.ensure_initialized()?;
         if self.server_capabilities().resources.is_none() {
             return Ok(Vec::new());
         }
@@ -69,6 +72,7 @@ impl ProxyBackend for Client {
     }
 
     fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+        self.ensure_initialized()?;
         if self.server_capabilities().prompts.is_none() {
             return Ok(Vec::new());
         }
@@ -259,6 +263,10 @@ pub(crate) struct ProxyResourceHandler {
     resource: Resource,
     /// The original URI on the remote server (for forwarding).
     external_uri: String,
+    /// Exact exposed prefix, including its trailing separator, when one was
+    /// deliberately configured. URI schemes must never be inferred as proxy
+    /// prefixes.
+    uri_prefix: Option<String>,
     template: Option<ResourceTemplate>,
     client: ProxyClient,
 }
@@ -269,6 +277,7 @@ impl ProxyResourceHandler {
         Self {
             resource,
             external_uri,
+            uri_prefix: None,
             template: None,
             client,
         }
@@ -281,6 +290,7 @@ impl ProxyResourceHandler {
         Self {
             resource,
             external_uri,
+            uri_prefix: Some(format!("{prefix}/")),
             template: None,
             client,
         }
@@ -291,6 +301,7 @@ impl ProxyResourceHandler {
         Self {
             resource: resource_from_template(&template),
             external_uri,
+            uri_prefix: None,
             template: Some(template),
             client,
         }
@@ -307,6 +318,7 @@ impl ProxyResourceHandler {
         Self {
             resource: resource_from_template(&template),
             external_uri,
+            uri_prefix: Some(format!("{prefix}/")),
             template: Some(template),
             client,
         }
@@ -333,21 +345,14 @@ impl ResourceHandler for ProxyResourceHandler {
         uri: &str,
         _params: &UriParams,
     ) -> McpResult<Vec<ResourceContent>> {
-        // For templated resources with a prefix, we need to strip the prefix
-        // to forward the correct URI to the external server.
-        //
-        // If the incoming URI matches our prefixed pattern (e.g., "ext/file://..."),
-        // strip the prefix to get the original URI (e.g., "file://...").
-        let external_uri = if uri.starts_with(&format!(
-            "{}/",
-            self.resource.uri.split('/').next().unwrap_or("")
-        )) {
-            // Strip the prefix (everything before and including the first '/')
-            uri.splitn(2, '/').nth(1).unwrap_or(uri)
-        } else {
-            // No prefix match, use as-is
-            uri
-        };
+        // Strip only a prefix that this handler explicitly installed. Deriving
+        // it from the exposed URI would misclassify `db://` and other schemes,
+        // and splitting once would corrupt configured prefixes containing `/`.
+        let external_uri = self
+            .uri_prefix
+            .as_deref()
+            .and_then(|prefix| uri.strip_prefix(prefix))
+            .unwrap_or(uri);
         self.client.read_resource(ctx, external_uri)
     }
 }
@@ -413,8 +418,12 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use asupersync::Cx;
+    #[cfg(unix)]
+    use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_core::McpContext;
     use fastmcp_protocol::{Content, Prompt, PromptMessage, Resource, ResourceContent, Tool};
 
@@ -424,6 +433,7 @@ mod tests {
     #[derive(Default)]
     struct TestState {
         last_tool: Option<(String, serde_json::Value)>,
+        last_resource: Option<String>,
         last_prompt: Option<(String, HashMap<String, String>)>,
     }
 
@@ -476,7 +486,12 @@ mod tests {
             self.call_tool(name, arguments)
         }
 
-        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+        fn read_resource(&mut self, uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            self.state
+                .lock()
+                .expect("state lock poisoned")
+                .last_resource
+                .replace(uri.to_string());
             Ok(vec![ResourceContent {
                 uri: "test://resource".to_string(),
                 text: Some("resource".to_string()),
@@ -499,6 +514,141 @@ mod tests {
                 },
             }])
         }
+    }
+
+    #[cfg(unix)]
+    fn scripted_response_line(id: i64, result: serde_json::Value) -> String {
+        let message =
+            fastmcp_protocol::JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(id),
+                result,
+            ));
+        let line = serde_json::to_string(&message).expect("serialize scripted response");
+        assert!(
+            !line.contains('\''),
+            "the shell fixture requires a single-quote-free JSON line"
+        );
+        line
+    }
+
+    #[cfg(unix)]
+    fn scripted_peer_timeout_policy() -> RequestTimeoutPolicy {
+        // These fixtures emit responses immediately. Keep the former
+        // five-second total ceiling while detecting an idle peer first.
+        RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5))
+            .expect("valid scripted-peer timeout policy")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_catalog_initializes_real_client_before_capability_checks() {
+        let initialize = fastmcp_protocol::InitializeResult {
+            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_string(),
+            capabilities: fastmcp_protocol::ServerCapabilities {
+                tools: Some(fastmcp_protocol::ToolsCapability::default()),
+                resources: Some(fastmcp_protocol::ResourcesCapability::default()),
+                prompts: Some(fastmcp_protocol::PromptsCapability::default()),
+                ..fastmcp_protocol::ServerCapabilities::default()
+            },
+            server_info: fastmcp_protocol::ServerInfo {
+                name: "proxy-script".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            instructions: None,
+        };
+        let initialize = scripted_response_line(
+            1,
+            serde_json::to_value(initialize).expect("serialize initialize result"),
+        );
+        let tools = scripted_response_line(2, serde_json::json!({"tools": []}));
+        let resources = scripted_response_line(3, serde_json::json!({"resources": []}));
+        let templates = scripted_response_line(4, serde_json::json!({"resourceTemplates": []}));
+        let prompts = scripted_response_line(5, serde_json::json!({"prompts": []}));
+        // Act as a minimal real peer: require every request in protocol order
+        // before releasing its response. A watchdog bounds failures where the
+        // client stops writing while the peer is waiting for the next line.
+        let script = format!(
+            r#"
+peer_pid=$$
+(sleep 8; kill -TERM "$peer_pid" 2>/dev/null) >/dev/null 2>&1 &
+watchdog_pid=$!
+trap 'kill "$watchdog_pid" 2>/dev/null || true' EXIT
+trap 'exit 99' HUP INT TERM
+expect_method() (
+    IFS= read -r line || exit 90
+    case "$line" in
+        *"\"method\":\"$1\""*) ;;
+        *) exit 91 ;;
+    esac
+)
+expect_method initialize || exit $?
+printf '%s\n' '{initialize}'
+expect_method notifications/initialized || exit $?
+expect_method tools/list || exit $?
+printf '%s\n' '{tools}'
+expect_method resources/list || exit $?
+printf '%s\n' '{resources}'
+expect_method resources/templates/list || exit $?
+printf '%s\n' '{templates}'
+expect_method prompts/list || exit $?
+printf '%s\n' '{prompts}'
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+exec sleep 2
+"#
+        );
+        let cx = Cx::for_testing();
+        let mut client = fastmcp_client::ClientBuilder::new()
+            .auto_initialize(true)
+            .request_timeout_policy(scripted_peer_timeout_policy())
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
+            .expect("spawn scripted auto-initializing client");
+        assert!(!client.is_initialized());
+
+        let catalog = ProxyCatalog::from_client(&mut client)
+            .expect("catalog initializes and enumerates advertised capabilities");
+
+        assert!(client.is_initialized());
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        assert!(catalog.prompts.is_empty());
+        client.close().expect("close proxy catalog client");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_catalog_initializes_before_skipping_unadvertised_lists() {
+        let initialize = fastmcp_protocol::InitializeResult {
+            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_string(),
+            capabilities: fastmcp_protocol::ServerCapabilities::default(),
+            server_info: fastmcp_protocol::ServerInfo {
+                name: "proxy-script".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            instructions: None,
+        };
+        let initialize = scripted_response_line(
+            1,
+            serde_json::to_value(initialize).expect("serialize initialize result"),
+        );
+        let script = format!("printf '%s\\n' '{initialize}'; exec sleep 2");
+        let cx = Cx::for_testing();
+        let mut client = fastmcp_client::ClientBuilder::new()
+            .auto_initialize(true)
+            .request_timeout_policy(scripted_peer_timeout_policy())
+            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
+            .expect("spawn scripted auto-initializing client");
+
+        let catalog = ProxyCatalog::from_client(&mut client)
+            .expect("unadvertised lists are skipped only after initialization");
+
+        assert!(client.is_initialized());
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        assert!(catalog.prompts.is_empty());
+        client.close().expect("close proxy catalog client");
     }
 
     #[test]
@@ -923,6 +1073,7 @@ mod tests {
         use crate::handler::ResourceHandler;
 
         let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
         let proxy = ProxyClient::from_backend(backend);
         let handler = ProxyResourceHandler::new(
             Resource {
@@ -941,6 +1092,10 @@ mod tests {
         let result = handler.read(&ctx).expect("read ok");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].text, Some("resource".to_string()));
+        assert_eq!(
+            state.lock().expect("state lock poisoned").last_resource,
+            Some("test://resource".to_string())
+        );
     }
 
     #[test]
@@ -1272,6 +1427,7 @@ mod tests {
         use crate::handler::ResourceHandler;
 
         let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
         let proxy = ProxyClient::from_backend(backend);
         let handler = ProxyResourceHandler::with_prefix(
             Resource {
@@ -1294,6 +1450,10 @@ mod tests {
             .read_with_uri(&ctx, "ext/file://data", &params)
             .expect("read ok");
         assert_eq!(result.len(), 1);
+        assert_eq!(
+            state.lock().expect("state lock poisoned").last_resource,
+            Some("file://data".to_string())
+        );
     }
 
     #[test]
@@ -1302,6 +1462,7 @@ mod tests {
         use crate::handler::ResourceHandler;
 
         let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
         let proxy = ProxyClient::from_backend(backend);
         let handler = ProxyResourceHandler::new(
             Resource {
@@ -1323,6 +1484,10 @@ mod tests {
             .read_with_uri(&ctx, "other://uri", &params)
             .expect("read ok");
         assert_eq!(result.len(), 1);
+        assert_eq!(
+            state.lock().expect("state lock poisoned").last_resource,
+            Some("other://uri".to_string())
+        );
     }
 
     // =========================================================================
@@ -2188,6 +2353,7 @@ mod tests {
         use fastmcp_protocol::ResourceTemplate;
 
         let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
         let proxy = ProxyClient::from_backend(backend);
         let template = ResourceTemplate {
             uri_template: "db://{table}".to_string(),
@@ -2207,6 +2373,10 @@ mod tests {
             .read_with_uri(&ctx, "db://users", &params)
             .expect("read ok");
         assert_eq!(result.len(), 1);
+        assert_eq!(
+            state.lock().expect("state lock poisoned").last_resource,
+            Some("db://users".to_string())
+        );
     }
 
     #[test]
@@ -2216,6 +2386,7 @@ mod tests {
         use fastmcp_protocol::ResourceTemplate;
 
         let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
         let proxy = ProxyClient::from_backend(backend);
         let template = ResourceTemplate {
             uri_template: "db://{table}".to_string(),
@@ -2226,16 +2397,21 @@ mod tests {
             version: None,
             tags: vec![],
         };
-        let handler = ProxyResourceHandler::from_template_with_prefix(template, "remote", proxy);
+        let handler =
+            ProxyResourceHandler::from_template_with_prefix(template, "tenant/remote", proxy);
 
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let mut params = HashMap::new();
         params.insert("table".to_string(), "orders".to_string());
         // Prefixed URI
         let result = handler
-            .read_with_uri(&ctx, "remote/db://orders", &params)
+            .read_with_uri(&ctx, "tenant/remote/db://orders", &params)
             .expect("read ok");
         assert_eq!(result.len(), 1);
+        assert_eq!(
+            state.lock().expect("state lock poisoned").last_resource,
+            Some("db://orders".to_string())
+        );
     }
 
     // =========================================================================

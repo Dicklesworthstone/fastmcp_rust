@@ -3,7 +3,7 @@
 //! Provides beautiful table displays for tools, resources, and prompts
 //! using rich_rust, with plain-text fallback for agent contexts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fastmcp_protocol::{Prompt, PromptArgument, Resource, Tool};
 use rich_rust::r#box::ROUNDED;
@@ -11,9 +11,33 @@ use rich_rust::prelude::*;
 use rich_rust::text::OverflowMethod;
 use serde_json::Value;
 
-use crate::console::FastMcpConsole;
+use crate::config::ConsoleConfig;
+use crate::console::{
+    DEFAULT_TERMINAL_FIELD_MAX_CHARS, FastMcpConsole, bounded_redacted_rich_fragment,
+    bounded_redacted_rich_text, bounded_redacted_terminal_text,
+};
 use crate::detection::DisplayContext;
 use crate::theme::FastMcpTheme;
+
+const TABLE_ROWS_HARD_MAX: usize = 1_000;
+const REQUIRED_NAMES_SCAN_HARD_MAX: usize = 4_096;
+const REQUIRED_NAME_SOURCE_MAX_BYTES: usize = 2_048;
+const REQUIRED_NAMES_SOURCE_MAX_BYTES: usize = 65_536;
+const URI_TEMPLATE_HIGHLIGHT_MAX: usize = 16;
+
+// `Table::add_row_cells` wraps strings as plain `Text`; its values must be
+// terminal-safe but must not carry rich escaping, which would render visibly.
+fn effective_row_limit(configured: usize) -> usize {
+    configured.min(TABLE_ROWS_HARD_MAX)
+}
+
+fn omitted_count(total: usize, shown: usize) -> usize {
+    total.saturating_sub(shown)
+}
+
+fn omitted_label(omitted: usize) -> String {
+    format!("... {omitted} more omitted")
+}
 
 // ============================================================================
 // Tool Table Renderer
@@ -31,6 +55,8 @@ pub struct ToolTableRenderer {
     pub show_parameters: bool,
     /// Maximum width for description column before truncation
     pub max_description_width: usize,
+    /// Maximum number of rows rendered (subject to an internal hard ceiling).
+    pub max_rows: usize,
 }
 
 impl ToolTableRenderer {
@@ -42,7 +68,19 @@ impl ToolTableRenderer {
             context,
             show_parameters: true,
             max_description_width: 50,
+            max_rows: crate::config::ConsoleConfig::default().max_table_rows,
         }
+    }
+
+    /// Create a renderer from centralized console configuration.
+    ///
+    /// The configured display context and table-row limit are resolved once
+    /// when the renderer is constructed.
+    #[must_use]
+    pub fn from_config(config: &ConsoleConfig) -> Self {
+        let mut renderer = Self::new(config.resolve_context());
+        renderer.max_rows = config.max_table_rows;
+        renderer
     }
 
     /// Create a renderer using auto-detected display context.
@@ -57,7 +95,7 @@ impl ToolTableRenderer {
             if self.should_use_rich(console) {
                 console.print("[dim]No tools registered[/]");
             } else {
-                console.print("No tools registered");
+                console.print_plain("No tools registered");
             }
             return;
         }
@@ -77,7 +115,7 @@ impl ToolTableRenderer {
         table.add_column(Column::new("Name").style(self.theme.key_style.clone()));
         table.add_column(
             Column::new("Description")
-                .max_width(self.max_description_width)
+                .max_width(self.description_limit())
                 .overflow(OverflowMethod::Ellipsis),
         );
 
@@ -85,15 +123,27 @@ impl ToolTableRenderer {
             table.add_column(Column::new("Parameters").justify(JustifyMethod::Center));
         }
 
-        for tool in tools {
+        let row_limit = self.row_limit();
+        for tool in tools.iter().take(row_limit) {
+            let name = bounded_redacted_terminal_text(&tool.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
             let desc = tool.description.as_deref().unwrap_or("-");
             let truncated_desc = self.truncate_description(desc);
 
             if self.show_parameters {
                 let params = self.format_parameters(&tool.input_schema);
-                table.add_row_cells([tool.name.as_str(), truncated_desc.as_str(), params.as_str()]);
+                table.add_row_cells([name.as_str(), truncated_desc.as_str(), params.as_str()]);
             } else {
-                table.add_row_cells([tool.name.as_str(), truncated_desc.as_str()]);
+                table.add_row_cells([name.as_str(), truncated_desc.as_str()]);
+            }
+        }
+
+        let omitted = omitted_count(tools.len(), row_limit.min(tools.len()));
+        if omitted > 0 {
+            let label = omitted_label(omitted);
+            if self.show_parameters {
+                table.add_row_cells([label.as_str(), "", ""]);
+            } else {
+                table.add_row_cells([label.as_str(), ""]);
             }
         }
 
@@ -108,15 +158,16 @@ impl ToolTableRenderer {
         }
 
         // Tool name header
-        console.print(&format!("\n[bold cyan]{}[/]", tool.name));
-        console.print(&format!(
-            "[dim]{}[/]\n",
-            tool.description.as_deref().unwrap_or("No description")
-        ));
+        let name = bounded_redacted_rich_fragment(&tool.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let description =
+            self.rich_description(tool.description.as_deref().unwrap_or("No description"));
+        console.print(&format!("\n[bold cyan]{name}[/]"));
+        console.print(&format!("[dim]{description}[/]\n"));
 
         // Parameters table (extracted from JSON Schema)
         let params = self.extract_parameters(&tool.input_schema);
-        if !params.is_empty() {
+        let parameter_count = self.parameter_count(&tool.input_schema);
+        if parameter_count != 0 {
             let mut param_table = Table::new()
                 .title("Parameters")
                 .title_style(self.theme.subheader_style.clone())
@@ -129,14 +180,35 @@ impl ToolTableRenderer {
             param_table.add_column(Column::new("Required").justify(JustifyMethod::Center));
             param_table.add_column(Column::new("Description").max_width(40));
 
-            for param in &params {
-                let required_mark = if param.required { "✓" } else { "" };
-                param_table.add_row_cells([
-                    param.name.as_str(),
+            let row_limit = self.row_limit();
+            for param in params.iter().take(row_limit) {
+                let required_mark = match param.requiredness {
+                    ParameterRequiredness::Required => "✓",
+                    ParameterRequiredness::Optional => "",
+                    ParameterRequiredness::Unknown => "?",
+                };
+                let param_name =
+                    bounded_redacted_terminal_text(&param.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+                let type_name = bounded_redacted_terminal_text(
                     &param.type_name,
-                    required_mark,
+                    DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                );
+                let description = bounded_redacted_terminal_text(
                     param.description.as_deref().unwrap_or("-"),
+                    self.description_limit().min(40),
+                );
+                param_table.add_row_cells([
+                    param_name.as_str(),
+                    type_name.as_str(),
+                    required_mark,
+                    description.as_str(),
                 ]);
+            }
+
+            let omitted = omitted_count(parameter_count, params.len());
+            if omitted > 0 {
+                let label = omitted_label(omitted);
+                param_table.add_row_cells([label.as_str(), "", "", ""]);
             }
 
             console.render(&param_table);
@@ -149,113 +221,184 @@ impl ToolTableRenderer {
         self.context.is_human() && console.is_rich()
     }
 
+    fn row_limit(&self) -> usize {
+        effective_row_limit(self.max_rows)
+    }
+
+    fn description_limit(&self) -> usize {
+        self.max_description_width
+            .clamp(1, DEFAULT_TERMINAL_FIELD_MAX_CHARS)
+    }
+
+    fn rich_description(&self, description: &str) -> String {
+        bounded_redacted_rich_fragment(description, self.description_limit())
+    }
+
     fn format_parameters(&self, schema: &Value) -> String {
         let params = self.extract_parameters(schema);
+        let omitted = omitted_count(self.parameter_count(schema), params.len());
         if params.is_empty() {
-            "none".to_string()
+            if omitted == 0 {
+                "none".to_string()
+            } else {
+                format!("{omitted} omitted")
+            }
         } else {
-            let required = params.iter().filter(|p| p.required).count();
-            let optional = params.len() - required;
+            let required = params
+                .iter()
+                .filter(|p| p.requiredness == ParameterRequiredness::Required)
+                .count();
+            let optional = params
+                .iter()
+                .filter(|p| p.requiredness == ParameterRequiredness::Optional)
+                .count();
+            let unknown = params.len() - required - optional;
 
-            match (required, optional) {
-                (r, 0) => format!("{r} required"),
-                (0, o) => format!("{o} optional"),
-                (r, o) => format!("{r} req, {o} opt"),
+            let visible = match (required, optional, unknown) {
+                (r, 0, 0) => format!("{r} required"),
+                (0, o, 0) => format!("{o} optional"),
+                (r, o, 0) => format!("{r} req, {o} opt"),
+                (0, 0, u) => format!("{u} unknown"),
+                (r, 0, u) => format!("{r} req, {u} unknown"),
+                (0, o, u) => format!("{o} opt, {u} unknown"),
+                (r, o, u) => format!("{r} req, {o} opt, {u} unknown"),
+            };
+            if omitted == 0 {
+                visible
+            } else {
+                format!("{visible}, {omitted} omitted")
             }
         }
+    }
+
+    fn parameter_count(&self, schema: &Value) -> usize {
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len)
     }
 
     fn extract_parameters(&self, schema: &Value) -> Vec<ParameterInfo> {
         let mut params = Vec::new();
 
         let properties = schema.get("properties").and_then(Value::as_object);
-        let required = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let required_values = schema.get("required").and_then(Value::as_array);
+        let mut required_scan_incomplete =
+            required_values.is_some_and(|values| values.len() > REQUIRED_NAMES_SCAN_HARD_MAX);
+        let mut required_source_bytes = 0usize;
+        let mut required = HashSet::new();
+        if let Some(values) = required_values {
+            for value in values.iter().take(REQUIRED_NAMES_SCAN_HARD_MAX) {
+                let Some(name) = value.as_str() else {
+                    required_scan_incomplete = true;
+                    continue;
+                };
+                if name.len() > REQUIRED_NAME_SOURCE_MAX_BYTES {
+                    required_scan_incomplete = true;
+                    continue;
+                }
+                let Some(next_source_bytes) = required_source_bytes.checked_add(name.len()) else {
+                    required_scan_incomplete = true;
+                    break;
+                };
+                if next_source_bytes > REQUIRED_NAMES_SOURCE_MAX_BYTES {
+                    required_scan_incomplete = true;
+                    break;
+                }
+                required_source_bytes = next_source_bytes;
+                required.insert(name);
+            }
+        }
 
         if let Some(props) = properties {
-            for (name, prop) in props {
-                let type_name = prop
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("any")
-                    .to_string();
+            for (raw_name, prop) in props.iter().take(self.row_limit()) {
+                let raw_name_is_bounded = raw_name.len() <= REQUIRED_NAME_SOURCE_MAX_BYTES;
+                let requiredness = if raw_name_is_bounded && required.contains(raw_name.as_str()) {
+                    ParameterRequiredness::Required
+                } else if required_scan_incomplete || !raw_name_is_bounded {
+                    ParameterRequiredness::Unknown
+                } else {
+                    ParameterRequiredness::Optional
+                };
+                let name =
+                    bounded_redacted_terminal_text(raw_name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+                let type_name = prop.get("type").and_then(Value::as_str).unwrap_or("any");
 
                 let description = prop
                     .get("description")
                     .and_then(Value::as_str)
-                    .map(String::from);
+                    .map(|value| {
+                        bounded_redacted_terminal_text(value, DEFAULT_TERMINAL_FIELD_MAX_CHARS)
+                    });
 
                 params.push(ParameterInfo {
-                    name: name.clone(),
-                    type_name,
-                    required: required.contains(name),
+                    requiredness,
+                    name,
+                    type_name: bounded_redacted_terminal_text(
+                        type_name,
+                        DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                    ),
                     description,
                 });
             }
         }
 
-        // Sort: required first, then alphabetically
-        params.sort_by(|a, b| match (a.required, b.required) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
+        // Sort known-required entries first, then unknown, then known-optional;
+        // preserve alphabetical ordering within each truthfulness class.
+        params.sort_by(|a, b| {
+            a.requiredness
+                .sort_rank()
+                .cmp(&b.requiredness.sort_rank())
+                .then_with(|| a.name.cmp(&b.name))
         });
 
         params
     }
 
     fn truncate_description(&self, desc: &str) -> String {
-        let char_count = desc.chars().count();
-        if char_count <= self.max_description_width {
-            desc.to_string()
-        } else {
-            let truncated: String = desc
-                .chars()
-                .take(self.max_description_width.saturating_sub(3))
-                .collect();
-            format!("{truncated}...")
-        }
+        bounded_redacted_terminal_text(desc, self.description_limit())
     }
 
     fn render_plain(&self, tools: &[Tool], console: &FastMcpConsole) {
         console.print_plain(&format!("Registered Tools ({})", tools.len()));
         console.print_plain(&"=".repeat(40));
-        for tool in tools {
-            let desc = tool.description.as_deref().unwrap_or("-");
+        let row_limit = self.row_limit();
+        for tool in tools.iter().take(row_limit) {
+            let name = bounded_redacted_terminal_text(&tool.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            let desc = self.truncate_description(tool.description.as_deref().unwrap_or("-"));
             if self.show_parameters {
                 let params = self.format_parameters(&tool.input_schema);
-                console.print_plain(&format!("  {} - {} [{}]", tool.name, desc, params));
+                console.print_plain(&format!("  {name} - {desc} [{params}]"));
             } else {
-                console.print_plain(&format!("  {} - {}", tool.name, desc));
+                console.print_plain(&format!("  {name} - {desc}"));
             }
+        }
+        let omitted = omitted_count(tools.len(), row_limit.min(tools.len()));
+        if omitted > 0 {
+            console.print_plain(&format!("  {}", omitted_label(omitted)));
         }
     }
 
     fn render_detail_plain(&self, tool: &Tool, console: &FastMcpConsole) {
-        console.print_plain(&format!("Tool: {}", tool.name));
+        let name = bounded_redacted_terminal_text(&tool.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        console.print_plain(&format!("Tool: {name}"));
         console.print_plain(&format!(
             "Description: {}",
-            tool.description.as_deref().unwrap_or("No description")
+            self.truncate_description(tool.description.as_deref().unwrap_or("No description"))
         ));
 
         let params = self.extract_parameters(&tool.input_schema);
-        if params.is_empty() {
+        let parameter_count = self.parameter_count(&tool.input_schema);
+        if parameter_count == 0 {
             console.print_plain("Parameters: none");
         } else {
             console.print_plain("Parameters:");
-            for param in &params {
-                let req = if param.required {
-                    "required"
-                } else {
-                    "optional"
+            let row_limit = self.row_limit();
+            for param in params.iter().take(row_limit) {
+                let req = match param.requiredness {
+                    ParameterRequiredness::Required => "required",
+                    ParameterRequiredness::Optional => "optional",
+                    ParameterRequiredness::Unknown => "requiredness unknown",
                 };
                 console.print_plain(&format!(
                     "  - {}: {} ({}) - {}",
@@ -264,6 +407,10 @@ impl ToolTableRenderer {
                     req,
                     param.description.as_deref().unwrap_or("-")
                 ));
+            }
+            let omitted = omitted_count(parameter_count, params.len());
+            if omitted > 0 {
+                console.print_plain(&format!("  {}", omitted_label(omitted)));
             }
         }
     }
@@ -280,8 +427,27 @@ impl Default for ToolTableRenderer {
 struct ParameterInfo {
     name: String,
     type_name: String,
-    required: bool,
+    requiredness: ParameterRequiredness,
     description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterRequiredness {
+    Required,
+    Optional,
+    /// The schema's required-name list exceeded the defensive scan budget,
+    /// so absence from the scanned prefix cannot prove optionality.
+    Unknown,
+}
+
+impl ParameterRequiredness {
+    const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Required => 0,
+            Self::Unknown => 1,
+            Self::Optional => 2,
+        }
+    }
 }
 
 // ============================================================================
@@ -297,6 +463,8 @@ pub struct ResourceTableRenderer {
     pub max_description_width: usize,
     /// Whether to show MIME type column
     pub show_mime_type: bool,
+    /// Maximum number of rows or tree leaves rendered (subject to a hard ceiling).
+    pub max_rows: usize,
 }
 
 impl ResourceTableRenderer {
@@ -308,7 +476,19 @@ impl ResourceTableRenderer {
             context,
             max_description_width: 40,
             show_mime_type: true,
+            max_rows: crate::config::ConsoleConfig::default().max_table_rows,
         }
+    }
+
+    /// Create a renderer from centralized console configuration.
+    ///
+    /// The configured display context and table-row limit are resolved once
+    /// when the renderer is constructed.
+    #[must_use]
+    pub fn from_config(config: &ConsoleConfig) -> Self {
+        let mut renderer = Self::new(config.resolve_context());
+        renderer.max_rows = config.max_table_rows;
+        renderer
     }
 
     /// Create a renderer using auto-detected display context.
@@ -344,7 +524,7 @@ impl ResourceTableRenderer {
         table.add_column(Column::new("URI").style(self.theme.muted_style.clone()));
         table.add_column(
             Column::new("Description")
-                .max_width(self.max_description_width)
+                .max_width(self.description_limit())
                 .overflow(OverflowMethod::Ellipsis),
         );
 
@@ -352,25 +532,42 @@ impl ResourceTableRenderer {
             table.add_column(Column::new("Type"));
         }
 
-        for resource in resources {
+        let row_limit = self.row_limit();
+        for resource in resources.iter().take(row_limit) {
+            let name =
+                bounded_redacted_terminal_text(&resource.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
             let desc = resource.description.as_deref().unwrap_or("-");
             let truncated_desc = self.truncate_description(desc);
-            let formatted_uri = self.format_uri(&resource.uri);
+            let formatted_uri =
+                bounded_redacted_terminal_text(&resource.uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
 
             if self.show_mime_type {
-                let mime = resource.mime_type.as_deref().unwrap_or("-");
+                let mime = bounded_redacted_terminal_text(
+                    resource.mime_type.as_deref().unwrap_or("-"),
+                    DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                );
                 table.add_row_cells([
-                    resource.name.as_str(),
+                    name.as_str(),
                     formatted_uri.as_str(),
                     truncated_desc.as_str(),
-                    mime,
+                    mime.as_str(),
                 ]);
             } else {
                 table.add_row_cells([
-                    resource.name.as_str(),
+                    name.as_str(),
                     formatted_uri.as_str(),
                     truncated_desc.as_str(),
                 ]);
+            }
+        }
+
+        let omitted = omitted_count(resources.len(), row_limit.min(resources.len()));
+        if omitted > 0 {
+            let label = omitted_label(omitted);
+            if self.show_mime_type {
+                table.add_row_cells([label.as_str(), "", "", ""]);
+            } else {
+                table.add_row_cells([label.as_str(), "", ""]);
             }
         }
 
@@ -384,14 +581,15 @@ impl ResourceTableRenderer {
             return;
         }
 
-        console.print(&format!("\n[bold cyan]{}[/]", resource.name));
+        let name = bounded_redacted_rich_fragment(&resource.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let description =
+            self.rich_description(resource.description.as_deref().unwrap_or("No description"));
+        console.print(&format!("\n[bold cyan]{name}[/]"));
         console.print(&format!("[dim]URI:[/] {}", self.format_uri(&resource.uri)));
-        console.print(&format!(
-            "[dim]Description:[/] {}",
-            resource.description.as_deref().unwrap_or("No description")
-        ));
+        console.print(&format!("[dim]Description:[/] {description}"));
         if let Some(mime) = &resource.mime_type {
-            console.print(&format!("[dim]MIME Type:[/] {}", mime));
+            let mime = bounded_redacted_rich_text(mime, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            console.print(&format!("[dim]MIME Type:[/] {mime}"));
         }
     }
 
@@ -416,7 +614,8 @@ impl ResourceTableRenderer {
 
         // Group resources by URI scheme/prefix
         let mut groups: HashMap<String, Vec<&Resource>> = HashMap::new();
-        for resource in resources {
+        let row_limit = self.row_limit();
+        for resource in resources.iter().take(row_limit) {
             let prefix = self.extract_uri_prefix(&resource.uri);
             groups.entry(prefix).or_default().push(resource);
         }
@@ -429,14 +628,20 @@ impl ResourceTableRenderer {
         sorted_keys.sort();
 
         let root = sorted_keys.into_iter().fold(root, |root, prefix| {
-            let group_resources = groups.get(&prefix).unwrap();
+            let Some(group_resources) = groups.get(&prefix) else {
+                return root;
+            };
+            let prefix = bounded_redacted_rich_fragment(&prefix, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
             let group_node =
-                TreeNode::new(format!("[cyan]{}[/] ({})", prefix, group_resources.len()));
+                TreeNode::new(format!("[cyan]{prefix}[/] ({})", group_resources.len()));
 
             // Add each resource as a child
             let group_node = group_resources.iter().fold(group_node, |node, resource| {
                 let name_part = self.extract_uri_path(&resource.uri);
-                let desc = self.truncate_description(resource.description.as_deref().unwrap_or(""));
+                let desc = bounded_redacted_rich_fragment(
+                    resource.description.as_deref().unwrap_or(""),
+                    self.description_limit(),
+                );
                 let leaf_label = if desc.is_empty() {
                     self.format_uri(&name_part)
                 } else {
@@ -448,6 +653,13 @@ impl ResourceTableRenderer {
             root.child(group_node)
         });
 
+        let omitted = omitted_count(resources.len(), row_limit.min(resources.len()));
+        let root = if omitted > 0 {
+            root.child(TreeNode::new(omitted_label(omitted)))
+        } else {
+            root
+        };
+
         let tree = Tree::new(root).guides(TreeGuides::Rounded);
         console.render(&tree);
     }
@@ -457,48 +669,68 @@ impl ResourceTableRenderer {
     /// Template parts like `{path}` or `{id}` are highlighted to make
     /// them visually distinct from static URI parts.
     fn format_uri(&self, uri: &str) -> String {
+        let uri = bounded_redacted_terminal_text(uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
         if !uri.contains('{') {
-            return uri.to_string();
+            return bounded_redacted_rich_text(&uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
         }
 
-        let mut result = String::with_capacity(uri.len() + 20); // Pre-alloc some extra for markup
+        let mut result = String::with_capacity(uri.len().saturating_add(64));
+        let mut literal = String::new();
         let mut buffer = String::new();
         let mut in_template = false;
+        let mut highlighted = 0usize;
 
         for c in uri.chars() {
             if in_template {
                 buffer.push(c);
                 if c == '}' {
-                    // Valid template part end
-                    result.push_str("[yellow]");
-                    result.push_str(&buffer);
-                    result.push_str("[/]");
+                    if highlighted < URI_TEMPLATE_HIGHLIGHT_MAX {
+                        result.push_str("[yellow]");
+                        result.push_str(&bounded_redacted_rich_fragment(
+                            &buffer,
+                            DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                        ));
+                        result.push_str("[/]");
+                        highlighted += 1;
+                    } else {
+                        result.push_str(&bounded_redacted_rich_text(
+                            &buffer,
+                            DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                        ));
+                    }
                     buffer.clear();
                     in_template = false;
                 } else if c == '{' {
-                    // Nested '{' found, treat previous buffer as literal text
-                    // (URI templates don't support nesting, so assume previous '{' was literal)
-                    // But wait, '{' inside a template is invalid unless escaped.
-                    // Let's just flush the buffer up to the new '{' as literal.
-                    // Actually, simpler: if we hit another '{', assume the previous one was just a char.
-                    // But we already consumed it.
-                    // Let's flush everything except the new char.
-                    result.push_str(&buffer[..buffer.len() - 1]); // Flush previous part
-                    // Keep the new '{' in buffer (buffer now contains just "{")
+                    buffer.pop();
+                    result.push_str(&bounded_redacted_rich_fragment(
+                        &buffer,
+                        DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                    ));
                     buffer.clear();
-                    buffer.push('{');
+                    buffer.push(c);
                 }
             } else if c == '{' {
+                result.push_str(&bounded_redacted_rich_fragment(
+                    &literal,
+                    DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+                ));
+                literal.clear();
                 in_template = true;
                 buffer.push(c);
             } else {
-                result.push(c);
+                literal.push(c);
             }
         }
 
-        // Flush any remaining buffer (unclosed template)
+        result.push_str(&bounded_redacted_rich_text(
+            &literal,
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+        ));
         if in_template {
-            result.push_str(&buffer);
+            result.push_str(&bounded_redacted_rich_text(
+                &buffer,
+                DEFAULT_TERMINAL_FIELD_MAX_CHARS,
+            ));
         }
 
         result
@@ -506,6 +738,7 @@ impl ResourceTableRenderer {
 
     /// Extract the URI scheme/prefix (e.g., "file", "config", "db").
     fn extract_uri_prefix(&self, uri: &str) -> String {
+        let uri = bounded_redacted_terminal_text(uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
         if let Some(idx) = uri.find("://") {
             uri[..idx].to_string()
         } else if let Some(idx) = uri.find(':') {
@@ -517,6 +750,7 @@ impl ResourceTableRenderer {
 
     /// Extract the path portion of a URI after the scheme.
     fn extract_uri_path(&self, uri: &str) -> String {
+        let uri = bounded_redacted_terminal_text(uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
         if let Some(idx) = uri.find("://") {
             uri[idx + 3..].to_string()
         } else if let Some(idx) = uri.find(':') {
@@ -530,40 +764,53 @@ impl ResourceTableRenderer {
         self.context.is_human() && console.is_rich()
     }
 
+    fn row_limit(&self) -> usize {
+        effective_row_limit(self.max_rows)
+    }
+
+    fn description_limit(&self) -> usize {
+        self.max_description_width
+            .clamp(1, DEFAULT_TERMINAL_FIELD_MAX_CHARS)
+    }
+
+    fn rich_description(&self, description: &str) -> String {
+        bounded_redacted_rich_text(description, self.description_limit())
+    }
+
     fn truncate_description(&self, desc: &str) -> String {
-        let char_count = desc.chars().count();
-        if char_count <= self.max_description_width {
-            desc.to_string()
-        } else {
-            let truncated: String = desc
-                .chars()
-                .take(self.max_description_width.saturating_sub(3))
-                .collect();
-            format!("{truncated}...")
-        }
+        bounded_redacted_terminal_text(desc, self.description_limit())
     }
 
     fn render_plain(&self, resources: &[Resource], console: &FastMcpConsole) {
         console.print_plain(&format!("Registered Resources ({})", resources.len()));
         console.print_plain(&"=".repeat(40));
-        for resource in resources {
-            let desc = resource.description.as_deref().unwrap_or("-");
-            console.print_plain(&format!(
-                "  {} ({}) - {}",
-                resource.name, resource.uri, desc
-            ));
+        let row_limit = self.row_limit();
+        for resource in resources.iter().take(row_limit) {
+            let name =
+                bounded_redacted_terminal_text(&resource.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            let uri =
+                bounded_redacted_terminal_text(&resource.uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            let desc = self.truncate_description(resource.description.as_deref().unwrap_or("-"));
+            console.print_plain(&format!("  {name} ({uri}) - {desc}"));
+        }
+        let omitted = omitted_count(resources.len(), row_limit.min(resources.len()));
+        if omitted > 0 {
+            console.print_plain(&format!("  {}", omitted_label(omitted)));
         }
     }
 
     fn render_detail_plain(&self, resource: &Resource, console: &FastMcpConsole) {
-        console.print_plain(&format!("Resource: {}", resource.name));
-        console.print_plain(&format!("URI: {}", resource.uri));
+        let name = bounded_redacted_terminal_text(&resource.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let uri = bounded_redacted_terminal_text(&resource.uri, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        console.print_plain(&format!("Resource: {name}"));
+        console.print_plain(&format!("URI: {uri}"));
         console.print_plain(&format!(
             "Description: {}",
-            resource.description.as_deref().unwrap_or("No description")
+            self.truncate_description(resource.description.as_deref().unwrap_or("No description"))
         ));
         if let Some(mime) = &resource.mime_type {
-            console.print_plain(&format!("MIME Type: {}", mime));
+            let mime = bounded_redacted_terminal_text(mime, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            console.print_plain(&format!("MIME Type: {mime}"));
         }
     }
 }
@@ -587,6 +834,8 @@ pub struct PromptTableRenderer {
     pub max_description_width: usize,
     /// Whether to show argument counts
     pub show_arguments: bool,
+    /// Maximum number of rows rendered (subject to an internal hard ceiling).
+    pub max_rows: usize,
 }
 
 impl PromptTableRenderer {
@@ -598,7 +847,19 @@ impl PromptTableRenderer {
             context,
             max_description_width: 50,
             show_arguments: true,
+            max_rows: crate::config::ConsoleConfig::default().max_table_rows,
         }
+    }
+
+    /// Create a renderer from centralized console configuration.
+    ///
+    /// The configured display context and table-row limit are resolved once
+    /// when the renderer is constructed.
+    #[must_use]
+    pub fn from_config(config: &ConsoleConfig) -> Self {
+        let mut renderer = Self::new(config.resolve_context());
+        renderer.max_rows = config.max_table_rows;
+        renderer
     }
 
     /// Create a renderer using auto-detected display context.
@@ -633,7 +894,7 @@ impl PromptTableRenderer {
         table.add_column(Column::new("Name").style(self.theme.key_style.clone()));
         table.add_column(
             Column::new("Description")
-                .max_width(self.max_description_width)
+                .max_width(self.description_limit())
                 .overflow(OverflowMethod::Ellipsis),
         );
 
@@ -641,15 +902,28 @@ impl PromptTableRenderer {
             table.add_column(Column::new("Arguments").justify(JustifyMethod::Center));
         }
 
-        for prompt in prompts {
+        let row_limit = self.row_limit();
+        for prompt in prompts.iter().take(row_limit) {
+            let name =
+                bounded_redacted_terminal_text(&prompt.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
             let desc = prompt.description.as_deref().unwrap_or("-");
             let truncated_desc = self.truncate_description(desc);
 
             if self.show_arguments {
                 let args = self.format_arguments(&prompt.arguments);
-                table.add_row_cells([prompt.name.as_str(), truncated_desc.as_str(), args.as_str()]);
+                table.add_row_cells([name.as_str(), truncated_desc.as_str(), args.as_str()]);
             } else {
-                table.add_row_cells([prompt.name.as_str(), truncated_desc.as_str()]);
+                table.add_row_cells([name.as_str(), truncated_desc.as_str()]);
+            }
+        }
+
+        let omitted = omitted_count(prompts.len(), row_limit.min(prompts.len()));
+        if omitted > 0 {
+            let label = omitted_label(omitted);
+            if self.show_arguments {
+                table.add_row_cells([label.as_str(), "", ""]);
+            } else {
+                table.add_row_cells([label.as_str(), ""]);
             }
         }
 
@@ -663,11 +937,11 @@ impl PromptTableRenderer {
             return;
         }
 
-        console.print(&format!("\n[bold cyan]{}[/]", prompt.name));
-        console.print(&format!(
-            "[dim]{}[/]\n",
-            prompt.description.as_deref().unwrap_or("No description")
-        ));
+        let name = bounded_redacted_rich_fragment(&prompt.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        let description =
+            self.rich_description(prompt.description.as_deref().unwrap_or("No description"));
+        console.print(&format!("\n[bold cyan]{name}[/]"));
+        console.print(&format!("[dim]{description}[/]\n"));
 
         // Arguments table
         if !prompt.arguments.is_empty() {
@@ -682,13 +956,25 @@ impl PromptTableRenderer {
             arg_table.add_column(Column::new("Required").justify(JustifyMethod::Center));
             arg_table.add_column(Column::new("Description").max_width(40));
 
-            for arg in &prompt.arguments {
+            let row_limit = self.row_limit();
+            for arg in prompt.arguments.iter().take(row_limit) {
                 let required_mark = if arg.required { "✓" } else { "" };
-                arg_table.add_row_cells([
-                    arg.name.as_str(),
-                    required_mark,
+                let name =
+                    bounded_redacted_terminal_text(&arg.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+                let description = bounded_redacted_terminal_text(
                     arg.description.as_deref().unwrap_or("-"),
-                ]);
+                    self.description_limit().min(40),
+                );
+                arg_table.add_row_cells([name.as_str(), required_mark, description.as_str()]);
+            }
+
+            let omitted = omitted_count(
+                prompt.arguments.len(),
+                row_limit.min(prompt.arguments.len()),
+            );
+            if omitted > 0 {
+                let label = omitted_label(omitted);
+                arg_table.add_row_cells([label.as_str(), "", ""]);
             }
 
             console.render(&arg_table);
@@ -701,66 +987,95 @@ impl PromptTableRenderer {
         self.context.is_human() && console.is_rich()
     }
 
+    fn row_limit(&self) -> usize {
+        effective_row_limit(self.max_rows)
+    }
+
+    fn description_limit(&self) -> usize {
+        self.max_description_width
+            .clamp(1, DEFAULT_TERMINAL_FIELD_MAX_CHARS)
+    }
+
+    fn rich_description(&self, description: &str) -> String {
+        bounded_redacted_rich_fragment(description, self.description_limit())
+    }
+
     fn format_arguments(&self, args: &[PromptArgument]) -> String {
         if args.is_empty() {
             return "none".to_string();
         }
-        let required = args.iter().filter(|a| a.required).count();
-        let optional = args.len() - required;
-
-        match (required, optional) {
+        let shown = self.row_limit().min(args.len());
+        let required = args.iter().take(shown).filter(|a| a.required).count();
+        let optional = shown - required;
+        let visible = match (required, optional) {
             (r, 0) => format!("{r} required"),
             (0, o) => format!("{o} optional"),
             (r, o) => format!("{r} req, {o} opt"),
+        };
+        let omitted = omitted_count(args.len(), shown);
+        if omitted == 0 {
+            visible
+        } else if shown == 0 {
+            format!("{omitted} omitted")
+        } else {
+            format!("{visible}, {omitted} omitted")
         }
     }
 
     fn truncate_description(&self, desc: &str) -> String {
-        let char_count = desc.chars().count();
-        if char_count <= self.max_description_width {
-            desc.to_string()
-        } else {
-            let truncated: String = desc
-                .chars()
-                .take(self.max_description_width.saturating_sub(3))
-                .collect();
-            format!("{truncated}...")
-        }
+        bounded_redacted_terminal_text(desc, self.description_limit())
     }
 
     fn render_plain(&self, prompts: &[Prompt], console: &FastMcpConsole) {
         console.print_plain(&format!("Registered Prompts ({})", prompts.len()));
         console.print_plain(&"=".repeat(40));
-        for prompt in prompts {
-            let desc = prompt.description.as_deref().unwrap_or("-");
+        let row_limit = self.row_limit();
+        for prompt in prompts.iter().take(row_limit) {
+            let name =
+                bounded_redacted_terminal_text(&prompt.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+            let desc = self.truncate_description(prompt.description.as_deref().unwrap_or("-"));
             if self.show_arguments {
                 let args = self.format_arguments(&prompt.arguments);
-                console.print_plain(&format!("  {} - {} [{}]", prompt.name, desc, args));
+                console.print_plain(&format!("  {name} - {desc} [{args}]"));
             } else {
-                console.print_plain(&format!("  {} - {}", prompt.name, desc));
+                console.print_plain(&format!("  {name} - {desc}"));
             }
+        }
+        let omitted = omitted_count(prompts.len(), row_limit.min(prompts.len()));
+        if omitted > 0 {
+            console.print_plain(&format!("  {}", omitted_label(omitted)));
         }
     }
 
     fn render_detail_plain(&self, prompt: &Prompt, console: &FastMcpConsole) {
-        console.print_plain(&format!("Prompt: {}", prompt.name));
+        let name = bounded_redacted_terminal_text(&prompt.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        console.print_plain(&format!("Prompt: {name}"));
         console.print_plain(&format!(
             "Description: {}",
-            prompt.description.as_deref().unwrap_or("No description")
+            self.truncate_description(prompt.description.as_deref().unwrap_or("No description"))
         ));
 
         if prompt.arguments.is_empty() {
             console.print_plain("Arguments: none");
         } else {
             console.print_plain("Arguments:");
-            for arg in &prompt.arguments {
+            let row_limit = self.row_limit();
+            for arg in prompt.arguments.iter().take(row_limit) {
                 let req = if arg.required { "required" } else { "optional" };
-                console.print_plain(&format!(
-                    "  - {} ({}) - {}",
-                    arg.name,
-                    req,
-                    arg.description.as_deref().unwrap_or("-")
-                ));
+                let name =
+                    bounded_redacted_terminal_text(&arg.name, DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+                let description = bounded_redacted_terminal_text(
+                    arg.description.as_deref().unwrap_or("-"),
+                    self.description_limit().min(40),
+                );
+                console.print_plain(&format!("  - {name} ({req}) - {description}"));
+            }
+            let omitted = omitted_count(
+                prompt.arguments.len(),
+                row_limit.min(prompt.arguments.len()),
+            );
+            if omitted > 0 {
+                console.print_plain(&format!("  {}", omitted_label(omitted)));
             }
         }
     }
@@ -957,8 +1272,40 @@ mod tests {
         let params = renderer.extract_parameters(&tools[0].input_schema);
         assert_eq!(params.len(), 2);
         // First should be required (expression)
-        assert!(params[0].required);
+        assert_eq!(params[0].requiredness, ParameterRequiredness::Required);
         assert_eq!(params[0].name, "expression");
+    }
+
+    #[test]
+    fn config_constructors_apply_resolved_context_and_table_row_limit() {
+        let config = ConsoleConfig::new()
+            .with_context(DisplayContext::new_agent())
+            .with_max_table_rows(1);
+
+        let tool_renderer = ToolTableRenderer::from_config(&config);
+        let resource_renderer = ResourceTableRenderer::from_config(&config);
+        let prompt_renderer = PromptTableRenderer::from_config(&config);
+        assert_eq!(tool_renderer.context, DisplayContext::Agent);
+        assert_eq!(resource_renderer.context, DisplayContext::Agent);
+        assert_eq!(prompt_renderer.context, DisplayContext::Agent);
+        assert_eq!(tool_renderer.max_rows, 1);
+        assert_eq!(resource_renderer.max_rows, 1);
+        assert_eq!(prompt_renderer.max_rows, 1);
+
+        let tools = TestConsole::new();
+        tool_renderer.render(&sample_tools(), tools.console());
+        tools.assert_contains("1 more omitted");
+        tools.assert_not_contains("search");
+
+        let resources = TestConsole::new();
+        resource_renderer.render(&sample_resources(), resources.console());
+        resources.assert_contains("1 more omitted");
+        resources.assert_not_contains("data.csv");
+
+        let prompts = TestConsole::new();
+        prompt_renderer.render(&sample_prompts(), prompts.console());
+        prompts.assert_contains("1 more omitted");
+        prompts.assert_not_contains("summarize");
     }
 
     #[test]
@@ -1044,6 +1391,7 @@ mod tests {
             context: DisplayContext::new_agent(),
             show_parameters: true,
             max_description_width: 20,
+            max_rows: 100,
         };
 
         assert_eq!(renderer.truncate_description("Short"), "Short");
@@ -1285,7 +1633,7 @@ mod tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "raw");
         assert_eq!(params[0].type_name, "any");
-        assert!(!params[0].required);
+        assert_eq!(params[0].requiredness, ParameterRequiredness::Optional);
         assert!(params[0].description.is_none());
     }
 
@@ -1302,9 +1650,197 @@ mod tests {
         }));
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "z");
-        assert!(params[0].required);
+        assert_eq!(params[0].requiredness, ParameterRequiredness::Required);
         assert_eq!(params[1].name, "a");
-        assert!(!params[1].required);
+        assert_eq!(params[1].requiredness, ParameterRequiredness::Optional);
+    }
+
+    #[test]
+    fn tool_requiredness_uses_raw_names_before_display_truncation() {
+        let common_prefix = "x".repeat(DEFAULT_TERMINAL_FIELD_MAX_CHARS + 8);
+        let required_name = format!("{common_prefix}-required");
+        let optional_name = format!("{common_prefix}-optional");
+        let mut properties = serde_json::Map::new();
+        properties.insert(required_name.clone(), json!({"type": "string"}));
+        properties.insert(optional_name, json!({"type": "string"}));
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": [required_name]
+        });
+
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        let params = renderer.extract_parameters(&schema);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, params[1].name);
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Required)
+                .count(),
+            1
+        );
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Optional)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_requiredness_bounds_each_raw_schema_name_before_hashing() {
+        let bounded_name = "a".repeat(REQUIRED_NAME_SOURCE_MAX_BYTES);
+        let oversized_name = "b".repeat(REQUIRED_NAME_SOURCE_MAX_BYTES + 1);
+        let mut properties = serde_json::Map::new();
+        properties.insert(bounded_name.clone(), json!({"type": "string"}));
+        properties.insert(oversized_name.clone(), json!({"type": "string"}));
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": [bounded_name, oversized_name]
+        });
+
+        let params =
+            ToolTableRenderer::new(DisplayContext::new_agent()).extract_parameters(&schema);
+        assert_eq!(params.len(), 2);
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Required)
+                .count(),
+            1
+        );
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Unknown)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_requiredness_bounds_aggregate_required_name_bytes() {
+        let mut required = (0..(REQUIRED_NAMES_SOURCE_MAX_BYTES / REQUIRED_NAME_SOURCE_MAX_BYTES))
+            .map(|index| {
+                format!(
+                    "{index:04}{}",
+                    "r".repeat(REQUIRED_NAME_SOURCE_MAX_BYTES - 4)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            required.iter().map(String::len).sum::<usize>(),
+            REQUIRED_NAMES_SOURCE_MAX_BYTES
+        );
+        let accepted_name = required[0].clone();
+        let late_name = "late".to_string();
+        required.push(late_name.clone());
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                (accepted_name): {"type": "string"},
+                "early_optional": {"type": "string"},
+                (late_name): {"type": "string"}
+            },
+            "required": required
+        });
+
+        let params =
+            ToolTableRenderer::new(DisplayContext::new_agent()).extract_parameters(&schema);
+        assert_eq!(params.len(), 3);
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Required)
+                .count(),
+            1
+        );
+        assert_eq!(
+            params
+                .iter()
+                .filter(|param| param.requiredness == ParameterRequiredness::Unknown)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn oversized_property_name_is_bounded_and_has_unknown_requiredness() {
+        let huge_name = "p".repeat(100_000);
+        let mut properties = serde_json::Map::new();
+        properties.insert(huge_name, json!({"type": "string"}));
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": []
+        });
+
+        let params =
+            ToolTableRenderer::new(DisplayContext::new_agent()).extract_parameters(&schema);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].requiredness, ParameterRequiredness::Unknown);
+        assert!(params[0].name.chars().count() <= DEFAULT_TERMINAL_FIELD_MAX_CHARS);
+        assert!(params[0].name.ends_with("..."));
+    }
+
+    #[test]
+    fn tool_requiredness_is_unknown_when_required_scan_is_incomplete() {
+        let mut required = Vec::with_capacity(REQUIRED_NAMES_SCAN_HARD_MAX + 1);
+        required.push(Value::String("early_required".to_string()));
+        required.extend(
+            (1..REQUIRED_NAMES_SCAN_HARD_MAX)
+                .map(|index| Value::String(format!("irrelevant_{index}"))),
+        );
+        required.push(Value::String("late_required".to_string()));
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "early_required": {"type": "string"},
+                "late_required": {"type": "string"},
+                "actually_optional": {"type": "string"}
+            },
+            "required": required
+        });
+
+        let renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        let params = renderer.extract_parameters(&schema);
+        assert_eq!(params.len(), 3);
+        assert_eq!(
+            params
+                .iter()
+                .find(|param| param.name == "early_required")
+                .map(|param| param.requiredness),
+            Some(ParameterRequiredness::Required)
+        );
+        for name in ["late_required", "actually_optional"] {
+            assert_eq!(
+                params
+                    .iter()
+                    .find(|param| param.name == name)
+                    .map(|param| param.requiredness),
+                Some(ParameterRequiredness::Unknown)
+            );
+        }
+        assert_eq!(renderer.format_parameters(&schema), "1 req, 2 unknown");
+
+        let console = TestConsole::new();
+        let tool = Tool {
+            name: "scan-limited".to_string(),
+            description: None,
+            input_schema: schema,
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        renderer.render_detail(&tool, console.console());
+        console.assert_contains("late_required: string (requiredness unknown)");
+        console.assert_contains("actually_optional: string (requiredness unknown)");
+        console.assert_not_contains("late_required: string (optional)");
     }
 
     #[test]
@@ -1501,6 +2037,7 @@ mod tests {
             context: DisplayContext::new_human(),
             max_description_width: 12,
             show_mime_type: true,
+            max_rows: 100,
         };
         assert_eq!(resource_renderer.truncate_description("short"), "short");
         assert_eq!(
@@ -1513,6 +2050,7 @@ mod tests {
             context: DisplayContext::new_human(),
             max_description_width: 12,
             show_arguments: true,
+            max_rows: 100,
         };
         assert_eq!(prompt_renderer.truncate_description("short"), "short");
         assert_eq!(
@@ -1564,5 +2102,229 @@ mod tests {
         let _tool = ToolTableRenderer::default();
         let _resource = ResourceTableRenderer::default();
         let _prompt = PromptTableRenderer::default();
+    }
+
+    #[test]
+    fn test_plain_tables_preserve_brackets_and_escape_terminal_controls() {
+        let hostile = "[literal]\nnext\u{1b}\u{202e}";
+
+        let tool = Tool {
+            name: hostile.to_string(),
+            description: Some(hostile.to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let tool_console = TestConsole::new();
+        ToolTableRenderer::new(DisplayContext::new_agent()).render(&[tool], tool_console.console());
+        tool_console.assert_contains("[literal]");
+        tool_console.assert_contains(r"\nnext\u{1b}\u{202e}");
+        tool_console.assert_not_contains(r"\[literal]");
+
+        let resource = Resource {
+            uri: format!("file://{hostile}"),
+            name: hostile.to_string(),
+            description: Some(hostile.to_string()),
+            mime_type: Some(hostile.to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let resource_console = TestConsole::new();
+        ResourceTableRenderer::new(DisplayContext::new_agent())
+            .render_detail(&resource, resource_console.console());
+        resource_console.assert_contains("Resource: [literal]");
+        resource_console.assert_contains(r"\nnext\u{1b}\u{202e}");
+        resource_console.assert_not_contains(r"\[literal]");
+
+        let prompt = Prompt {
+            name: hostile.to_string(),
+            description: Some(hostile.to_string()),
+            arguments: vec![PromptArgument {
+                name: hostile.to_string(),
+                description: Some(hostile.to_string()),
+                required: true,
+            }],
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let prompt_console = TestConsole::new();
+        PromptTableRenderer::new(DisplayContext::new_agent())
+            .render_detail(&prompt, prompt_console.console());
+        prompt_console.assert_contains("Prompt: [literal]");
+        prompt_console.assert_contains(r"\nnext\u{1b}\u{202e}");
+        prompt_console.assert_not_contains(r"\[literal]");
+    }
+
+    #[test]
+    fn test_rich_tables_render_untrusted_markup_as_literal_text() {
+        let canary = "[bold red]FORGED[/]";
+        let parity_canary = r"\[link=https://attacker.invalid]PARITY[/]";
+        let tool = Tool {
+            name: canary.to_string(),
+            description: Some(parity_canary.to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "[italic]parameter[/]": {
+                        "type": "[blue]string[/]",
+                        "description": canary
+                    }
+                }
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let console = TestConsole::new_rich();
+        let renderer = ToolTableRenderer::new(DisplayContext::new_human());
+        renderer.render(&[tool.clone()], console.console());
+        renderer.render_detail(&tool, console.console());
+        console.assert_contains(canary);
+        console.assert_contains(parity_canary);
+        console.assert_contains("[italic]parameter[/]");
+        console.assert_contains("[blue]string[/]");
+        console.assert_not_contains(r"\[bold red]FORGED\[/]");
+        console.assert_not_contains(r"\[italic]parameter\[/]");
+        console.assert_not_contains(r"\[blue]string\[/]");
+
+        let resource_renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+        let formatted = resource_renderer.format_uri("file://[bold]x[/]/{id}\u{1b}");
+        assert!(formatted.contains(r"\[bold]x\[/]"));
+        assert!(formatted.contains("[yellow]{id}[/]"));
+        assert!(!formatted.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn test_rich_resource_summary_uses_plain_terminal_safe_uri_cells() {
+        let resource = Resource {
+            uri: "file://[bold]segment[/]/{id}?token=uri-canary".to_string(),
+            name: "[cyan]resource[/]".to_string(),
+            description: Some("[dim]description[/]".to_string()),
+            mime_type: Some("[green]application/json[/]".to_string()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let console = TestConsole::new_rich();
+        ResourceTableRenderer::new(DisplayContext::new_human())
+            .render(&[resource], console.console());
+
+        console.assert_contains("[cyan]resource[/]");
+        console.assert_contains("file://[bold]segment[/]/{id}?token=[REDACTED]");
+        console.assert_contains("[dim]description[/]");
+        console.assert_contains("[green]application/json[/]");
+        console.assert_not_contains("[yellow]");
+        console.assert_not_contains(r"\[bold]segment\[/]");
+        console.assert_not_contains("uri-canary");
+    }
+
+    #[test]
+    fn test_collection_and_tree_renderers_enforce_row_limits() {
+        let mut tools = sample_tools();
+        let mut extra_tool = tools[0].clone();
+        extra_tool.name = "third-tool".to_string();
+        tools.push(extra_tool);
+        let tool_console = TestConsole::new();
+        let mut tool_renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        tool_renderer.max_rows = 1;
+        tool_renderer.render(&tools, tool_console.console());
+        tool_console.assert_contains("calculate");
+        tool_console.assert_contains("2 more omitted");
+        tool_console.assert_not_contains("search");
+        tool_console.assert_not_contains("third-tool");
+
+        let resources = sample_resources_with_templates();
+        let resource_console = TestConsole::new_rich();
+        let mut resource_renderer = ResourceTableRenderer::new(DisplayContext::new_human());
+        resource_renderer.max_rows = 1;
+        resource_renderer.render_tree(&resources, resource_console.console());
+        resource_console.assert_contains("3 more omitted");
+        resource_console.assert_contains("{path}");
+        resource_console.assert_not_contains("config.json");
+        resource_console.assert_not_contains("users/{id}");
+
+        let prompts = sample_prompts();
+        let prompt_console = TestConsole::new();
+        let mut prompt_renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        prompt_renderer.max_rows = 1;
+        prompt_renderer.render(&prompts, prompt_console.console());
+        prompt_console.assert_contains("greeting");
+        prompt_console.assert_contains("1 more omitted");
+        prompt_console.assert_not_contains("summarize");
+    }
+
+    #[test]
+    fn test_detail_renderers_enforce_nested_row_limits() {
+        let tool = Tool {
+            name: "bounded-tool".to_string(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"},
+                    "c": {"type": "string"}
+                }
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let tool_console = TestConsole::new();
+        let mut tool_renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        tool_renderer.max_rows = 1;
+        tool_renderer.render_detail(&tool, tool_console.console());
+        tool_console.assert_contains("a: string");
+        tool_console.assert_contains("2 more omitted");
+        tool_console.assert_not_contains("b: string");
+        tool_console.assert_not_contains("c: string");
+
+        let prompt = Prompt {
+            name: "bounded-prompt".to_string(),
+            description: None,
+            arguments: vec![
+                PromptArgument {
+                    name: "first".to_string(),
+                    description: None,
+                    required: true,
+                },
+                PromptArgument {
+                    name: "second".to_string(),
+                    description: None,
+                    required: false,
+                },
+            ],
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let prompt_console = TestConsole::new();
+        let mut prompt_renderer = PromptTableRenderer::new(DisplayContext::new_agent());
+        prompt_renderer.max_rows = 1;
+        prompt_renderer.render_detail(&prompt, prompt_console.console());
+        prompt_console.assert_contains("first (required)");
+        prompt_console.assert_contains("1 more omitted");
+        prompt_console.assert_not_contains("second (optional)");
+    }
+
+    #[test]
+    fn test_row_and_description_limits_have_hard_ceilings() {
+        let mut renderer = ToolTableRenderer::new(DisplayContext::new_agent());
+        renderer.max_rows = usize::MAX;
+        renderer.max_description_width = usize::MAX;
+        assert_eq!(renderer.row_limit(), TABLE_ROWS_HARD_MAX);
+        assert_eq!(
+            renderer.description_limit(),
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS
+        );
     }
 }

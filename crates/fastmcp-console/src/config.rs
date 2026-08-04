@@ -1,53 +1,49 @@
 //! Centralized configuration for FastMCP console output.
 //!
-//! `ConsoleConfig` provides a single point of configuration for all aspects
-//! of rich console output, supporting both programmatic and environment
-//! variable-based configuration.
+//! `ConsoleConfig` groups settings consumed by console renderers and their
+//! host integrations, with programmatic and environment-based configuration.
 
 use crate::detection::DisplayContext;
 use std::env;
 
-/// Comprehensive configuration for FastMCP console output
+/// Shared configuration for FastMCP console output and host integrations.
 #[derive(Debug, Clone)]
 pub struct ConsoleConfig {
     // Display mode
     /// Override display context (None = auto-detect)
     pub context: Option<DisplayContext>,
-    /// Force color output even in non-TTY
+    /// Explicit color-mode override (`true` = rich, `false` = plain).
+    ///
+    /// `None` leaves the decision to [`Self::context`] or environment
+    /// detection.
     pub force_color: Option<bool>,
     /// Force plain text mode (no styling)
     pub force_plain: bool,
 
-    // Theme
-    /// Custom color overrides (theme accessed via crate::theme::theme())
-    pub custom_colors: Option<CustomColors>,
-
     // Startup
     /// Show startup banner
     pub show_banner: bool,
-    /// Show capabilities list in banner
+    /// Ask the host's banner renderer to include its capabilities list.
+    ///
+    /// `ConsoleConfig` stores this integration setting but does not itself
+    /// render banners.
     pub show_capabilities: bool,
     /// Banner display style
     pub banner_style: BannerStyle,
 
     // Logging
-    /// Log level filter
-    pub log_level: Option<log::Level>,
-    /// Show timestamps in logs
+    /// Maximum enabled log verbosity for the host's logging integration.
+    pub log_level: log::LevelFilter,
+    /// Ask the host's logging integration to show timestamps.
     pub log_timestamps: bool,
-    /// Show target module in logs
+    /// Ask the host's logging integration to show target modules.
     pub log_targets: bool,
-    /// Show file and line in logs
+    /// Ask the host's logging integration to show source file and line.
     pub log_file_line: bool,
 
     // Runtime
-    /// Show periodic stats
-    pub show_stats_periodic: bool,
-    /// Stats display interval in seconds
-    pub stats_interval_secs: u64,
-    /// Show request/response traffic
-    pub show_request_traffic: bool,
-    /// Traffic logging verbosity
+    /// Traffic logging verbosity. [`TrafficVerbosity::None`] disables traffic
+    /// rendering entirely.
     pub traffic_verbosity: TrafficVerbosity,
 
     // Errors
@@ -55,13 +51,18 @@ pub struct ConsoleConfig {
     pub show_suggestions: bool,
     /// Show error codes
     pub show_error_codes: bool,
-    /// Show backtraces for errors
+    /// Show explicitly captured panic backtraces.
+    ///
+    /// Ordinary [`fastmcp_core::McpError`] values do not carry a captured
+    /// backtrace, so this setting neither captures nor synthesizes one. It is
+    /// honored by `RichErrorRenderer::from_config` when a backtrace is passed
+    /// to `RichErrorRenderer::render_panic`.
     pub show_backtrace: bool,
 
     // Output limits
     /// Maximum rows in tables
     pub max_table_rows: usize,
-    /// Maximum depth for JSON display
+    /// Maximum JSON depth admitted for traffic previews before omission.
     pub max_json_depth: usize,
     /// Truncate long strings at this length
     pub truncate_at: usize,
@@ -89,25 +90,8 @@ pub enum TrafficVerbosity {
     None,
     /// Summary only (method name, timing)
     Summary,
-    /// Include headers/metadata
-    Headers,
     /// Full request/response bodies
     Full,
-}
-
-/// Custom color overrides
-#[derive(Debug, Clone, Default)]
-pub struct CustomColors {
-    /// Primary brand color override
-    pub primary: Option<String>,
-    /// Secondary accent color override
-    pub secondary: Option<String>,
-    /// Success color override
-    pub success: Option<String>,
-    /// Warning color override
-    pub warning: Option<String>,
-    /// Error color override
-    pub error: Option<String>,
 }
 
 impl Default for ConsoleConfig {
@@ -116,17 +100,13 @@ impl Default for ConsoleConfig {
             context: None,
             force_color: None,
             force_plain: false,
-            custom_colors: None,
             show_banner: true,
             show_capabilities: true,
             banner_style: BannerStyle::Full,
-            log_level: None,
+            log_level: log::LevelFilter::Info,
             log_timestamps: true,
             log_targets: true,
             log_file_line: false,
-            show_stats_periodic: false,
-            stats_interval_secs: 60,
-            show_request_traffic: false,
             traffic_verbosity: TrafficVerbosity::None,
             show_suggestions: true,
             show_error_codes: true,
@@ -155,9 +135,12 @@ impl ConsoleConfig {
     /// | `FASTMCP_PLAIN` | (set) | Force plain output |
     /// | `NO_COLOR` | (set) | Disable colors (standard) |
     /// | `FASTMCP_BANNER` | full/compact/minimal/none | Banner style |
-    /// | `FASTMCP_LOG` | trace/debug/info/warn/error | Log level |
+    /// | `FASTMCP_NO_BANNER` | 1/true/yes | Disable the banner |
+    /// | `FASTMCP_LOG` | off/trace/debug/info/warn/error | Log level |
     /// | `FASTMCP_LOG_TIMESTAMPS` | 0/1 | Show timestamps |
-    /// | `FASTMCP_TRAFFIC` | none/summary/headers/full | Traffic logging |
+    /// | `FASTMCP_LOG_TARGETS` | 0/1 | Show target modules |
+    /// | `FASTMCP_LOG_FILE_LINE` | 0/1 | Show source file and line |
+    /// | `FASTMCP_TRAFFIC` | none/summary/full | Traffic logging |
     /// | `RUST_BACKTRACE` | 1/full | Show backtraces |
     #[must_use]
     pub fn from_env() -> Self {
@@ -189,42 +172,56 @@ impl ConsoleConfig {
             };
             config.show_banner = !matches!(config.banner_style, BannerStyle::None);
         }
+        if lookup("FASTMCP_NO_BANNER").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }) {
+            config.show_banner = false;
+            config.banner_style = BannerStyle::None;
+        }
 
         // Logging
         if let Some(level) = lookup("FASTMCP_LOG") {
             config.log_level = match level.to_lowercase().as_str() {
-                "trace" => Some(log::Level::Trace),
-                "debug" => Some(log::Level::Debug),
-                "info" => Some(log::Level::Info),
-                "warn" | "warning" => Some(log::Level::Warn),
-                "error" => Some(log::Level::Error),
-                _ => None,
+                "off" => log::LevelFilter::Off,
+                "trace" => log::LevelFilter::Trace,
+                "debug" => log::LevelFilter::Debug,
+                "info" => log::LevelFilter::Info,
+                "warn" | "warning" => log::LevelFilter::Warn,
+                "error" => log::LevelFilter::Error,
+                _ => config.log_level,
             };
         }
         if lookup("FASTMCP_LOG_TIMESTAMPS")
-            .map(|v| v == "0" || v.to_lowercase() == "false")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(false)
         {
             config.log_timestamps = false;
         }
+        if lookup("FASTMCP_LOG_TARGETS")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(false)
+        {
+            config.log_targets = false;
+        }
+        config.log_file_line = lookup("FASTMCP_LOG_FILE_LINE")
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
 
         // Traffic
         if let Some(val) = lookup("FASTMCP_TRAFFIC") {
             config.traffic_verbosity = match val.to_lowercase().as_str() {
                 "summary" | "1" => TrafficVerbosity::Summary,
-                "headers" | "2" => TrafficVerbosity::Headers,
-                "full" | "3" => TrafficVerbosity::Full,
+                "full" | "2" => TrafficVerbosity::Full,
                 // "none", "0", and any other value default to None
                 _ => TrafficVerbosity::None,
             };
-            config.show_request_traffic =
-                !matches!(config.traffic_verbosity, TrafficVerbosity::None);
         }
 
         // Errors
-        if lookup("RUST_BACKTRACE").is_some() {
-            config.show_backtrace = true;
-        }
+        config.show_backtrace = lookup("RUST_BACKTRACE")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "full"));
 
         config
     }
@@ -233,7 +230,11 @@ impl ConsoleConfig {
     // Builder Methods
     // ─────────────────────────────────────────────────
 
-    /// Force color output
+    /// Set an explicit color-mode override.
+    ///
+    /// Passing `true` forces rich output, including for non-TTY destinations.
+    /// Passing `false` forces plain output. Leave [`Self::force_color`] as
+    /// `None` to use the configured context or automatic detection.
     #[must_use]
     pub fn force_color(mut self, force: bool) -> Self {
         self.force_color = Some(force);
@@ -266,7 +267,14 @@ impl ConsoleConfig {
     /// Set the log level
     #[must_use]
     pub fn with_log_level(mut self, level: log::Level) -> Self {
-        self.log_level = Some(level);
+        self.log_level = level.to_level_filter();
+        self
+    }
+
+    /// Set the log level from a filter, including [`log::LevelFilter::Off`].
+    #[must_use]
+    pub fn with_log_level_filter(mut self, level: log::LevelFilter) -> Self {
+        self.log_level = level;
         self
     }
 
@@ -274,15 +282,6 @@ impl ConsoleConfig {
     #[must_use]
     pub fn with_traffic(mut self, verbosity: TrafficVerbosity) -> Self {
         self.traffic_verbosity = verbosity;
-        self.show_request_traffic = !matches!(verbosity, TrafficVerbosity::None);
-        self
-    }
-
-    /// Enable periodic stats display
-    #[must_use]
-    pub fn with_periodic_stats(mut self, interval_secs: u64) -> Self {
-        self.show_stats_periodic = true;
-        self.stats_interval_secs = interval_secs;
         self
     }
 
@@ -290,13 +289,6 @@ impl ConsoleConfig {
     #[must_use]
     pub fn without_suggestions(mut self) -> Self {
         self.show_suggestions = false;
-        self
-    }
-
-    /// Set custom colors
-    #[must_use]
-    pub fn with_custom_colors(mut self, colors: CustomColors) -> Self {
-        self.custom_colors = Some(colors);
         self
     }
 
@@ -314,7 +306,7 @@ impl ConsoleConfig {
         self
     }
 
-    /// Set maximum JSON depth
+    /// Set the maximum JSON depth admitted for traffic previews.
     #[must_use]
     pub fn with_max_json_depth(mut self, max: usize) -> Self {
         self.max_json_depth = max;
@@ -348,8 +340,12 @@ impl ConsoleConfig {
         if self.force_plain {
             return DisplayContext::new_agent();
         }
-        if let Some(true) = self.force_color {
-            return DisplayContext::new_human();
+        if let Some(force_color) = self.force_color {
+            return if force_color {
+                DisplayContext::new_human()
+            } else {
+                DisplayContext::new_agent()
+            };
         }
         self.context.unwrap_or_else(DisplayContext::detect)
     }
@@ -387,14 +383,11 @@ mod tests {
         let config = ConsoleConfig::new()
             .with_banner(BannerStyle::Compact)
             .with_log_level(log::Level::Debug)
-            .with_traffic(TrafficVerbosity::Summary)
-            .with_periodic_stats(30);
+            .with_traffic(TrafficVerbosity::Summary);
 
         assert_eq!(config.banner_style, BannerStyle::Compact);
-        assert_eq!(config.log_level, Some(log::Level::Debug));
+        assert_eq!(config.log_level, log::LevelFilter::Debug);
         assert_eq!(config.traffic_verbosity, TrafficVerbosity::Summary);
-        assert!(config.show_stats_periodic);
-        assert_eq!(config.stats_interval_secs, 30);
     }
 
     #[test]
@@ -422,10 +415,9 @@ mod tests {
     fn test_from_lookup_defaults_when_empty() {
         let config = config_from_pairs(&[]);
         assert_eq!(config.banner_style, BannerStyle::Full);
-        assert_eq!(config.log_level, None);
+        assert_eq!(config.log_level, log::LevelFilter::Info);
         assert!(config.log_timestamps);
         assert_eq!(config.traffic_verbosity, TrafficVerbosity::None);
-        assert!(!config.show_request_traffic);
         assert!(!config.show_backtrace);
     }
 
@@ -434,6 +426,8 @@ mod tests {
         let config = config_from_pairs(&[("FASTMCP_FORCE_COLOR", "1"), ("FASTMCP_PLAIN", "1")]);
         assert_eq!(config.force_color, Some(true));
         assert!(config.force_plain);
+        assert_eq!(config.resolve_context(), DisplayContext::Agent);
+        assert!(!config.should_use_rich());
 
         let no_color = config_from_pairs(&[("NO_COLOR", "1")]);
         assert!(no_color.force_plain);
@@ -460,21 +454,37 @@ mod tests {
         let fallback = config_from_pairs(&[("FASTMCP_BANNER", "unknown")]);
         assert_eq!(fallback.banner_style, BannerStyle::Full);
         assert!(fallback.show_banner);
+
+        for truthy in ["1", "true", "yes", "on"] {
+            let disabled =
+                config_from_pairs(&[("FASTMCP_BANNER", "full"), ("FASTMCP_NO_BANNER", truthy)]);
+            assert_eq!(disabled.banner_style, BannerStyle::None);
+            assert!(!disabled.show_banner);
+        }
+
+        for falsey in ["0", "false", "no", "off", ""] {
+            let enabled = config_from_pairs(&[("FASTMCP_NO_BANNER", falsey)]);
+            assert_eq!(enabled.banner_style, BannerStyle::Full);
+            assert!(enabled.show_banner);
+        }
     }
 
     #[test]
     fn test_from_lookup_log_levels_and_timestamp_toggle() {
         let trace = config_from_pairs(&[("FASTMCP_LOG", "trace")]);
-        assert_eq!(trace.log_level, Some(log::Level::Trace));
+        assert_eq!(trace.log_level, log::LevelFilter::Trace);
 
         let debug = config_from_pairs(&[("FASTMCP_LOG", "debug")]);
-        assert_eq!(debug.log_level, Some(log::Level::Debug));
+        assert_eq!(debug.log_level, log::LevelFilter::Debug);
 
         let warn_alias = config_from_pairs(&[("FASTMCP_LOG", "warning")]);
-        assert_eq!(warn_alias.log_level, Some(log::Level::Warn));
+        assert_eq!(warn_alias.log_level, log::LevelFilter::Warn);
+
+        let off = config_from_pairs(&[("FASTMCP_LOG", "off")]);
+        assert_eq!(off.log_level, log::LevelFilter::Off);
 
         let invalid = config_from_pairs(&[("FASTMCP_LOG", "verbose")]);
-        assert_eq!(invalid.log_level, None);
+        assert_eq!(invalid.log_level, log::LevelFilter::Info);
 
         let timestamps_disabled_zero = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "0")]);
         assert!(!timestamps_disabled_zero.log_timestamps);
@@ -482,63 +492,50 @@ mod tests {
         let timestamps_disabled_false = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "false")]);
         assert!(!timestamps_disabled_false.log_timestamps);
 
+        let timestamps_disabled_no = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "no")]);
+        assert!(!timestamps_disabled_no.log_timestamps);
+
         let timestamps_enabled = config_from_pairs(&[("FASTMCP_LOG_TIMESTAMPS", "1")]);
         assert!(timestamps_enabled.log_timestamps);
+
+        let targets_disabled = config_from_pairs(&[("FASTMCP_LOG_TARGETS", "no")]);
+        assert!(!targets_disabled.log_targets);
+
+        let file_line_enabled = config_from_pairs(&[("FASTMCP_LOG_FILE_LINE", "yes")]);
+        assert!(file_line_enabled.log_file_line);
     }
 
     #[test]
     fn test_from_lookup_traffic_variants_and_backtrace() {
         let summary = config_from_pairs(&[("FASTMCP_TRAFFIC", "summary")]);
         assert_eq!(summary.traffic_verbosity, TrafficVerbosity::Summary);
-        assert!(summary.show_request_traffic);
 
-        let headers = config_from_pairs(&[("FASTMCP_TRAFFIC", "2")]);
-        assert_eq!(headers.traffic_verbosity, TrafficVerbosity::Headers);
-        assert!(headers.show_request_traffic);
-
-        let full = config_from_pairs(&[("FASTMCP_TRAFFIC", "3")]);
+        let full = config_from_pairs(&[("FASTMCP_TRAFFIC", "2")]);
         assert_eq!(full.traffic_verbosity, TrafficVerbosity::Full);
-        assert!(full.show_request_traffic);
 
         let none = config_from_pairs(&[("FASTMCP_TRAFFIC", "none")]);
         assert_eq!(none.traffic_verbosity, TrafficVerbosity::None);
-        assert!(!none.show_request_traffic);
 
         let unknown = config_from_pairs(&[("FASTMCP_TRAFFIC", "loud")]);
         assert_eq!(unknown.traffic_verbosity, TrafficVerbosity::None);
-        assert!(!unknown.show_request_traffic);
 
         let backtrace = config_from_pairs(&[("RUST_BACKTRACE", "full")]);
         assert!(backtrace.show_backtrace);
+
+        let disabled_backtrace = config_from_pairs(&[("RUST_BACKTRACE", "0")]);
+        assert!(!disabled_backtrace.show_backtrace);
     }
 
     #[test]
     fn test_additional_builder_methods_and_accessors() {
-        let custom = CustomColors {
-            primary: Some("#123456".to_string()),
-            secondary: None,
-            success: Some("#22aa22".to_string()),
-            warning: None,
-            error: Some("#ff0000".to_string()),
-        };
-
         let config = ConsoleConfig::new()
             .without_suggestions()
-            .with_custom_colors(custom.clone())
             .with_context(DisplayContext::new_agent())
             .with_max_table_rows(50)
             .with_max_json_depth(3)
             .with_truncate_at(80);
 
         assert!(!config.show_suggestions);
-        assert!(config.custom_colors.is_some());
-        assert_eq!(
-            config
-                .custom_colors
-                .as_ref()
-                .and_then(|c| c.primary.as_deref()),
-            Some("#123456")
-        );
         assert_eq!(config.context, Some(DisplayContext::Agent));
         assert_eq!(config.max_table_rows, 50);
         assert_eq!(config.max_json_depth, 3);
@@ -573,11 +570,8 @@ mod tests {
         let set_log: fn(ConsoleConfig, log::Level) -> ConsoleConfig = ConsoleConfig::with_log_level;
         let set_traffic: fn(ConsoleConfig, TrafficVerbosity) -> ConsoleConfig =
             ConsoleConfig::with_traffic;
-        let set_stats: fn(ConsoleConfig, u64) -> ConsoleConfig = ConsoleConfig::with_periodic_stats;
         let disable_suggestions: fn(ConsoleConfig) -> ConsoleConfig =
             ConsoleConfig::without_suggestions;
-        let set_custom: fn(ConsoleConfig, CustomColors) -> ConsoleConfig =
-            ConsoleConfig::with_custom_colors;
         let set_context: fn(ConsoleConfig, DisplayContext) -> ConsoleConfig =
             ConsoleConfig::with_context;
         let set_rows: fn(ConsoleConfig, usize) -> ConsoleConfig =
@@ -587,34 +581,20 @@ mod tests {
         let set_truncate: fn(ConsoleConfig, usize) -> ConsoleConfig =
             ConsoleConfig::with_truncate_at;
 
-        let custom = CustomColors {
-            primary: Some("#111111".to_string()),
-            secondary: Some("#222222".to_string()),
-            success: None,
-            warning: Some("#ffaa00".to_string()),
-            error: None,
-        };
-
         let config = set_truncate(
             set_depth(
                 set_rows(
                     set_context(
-                        set_custom(
-                            disable_suggestions(set_stats(
-                                set_traffic(
-                                    set_log(
-                                        set_banner(
-                                            set_force_color(ConsoleConfig::new(), false),
-                                            BannerStyle::None,
-                                        ),
-                                        log::Level::Error,
-                                    ),
-                                    TrafficVerbosity::Headers,
+                        disable_suggestions(set_traffic(
+                            set_log(
+                                set_banner(
+                                    set_force_color(ConsoleConfig::new(), false),
+                                    BannerStyle::None,
                                 ),
-                                15,
-                            )),
-                            custom.clone(),
-                        ),
+                                log::Level::Error,
+                            ),
+                            TrafficVerbosity::Full,
+                        )),
                         DisplayContext::new_human(),
                     ),
                     12,
@@ -627,19 +607,9 @@ mod tests {
         assert_eq!(config.force_color, Some(false));
         assert_eq!(config.banner_style, BannerStyle::None);
         assert!(!config.show_banner);
-        assert_eq!(config.log_level, Some(log::Level::Error));
-        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Headers);
-        assert!(config.show_request_traffic);
-        assert!(config.show_stats_periodic);
-        assert_eq!(config.stats_interval_secs, 15);
+        assert_eq!(config.log_level, log::LevelFilter::Error);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
         assert!(!config.show_suggestions);
-        assert_eq!(
-            config
-                .custom_colors
-                .as_ref()
-                .and_then(|c| c.secondary.as_deref()),
-            Some("#222222")
-        );
         assert_eq!(config.context, Some(DisplayContext::Human));
         assert_eq!(config.max_table_rows, 12);
         assert_eq!(config.max_json_depth, 7);
@@ -659,8 +629,8 @@ mod tests {
         let explicit_human = ConsoleConfig::new()
             .force_color(false)
             .with_context(DisplayContext::new_human());
-        assert_eq!(explicit_human.resolve_context(), DisplayContext::Human);
-        assert!(explicit_human.should_use_rich());
+        assert_eq!(explicit_human.resolve_context(), DisplayContext::Agent);
+        assert!(!explicit_human.should_use_rich());
     }
 
     // =========================================================================
@@ -684,20 +654,7 @@ mod tests {
 
         let cloned = config.clone();
         assert_eq!(cloned.max_table_rows, 42);
-        assert_eq!(cloned.log_level, Some(log::Level::Info));
-    }
-
-    #[test]
-    fn custom_colors_default_all_none() {
-        let colors = CustomColors::default();
-        assert!(colors.primary.is_none());
-        assert!(colors.secondary.is_none());
-        assert!(colors.success.is_none());
-        assert!(colors.warning.is_none());
-        assert!(colors.error.is_none());
-
-        let debug = format!("{colors:?}");
-        assert!(debug.contains("CustomColors"));
+        assert_eq!(cloned.log_level, log::LevelFilter::Info);
     }
 
     #[test]
@@ -714,20 +671,19 @@ mod tests {
     #[test]
     fn from_lookup_remaining_log_levels() {
         let info = config_from_pairs(&[("FASTMCP_LOG", "info")]);
-        assert_eq!(info.log_level, Some(log::Level::Info));
+        assert_eq!(info.log_level, log::LevelFilter::Info);
 
         let warn = config_from_pairs(&[("FASTMCP_LOG", "warn")]);
-        assert_eq!(warn.log_level, Some(log::Level::Warn));
+        assert_eq!(warn.log_level, log::LevelFilter::Warn);
 
         let error = config_from_pairs(&[("FASTMCP_LOG", "error")]);
-        assert_eq!(error.log_level, Some(log::Level::Error));
+        assert_eq!(error.log_level, log::LevelFilter::Error);
     }
 
     #[test]
     fn from_lookup_traffic_numeric_one() {
         let summary = config_from_pairs(&[("FASTMCP_TRAFFIC", "1")]);
         assert_eq!(summary.traffic_verbosity, TrafficVerbosity::Summary);
-        assert!(summary.show_request_traffic);
     }
 
     #[test]
@@ -738,11 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn with_traffic_none_clears_show_request_traffic() {
+    fn with_traffic_none_disables_traffic() {
         let config = ConsoleConfig::new()
             .with_traffic(TrafficVerbosity::Full)
             .with_traffic(TrafficVerbosity::None);
-        assert!(!config.show_request_traffic);
         assert_eq!(config.traffic_verbosity, TrafficVerbosity::None);
     }
 
@@ -752,12 +707,9 @@ mod tests {
         assert!(config.log_targets);
         assert!(!config.log_file_line);
         assert!(config.show_error_codes);
-        assert!(!config.show_stats_periodic);
-        assert_eq!(config.stats_interval_secs, 60);
         assert_eq!(config.max_json_depth, 5);
         assert_eq!(config.truncate_at, 200);
         assert!(config.show_suggestions);
-        assert!(config.custom_colors.is_none());
         assert!(config.context.is_none());
         assert!(config.force_color.is_none());
     }

@@ -1,0 +1,229 @@
+schema_version = 1
+bead_id = "bd-mcp-2026-07-28-support-ahet.1.6"
+finding_id = "FND-01"
+related_finding = "FND-04"
+recorded_at_utc = "2026-07-29T20:56:45Z"
+candidate = "asupersync 0.3.10"
+verdict = "rejected_as_release_pin"
+scope = "Public consumer APIs and behavior present in the exact crates.io package archive."
+
+[archive]
+url = "https://static.crates.io/crates/asupersync/asupersync-0.3.10.crate"
+content_length_bytes = 10428083
+sha256 = "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7"
+registry_checksum = "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7"
+published_at = "2026-07-27T19:52:06Z"
+yanked = false
+packaged_vcs_commit = "dd06981df6d4c65ce40ac13d60aab6df5ae11d58"
+packaged_vcs_dirty = true
+note = "The package VCS metadata is dirty and does not match the v0.3.10 tag. Reproduction is anchored to the immutable archive checksum."
+
+[reproduction]
+archive_path = "/absolute/new/empty/asupersync-0.3.10.crate"
+extraction_directory = "/absolute/new/empty/asupersync-0.3.10-extract"
+extracted_source_root = "/absolute/new/empty/asupersync-0.3.10-extract/asupersync-0.3.10"
+precondition = "The archive path does not exist and the extraction directory is a new path on a disposable audit machine."
+archive_verification = '''
+set -eu
+if [ -e /absolute/new/empty/asupersync-0.3.10.crate ]; then
+  printf 'refusing existing archive path\n' >&2
+  exit 1
+fi
+curl --proto '=https' --tlsv1.2 -fsSLo /absolute/new/empty/asupersync-0.3.10.crate \
+  https://static.crates.io/crates/asupersync/asupersync-0.3.10.crate
+case "$(uname -s)" in
+  Darwin)
+    printf '%s  %s\n' \
+      '76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7' \
+      '/absolute/new/empty/asupersync-0.3.10.crate' | shasum -a 256 -c -
+    ;;
+  Linux)
+    printf '%s  %s\n' \
+      '76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7' \
+      '/absolute/new/empty/asupersync-0.3.10.crate' | sha256sum -c -
+    ;;
+  *)
+    printf 'unsupported checksum platform\n' >&2
+    exit 64
+    ;;
+esac
+'''
+source_hash_verification = '''
+set -eu
+FASTMCP_ARCHIVE=/absolute/new/empty/asupersync-0.3.10.crate
+FASTMCP_EXTRACT_DIR=/absolute/new/empty/asupersync-0.3.10-extract
+FASTMCP_SOURCE_ROOT=/absolute/new/empty/asupersync-0.3.10-extract/asupersync-0.3.10
+
+verify_sha256() {
+  expected=$1
+  path=$2
+  case "$(uname -s)" in
+    Darwin)
+      if ! output=$(shasum -a 256 "$path"); then
+        printf 'SHA-256 command failed for %s\n' "$path" >&2
+        exit 1
+      fi
+      ;;
+    Linux)
+      if ! output=$(sha256sum "$path"); then
+        printf 'SHA-256 command failed for %s\n' "$path" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      printf 'unsupported checksum platform\n' >&2
+      exit 64
+      ;;
+  esac
+  actual=${output%% *}
+  if [ "$actual" != "$expected" ]; then
+    printf 'SHA-256 mismatch for %s\nexpected: %s\nactual:   %s\n' \
+      "$path" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+verify_sha256 \
+  76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7 \
+  "$FASTMCP_ARCHIVE"
+if [ -e "$FASTMCP_EXTRACT_DIR" ]; then
+  printf 'refusing non-new extraction path: %s\n' "$FASTMCP_EXTRACT_DIR" >&2
+  exit 1
+fi
+mkdir "$FASTMCP_EXTRACT_DIR"
+tar -xzf "$FASTMCP_ARCHIVE" -C "$FASTMCP_EXTRACT_DIR"
+if [ ! -d "$FASTMCP_SOURCE_ROOT" ]; then
+  printf 'missing exact extracted source root: %s\n' "$FASTMCP_SOURCE_ROOT" >&2
+  exit 1
+fi
+
+verify_sha256 \
+  516af14e3110790d510943d4e329c1afb957d8257c73e2f4fb1b29d139b933a8 \
+  "$FASTMCP_SOURCE_ROOT/src/cx/cx.rs"
+verify_sha256 \
+  4521de4139fbe9aabe42baba8da7b826dde4472025a32149325bd9490b687bec \
+  "$FASTMCP_SOURCE_ROOT/src/cx/scope.rs"
+verify_sha256 \
+  8e05936deb5d8c705711b580e5804228706dd3a1353977b921ffd070038309bc \
+  "$FASTMCP_SOURCE_ROOT/src/runtime/builder.rs"
+verify_sha256 \
+  c08b2aee703f9f29d0ea659c9ff671dfbc39fdf84df6fa3fc6981bdd621a2f4e \
+  "$FASTMCP_SOURCE_ROOT/src/runtime/state.rs"
+verify_sha256 \
+  7697599162f83ff00697137d598ffb612608a3b4adc0062f4aa3930b33cd1ee6 \
+  "$FASTMCP_SOURCE_ROOT/src/runtime/spawn_blocking.rs"
+verify_sha256 \
+  90fe4feb116838840b62fec8b5825bc35b6af050439dd8fec3e0c736dea26aa8 \
+  "$FASTMCP_SOURCE_ROOT/src/process.rs"
+'''
+line_audit_method = "After the fail-closed extraction and source-hash recipe succeeds, run `nl -ba /absolute/new/empty/asupersync-0.3.10-extract/asupersync-0.3.10/PATH | sed -n RANGEp` for each source range below. Line numbers refer to the exact verified extracted files."
+negative_inventory_query = "rg -n 'pub (async )?fn (stdin|stdout|stderr)|pub struct (Stdin|Stdout|Stderr)|struct (Stdin|Stdout|Stderr)' /absolute/new/empty/asupersync-0.3.10-extract/asupersync-0.3.10/src"
+negative_inventory_result = "Only process Command configuration methods, Child accessors, ChildStdin/ChildStdout/ChildStderr, and an unrelated observability StdoutExporter matched. No public own-process async stdin/stdout adapter matched."
+
+[[source_files]]
+path = "src/cx/cx.rs"
+sha256 = "516af14e3110790d510943d4e329c1afb957d8257c73e2f4fb1b29d139b933a8"
+
+[[source_files]]
+path = "src/cx/scope.rs"
+sha256 = "4521de4139fbe9aabe42baba8da7b826dde4472025a32149325bd9490b687bec"
+
+[[source_files]]
+path = "src/runtime/builder.rs"
+sha256 = "8e05936deb5d8c705711b580e5804228706dd3a1353977b921ffd070038309bc"
+
+[[source_files]]
+path = "src/runtime/state.rs"
+sha256 = "c08b2aee703f9f29d0ea659c9ff671dfbc39fdf84df6fa3fc6981bdd621a2f4e"
+
+[[source_files]]
+path = "src/runtime/spawn_blocking.rs"
+sha256 = "7697599162f83ff00697137d598ffb612608a3b4adc0062f4aa3930b33cd1ee6"
+
+[[source_files]]
+path = "src/process.rs"
+sha256 = "90fe4feb116838840b62fec8b5825bc35b6af050439dd8fec3e0c736dea26aa8"
+
+[[prerequisites]]
+id = "FND-04-P1"
+name = "ambient-Cx-owned-child-region"
+required_contract = "From an ambient &Cx, a public consumer can create a genuinely owned child region whose cancellation, close, drain, and quiescence are independent and observable."
+status = "unresolved"
+candidate_result = "fail"
+release_consequence = "Blocks 0.3.10 release pin."
+observations = [
+  "Cx::scope documentation calls the implementation Phase 0 and says it binds to the current region.",
+  "Cx::scope constructs Scope with self.region_id().",
+  "Cx::scope_with_budget also constructs Scope with self.region_id().",
+  "Cx::scope_with_budget_and_capability_budget delegates to scope_with_budget and preserves that scope's region_id().",
+  "The APIs that actually call create_child_region_with_capability_budget_and_priority are Scope::region* and require &mut RuntimeState.",
+]
+source_ranges = [
+  "src/cx/cx.rs:3707-3731",
+  "src/cx/cx.rs:3733-3807",
+  "src/cx/cx.rs:3810-3831",
+  "src/cx/scope.rs:545-715",
+]
+minimum_acceptable_resolution = "A supported public API callable from ambient &Cx must create and own a distinct child region and expose cancellation plus close/drain/quiescence semantics without consumer access to RuntimeState."
+
+[[prerequisites]]
+id = "FND-04-P2"
+name = "ambient-Cx-guaranteed-non-inline-bounded-blocking"
+required_contract = "From the ambient &Cx available to FastMCP, a public bounded blocking facility is detectable and guarantees the closure does not execute inline on an async worker."
+status = "unresolved"
+candidate_result = "fail"
+release_consequence = "Blocks 0.3.10 release pin."
+observations = [
+  "Cx::spawn_blocking documentation explicitly states that the closure runs inline when the Cx lacks a blocking-pool handle.",
+  "Cx::spawn_blocking executes f(child) directly in the None arm.",
+  "Cx::spawn_blocking_in has the same inline None arm.",
+  "The pool-handle accessor is crate-private, so FastMCP cannot reliably preflight and reject the inline path through public API.",
+  "Runtime- and RuntimeState-level blocking handles exist, but FastMCP deliberately receives only the consumer runtime's ambient &Cx and cannot recover either owner object from that context through public API.",
+  "The free runtime spawn_blocking helper also runs inline for a current Cx without a pool.",
+]
+source_ranges = [
+  "src/cx/cx.rs:4142-4188",
+  "src/cx/cx.rs:4190-4223",
+  "src/runtime/builder.rs:3547-3577",
+  "src/runtime/builder.rs:3731-3765",
+  "src/runtime/spawn_blocking.rs",
+]
+minimum_acceptable_resolution = "A public ambient-Cx API must either guarantee pool execution or return a detectable error before invoking the closure when no bounded blocking executor is available."
+
+[[prerequisites]]
+id = "FND-04-P3"
+name = "cross-platform-own-and-child-process-async-stdio"
+required_contract = "Public cancel-aware own-process and spawned-child stdin/stdout work on Linux, macOS, and Windows without private drivers, test-only internals, per-stream threads, or blocking-pipe fallbacks."
+status = "unresolved"
+candidate_result = "fail"
+release_consequence = "Blocks 0.3.10 release pin."
+observations = [
+  "ChildStdin is public, but its non-Unix poll_write and poll_flush return io::ErrorKind::Unsupported.",
+  "ChildStdin poll_shutdown has no platform split and returns Poll::Ready(Ok(())) on every platform; it is not part of the Unsupported finding.",
+  "ChildStdout and ChildStderr are public, but their non-Unix poll_read implementations return io::ErrorKind::Unsupported.",
+  "Windows wait_with_output documents that std::process anonymous pipes are blocking and drains stdout/stderr on bounded helper threads.",
+  "spawn_process_output_reader creates a distinct std::thread for each captured stream.",
+  "The exact archive's public API inventory contains child-process pipe accessors but no own-process async stdin/stdout adapter.",
+]
+source_ranges = [
+  "src/process.rs:1587-1625",
+  "src/process.rs:1635-1707",
+  "src/process.rs:1980-2106",
+  "src/process.rs:2140-2216",
+  "src/process.rs:2240-2316",
+]
+minimum_acceptable_resolution = "Public production APIs must provide cancel-aware own-process and child-process stdio across all required platforms, including native Windows async pipe behavior without helper-thread substitution."
+
+[disposition]
+prerequisites_total = 3
+prerequisites_satisfied = 0
+prerequisites_unresolved = 3
+release_pin = "asupersync 0.3.9"
+candidate_use = "feasibility-only"
+recheck_trigger = "A new exact asupersync release or immutable commit claims to resolve one or more FND-04 prerequisites."
+recheck_requirements = [
+  "Repeat archive checksum, feature graph, and public source audit.",
+  "Compile public-consumer probes without test-internals.",
+  "Run behavior probes on Linux, macOS, and Windows.",
+  "Accept a release change only if all three prerequisites pass.",
+]

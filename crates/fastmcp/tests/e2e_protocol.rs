@@ -77,13 +77,10 @@ fn error_tool_handler() -> McpResult<String> {
 )]
 fn auth_info_tool_handler(ctx: &McpContext) -> String {
     let auth = ctx.auth().unwrap_or_else(AuthContext::anonymous);
-    let access = auth.token.as_ref();
 
     let payload = json!({
         "subject": auth.subject,
         "scopes": auth.scopes,
-        "scheme": access.map(|t| t.scheme.clone()),
-        "token": access.map(|t| t.token.clone()),
     });
 
     payload.to_string()
@@ -309,7 +306,9 @@ fn e2e_initialize_stores_server_info() {
 #[test]
 fn e2e_auth_static_token_flow_allows_and_denies() {
     let verifier = StaticTokenVerifier::new([("good-token", AuthContext::with_subject("user-1"))])
-        .with_allowed_schemes(["Bearer"]);
+        .expect("valid verifier configuration")
+        .with_allowed_schemes(["Bearer"])
+        .expect("valid scheme configuration");
     let provider = TokenAuthProvider::new(verifier);
 
     let mut client = setup_auth_server_and_client(provider, "e2e-auth-static");
@@ -372,7 +371,7 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     };
     assert_eq!(text, "Hello, Ada!");
 
-    // Verify the server stored auth context into McpContext (subject + token).
+    // Verify handlers receive verified identity facts, never the raw token.
     let params = json!({
         "name": "auth_info",
         "arguments": {},
@@ -395,149 +394,12 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
         auth_json.get("subject").and_then(|v| v.as_str()),
         Some("user-1")
     );
-    assert_eq!(
-        auth_json.get("token").and_then(|v| v.as_str()),
-        Some("good-token")
-    );
+    assert!(auth_json.get("token").is_none());
+    assert!(!text.contains("good-token"));
 }
 
-#[cfg(feature = "jwt")]
-#[test]
-fn e2e_auth_jwt_flow_allows_and_denies() {
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let signing_bytes = b"e2e-jwt-bytes";
-    let verifier = fastmcp_rust::JwtTokenVerifier::hs256(signing_bytes);
-    let provider = TokenAuthProvider::new(verifier);
-
-    let mut client = setup_auth_server_and_client(provider, "e2e-auth-jwt");
-    client.initialize().unwrap();
-
-    let mut trace = TestTrace::new("e2e-auth-jwt");
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let exp_ok = i64::try_from(now + 10 * 60).unwrap();
-    let token_ok = encode(
-        &Header::new(Algorithm::HS256),
-        &json!({
-            "sub": "user123",
-            "scope": "read write",
-            "exp": exp_ok,
-        }),
-        &EncodingKey::from_secret(signing_bytes),
-    )
-    .unwrap();
-
-    // Unauthorized tools/list.
-    let params = json!({ "cursor": null });
-    let corr = trace.log_request("tools/list", Some(&params));
-    let err = client.send_request_json("tools/list", params).unwrap_err();
-    trace.log_response(
-        &corr,
-        None::<&serde_json::Value>,
-        Some(&json!({"error": err.message})),
-    );
-    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
-
-    // Expired token should be rejected.
-    let exp_expired = i64::try_from(now.saturating_sub(60)).unwrap();
-    let token_expired = encode(
-        &Header::new(Algorithm::HS256),
-        &json!({
-            "sub": "user123",
-            "scope": "read write",
-            "exp": exp_expired,
-        }),
-        &EncodingKey::from_secret(signing_bytes),
-    )
-    .unwrap();
-    let params = json!({ "cursor": null, "auth": format!("Bearer {token_expired}") });
-    let corr = trace.log_request("tools/list(expired)", Some(&params));
-    let err = client.send_request_json("tools/list", params).unwrap_err();
-    trace.log_response(
-        &corr,
-        None::<&serde_json::Value>,
-        Some(&json!({"error": err.message})),
-    );
-    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
-
-    // Invalid signature should be rejected.
-    let token_bad_sig = encode(
-        &Header::new(Algorithm::HS256),
-        &json!({
-            "sub": "user123",
-            "scope": "read write",
-            "exp": exp_ok,
-        }),
-        &EncodingKey::from_secret(b"wrong-secret"),
-    )
-    .unwrap();
-    let params = json!({ "cursor": null, "auth": format!("Bearer {token_bad_sig}") });
-    let corr = trace.log_request("tools/list(bad_sig)", Some(&params));
-    let err = client.send_request_json("tools/list", params).unwrap_err();
-    trace.log_response(
-        &corr,
-        None::<&serde_json::Value>,
-        Some(&json!({"error": err.message})),
-    );
-    assert_eq!(err.code, McpErrorCode::ResourceForbidden);
-
-    // Authorized tools/call.
-    let params = json!({
-        "name": "greeting",
-        "arguments": { "name": "Linus" },
-        "auth": format!("Bearer {token_ok}"),
-    });
-    let corr = trace.log_request("tools/call", Some(&params));
-    let value = client.send_request_json("tools/call", params).unwrap();
-    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
-
-    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
-    assert!(!call.is_error);
-    assert!(
-        matches!(call.content.first(), Some(Content::Text { .. })),
-        "expected text content"
-    );
-    let Some(Content::Text { text }) = call.content.first() else {
-        return;
-    };
-    assert_eq!(text, "Hello, Linus!");
-
-    // Verify claims extracted to auth context.
-    let params = json!({
-        "name": "auth_info",
-        "arguments": {},
-        "auth": format!("Bearer {token_ok}"),
-    });
-    let corr = trace.log_request("tools/call(auth_info)", Some(&params));
-    let value = client.send_request_json("tools/call", params).unwrap();
-    trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
-
-    let call: fastmcp_protocol::CallToolResult = serde_json::from_value(value).unwrap();
-    assert!(
-        matches!(call.content.first(), Some(Content::Text { .. })),
-        "expected text content"
-    );
-    let Some(Content::Text { text }) = call.content.first() else {
-        return;
-    };
-    let auth_json: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(
-        auth_json.get("subject").and_then(|v| v.as_str()),
-        Some("user123")
-    );
-    let scopes = auth_json
-        .get("scopes")
-        .and_then(|v| v.as_array())
-        .expect("scopes array");
-    let scopes: Vec<_> = scopes.iter().filter_map(|v| v.as_str()).collect();
-    assert!(scopes.contains(&"read"));
-    assert!(scopes.contains(&"write"));
-}
+// FND-01: JWT e2e removed — undeclared cfg(feature="jwt") is fatal under -D warnings,
+// and production JWT is not a facade/server feature (FACADE-NO-JSONWEBTOKEN).
 
 #[test]
 fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
@@ -548,22 +410,22 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
 
     let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
     let client_def = OAuthClient::builder("test-client")
-        .redirect_uri("http://localhost:3000/callback")
+        .redirect_uri("http://127.0.0.1:3000/callback")
         .scope("read")
         .build()
         .unwrap();
     oauth.register_client(client_def).unwrap();
 
-    // OAuth 2.1 requires PKCE. Use the plain method for a fully deterministic test.
-    let code_verifier = "verifier-verifier-verifier-verifier-verifier-verifier-123";
+    // RFC 7636 Appendix B verifier/challenge pair.
+    let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let auth_request = AuthorizationRequest {
         response_type: "code".to_string(),
         client_id: "test-client".to_string(),
-        redirect_uri: "http://localhost:3000/callback".to_string(),
+        redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
         scopes: vec!["read".to_string()],
         state: None,
-        code_challenge: code_verifier.to_string(),
-        code_challenge_method: CodeChallengeMethod::Plain,
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+        code_challenge_method: CodeChallengeMethod::S256,
     };
     let (code, _redirect) = oauth
         .authorize(&auth_request, Some("user123".to_string()))
@@ -573,7 +435,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
         .token(&TokenRequest {
             grant_type: "authorization_code".to_string(),
             code: Some(code),
-            redirect_uri: Some("http://localhost:3000/callback".to_string()),
+            redirect_uri: Some("http://127.0.0.1:3000/callback".to_string()),
             client_id: "test-client".to_string(),
             client_secret: None,
             code_verifier: Some(code_verifier.to_string()),

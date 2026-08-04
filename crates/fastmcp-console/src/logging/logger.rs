@@ -22,21 +22,83 @@
 //!     .init();
 //! ```
 
+use std::fmt;
+
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use time::{OffsetDateTime, format_description};
 
 use super::{LogEvent, LogLevel, RichLogFormatter};
-use crate::console::FastMcpConsole;
+use crate::console::{
+    DEFAULT_LOG_MESSAGE_MAX_CHARS, DEFAULT_TERMINAL_FIELD_MAX_CHARS, FastMcpConsole,
+    bounded_redacted_terminal_text, strip_markup,
+};
 use crate::detection::DisplayContext;
+
+const LOG_SOURCE_CAPTURE_MULTIPLIER: usize = 4;
+
+struct BoundedMessageWriter {
+    output: String,
+    remaining_chars: usize,
+    truncated: bool,
+}
+
+impl BoundedMessageWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            output: String::with_capacity(max_chars.min(1_024)),
+            remaining_chars: max_chars,
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.output.push_str("...");
+        }
+        self.output
+    }
+}
+
+impl fmt::Write for BoundedMessageWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.remaining_chars == 0 {
+            self.truncated |= !value.is_empty();
+            return if value.is_empty() {
+                Ok(())
+            } else {
+                Err(fmt::Error)
+            };
+        }
+
+        let mut characters = value.chars();
+        for character in characters.by_ref().take(self.remaining_chars) {
+            self.output.push(character);
+            self.remaining_chars -= 1;
+        }
+        if characters.next().is_some() {
+            self.truncated = true;
+            Err(fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn bounded_record_message(arguments: &fmt::Arguments<'_>) -> String {
+    let capture_limit = DEFAULT_LOG_MESSAGE_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER);
+    let mut writer = BoundedMessageWriter::new(capture_limit);
+    let _ = fmt::write(&mut writer, *arguments);
+    writer.finish()
+}
 
 /// Rich-formatted logger that writes to stderr.
 ///
 /// This logger uses the [`RichLogFormatter`] to produce styled output
 /// when running in human context, and plain text when running in agent context.
 pub struct RichLogger {
-    console: &'static FastMcpConsole,
+    console: FastMcpConsole,
     formatter: RichLogFormatter,
-    min_level: Level,
+    level_filter: LevelFilter,
     show_timestamps: bool,
 }
 
@@ -44,12 +106,7 @@ impl RichLogger {
     /// Create a new rich logger with the given minimum level.
     #[must_use]
     pub fn new(min_level: Level) -> Self {
-        Self {
-            console: crate::console::console(),
-            formatter: RichLogFormatter::detect(),
-            min_level,
-            show_timestamps: true,
-        }
+        RichLoggerBuilder::new().level(min_level).build()
     }
 
     /// Create a logger using the builder pattern.
@@ -76,9 +133,13 @@ impl RichLogger {
     /// Convert a log::Record to a LogEvent.
     fn record_to_event(&self, record: &Record) -> LogEvent {
         let level = LogLevel::from(record.level());
-        let message = format!("{}", record.args());
+        let message = bounded_record_message(record.args());
 
-        let mut event = LogEvent::new(level, message).with_target(record.target());
+        let target = bounded_redacted_terminal_text(
+            record.target(),
+            DEFAULT_TERMINAL_FIELD_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+        );
+        let mut event = LogEvent::new(level, message).with_target(target);
 
         // Add timestamp if enabled
         if self.show_timestamps {
@@ -92,7 +153,10 @@ impl RichLogger {
         }
 
         if let Some(file) = record.file() {
-            event = event.with_file(file);
+            event = event.with_file(bounded_redacted_terminal_text(
+                file,
+                DEFAULT_TERMINAL_FIELD_MAX_CHARS.saturating_mul(LOG_SOURCE_CAPTURE_MULTIPLIER),
+            ));
         }
         if let Some(line) = record.line() {
             event = event.with_line(line);
@@ -119,7 +183,8 @@ impl RichLogger {
 /// ```
 #[derive(Debug)]
 pub struct RichLoggerBuilder {
-    min_level: Level,
+    level_filter: LevelFilter,
+    context: Option<DisplayContext>,
     show_timestamps: bool,
     show_targets: bool,
     show_file_line: bool,
@@ -137,7 +202,8 @@ impl RichLoggerBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            min_level: Level::Info,
+            level_filter: LevelFilter::Info,
+            context: None,
             show_timestamps: true,
             show_targets: true,
             show_file_line: false,
@@ -148,14 +214,23 @@ impl RichLoggerBuilder {
     /// Set the minimum log level.
     #[must_use]
     pub fn level(mut self, level: Level) -> Self {
-        self.min_level = level;
+        self.level_filter = level.to_level_filter();
         self
     }
 
     /// Set the minimum log level from a LevelFilter.
     #[must_use]
     pub fn level_filter(mut self, filter: LevelFilter) -> Self {
-        self.min_level = filter.to_level().unwrap_or(Level::Trace);
+        self.level_filter = filter;
+        self
+    }
+
+    /// Set the display context used by both formatting and output.
+    ///
+    /// When omitted, the context is auto-detected at build time.
+    #[must_use]
+    pub fn with_context(mut self, context: DisplayContext) -> Self {
+        self.context = Some(context);
         self
     }
 
@@ -190,7 +265,7 @@ impl RichLoggerBuilder {
     /// Build the logger without installing it.
     #[must_use]
     pub fn build(self) -> RichLogger {
-        let context = DisplayContext::detect();
+        let context = self.context.unwrap_or_else(DisplayContext::detect);
         let theme = crate::theme::theme();
 
         let formatter = RichLogFormatter::new(theme, context)
@@ -200,9 +275,9 @@ impl RichLoggerBuilder {
             .with_max_width(self.max_width);
 
         RichLogger {
-            console: crate::console::console(),
+            console: FastMcpConsole::with_enabled(context.is_human()),
             formatter,
-            min_level: self.min_level,
+            level_filter: self.level_filter,
             show_timestamps: self.show_timestamps,
         }
     }
@@ -211,10 +286,10 @@ impl RichLoggerBuilder {
     ///
     /// Returns an error if a logger has already been set.
     pub fn init(self) -> Result<(), log::SetLoggerError> {
-        let level = self.min_level;
+        let level_filter = self.level_filter;
         let logger = Box::new(self.build());
         log::set_boxed_logger(logger)?;
-        log::set_max_level(level.to_level_filter());
+        log::set_max_level(level_filter);
         Ok(())
     }
 
@@ -226,7 +301,9 @@ impl RichLoggerBuilder {
 
 impl Log for RichLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.min_level
+        self.level_filter
+            .to_level()
+            .is_some_and(|level| metadata.level() <= level)
     }
 
     fn log(&self, record: &Record) {
@@ -237,10 +314,12 @@ impl Log for RichLogger {
         let event = self.record_to_event(record);
         let line = self.formatter.format_line(&event);
 
-        if self.console.is_rich() {
+        if self.console.is_rich() && self.formatter.should_use_rich() {
             self.console.print(&line);
+        } else if self.formatter.should_use_rich() {
+            self.console.print_plain(&strip_markup(&line));
         } else {
-            eprintln!("{}", crate::console::strip_markup(&line));
+            self.console.print_plain(&line);
         }
     }
 
@@ -250,6 +329,65 @@ impl Log for RichLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct CountingDisplay<'a> {
+        visits: &'a AtomicUsize,
+    }
+
+    impl fmt::Display for CountingDisplay<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            loop {
+                self.visits.fetch_add(1, Ordering::Relaxed);
+                formatter.write_str("x")?;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared output lock should not be poisoned")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn record_message_capture_is_bounded_before_log_event_allocation() {
+        let huge = "x".repeat(DEFAULT_LOG_MESSAGE_MAX_CHARS * 16);
+        let captured = bounded_record_message(&format_args!("prefix:{huge}"));
+
+        assert!(
+            captured.chars().count()
+                <= DEFAULT_LOG_MESSAGE_MAX_CHARS * LOG_SOURCE_CAPTURE_MULTIPLIER + 3
+        );
+        assert!(captured.starts_with("prefix:"));
+        assert!(captured.ends_with("..."));
+    }
+
+    #[test]
+    fn bounded_message_writer_short_circuits_adversarial_display() {
+        let visits = AtomicUsize::new(0);
+        let value = CountingDisplay { visits: &visits };
+        let mut writer = BoundedMessageWriter::new(8);
+
+        let result = fmt::write(&mut writer, format_args!("{value}"));
+        let captured = writer.finish();
+
+        assert!(result.is_err(), "exhaustion should stop fmt traversal");
+        assert_eq!(visits.load(Ordering::Relaxed), 9);
+        assert_eq!(captured, "xxxxxxxx...");
+    }
 
     #[test]
     fn test_rich_logger_enabled() {
@@ -318,7 +456,8 @@ mod tests {
     fn test_builder_default() {
         let builder = RichLoggerBuilder::default();
         // Default level should be Info
-        assert_eq!(builder.min_level, Level::Info);
+        assert_eq!(builder.level_filter, LevelFilter::Info);
+        assert_eq!(builder.context, None);
         assert!(builder.show_timestamps);
         assert!(builder.show_targets);
         assert!(!builder.show_file_line);
@@ -327,19 +466,64 @@ mod tests {
     #[test]
     fn test_builder_level() {
         let builder = RichLoggerBuilder::new().level(Level::Debug);
-        assert_eq!(builder.min_level, Level::Debug);
+        assert_eq!(builder.level_filter, LevelFilter::Debug);
     }
 
     #[test]
     fn test_builder_level_filter() {
         let builder = RichLoggerBuilder::new().level_filter(LevelFilter::Warn);
-        assert_eq!(builder.min_level, Level::Warn);
+        assert_eq!(builder.level_filter, LevelFilter::Warn);
     }
 
     #[test]
-    fn test_builder_level_filter_off_falls_back_to_trace() {
-        let builder = RichLoggerBuilder::new().level_filter(LevelFilter::Off);
-        assert_eq!(builder.min_level, Level::Trace);
+    fn test_builder_level_filter_off_disables_every_level_and_emits_nothing() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut logger = RichLoggerBuilder::new()
+            .level_filter(LevelFilter::Off)
+            .with_context(DisplayContext::new_agent())
+            .with_timestamps(false)
+            .build();
+        logger.console = FastMcpConsole::with_writer(SharedWriter(Arc::clone(&output)), false);
+
+        for level in [
+            Level::Error,
+            Level::Warn,
+            Level::Info,
+            Level::Debug,
+            Level::Trace,
+        ] {
+            let metadata = log::Metadata::builder().level(level).target("test").build();
+            assert!(!logger.enabled(&metadata));
+        }
+
+        let record = log::Record::builder()
+            .args(format_args!("must not be emitted"))
+            .level(Level::Error)
+            .target("test")
+            .build();
+        logger.log(&record);
+
+        assert!(
+            output
+                .lock()
+                .expect("shared output lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn builder_context_keeps_formatter_and_output_mode_in_sync() {
+        let agent = RichLoggerBuilder::new()
+            .with_context(DisplayContext::new_agent())
+            .build();
+        assert!(!agent.formatter.should_use_rich());
+        assert!(!agent.console.is_rich());
+
+        let human = RichLoggerBuilder::new()
+            .with_context(DisplayContext::new_human())
+            .build();
+        assert!(human.formatter.should_use_rich());
+        assert!(human.console.is_rich());
     }
 
     #[test]
@@ -389,7 +573,7 @@ mod tests {
     fn test_logger_builder_method() {
         let builder = RichLogger::builder();
         // Should create a default builder
-        assert_eq!(builder.min_level, Level::Info);
+        assert_eq!(builder.level_filter, LevelFilter::Info);
     }
 
     #[test]

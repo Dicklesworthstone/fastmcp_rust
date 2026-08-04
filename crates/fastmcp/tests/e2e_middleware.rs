@@ -299,8 +299,9 @@ fn spawn_middleware_server(
     let handle = std::thread::spawn(move || {
         set_echo_tool_calls(echo_calls);
         let cx = Cx::for_testing();
-        server.run_transport_returning_with_cx(&cx, server_transport);
+        let run_result = server.run_transport_returning_with_cx(&cx, server_transport);
         set_echo_tool_calls(None);
+        run_result.expect("middleware server loop");
     });
 
     (client_transport, handle)
@@ -580,7 +581,9 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
 
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let caching = ResponseCachingMiddleware::new().call_ttl_secs(1);
+    let caching = ResponseCachingMiddleware::new()
+        .call_ttl_secs(1)
+        .include_tools(vec!["echo".to_string()]);
 
     let (transport, server_handle) =
         spawn_middleware_server("mw-caching", Some(Arc::clone(&calls)), |builder| {
