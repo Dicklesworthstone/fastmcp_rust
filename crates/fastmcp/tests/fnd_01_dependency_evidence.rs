@@ -2733,7 +2733,10 @@ mod trust_std {
         }
     }
 
-    fn validate_absolute_lexical_path(value: &str, subject: &str) -> TrustResult<PathBuf> {
+    pub(super) fn validate_absolute_lexical_path(
+        value: &str,
+        subject: &str,
+    ) -> TrustResult<PathBuf> {
         if value.len() > MAX_ABSOLUTE_PATH_BYTES
             || !value.starts_with('/')
             || value == "/"
@@ -17793,8 +17796,8 @@ mod phase_b_std {
         AcquisitionCommandExpectation, AcquisitionCommandPreimageInput,
         AcquisitionCommandStreamPreimage,
         AcquisitionToolPaths, AuthoringMarker, BootstrapArguments,
-        BootstrapEnvironment, BootstrapMode, FileBinding, FilesystemUsage,
-        IntegrationSeal, PhaseBSpaceBudget,
+        BootstrapEnvironment, BootstrapMode, CheckedSnapshot, FileBinding, FilesystemUsage,
+        IntegrationSeal, LinuxFileIdentity, PhaseBSpaceBudget,
         NativeToolDescriptor as NativeTool, NATIVE_TOOL_DESCRIPTORS as NATIVE_TOOLS,
         RetainedSnapshotSet, SparseDependencyKind,
         SparseDependencySemantic, TrustError, TrustResult,
@@ -17813,8 +17816,10 @@ mod phase_b_std {
         validate_bootstrap_cargo_lock_v4_lexical,
         validate_cargo_config_discovery,
         snapshot_usage_roots_nofollow, validate_sparse_index_semantics,
+        validate_absolute_lexical_path,
     };
     use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::unix::fs::MetadataExt;
@@ -19612,11 +19617,227 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(chain)
     }
 
+    fn bound_parent_identity(path: &Path, subject: &str) -> TrustResult<FsIdentity> {
+        directory_metadata(path, subject)
+            .map(|metadata| fs_identity(&metadata))
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent chain ({})", error.detail()),
+                )
+            })
+    }
+
+    fn parent_sync_error(
+        parent: &Path,
+        expected_parent: FsIdentity,
+        subject: &str,
+        error: &io::Error,
+    ) -> TrustError {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || !expected_parent.same_directory_object(fs_identity(&metadata)) =>
+            {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent changed during fsync"),
+                )
+            }
+            Err(observed)
+                if matches!(
+                    observed.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent unavailable during fsync"),
+                )
+            }
+            _ => io_error("E_PHASE_B_FSYNC", subject, error),
+        }
+    }
+
+    fn bind_parent_members(
+        parent: &Path,
+        expected_parent: FsIdentity,
+        maximum_parent_members: u64,
+        subject: &str,
+    ) -> TrustResult<Vec<(OsString, FsIdentity)>> {
+        if maximum_parent_members == 0 {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: parent member cap is zero"),
+            ));
+        }
+        if bound_parent_identity(parent, subject)? != expected_parent {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: parent changed before member binding"),
+            ));
+        }
+        let entries = fs::read_dir(parent).map_err(|error| {
+            phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: parent member enumeration ({error})"),
+            )
+        })?;
+        let mut members = Vec::new();
+        let mut member_count = 0u64;
+        for entry in entries {
+            member_count = member_count.checked_add(1).ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent member count overflow"),
+                )
+            })?;
+            if member_count > maximum_parent_members {
+                return Err(phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!(
+                        "{subject}: parent member count exceeds canonical cap {maximum_parent_members}",
+                    ),
+                ));
+            }
+            let entry = entry.map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent member ({error})"),
+                )
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent member metadata ({error})"),
+                )
+            })?;
+            members.try_reserve(1)
+                .map_err(|_| phase_b_error("E_PHASE_B_ALLOCATION", subject))?;
+            members.push((entry.file_name(), fs_identity(&metadata)));
+        }
+        members.sort_by(|left, right| left.0.cmp(&right.0));
+        if members.windows(2).any(|pair| {
+            pair[0].0.as_os_str() == pair[1].0.as_os_str()
+        })
+            || bound_parent_identity(parent, subject)? != expected_parent
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: parent member binding changed"),
+            ));
+        }
+        Ok(members)
+    }
+
+    fn parent_member_delta_is_exact(
+        before: &[(OsString, FsIdentity)],
+        after: &[(OsString, FsIdentity)],
+        created_name: &OsStr,
+        created_identity: FsIdentity,
+    ) -> bool {
+        let Some(expected_after_len) = before.len().checked_add(1) else {
+            return false;
+        };
+        if before
+            .iter()
+            .any(|(name, _)| name.as_os_str() == created_name)
+            || after.len() != expected_after_len
+        {
+            return false;
+        }
+        let mut before_index = 0usize;
+        let mut created_seen = false;
+        for (name, identity) in after {
+            if name.as_os_str() == created_name {
+                if created_seen || *identity != created_identity {
+                    return false;
+                }
+                created_seen = true;
+            } else {
+                let Some((expected_name, expected_identity)) = before.get(before_index) else {
+                    return false;
+                };
+                if name != expected_name || identity != expected_identity {
+                    return false;
+                }
+                before_index += 1;
+            }
+        }
+        created_seen && before_index == before.len()
+    }
+
     fn recheck_parent_chain(chain: &[(PathBuf, FsIdentity)], subject: &str) -> TrustResult<()> {
         for (path, expected) in chain {
-            if fs_identity(&directory_metadata(path, subject)?) != *expected {
+            if bound_parent_identity(path, subject)? != *expected {
                 return Err(phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent chain")));
             }
+        }
+        Ok(())
+    }
+
+    fn advance_parent_chain_after_leaf_creation(
+        chain: &mut [(PathBuf, FsIdentity)],
+        before_members: &[(OsString, FsIdentity)],
+        created_name: &OsStr,
+        created_identity: FsIdentity,
+        maximum_parent_members: u64,
+        subject: &str,
+    ) -> TrustResult<Vec<(OsString, FsIdentity)>> {
+        let direct_index = chain.len().checked_sub(1).ok_or_else(|| {
+            phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: empty parent chain"))
+        })?;
+        let observed_direct = bound_parent_identity(&chain[direct_index].0, subject)?;
+        let expected_direct = chain[direct_index].1;
+        if !expected_direct.same_directory_object(observed_direct) {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: direct parent identity"),
+            ));
+        }
+        for (path, expected) in &chain[..direct_index] {
+            if bound_parent_identity(path, subject)? != *expected {
+                return Err(phase_b_error(
+                    "E_PHASE_B_FILE_RACE",
+                    format!("{subject}: parent chain"),
+                ));
+            }
+        }
+        let after_members = bind_parent_members(
+            &chain[direct_index].0,
+            observed_direct,
+            maximum_parent_members,
+            subject,
+        )?;
+        if !parent_member_delta_is_exact(
+            before_members,
+            &after_members,
+            created_name,
+            created_identity,
+        ) {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: parent member delta"),
+            ));
+        }
+        // The intended leaf insertion may change only the direct directory's
+        // length and timestamps, and its exact member delta must be the created
+        // file. Commit the new identity only after every check has validated.
+        chain[direct_index].1 = observed_direct;
+        Ok(after_members)
+    }
+
+    fn require_created_file_identity(
+        snapshot: &CheckedSnapshot,
+        expected: FsIdentity,
+        subject: &str,
+    ) -> TrustResult<()> {
+        if !expected.matches_checked_file(snapshot.identity) {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: created file identity"),
+            ));
         }
         Ok(())
     }
@@ -19643,7 +19864,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             phase_b_error("E_PHASE_B_PATH", format!("{subject}: missing parent"))
         })?;
         directory_metadata(parent, subject)?;
-        let parent_chain = bind_parent_chain(repository_root, relative, subject)?;
+        let mut parent_chain = bind_parent_chain(repository_root, relative, subject)?;
         space_guard.require_projected(
             space_group,
             FilesystemUsage {
@@ -19652,7 +19873,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             },
             subject,
         )?;
-        let mutation = (|| -> TrustResult<()> {
+        let direct_parent_identity = parent_chain.last()
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_FILE_RACE", subject))?;
+        let parent_members = bind_parent_members(
+            parent,
+            direct_parent_identity,
+            space_guard.budget.max_tree_entry_count,
+            subject,
+        )?;
+        let created_name = path.file_name().ok_or_else(|| {
+            phase_b_error("E_PHASE_B_PATH", format!("{subject}: missing file name"))
+        })?.to_os_string();
+        let mutation = (|| -> TrustResult<FsIdentity> {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -19665,13 +19898,22 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .map_err(|error| {
                     io_error("E_PHASE_B_WRITE", subject, &error)
                 })?;
-            drop(file);
+            let created_identity = fs_identity(
+                &file.metadata().map_err(|error| {
+                    io_error("E_PHASE_B_METADATA", subject, &error)
+                })?,
+            );
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| {
-                    io_error("E_PHASE_B_FSYNC", subject, &error)
+                    parent_sync_error(
+                        parent,
+                        direct_parent_identity,
+                        subject,
+                        &error,
+                    )
                 })?;
-            Ok(())
+            Ok(created_identity)
         })();
         let post_mutation_space = space_guard.require_projected(
             space_group,
@@ -19679,7 +19921,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             subject,
         );
         post_mutation_space?;
-        mutation?;
+        let created_identity = mutation?;
+        let advanced_parent_members = advance_parent_chain_after_leaf_creation(
+            &mut parent_chain,
+            &parent_members,
+            &created_name,
+            created_identity,
+            space_guard.budget.max_tree_entry_count,
+            subject,
+        )?;
         let sealed = (|| -> TrustResult<BoundPath> {
             let expected = FileBinding {
                 byte_length: length,
@@ -19691,13 +19941,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 maximum,
                 Some(expected),
             )?;
+            require_created_file_identity(&snapshot, created_identity, subject)?;
             if reopened != bytes {
                 return Err(phase_b_error(
                     "E_PHASE_B_FILE_RACE",
                     format!("{subject}: reopened bytes differ"),
                 ));
             }
-            recheck_parent_chain(&parent_chain, subject)?;
             Ok(BoundPath {
                 path: utf8_absolute(&path, subject)?,
                 binding: FileBinding {
@@ -19712,7 +19962,24 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             subject,
         );
         final_space?;
-        sealed
+        let sealed = sealed?;
+        recheck_parent_chain(&parent_chain, subject)?;
+        let final_parent_identity = parent_chain.last()
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_FILE_RACE", subject))?;
+        if bind_parent_members(
+            parent,
+            final_parent_identity,
+            space_guard.budget.max_tree_entry_count,
+            subject,
+        )? != advanced_parent_members
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_FILE_RACE",
+                format!("{subject}: final parent member binding"),
+            ));
+        }
+        Ok(sealed)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19730,6 +19997,28 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         mtime: i64, mtime_nsec: i64, ctime: i64, ctime_nsec: i64,
     }
 
+    impl FsIdentity {
+        fn same_directory_object(self, observed: Self) -> bool {
+            self.dev == observed.dev
+                && self.ino == observed.ino
+                && self.mode == observed.mode
+                && self.nlink == observed.nlink
+        }
+
+        fn matches_checked_file(self, observed: LinuxFileIdentity) -> bool {
+            self.dev == observed.device
+                && self.ino == observed.inode
+                && self.mode == observed.mode
+                && self.nlink == observed.link_count
+                && self.len == observed.byte_length
+                && self.mtime == observed.modification_seconds
+                && self.mtime_nsec == observed.modification_nanoseconds
+                && self.ctime == observed.change_seconds
+                && self.ctime_nsec == observed.change_nanoseconds
+                && self.mode & 0o170_000 == observed.file_type
+        }
+    }
+
     fn fs_identity(metadata: &Metadata) -> FsIdentity {
         FsIdentity {
             dev: metadata.dev(), ino: metadata.ino(), mode: metadata.mode(),
@@ -19737,6 +20026,386 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             mtime_nsec: metadata.mtime_nsec(), ctime: metadata.ctime(),
             ctime_nsec: metadata.ctime_nsec(),
         }
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct CreateSealedFileParentChainRaceReceipt {
+        pub direct_parent_code: &'static str,
+        pub direct_parent_detail: String,
+        pub direct_parent_binding_unchanged: bool,
+        pub member_cap_code: &'static str,
+        pub member_cap_detail: String,
+        pub member_cap_binding_unchanged: bool,
+        pub substituted_parent_code: &'static str,
+        pub substituted_parent_binding_unchanged: bool,
+        pub post_advance_code: &'static str,
+        pub same_bytes_file_code: &'static str,
+        pub accepted_binding_count: usize,
+    }
+
+    #[cfg(test)]
+    fn fresh_parent_chain_contract_root(
+        label: &str,
+    ) -> TrustResult<(PathBuf, String)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| phase_b_error("E_PHASE_B_TEST_CLOCK", error.to_string()))?
+            .as_nanos();
+        let run_id = format!(
+            "{:032x}",
+            timestamp ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),
+        );
+        let root = PathBuf::from("/tmp").join(format!(
+            "fastmcp-fnd01-parent-chain-{label}-{}-{timestamp}-{sequence}",
+            std::process::id(),
+        ));
+        fs::create_dir(&root).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "parent-chain root", &error)
+        })?;
+        Ok((root, run_id))
+    }
+
+    #[cfg(test)]
+    fn parent_chain_contract_space_budget() -> PhaseBSpaceBudget {
+        PhaseBSpaceBudget {
+            max_tree_entry_count: 256,
+            max_run_scratch_total_bytes: 4 * 1024 * 1024,
+            max_fallback_target_total_bytes: 4 * 1024 * 1024,
+            max_execution_footprint_total_bytes: 8 * 1024 * 1024,
+            max_control_plane_total_bytes: 4 * 1024 * 1024,
+            max_bootstrap_scratch_total_bytes: 4 * 1024 * 1024,
+            max_materialization_total_bytes: 4 * 1024 * 1024,
+        }
+    }
+
+    #[cfg(test)]
+    fn write_parent_chain_contract_file(
+        path: &Path,
+        bytes: &[u8],
+        subject: &str,
+    ) -> TrustResult<FsIdentity> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| io_error("E_PHASE_B_TEST_CREATE", subject, &error))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error("E_PHASE_B_TEST_WRITE", subject, &error))?;
+        file.metadata()
+            .map(|metadata| fs_identity(&metadata))
+            .map_err(|error| io_error("E_PHASE_B_TEST_METADATA", subject, &error))
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_sealed_file_parent_chain_positive()
+        -> TrustResult<FileBinding>
+    {
+        let (root, run_id) = fresh_parent_chain_contract_root("positive")?;
+        let parent_relative = format!(
+            ".fnd01-run/integration-producer/{run_id}/sealed-parent",
+        );
+        fs::create_dir_all(root.join(&parent_relative)).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "positive parent chain", &error)
+        })?;
+        let guard = PhaseBSpaceGuard::new(
+            &root,
+            &run_id,
+            parent_chain_contract_space_budget(),
+        )?;
+        let payload = b"intended sealed leaf\n";
+        let sealed = create_sealed_file(
+            &root,
+            &format!("{parent_relative}/leaf.bin"),
+            payload,
+            1024,
+            &guard,
+            PhaseBSpaceGroup::RunOnly,
+            "parent-chain intended leaf",
+        )?;
+        Ok(sealed.binding)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_sealed_file_parent_chain_negatives()
+        -> TrustResult<CreateSealedFileParentChainRaceReceipt>
+    {
+        let mut accepted_bindings = Vec::new();
+        let maximum_parent_members =
+            parent_chain_contract_space_budget().max_tree_entry_count;
+        let (direct_root, _) = fresh_parent_chain_contract_root("direct-parent")?;
+        let direct_relative = "container/direct/leaf.bin";
+        let direct_parent = direct_root.join("container/direct");
+        fs::create_dir_all(&direct_parent).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "direct parent", &error)
+        })?;
+        let mut direct_chain =
+            bind_parent_chain(&direct_root, direct_relative, "direct parent negative")?;
+        let direct_before = direct_chain.clone();
+        let direct_parent_identity = direct_chain.last()
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_TEST_EXPECTATION", "direct parent"))?;
+        let direct_before_members = bind_parent_members(
+            &direct_parent,
+            direct_parent_identity,
+            maximum_parent_members,
+            "direct parent negative",
+        )?;
+        let direct_created_identity = write_parent_chain_contract_file(
+            &direct_root.join(direct_relative),
+            b"intended leaf\n",
+            "direct intended leaf",
+        )?;
+        write_parent_chain_contract_file(
+            &direct_parent.join("unrelated.bin"),
+            b"unrelated same-inode member\n",
+            "direct unrelated member",
+        )?;
+        File::open(&direct_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                io_error("E_PHASE_B_TEST_FSYNC", "direct parent", &error)
+            })?;
+        let direct_result = advance_parent_chain_after_leaf_creation(
+            &mut direct_chain,
+            &direct_before_members,
+            OsStr::new("leaf.bin"),
+            direct_created_identity,
+            maximum_parent_members,
+            "direct parent negative",
+        );
+        if direct_result.is_ok() {
+            accepted_bindings.push("direct-parent-member-delta");
+        }
+        let direct_error = direct_result.err().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "same-inode parent member mutation was accepted",
+            )
+        })?;
+        let direct_parent_binding_unchanged = direct_chain == direct_before;
+
+        let (cap_root, _) = fresh_parent_chain_contract_root("member-cap")?;
+        let cap_relative = "container/direct/leaf.bin";
+        let cap_parent = cap_root.join("container/direct");
+        fs::create_dir_all(&cap_parent).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "member-cap parent", &error)
+        })?;
+        let mut cap_chain =
+            bind_parent_chain(&cap_root, cap_relative, "member-cap negative")?;
+        let cap_before = cap_chain.clone();
+        let cap_parent_identity = cap_chain.last()
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_TEST_EXPECTATION", "member-cap parent"))?;
+        let cap_before_members = bind_parent_members(
+            &cap_parent,
+            cap_parent_identity,
+            maximum_parent_members,
+            "member-cap negative",
+        )?;
+        let cap_created_identity = write_parent_chain_contract_file(
+            &cap_root.join(cap_relative),
+            b"intended leaf\n",
+            "member-cap intended leaf",
+        )?;
+        for ordinal in 0..maximum_parent_members {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(cap_parent.join(format!("extra-{ordinal:020}.bin")))
+                .map_err(|error| {
+                    io_error("E_PHASE_B_TEST_CREATE", "member-cap extra", &error)
+                })?;
+        }
+        File::open(&cap_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                io_error("E_PHASE_B_TEST_FSYNC", "member-cap parent", &error)
+            })?;
+        let cap_result = advance_parent_chain_after_leaf_creation(
+            &mut cap_chain,
+            &cap_before_members,
+            OsStr::new("leaf.bin"),
+            cap_created_identity,
+            maximum_parent_members,
+            "member-cap negative",
+        );
+        if cap_result.is_ok() {
+            accepted_bindings.push("member-cap-plus-one");
+        }
+        let cap_error = cap_result.err().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "parent member cap plus one was accepted",
+            )
+        })?;
+        let member_cap_binding_unchanged = cap_chain == cap_before;
+
+        fs::rename(
+            &direct_parent,
+            direct_root.join("container/direct.retained"),
+        )
+        .map_err(|error| {
+            io_error("E_PHASE_B_TEST_RENAME", "direct parent", &error)
+        })?;
+        fs::create_dir(&direct_parent).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "replacement direct parent", &error)
+        })?;
+        let substituted_created_identity = write_parent_chain_contract_file(
+            &direct_root.join(direct_relative),
+            b"intended leaf\n",
+            "substituted-parent intended leaf",
+        )?;
+        File::open(&direct_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                io_error("E_PHASE_B_TEST_FSYNC", "substituted parent", &error)
+            })?;
+        let substituted_result = advance_parent_chain_after_leaf_creation(
+            &mut direct_chain,
+            &direct_before_members,
+            OsStr::new("leaf.bin"),
+            substituted_created_identity,
+            maximum_parent_members,
+            "substituted parent negative",
+        );
+        if substituted_result.is_ok() {
+            accepted_bindings.push("substituted-parent");
+        }
+        let substituted_error = substituted_result.err().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "direct-parent substitution was accepted",
+            )
+        })?;
+
+        let (post_root, _) = fresh_parent_chain_contract_root("post-advance")?;
+        let post_relative = "container/direct/leaf.bin";
+        let post_parent = post_root.join("container/direct");
+        fs::create_dir_all(&post_parent).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "post-advance parent", &error)
+        })?;
+        let mut post_chain =
+            bind_parent_chain(&post_root, post_relative, "post-advance negative")?;
+        let post_parent_identity = post_chain.last()
+            .map(|(_, identity)| *identity)
+            .ok_or_else(|| phase_b_error("E_PHASE_B_TEST_EXPECTATION", "post parent"))?;
+        let post_before_members = bind_parent_members(
+            &post_parent,
+            post_parent_identity,
+            maximum_parent_members,
+            "post-advance negative",
+        )?;
+        let post_created_identity = write_parent_chain_contract_file(
+            &post_root.join(post_relative),
+            b"post-advance leaf\n",
+            "post-advance leaf",
+        )?;
+        File::open(&post_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                io_error("E_PHASE_B_TEST_FSYNC", "post-advance parent", &error)
+            })?;
+        advance_parent_chain_after_leaf_creation(
+            &mut post_chain,
+            &post_before_members,
+            OsStr::new("leaf.bin"),
+            post_created_identity,
+            maximum_parent_members,
+            "post-advance negative",
+        )?;
+        fs::rename(
+            &post_parent,
+            post_root.join("container/direct.retained"),
+        )
+        .map_err(|error| {
+            io_error("E_PHASE_B_TEST_RENAME", "post-advance parent", &error)
+        })?;
+        fs::create_dir(&post_parent).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "post-advance replacement", &error)
+        })?;
+        let post_result = recheck_parent_chain(
+            &post_chain,
+            "post-advance negative",
+        );
+        if post_result.is_ok() {
+            accepted_bindings.push("post-advance");
+        }
+        let post_error = post_result.err().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "post-advance parent replacement was accepted",
+            )
+        })?;
+
+        let (file_root, _) = fresh_parent_chain_contract_root("created-file")?;
+        fs::create_dir(file_root.join("parent")).map_err(|error| {
+            io_error("E_PHASE_B_TEST_CREATE", "created-file parent", &error)
+        })?;
+        let file_relative = "parent/leaf.bin";
+        let file_path = file_root.join(file_relative);
+        let payload = b"same bytes, different inode\n";
+        let created_identity = write_parent_chain_contract_file(
+            &file_path,
+            payload,
+            "created-file leaf",
+        )?;
+        fs::rename(&file_path, file_root.join("parent/leaf.retained"))
+            .map_err(|error| {
+                io_error("E_PHASE_B_TEST_RENAME", "created-file leaf", &error)
+            })?;
+        write_parent_chain_contract_file(
+            &file_path,
+            payload,
+            "created-file replacement",
+        )?;
+        let expected = FileBinding {
+            byte_length: usize_u64(payload.len(), "created-file payload")?,
+            sha256: sha256(payload)?,
+        };
+        let (snapshot, reopened) =
+            checked_read(&file_root, file_relative, 1024, Some(expected))?;
+        if reopened != payload {
+            return Err(phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "same-bytes replacement payload drifted",
+            ));
+        }
+        let file_result = require_created_file_identity(
+            &snapshot,
+            created_identity,
+            "created-file replacement",
+        );
+        if file_result.is_ok() {
+            accepted_bindings.push("created-file");
+        }
+        let file_error = file_result.err().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TEST_EXPECTATION",
+                "same-bytes created-file replacement was accepted",
+            )
+        })?;
+
+        Ok(CreateSealedFileParentChainRaceReceipt {
+            direct_parent_code: direct_error.code(),
+            direct_parent_detail: direct_error.detail().to_owned(),
+            direct_parent_binding_unchanged,
+            member_cap_code: cap_error.code(),
+            member_cap_detail: cap_error.detail().to_owned(),
+            member_cap_binding_unchanged,
+            substituted_parent_code: substituted_error.code(),
+            substituted_parent_binding_unchanged: direct_chain == direct_before,
+            post_advance_code: post_error.code(),
+            same_bytes_file_code: file_error.code(),
+            accepted_binding_count: accepted_bindings.len(),
+        })
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -27684,6 +28353,68 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         final_sha256: Option<[u8; 32]>,
     }
 
+    fn resolved_tool_symlink_target(
+        current: &str,
+        link_target: &Path,
+    ) -> TrustResult<String> {
+        let target = if link_target.is_absolute() {
+            link_target.to_path_buf()
+        } else {
+            let mut target = Path::new(current)
+                .parent()
+                .ok_or_else(|| {
+                    phase_b_error(
+                        "E_PHASE_B_TOOL_PATH",
+                        format!("{current}: symlink has no lexical parent"),
+                    )
+                })?
+                .to_path_buf();
+            for component in link_target.components() {
+                match component {
+                    Component::Normal(component) => target.push(component),
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        if !target.pop() {
+                            return Err(phase_b_error(
+                                "E_PHASE_B_TOOL_PATH",
+                                format!("{current}: relative symlink escapes filesystem root"),
+                            ));
+                        }
+                    }
+                    Component::RootDir | Component::Prefix(_) => {
+                        return Err(phase_b_error(
+                            "E_PHASE_B_TOOL_PATH",
+                            format!("{current}: malformed relative symlink target"),
+                        ));
+                    }
+                }
+            }
+            target
+        };
+        let text = target.to_str().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_TOOL_PATH",
+                format!("{current}: symlink target is not UTF-8"),
+            )
+        })?;
+        let lexical = validate_absolute_lexical_path(text, "tool symlink target")
+            .map_err(|error| {
+                phase_b_error(
+                    "E_PHASE_B_TOOL_PATH",
+                    format!("{current}: {}", error.detail()),
+                )
+            })?;
+        lexical
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                phase_b_error(
+                    "E_PHASE_B_TOOL_PATH",
+                    format!("{current}: normalized symlink target is not UTF-8"),
+                )
+            })
+    }
+
     fn resolve_tool_candidate(path: &str) -> TrustResult<ResolvedCandidate> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -27753,15 +28484,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     ));
                 }
                 hops.push((current.clone(), link_raw, link_identity));
-                let target = if link_os.is_absolute() {
-                    PathBuf::from(&link_os)
-                } else {
-                    Path::new(&current)
-                        .parent()
-                        .unwrap_or_else(|| Path::new("/"))
-                        .join(&link_os)
-                };
-                current = utf8_absolute(&target, "tool symlink target")?;
+                current = resolved_tool_symlink_target(&current, &link_os)?;
                 current_metadata = fs::symlink_metadata(&current)
                     .map_err(|error| io_error("E_PHASE_B_TOOL_METADATA", &current, &error))?;
                 continue;
@@ -86343,6 +87066,83 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_fixture_copy_bounded_executable(
+        source: &Path,
+        destination: &Path,
+    ) -> Result<u64, String> {
+        let source_metadata = fs::symlink_metadata(source).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: source executable metadata: {error}")
+        })?;
+        let debug_input_maximum = MAX_GATE_EXECUTABLE_BYTES
+            .checked_mul(2)
+            .ok_or_else(|| {
+                "E_ORDINARY_HANDOFF_PENDING: debug executable input cap overflow".to_owned()
+            })?;
+        if source_metadata.file_type().is_symlink()
+            || !source_metadata.is_file()
+            || source_metadata.len() == 0
+            || source_metadata.len() > debug_input_maximum
+        {
+            return Err(format!(
+                "E_ORDINARY_HANDOFF_PENDING: debug executable length {} outside 1..={debug_input_maximum}",
+                source_metadata.len(),
+            ));
+        }
+        if source_metadata.len() <= MAX_GATE_EXECUTABLE_BYTES {
+            fs::copy(source, destination).map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: copy selected executable: {error}")
+            })?;
+        } else {
+            let strip = Path::new("/usr/bin/strip");
+            let strip_metadata = fs::metadata(strip).map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: strip fixture tool metadata: {error}")
+            })?;
+            if !strip_metadata.is_file() || strip_metadata.mode() & 0o111 == 0 {
+                return Err(
+                    "E_ORDINARY_HANDOFF_PENDING: strip fixture tool is not executable"
+                        .to_owned(),
+                );
+            }
+            let status = Command::new(strip)
+                .arg("--strip-debug")
+                .arg("-o")
+                .arg(destination)
+                .arg(source)
+                .env_clear()
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|error| {
+                    format!("E_ORDINARY_HANDOFF_PENDING: strip debug executable: {error}")
+                })?;
+            if !status.success() {
+                return Err(format!(
+                    "E_ORDINARY_HANDOFF_PENDING: strip debug executable exit {:?}",
+                    status.code(),
+                ));
+            }
+        }
+        let output_metadata = fs::symlink_metadata(destination).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: selected executable metadata: {error}")
+        })?;
+        if output_metadata.file_type().is_symlink()
+            || !output_metadata.is_file()
+            || output_metadata.len() == 0
+            || output_metadata.len() > MAX_GATE_EXECUTABLE_BYTES
+        {
+            return Err(format!(
+                "E_ORDINARY_HANDOFF_PENDING: selected executable length {} outside 1..={MAX_GATE_EXECUTABLE_BYTES}",
+                output_metadata.len(),
+            ));
+        }
+        Ok(output_metadata.len())
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     #[derive(Debug, PartialEq, Eq)]
     struct OrdinaryFixtureNodeMetadata {
         device: u64,
@@ -86620,15 +87420,13 @@ fn fallible(value: Option<u8>) {
                 "E_ORDINARY_HANDOFF_PENDING: selected executable already exists".to_owned(),
             );
         }
-        let copied = fs::copy(
-            std::env::current_exe().map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: current test executable: {error}")
-            })?,
-            &selected_executable,
-        )
-        .map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: copy selected executable: {error}")
+        let source_executable = std::env::current_exe().map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: current test executable: {error}")
         })?;
+        let copied = ordinary_fixture_copy_bounded_executable(
+            &source_executable,
+            &selected_executable,
+        )?;
         if copied == 0 {
             return Err("E_ORDINARY_HANDOFF_PENDING: copied executable is empty".to_owned());
         }
@@ -86639,12 +87437,24 @@ fn fallible(value: Option<u8>) {
         fs::set_permissions(&selected_executable, permissions).map_err(|error| {
             format!("E_ORDINARY_HANDOFF_PENDING: selected executable chmod: {error}")
         })?;
+        File::open(&selected_executable)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: selected executable sync: {error}")
+            })?;
+        File::open(selected_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: selected executable parent sync: {error}")
+            })?;
         let selected_metadata = fs::symlink_metadata(&selected_executable).map_err(|error| {
             format!("E_ORDINARY_HANDOFF_PENDING: selected executable recheck: {error}")
         })?;
         if !selected_metadata.is_file()
             || selected_metadata.nlink() != 1
             || selected_metadata.mode() & 0o100 == 0
+            || selected_metadata.len() != copied
+            || selected_metadata.len() > MAX_GATE_EXECUTABLE_BYTES
         {
             return Err(
                 "E_ORDINARY_HANDOFF_PENDING: selected executable identity is not sealed".to_owned(),
@@ -87978,6 +88788,19 @@ fn fallible(value: Option<u8>) {
             Self::BookendExecutable,
             Self::Evidence,
         ];
+
+        /// Exact `cfg(test)`-only route partition. These direct-helper seams are
+        /// retained for negative coverage and receive no shipped capability credit.
+        #[cfg(test)]
+        const LEGACY_TEST_ONLY: &'static [Self] = &[
+            Self::Path,
+            Self::Process,
+            Self::ToolPlatform,
+            Self::LedgerArguments,
+            Self::LedgerDigest,
+            Self::LedgerEnvironment,
+            Self::LedgerEnvironmentSet,
+        ];
     }
 
     /// Stable identifiers for the executable ordinary failure sites.  Unlike the
@@ -88059,6 +88882,11 @@ fn fallible(value: Option<u8>) {
         /// Defensive catch emitters that remain shipped but have no public
         /// argv/environment/filesystem failure witness.
         const CATCH_ONLY: &'static [Self] = &[Self::HandoffPanic];
+
+        /// Direct-helper site retained only for the unqualified-platform
+        /// negative; initial platform admission dominates it in shipped entry.
+        #[cfg(test)]
+        const LEGACY_TEST_ONLY: &'static [Self] = &[Self::ProbeToolPlatform];
 
         const fn route(self) -> OrdinaryFailureRoute {
             match self {
@@ -89568,10 +90396,16 @@ fn fallible(value: Option<u8>) {
             .to_string()
     }
 
+    fn compact_ordinary_token_text(text: &str) -> String {
+        text.chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    }
+
     fn validate_ordinary_harness_wrapper_binding(body: &str) -> Result<(), &'static str> {
-        let compact = body.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+        let compact = compact_ordinary_token_text(body);
         const REQUIRED_BINDING: &str = "ordinary_handoff_harness_core(arguments,run_ordinary_handoff_entry,|mode,run_id,failure|{emit_ordinary_entry_failure_route(mode,run_id,failure);}";
-        if compact.contains(REQUIRED_BINDING) {
+        if compact.matches(REQUIRED_BINDING).count() == 2 {
             Ok(())
         } else {
             Err("ordinary harness must bind the real handoff callback and emitter")
@@ -89812,6 +90646,129 @@ fn fallible(value: Option<u8>) {
 
     #[test]
     fn ordinary_b_r4_all_fail_closed_branches_emit_product_stage() {
+        assert_eq!(OrdinaryFailureSite::ALL.len(), 42, "raw public site count");
+        let public_sites = OrdinaryFailureSite::ALL
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            public_sites.len(),
+            OrdinaryFailureSite::ALL.len(),
+            "public site rows must be unique before map equality",
+        );
+        assert_eq!(
+            OrdinaryFailureSite::CATCH_ONLY.len(),
+            1,
+            "raw catch-only site count",
+        );
+        let catch_only_sites = OrdinaryFailureSite::CATCH_ONLY
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            catch_only_sites.len(),
+            OrdinaryFailureSite::CATCH_ONLY.len(),
+            "catch-only site rows must be unique before map equality",
+        );
+        assert_eq!(
+            ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(),
+            42,
+            "raw public site-oracle row count",
+        );
+        let oracle_sites = ORDINARY_PUBLIC_FAILURE_SITE_ORACLE
+            .iter()
+            .map(|(site, _)| *site)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            oracle_sites.len(),
+            ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(),
+            "site-oracle keys must be unique before map equality",
+        );
+        let oracle_site_routes = ORDINARY_PUBLIC_FAILURE_SITE_ORACLE
+            .iter()
+            .map(|(_, route)| *route)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            oracle_site_routes.len(),
+            41,
+            "ExecutableAdmission is the sole two-site public route",
+        );
+        assert_eq!(
+            ORDINARY_FAILURE_ROUTE_ORACLE.len(),
+            42,
+            "raw literal route-oracle row count",
+        );
+        let oracle_routes = ORDINARY_FAILURE_ROUTE_ORACLE
+            .iter()
+            .map(|row| row.route)
+            .collect::<BTreeSet<_>>();
+        let oracle_route_ids = ORDINARY_FAILURE_ROUTE_ORACLE
+            .iter()
+            .map(|row| row.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            oracle_routes.len(),
+            ORDINARY_FAILURE_ROUTE_ORACLE.len(),
+            "literal route rows must have unique route keys",
+        );
+        assert_eq!(
+            oracle_route_ids.len(),
+            ORDINARY_FAILURE_ROUTE_ORACLE.len(),
+            "literal route rows must have unique IDs",
+        );
+        assert_eq!(
+            OrdinaryFailureRoute::SHIPPED.len(),
+            42,
+            "raw shipped route count",
+        );
+        let shipped_routes = OrdinaryFailureRoute::SHIPPED
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            shipped_routes.len(),
+            OrdinaryFailureRoute::SHIPPED.len(),
+            "shipped route rows must be unique before set equality",
+        );
+        assert_eq!(
+            OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(),
+            7,
+            "raw legacy route count",
+        );
+        let legacy_test_routes = OrdinaryFailureRoute::LEGACY_TEST_ONLY
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            legacy_test_routes.len(),
+            OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(),
+            "legacy route rows must be unique before set equality",
+        );
+        assert_eq!(OrdinaryFailureRoute::ALL.len(), 49, "raw complete route count");
+        let all_routes = OrdinaryFailureRoute::ALL
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            all_routes.len(),
+            OrdinaryFailureRoute::ALL.len(),
+            "complete route rows must be unique before partition equality",
+        );
+        assert_eq!(
+            OrdinaryFailureSite::LEGACY_TEST_ONLY,
+            &[OrdinaryFailureSite::ProbeToolPlatform],
+            "the dominated direct-helper platform site is the sole legacy site",
+        );
+        let legacy_test_sites = OrdinaryFailureSite::LEGACY_TEST_ONLY
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            legacy_test_sites.len(),
+            OrdinaryFailureSite::LEGACY_TEST_ONLY.len(),
+            "legacy site rows must be unique before partition equality",
+        );
+
         let public = OrdinaryFailureSite::ALL
             .iter()
             .copied()
@@ -89830,8 +90787,6 @@ fn fallible(value: Option<u8>) {
         // This is an independent production-registry equality check, not a
         // reachability claim. Public runtime witnesses remain the argv, env,
         // filesystem, and race tests that select those paths without a test hook.
-        assert_eq!(public.len(), 42, "exact public site cardinality");
-        assert_eq!(catch_only.len(), 1, "exact defensive catch-only cardinality");
         assert_eq!(public, expected, "public site-to-route oracle must be exact");
         assert_eq!(
             catch_only,
@@ -89842,44 +90797,53 @@ fn fallible(value: Option<u8>) {
             public.keys().all(|site| !catch_only.contains_key(site)),
             "public and catch-only site sets must be disjoint",
         );
+        assert!(
+            legacy_test_sites
+                .iter()
+                .all(|site| !public_sites.contains(site) && !catch_only_sites.contains(site)),
+            "legacy sites cannot receive public or catch-only credit",
+        );
+        assert!(
+            ORDINARY_PUBLIC_FAILURE_SITE_ORACLE
+                .iter()
+                .all(|(site, route)| {
+                    !legacy_test_sites.contains(site) && !legacy_test_routes.contains(route)
+                }),
+            "the public site oracle must exclude every legacy site and route",
+        );
         let covered_routes = public
             .values()
             .chain(catch_only.values())
             .copied()
             .collect::<BTreeSet<_>>();
-        let frozen_routes = ORDINARY_FAILURE_ROUTE_ORACLE
-            .iter()
-            .map(|row| row.route)
-            .collect::<BTreeSet<_>>();
         assert_eq!(
-            frozen_routes, covered_routes,
+            oracle_routes, covered_routes,
             "literal route metadata covers every public and catch-only site route",
         );
-        let shipped_routes = OrdinaryFailureRoute::SHIPPED
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
         assert_eq!(
-            frozen_routes, shipped_routes,
+            oracle_routes, shipped_routes,
             "literal 42-row metadata must equal the exact shipped-route inventory",
         );
-        let legacy_test_routes = OrdinaryFailureRoute::ALL
-            .iter()
+        assert_eq!(
+            covered_routes, shipped_routes,
+            "public site routes plus the catch-only route equal SHIPPED",
+        );
+        assert!(
+            shipped_routes.is_disjoint(&legacy_test_routes),
+            "shipped and legacy routes must be disjoint",
+        );
+        let complete_partition = shipped_routes
+            .union(&legacy_test_routes)
             .copied()
-            .filter(|route| !shipped_routes.contains(route))
             .collect::<BTreeSet<_>>();
         assert_eq!(
-            legacy_test_routes,
-            BTreeSet::from([
-                OrdinaryFailureRoute::Path,
-                OrdinaryFailureRoute::Process,
-                OrdinaryFailureRoute::ToolPlatform,
-                OrdinaryFailureRoute::LedgerArguments,
-                OrdinaryFailureRoute::LedgerDigest,
-                OrdinaryFailureRoute::LedgerEnvironment,
-                OrdinaryFailureRoute::LedgerEnvironmentSet,
-            ]),
-            "only seven legacy cfg(test) routes remain outside shipped/public credit",
+            complete_partition, all_routes,
+            "shipped plus legacy routes must partition the complete registry",
+        );
+        assert_eq!(
+            OrdinaryFailureSite::ProbeToolPlatform.route(),
+            OrdinaryFailureRoute::ToolPlatform,
+            "the sole legacy site maps only to the legacy platform route",
         );
 
         let mut route_counts = BTreeMap::new();
@@ -90124,14 +91088,62 @@ fn fallible(value: Option<u8>) {
     /// same test ID to consume the real production permit and ledger path.
     #[test]
     fn ordinary_b_r2_sealed_production_e2e() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let payload = b"intended sealed leaf\n";
+            let binding = super::phase_b_std::create_sealed_file_parent_chain_positive()
+                .expect("intended leaf creation advances only the direct-parent binding");
+            assert_eq!(
+                binding.byte_length,
+                u64::try_from(payload.len()).expect("intended leaf length"),
+            );
+            assert_eq!(
+                binding.sha256,
+                trust_sha256(payload).expect("intended leaf digest"),
+            );
+        }
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID, false);
     }
 
-    /// Frozen R2 negative: only the child-sealed bound tool-set digest differs;
-    /// the production entry must fail before evidence and leave accepted state
-    /// byte-for-byte unchanged.
+    /// Frozen R2 negatives: physical parent/file substitutions are refused by
+    /// the sealing boundary, then only the child-sealed bound tool-set digest
+    /// differs in self-reexec; both paths leave accepted state unchanged.
     #[test]
     fn ordinary_b_r2_sealed_field_desync_fails_closed() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let receipt = super::phase_b_std::create_sealed_file_parent_chain_negatives()
+                .expect("physical parent/file substitutions produce a typed receipt");
+            assert_eq!(receipt.direct_parent_code, "E_PHASE_B_FILE_RACE");
+            assert_eq!(
+                receipt.direct_parent_detail,
+                "direct parent negative: parent member delta",
+            );
+            assert!(
+                receipt.direct_parent_binding_unchanged,
+                "rejected same-inode member drift cannot advance the binding",
+            );
+            assert_eq!(receipt.member_cap_code, "E_PHASE_B_FILE_RACE");
+            assert_eq!(
+                receipt.member_cap_detail,
+                "member-cap negative: parent member count exceeds canonical cap 256",
+            );
+            assert!(
+                receipt.member_cap_binding_unchanged,
+                "cap-plus-one parent members cannot advance the binding",
+            );
+            assert_eq!(receipt.substituted_parent_code, "E_PHASE_B_FILE_RACE");
+            assert!(
+                receipt.substituted_parent_binding_unchanged,
+                "rejected direct-parent substitution cannot advance the binding",
+            );
+            assert_eq!(receipt.post_advance_code, "E_PHASE_B_FILE_RACE");
+            assert_eq!(receipt.same_bytes_file_code, "E_PHASE_B_FILE_RACE");
+            assert_eq!(
+                receipt.accepted_binding_count, 0,
+                "no rejected physical substitution earns an accepted binding",
+            );
+        }
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID, true);
     }
 
@@ -90430,7 +91442,7 @@ fn fallible(value: Option<u8>) {
     #[test]
     fn ordinary_product_stages_are_first_class_entry_tokens() {
         let mut route_ids = BTreeSet::new();
-        for route in OrdinaryFailureRoute::ALL {
+        for route in OrdinaryFailureRoute::SHIPPED {
             assert!(
                 route_ids.insert(route.id()),
                 "duplicate ordinary route id: {}",
@@ -90575,27 +91587,46 @@ fn fallible(value: Option<u8>) {
     /// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures.
     #[test]
     fn ordinary_harness_main_product_failures_emit_authority_stage() {
+        #[derive(Clone, Default, Debug, PartialEq, Eq)]
+        struct MalformedHandoffState {
+            callback_attempts: usize,
+            acceptance_effects: usize,
+            diagnostics: Vec<String>,
+        }
+
         let source = include_str!("fnd_01_dependency_evidence.rs");
         let ordinary_start = source.find("mod ordinary {").expect("ordinary module");
         let ordinary_end = source.rfind("} // mod ordinary").expect("ordinary module end");
         let ordinary_source = &source[ordinary_start..ordinary_end + 1];
-        let body = ordinary_function_body(ordinary_source, "harness_main");
-        let handoff_core = ordinary_function_body(ordinary_source, "ordinary_handoff_harness_core");
+        let body = compact_ordinary_token_text(&ordinary_function_body(
+            ordinary_source,
+            "harness_main",
+        ));
+        let handoff_core = compact_ordinary_token_text(&ordinary_function_body(
+            ordinary_source,
+            "ordinary_handoff_harness_core",
+        ));
         validate_ordinary_harness_wrapper_binding(&body)
             .expect("shipped harness must bind its real callback and emitter");
-        let planted = body.replacen("run_ordinary_handoff_entry", "|_| 3", 1);
+        let planted = body.replacen("run_ordinary_handoff_entry", "|_|3", 1);
         assert_eq!(
             validate_ordinary_harness_wrapper_binding(&planted),
             Err("ordinary harness must bind the real handoff callback and emitter"),
             "one callback binding replacement must reject the wrapper evaluator",
         );
-        // Known product failures construct their typed production sites.
+        let planted_emitter = body.replacen("emit_ordinary_entry_failure_route", "drop", 1);
+        assert_eq!(
+            validate_ordinary_harness_wrapper_binding(&planted_emitter),
+            Err("ordinary harness must bind the real handoff callback and emitter"),
+            "one emitter binding replacement must reject the wrapper evaluator",
+        );
+        // All structural predicates consume the same normalized TokenStream text.
         assert!(
-            body.contains("ordinary_handoff_harness_core("),
-            "shipped harness_main must delegate to the typed ordinary handoff core",
+            handoff_core.contains("arguments.len()!=ORDINARY_HANDOFF_ARGV_ARITY"),
+            "the typed core must reject malformed arity before callback dispatch",
         );
         assert!(
-            body.contains("OrdinaryFailureSite::EntryArity"),
+            handoff_core.contains("OrdinaryFailureSite::EntryArity"),
             "malformed arity must select the EntryArity site",
         );
         assert!(
@@ -90604,15 +91635,44 @@ fn fallible(value: Option<u8>) {
         );
         // No hard-coded stage=ordinary at ordinary product call sites (branches 3/4).
         assert!(
-            !body.contains("emit_entry_diagnostic(\n                    \"ordinary\","),
+            !body.contains("emit_entry_diagnostic(\"ordinary\","),
             "harness_main must not hard-code stage=ordinary for ordinary product failures",
         );
-        // Runtime fail-closed: wrong arity is never success (exit 3).
-        let code = harness_main([
-            std::ffi::OsString::from("/tmp/fnd01-harness"),
-            std::ffi::OsString::from("produce"),
-        ]);
-        assert_eq!(code, 3);
+
+        let state = std::rc::Rc::new(RefCell::new(MalformedHandoffState::default()));
+        let callback_state = std::rc::Rc::clone(&state);
+        let emitter_state = std::rc::Rc::clone(&state);
+        let code = ordinary_handoff_harness_core(
+            vec![
+                std::ffi::OsString::from("/tmp/fnd01-harness"),
+                std::ffi::OsString::from("produce"),
+            ],
+            move |_| {
+                let mut state = callback_state.borrow_mut();
+                state.callback_attempts += 1;
+                state.acceptance_effects += 1;
+                0
+            },
+            |mode, run_id, failure| {
+                let mut emitted = Vec::new();
+                write_ordinary_emitted_failure_frame(&mut emitted, mode, run_id, failure)
+                    .expect("malformed-arity frame write");
+                emitter_state
+                    .borrow_mut()
+                    .diagnostics
+                    .push(String::from_utf8(emitted).expect("malformed-arity frame UTF-8"));
+            },
+        );
+        assert_eq!(code, 3, "malformed arity must fail closed");
+        let state = state.borrow();
+        assert_eq!(state.callback_attempts, 0, "callback must remain unstarted");
+        assert_eq!(state.acceptance_effects, 0, "accepted/effect state must remain empty");
+        assert_eq!(state.diagnostics.len(), 1, "exactly one typed frame is emitted");
+        assert_eq!(
+            state.diagnostics[0],
+            "FND01ENTRYv1|authority|unknown|E_ENTRY_ARGUMENTS|role=unknown @ run_id=unavailable @ expected=valid ordinary handoff argv @ observed=invalid argument count\n",
+            "the captured production writer preserves the typed authority-stage route",
+        );
     }
 
     #[test]
@@ -91333,10 +92393,10 @@ fn fallible(value: Option<u8>) {
         assert_eq!(run_ordinary_controller_entry(arguments), 3);
     }
 
-    /// The ordinary five-argument branch has one small injectable core so its
-    /// defensive panic edge can be tested without creating a test-only public
-    /// route. The shipped wrapper below supplies the real handoff and stderr
-    /// emitter; only the callback boundary is parameterized.
+    /// The ordinary handoff branches share one small injectable core so malformed
+    /// arity and the defensive panic edge use the same typed emitter. The shipped
+    /// wrapper supplies the real handoff and stderr emitter; only the callback
+    /// boundary is parameterized.
     fn ordinary_handoff_harness_core<F, E>(
         arguments: Vec<std::ffi::OsString>,
         handoff: F,
@@ -91346,6 +92406,17 @@ fn fallible(value: Option<u8>) {
         F: FnOnce(Vec<std::ffi::OsString>) -> i32,
         E: FnMut(&str, &str, OrdinaryEntryFailure),
     {
+        if arguments.len() != ORDINARY_HANDOFF_ARGV_ARITY {
+            emit(
+                "unknown",
+                "unavailable",
+                OrdinaryEntryFailure::from_site(
+                    OrdinaryFailureSite::EntryArity,
+                    "invalid argument count",
+                ),
+            );
+            return 3;
+        }
         let mode = match arguments.get(1).and_then(|value| value.to_str()) {
             Some("produce") => "produce",
             Some("attest") => "attest",
@@ -91439,15 +92510,13 @@ fn fallible(value: Option<u8>) {
                 // B-R4 consumes the typed ordinary route registry at the production edge.
                 _ => {
                     branch.set(4);
-                    emit_ordinary_entry_failure_route(
-                        "unknown",
-                        "unavailable",
-                        OrdinaryEntryFailure::from_site(
-                            OrdinaryFailureSite::EntryArity,
-                            "invalid argument count",
-                        ),
-                    );
-                    3
+                    ordinary_handoff_harness_core(
+                        arguments,
+                        run_ordinary_handoff_entry,
+                        |mode, run_id, failure| {
+                            emit_ordinary_entry_failure_route(mode, run_id, failure);
+                        },
+                    )
                 }
             }
         }));
