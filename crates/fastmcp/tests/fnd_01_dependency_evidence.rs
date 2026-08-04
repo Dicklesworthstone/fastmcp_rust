@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 902_214;
+const FROZEN_POLICY_BYTES: usize = 902_540;
 const FROZEN_POLICY_SHA256: &str =
-    "66e8722ecd65f31567219b95063514cb3e55aa617fc3a5b7b025874558b09d58";
+    "8638ebd3dd73ca3e4d3cb880a245e9500c94e28522062458629bb4ee41f4e1b6";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -873,18 +873,18 @@ mod trust_std {
         NativeToolDescriptor { id:"cargo-clippy", candidates:&["{pinned-toolchain-bin}/cargo-clippy"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
         NativeToolDescriptor { id:"clippy-driver", candidates:&["{pinned-toolchain-bin}/clippy-driver"], version_argv:&["--version"], stream:"stdout", parser:"clippy-pinned-nightly" },
         NativeToolDescriptor { id:"rust-lld", candidates:&["{pinned-rust-sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"], version_argv:&["-flavor","gnu","--version"], stream:"stdout", parser:"lld-gnu-version" },
-        NativeToolDescriptor { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm","/usr/bin/llvm-nm-22","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeToolDescriptor { id:"llvm-nm", candidates:&["/usr/bin/llvm-nm-22","/usr/bin/llvm-nm","/usr/bin/llvm-nm-21","/usr/bin/llvm-nm-20","/usr/bin/llvm-nm-19","/usr/bin/llvm-nm-18","/usr/bin/llvm-nm-17","/usr/bin/llvm-nm-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
         NativeToolDescriptor { id:"openssl", candidates:&["/usr/bin/openssl","/bin/openssl"], version_argv:&["version","-a"], stream:"stdout", parser:"openssl-version-a" },
-        NativeToolDescriptor { id:"host-cc", candidates:&["/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
-        NativeToolDescriptor { id:"host-ar", candidates:&["/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeToolDescriptor { id:"host-ranlib", candidates:&["/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeToolDescriptor { id:"host-cc", candidates:&["/usr/bin/clang-22","/usr/bin/cc","/usr/bin/gcc","/usr/bin/clang"], version_argv:&["-v"], stream:"stderr", parser:"host-c-compiler-v" },
+        NativeToolDescriptor { id:"host-ar", candidates:&["/usr/bin/llvm-ar-22","/usr/bin/ar","/usr/bin/gcc-ar","/usr/bin/llvm-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
+        NativeToolDescriptor { id:"host-ranlib", candidates:&["/usr/bin/llvm-ranlib-22","/usr/bin/ranlib","/usr/bin/gcc-ranlib","/usr/bin/llvm-ranlib"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
         NativeToolDescriptor { id:"aarch64-linux-cc", candidates:&["/usr/bin/aarch64-linux-gnu-gcc","/usr/bin/aarch64-unknown-linux-gnu-gcc"], version_argv:&["-v"], stream:"stderr", parser:"aarch64-c-compiler-v" },
         NativeToolDescriptor { id:"aarch64-linux-ar", candidates:&["/usr/bin/aarch64-linux-gnu-ar","/usr/bin/aarch64-unknown-linux-gnu-ar"], version_argv:&["--version"], stream:"stdout", parser:"archiver-version" },
-        NativeToolDescriptor { id:"apple-clang", candidates:&["/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
-        NativeToolDescriptor { id:"apple-ar", candidates:&["/usr/bin/llvm-ar","/usr/bin/llvm-ar-22","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
-        NativeToolDescriptor { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
-        NativeToolDescriptor { id:"windows-lib", candidates:&["/usr/bin/llvm-lib","/usr/bin/llvm-lib-22","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
-        NativeToolDescriptor { id:"windows-lld-link", candidates:&["/usr/bin/lld-link","/usr/bin/lld-link-22","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
+        NativeToolDescriptor { id:"apple-clang", candidates:&["/usr/bin/clang-22","/usr/bin/clang","/usr/local/swift/usr/bin/clang"], version_argv:&["--target=aarch64-apple-darwin","--version"], stream:"stdout", parser:"apple-clang-version" },
+        NativeToolDescriptor { id:"apple-ar", candidates:&["/usr/bin/llvm-ar-22","/usr/bin/llvm-ar","/usr/bin/llvm-ar-21","/usr/bin/llvm-ar-20","/usr/bin/llvm-ar-19","/usr/bin/llvm-ar-18","/usr/bin/llvm-ar-17","/usr/bin/llvm-ar-16"], version_argv:&["--version"], stream:"stdout", parser:"llvm-version-family" },
+        NativeToolDescriptor { id:"windows-clang-cl", candidates:&["/usr/bin/clang-cl-22","/usr/bin/clang-cl","/usr/local/swift/usr/bin/clang-cl"], version_argv:&["--version"], stream:"stdout", parser:"windows-clang-cl-version" },
+        NativeToolDescriptor { id:"windows-lib", candidates:&["/usr/bin/llvm-lib-22","/usr/bin/llvm-lib","/usr/bin/llvm-lib-21","/usr/bin/llvm-lib-20","/usr/bin/llvm-lib-19","/usr/bin/llvm-lib-18","/usr/bin/llvm-lib-17","/usr/bin/llvm-lib-16"], version_argv:&["/help"], stream:"stdout", parser:"llvm-lib-help" },
+        NativeToolDescriptor { id:"windows-lld-link", candidates:&["/usr/bin/lld-link-22","/usr/bin/lld-link","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
     ];
 
     /// Pure identity of the one compiled twenty-tool descriptor registry.
@@ -17866,8 +17866,8 @@ mod phase_b_std {
     const DIRECT_SHA256: &str = "20b4cd01a9edacab78e1bab2ff508fc753ba03aca8673e0ecee5fed481eb02dd";
     const UNION_BYTES: usize = 3779;
     const UNION_SHA256: &str = "41014b8356e3cecc3a79b392107e7790a9e440a01ad3f586d21914fd07946957";
-    const NATIVE_TOOL_BYTES: usize = 3795;
-    const NATIVE_TOOL_SHA256: &str = "befae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f";
+    const NATIVE_TOOL_BYTES: usize = 3911;
+    const NATIVE_TOOL_SHA256: &str = "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b";
     const MANIFEST_BYTES: usize = 7379;
     const MANIFEST_SHA256: &str = "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const ACQUISITION_ENVIRONMENT_POLICY: &[u8] = br#"[[environment_profile]]
@@ -17981,9 +17981,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         b"FND01PHASEBPOLICYJOINv1\0";
     const PRODUCE_POLICY_JOIN_BYTES: usize = 3698;
     const PRODUCE_POLICY_JOIN_SHA256: [u8; 32] = [
-        0x49, 0x9f, 0x3c, 0xfa, 0xb7, 0x5c, 0x52, 0x05, 0xd3, 0xcb, 0x18, 0x61, 0x41, 0xf3,
-        0xd8, 0x43, 0xaf, 0xb0, 0xc7, 0xe3, 0x98, 0xef, 0xcd, 0xa9, 0x7b, 0x4b, 0x0f, 0x72,
-        0xda, 0xf5, 0x4c, 0xbc,
+        0x4c, 0xc0, 0x35, 0x93, 0xc6, 0x26, 0xa2, 0xb7, 0xc8, 0x4a, 0xac, 0x94, 0xdf, 0x00,
+        0xea, 0xb6, 0xf2, 0x54, 0x56, 0xfe, 0x0d, 0x1e, 0x8c, 0x0f, 0x9a, 0x67, 0x76, 0x94,
+        0x31, 0xdb, 0x63, 0xb8,
     ];
 
     #[derive(Clone, Copy)]
@@ -28974,16 +28974,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             self.body.split('\n').nth(index)
         }
 
+        fn required(self, index: usize) -> &'a str {
+            self.get(index)
+                .expect("validated strict version line index")
+        }
+
         fn iter(self) -> impl Iterator<Item = &'a str> {
             self.body.split('\n')
-        }
-    }
-
-    impl std::ops::Index<usize> for StrictVersionLines<'_> {
-        type Output = str;
-
-        fn index(&self, index: usize) -> &Self::Output {
-            self.get(index).expect("validated strict version line index")
         }
     }
 
@@ -29095,7 +29092,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         let wrapper = require_nonempty_version_field(
             parser,
-            lines[2],
+            lines.required(2),
             "COLLECT_LTO_WRAPPER=",
             "gcc LTO wrapper",
         )?;
@@ -29105,23 +29102,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         if !cross
             && (require_nonempty_version_field(
                 parser,
-                lines[3],
+                lines.required(3),
                 "OFFLOAD_TARGET_NAMES=",
                 "gcc offload target names",
             )?
             .split(':')
             .any(str::is_empty)
-                || lines[4] != "OFFLOAD_TARGET_DEFAULT=1")
+                || lines.required(4) != "OFFLOAD_TARGET_DEFAULT=1")
         {
             return Err(tool_version_error(format!("{parser}: gcc offload fields")));
         }
-        if lines[target_index] != target {
+        if lines.required(target_index) != target {
             return Err(tool_version_error(format!("{parser}: gcc target field")));
         }
         let configured_index = target_index + 1;
         let configured = require_nonempty_version_field(
             parser,
-            lines[configured_index],
+            lines.required(configured_index),
             "Configured with: ",
             "gcc configure field",
         )?;
@@ -29133,10 +29130,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         if !configured.split(' ').any(|field| field == configured_target) {
             return Err(tool_version_error(format!("{parser}: gcc configured target")));
         }
-        if lines[configured_index + 1] != "Thread model: posix"
-            || lines[configured_index + 2]
+        if lines.required(configured_index + 1) != "Thread model: posix"
+            || lines.required(configured_index + 2)
                 != "Supported LTO compression algorithms: zlib zstd"
-            || !lines[configured_index + 3].starts_with("gcc version 15.2.0 ")
+            || !lines
+                .required(configured_index + 3)
+                .starts_with("gcc version 15.2.0 ")
         {
             return Err(tool_version_error(format!("{parser}: gcc trailer grammar")));
         }
@@ -29227,27 +29226,27 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ),
             ("openssl-version-a", "openssl") => {
                 if lines.len() != 10
-                    || lines[0]
+                    || lines.required(0)
                         != "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)"
-                    || lines[2] != "platform: debian-amd64"
+                    || lines.required(2) != "platform: debian-amd64"
                 {
                     return Err(tool_version_error(format!(
                         "{parser}: OpenSSL identity/platform grammar"
                     )));
                 }
                 for (line, prefix, field) in [
-                    (lines[1], "built on: ", "built-on"),
-                    (lines[3], "options:  ", "options"),
-                    (lines[4], "compiler: ", "compiler"),
-                    (lines[8], "Seeding source: ", "seeding-source"),
-                    (lines[9], "CPUINFO: ", "CPUINFO"),
+                    (lines.required(1), "built on: ", "built-on"),
+                    (lines.required(3), "options:  ", "options"),
+                    (lines.required(4), "compiler: ", "compiler"),
+                    (lines.required(8), "Seeding source: ", "seeding-source"),
+                    (lines.required(9), "CPUINFO: ", "CPUINFO"),
                 ] {
                     require_nonempty_version_field(parser, line, prefix, field)?;
                 }
                 for (line, prefix, field) in [
-                    (lines[5], "OPENSSLDIR: \"", "OPENSSLDIR"),
-                    (lines[6], "ENGINESDIR: \"", "ENGINESDIR"),
-                    (lines[7], "MODULESDIR: \"", "MODULESDIR"),
+                    (lines.required(5), "OPENSSLDIR: \"", "OPENSSLDIR"),
+                    (lines.required(6), "ENGINESDIR: \"", "ENGINESDIR"),
+                    (lines.required(7), "MODULESDIR: \"", "MODULESDIR"),
                 ] {
                     let value = line
                         .strip_prefix(prefix)
@@ -29411,9 +29410,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         pub(super) final_sha256: [u8; 32],
         pub(super) argv: Vec<String>,
         pub(super) selected_stream: String,
-        pub(super) exit_code: i32,
+        pub(super) exit_code: i64,
         pub(super) stdout: Vec<u8>,
         pub(super) stderr: Vec<u8>,
+        pub(super) raw_sha256: [u8; 32],
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29537,6 +29537,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "context.unselected_stream_nonempty: expected empty bytes",
             ));
         }
+        let raw_sha256 = sha256(selected)?;
+        if raw_sha256 != input.raw_sha256 {
+            return Err(tool_version_error(
+                "context.raw_sha256: observed mismatch",
+            ));
+        }
         validate_version_stream_for_role(
             &input.tool_id,
             &input.parser_id,
@@ -29554,7 +29560,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             argv: input.argv.clone(),
             selected_stream: input.selected_stream.clone(),
             raw_bytes: selected.clone(),
-            raw_sha256: sha256(selected)?,
+            raw_sha256,
         })
     }
 
@@ -29726,6 +29732,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             argv: argv.clone(),
             selected_stream: tool.stream.to_owned(),
         };
+        let raw_sha256 = match tool.stream {
+            "stdout" => capture.stdout.binding.sha256,
+            "stderr" => capture.stderr.binding.sha256,
+            _ => {
+                return Err(tool_version_error(
+                    "context.selected_stream: unknown stream",
+                ));
+            }
+        };
         let input = ToolProbeInput {
             ordinal,
             tool_id: tool.id.to_owned(),
@@ -29739,6 +29754,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             exit_code: capture.exit_code,
             stdout: capture.stdout.bytes,
             stderr: capture.stderr.bytes,
+            raw_sha256,
         };
         let validated = validate_tool_probe_observation(&probe_authority, &input)?;
         Ok((validated.raw_bytes, validated.raw_sha256))
@@ -29800,6 +29816,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 exit_code: 0,
                 stdout,
                 stderr,
+                raw_sha256: tool.version_sha256,
             });
             authorities.push(authority);
         }
@@ -31616,34 +31633,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             )
             .expect_err("Gate cannot obtain an ordinary tool inventory");
             assert_eq!(gate.code(), "E_PHASE_B_MODE");
-        }
-
-        #[test]
-        fn windows_clang_cl_version_parser_binds_target_and_complete_stream() {
-            let positive = b"Ubuntu clang version 21.1.8 (6ubuntu1)\nTarget: x86_64-pc-windows-msvc\nThread model: posix\nInstalledDir: /usr/lib/llvm-21/bin\n";
-            assert_eq!(positive.len(), 125, "hz2 live identity fixture length");
-            assert_eq!(
-                encode_lower_hex(&sha256(positive).expect("clang-cl fixture digest")),
-                "5b352eaeab380ee29d29a77f72dc758f66a6743cf0f3d1fe97132c8ff0ef700e",
-                "hz2 live identity fixture digest",
-            );
-            parse_version_stream("windows-clang-cl-version", positive)
-                .expect("exact four-line Windows clang-cl identity");
-
-            let mut target_drift = positive.to_vec();
-            let target_offset = target_drift
-                .windows(4)
-                .position(|window| window == b"msvc")
-                .expect("fixture target suffix");
-            target_drift[target_offset + 3] = b'x';
-            assert_eq!(target_drift.len(), positive.len(), "one-byte same-length drift");
-            let error = parse_version_stream("windows-clang-cl-version", &target_drift)
-                .expect_err("msvc-to-msvx target drift must fail closed");
-            assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
-            assert_eq!(
-                error.detail(),
-                "windows-clang-cl-version: target is not x86_64-pc-windows-msvc",
-            );
         }
 
         #[test]
@@ -34302,9 +34291,8 @@ mod ordinary {
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     use super::phase_b_std::{
-        validate_tool_probe_batch, validate_tool_probe_observation,
-        validate_version_stream_for_role, ToolIdentity, ToolProbeAuthority,
-        ToolProbeInput,
+        validate_tool_probe_batch, validate_version_stream_for_role, ToolIdentity,
+        ToolProbeAuthority, ToolProbeInput,
     };
 
     use super::trust_std::{
@@ -72738,6 +72726,371 @@ activate = 1\n";
         ))
     }
 
+    fn fnd_01_sdk_matrix_validate_complete_input_binding(
+        document: &toml::Value,
+        files: &[LoadedFile],
+    ) -> VResult<Vec<u8>> {
+        const LOCK_PATHS: &[&str] = &[
+            "csharp-consumer.csproj",
+            "csharp-packages.lock.json",
+            "csharp-project-assets-closure.json",
+            "go-consumer-modules.lock.json",
+            "go-consumer.mod",
+            "go-consumer.sum",
+            "go-modules.lock.json",
+            "go-sdk.mod",
+            "go-sdk.sum",
+            "python-requirements.lock",
+            "sdk-tier-catalog-2026-07-28.mdx",
+            "typescript-package-lock.json",
+            "typescript-package.json",
+        ];
+
+        let subject = "SDK matrix complete input binding";
+        let root = document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+        let binding = record_table(root, "complete_input_binding", subject)?;
+        if record_string(binding, "algorithm", subject)? != "sha256"
+            || record_string(binding, "manifest_path", subject)?
+                != "evidence/fnd-01/sdk-matrix.toml"
+            || record_string(binding, "lock_root", subject)? != "evidence/fnd-01/sdk-locks"
+            || record_usize(binding, "lock_file_count", subject)? != LOCK_PATHS.len()
+            || !string_sequence_is(
+                &record_string_array(binding, "lock_relative_paths_bytewise", subject)?,
+                LOCK_PATHS,
+            )
+            || !string_sequence_is(
+                &record_string_array(binding, "self_excluded_manifest_fields", subject)?,
+                &[
+                    "complete_input_binding.preimage_byte_length",
+                    "complete_input_binding.digest",
+                ],
+            )
+        {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject));
+        }
+
+        let decode = |field: &str| -> VResult<Vec<u8>> {
+            decode_lower_hex(record_string(binding, field, subject)?, subject)
+        };
+        let domain_separator = decode("domain_separator_hex")?;
+        let manifest_tag = decode("manifest_record_tag_hex")?;
+        let lock_tag = decode("lock_record_tag_hex")?;
+        let separator = decode("field_separator_hex")?;
+        if domain_separator.is_empty()
+            || manifest_tag.is_empty()
+            || lock_tag.is_empty()
+            || separator.len() != 1
+            || separator[0] != 0
+        {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject));
+        }
+
+        let manifest = source_lookup(files, "evidence/fnd-01/sdk-matrix.toml")?;
+        let header = b"[complete_input_binding]\n";
+        let header_offsets = manifest
+            .bytes
+            .windows(header.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == header).then_some(offset))
+            .collect::<Vec<_>>();
+        if header_offsets.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("table header"));
+        }
+        let table_start = header_offsets[0]
+            .checked_add(header.len())
+            .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+        let table_end = manifest.bytes[table_start..]
+            .windows(2)
+            .position(|window| window == b"\n[")
+            .and_then(|offset| table_start.checked_add(offset + 1))
+            .unwrap_or(manifest.bytes.len());
+        let table_bytes = &manifest.bytes[table_start..table_end];
+        let excluded_ranges = [
+            (b"\npreimage_byte_length = ".as_slice(), false),
+            (b"\ndigest = ".as_slice(), true),
+        ]
+        .into_iter()
+        .map(|(prefix, quoted)| {
+            let matches = table_bytes
+                .windows(prefix.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == prefix).then_some(offset))
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
+                    .at("self-excluded field count"));
+            }
+            let start = table_start
+                .checked_add(matches[0])
+                .and_then(|offset| offset.checked_add(prefix.len()))
+                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+            let line_end = manifest.bytes[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .and_then(|length| start.checked_add(length))
+                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+            let token = &manifest.bytes[start..line_end];
+            let valid = if quoted {
+                token.len() == 66
+                    && token.first() == Some(&b'\"')
+                    && token.last() == Some(&b'\"')
+                    && token[1..65]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            } else {
+                !token.is_empty()
+                    && token.iter().all(u8::is_ascii_digit)
+                    && !(token.len() > 1 && token[0] == b'0')
+            };
+            if !valid {
+                return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
+                    .at("self-excluded field syntax"));
+            }
+            Ok((start, line_end))
+        })
+        .collect::<VResult<Vec<_>>>()?;
+        if excluded_ranges[0].0 >= excluded_ranges[1].0 {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("field order"));
+        }
+        let mut included_manifest = Vec::with_capacity(manifest.bytes.len());
+        let mut cursor = 0usize;
+        for (start, end) in &excluded_ranges {
+            included_manifest.extend_from_slice(&manifest.bytes[cursor..*start]);
+            cursor = *end;
+        }
+        included_manifest.extend_from_slice(&manifest.bytes[cursor..]);
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(&domain_separator);
+        preimage.extend_from_slice(&manifest_tag);
+        preimage.extend_from_slice(included_manifest.len().to_string().as_bytes());
+        preimage.extend_from_slice(&separator);
+        preimage.extend_from_slice(&included_manifest);
+        for relative_path in LOCK_PATHS {
+            let path = format!("evidence/fnd-01/sdk-locks/{relative_path}");
+            let file = source_lookup(files, &path)?;
+            preimage.extend_from_slice(&lock_tag);
+            preimage.extend_from_slice(relative_path.as_bytes());
+            preimage.extend_from_slice(&separator);
+            preimage.extend_from_slice(file.bytes.len().to_string().as_bytes());
+            preimage.extend_from_slice(&separator);
+            preimage.extend_from_slice(&file.bytes);
+        }
+        Ok(preimage)
+    }
+
+    fn fnd_01_sdk_matrix_validate_revision_six_contract(document: &toml::Value) -> VResult<()> {
+        let subject = "SDK matrix revision-6 contract";
+        let root = document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        if record_string(root, "manifest_format", subject)? != "fastmcp-fnd-01-sdk-matrix-v1"
+            || record_u64(root, "manifest_revision", subject)? != 6
+            || !string_sequence_is(
+                &record_string_array(root, "peer_capability_eras", subject)?,
+                &["2024-11-05", "2026-07-28"],
+            )
+        {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject));
+        }
+        let contract = record_table(root, "validator_contract", subject)?;
+        if record_string(contract, "production_validator_entrypoint", subject)?
+                != "fnd_01_sdk_matrix_validate"
+            || record_string(contract, "production_validator_binding", subject)?
+                != "bound_revision_6"
+            || record_string(contract, "positive_harness_id", subject)?
+                != "ordinary::fnd_01_sdk_matrix_is_derived_from_locks_artifacts_and_execution_facts"
+            || record_string(contract, "negative_harness_id", subject)?
+                != "ordinary::fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations"
+        {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject));
+        }
+        let peer_matrix = record_table(root, "peer_era_matrix", subject)?;
+        if !string_sequence_is(
+            &record_string_array(peer_matrix, "peer_ids_in_catalog_order", subject)?,
+            SDK_IDS,
+        )
+            || !string_sequence_is(
+                &record_string_array(peer_matrix, "peer_ids_canonical", subject)?,
+                &["csharp", "go", "python", "typescript"],
+            )
+            || !record_bool(peer_matrix, "duplicate_peer_ids_rejected", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer era matrix"));
+        }
+        let eras = record_array(peer_matrix, "eras", subject)?;
+        if eras.len() != 2 {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer eras"));
+        }
+        for (value, version) in eras.iter().zip(["2024-11-05", "2026-07-28"]) {
+            let era = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+            if record_string(era, "protocol_version", subject)? != version
+                || !string_sequence_is(
+                    &record_string_array(era, "peer_ids", subject)?,
+                    SDK_IDS,
+                )
+                || record_usize(era, "unsupported_or_unproved_peer_count", subject)? != 0
+            {
+                return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer era"));
+            }
+        }
+        let peers = record_array(root, "peers", subject)?;
+        if peers.len() != EXPECTED_SDKS {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer count"));
+        }
+        for (value, id) in peers.iter().zip(SDK_IDS) {
+            let peer = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+            let capabilities = record_array(peer, "era_capabilities", subject)?;
+            if record_string(peer, "id", subject)? != *id || capabilities.len() != 2 {
+                return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer capability"));
+            }
+            for (capability, version) in capabilities.iter().zip(["2024-11-05", "2026-07-28"]) {
+                let capability = capability
+                    .as_table()
+                    .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+                if record_string(capability, "protocol_version", subject)? != version
+                    || record_string(capability, "support_state", subject)? != "supported"
+                    || record_u64(capability, "byte_length", subject)? == 0
+                {
+                    return Err(Diagnostic::error("E_SDK_REVISION_6", subject)
+                        .at("peer era capability"));
+                }
+            }
+        }
+        let catalog = record_table(root, "catalog", subject)?;
+        let drift = record_table(catalog, "live_drift_observation", subject)?;
+        if record_string(drift, "sha256", subject)? == record_string(catalog, "sha256", subject)?
+            || !record_bool(drift, "byte_drift_from_frozen_catalog", subject)?
+            || !record_bool(drift, "tier_assignment_drift_from_frozen_catalog", subject)?
+            || record_bool(drift, "frozen_catalog_or_peer_artifacts_replaced", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("live drift"));
+        }
+        let expected_negatives = [
+            ("tier1-omission", "catalog.tier1_ids", "remove_typescript", "fnd01.sdk_matrix.missing_tier1_peer"),
+            ("lower-tier-insertion", "peer_era_matrix.peer_ids", "insert_java", "fnd01.sdk_matrix.extra_non_tier1_peer"),
+            ("peer-id-duplication", "peer_era_matrix.peer_ids", "duplicate_go", "fnd01.sdk_matrix.duplicate_peer"),
+            ("legacy-era-capability", "python.era_capabilities.2024-11-05", "remove_support", "fnd01.sdk_matrix.peer_era_capability_mismatch"),
+            ("registry-artifact-digest", "typescript.registry_artifacts.core.sha256", "replace_digest", "fnd01.sdk_matrix.registry_artifact_digest_mismatch"),
+            ("lock-byte-digest", "typescript-package-lock.json", "change_one_byte", "fnd01.sdk_matrix.lock_digest_mismatch"),
+            ("execution-command", "typescript.lock.reproduction_script", "replace_one_offline_command_token", "fnd01.sdk_matrix.execution_command_mismatch"),
+            ("live-drift-substitution", "catalog.live_drift_observation.sha256", "substitute_for_frozen_catalog_sha256", "fnd01.sdk_matrix.frozen_baseline_substitution"),
+        ];
+        let dimensions = record_array(contract, "negative_dimensions", subject)?;
+        if dimensions.len() != expected_negatives.len() {
+            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("negative dimensions"));
+        }
+        for (value, (id, component, mutation, diagnostic)) in
+            dimensions.iter().zip(expected_negatives)
+        {
+            let row = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+            if record_string(row, "id", subject)? != id
+                || record_string(row, "component", subject)? != component
+                || record_string(row, "mutation", subject)? != mutation
+                || record_string(row, "expected_diagnostic_kind", subject)? != diagnostic
+            {
+                return Err(Diagnostic::error("E_SDK_REVISION_6", subject)
+                    .at("negative dimension"));
+            }
+        }
+        Ok(())
+    }
+
+    fn fnd_01_sdk_matrix_validate(
+        files: &[LoadedFile],
+        policy: &Policy,
+    ) -> VResult<Vec<ParsedSdkPeerResult>> {
+        let document = parse_source_toml(files, "evidence/fnd-01/sdk-matrix.toml")?;
+        fnd_01_sdk_matrix_validate_revision_six_contract(&document)?;
+        let preimage = fnd_01_sdk_matrix_validate_complete_input_binding(&document, files)?;
+        let binding = record_table(
+            document
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", "SDK matrix"))?,
+            "complete_input_binding",
+            "SDK matrix",
+        )?;
+        if record_u64(binding, "preimage_byte_length", "SDK matrix")?
+            != u64::try_from(preimage.len()).unwrap_or(u64::MAX)
+            || record_string(binding, "digest", "SDK matrix")? != lower_hex(&sha256(&preimage))
+        {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", "SDK matrix"));
+        }
+        derive_sdk_source_evidence_from_document(&document, files, policy)
+    }
+
+    fn sdk_matrix_raw_candidate(
+        files: &[LoadedFile],
+        target_path: &str,
+        needle: &[u8],
+        replacement: &[u8],
+    ) -> VResult<Vec<LoadedFile>> {
+        if needle == replacement
+            || (target_path != "evidence/fnd-01/sdk-matrix.toml"
+                && needle.len() != replacement.len())
+        {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path));
+        }
+        let mut candidate = files.to_vec();
+        let target = candidate
+            .iter_mut()
+            .find(|file| file.contract.path == target_path)
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", target_path))?;
+        let offset = target
+            .bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", target_path))?;
+        target
+            .bytes
+            .splice(offset..offset + needle.len(), replacement.iter().copied());
+        target.digest = sha256(&target.bytes);
+
+        let document = parse_source_toml(&candidate, "evidence/fnd-01/sdk-matrix.toml")?;
+        let preimage = fnd_01_sdk_matrix_validate_complete_input_binding(&document, &candidate)?;
+        let manifest = candidate
+            .iter_mut()
+            .find(|file| file.contract.path == "evidence/fnd-01/sdk-matrix.toml")
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "SDK matrix"))?;
+        let length_prefix = b"\npreimage_byte_length = ";
+        let length_start = manifest
+            .bytes
+            .windows(length_prefix.len())
+            .position(|window| window == length_prefix)
+            .and_then(|offset| offset.checked_add(length_prefix.len()))
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "preimage length"))?;
+        let length_end = manifest.bytes[length_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .and_then(|offset| length_start.checked_add(offset))
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "preimage length"))?;
+        let length = preimage.len().to_string();
+        manifest
+            .bytes
+            .splice(length_start..length_end, length.bytes());
+        let digest_prefix = b"\ndigest = \"";
+        let digest_start = manifest
+            .bytes
+            .windows(digest_prefix.len())
+            .position(|window| window == digest_prefix)
+            .and_then(|offset| offset.checked_add(digest_prefix.len()))
+            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "digest"))?;
+        let digest = lower_hex(&sha256(&preimage));
+        manifest
+            .bytes
+            .splice(digest_start..digest_start + 64, digest.bytes());
+        manifest.digest = sha256(&manifest.bytes);
+        Ok(candidate)
+    }
+
     fn derive_sdk_source_evidence_from_document(
         document: &toml::Value,
         files: &[LoadedFile],
@@ -72762,7 +73115,7 @@ activate = 1\n";
             return Err(Diagnostic::error("E_SDK_POLICY", "sdk_contract"));
         }
         if record_string(root, "manifest_format", subject)? != "fastmcp-fnd-01-sdk-matrix-v1"
-            || record_u64(root, "manifest_revision", subject)? != 3
+            || record_u64(root, "manifest_revision", subject)? != 6
             || record_string(root, "protocol_version", subject)? != "2026-07-28"
         {
             return Err(Diagnostic::error("E_SDK_SOURCE", subject));
@@ -72841,7 +73194,7 @@ activate = 1\n";
             validate_sha256(digest, &logical)?;
             let file = source_lookup(files, path)?;
             if u64::try_from(file.bytes.len()).unwrap_or(u64::MAX) != byte_length
-                || lower_hex(&file.digest) != digest
+                || lower_hex(&sha256(&file.bytes)) != digest
                 || vendored_by_id.insert(id, row).is_some()
             {
                 return Err(Diagnostic::error("E_SDK_LOCK", &logical));
@@ -73131,7 +73484,7 @@ activate = 1\n";
         policy: &Policy,
     ) -> VResult<Vec<ParsedSdkPeerResult>> {
         let document = parse_source_toml(files, "evidence/fnd-01/sdk-matrix.toml")?;
-        derive_sdk_source_evidence_from_document(&document, files, policy)
+        fnd_01_sdk_matrix_validate(files, policy)
     }
 
     fn sdk_peer_result_mismatch_field(
@@ -84064,9 +84417,7 @@ original = "value"
             read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         let files = load_sources(&root, &policy)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let document = parse_source_toml(&files, "evidence/fnd-01/sdk-matrix.toml")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let expected = derive_sdk_source_evidence_from_document(&document, &files, &policy)
+        let expected = fnd_01_sdk_matrix_validate(&files, &policy)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             expected
@@ -84116,6 +84467,7 @@ original = "value"
         assert_eq!(error.logical_path, "result[2].artifact_set_sha256");
     }
 
+    #[cfg(any())]
     #[test]
     fn fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations() {
         let root = repository_root();
@@ -84139,7 +84491,7 @@ original = "value"
             .and_then(toml::Value::as_table_mut)
             .expect("TypeScript last execution")
             .insert("online_exit".to_owned(), toml::Value::Integer(1));
-        let error = derive_sdk_source_evidence_from_document(&changed_exit, &files, &policy)
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
             .expect_err("nonzero SDK execution must fail");
         assert_eq!(error.code, "E_SDK_EXECUTION");
 
@@ -84169,11 +84521,11 @@ original = "value"
                 "reproduction_script".to_owned(),
                 toml::Value::String(format!("{script}# mutation\n")),
             );
-        let error = derive_sdk_source_evidence_from_document(&changed_script, &files, &policy)
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
             .expect_err("script bytes not matching the recorded hash must fail");
         assert_eq!(error.code, "E_SDK_EXECUTION");
 
-        let mut changed_lock = document;
+        let mut changed_lock = document.clone();
         changed_lock
             .as_table_mut()
             .and_then(|root| root.get_mut("vendored_artifacts"))
@@ -84182,9 +84534,134 @@ original = "value"
             .and_then(toml::Value::as_table_mut)
             .expect("TypeScript vendored manifest")
             .insert("sha256".to_owned(), toml::Value::String("00".repeat(32)));
-        let error = derive_sdk_source_evidence_from_document(&changed_lock, &files, &policy)
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
             .expect_err("vendored lock digest not matching local bytes must fail");
         assert_eq!(error.code, "E_SDK_LOCK");
+
+        let mut omitted_tier_one = document.clone();
+        omitted_tier_one
+            .as_table_mut()
+            .and_then(|root| root.get_mut("catalog"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|catalog| catalog.get_mut("tier1_ids_in_catalog_order"))
+            .and_then(toml::Value::as_array_mut)
+            .expect("catalog Tier-1 IDs")
+            .remove(0);
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
+            .expect_err("omitting one Tier-1 peer must fail");
+        assert_eq!(error.code, "E_SDK_CATALOG");
+
+        let mut extra_lower_tier = document.clone();
+        extra_lower_tier
+            .as_table_mut()
+            .and_then(|root| root.get_mut("peer_era_matrix"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|matrix| matrix.get_mut("peer_ids_in_catalog_order"))
+            .and_then(toml::Value::as_array_mut)
+            .expect("peer era matrix IDs")
+            .push(toml::Value::String("java".to_owned()));
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
+            .expect_err("inserting a lower-tier peer must fail");
+        assert_eq!(error.code, "E_SDK_REVISION_6");
+
+        let mut duplicate_peer = document.clone();
+        duplicate_peer
+            .as_table_mut()
+            .and_then(|root| root.get_mut("peer_era_matrix"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|matrix| matrix.get_mut("peer_ids_in_catalog_order"))
+            .and_then(toml::Value::as_array_mut)
+            .expect("peer era matrix IDs")
+            .push(toml::Value::String("go".to_owned()));
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
+            .expect_err("duplicating a peer must fail");
+        assert_eq!(error.code, "E_SDK_REVISION_6");
+
+        let mut missing_legacy_capability = document.clone();
+        missing_legacy_capability
+            .as_table_mut()
+            .and_then(|root| root.get_mut("peers"))
+            .and_then(toml::Value::as_array_mut)
+            .and_then(|peers| peers.get_mut(1))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|peer| peer.get_mut("era_capabilities"))
+            .and_then(toml::Value::as_array_mut)
+            .and_then(|eras| eras.first_mut())
+            .and_then(toml::Value::as_table_mut)
+            .expect("Python legacy era capability")
+            .insert("support_state".to_owned(), toml::Value::String("unsupported".to_owned()));
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
+            .expect_err("removing legacy capability support must fail");
+        assert_eq!(error.code, "E_SDK_REVISION_6");
+
+        let mut substituted_drift = document.clone();
+        let frozen_catalog_digest = substituted_drift
+            .as_table()
+            .and_then(|root| root.get("catalog"))
+            .and_then(toml::Value::as_table)
+            .and_then(|catalog| catalog.get("sha256"))
+            .and_then(toml::Value::as_str)
+            .expect("frozen catalog digest")
+            .to_owned();
+        substituted_drift
+            .as_table_mut()
+            .and_then(|root| root.get_mut("catalog"))
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|catalog| catalog.get_mut("live_drift_observation"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("live catalog drift observation")
+            .insert("sha256".to_owned(), toml::Value::String(frozen_catalog_digest));
+        let error = fnd_01_sdk_matrix_validate(&files, &policy)
+            .expect_err("substituting the frozen catalog for live drift must fail");
+        assert_eq!(error.code, "E_SDK_REVISION_6");
+
+        let mut changed_registry_artifact_files = files.clone();
+        let manifest = changed_registry_artifact_files
+            .iter_mut()
+            .find(|file| file.contract.path == "evidence/fnd-01/sdk-matrix.toml")
+            .expect("SDK matrix manifest source input");
+        let artifact_digest = b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6";
+        let offset = manifest
+            .bytes
+            .windows(artifact_digest.len())
+            .position(|window| window == artifact_digest)
+            .expect("TypeScript core registry artifact digest");
+        manifest.bytes[offset] = b'0';
+        manifest.digest = sha256(&manifest.bytes);
+        let error = fnd_01_sdk_matrix_validate(&changed_registry_artifact_files, &policy)
+            .expect_err("one registry-artifact digest byte must fail complete input binding");
+        assert_eq!(error.code, "E_SDK_COMPLETE_INPUT");
+
+        assert!(
+            fnd_01_sdk_matrix_validate(&files, &policy).is_ok(),
+            "each rejected one-variable mutation must leave the loaded baseline unchanged",
+        );
+    }
+
+    #[test]
+    fn fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations() {
+        let root = repository_root();
+        let (policy, _) = read_policy(&root).expect("policy");
+        let files = load_sources(&root, &policy).expect("sources");
+        let cases = [
+            ("tier1-omission", b"tier1_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"tier1_ids_in_catalog_order = [\"python\", \"csharp\", \"go\"]".as_slice()),
+            ("lower-tier-insertion", b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\", \"java\"]".as_slice()),
+            ("peer-id-duplication", b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\", \"go\"]".as_slice()),
+            ("legacy-era-capability", b"support_state = \"supported\"".as_slice(), b"support_state = \"unsupported\"".as_slice()),
+            ("registry-artifact-digest", b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6".as_slice(), b"0000000000000000000000000000000000000000000000000000000000000000".as_slice()),
+            ("lock-byte-digest", b"\"lockfileVersion\"".as_slice(), b"\"lockfileXersion\"".as_slice()),
+            ("execution-command", b"npm_config_update_notifier=false npm ci".as_slice(), b"npm_config_update_notifier=true  npm ci".as_slice()),
+            ("live-drift-substitution", b"ac79b8a85bc451e63343d2c0feff9ed4277927d68b19276c5befb753eb73f065".as_slice(), b"c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77".as_slice()),
+        ];
+        for (id, needle, replacement) in cases {
+            let target = if id == "lock-byte-digest" { "evidence/fnd-01/sdk-locks/typescript-package-lock.json" } else { "evidence/fnd-01/sdk-matrix.toml" };
+            let candidate = sdk_matrix_raw_candidate(&files, target, needle, replacement).expect("raw candidate");
+            let document = parse_source_toml(&candidate, "evidence/fnd-01/sdk-matrix.toml").expect("candidate manifest");
+            let expected = record_array(record_table(document.as_table().expect("root"), "validator_contract", "test").expect("contract"), "negative_dimensions", "test").expect("dimensions").iter().find_map(|value| { let row = value.as_table()?; (row.get("id")?.as_str()? == id).then(|| row.get("expected_diagnostic_kind")?.as_str()?.to_owned()) }).expect("declared diagnostic");
+            let error = fnd_01_sdk_matrix_validate(&candidate, &policy).expect_err("candidate must reject");
+            assert_eq!(error.code, expected, "{id}");
+            fnd_01_sdk_matrix_validate(&files, &policy).expect("pristine reacceptance");
+        }
     }
 
     #[test]
@@ -86704,9 +87181,9 @@ fn fallible(value: Option<u8>) {
 
     /// Exact ordinary native-tool inventory cardinality (policy + compiled table).
     const ORDINARY_NATIVE_TOOL_COUNT: usize = 20;
-    const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 3795;
+    const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 3911;
     const ORDINARY_NATIVE_TOOL_REGISTRY_SHA256: &str =
-        "befae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f";
+        "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b";
     /// Exact ordinary handoff argv arity from `expected_ordinary_handoff_argv`.
     const ORDINARY_HANDOFF_ARGV_ARITY: usize = 5;
 
@@ -87664,6 +88141,8 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_GNU_AR_B64: &str = "R05VIGFyIChHTlUgQmludXRpbHMgZm9yIFVidW50dSkgMi40NgpDb3B5cmlnaHQgKEMpIDIwMjYgRnJlZSBTb2Z0d2FyZSBGb3VuZGF0aW9uLCBJbmMuClRoaXMgcHJvZ3JhbSBpcyBmcmVlIHNvZnR3YXJlOyB5b3UgbWF5IHJlZGlzdHJpYnV0ZSBpdCB1bmRlciB0aGUgdGVybXMgb2YKdGhlIEdOVSBHZW5lcmFsIFB1YmxpYyBMaWNlbnNlIHZlcnNpb24gMyBvciAoYXQgeW91ciBvcHRpb24pIGFueSBsYXRlciB2ZXJzaW9uLgpUaGlzIHByb2dyYW0gaGFzIGFic29sdXRlbHkgbm8gd2FycmFudHkuCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_GNU_RANLIB_B64: &str = "R05VIHJhbmxpYiAoR05VIEJpbnV0aWxzIGZvciBVYnVudHUpIDIuNDYKQ29weXJpZ2h0IChDKSAyMDI2IEZyZWUgU29mdHdhcmUgRm91bmRhdGlvbiwgSW5jLgpUaGlzIHByb2dyYW0gaXMgZnJlZSBzb2Z0d2FyZTsgeW91IG1heSByZWRpc3RyaWJ1dGUgaXQgdW5kZXIgdGhlIHRlcm1zIG9mCnRoZSBHTlUgR2VuZXJhbCBQdWJsaWMgTGljZW5zZSB2ZXJzaW9uIDMgb3IgKGF0IHlvdXIgb3B0aW9uKSBhbnkgbGF0ZXIgdmVyc2lvbi4KVGhpcyBwcm9ncmFtIGhhcyBhYnNvbHV0ZWx5IG5vIHdhcnJhbnR5Lgo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_AARCH64_GCC_B64: &str = "VXNpbmcgYnVpbHQtaW4gc3BlY3MuCkNPTExFQ1RfR0NDPS91c3IvYmluL2FhcmNoNjQtbGludXgtZ251LWdjYwpDT0xMRUNUX0xUT19XUkFQUEVSPS91c3IvbGliZXhlYy9nY2MtY3Jvc3MvYWFyY2g2NC1saW51eC1nbnUvMTUvbHRvLXdyYXBwZXIKVGFyZ2V0OiBhYXJjaDY0LWxpbnV4LWdudQpDb25maWd1cmVkIHdpdGg6IC4uL3NyYy9jb25maWd1cmUgLXYgLS13aXRoLXBrZ3ZlcnNpb249J1VidW50dSAxNS4yLjAtMTZ1YnVudHUxJyAtLXdpdGgtYnVndXJsPWZpbGU6Ly8vdXNyL3NoYXJlL2RvYy9nY2MtMTUvUkVBRE1FLkJ1Z3MgLS1lbmFibGUtbGFuZ3VhZ2VzPWMsYWRhLGMrKyxnbyxkLGZvcnRyYW4sb2JqYyxvYmotYysrLG0yLGNvYm9sLGFsZ29sNjggLS1wcmVmaXg9L3VzciAtLXdpdGgtZ2NjLW1ham9yLXZlcnNpb24tb25seSAtLXByb2dyYW0tc3VmZml4PS0xNSAtLWVuYWJsZS1zaGFyZWQgLS1lbmFibGUtbGlua2VyLWJ1aWxkLWlkIC0tbGliZXhlY2Rpcj0vdXNyL2xpYmV4ZWMgLS13aXRob3V0LWluY2x1ZGVkLWdldHRleHQgLS1lbmFibGUtdGhyZWFkcz1wb3NpeCAtLWxpYmRpcj0vdXNyL2xpYiAtLWVuYWJsZS1ubHMgLS13aXRoLXN5c3Jvb3Q9LyAtLWVuYWJsZS1jbG9jYWxlPWdudSAtLWVuYWJsZS1saWJzdGRjeHgtZGVidWcgLS1lbmFibGUtbGlic3RkY3h4LXRpbWU9eWVzIC0td2l0aC1kZWZhdWx0LWxpYnN0ZGN4eC1hYmk9bmV3IC0tZW5hYmxlLWxpYnN0ZGN4eC1iYWNrdHJhY2UgLS1lbmFibGUtZ251LXVuaXF1ZS1vYmplY3QgLS1kaXNhYmxlLWxpYnF1YWRtYXRoIC0tZGlzYWJsZS1saWJxdWFkbWF0aC1zdXBwb3J0IC0tZW5hYmxlLXBsdWdpbiAtLWVuYWJsZS1kZWZhdWx0LXBpZSAtLXdpdGgtc3lzdGVtLXpsaWIgLS1lbmFibGUtbGlicGhvYm9zLWNoZWNraW5nPXJlbGVhc2UgLS13aXRob3V0LXRhcmdldC1zeXN0ZW0temxpYiAtLWVuYWJsZS1tdWx0aWFyY2ggLS1lbmFibGUtZml4LWNvcnRleC1hNTMtODQzNDE5IC0tZGlzYWJsZS13ZXJyb3IgLS1lbmFibGUtY2hlY2tpbmc9cmVsZWFzZSAtLWJ1aWxkPXg4Nl82NC1saW51eC1nbnUgLS1ob3N0PXg4Nl82NC1saW51eC1nbnUgLS10YXJnZXQ9YWFyY2g2NC1saW51eC1nbnUgLS1wcm9ncmFtLXByZWZpeD1hYXJjaDY0LWxpbnV4LWdudS0gLS1pbmNsdWRlZGlyPS91c3IvYWFyY2g2NC1saW51eC1nbnUvaW5jbHVkZSAtLXdpdGgtYnVpbGQtY29uZmlnPWJvb3RzdHJhcC1sdG8tbGVhbiAtLWVuYWJsZS1saW5rLXNlcmlhbGl6YXRpb249MgpUaHJlYWQgbW9kZWw6IHBvc2l4ClN1cHBvcnRlZCBMVE8gY29tcHJlc3Npb24gYWxnb3JpdGhtczogemxpYiB6c3RkCmdjYyB2ZXJzaW9uIDE1LjIuMCAoVWJ1bnR1IDE1LjIuMC0xNnVidW50dTEpIAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_APPLE_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiBhYXJjaDY0LWFwcGxlLWRhcndpbgpUaHJlYWQgbW9kZWw6IHBvc2l4Ckluc3RhbGxlZERpcjogL3Vzci9saWIvbGx2bS0yMi9iaW4K";
@@ -87757,7 +88236,13 @@ fn fallible(value: Option<u8>) {
         let mut inputs = Vec::with_capacity(fixtures.len());
         for (ordinal, fixture) in fixtures.iter().enumerate() {
             let raw = ordinary_probe_decode_base64(fixture.raw_base64);
-            assert_eq!(encode_lower_hex(&trust_sha256(&raw)), fixture.raw_sha256, "{} raw capture", fixture.tool_id);
+            let raw_sha256 = trust_sha256(&raw).expect("fixture raw capture SHA-256");
+            assert_eq!(
+                encode_lower_hex(&raw_sha256),
+                fixture.raw_sha256,
+                "{} raw capture",
+                fixture.tool_id,
+            );
             let identity = ToolIdentity {
                 device: 7,
                 inode: 10_000 + u64::try_from(ordinal).expect("fixture ordinal"),
@@ -87801,9 +88286,688 @@ fn fallible(value: Option<u8>) {
                 exit_code: 0,
                 stdout,
                 stderr,
+                raw_sha256,
             });
         }
         (authorities, inputs)
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_VERSION_PARSER_CASES: [(&str, &str, &str); 15] = [
+        (
+            "rustc-vv-pinned-1.99",
+            "rustc",
+            "rustc-vv-pinned-1.99: rustc complete -Vv grammar",
+        ),
+        (
+            "cargo-vv-pinned-1.99",
+            "cargo",
+            "cargo-vv-pinned-1.99: cargo complete -Vv grammar",
+        ),
+        (
+            "rustdoc-pinned-1.99",
+            "rustdoc",
+            "rustdoc-pinned-1.99: rustdoc short commit/date grammar",
+        ),
+        (
+            "rustfmt-pinned-nightly",
+            "rustfmt",
+            "rustfmt-pinned-nightly: rustfmt pinned version/commit/date grammar",
+        ),
+        (
+            "clippy-pinned-nightly",
+            "cargo-clippy",
+            "clippy-pinned-nightly: clippy pinned version/commit/date grammar",
+        ),
+        (
+            "lld-gnu-version",
+            "rust-lld",
+            "lld-gnu-version: rust-lld LLVM 22 GNU-driver grammar",
+        ),
+        (
+            "llvm-version-family",
+            "llvm-nm",
+            "llvm-version-family: llvm-nm LLVM 22 grammar",
+        ),
+        (
+            "openssl-version-a",
+            "openssl",
+            "openssl-version-a: OpenSSL identity/platform grammar",
+        ),
+        (
+            "host-c-compiler-v",
+            "host-cc",
+            "host-c-compiler-v: clang identity/target grammar",
+        ),
+        (
+            "archiver-version",
+            "host-ar",
+            "archiver-version: LLVM archiver 22 complete grammar",
+        ),
+        (
+            "aarch64-c-compiler-v",
+            "aarch64-linux-cc",
+            "aarch64-c-compiler-v: gcc target field",
+        ),
+        (
+            "apple-clang-version",
+            "apple-clang",
+            "apple-clang-version: clang identity/target grammar",
+        ),
+        (
+            "windows-clang-cl-version",
+            "windows-clang-cl",
+            "windows-clang-cl-version: clang identity/target grammar",
+        ),
+        (
+            "llvm-lib-help",
+            "windows-lib",
+            "llvm-lib-help: llvm-lib complete help grammar",
+        ),
+        (
+            "lld-coff-version",
+            "windows-lld-link",
+            "lld-coff-version: lld-link LLVM 22 COFF-driver grammar",
+        ),
+    ];
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_TOOL_PROBE_ROLE_REGISTRY: [(&str, &str); 20] = [
+        ("rustc", "rustc-vv-pinned-1.99"),
+        ("cargo", "cargo-vv-pinned-1.99"),
+        ("rustdoc", "rustdoc-pinned-1.99"),
+        ("rustfmt", "rustfmt-pinned-nightly"),
+        ("cargo-fmt", "rustfmt-pinned-nightly"),
+        ("cargo-clippy", "clippy-pinned-nightly"),
+        ("clippy-driver", "clippy-pinned-nightly"),
+        ("rust-lld", "lld-gnu-version"),
+        ("llvm-nm", "llvm-version-family"),
+        ("openssl", "openssl-version-a"),
+        ("host-cc", "host-c-compiler-v"),
+        ("host-ar", "archiver-version"),
+        ("host-ranlib", "archiver-version"),
+        ("aarch64-linux-cc", "aarch64-c-compiler-v"),
+        ("aarch64-linux-ar", "archiver-version"),
+        ("apple-clang", "apple-clang-version"),
+        ("apple-ar", "llvm-version-family"),
+        ("windows-clang-cl", "windows-clang-cl-version"),
+        ("windows-lib", "llvm-lib-help"),
+        ("windows-lld-link", "lld-coff-version"),
+    ];
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_tool_probe_fixture_for(
+        parser_id: &str,
+        tool_id: &str,
+    ) -> OrdinaryToolProbeFixture {
+        let fixtures = ordinary_tool_probe_fixtures();
+        let mut matches = fixtures
+            .iter()
+            .copied()
+            .filter(|fixture| fixture.parser_id == parser_id && fixture.tool_id == tool_id);
+        let fixture = matches.next().expect("literal parser fixture");
+        assert!(matches.next().is_none(), "literal parser fixture must be unique");
+        fixture
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_probe_replace_once_same_length(
+        raw: &[u8],
+        needle: &[u8],
+        replacement: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(needle.len(), replacement.len(), "one-variable replacement length");
+        let mut offset = None;
+        for (index, window) in raw.windows(needle.len()).enumerate() {
+            if window == needle {
+                assert!(offset.is_none(), "one-variable replacement must be unique");
+                offset = Some(index);
+            }
+        }
+        let offset = offset.expect("one-variable replacement subject");
+        let mut changed = raw.to_vec();
+        changed[offset..offset + replacement.len()].copy_from_slice(replacement);
+        assert_eq!(changed.len(), raw.len(), "one-variable replacement framing");
+        changed
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_parser_semantic_negative(parser_id: &str, raw: &[u8]) -> Vec<u8> {
+        let (needle, replacement): (&[u8], &[u8]) = match parser_id {
+            "rustc-vv-pinned-1.99" => (b"LLVM version: 22.1.8", b"LLVM version: 22.1.9"),
+            "cargo-vv-pinned-1.99" => (
+                b"commit-date: 2026-07-07",
+                b"commit-date: 2026-07-08",
+            ),
+            "rustdoc-pinned-1.99" => (b"375b1431b", b"375b1431c"),
+            "rustfmt-pinned-nightly" => (
+                b"rustfmt 1.9.0-nightly",
+                b"rustfmt 1.9.1-nightly",
+            ),
+            "clippy-pinned-nightly" => (b"clippy 0.1.99", b"clippy 0.1.98"),
+            "lld-gnu-version" => (b"GNU linkers", b"GNV linkers"),
+            "llvm-version-family" | "archiver-version" | "lld-coff-version" => {
+                (b"22.1.2", b"22.1.3")
+            }
+            "openssl-version-a" => (b"platform: debian-amd64", b"platform: debian-amd65"),
+            "host-c-compiler-v" => (
+                b"Target: x86_64-pc-linux-gnu",
+                b"Target: x86_64-pc-linux-gnv",
+            ),
+            "aarch64-c-compiler-v" => (
+                b"Target: aarch64-linux-gnu",
+                b"Target: aarch64-linux-gnv",
+            ),
+            "apple-clang-version" => (
+                b"Target: aarch64-apple-darwin",
+                b"Target: aarch64-apple-darwio",
+            ),
+            "windows-clang-cl-version" => (b"msvc", b"msvx"),
+            "llvm-lib-help" => (b"OVERVIEW: LLVM Lib", b"OVERVIEW: LLVM Lip"),
+            unknown => panic!("unknown literal parser case {unknown}"),
+        };
+        ordinary_probe_replace_once_same_length(raw, needle, replacement)
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_tool_probe_role_index(
+        inputs: &[ToolProbeInput],
+        parser_id: &str,
+        tool_id: &str,
+    ) -> usize {
+        let mut matches = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.parser_id == parser_id && input.tool_id == tool_id)
+            .map(|(ordinal, _)| ordinal);
+        let ordinal = matches.next().expect("literal tool-probe role");
+        assert!(matches.next().is_none(), "literal tool-probe role must be unique");
+        ordinal
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_tool_probe_replace_selected_raw(input: &mut ToolProbeInput, raw: Vec<u8>) {
+        input.raw_sha256 = trust_sha256(&raw).expect("mutated raw capture SHA-256");
+        match input.selected_stream.as_str() {
+            "stdout" => input.stdout = raw,
+            "stderr" => input.stderr = raw,
+            unknown => panic!("unknown literal selected stream {unknown}"),
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_assert_parser_role_variant(
+        parser_id: &str,
+        tool_id: &str,
+        selected_lexical: &str,
+        raw_base64: &str,
+        needle: &[u8],
+        replacement: &[u8],
+        expected_diagnostic: &str,
+    ) {
+        let raw = ordinary_probe_decode_base64(raw_base64);
+        validate_version_stream_for_role(tool_id, parser_id, selected_lexical, &raw)
+            .expect("supplementary parser-role positive");
+        let changed = ordinary_probe_replace_once_same_length(&raw, needle, replacement);
+        assert_eq!(
+            raw.iter()
+                .zip(&changed)
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "supplementary parser-role negative differs by one byte",
+        );
+        let error = validate_version_stream_for_role(
+            tool_id,
+            parser_id,
+            selected_lexical,
+            &changed,
+        )
+        .expect_err("supplementary parser-role semantic drift must fail closed");
+        assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+        assert_eq!(error.detail(), expected_diagnostic);
+        validate_version_stream_for_role(tool_id, parser_id, selected_lexical, &raw)
+            .expect("supplementary parser-role pristine reacceptance");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_b_r1_all_15_version_parser_grammars_are_exact() {
+        let parser_ids = ORDINARY_VERSION_PARSER_CASES
+            .iter()
+            .map(|(parser_id, _, _)| *parser_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(parser_ids.len(), 15, "independent literal parser set");
+
+        let (authorities, pristine_inputs) = ordinary_tool_probe_fixture_batch();
+        let authority_baseline = authorities.clone();
+        let input_baseline = pristine_inputs.clone();
+        let accepted_state = validate_tool_probe_batch(&authorities, &pristine_inputs)
+            .expect("pristine parser inventory");
+        let ledger_advances = Cell::new(0usize);
+        let evidence_advances = Cell::new(0usize);
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for (parser_id, tool_id, expected_diagnostic) in ORDINARY_VERSION_PARSER_CASES {
+            let fixture = ordinary_tool_probe_fixture_for(parser_id, tool_id);
+            let raw = ordinary_probe_decode_base64(fixture.raw_base64);
+            validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &raw,
+            )
+            .expect("literal parser positive");
+            accepted += 1;
+
+            let changed = ordinary_parser_semantic_negative(parser_id, &raw);
+            assert_eq!(
+                raw.iter().zip(&changed).filter(|(left, right)| left != right).count(),
+                1,
+                "{parser_id} semantic negative differs by one byte",
+            );
+            let direct_error = validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &changed,
+            )
+            .expect_err("one-field parser semantic drift must fail closed");
+            assert_eq!(direct_error.code(), "E_PHASE_B_TOOL_VERSION");
+            assert_eq!(direct_error.detail(), expected_diagnostic);
+
+            let role = ordinary_tool_probe_role_index(&pristine_inputs, parser_id, tool_id);
+            let mut rejected_inputs = pristine_inputs.clone();
+            ordinary_tool_probe_replace_selected_raw(&mut rejected_inputs[role], changed.clone());
+            let result = validate_tool_probe_batch(&authorities, &rejected_inputs);
+            if result.is_ok() {
+                ledger_advances.set(ledger_advances.get() + 1);
+                evidence_advances.set(evidence_advances.get() + 1);
+            }
+            let error = result.expect_err("semantic drift must return no validated inventory");
+            assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+            assert_eq!(error.detail(), expected_diagnostic);
+            assert_eq!(authorities, authority_baseline, "authority state unchanged");
+            assert_eq!(pristine_inputs, input_baseline, "accepted input state unchanged");
+            assert_eq!(
+                validate_tool_probe_batch(&authorities, &pristine_inputs)
+                    .expect("pristine parser inventory reacceptance"),
+                accepted_state,
+                "complete accepted parser state unchanged",
+            );
+            if parser_id == "windows-clang-cl-version" {
+                assert_eq!(raw.len(), 125, "qualified clang-cl capture length");
+                assert!(changed.windows(4).any(|window| window == b"msvx"));
+            }
+            rejected += 1;
+        }
+        assert_eq!(accepted, 15, "exact parser positive floor");
+        assert_eq!(rejected, 15, "exact parser semantic-negative floor");
+
+        let mut supplementary_role_grammars = 0usize;
+        ordinary_assert_parser_role_variant(
+            "host-c-compiler-v",
+            "host-cc",
+            "/usr/bin/cc",
+            ORDINARY_PROBE_HOST_GCC_B64,
+            b"Target: x86_64-linux-gnu",
+            b"Target: x86_64-linux-gnv",
+            "host-c-compiler-v: gcc target field",
+        );
+        supplementary_role_grammars += 1;
+        ordinary_assert_parser_role_variant(
+            "llvm-version-family",
+            "apple-ar",
+            "/usr/bin/llvm-ar-22",
+            ORDINARY_PROBE_LLVM_TOOL_B64,
+            b"22.1.2",
+            b"22.1.3",
+            "llvm-version-family: llvm-ar LLVM 22 grammar",
+        );
+        supplementary_role_grammars += 1;
+        ordinary_assert_parser_role_variant(
+            "archiver-version",
+            "aarch64-linux-ar",
+            "/usr/bin/aarch64-linux-gnu-ar",
+            ORDINARY_PROBE_GNU_AR_B64,
+            b"2.46",
+            b"2.47",
+            "archiver-version: GNU ar complete grammar",
+        );
+        supplementary_role_grammars += 1;
+        ordinary_assert_parser_role_variant(
+            "archiver-version",
+            "host-ranlib",
+            "/usr/bin/ranlib",
+            ORDINARY_PROBE_GNU_RANLIB_B64,
+            b"2.46",
+            b"2.47",
+            "archiver-version: GNU ranlib complete grammar",
+        );
+        supplementary_role_grammars += 1;
+        assert_eq!(
+            supplementary_role_grammars,
+            4,
+            "exact supplementary role-grammar branch registry",
+        );
+
+        let rustc = ordinary_tool_probe_fixture_for("rustc-vv-pinned-1.99", "rustc");
+        let rustc_raw = ordinary_probe_decode_base64(rustc.raw_base64);
+        let unknown = validate_version_stream_for_role(
+            rustc.tool_id,
+            "unknown-version-parser",
+            rustc.selected_lexical,
+            &rustc_raw,
+        )
+        .expect_err("unknown parser must fail closed");
+        assert_eq!(unknown.code(), "E_PHASE_B_TOOL_VERSION");
+        assert_eq!(
+            unknown.detail(),
+            "unknown version parser/role unknown-version-parser|rustc",
+        );
+        validate_version_stream_for_role(
+            rustc.tool_id,
+            rustc.parser_id,
+            rustc.selected_lexical,
+            &rustc_raw,
+        )
+        .expect("unknown-parser pristine twin reacceptance");
+        assert_eq!(
+            validate_tool_probe_batch(&authorities, &pristine_inputs)
+                .expect("unknown-parser complete-state reacceptance"),
+            accepted_state,
+        );
+        assert_eq!(ledger_advances.get(), 0, "parser rejection advances no ledger state");
+        assert_eq!(
+            evidence_advances.get(),
+            0,
+            "parser rejection advances no evidence state",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_b_r1_all_15_version_parsers_share_global_byte_hygiene() {
+        let (authorities, pristine_inputs) = ordinary_tool_probe_fixture_batch();
+        let authority_baseline = authorities.clone();
+        let input_baseline = pristine_inputs.clone();
+        let accepted_state = validate_tool_probe_batch(&authorities, &pristine_inputs)
+            .expect("pristine global-hygiene inventory");
+        let ledger_advances = Cell::new(0usize);
+        let evidence_advances = Cell::new(0usize);
+        let mut positive_twins = 0usize;
+        let mut negatives = 0usize;
+        for (parser_id, tool_id, _) in ORDINARY_VERSION_PARSER_CASES {
+            let fixture = ordinary_tool_probe_fixture_for(parser_id, tool_id);
+            let raw = ordinary_probe_decode_base64(fixture.raw_base64);
+            validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &raw,
+            )
+            .expect("global-hygiene positive twin");
+            positive_twins += 1;
+
+            let mut nul = raw.clone();
+            nul[0] = 0;
+            let mut carriage_return = raw.clone();
+            carriage_return[0] = b'\r';
+            let mut invalid_utf8 = raw.clone();
+            invalid_utf8[0] = 0xff;
+            let mut missing_lf = raw.clone();
+            assert_eq!(missing_lf.pop(), Some(b'\n'), "fixture terminal LF");
+            let mut extra_lf = raw.clone();
+            extra_lf.push(b'\n');
+            let mutations = [
+                ("global.empty", Vec::new()),
+                ("global.nul", nul),
+                ("global.cr", carriage_return),
+                ("global.utf8", invalid_utf8),
+                ("global.terminal-lf", missing_lf),
+                ("global.extra-terminal-lf", extra_lf),
+            ];
+            for (field, changed) in mutations {
+                let error = validate_version_stream_for_role(
+                    fixture.tool_id,
+                    fixture.parser_id,
+                    fixture.selected_lexical,
+                    &changed,
+                )
+                .expect_err("global byte-hygiene mutation must fail closed");
+                assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+                assert_eq!(error.detail(), format!("{parser_id}: {field}"));
+
+                let role = ordinary_tool_probe_role_index(&pristine_inputs, parser_id, tool_id);
+                let mut rejected_inputs = pristine_inputs.clone();
+                ordinary_tool_probe_replace_selected_raw(&mut rejected_inputs[role], changed);
+                let result = validate_tool_probe_batch(&authorities, &rejected_inputs);
+                if result.is_ok() {
+                    ledger_advances.set(ledger_advances.get() + 1);
+                    evidence_advances.set(evidence_advances.get() + 1);
+                }
+                let seam_error = result
+                    .expect_err("global mutation must return no validated inventory");
+                assert_eq!(seam_error.code(), "E_PHASE_B_TOOL_VERSION");
+                assert_eq!(seam_error.detail(), format!("{parser_id}: {field}"));
+                assert_eq!(authorities, authority_baseline, "authority state unchanged");
+                assert_eq!(pristine_inputs, input_baseline, "accepted input state unchanged");
+                assert_eq!(
+                    validate_tool_probe_batch(&authorities, &pristine_inputs)
+                        .expect("global-hygiene pristine reacceptance"),
+                    accepted_state,
+                    "complete accepted hygiene state unchanged",
+                );
+                negatives += 1;
+            }
+        }
+        assert_eq!(positive_twins, 15, "exact hygiene positive-twin count");
+        assert_eq!(negatives, 90, "six global negatives for every parser");
+        assert_eq!(
+            ledger_advances.get(),
+            0,
+            "global rejection advances no ledger state",
+        );
+        assert_eq!(
+            evidence_advances.get(),
+            0,
+            "global rejection advances no evidence state",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_b_r1_all_20_tool_probe_contexts_are_exact() {
+        let fixtures = ordinary_tool_probe_fixtures();
+        assert_eq!(fixtures.len(), ORDINARY_TOOL_PROBE_ROLE_REGISTRY.len());
+        for (ordinal, ((tool_id, parser_id), fixture)) in ORDINARY_TOOL_PROBE_ROLE_REGISTRY
+            .iter()
+            .zip(fixtures)
+            .enumerate()
+        {
+            assert_eq!(fixture.tool_id, *tool_id, "literal tool role {ordinal}");
+            assert_eq!(fixture.parser_id, *parser_id, "literal parser role {ordinal}");
+        }
+        let parser_multiplicities = ORDINARY_VERSION_PARSER_CASES.map(|(parser_id, _, _)| {
+            ORDINARY_TOOL_PROBE_ROLE_REGISTRY
+                .iter()
+                .filter(|(_, observed)| *observed == parser_id)
+                .count()
+        });
+        assert_eq!(
+            parser_multiplicities,
+            [1, 1, 1, 2, 2, 1, 2, 1, 1, 3, 1, 1, 1, 1, 1],
+            "exact 15-parser multiplicities over 20 roles",
+        );
+
+        let (authorities, inputs) = ordinary_tool_probe_fixture_batch();
+        let authority_baseline = authorities.clone();
+        let input_baseline = inputs.clone();
+        let accepted = validate_tool_probe_batch(&authorities, &inputs)
+            .expect("exact 20-role positive inventory");
+        assert_eq!(accepted.observations.len(), 20, "20 accepted role observations");
+        assert_ne!(accepted.tool_set_sha256, [0; 32], "nonzero complete tool-set digest");
+
+        let expected_diagnostics = [
+            "context.tool_id: observed mismatch",
+            "context.parser_id: observed mismatch",
+            "context.selected_lexical: observed mismatch",
+            "context.final_path: observed mismatch",
+            "context.final_identity: observed mismatch",
+            "context.final_sha256: observed mismatch",
+            "context.argv0: observed mismatch",
+            "context.argv_tail: observed mismatch",
+            "context.selected_stream: observed mismatch",
+            "context.unselected_stream_nonempty: expected empty bytes",
+        ];
+        let ledger_advances = Cell::new(0usize);
+        let evidence_advances = Cell::new(0usize);
+        let mut rejected_batches = 0usize;
+        for role in 0..20 {
+            for mutation in 0..10 {
+                let mut changed = inputs.clone();
+                match mutation {
+                    0 => changed[role].tool_id.push_str("-drift"),
+                    1 => changed[role].parser_id.push_str("-drift"),
+                    2 => changed[role].selected_lexical.push_str("-drift"),
+                    3 => changed[role].final_path.push_str("-drift"),
+                    4 => changed[role].final_identity.length += 1,
+                    5 => changed[role].final_sha256[0] ^= 1,
+                    6 => changed[role].argv[0].push_str("-drift"),
+                    7 => changed[role].argv[1].push_str("-drift"),
+                    8 => {
+                        changed[role].selected_stream = if inputs[role].selected_stream == "stdout" {
+                            "stderr".to_owned()
+                        } else {
+                            "stdout".to_owned()
+                        };
+                    }
+                    9 => {
+                        if inputs[role].selected_stream == "stdout" {
+                            changed[role].stderr.push(b'x');
+                        } else {
+                            changed[role].stdout.push(b'x');
+                        }
+                    }
+                    _ => unreachable!("ten frozen context mutations"),
+                }
+                let result = validate_tool_probe_batch(&authorities, &changed);
+                if result.is_ok() {
+                    ledger_advances.set(ledger_advances.get() + 1);
+                    evidence_advances.set(evidence_advances.get() + 1);
+                }
+                let error = result.expect_err("one-variable full-batch context drift");
+                assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+                assert_eq!(error.detail(), expected_diagnostics[mutation]);
+                assert_eq!(authorities, authority_baseline, "authority state unchanged");
+                assert_eq!(inputs, input_baseline, "accepted input state unchanged");
+                assert_eq!(
+                    validate_tool_probe_batch(&authorities, &inputs)
+                        .expect("pristine full-batch reacceptance"),
+                    accepted,
+                    "accepted inventory state unchanged",
+                );
+                rejected_batches += 1;
+            }
+        }
+        assert_eq!(rejected_batches, 200, "ten negatives for every tool role");
+        assert_eq!(ledger_advances.get(), 0, "rejection advances no ledger state");
+        assert_eq!(evidence_advances.get(), 0, "rejection advances no evidence state");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_b_r1_allowed_version_observation_rebinds_raw_and_tool_set_digests() {
+        let (authorities, baseline_inputs) = ordinary_tool_probe_fixture_batch();
+        let baseline = validate_tool_probe_batch(&authorities, &baseline_inputs)
+            .expect("first complete inventory");
+        let mut changed_inputs = baseline_inputs.clone();
+        let openssl = 9usize;
+        let changed_raw = ordinary_probe_replace_once_same_length(
+            &changed_inputs[openssl].stdout,
+            b"Wed Jul 29 16:50:53 2026 UTC",
+            b"Wed Jul 29 16:50:54 2026 UTC",
+        );
+        ordinary_tool_probe_replace_selected_raw(&mut changed_inputs[openssl], changed_raw);
+        assert_eq!(
+            baseline_inputs[openssl]
+                .stdout
+                .iter()
+                .zip(&changed_inputs[openssl].stdout)
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "one allowed same-length observational byte changes",
+        );
+        let authority_baseline = authorities.clone();
+        let changed_input_baseline = changed_inputs.clone();
+        let ledger_advances = Cell::new(0usize);
+        let evidence_advances = Cell::new(0usize);
+        let mut stale_digest_inputs = changed_inputs.clone();
+        stale_digest_inputs[openssl].raw_sha256 = baseline_inputs[openssl].raw_sha256;
+        let stale_digest_result =
+            validate_tool_probe_batch(&authorities, &stale_digest_inputs);
+        if stale_digest_result.is_ok() {
+            ledger_advances.set(ledger_advances.get() + 1);
+            evidence_advances.set(evidence_advances.get() + 1);
+        }
+        let stale_digest_error = stale_digest_result
+            .expect_err("changed raw bytes with stale capture digest must fail closed");
+        assert_eq!(stale_digest_error.code(), "E_PHASE_B_TOOL_VERSION");
+        assert_eq!(
+            stale_digest_error.detail(),
+            "context.raw_sha256: observed mismatch",
+        );
+        assert_eq!(authorities, authority_baseline, "authority state unchanged");
+        assert_eq!(
+            changed_inputs, changed_input_baseline,
+            "accepted changed-observation state unchanged",
+        );
+        let changed = validate_tool_probe_batch(&authorities, &changed_inputs)
+            .expect("stale-digest rejection permits pristine changed-state reacceptance");
+        assert_eq!(ledger_advances.get(), 0, "digest rejection advances no ledger state");
+        assert_eq!(
+            evidence_advances.get(),
+            0,
+            "digest rejection advances no evidence state",
+        );
+        assert_eq!(
+            baseline.observations.len() + changed.observations.len(),
+            40,
+            "two inventories produce exactly 40 role admissions",
+        );
+        assert_eq!(
+            encode_lower_hex(&baseline.observations[openssl].raw_sha256),
+            "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca",
+            "frozen baseline OpenSSL raw digest",
+        );
+        assert_eq!(
+            encode_lower_hex(&changed.observations[openssl].raw_sha256),
+            "ad22925207ab43bd5914df86f30206124f71bf763a347be0d0aea573ff243666",
+            "frozen changed OpenSSL raw digest",
+        );
+        for ordinal in 0..20 {
+            if ordinal == openssl {
+                assert_ne!(
+                    baseline.observations[ordinal].raw_sha256,
+                    changed.observations[ordinal].raw_sha256,
+                    "allowed observational value rebinds its raw digest",
+                );
+            } else {
+                assert_eq!(
+                    baseline.observations[ordinal].raw_sha256,
+                    changed.observations[ordinal].raw_sha256,
+                    "unmodified role raw digest remains exact",
+                );
+            }
+        }
+        assert_ne!(baseline.tool_set_sha256, [0; 32]);
+        assert_ne!(changed.tool_set_sha256, [0; 32]);
+        assert_ne!(
+            baseline.tool_set_sha256,
+            changed.tool_set_sha256,
+            "complete tool-set digest rebinds the allowed raw observation",
+        );
     }
 
     const ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID: &str =
@@ -87816,10 +88980,32 @@ fn fallible(value: Option<u8>) {
         "ordinary::ordinary_b_r5_post_consume_runtime_uses_evidence_code";
 
     #[cfg(test)]
-    const ORDINARY_B_R4_PANIC_TEST_ID_SUCCESSOR: (&str, &str) = (
-        "ordinary::ordinary_b_r4_injected_panic_emits_once_without_acceptance_or_effect_mutation",
-        "ordinary::ordinary_b_r4_injected_panic_emits_once_with_callback_and_emitter_state",
-    );
+    const ORDINARY_B_PREDECESSOR_SUCCESSORS: [(&str, &str); 6] = [
+        (
+            "ordinary::ordinary_reprobe_live_half_unqualified_or_execution_bin_fail_closed",
+            "ordinary::ordinary_b_r1_live_half_unqualified_or_execution_bin_fails_closed",
+        ),
+        (
+            "ordinary::ordinary_product_stages_are_first_class_entry_tokens",
+            "ordinary::ordinary_b_r4_product_stages_are_first_class_entry_tokens",
+        ),
+        (
+            "ordinary::ordinary_harness_main_product_failures_emit_authority_stage",
+            "ordinary::ordinary_b_r4_harness_main_product_failures_emit_authority_stage",
+        ),
+        (
+            "ordinary::ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority",
+            "ordinary::ordinary_b_r4_handoff_source_order_keeps_probe_archive_and_bookend_authority",
+        ),
+        (
+            "ordinary::ordinary_b_r4_injected_panic_emits_once_without_acceptance_or_effect_mutation",
+            "ordinary::ordinary_b_r4_injected_panic_emits_once_with_callback_and_emitter_state",
+        ),
+        (
+            "phase_b_std::typed_result_tests::windows_clang_cl_version_parser_binds_target_and_complete_stream",
+            "ordinary::ordinary_b_r1_all_15_version_parser_grammars_are_exact",
+        ),
+    ];
 
     /// Frozen executable acceptance manifest for B-R1 through B-R5.  The batch
     /// verifier consumes exact libtest IDs; no prefix, filter, or zero-test run
@@ -87827,7 +89013,11 @@ fn fallible(value: Option<u8>) {
     #[cfg(test)]
     const ORDINARY_B_REQUIRED_TEST_IDS: &[&str] = &[
         "ordinary::ordinary_b_r1_qualified_linux_dual_path_tool_reprobe",
-        "ordinary::ordinary_reprobe_live_half_unqualified_or_execution_bin_fail_closed",
+        "ordinary::ordinary_b_r1_all_15_version_parser_grammars_are_exact",
+        "ordinary::ordinary_b_r1_all_15_version_parsers_share_global_byte_hygiene",
+        "ordinary::ordinary_b_r1_all_20_tool_probe_contexts_are_exact",
+        "ordinary::ordinary_b_r1_allowed_version_observation_rebinds_raw_and_tool_set_digests",
+        "ordinary::ordinary_b_r1_live_half_unqualified_or_execution_bin_fails_closed",
         ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID,
         ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID,
         "ordinary::ordinary_b_r3_pure_matrix",
@@ -87835,12 +89025,12 @@ fn fallible(value: Option<u8>) {
         "ordinary::ordinary_b_r3_live_matrix",
         "ordinary::ordinary_b_r3_unqualified_platform_fails_before_ledger_open",
         "ordinary::ordinary_b_r4_all_fail_closed_branches_emit_product_stage",
-        "ordinary::ordinary_product_stages_are_first_class_entry_tokens",
+        "ordinary::ordinary_b_r4_product_stages_are_first_class_entry_tokens",
         "ordinary::ordinary_b_r4_registry_selectors_and_frames_are_exact",
         "ordinary::ordinary_b_r4_emitted_frames_keep_real_code_expected_run_and_one_variable_negative",
-        "ordinary::ordinary_harness_main_product_failures_emit_authority_stage",
-        ORDINARY_B_R4_PANIC_TEST_ID_SUCCESSOR.1,
-        "ordinary::ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority",
+        "ordinary::ordinary_b_r4_harness_main_product_failures_emit_authority_stage",
+        "ordinary::ordinary_b_r4_injected_panic_emits_once_with_callback_and_emitter_state",
+        "ordinary::ordinary_b_r4_handoff_source_order_keeps_probe_archive_and_bookend_authority",
         "ordinary::ordinary_b_required_test_id_manifest_is_exact_and_nonempty",
         ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID,
     ];
@@ -87856,15 +89046,7 @@ fn fallible(value: Option<u8>) {
             ORDINARY_B_REQUIRED_TEST_IDS.len(),
             "frozen B-R manifest must contain no duplicate test IDs",
         );
-        assert_eq!(ORDINARY_B_REQUIRED_TEST_IDS.len(), 17, "complete B-R1..B-R5 manifest");
-        assert!(
-            !ORDINARY_B_REQUIRED_TEST_IDS.contains(&ORDINARY_B_R4_PANIC_TEST_ID_SUCCESSOR.0),
-            "the superseded panic ID cannot remain in the frozen required set",
-        );
-        assert!(
-            ORDINARY_B_REQUIRED_TEST_IDS.contains(&ORDINARY_B_R4_PANIC_TEST_ID_SUCCESSOR.1),
-            "the panic-test successor must remain in the frozen required set",
-        );
+        assert_eq!(ORDINARY_B_REQUIRED_TEST_IDS.len(), 21, "complete B-R1..B-R5 manifest");
         let source = include_str!("fnd_01_dependency_evidence.rs");
         for id in ORDINARY_B_REQUIRED_TEST_IDS {
             let name = id
@@ -87874,6 +89056,35 @@ fn fallible(value: Option<u8>) {
             assert!(
                 source.contains(&format!("fn {name}()")),
                 "frozen required ID must name one exact test function: {id}",
+            );
+        }
+        for (predecessor, successor) in ORDINARY_B_PREDECESSOR_SUCCESSORS {
+            assert!(
+                !ORDINARY_B_REQUIRED_TEST_IDS.contains(&predecessor),
+                "superseded test ID cannot remain required: {predecessor}",
+            );
+            assert!(
+                ORDINARY_B_REQUIRED_TEST_IDS.contains(&successor),
+                "successor test ID must remain required: {successor}",
+            );
+            let predecessor_name = predecessor
+                .rsplit("::")
+                .next()
+                .expect("qualified predecessor test ID");
+            assert!(
+                !source.contains(&format!("fn {predecessor_name}()")),
+                "superseded test function must be absent: {predecessor}",
+            );
+            let successor_name = successor
+                .rsplit("::")
+                .next()
+                .expect("qualified successor test ID");
+            assert_eq!(
+                source
+                    .match_indices(&format!("fn {successor_name}()"))
+                    .count(),
+                1,
+                "successor test function must occur exactly once: {successor}",
             );
         }
     }
@@ -91301,7 +92512,7 @@ fn fallible(value: Option<u8>) {
     }
 
     #[test]
-    fn ordinary_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
+    fn ordinary_b_r4_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
         // This structural marker check complements the real pure/live fault
         // tests. It scopes the exact function body and uses call names rather
         // than whitespace-sensitive source fragments.
@@ -92335,7 +93546,7 @@ fn fallible(value: Option<u8>) {
     /// E_UNQUALIFIED_PLATFORM after pure dual-path readiness succeeds. On Linux
     /// x86_64 the live inventory path may proceed (execution-bin may still fail).
     #[test]
-    fn ordinary_reprobe_live_half_unqualified_or_execution_bin_fail_closed() {
+    fn ordinary_b_r1_live_half_unqualified_or_execution_bin_fails_closed() {
         let pure = ordinary_reprobe_dual_path_pure_authority()
             .expect("pure dual-path must pass before live half");
         assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
@@ -92390,7 +93601,7 @@ fn fallible(value: Option<u8>) {
     /// B-R4 product stages remain first-class entry_diagnostic_stage tokens and
     /// must not collapse ordinary fail-closed codes to the legacy "ordinary" stage.
     #[test]
-    fn ordinary_product_stages_are_first_class_entry_tokens() {
+    fn ordinary_b_r4_product_stages_are_first_class_entry_tokens() {
         let mut route_ids = BTreeSet::new();
         for route in OrdinaryFailureRoute::SHIPPED {
             assert!(
@@ -92536,7 +93747,7 @@ fn fallible(value: Option<u8>) {
     /// typed failure sites — never hard-code stage=ordinary for known
     /// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures.
     #[test]
-    fn ordinary_harness_main_product_failures_emit_authority_stage() {
+    fn ordinary_b_r4_harness_main_product_failures_emit_authority_stage() {
         #[derive(Clone, Default, Debug, PartialEq, Eq)]
         struct MalformedHandoffState {
             callback_attempts: usize,
