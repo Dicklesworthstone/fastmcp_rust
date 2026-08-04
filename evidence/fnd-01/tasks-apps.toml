@@ -44,8 +44,8 @@ reject_generated_schema_as_whole_message_or_direction_oracle = true
 contract_id = "fnd-01-tasks-apps-source-integrity-v1"
 shared_verifier_path = "crates/fastmcp/tests/fnd_01_dependency_evidence.rs"
 required_test_ids = [
-  "tests::fnd_01_tasks_apps_sources_positive",
-  "tests::fnd_01_tasks_apps_sources_planted_negative",
+  "ordinary::tests::fnd_01_tasks_apps_sources_positive",
+  "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative",
 ]
 required_enclosing_module = "tests"
 phase_a_source_observation = "At Phase A the two required functions and an enclosing tests module are absent from the shared integration-test source; Phase B must add exactly those functions in exactly that module under the serialized shared-source handoff."
