@@ -73,7 +73,7 @@ impl SessionState {
 
     fn from_map_with_partition_draw<F, E>(
         values: HashMap<String, serde_json::Value>,
-        draw: F,
+        draw: F
     ) -> Self
     where
         F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,

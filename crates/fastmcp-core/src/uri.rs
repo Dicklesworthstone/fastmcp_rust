@@ -1048,6 +1048,10 @@ impl CanonicalHttpUrl {
     fn has_syntax_violation(&self) -> bool {
         self.syntax_flags.any
     }
+
+    fn has_credential_syntax_violation(&self) -> bool {
+        self.syntax_flags.credentials
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1457,14 +1461,7 @@ impl CanonicalResourceId {
         let parsed = parse_canonical_http_url(input, max_bytes)
             .map_err(CanonicalResourceIdError::HttpUrl)?;
         validate_resource_common(&parsed)?;
-        if policy.query == QueryPolicy::Reject && parsed.url.query().is_some() {
-            return Err(CanonicalResourceIdError::QueryNotAllowed);
-        }
-        if !endpoint_path_matches(parsed.url.path(), policy.endpoint_path) {
-            return Err(CanonicalResourceIdError::EndpointPathPolicyMismatch {
-                required: policy.endpoint_path,
-            });
-        }
+        validate_resource_policy(&parsed, policy)?;
 
         Ok(Self {
             url: parsed.url,
@@ -1512,6 +1509,32 @@ impl CanonicalResourceId {
         let parsed = parse_canonical_http_url(input, max_bytes)
             .map_err(CanonicalResourceIdError::HttpUrl)?;
         validate_resource_common(&parsed)?;
+
+        // Prefer the resource's own closed policy failure over a configured
+        // endpoint policy mismatch when no origin-compatible policy could
+        // admit this resource. This keeps rejected empty queries and endpoint
+        // path shapes observable as input errors rather than configuration
+        // errors from the convenience endpoint used by the caller.
+        let mut origin_compatible = false;
+        let mut policy_accepted = false;
+        let mut resource_error = None;
+        for configured in configured_endpoints {
+            if !canonical_origins_match(&parsed.url, configured.endpoint) {
+                continue;
+            }
+            origin_compatible = true;
+            match validate_resource_policy(&parsed, configured.resource_policy) {
+                Ok(()) => policy_accepted = true,
+                Err(error) => {
+                    resource_error.get_or_insert(error);
+                }
+            }
+        }
+        if origin_compatible && !policy_accepted {
+            if let Some(error) = resource_error {
+                return Err(error);
+            }
+        }
         validate_configured_endpoint_policies(configured_endpoints)?;
         let mut selected: Option<(usize, Self)> = None;
         let mut ambiguous_specificity = None;
@@ -1686,6 +1709,21 @@ fn validate_resource_common(
     Ok(())
 }
 
+fn validate_resource_policy(
+    parsed: &ParsedCanonicalHttpUrl,
+    policy: CanonicalResourceIdPolicy,
+) -> Result<(), CanonicalResourceIdError> {
+    if policy.query == QueryPolicy::Reject && parsed.url.query().is_some() {
+        return Err(CanonicalResourceIdError::QueryNotAllowed);
+    }
+    if !endpoint_path_matches(parsed.url.path(), policy.endpoint_path) {
+        return Err(CanonicalResourceIdError::EndpointPathPolicyMismatch {
+            required: policy.endpoint_path,
+        });
+    }
+    Ok(())
+}
+
 fn canonical_origins_match(left: &CanonicalHttpUrl, right: &CanonicalHttpUrl) -> bool {
     left.scheme() == right.scheme()
         && left.host() == right.host()
@@ -1721,11 +1759,13 @@ fn validate_configured_endpoint_policies(
     configured_endpoints: &[ConfiguredResourceEndpoint<'_>],
 ) -> Result<(), CanonicalResourceIdError> {
     for configured in configured_endpoints {
+        if configured.endpoint.has_userinfo()
+            || configured.endpoint.has_credential_syntax_violation()
+        {
+            return Err(CanonicalResourceIdError::ConfiguredEndpointUserinfoNotAllowed);
+        }
         if configured.endpoint.has_syntax_violation() {
             return Err(CanonicalResourceIdError::ConfiguredEndpointNonCanonicalSyntax);
-        }
-        if configured.endpoint.has_userinfo() {
-            return Err(CanonicalResourceIdError::ConfiguredEndpointUserinfoNotAllowed);
         }
         if !configured_endpoint_matches_policy(configured) {
             return Err(CanonicalResourceIdError::ConfiguredEndpointPolicyMismatch);
@@ -1746,10 +1786,19 @@ fn configured_endpoint_matches_policy(configured: &ConfiguredResourceEndpoint<'_
 }
 
 fn endpoint_path_is_prefix_of_resource(endpoint_path: &str, resource_path: &str) -> bool {
-    resource_path == endpoint_path
-        || (resource_path.starts_with(endpoint_path)
-            && (endpoint_path.ends_with('/')
-                || resource_path.as_bytes().get(endpoint_path.len()) == Some(&b'/')))
+    let Some(suffix) = resource_path.strip_prefix(endpoint_path) else {
+        return false;
+    };
+    (suffix.is_empty() || endpoint_path.ends_with('/') || suffix.starts_with('/'))
+        && !contains_percent_encoded_path_separator(suffix)
+}
+
+fn contains_percent_encoded_path_separator(path_suffix: &str) -> bool {
+    path_suffix.as_bytes().windows(3).any(|triplet| {
+        triplet[0] == b'%'
+            && ((triplet[1] == b'2' && matches!(triplet[2], b'f' | b'F'))
+                || (triplet[1] == b'5' && matches!(triplet[2], b'c' | b'C')))
+    })
 }
 
 fn endpoint_path_matches(path: &str, policy: ResourceEndpointPathPolicy) -> bool {
@@ -2303,7 +2352,12 @@ mod tests {
 
         let root = CanonicalResourceIdPolicy::root_endpoint();
         assert!(parse_resource_for_matching_endpoint("https://example.test/", root).is_ok());
-        assert!(parse_resource_for_matching_endpoint("https://example.test/mcp", root).is_err());
+        assert_eq!(
+            parse_resource_for_matching_endpoint("https://example.test/mcp", root),
+            Err(CanonicalResourceIdError::EndpointPathPolicyMismatch {
+                required: ResourceEndpointPathPolicy::RootEndpoint,
+            })
+        );
     }
 
     #[test]
@@ -2433,17 +2487,24 @@ mod tests {
         );
 
         let foreign_endpoint = CanonicalHttpUrl::parse("https://foreign.example.test/mcp").unwrap();
-        let foreign = ConfiguredResourceEndpoint::new(
-            "foreign",
-            &foreign_endpoint,
-            CanonicalResourceIdPolicy::DEFAULT,
-        );
         let last = ConfiguredResourceEndpoint::new(
             "sole-last-match",
             &endpoint,
             CanonicalResourceIdPolicy::DEFAULT,
         );
-        let mut at_limit = vec![foreign; MAX_CONFIGURED_RESOURCE_ENDPOINTS];
+        let foreign_identities: Vec<_> = (0..MAX_CONFIGURED_RESOURCE_ENDPOINTS)
+            .map(|index| format!("foreign-{index}"))
+            .collect();
+        let mut at_limit: Vec<_> = foreign_identities
+            .iter()
+            .map(|identity| {
+                ConfiguredResourceEndpoint::new(
+                    identity,
+                    &foreign_endpoint,
+                    CanonicalResourceIdPolicy::DEFAULT,
+                )
+            })
+            .collect();
         *at_limit.last_mut().unwrap() = last;
         let selected = CanonicalResourceId::parse_for_configured_endpoints(
             "https://api.example.test/mcp",
