@@ -155,7 +155,7 @@ impl Sha256Digest {
 /// canonical input.
 pub fn sha256_bounded(
     input: &[u8],
-    max_input_bytes: usize,
+    max_input_bytes: usize
 ) -> Result<Sha256Digest, CryptoInputTooLongError> {
     sha256_bounded_with(input, max_input_bytes, sha256_exact)
 }
@@ -230,7 +230,7 @@ impl HmacSha256Key {
     pub fn authenticate_bounded(
         &self,
         input: &[u8],
-        max_input_bytes: usize,
+        max_input_bytes: usize
     ) -> Result<HmacSha256Tag, CryptoInputTooLongError> {
         enforce_input_limit(input, max_input_bytes)?;
 
@@ -253,7 +253,7 @@ impl HmacSha256Key {
         &self,
         input: &[u8],
         max_input_bytes: usize,
-        tag: &HmacSha256Tag,
+        tag: &HmacSha256Tag
     ) -> Result<(), HmacVerificationError> {
         enforce_input_limit(input, max_input_bytes)?;
 
@@ -1338,7 +1338,24 @@ mod tests {
     }
 
     fn function_header_end(tokens: &[SourceToken<'_>], fn_index: usize) -> Option<usize> {
-        (fn_index + 1..tokens.len()).find(|index| matches!(tokens[*index].text, "{" | ";"))
+        // Track nesting so the `;` inside array types such as `[u8; N]` is not
+        // mistaken for the end of a function signature.
+        let mut angle = 0_usize;
+        let mut paren = 0_usize;
+        let mut square = 0_usize;
+        for index in fn_index + 1..tokens.len() {
+            match tokens[index].text {
+                "<" => angle = angle.saturating_add(1),
+                ">" => angle = angle.saturating_sub(1),
+                "(" => paren = paren.saturating_add(1),
+                ")" => paren = paren.saturating_sub(1),
+                "[" => square = square.saturating_add(1),
+                "]" => square = square.saturating_sub(1),
+                "{" | ";" if angle == 0 && paren == 0 && square == 0 => return Some(index),
+                _ => {}
+            }
+        }
+        None
     }
 
     fn enclosing_braces(tokens: &[SourceToken<'_>], before: usize) -> Option<Vec<usize>> {
@@ -1631,9 +1648,27 @@ mod tests {
     }
 
     fn statement_end(tokens: &[SourceToken<'_>], start: usize) -> usize {
-        (start..tokens.len())
-            .find(|index| matches!(tokens[*index].text, ";" | ","))
-            .unwrap_or(tokens.len())
+        // Ignore `,` / `;` nested inside type arguments (`Result<(), E>`,
+        // `[u8; N]`) so binding statements can be scanned to their real end.
+        let mut angle = 0_usize;
+        let mut paren = 0_usize;
+        let mut square = 0_usize;
+        for index in start..tokens.len() {
+            match tokens[index].text {
+                "<" => angle = angle.saturating_add(1),
+                ">" => angle = angle.saturating_sub(1),
+                "(" => paren = paren.saturating_add(1),
+                ")" => paren = paren.saturating_sub(1),
+                "[" => square = square.saturating_add(1),
+                "]" => square = square.saturating_sub(1),
+                ";" if angle == 0 && paren == 0 && square == 0 => return index,
+                // Top-level commas still terminate multi-item declarations, but
+                // never those nested inside type/argument lists.
+                "," if angle == 0 && paren == 0 && square == 0 => return index,
+                _ => {}
+            }
+        }
+        tokens.len()
     }
 
     fn use_statement_end(tokens: &[SourceToken<'_>], start: usize) -> usize {
@@ -1677,10 +1712,11 @@ mod tests {
                     &canonical_tokens(surface),
                 )));
             }
-            if item.text == "fn" {
-                // Top-level and associated `pub fn` signatures are allowlisted by
-                // `SEALED_EXTERNAL_CALLABLES`. Do not truncate them at the first
-                // comma inside a type argument list here.
+            if matches!(item.text, "fn" | "trait" | "struct" | "enum" | "impl") {
+                // Callables, traits, and type items are validated by the sealed
+                // external-callable / public-trait allowlists later. Truncating
+                // their surfaces at type-list commas would misclassify them as
+                // ambient entropy exports.
                 continue;
             }
             if item.text == "const" {
@@ -1835,13 +1871,16 @@ mod tests {
                 ));
             };
             // `pub fn` / `pub const fn` callables are allowlisted by
-            // `SEALED_EXTERNAL_CALLABLES`; do not treat them as ambient entropy
-            // exports (statement_end also truncates at type-list commas).
-            if tokens[item_index].text == "fn"
-                || (tokens[item_index].text == "const"
-                    && tokens
-                        .get(item_index + 1)
-                        .is_some_and(|token| token.text == "fn"))
+            // `SEALED_EXTERNAL_CALLABLES`. Traits/structs/enums are checked by
+            // the public-trait / raw-surface scanners. Do not treat any of them
+            // as ambient entropy exports.
+            if matches!(
+                tokens[item_index].text,
+                "fn" | "trait" | "struct" | "enum" | "impl"
+            ) || (tokens[item_index].text == "const"
+                && tokens
+                    .get(item_index + 1)
+                    .is_some_and(|token| token.text == "fn"))
             {
                 continue;
             }
@@ -1908,6 +1947,11 @@ mod tests {
 
     fn push_alias<'a>(aliases: &mut Vec<&'a str>, alias: &'a str) {
         let alias = bare_identifier(alias);
+        // Never treat `_` as a named fill alias; wildcard bindings would otherwise
+        // make every underscore token look like a getrandom::fill reference.
+        if alias == "_" || alias.is_empty() {
+            return;
+        }
         if !aliases.contains(&alias) {
             aliases.push(alias);
         }
@@ -2069,10 +2113,29 @@ mod tests {
             .is_some_and(|token| matches!(token.text, "as" | "let" | "const" | "static"))
     }
 
+    fn token_is_inside_use_tree(tokens: &[SourceToken<'_>], index: usize) -> bool {
+        let mut depth = 0_isize;
+        for candidate in (0..=index).rev() {
+            match tokens[candidate].text {
+                "}" => depth += 1,
+                "{" => depth -= 1,
+                ";" if depth == 0 => return false,
+                "use" if depth == 0 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn semantic_fill_references(tokens: &[SourceToken<'_>]) -> Vec<usize> {
         let aliases = fill_aliases(tokens);
         (0..tokens.len())
             .filter(|index| {
+                // Import trees name `getrandom::fill` without invoking it; those
+                // paths are alias definitions, not executable fill references.
+                if token_is_inside_use_tree(tokens, *index) {
+                    return false;
+                }
                 let direct = path_to_fill_end(tokens, *index, &aliases.modules).is_some();
                 let alias = aliases
                     .functions
