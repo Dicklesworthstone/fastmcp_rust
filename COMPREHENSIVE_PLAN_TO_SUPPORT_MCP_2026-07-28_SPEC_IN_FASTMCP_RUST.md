@@ -90,8 +90,12 @@
   re-attest the complete evidence set before any dependency-freeze,
   FND-01, release, or aggregate-support gate can pass.
 - Primary owner: FastMCP Rust maintainers
-- Execution tracker: the 2026-08-03 Beads projection contains all 143 formal
-  packages and bounded child topologies. Its graph shape is cycle-free, but a
+- Execution tracker: the frozen pre-bridge projection has 902 physical and
+  879 non-tombstone records, 143 of 145 formal parents, 456 parent-associated
+  decomposition records, and 391 records labeled `work-package-child`. The
+  bridge adds API-CORE-01, CLI-CORE-01, and 140 missing children and
+  rematerializes weak existing topologies. Its current graph shape is
+  cycle-free, but a
   fresh source/version audit found 40 formal bodies whose normative text still
   carries superseded 2025-era, optional-profile, or core-only-release rules.
   Those lineages are quarantined until their bodies and children are
@@ -141,10 +145,11 @@ REL-02 cannot close without that aggregate. A green core-only or individual
 extension manifest is useful component evidence, never an aggregate support
 claim.
 
-The amended formal inventory is exactly 143 package IDs: the prior 129 formal
+The amended formal inventory is exactly 145 package IDs: the prior 129 formal
 packages plus `LEG-HTTP-01`, `LEG-NEG-01`, `LEG-TST-01`, `LEG-INTEROP-01`,
 `DEPR-01`, `APP-03`, `APP-04`, `AUTHX-04`, `AUTHX-05`, `EXT-SRC-01`,
-`COMP-ALL-01`, `CONF-03`, `GATE-ALL-MCP-READY`, and `CI-ALL-MCP-01`. Historical
+`COMP-ALL-01`, `CONF-03`, `GATE-ALL-MCP-READY`, `CI-ALL-MCP-01`,
+`API-CORE-01`, and `CLI-CORE-01`. Historical
 129/663 and 122/606 counts remain audit history only. The formal dependency
 edge count, roots, sinks, closure sets, and critical path must be regenerated
 from the amended Beads graph; no arithmetic patch to an obsolete edge count is
@@ -3641,9 +3646,9 @@ They must never be reachable from a modern transport policy.
 
 ### 7.22 Tracker and release-control gaps found on 2026-07-31
 
-- The revised formal MCP plan contains 129 packages and 663 package
-  dependencies, but the historical tracker maps only the older 122-
-  package/606-edge revision; none of the 129 has current synchronized
+- At the 2026-07-31 snapshot, the revised formal MCP plan contained 129
+  packages and 663 package dependencies, but the tracker mapped only the
+  older 122-package/606-edge revision; none of those 129 then had synchronized
   completion evidence.
 - Twelve FND-01 children were closed without attached gate receipts,
   while several child descriptions explicitly defer required clean-
@@ -3683,17 +3688,17 @@ item; it never implies aggregate MCP 2026-07-28 support.
 | Consumer-owned asupersync structured concurrency and cancel correctness | `WRONG_APPROACH` | ambient global runtime/block-on, synchronous transports, OS-thread-per-connection paths, and runtime-minting task code violate the target authority model | FND-04/05, LIMIT-01, STD-01, HTTP-01/03, TASK-02 |
 | Modern server plus stdio/Streamable-HTTP behavior | `PARTIAL` | substantial legacy server/framing code exists, but lifecycle, request-scoped SSE, routing headers, cancellation, auth ingress, and configured-policy propagation are wrong or absent; production paths block on async handlers and HTTP JSON serialization can silently become an empty body | SRV-01 through SRV-04, SRV-MW-01, STD-01, HTTP-01 through HTTP-06, XPORT-01 |
 | Modern concurrent client, era discovery, HTTP client, MRTR, and subscriptions | `STUB` | current child-stdio client initializes through temporary/placeholder sessions, is not a safe concurrent modern dispatcher, and has no `server/discover`, `subscriptions/listen`, modern HTTP, or MRTR implementation | CLT-01/02, MRTR-01 through MRTR-03, SUB-01 through SUB-03 |
-| Tool/resource/prompt/completion ergonomics and facade-only macros | `PARTIAL` | legacy registration is useful, but final result/schema/cache shapes are absent; macros block on ambient runtime and name component crates directly; README handler examples do not type-check as written | TOOL/RES/PRM/CMP, MAC-01, API-01, DX-TEST-01 |
+| Tool/resource/prompt/completion ergonomics and facade-only macros | `PARTIAL` | legacy registration is useful, but final result/schema/cache shapes are absent; macros block on ambient runtime and name component crates directly; README handler examples do not type-check as written | TOOL/RES/PRM/CMP, MAC-01, API-CORE-01/API-01, DX-TEST-01 |
 | Authorization, token custody, OAuth/OIDC, and cache partitioning | `PARTIAL` | useful primitives exist, but credentials cross synthetic JSON/state boundaries and issuer/resource/audience, SSRF, RFC metadata, custody, and cache invariants are incomplete | AUTH-00 through AUTH-07, CACHE-01 through CACHE-03, FND-06/09 |
 | Tasks, proxy, and optional extension profiles | `PARTIAL` | legacy/custom implementations exist but use obsolete core Tasks/reverse-call/session semantics and cannot support the planned claim boundaries | EXT-01; TASK-01, TASK-02, TASK-03, TASKP-01, and TASKR-01; PXY-01 through PXY-04; and the independent optional gates |
-| Facade/downstream usability and production-faithful public testing | `REGRESSED` | facade exports runtime/test authority, generated macro paths undermine a renamed facade-only consumer, and current facade trace round trips fail | API-01, EXT-DEV-01, DX-TEST-01, MAC-01 |
-| CLI run/dev/install/inspect behavior | `PARTIAL` | substantial parsing/rendering exists, but inspect converts list failures to empty catalogs, the current dev hot-reload E2E times out, and the advertised example command does not exist | CLI-01, DX-TEST-01, TST-03, DOC-01/02 |
+| Facade/downstream usability and production-faithful public testing | `REGRESSED` | facade exports runtime/test authority, generated macro paths undermine a renamed facade-only consumer, and current facade trace round trips fail | API-CORE-01/API-01, EXT-DEV-01, DX-TEST-01, MAC-01 |
+| CLI run/dev/install/inspect behavior | `PARTIAL` | substantial parsing/rendering exists, but inspect converts list failures to empty catalogs, the current dev hot-reload E2E times out, and the advertised example command does not exist | CLI-CORE-01/CLI-01, DX-TEST-01, TST-03, DOC-01/02 |
 | Workspace CI, conformance, interoperability, and clean test evidence | `REGRESSED` | local RCH sweeps have check warnings, clippy failures, CLI e2e failure, and facade trace failures; latest observed origin/main CI is red and its audit job masks failure | TST-01 through TST-04, CONF-01/02, INTEROP-01, CI-BASE-01, CI-CORE-01, and CI-FINAL-CORE-01 |
 | Bounded operations, capacity, performance, and soak evidence | `NOT_STARTED` | no modern-profile health/readiness/metrics contract or reproducible capacity/saturation/soak baseline exists | OPS-01, PERF-01 |
 | Truthful documentation and support claims | `REGRESSED` | README advertises cancel correctness, automatic timeout, zero-copy, and examples that current code/evidence do not establish; feature-parity text is internally inconsistent | DOC-01/02 plus all prerequisite gates |
 | Safe, licensed, resumable, independently verified publication | `WRONG_APPROACH` | active historical tag/manual publisher has ambient mutation reach; current license representations conflict; immutable `0.3.2` artifacts already expose a metadata/README/missing-file contradiction | REL-QUAR-00, REL-PREP-01, REL-01, REL-02 |
-| Current tracker representation of the revised plan | `NO_BEAD` | seven formal packages are absent, 24 FND provenance edges are missing, and multiple evidence-bearing children are closed without the required receipts | Section 36 rematerialization/refinement ceremony |
-| Published stable MCP 2026-07-28 product | `NOT_STARTED` | crates.io remains the old `0.3.2` family and neither the local tree nor provider evidence satisfies the modern stable profile | complete the self-inclusive 84-package profile and separately authorize/read back the exact `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)` success pair |
+| Current tracker representation of the revised plan | `NO_BEAD` | The frozen baseline has 902 physical and 879 non-tombstone records, including 143 formal parents, 456 non-tombstone parent-associated decomposition records, and 391 executable `work-package-child` records: 109 ordinary quartets, API-01/CLI-01's one retained A each, and FND-01's 18-record staged shape. Thirty-three formal packages have no quartet records, two core parents are absent, 50 existing quartets still fail the frozen contract, and 24 FND provenance edges remain subject to current verification | Section 36 rematerialization/refinement ceremony |
+| Published stable MCP 2026-07-28 product | `NOT_STARTED` | crates.io remains the old `0.3.2` family and neither the local tree nor provider evidence satisfies the modern stable profile | complete the self-inclusive 142-package `AllMcpReleaseProfileInventory` and separately authorize/read back the exact `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)` success pair |
 
 ### 7.24 Gap classification and bridge plan
 
@@ -3707,16 +3712,20 @@ tracks close the checklist gaps in this order:
 | Server/client/transports | SRV, CLT, STD, HTTP, XPORT, MRTR, SUB | raw-wire, cancellation, concurrency, era, and request-stream matrices |
 | User-facing MCP domains | TOOL, RES, PRM, CMP, OBS | final discriminated results, MRTR/cache/metadata behavior, handler and catalog evidence |
 | Authorization and cache safety | AUTH-00 through AUTH-07, CACHE-01 through CACHE-03 | issuer/resource/principal binding, custody/SSRF/step-up tests, partitioned invalidation |
-| Extensions, macros, facade, CLI, downstream DX | EXT-01, EXT-DEV-01, MAC-01, API-01, CLI-01, DX-TEST-01 | facade-only and renamed-dependency packaged consumers, safe out-of-tree extension and public test contracts |
+| Extensions, macros, facade, CLI, downstream DX | EXT-01, EXT-DEV-01, MAC-01, API-CORE-01, CLI-CORE-01, API-01, CLI-01, DX-TEST-01 | facade-only and renamed-dependency packaged consumers, safe out-of-tree extension and public test contracts |
 | Qualification | TST, GATE-CORE-READY, CONF, INTEROP, OPS, PERF, CI packages | zero baseline, nonempty exact scenario inventories, supported-platform/docs/security/capacity/soak evidence |
 | Claims and delivery | DOC-01/02, REL-QUAR-00, REL-PREP-01, REL-01, REL-02 | evidence-derived docs, quarantined ambient publisher, sealed candidate, separately authorized transaction, independent cleanup/docs observation, terminal rollback anchor |
 
 Completing every issue that is merely open in the current tracker would
-not close the vision gap. That tracker is a stale projection of an older
-122-package graph, omits seven packages and required edges, and contains
-unsupported closed evidence states. Only a safely reconciled,
-deterministically rematerialized and refinement-verified projection of
-the current 129-package formal graph can become scheduling authority.
+not close the vision gap. The frozen pre-bridge inventory is 902 physical/879
+non-tombstone records, with 143 of 145 formal parents, 456 of 596
+parent-associated decomposition records, and 391 of 595 executable
+`work-package-child` records; the completed topology has 580 canonical
+A/B/I/V role records. It retains 33 zero-record formal topologies plus weak
+existing quartets, missing or unverified provenance edges, and unsupported
+evidence states. Only a safely reconciled, deterministically rematerialized and
+refinement-verified projection of the current 145-package/782-prerequisite
+formal graph can become scheduling authority.
 
 ---
 
@@ -4678,6 +4687,7 @@ AUTH-03, AUTH-04, AUTH-06, TASK-01, TASK-02, TASK-03, TASKP-01,
 TASKR-01, EXT-01, APP-01, APP-02, AUTHX-01, AUTHX-02, AUTHX-03,
 PXY-02, OPS-01, DX-TEST-01, EXT-DEV-01, PERF-01, CI-BASE-01,
 REL-PREP-01, CI-CORE-01, CI-FINAL-CORE-01, REL-01, REL-02,
+API-CORE-01, CLI-CORE-01, API-01, CLI-01,
 LEG-02, LEG-03, LEG-HTTP-01, LEG-NEG-01, LEG-TST-01, LEG-INTEROP-01,
 DEPR-01, APP-03, APP-04,
 AUTHX-04, AUTHX-05, EXT-SRC-01, COMP-ALL-01, CONF-03,
@@ -4697,14 +4707,15 @@ a named integration child, and any declared independent final
 verification child close. Enforce that order in Beads, not only in
 prose: the integration child formally `blocks`-depends on every
 implementation child; an optional verification child formally
-`blocks`-depends on the integration child; and the aggregate formally
-`blocks`-depends on exactly one terminal child—the verification child
-when present, otherwise the integration child. Each child additionally
-carries its real external prerequisites. Parent-child hierarchy alone
-is not closure enforcement. The preclaim and close checker rejects an
-aggregate without that chain, an integration child that omits an
-implementation child, or simultaneous aggregate dependency edges to
-both the integration and verification children.
+`blocks`-depends on the integration child; and, among its decomposition
+children, the aggregate formally `blocks`-depends on exactly one terminal
+child—the verification child when present, otherwise the integration child.
+The aggregate also retains every canonical formal prerequisite declared by
+its package contract, and each child additionally carries its real external
+prerequisites. Parent-child hierarchy alone is not closure enforcement. The
+preclaim and close checker rejects an aggregate without that chain, an
+integration child that omits an implementation child, or aggregate bypass
+edges to both the integration and verification children.
 
 Every mandatory or voluntary decomposition uses the same schema:
 
@@ -4726,9 +4737,11 @@ Every mandatory or voluntary decomposition uses the same schema:
 - there is exactly one integration child and zero or one verification
   child; the integration child formally `blocks`-depends on every
   implementation child; when a verification child exists, it formally
-  `blocks`-depends on the integration child and the aggregate formally
-  `blocks`-depends only on the verification child; otherwise the
-  aggregate formally `blocks`-depends on the integration child;
+  `blocks`-depends on the integration child and the aggregate's sole
+  decomposition-child edge points to the verification child; otherwise
+  that sole decomposition-child edge points to the integration child. In
+  both cases the aggregate retains its complete canonical formal-
+  prerequisite set;
 - an implementation child carries every external prerequisite needed
   for its own work, and the integration child carries any remaining
   package-level prerequisite needed to assemble the result;
@@ -4775,16 +4788,39 @@ ownership:
   new exact module paths. The original monolith cannot remain the
   permanent integration point merely to evade reviewable ownership.
 
-FND-01's current verifier-authoring child requires this exception: its
-85,819-line integration verifier and exact shared policy/evidence inputs
-cannot honestly fit a 1,440-minute direct claim. Before rematerializing
-it, the current owner must checkpoint and hand back the fresh claim.
-Then split it into sequential, independently testable parser/corpus,
-acquisition/supply-authority, handoff/control-ledger, and mutation/
-integration/freeze stages, extracting reviewable modules and updating
-the declared author-marker module set. Do not reset or relabel the live
-claim, invent concurrent sibling ownership, or split the Bead without
-first applying this contract.
+FND-01's pre-existing verifier-authoring chain is the one frozen nested-
+planning exception to that generic staged schema. Its 85,819-line integration
+verifier and exact shared policy/evidence inputs cannot honestly fit a
+1,440-minute direct claim, but changing the already-audited record inventory
+would also invalidate Section 36's baseline and bridge cardinalities. Preserve
+the following exact representation during rematerialization:
+
+- `.1.14` remains the nonclaimable planning subaggregate. It keeps
+  `mandatory-planning-aggregate`, `nonclaimable-aggregate`,
+  `planning-subaggregate`, and `wp-parent-fnd-01`; it has no estimate and does
+  not receive `work-package-child`, `implementation-child`,
+  `staged-implementation-aggregate`, `work-package-stage`, or
+  `implementation-stage`;
+- its three executable residual records remain direct FND-01 implementation
+  children for cardinality and capability accounting. They keep
+  `work-package-child`, `implementation-child`, `wp-parent-fnd-01`, and
+  `subparent-fnd-01-14`, and use the stable references
+  `FND-01/implementation-dependency-verification-stage-01-ordinary-matrix`,
+  `FND-01/implementation-dependency-verification-stage-02-authority-control`,
+  and
+  `FND-01/implementation-dependency-verification-stage-03-freeze-package`;
+- the only residual blocking chain is ordinary-matrix → authority-control →
+  freeze-package → `.1.14`. The new FND-01 A grouping aggregate depends on
+  `.1.14`, never directly on its residual records, so it cannot bypass the
+  nested handoff;
+- the residual records still obey the generic stage ownership, 1-through-480
+  estimate, one-at-a-time claim, checkpoint, reservation, and handoff rules.
+  This exception changes labels and accounting only; it does not relax any
+  executable-stage proof or ownership requirement.
+
+Before rematerializing this chain, the current owner must checkpoint and hand
+back the fresh claim. Do not reset a live claim, invent concurrent sibling
+ownership, add duplicate stages, or convert `.1.14` into capability credit.
 
 The tracker checker rejects a decomposed package with a missing,
 duplicate, wrongly referenced, wrongly labelled, parent-edge-bearing, or dependency-bypassing
@@ -5523,9 +5559,10 @@ Implementation:
   active reservations, profile projection, canonical package
   fingerprints, and graph/corpus snapshots.
 - Have the same parsed graph generate and compare
-  `CoreImplementationInventory`, `CoreReleaseCandidateInventory`,
-  `CoreReleaseProfileInventory`, and every canonical optional-profile
-  closure. Reject hand-authored counts, endpoint drift, a delta-only
+  `CoreImplementationInventory`, `CoreQualificationInventory`,
+  `AllMcpReleaseCandidateInventory`, `AllMcpReleaseProfileInventory`,
+  and every canonical optional-profile closure. Reject hand-authored
+  counts, endpoint drift, a delta-only
   label where a full closure is required, or a Beads `profile-*` label
   whose membership differs from the generated full closure.
 - Parse Markdown with an explicit bounded fence-aware state machine, not
@@ -5816,10 +5853,6 @@ Tests:
 - HTTP bundle-key and era-cache invalidation tests varying either modern POST or legacy SSE target, same-origin paths, permitted queries, credential and security partitions, policy/receipt and configuration generations, canonical host/default-port equivalence, and proof that an origin-only collision cannot contaminate either bundle.
 - Diagnostic snapshot tests.
 
-Dependencies:
-
-- FND-01.
-
 Tracker decomposition:
 
 - Parent: `bd-mcp-2026-07-28-support-ahet.3` (FND-03).
@@ -5832,6 +5865,10 @@ Tracker decomposition:
 - Required closure direction: `.3.1 + .3.2 → .3.3 → .3.4 → .3`.
   The children are a Section 11 decomposition projection; formal package
   consumers retain their dependency on FND-03 rather than bypassing it.
+
+Dependencies:
+
+- FND-01.
 
 ### FND-04 — Complete runtime-managed `Cx` migration
 
@@ -11006,11 +11043,13 @@ Dependencies:
 
 ## 15. Phase 3 — Rebuild transports around request lifetime
 
-### STD-01 — Make Auto dual-era stdio cancel-correct and multiplexed
+### STD-01 — Make ModernOnly stdio cancel-correct and multiplexed
 
 Outcome:
 
-Implement the final modern stdio binding on asupersync.
+Implement the MCP `2026-07-28` ModernOnly stdio binding on asupersync,
+with adapter-neutral process and framing seams consumed by the optional
+dual-era packages.
 
 Reason:
 
@@ -11037,23 +11076,20 @@ Implementation:
   era router, lifecycle transition, dispatch, waiter/correlation,
   authorization, cache, task/session/subscription, response, or stdio state
   effect.
-- Capture FND-03's immutable
-  `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`
-  at process construction. On server ingress, enforce its exact first-
-  frame classification/terminal-close table before any era-specific
-  router: `ModernOnly` is preselected Modern,
-  `Auto` selects once from valid modern metadata versus
-  exact initialize (a syntactically valid unsupported modern version
-  still selects Modern and then receives `-32022`), and `LegacyOnly`
-  requires initialize directly.
-  Malformed/ambiguous opening traffic and every post-selection
-  cross-era message use the frozen error/no-response disposition and
-  can never trigger a second classification on that process.
-- On client egress, permit the first frame sequence only for the
-  selected policy: modern discover for `ModernOnly`, CLT-02's isolated
-  probe for `Auto`, or LEG-03's direct initialize for
-  `LegacyOnly`. The codec/transport cannot add fallback or infer a
-  policy from received bytes.
+- Capture FND-03's immutable ModernOnly stdio binding at process
+  construction. Modern is selected before the first byte. On server
+  ingress, admit a valid modern discovery opening or a valid modern
+  application opening carrying the complete per-request metadata, then
+  apply the frozen modern continuation/error table. Exact initialize
+  receives the supported-version diagnostic, and malformed, invalid,
+  mixed, or later cross-era traffic can never instantiate an adapter or
+  reclassify the process.
+- On client egress, the first application request is modern discovery.
+  The codec and transport expose adapter-neutral process/framing seams to
+  LEG-NEG-01's optional dual-era composition, but STD-01 itself cannot run
+  an Auto/alternate-era probe, initialize a legacy lifecycle, fall back,
+  construct an adapter receipt, or infer another era from peer bytes. Its
+  mandatory ModernOnly discovery opening is not a downgrade probe.
 - Run every complete line through PRT-01's bounded raw admission before
   typed decoding, with an explicit endpoint role and direction. At
   server ingress, invalid client JSON produces one omitted-ID `-32700`
@@ -11061,14 +11097,10 @@ Implementation:
   produces one omitted-ID `-32600` error; and an invalid client request
   with one readable valid ID receives a correlated `-32600` error
   echoing that exact ID. None of these server-generated errors enters
-  the waiter registry. After an era is already fixed or
-  selected—including preselected `ModernOnly`—the server connection
-  may continue after the bounded error frame as that binding permits.
-  During `Auto`'s unclassified opening, or before
-  `LegacyOnly` has admitted its required initialize, the same legal
-  error/no-response disposition is followed by FND-03's terminal
-  close; it never permits a second opening-frame classification
-  attempt. At client ingress, malformed server stdout or
+  the waiter registry. Because ModernOnly is fixed before traffic, the
+  server connection may continue after the bounded error frame only as
+  the frozen modern binding permits; no error path authorizes another
+  opening or era classification. At client ingress, malformed server stdout or
   an invalid server-direction envelope emits no response: because the
   shared line has no trustworthy owner, fail the stdio connection and
   all affected waiters with one bounded peer-protocol outcome. A
@@ -11124,21 +11156,23 @@ Implementation:
   `StdioRestartPolicy`. Its conformant default restarts the exact frozen
   child command/configuration with bounded exponential backoff and
   jitter under LIMIT-01's per-incident attempts/window, circuit-breaks
-  after exhaustion, and reruns the policy-specific opening because era
-  state is process-scoped. The new process reruns the exact
-  selected-policy opening sequence: modern-only discovery,
-  dual-era isolated classification, or legacy-only direct initialize.
+  after exhaustion, and reruns modern discovery on the fresh process.
+  Auto and LegacyOnly process classification, adapter construction, and
+  restart openings remain owned by LEG-NEG-01's composition with LEG-02
+  and LEG-03 rather than this transport package.
   Process restart itself never silently replays an
   ordinary request; Section 5.7 still governs a caller's fresh-ID
   reissue and side-effect uncertainty.
-- After a successful restart and version selection, re-establish every
-  still-live active subscription with a fresh request ID, its original
-  immutable filter/policy, remaining absolute lifetime, and an
-  observable gap marker because notifications may have been lost.
-  Do not restore a concurrently cancelled/expired handle or reset
-  reconnect/timeout limits. An application may explicitly disable
-  automatic restart only with a documented SHOULD-deviation; that
-  choice fails handles promptly rather than leaving them pending.
+- After a successful ModernOnly restart and discovery, publish one typed
+  fresh-process/generation signal to registered higher-level consumers.
+  STD-01 itself replays no ordinary request and re-establishes no
+  subscription. SUB-02 alone consumes that signal to re-establish each
+  still-live modern subscription with a fresh request ID, original
+  immutable filter/policy, remaining absolute lifetime, and observable
+  gap marker. A concurrently cancelled/expired handle stays terminal and
+  reconnect/timeout limits do not reset. An application may explicitly
+  disable automatic restart only with a documented SHOULD-deviation;
+  that choice fails handles promptly rather than leaving them pending.
 - After a caller cancels an already committed request, attempt exactly
   one valid `notifications/cancelled` on stdio from that connection
   control scope. If the peer response wins first, consume it and
@@ -11204,35 +11238,32 @@ Acceptance:
 - Graceful EOF shutdown, forced escalation, and child reaping complete
   within their independent budgets; benign stderr does not alter a
   successful protocol outcome.
-- Unexpected exit triggers the bounded default restart policy without
-  replaying ordinary requests; live subscriptions resume only after a
-  fresh policy-specific opening and expose their delivery gap.
-- Each process selects at most one era under its preconfigured policy;
-  first-frame ambiguity or later cross-era traffic cannot reuse the
-  process to probe another era.
+- Unexpected exit triggers the bounded default ModernOnly restart policy
+  without replaying ordinary requests; STD-01 exposes the fresh-process
+  generation signal, while SUB-02 exclusively owns any live-subscription
+  resumption and delivery-gap behavior.
+- Each process remains ModernOnly for its entire lifetime; peer bytes,
+  errors, restarts, or later traffic cannot select or probe another era.
 
 Tests:
 
 - Partial-read cancellation.
 - Partial-write cancellation.
 - Framing fuzz tests.
-- Three-policy server/client first-frame matrix, exact
-  modern/syntactically-valid-unsupported-version/initialize/mixed/
-  malformed/notification/response openings,
-  post-selection cross-era traffic, terminal close/no reclassification,
-  feature/adapter-receipt rejection before spawn, and fresh-PID
-  restart behavior. The unsupported-version row selects Modern,
-  returns exact `-32022`, and proves zero initialize, fallback, or
-  second classification.
+- ModernOnly server/client opening matrix over modern discovery, a valid
+  modern application request with complete per-request metadata,
+  syntactically valid unsupported versions, exact initialize, mixed,
+  malformed, notification, and response openings; later cross-era
+  traffic; feature-off symbol isolation; and fresh-PID restart behavior.
+  The unsupported-version row remains Modern, returns exact `-32022`,
+  and proves zero initialize, fallback, adapter receipt, or second
+  classification.
 - Invalid-JSON, invalid-request, missing/null/fractional/object ID, and
   readable-valid-ID error goldens at server ingress; prove omitted
   rather than null ID, exact valid-ID echo, and valid-notification
-  silence. Cross every first-frame case with all three policies:
-  preselected/selected-era cases take the specified continuation,
-  while an unclassified `Auto` or not-yet-initialized
-  `LegacyOnly` process closes after its permitted error/no-response
-  disposition and cannot classify from a second frame. In every case,
-  prove no completion of an unrelated active waiter.
+  silence. Cross every first-frame case with the preselected ModernOnly
+  continuation/close table and prove that no second opening, fallback,
+  adapter lookup, or unrelated waiter completion occurs.
 - Array-of-one-valid-request and mixed top-level-array negatives at both
   server and client stdio ingress, proving the frozen role disposition and
   zero partial lifecycle, dispatch, waiter/correlation, authorization, cache,
@@ -11255,11 +11286,13 @@ Tests:
   core wire fixtures contain no invented request correlator.
 - Process crash test.
 - Default restart/backoff/jitter/attempt/window/circuit-breaker tests;
-  fresh process-era probe, exact frozen command, restart-disabled
-  documented-deviation, and crash-loop accounting across new PIDs.
-- Reconnect and fresh-ID resubscribe with original filter, remaining
-  lifetime, gap marker, concurrent cancel/expiry, and no ordinary-
-  request auto-replay tests.
+  fresh-process modern discovery, exact frozen command,
+  restart-disabled documented-deviation, and crash-loop accounting
+  across new PIDs.
+- Fresh-process generation notification, generation monotonicity, and
+  zero transport-owned request/subscription replay tests. SUB-02 owns
+  the fresh-ID resubscribe, original-filter, remaining-lifetime, gap,
+  and concurrent cancel/expiry matrix.
 - No-protocol-output-on-stderr/stdout contamination test.
 - Cancel-after-commit and exactly-one-notification test.
 - Cancelled-request-context versus independent control-scope test;
@@ -11529,24 +11562,13 @@ Evidence:
   fixture-only result, filtered test run, zero-test green result, or an
   unbound process artifact earns no capability credit.
 
-Dependencies:
-
-- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
-- HDR-01 — `bd-mcp-2026-07-28-support-ahet.16`
-- PRT-03 — `bd-mcp-2026-07-28-support-ahet.10`
-- AUTH-00 — `bd-mcp-2026-07-28-support-ahet.12`
-- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
-- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
-- Independent verification gate — `bd-mcp-http-02-verification-wq1i`,
-  which depends on `bd-mcp-http-02-integration-ofev`; that integration
-  depends on `bd-mcp-http-02-a-78gg` and `bd-mcp-http-02-b-37a9`.
-
 Tracker mapping:
 
 - Plan package ID: HTTP-02
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.26`
-- Parent formal prerequisites: HTTP-01, HDR-01, PRT-03, AUTH-00, EXT-01,
-  LIMIT-01, and `bd-mcp-http-02-verification-wq1i`.
+- Parent formal prerequisites: HTTP-01, HDR-01, PRT-03, AUTH-00, EXT-01, and
+  LIMIT-01. Sole decomposition-terminal child:
+  `bd-mcp-http-02-verification-wq1i`.
 - Dependency direction: HTTP-02 is blocked by every listed prerequisite; the
   implementation A/B → integration → verification chain is mandatory before
   parent closure.
@@ -11554,6 +11576,15 @@ Tracker mapping:
   request-scoped JSON/SSE response selection.  It does not prove legacy
   transport support, Tasks, Apps, subscriptions, gateway translation,
   automatic era negotiation, or aggregate MCP conformance.
+
+Dependencies:
+
+- HTTP-01.
+- HDR-01.
+- PRT-03.
+- AUTH-00.
+- EXT-01.
+- LIMIT-01.
 
 ### HTTP-03 — Implement the modern HTTP client
 
@@ -12310,9 +12341,10 @@ Outcome:
   2024-11-05 JSON-RPC protocol, lifecycle, capability state, messages, and
   errors.
 - The adapter is constructed only with an explicit authenticated
-  `LegacyPeerBinding` supplied by a transport consumer.  STD-01 consumes it
-  for legacy stdio; LEG-HTTP-01 is the downstream consumer for the exact
-  two-endpoint HTTP+SSE transport.
+  `LegacyPeerBinding` supplied by a transport consumer. LEG-NEG-01's
+  legacy-stdio composition consumes it over STD-01's adapter-neutral
+  process/framing substrate; LEG-HTTP-01 is the downstream consumer for
+  the exact two-endpoint HTTP+SSE transport.
 - One binding owns one bounded lifecycle:
   `AwaitInitialize -> AwaitInitialized -> Operating -> Closed`.  Its
   negotiated protocol version, peer identity, capabilities, and pending
@@ -12373,15 +12405,18 @@ Implementation:
   later supplies the exact HTTP+SSE peer binding and independently owns its
   GET/POST framing, endpoint advertisement, reconnect handling, security,
   and teardown.
-- STD-01 invokes the same adapter through its explicitly selected legacy
-  stdio peer binding.  The adapter receives a preselected exact 2024 binding
-  or is not constructed.
+- LEG-NEG-01's stdio composition invokes the adapter through its explicitly
+  selected legacy peer binding over STD-01's neutral process/framing
+  substrate. STD-01 never selects, constructs, binds, or invokes this
+  adapter. The adapter receives a preselected exact-2024 binding or is not
+  constructed.
 
 Tests:
 
-- `leg_02_a_positive`: exercise the shipped adapter through a real stdio
-  consumer with exact initialize, initialized notification, negotiated
-  capabilities, legal operating requests, and exact success/error messages.
+- `leg_02_a_positive`: exercise the shipped adapter through LEG-NEG-01's
+  public stdio composition over the real STD-01 substrate, with exact
+  initialize, initialized notification, negotiated capabilities, legal
+  operating requests, and exact success/error messages.
 - `leg_02_a_planted_negative`: alter only one lifecycle or capability
   dimension and prove the exact typed rejection, no handler dispatch, and no
   negotiated-state mutation.
@@ -12412,7 +12447,7 @@ Tests:
 Evidence:
 
 - Bind each positive run to the exact revision/tree, legacy feature state,
-  stdio public consumer, authenticated peer-binding generation, negotiated
+  LEG-NEG-01 public stdio consumer, authenticated peer-binding generation, negotiated
   capability set, method direction, lifecycle transition, observable
   response/error, quota reservation/release count, and first-attempt result.
 - The positive observable is one exact 2024 lifecycle reaching `Operating`
@@ -12424,25 +12459,13 @@ Evidence:
   closure; fixture-only evidence, filtered/ignored tests, zero-test green
   output, or a plan edit earns no capability credit.
 
-Dependencies:
-
-- LEG-01 — `bd-mcp-2026-07-28-support-ahet.9`
-- SRV-01 — `bd-mcp-2026-07-28-support-ahet.15`
-- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
-- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
-- XPORT-01 — `bd-mcp-2026-07-28-support-ahet.48`
-- AUTH-00 — `bd-mcp-2026-07-28-support-ahet.12`
-- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
-- Independent verification gate — `bd-mcp-leg-02-verification-4wbe`,
-  which depends on `bd-mcp-leg-02-integration-wlj6`; that integration
-  depends on `bd-mcp-leg-02-a-h4l5` and `bd-mcp-leg-02-b-kk21`.
-
 Tracker mapping:
 
 - Plan package ID: LEG-02
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.58`
 - Parent formal prerequisites: LEG-01, SRV-01, STD-01, HTTP-01, XPORT-01,
-  AUTH-00, LIMIT-01, and `bd-mcp-leg-02-verification-4wbe`.
+  AUTH-00, and LIMIT-01. Sole decomposition-terminal child:
+  `bd-mcp-leg-02-verification-4wbe`.
 - Dependency direction: LEG-02 is blocked by every listed prerequisite; the
   implementation A/B → integration → verification chain is mandatory before
   parent closure.
@@ -12450,6 +12473,16 @@ Tracker mapping:
   and lifecycle adapter.  It does not implement a transport, own the
   two-endpoint HTTP+SSE protocol, provide cross-era route selection, or prove
   aggregate dual-era MCP conformance.
+
+Dependencies:
+
+- LEG-01.
+- SRV-01.
+- STD-01.
+- HTTP-01.
+- XPORT-01.
+- AUTH-00.
+- LIMIT-01.
 
 ### LEG-03 — Exact MCP 2024-11-05 client protocol and lifecycle adapter
 
@@ -12459,7 +12492,8 @@ Outcome:
   exact initialize exchange, negotiated capabilities, client requests,
   server-initiated requests, notifications, results, and errors.
 - The adapter is constructed only with an explicit authenticated
-  `LegacyClientPeerBinding`.  STD-01 supplies the binding for legacy stdio;
+  `LegacyClientPeerBinding`. LEG-NEG-01's legacy-stdio composition supplies
+  the binding over STD-01's adapter-neutral process/framing substrate;
   LEG-HTTP-01 is the downstream consumer that supplies the binding for its
   exact two-endpoint HTTP+SSE transport.
 - One binding owns one bounded client lifecycle:
@@ -12511,10 +12545,11 @@ Implementation:
   close, expiry, or shutdown.  Late frames cannot complete a released
   operation.
 - Use CLT-02 only for the final client policy/error and public dispatch
-  contracts, and use STD-01 only as the stdio consumer.  LEG-NEG supplies
-  any outer selection decision before a `LegacyClientPeerBinding` reaches
-  this adapter.  The adapter does not inspect selection evidence or perform
-  a second attempt.
+  contracts, and use STD-01 only as the adapter-neutral process/framing
+  substrate. LEG-NEG-01 alone owns the stdio consumer composition and any
+  outer selection decision before a `LegacyClientPeerBinding` reaches this
+  adapter. The adapter does not inspect selection evidence or perform a
+  second attempt.
 - Expose only a transport-neutral inbound-message/outbound-message interface
   plus close/cancellation signals.  It opens no network connection, parses no
   HTTP/SSE frame, chooses no endpoint, and performs no reconnect behavior.
@@ -12527,9 +12562,10 @@ Implementation:
 
 Tests:
 
-- `leg_03_a_positive`: exercise a shipped client entrypoint over a real
-  stdio consumer through exact initialize/result, initialized notification,
-  negotiated capabilities, ordinary client requests, and exact responses.
+- `leg_03_a_positive`: exercise a shipped client entrypoint through
+  LEG-NEG-01's public stdio composition over the real STD-01 substrate,
+  through exact initialize/result, initialized notification, negotiated
+  capabilities, ordinary client requests, and exact responses.
 - `leg_03_a_planted_negative`: change only one initialization, capability,
   ID, or message-shape dimension and prove the exact typed error, zero
   outbound application request, and unchanged negotiated state.
@@ -12561,7 +12597,7 @@ Tests:
 Evidence:
 
 - Bind every positive run to the exact revision/tree, legacy feature state,
-  public stdio consumer, authenticated binding generation, negotiated
+  LEG-NEG-01 public stdio consumer, authenticated binding generation, negotiated
   capabilities, message direction, lifecycle transition, response/error,
   reservation/release counts, and first-attempt result.
 - The positive observable is one exact 2024 client lifecycle entering
@@ -12573,23 +12609,12 @@ Evidence:
   closure; plan text, fixtures, filtered/ignored tests, zero-test green
   output, or stale revision evidence earns no capability credit.
 
-Dependencies:
-
-- LEG-01 — `bd-mcp-2026-07-28-support-ahet.9`
-- CLT-02 — `bd-mcp-2026-07-28-support-ahet.24`
-- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
-- HTTP-01 — `bd-mcp-2026-07-28-support-ahet.21`
-- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
-- Independent verification gate — `bd-mcp-leg-03-verification-dbh5`,
-  which depends on `bd-mcp-leg-03-integration-vh0b`; that integration
-  depends on `bd-mcp-leg-03-a-vsu7` and `bd-mcp-leg-03-b-uudd`.
-
 Tracker mapping:
 
 - Plan package ID: LEG-03
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.39`
-- Parent formal prerequisites: LEG-01, CLT-02, STD-01, HTTP-01, LIMIT-01,
-  and `bd-mcp-leg-03-verification-dbh5`.
+- Parent formal prerequisites: LEG-01, CLT-02, STD-01, HTTP-01, and LIMIT-01.
+  Sole decomposition-terminal child: `bd-mcp-leg-03-verification-dbh5`.
 - Dependency direction: LEG-03 is blocked by every listed prerequisite; the
   implementation A/B → integration → verification chain is mandatory before
   parent closure.
@@ -12597,6 +12622,14 @@ Tracker mapping:
   and lifecycle adapter.  It does not implement selection, a transport,
   LEG-HTTP-01's two-endpoint HTTP+SSE behavior, a fallback coordinator, or
   aggregate dual-era MCP conformance.
+
+Dependencies:
+
+- LEG-01.
+- CLT-02.
+- STD-01.
+- HTTP-01.
+- LIMIT-01.
 
 ### XPORT-01 — Disposition modern 2026 and exact 2024 transports
 
@@ -12708,14 +12741,6 @@ Evidence:
   compile-only, filtered, stale, or plan-only evidence earns no transport
   capability credit.
 
-Dependencies:
-
-- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
-- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
-- SUB-01 — `bd-mcp-2026-07-28-support-ahet.28`
-- LIMIT-01 — `bd-mcp-2026-07-28-support-ahet.13`
-- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
-
 Tracker mapping:
 
 - Plan package ID: XPORT-01
@@ -12726,6 +12751,14 @@ Tracker mapping:
   experimental/test infrastructure.  It does not prove exact-2024 HTTP+SSE,
   automatic era selection, WebSocket standards conformance, any superseded
   transport, or aggregate MCP conformance.
+
+Dependencies:
+
+- STD-01.
+- HTTP-03.
+- SUB-01.
+- LIMIT-01.
+- EXT-01.
 
 ### MRTR-01 — Implement the MRTR state machine
 
@@ -18705,7 +18738,8 @@ Acceptance:
   dispatch, cache, proxy, or state mutation.
 - Child I executes exactly two renamed packaged consumers: one builder-based
   and one derive/attribute-based consumer, each depending only on a renamed
-  facade and reaching the shipped sealed registration/activation path.
+  API-CORE-01 facade with `--no-default-features` and legacy absent, and
+  reaching the shipped sealed registration/activation path.
 - Child V binds the exact I revision and performs exactly three inventory
   checks: facade-public-export inventory, forbidden-authority/feature
   inventory, and discovered/started/passed test inventory. It also executes a
@@ -18734,7 +18768,7 @@ Dependencies:
 - EXT-01.
 - FND-04.
 - MAC-01.
-- API-01.
+- API-CORE-01.
 
 ### TASK-01 — Replace the Tasks wire model
 
@@ -25693,56 +25727,72 @@ Dependencies:
 - OPS-01.
 - EXT-DEV-01.
 
-### PXY-LEG-01 — Add mixed-era proxy routing
+### PXY-LEG-01 — Route exact MCP 2024 and 2026 upstream proxy legs
 
 Outcome:
 
-Let an explicitly dual-era gateway route to exact
-`2024-11-05` upstreams without weakening unrelated modern routes.
+Let a gateway whose downstream endpoint remains exact `2026-07-28` route
+each upstream connection independently as exact `2026-07-28` or exact
+`2024-11-05`, without weakening or conflating sibling routes. This package
+does not add a legacy-downstream gateway endpoint.
 
 Reason:
 
-Legacy upstream support is optional and must not become a prerequisite
-for the modern proxy profile.
+Exact-2024 upstream support is optional to the modern proxy component and
+must retain its own transport, lifecycle, and negotiation evidence.
 
 Implementation:
 
-- Attach LEG-03 to selected upstream configurations only.
-- Classify and cache each upstream era independently.
-- Translate only lossless results from LEG-01.
-- Keep initialization and direct legacy reverse requests inside the upstream
-  adapter; reject sessioned/replay semantics.
-- On every modern and exact-2024 downstream/upstream transport boundary,
-  reject a top-level JSON-RPC batch array, including array-of-one valid-request
-  and mixed-array forms, before translation, lifecycle, routing, dispatch,
-  correlation, authorization, cache, subscription, proxy forwarding,
-  response, or state mutation. Preserve each leg's sealed server/client role
-  disposition; no array receives partial cross-era translation.
-- Exclude modern-only MRTR, subscription, and extension behavior from
-  a legacy route.
+- Attach LEG-03 and, for HTTP, LEG-HTTP-01 only to upstream configurations
+  selected as exact 2024. Use LEG-NEG-01 for `Auto`; `ModernOnly` and
+  `LegacyOnly` dispatch directly to their configured upstream adapters.
+- Classify and cache each upstream independently by its complete transport/
+  configuration identity, policy, adapter receipt, and configuration
+  generation; never by origin or another route's result.
+- Translate only LEG-01 rows classified as lossless. Keep exact-2024
+  initialization, reverse requests, subscriptions, logging, cancellation/
+  progress, and connection state inside the upstream adapter.
+- Route modern HTTP only through the MCP 2026-07-28 request/response surface
+  and exact-2024 HTTP only through LEG-HTTP-01's two-endpoint SSE/advertised-
+  POST transport. Never substitute 2025 session headers, replay, GET/DELETE,
+  or inline fallback.
+- On the modern downstream boundary and every selected modern or exact-2024
+  upstream boundary, reject top-level JSON-RPC batch arrays before
+  translation, lifecycle, routing, dispatch, correlation, cache,
+  subscription, forwarding, response, or state mutation. Preserve each
+  boundary's sealed endpoint role and disposition.
+- Exclude modern-only MRTR, modern subscription, Tasks, and extension
+  behavior from an exact-2024 route.
 - Preserve the union catalog supplied by unrelated modern upstreams.
+- Reject planted `2025-11-25`, arbitrary-error downgrade, cross-route state
+  reuse, and route-policy mutation.
 
 Acceptance:
 
-- A legacy upstream cannot force another route into legacy mode.
-- Unsupported modern behavior fails per selected route.
-- No legacy lifecycle state appears downstream.
+- A 2024 upstream cannot force another route into legacy mode.
+- Exact-2026 and exact-2024 upstreams retain distinct transport, lifecycle,
+  receipt, cursor, and cache identities.
+- Unsupported behavior fails only on the selected route.
+- No legacy lifecycle state appears on the modern downstream leg.
+- This package makes no legacy-downstream/modern-upstream claim.
 
 Tests:
 
-- Modern-legacy and multiple mixed-upstream matrices.
-- Legacy route limitation diagnostics.
-- Modern capability non-regression.
-- Array-of-one-valid-request and mixed-array planted negatives for modern and
-  exact-2024 stdio and HTTP+SSE proxy legs, each proving no partial
-  translation/lifecycle/routing/dispatch/correlation/authorization/cache/
-  subscription/proxy/response effect and no cross-leg response emission.
+- Cross the modern downstream stdio and MCP 2026-07-28 HTTP surfaces with
+  selected exact-2024 upstream stdio and LEG-HTTP-01 HTTP+SSE.
+- Multiple mixed-upstream matrices with unrelated modern sibling routes.
+- `Auto`, `ModernOnly`, and `LegacyOnly` selection and isolation tests.
+- Legacy-route limitation and modern catalog non-regression tests.
+- Array-of-one and mixed-array planted negatives on every applicable leg,
+  proving no partial or cross-leg effect.
 
 Dependencies:
 
 - PXY-01.
 - LEG-01.
 - LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
 
 ### PXY-02 — Preserve modern result and cache semantics
 
@@ -26465,6 +26515,86 @@ Dependencies:
 - TASK-01.
 - TASK-02.
 
+### API-CORE-01 — Export the bounded ModernOnly public facade
+
+Outcome:
+
+Provide the complete public facade, builders, prelude, and packaged-consumer
+surface for MCP `2026-07-28` ModernOnly operation with
+`legacy-2024-11-05` compiled out.
+
+Reason:
+
+The modern component gate needs a real downstream public API without pulling
+the full Auto/exact-2024 aggregate into its dependency closure. An internal
+child Bead is not a formal package dependency and cannot substitute for this
+public package.
+
+Implementation:
+
+- Export every supported modern protocol, server, client, transport,
+  extension, handler, derive, context, result, and builder type through the
+  canonical facade and prelude. Generated code resolves only through the
+  renamed facade dependency.
+- Build and run with `legacy-2024-11-05` absent. `ModernOnly` is constructible;
+  parseable `Auto` or `LegacyOnly` configuration fails through FND-06's typed
+  `FeatureUnavailable` validation before bind, spawn, endpoint selection,
+  receipt lookup, or outbound bytes. No legacy module, symbol, initialization
+  convenience, adapter receipt, or two-endpoint HTTP constructor is exported.
+- Freeze protocol policy, modern endpoint, client metadata, capabilities,
+  extensions, limits, and caller-owned `&Cx` authority before execution.
+  Peer input and ordinary errors cannot change policy or create another era.
+- Exercise the shipped facade from isolated packaged consumers with renamed
+  dependencies over child stdio and modern HTTP. Tests use production
+  entrypoints and the shipped feature graph, not `cfg(test)` alternatives,
+  component-crate imports, wrappers, or copied schemas.
+- Preserve the existing `bd-mcp-api-modernonly-61vo` executable work as this
+  package's implementation-A child after its external reference and ownership
+  card are rematerialized. It is no longer a child of full API-01. Create a
+  distinct B/I/V chain and a formal API-CORE-01 parent; the parent depends on
+  V as its sole decomposition-child edge.
+
+Acceptance:
+
+- A renamed-facade external consumer compiles and executes every declared
+  ModernOnly builder/public surface with legacy disabled.
+- A near-identical consumer that changes only one legacy symbol, feature,
+  receipt, initialize action, endpoint, or policy dimension fails at the
+  declared typed boundary with unchanged state and zero process/network/cache
+  effect.
+- Public export inventory, generated paths, Cargo features, first MCP action,
+  caller-owned context, and discovered/started/passed test IDs are exact and
+  nonempty.
+- This package proves no Auto, exact-2024, optional profile, aggregate
+  conformance, maturity, or release claim.
+
+Tests:
+
+- Renamed packaged-consumer compile and execution matrix for facade/prelude,
+  builders, derives, modern stdio, modern HTTP, discovery, MRTR,
+  subscriptions, and registered extensions.
+- Legacy-feature-off symbol and dependency-tree negatives; `Auto` and
+  `LegacyOnly` typed-unavailable tests; exact initialize/legacy HTTP/receipt
+  attempts with zero side effects.
+- `&Cx`-first/no nested-runtime authority checks, immutable configuration and
+  first-wire assertions, public export inventory equality, and exact
+  required=discovered=started=passed test-set equality.
+
+Dependencies:
+
+- FND-06.
+- SRV-02.
+- CLT-02.
+- STD-01.
+- EXT-01.
+- HTTP-03.
+- MRTR-03.
+- SUB-03.
+- MAC-01.
+- HTTP-06.
+- AUTH-05.
+- CACHE-03.
+
 ### API-01 — Auto-default dual-era builders and facade exports
 
 Outcome:
@@ -26484,8 +26614,8 @@ Reason:
 - The facade is the public policy boundary.  Defaults, protocol modules,
   features, endpoint targets, and receipts must be captured before the first
   side effect so users cannot accidentally compose incompatible eras.
-- A bounded ModernOnly API remains independently verifiable for the core
-  profile; the full facade additionally composes Auto and exact legacy
+- API-CORE-01 remains independently verifiable for the core profile; the
+  full facade additionally composes Auto and exact legacy
   support without weakening that bounded proof.
 
 Implementation:
@@ -26540,12 +26670,9 @@ Implementation:
 
 Tests:
 
-- `api_01_modernonly_public_surface_positive` and
-  `api_01_modernonly_public_surface_planted_negative` are the exact bounded
-  leaf tests.  They compile and run a packaged external ModernOnly consumer
-  with legacy disabled, then differ only by one forbidden legacy
-  symbol/receipt/initialization attempt and prove the typed public rejection
-  with zero process/network/cache/auth mutation.
+- API-CORE-01 owns the packaged external ModernOnly positive and planted
+  negative. API-01 consumes its verified formal-package receipt and cannot
+  count or rerun that work as Auto/exact-2024 capability credit.
 - `api_01_auto_positive` and `api_01_auto_planted_negative` are full
   API-01 same-Bead tests.  They exercise the shipped public facade with Auto
   default, explicit ModernOnly, and explicit LegacyOnly across stdio and HTTP
@@ -26578,46 +26705,95 @@ Evidence:
   admits only its declared policy/module/bundle.  The planted negative
   observable is the registered typed rejection plus unchanged public state
   and zero outbound effect.
-- The bounded ModernOnly leaf proves only the core public surface.  The full
-  API aggregate requires its own real code, same-Bead positive and
+- API-CORE-01 proves only the core public surface. The full API aggregate
+  requires its own real code, same-Bead positive and
   near-identical planted-negative tests, and independent revision-bound
   verification before any Auto or legacy claim.
-
-Dependencies:
-
-- FND-06 — `bd-mcp-2026-07-28-support-ahet.7`
-- SRV-02 — `bd-mcp-2026-07-28-support-ahet.17`
-- CLT-02 — `bd-mcp-2026-07-28-support-ahet.24`
-- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
-- EXT-01 — `bd-mcp-2026-07-28-support-ahet.35`
-- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
-- MRTR-03 — `bd-mcp-2026-07-28-support-ahet.41`
-- SUB-03 — `bd-mcp-2026-07-28-support-ahet.43`
-- MAC-01 — `bd-mcp-2026-07-28-support-ahet.63`
-- HTTP-06 — `bd-mcp-2026-07-28-support-ahet.64`
-- AUTH-05 — `bd-mcp-2026-07-28-support-ahet.69`
-- CACHE-03 — `bd-mcp-2026-07-28-support-ahet.73`
-- API-01 bounded ModernOnly leaf — `bd-mcp-api-modernonly-61vo`
-- LEG-02 — `bd-mcp-2026-07-28-support-ahet.58`
-- LEG-03 — `bd-mcp-2026-07-28-support-ahet.39`
-- LEG-HTTP-01 — `bd-mcp-leg-http-01-4yed`
-- LEG-NEG-01 — `bd-mcp-leg-neg-01-jlbe`
 
 Tracker mapping:
 
 - Plan package ID: API-01
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.79`
-- Formal prerequisite IDs: FND-06, SRV-02, CLT-02, STD-01, EXT-01,
-  HTTP-03, MRTR-03, SUB-03, MAC-01, HTTP-06, AUTH-05, CACHE-03,
-  `bd-mcp-api-modernonly-61vo`, LEG-02, LEG-03, LEG-HTTP-01, and
-  LEG-NEG-01.
+- Formal prerequisite IDs: API-CORE-01, LEG-02, LEG-03, LEG-HTTP-01,
+  and LEG-NEG-01.
 - Dependency direction: all listed prerequisites → API-01 → GATE-DUAL-READY.
-  GATE-CORE-READY depends directly on
-  `bd-mcp-api-modernonly-61vo` and never on full API-01.
+  GATE-CORE-READY depends on API-CORE-01 and never on full API-01.
 - No-claim boundary: API-01 proves only the public Auto-default composition
   and explicit policy modules.  It does not prove a 2025/sessioned
   transport, automatic selection outside LEG-NEG-01, independent legacy
   transport behavior, aggregate conformance, maturity, or release readiness.
+
+Dependencies:
+
+- API-CORE-01.
+- LEG-02.
+- LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
+
+### CLI-CORE-01 — Ship the bounded ModernOnly CLI surface
+
+Outcome:
+
+Provide the complete shipped `fastmcp` run, inspect, and diagnostic surface
+for MCP `2026-07-28` ModernOnly operation with the legacy feature compiled
+out.
+
+Reason:
+
+The modern component gate must exercise the real public binary without
+depending on full Auto/exact-2024 CLI composition or an internal child Bead.
+
+Implementation:
+
+- Parse the public policy option once and admit only constructible
+  `ModernOnly` in this feature graph. Parseable `Auto` and `LegacyOnly` fail
+  with the stable FND-06 unavailable-feature diagnostic before a child,
+  listener, endpoint, credential/cache lookup, or protocol byte exists.
+- Run and inspect the API-CORE-01 surface over child stdio and modern HTTP.
+  The first client MCP action is modern discovery; the server remains Modern
+  before its first frame. No exact-2024 initialize, endpoint event, advertised
+  POST, adapter receipt, legacy module, or fallback path is reachable.
+- Keep protocol stdout pure, diagnostics on stderr, and exact machine JSON
+  schema-stable. Apply OBS-02's bounded untrusted-display rules to every
+  peer-controlled field and return a stable nonzero exit for every failure.
+- Exercise the installed binary from an isolated packaged consumer with the
+  real no-legacy feature graph. No private helper, wrapper binary, fixture, or
+  `cfg(test)` route can satisfy acceptance.
+- Preserve the existing `bd-mcp-cli-modernonly-31kh` executable work as this
+  package's implementation-A child after rematerializing its external
+  reference and ownership card. It is no longer a child of full CLI-01.
+  Create a distinct B/I/V chain and a formal CLI-CORE-01 parent whose sole
+  decomposition-child edge is V.
+
+Acceptance:
+
+- The shipped binary runs and inspects valid ModernOnly stdio and HTTP
+  subjects and emits exact policy/version/transport/first-action observables.
+- A near-identical command changing only one legacy feature, symbol, policy,
+  endpoint, receipt, or first-wire dimension fails before side effects with
+  stable machine JSON and nonzero exit.
+- Help/argument, stdout/stderr, terminal-safety, redaction, process cleanup,
+  and required=discovered=started=passed inventories are exact and nonempty.
+- This package grants no Auto, exact-2024, aggregate conformance, maturity, or
+  release credit.
+
+Tests:
+
+- Shipped-binary black-box run/inspect matrix over child stdio and modern HTTP
+  with legacy compiled out.
+- Exact feature-unavailable and no-symbol/no-dependency negatives for Auto,
+  LegacyOnly, initialize, legacy SSE, legacy receipt, and 2024 selection.
+- Machine JSON, stdout/stderr purity, bounded display/redaction, signal/EOF/
+  cancellation cleanup, first-wire, and exact test-inventory equality tests.
+
+Dependencies:
+
+- STD-01.
+- HTTP-03.
+- OBS-02.
+- AUTH-05.
+- API-CORE-01.
 
 ### CLI-01 — Auto-default dual-era run, inspect, and diagnostics
 
@@ -26636,8 +26812,8 @@ Reason:
   endpoint bundle, feature state, and receipt must be fixed before a command
   starts so peer input, ordinary failures, or presentation paths cannot alter
   protocol selection.
-- A bounded ModernOnly command surface must remain independently consumable
-  by the core gate while the full CLI composes Auto and exact legacy
+- CLI-CORE-01 remains independently consumable by the core gate while the
+  full CLI composes Auto and exact legacy
   diagnostics downstream.
 
 Implementation:
@@ -26684,13 +26860,9 @@ Implementation:
 
 Tests:
 
-- `cli_01_modernonly_public_surface_positive` and
-  `cli_01_modernonly_public_surface_planted_negative` are the exact bounded
-  leaf tests.  They execute the shipped binary with legacy disabled across
-  stdio and modern HTTP; the planted variant changes only one forbidden
-  initialize/legacy-SSE/legacy-receipt/2024-selection dimension and proves
-  typed rejection, stable machine JSON, nonzero exit, and zero
-  process/network/cache/auth mutation.
+- CLI-CORE-01 owns the shipped-binary ModernOnly positive and planted
+  negative. CLI-01 consumes its verified formal-package receipt and cannot
+  count or rerun that work as Auto/exact-2024 capability credit.
 - `cli_01_auto_public_surface_positive` and
   `cli_01_auto_public_surface_planted_negative` are full CLI-01 same-Bead
   tests over the shipped binary.  They cover default Auto plus explicit
@@ -26721,39 +26893,33 @@ Evidence:
   target/features, lockfile/toolchain, command and public export inventory,
   immutable policy, endpoint-bundle and receipt fields, first MCP action,
   selected output channel, exit status, and planted dimension.
-- The bounded ModernOnly leaf proves only the shipped ModernOnly run/inspect
-  diagnostic surface.  Full CLI-01 requires its own real code and same-Bead
+- CLI-CORE-01 proves only the shipped ModernOnly run/inspect diagnostic
+  surface. Full CLI-01 requires its own real code and same-Bead
   positive/negative evidence at the exact revision before any Auto or legacy
   claim.
-
-Dependencies:
-
-- STD-01 — `bd-mcp-2026-07-28-support-ahet.25`
-- HTTP-03 — `bd-mcp-2026-07-28-support-ahet.37`
-- LEG-03 — `bd-mcp-2026-07-28-support-ahet.39`
-- OBS-02 — `bd-mcp-2026-07-28-support-ahet.51`
-- LEG-02 — `bd-mcp-2026-07-28-support-ahet.58`
-- AUTH-05 — `bd-mcp-2026-07-28-support-ahet.69`
-- API-01 — `bd-mcp-2026-07-28-support-ahet.79`
-- CLI-01 bounded ModernOnly leaf — `bd-mcp-cli-modernonly-31kh`
-- LEG-HTTP-01 — `bd-mcp-leg-http-01-4yed`
-- LEG-NEG-01 — `bd-mcp-leg-neg-01-jlbe`
 
 Tracker mapping:
 
 - Plan package ID: CLI-01
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.83`
-- Formal prerequisite IDs: STD-01, HTTP-03, LEG-03, OBS-02, LEG-02,
-  AUTH-05, API-01, `bd-mcp-cli-modernonly-31kh`, LEG-HTTP-01, and
-  LEG-NEG-01.
+- Formal prerequisite IDs: CLI-CORE-01, API-01, LEG-02, LEG-03,
+  LEG-HTTP-01, and LEG-NEG-01.
 - Dependency direction: all listed prerequisites → CLI-01 → GATE-DUAL-READY.
-  GATE-CORE-READY consumes `bd-mcp-cli-modernonly-31kh` directly and never
-  the full CLI-01 aggregate.
+  GATE-CORE-READY consumes CLI-CORE-01 and never full CLI-01.
 - No-claim boundary: CLI-01 proves only public Auto-default composition and
   explicit exact-2026/exact-2024 policy diagnostics.  It does not prove a
   2025/sessioned transport, selection outside LEG-NEG-01, legacy endpoint
   behavior outside LEG-HTTP-01, aggregate conformance, maturity, or release
   readiness.
+
+Dependencies:
+
+- CLI-CORE-01.
+- API-01.
+- LEG-02.
+- LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
 
 ### CLI-02 — Add Tasks extension commands
 
@@ -26795,7 +26961,7 @@ Tests:
 
 Dependencies:
 
-- CLI-01.
+- CLI-CORE-01.
 - TASK-03.
 
 ### DX-TEST-01 — Provide feature-gated production-faithful facade testing
@@ -26841,11 +27007,12 @@ Implementation:
 
 Acceptance:
 
-- Child A freezes exactly four compile graphs: default facade without test
-  exports; `testing` production-faithful facade; `testing-lab` facade with
-  Lab-only exports; and a renamed-facade packaged consumer. Each proves the
-  intended symbols and the absence of forbidden runtime/test-internals symbols
-  for its graph.
+- Child A freezes exactly four core/no-legacy compile graphs, all based on
+  API-CORE-01 with `--no-default-features`: facade without test exports;
+  `testing` production-faithful facade; `testing-lab` facade with Lab-only
+  exports; and a renamed-facade packaged consumer. Each proves the intended
+  symbols and the absence of legacy, forbidden runtime, and test-internals
+  symbols for its graph.
 - Child B freezes Memory concurrency at `N-1`, `N`, and `N+1` against the
   published limit, plus cancellation, terminal-result, and cleanup cases. It
   records the exact trace/result/cardinality evaluator outcome and proves
@@ -26880,7 +27047,7 @@ Tests:
 Dependencies:
 
 - FND-04.
-- API-01.
+- API-CORE-01.
 - MAC-01.
 - EXT-DEV-01.
 - STD-01.
@@ -26893,9 +27060,10 @@ Dependencies:
 
 Outcome:
 
-- Public documentation truthfully describes only exact MCP 2026-07-28 and
-  feature-gated exact MCP 2024-11-05, with immutable `Auto` as the ordinary
-  facade and CLI default plus explicit `ModernOnly` and `LegacyOnly`.
+- Public core documentation truthfully describes the exact MCP 2026-07-28
+  ModernOnly component and its legacy-feature-off facade/CLI surfaces.
+  Exact-2024 and Auto rows remain explicitly planned/unverified until their
+  full API-01, CLI-01, legacy, gate, and CI evidence exists.
 - The documentation surface is provisional: every support row is planned or
   unverified until its owning revision-bound implementation and gate evidence
   exist.  No document, generated report, or successful documentation process
@@ -26920,30 +27088,22 @@ Implementation:
   compatibility, “100%”, and “production ready” statements rather than
   retaining them as compatibility wording.  Do not treat the Python reference
   as executable specification.
-- Document the canonical public policy exactly as
-  `ProtocolPolicy::{Auto, ModernOnly, LegacyOnly}` and the two supported eras
-  exactly as `ProtocolEra::{Modern2026, Legacy2024}`.  The policy is immutable
-  after validated builder/CLI parsing; peer bytes, user-visible diagnostics,
-  and ordinary failures cannot mutate it.  Feature-off documentation must
-  show ModernOnly, while LegacyOnly explains the exact legacy feature and
-  sealed role/owner/security-partition/configuration-generation/transport
-  receipt required before bind, connect, or spawn.
-- Document ModernOnly as final 2026-07-28 discovery-first behavior and
-  LegacyOnly as direct exact-2024-11-05 adapter behavior.  No modern example
-  initializes and no legacy example discovers.  Describe standard stdio and
-  modern HTTP separately from the exact legacy adapter; LEG-02 and LEG-03 own
-  legacy lifecycle, while LEG-HTTP-01 owns the exact legacy HTTP+SSE endpoint
-  pair and endpoint event.
-- Document Auto negotiation as owned solely by LEG-NEG-01.  For HTTP, exactly
-  status 400, 404, or 405 together with an empty or unrecognized modern body
-  makes one GET to the configured legacy candidate eligible.  Any recognized
-  modern JSON-RPC result or error at any HTTP status fixes Modern and prohibits
-  that GET.  Eligibility is not selection: only a valid legacy endpoint event
-  selects Legacy.  Redirects, authentication challenges, timeouts, network
-  failures, application errors, malformed events, and display failures never
-  select an era; no application request is replayed.  For stdio, document
-  only LEG-NEG-01's frozen eligible observation, reaped modern probe, and
-  fresh exact-2024 child, never a generic retry narrative.
+- Document the core policy as constructible `ModernOnly` over exact
+  `ProtocolEra::Modern2026`. Policy is immutable after validated builder/CLI
+  parsing; peer bytes, diagnostics, and ordinary failures cannot mutate it.
+  Parseable `Auto` and `LegacyOnly` are documented only as typed unavailable
+  in the legacy-feature-off component, never as runnable core examples.
+- Document final 2026-07-28 discovery-first client behavior, valid modern
+  discovery/application server openings, stateless request metadata,
+  standard stdio, and modern request/response HTTP. No core example
+  initializes, opens an endpoint-event stream, derives a legacy endpoint,
+  constructs an adapter receipt, or presents optional dual-era behavior as
+  executable.
+- Leave exact Auto/exact-2024 negotiation, endpoint-bundle, adapter, receipt,
+  HTTP fallback table, and dual-era executable examples to API-01, CLI-01,
+  LEG-*, GATE-DUAL-READY, and CI-DUAL-01. DOC-01 may identify those rows as
+  planned/unverified and name their owners, but it cannot execute, summarize
+  as supported, or receive capability credit for them.
 - Add an explicit rejection/no-claim row for MCP 2025-11-25.  It is an
   unsupported planted negative, has no public alias or compatibility profile,
   and cannot be selected by Auto, ModernOnly, LegacyOnly, a route, or a
@@ -26954,8 +27114,8 @@ Implementation:
   row names its owner, profile, exact revision-bound evidence requirement,
   and present planned/unverified state; no schema, component, or process
   artifact may satisfy another row or the aggregate row.
-- Update migration examples from initialization/session assumptions to
-  explicit policy, endpoint-bundle, receipt, and cancellation ownership.
+- Update core migration examples from initialization/session assumptions to
+  explicit ModernOnly discovery, request metadata, and cancellation ownership.
   Keep only claims backed by the owning public contract: typed JSON-RPC/schema
   errors, header/auth/redaction boundaries, extension activation, Tasks,
   MRTR, subscriptions, and Apps language remain conditional on their
@@ -26971,21 +27131,20 @@ Tests:
 
 - `doc_01_public_docs_positive` and
   `doc_01_public_docs_planted_negative` are same-Bead real tests over the
-  shipped documentation sources and packaged public examples.  The positive
-  verifies the exact policy/era/matrix/Auto-negotiation text and executable
-  examples; the planted negative changes only one stale profile, era, fallback
-  rule, aggregate claim, or unsafe example and fails with a stable diagnostic.
+  shipped documentation sources and packaged public examples. The positive
+  verifies exact ModernOnly policy/era/matrix text and executable examples;
+  the planted negative changes only one stale profile, era, aggregate claim,
+  runnable optional-profile assertion, or unsafe example and fails with a
+  stable diagnostic.
 - Run real public example/doctest and CLI-help checks for the source changes,
   plus link, rustdoc, machine-output-schema, redaction, and migration-snippet
-  tests.  Assert modern discovery first action, legacy feature/receipt
-  admission, Auto's sealed LEG-NEG observation, and the no-replay boundary
-  through the shipped surfaces rather than direct formatter calls or a copied
-  constant.
-- Test the complete HTTP documentation matrix: the six 400/404/405 ×
-  empty/unrecognized rows permit one configured candidate GET, the three
-  recognized-modern rows prohibit it, every other status/body row is
-  ineligible, and valid endpoint event is the sole legacy selection.  Verify
-  the same text remains aligned with the global fallback contract.
+  tests. Assert modern discovery first action, valid modern application
+  opening, legacy-feature-off isolation, typed Auto/Legacy unavailability,
+  and no initialization/fallback/adapter effect through shipped surfaces.
+- Test the core HTTP documentation matrix: one modern request/response POST
+  surface, no management GET/DELETE, no session/replay headers, and no legacy
+  endpoint derivation or fallback. Dual-era HTTP tables are CI-DUAL-01 inputs,
+  not DOC-01 positives.
 - Explicit planted negatives reject an invented 2025 alias, obsolete
   `LatestOnly`-style profile, sessioned legacy transport, generic fallback,
   inferred endpoint, initialization in a modern example, discovery in a
@@ -27007,24 +27166,25 @@ Evidence:
   publish support claims after it consumes the requisite downstream gate
   evidence; DOC-01 neither consumes nor proves that aggregate result.
 
-Dependencies:
-
-- FND-03 — `bd-mcp-2026-07-28-support-ahet.3`
-- PRT-05 — `bd-mcp-2026-07-28-support-ahet.14`
-- SCH-01 — `bd-mcp-2026-07-28-support-ahet.22`
-- API-01 — `bd-mcp-2026-07-28-support-ahet.79`
-- CLI-01 — `bd-mcp-2026-07-28-support-ahet.83`
-
 Tracker mapping:
 
 - Plan package ID: DOC-01
 - Parent Bead: `bd-mcp-2026-07-28-support-ahet.86`
-- Formal prerequisite IDs: FND-03, PRT-05, SCH-01, API-01, and CLI-01.
+- Formal prerequisite IDs: FND-03, PRT-05, SCH-01, API-CORE-01, and
+  CLI-CORE-01.
 - Dependency direction: all listed prerequisites → DOC-01 → DOC-02.  DOC-01
   has no reverse edge to a gate, evidence artifact, or aggregate release
   claim.
 - No-claim boundary: DOC-01 does not prove implementation, runtime behavior,
   a gate, aggregate MCP support, conformance, maturity, or release readiness.
+
+Dependencies:
+
+- FND-03.
+- PRT-05.
+- SCH-01.
+- API-CORE-01.
+- CLI-CORE-01.
 
 ### DOC-02 — Publish evidence-backed support claims
 
@@ -29547,6 +29707,8 @@ Implementation:
   tests satisfied.
 - Verify the core profile excludes legacy and optional extension
   claims.
+- Exclude DEPR-01 entirely. Deprecated-profile registry completion is
+  cross-profile/all-MCP work and is not core implementation readiness.
 - Aggregate core-default `ModernOnly` evidence with the legacy feature
   disabled under FND-03's immutable v2 policy profiles. On both
   server and client, the process is fixed Modern before first traffic;
@@ -29589,12 +29751,13 @@ Implementation:
   implementation dependencies, excluding the gate itself and all
   downstream test, conformance, evidence, documentation, and release
   packages.
-- Leave `CoreReleaseCandidateInventory` to Section 25.1 and REL-01,
-  and `CoreReleaseProfileInventory` to Section 25.1 and REL-02. They
-  are separate generated transitive closures: the candidate includes
-  this gate, qualification, post-documentation sealing, and the no-
-  publish handoff; the published inventory adds only the authorized
-  REL-02 publication boundary.
+- Leave `CoreQualificationInventory` to Section 25.1 and
+  CI-FINAL-CORE-01, and leave `AllMcpReleaseCandidateInventory` plus
+  `AllMcpReleaseProfileInventory` to Section 25.1 and REL-01/REL-02.
+  They are separate generated transitive closures: core qualification
+  ends at CI-FINAL-CORE-01, the all-MCP candidate adds every mandatory
+  profile and the nonpublishing REL-01 handoff, and the published
+  inventory adds only the authorized REL-02 publication boundary.
 
 Acceptance:
 
@@ -29710,8 +29873,8 @@ Dependencies:
 - AUTH-05.
 - AUTH-07.
 - MAC-01.
-- API-01.
-- CLI-01.
+- API-CORE-01.
+- CLI-CORE-01.
 - OPS-01.
 - EXT-DEV-01.
 - CI-BASE-01.
@@ -29875,8 +30038,8 @@ and complete.
 Reason:
 
 Auto is a separately qualified full dual-era API/CLI surface. It must not be
-inferred from GATE-CORE, which receives only bounded ModernOnly leaves; there
-is no reverse edge from GATE-DUAL to GATE-CORE.
+inferred from GATE-CORE, which receives only API-CORE-01 and CLI-CORE-01;
+there is no reverse edge from GATE-DUAL to GATE-CORE.
 
 Implementation:
 
@@ -29971,9 +30134,16 @@ Tests:
 Dependencies:
 
 - GATE-CORE-READY.
+- FND-06.
+- API-01.
+- CLI-01.
 - LEG-01.
 - LEG-02.
 - LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
+- LEG-TST-01.
+- LEG-INTEROP-01.
 - CONF-01.
 - CI-BASE-01.
 
@@ -31219,8 +31389,12 @@ composition seam.
 Implementation:
 
 - Aggregate GATE-PROXY-READY, GATE-DUAL-READY, and PXY-LEG-01.
-- Run both downstream-modern/upstream-legacy and allowed inverse-role
-  matrices over stdio and sessioned Streamable HTTP.
+- Run the supported downstream-modern/upstream-legacy matrix: cross the
+  exact-2026 downstream stdio and HTTP request/response surfaces with
+  exact-2024 upstream stdio and LEG-HTTP-01 HTTP+SSE. Include unrelated
+  modern upstream siblings as isolation controls.
+- Do not claim a legacy-downstream/modern-upstream inverse gateway; that
+  surface is outside PXY-LEG-01.
 - Require credential separation, modern-header reconstruction,
   legacy-session containment, collision policy, and no-downgrade
   security evidence.
@@ -31235,7 +31409,8 @@ Acceptance:
 
 Tests:
 
-- Mixed-era proxy matrix.
+- Exact four-cell downstream-transport × legacy-upstream-transport matrix
+  plus modern-sibling controls.
 - Header/auth/session/cursor boundary tests.
 - Feature-off and invalid-combination tests.
 
@@ -31396,9 +31571,9 @@ Implementation:
   manifest with a checker-derived `qualification_membership` equal to
   CI-CORE-01's exact 79-member self-inclusive transitive closure (78
   prerequisites plus CI-CORE-01). It is run membership, neither
-  `CoreReleaseCandidateInventory` nor `CoreReleaseProfileInventory`, and
-  carries no publication state. Do not place optional readiness booleans
-  in it.
+  `CoreQualificationInventory`, `AllMcpReleaseCandidateInventory`, nor
+  `AllMcpReleaseProfileInventory`, and carries no publication state. Do
+  not place optional readiness booleans in it.
 - Include the exact immutable
   `fastmcp-2026-07-28-with-2024-11-05-auto-v2` and
   `fastmcp-2026-07-28-with-2024-11-05-auto-stdio-v2`
@@ -31537,8 +31712,9 @@ Implementation:
   `publication_state="unpublished"` and a checker-derived
   `final_evidence_membership` equal to CI-FINAL-CORE-01's exact
   82-member self-inclusive transitive closure (81 prerequisites plus
-  CI-FINAL-CORE-01). This is not a named release inventory; REL-01
-  separately establishes the 83-member candidate inventory. The artifact identity contains the
+  CI-FINAL-CORE-01), which is `CoreQualificationInventory`. REL-01
+  separately establishes the 141-member all-MCP candidate inventory.
+  The artifact identity contains the
   source/lock/toolchain/documentation/package bindings above and the
   manifest contains their digests, not merely a digest of the earlier
   qualification manifest.
@@ -31574,8 +31750,9 @@ Acceptance:
   missing inventory member, rebuilt byte, or stale cache fragment
   fails closed and yields no releasable identity.
 - The manifest remains explicitly `unpublished`, contains exactly its
-  82-member final-evidence closure, and cannot be parsed or displayed as
-  either the 83-member candidate or 84-member published inventory.
+  82-member core-qualification closure, and cannot be parsed or displayed
+  as either the 141-member all-MCP candidate or 142-member published
+  inventory.
 
 Tests:
 
@@ -32512,14 +32689,15 @@ Dependencies:
 - CI-FINAL-CORE-01.
 - DOC-02.
 
-### REL-01 — Seal the release gate and no-publish handoff
+### REL-01 — Seal the no-authority complete all-MCP release handoff
 
 Outcome:
 
-Seal the exact core `0.4.0` candidate, publication coordinator, and
-private release-asset bundle after protocol, security, runtime, and
-documentation evidence agree, then stop before every crates.io, tag,
-and public GitHub Release mutation.
+Seal the exact complete all-MCP `0.4.0` candidate, publication coordinator,
+and private release-asset bundle after modern core, exact-2024, Auto,
+official-extension, composition, conformance, runtime, and documentation
+evidence agree, then stop before every crates.io, tag, and public GitHub
+Release mutation.
 
 Reason:
 
@@ -32528,9 +32706,11 @@ legacy paths.
 
 Implementation:
 
-- Consume CI-FINAL-CORE-01's exact
-  `CoreReleaseArtifactIdentity`; reject CI-CORE-01 qualification
-  evidence as non-releasable.
+- Consume CI-ALL-MCP-01's exact `AllMcpReleaseArtifactIdentity` as the sole
+  releasable product candidate. CI-FINAL-CORE-01's sealed
+  `CoreReleaseArtifactIdentity` remains a required component input; reject
+  CI-CORE-01 qualification evidence or any individual profile receipt as a
+  substitute for the aggregate identity.
 - Run from a fresh checkout whose repository, commit, tree, clean
   staged/unstaged/untracked state, `Cargo.lock`, toolchain, manifests,
   support-claim documents, and release-note digests exactly equal the
@@ -32548,9 +32728,9 @@ Implementation:
 - Run `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`.
 - Run `rch exec -- cargo test --workspace`.
 - Run `rch exec -- cargo test --workspace --all-features`.
-- Treat the all-features command as shipped-code compile/unit/security
-  safety, not evidence that any optional profile is conformant or
-  supported.
+- Treat the all-features command as shipped-code compile/unit safety, not by
+  itself as evidence that a profile is conformant or supported; the exact
+  CI-ALL-MCP-01 component and composition receipts provide that evidence.
 - Build documentation with warnings denied, then reproduce every sealed
   per-crate `DocsRsBuildProfile` from packaged archives in the pinned
   network-isolated docs.rs-equivalent environment. A local rustdoc pass
@@ -32694,7 +32874,7 @@ Implementation:
 
 Acceptance:
 
-- Every prerequisite member of `CoreReleaseCandidateInventory` other
+- Every prerequisite member of `AllMcpReleaseCandidateInventory` other
   than REL-01 passes; REL-01 itself is this handoff gate and REL-02
   remains the sole pending publication endpoint.
 - An optional profile is unclaimed unless its independent CI evidence
@@ -32769,11 +32949,13 @@ Tests:
 Dependencies:
 
 - CONF-02.
+- CI-ALL-MCP-01.
 - CI-FINAL-CORE-01.
 - INTEROP-01.
 - DOC-02.
 - GATE-CORE-READY.
 - REL-PREP-01.
+- REL-QUAR-00.
 
 ### REL-02 — Execute the authorized resumable publication transaction
 
@@ -33047,7 +33229,7 @@ Implementation:
   observations; and checker-derived intended profile membership plus the
   current nonclosing per-member/status snapshot
   (`published_pending_cleanup` or documentation incident). It cannot
-  attest the completed 84-member stable closure; only the later retained
+  attest the completed 142-member stable closure; only the later retained
   stable aggregate bundle can do that. Redact credentials.
   Upload the receipt
   once under its fixed digest-qualified asset name and read it back.
@@ -33213,11 +33395,11 @@ Implementation:
 
 Acceptance:
 
-- The checker-generated `CoreReleaseProfileInventory` is exactly the
-  84-member self-inclusive prerequisite closure (83 prerequisites plus
+- The checker-generated `AllMcpReleaseProfileInventory` is exactly the
+  142-member self-inclusive prerequisite closure (141 prerequisites plus
   REL-02); every other
   member is closed/passed before REL-02 executes, and neither a hand-
-  edited inventory nor an 83-member candidate inventory can satisfy the
+  edited inventory nor a 141-member candidate inventory can satisfy the
   published-stable boundary.
 - The exact-identity two-step publication authorization ceremony is
   complete before the first external mutation. Every mutation uses a
@@ -33565,19 +33747,61 @@ Dependencies:
 - AUTH-01.
 - LIMIT-01.
 
-### LEG-NEG-01 — Implement downgrade-resistant automatic era negotiation
+### LEG-NEG-01 — Implement downgrade-resistant dual-era negotiation and stdio composition
 
 Outcome:
 
 Make `ProtocolPolicy::Auto` the safe default while preserving explicit
-`ModernOnly` and `LegacyOnly` behavior.
+`ModernOnly` and `LegacyOnly` behavior, and own the public stdio composition
+that binds one preselected era to STD-01's neutral process/framing substrate
+and the corresponding modern dispatcher or exact-2024 adapter.
 
 Implementation:
 
-- For stdio, launch a disposable modern discovery probe process. Select modern
-  only on a valid modern response. On the frozen eligible unrecognized signal,
-  terminate and reap that process before launching a fresh legacy process whose
-  first MCP request is exact 2024 `initialize`.
+- Own the dual-era stdio coordinator, never either era's protocol semantics.
+  It consumes STD-01's cancel-correct adapter-neutral process/framing
+  substrate, the ModernOnly dispatcher, LEG-02's exact-2024 server adapter,
+  and LEG-03's exact-2024 client adapter. STD-01 never selects or invokes a
+  legacy adapter, and neither legacy adapter reads transport frames or makes
+  a selection decision.
+- On server stdio, freeze the configured policy before reading frame one.
+  `ModernOnly` preselects the modern dispatcher. `Auto` runs PRT-01 raw
+  admission once, then applies FND-03's exact opening table: a valid modern
+  discovery or application request with complete modern metadata selects the
+  modern dispatcher and receives that same admitted frame exactly once; one
+  structurally valid exact-2024 initialize without a modern marker constructs
+  one LEG-02 binding and receives that same admitted frame exactly once.
+  `LegacyOnly` requires the exact-2024 initialize opening before constructing
+  LEG-02. Every malformed, ambiguous, mixed-era, response-shaped, or
+  notification-shaped opening takes its frozen role-correct error/no-response
+  and close disposition with zero adapter construction or handler/state
+  effect. Classification is one-shot and cannot be revisited by later bytes.
+- On client stdio in `ModernOnly`, use STD-01's mandatory discovery opening
+  directly. In `Auto`, launch one isolated modern discovery candidate process;
+  promote it as the selected modern process only on a valid modern result or
+  recognized modern error. On the frozen eligible well-formed non-modern
+  JSON-RPC error or bounded first-probe timeout, terminate and reap that
+  process before launching a fresh legacy process, constructing one LEG-03
+  binding, and sending exact-2024 `initialize` first. In `LegacyOnly`, launch
+  one process, construct one LEG-03 binding, and send exact-2024 `initialize`
+  first without a modern probe.
+- Bind the selection evidence, policy, role, exact command/configuration,
+  process identity, security partition, limits, and adapter/configuration
+  generations into FND-03's immutable installed-adapter receipt. A receipt
+  for another process, role, generation, or policy is unusable.
+- For Auto and LegacyOnly process failure, own the outer restart supervisor:
+  preserve one LIMIT-01 attempt/window and circuit-breaker history across all
+  failed PIDs; start a fresh process with the exact frozen command and
+  configuration; rerun the isolated Auto classifier or direct LegacyOnly
+  initialize as appropriate; and never inherit a prior binding or negotiated
+  state. Do not replay an ordinary request. After successful Auto-modern
+  selection, SUB-02 alone may consume the new process-generation signal to
+  reissue still-live modern subscriptions under its fresh-ID/gap rules. After
+  a fresh exact-2024 lifecycle reaches `Operating`, the composition may reissue
+  only explicitly configured still-live legacy resource subscriptions with
+  fresh IDs, remaining lifetime, and an observable gap; cancelled/expired
+  subscriptions remain terminal. No reconnect path resets the supervisor,
+  subscription, timeout, or incident-window bounds.
 - For HTTP, issue the modern POST discovery probe first. Only an eligible
   unrecognized `400`, `404`, or `405` may start one legacy GET probe against the
   original endpoint; select 2024 only after the first valid `endpoint` SSE
@@ -33590,12 +33814,21 @@ Implementation:
 
 Acceptance and tests:
 
-- The full three-policy x two-transport first-wire matrix is deterministic and
-  proves one classification, no credential leakage, no mixed process bytes,
-  and no reclassification.
+- The full three-policy x two-role x two-transport first-wire matrix is
+  deterministic and proves one classification, exact first-frame ownership,
+  no credential leakage, no mixed process bytes, and no reclassification.
 - Each eligible fallback has a near-identical ineligible negative differing in
   only one signal. Concurrent same-origin/different-path endpoints remain
   isolated.
+- Server stdio positives cover valid modern discovery, valid modern
+  application, and exact-2024 initialize openings; near-identical malformed,
+  mixed, notification, response, missing-marker, and unsupported-version rows
+  prove the FND-03 error/close table, unchanged state, and zero duplicate first
+  dispatch.
+- Auto and LegacyOnly restart tests prove fresh PIDs, preserved incident-window
+  accounting, isolated reclassification/direct initialize, fresh binding
+  generations, no ordinary-request replay, exact configured-subscription
+  reissue/gap behavior, and no reissue after concurrent cancel/expiry.
 - `2025-11-25` is never emitted, accepted as an alias, or inferred.
 
 Dependencies:
@@ -33603,6 +33836,9 @@ Dependencies:
 - FND-03.
 - CLT-02.
 - STD-01.
+- SUB-02.
+- LEG-02.
+- LEG-03.
 - HTTP-03.
 - LEG-HTTP-01.
 
@@ -33688,6 +33924,17 @@ Logging, Dynamic Client Registration, deprecated Sampling `includeContext`
 values `thisServer` and `allServers`, and exact legacy HTTP+SSE through
 LEG-HTTP-01.
 
+This is a cross-profile/all-MCP registry aggregate, not a core or
+dual-era gate prerequisite. Modern deprecated rows and the exact-2024
+HTTP+SSE row retain distinct identities; COMP-ALL-01 is the complete
+aggregate consumer.
+
+Every modern deprecated row remains a required usable runtime capability
+through its owning core package. Excluding DEPR-01 from GATE-CORE-READY and
+GATE-DUAL-READY excludes only the cross-profile six-row aggregate receipt; it
+does not waive those modern implementations or LEG-HTTP-01 inside the
+dual-era profile.
+
 Implementation:
 
 - Freeze an immutable six-row registry manifest; no row may be merged,
@@ -33737,8 +33984,9 @@ Acceptance and tests:
   malformed registration before credential or registration mutation.
 - A modern client/server negotiates and uses each modern row, while the
   legacy transport row uses only exact-2024 LEG-HTTP-01 representation.
-  Core readiness cannot close on refusal-only implementations, generic pair
-  evidence, or a row count other than six.
+  DEPR-01, and therefore any all-MCP aggregate that consumes it, cannot close
+  on refusal-only implementations, generic pair evidence, or a row count
+  other than six.
 
 Dependencies:
 
@@ -34068,8 +34316,10 @@ profile, and required compositions.
 
 Implementation and acceptance:
 
-- Consume the completed modern core/deprecated, dual-era, Tasks, Apps, EMA,
-  OAuth Client Credentials, built-in auth, proxy, source-pin, composition,
+- Consume the completed modern-core and dual-era gates and, through
+  COMP-ALL-01's revision-bound DEPR-01 dependency, the complete six-row
+  deprecated registry. Also consume the Tasks, Apps, EMA, OAuth Client
+  Credentials, built-in auth, proxy, source-pin, composition,
   conformance-supplement, and interoperability gates without weakening any
   component denominator.
 - Reject any missing profile, refusal-only positive, partial branch, stale
@@ -34184,7 +34434,7 @@ flowchart TD
     SRV[SRV-01..04 + SRV-MW-01<br/>stateless server]
     CLT[CLT-01..02<br/>concurrent client]
     TX[STD-01 + HTTP-01..06 + XPORT-01<br/>bound modern transports]
-    OBSBASE[OBS-01..02<br/>logging/progress foundation]
+    OBSBASE[OBS-01..02<br/>trace-context/logging foundation]
     OPS[OPS-01<br/>bounded health/telemetry]
     LEG[LEG-01..03<br/>previous-version adapter]
     MRTR[MRTR-01..03]
@@ -34200,7 +34450,7 @@ flowchart TD
     APP[APP-01..02]
     AUTHX[AUTHX-01..03<br/>auth profiles/composition]
     PXY[PXY-01..04 + optional legacy/task add-ons]
-    DX[MAC-01 + API-01 + CLI-01]
+    DX[MAC-01 + API-CORE-01 + CLI-CORE-01]
     EXTDEV[EXT-DEV-01<br/>external compile-linked extensions]
     DXTEST[DX-TEST-01<br/>public production-faithful test kit]
     DOCPROV[DOC-01<br/>provisional docs]
@@ -34381,13 +34631,13 @@ Beads graph becomes its machine-checked execution projection only after
 Section 36's safe rematerialization, exact equality check, and clean
 doctor/sync/checker gates; the present tracker is not that projection.
 
-The only intentional terminal sinks are REL-02 and the optional
-promotion/claim endpoints CI-APPS-01, CI-EMA-BUILTIN-01,
-CI-EXPERIMENTAL-AUTH-01, CI-PROXY-DUAL-01,
-CI-PROXY-TASKS-01, and CI-REDIS-TASKS-01. CI-EMA-01 and
-CI-BUILTIN-AUTH-01 feed their composition, while CI-DUAL-01,
-CI-TASKS-01, and CI-PROXY-01 feed proxy or Redis compositions, so none
-is terminal in the complete plan graph.
+After the separately owned stale authorization-profile names are corrected,
+the only intentional terminal sinks are REL-02 and the independently optional
+Redis operational-profile endpoint CI-REDIS-TASKS-01. Every required MCP
+component/profile CI endpoint feeds CI-ALL-MCP-01 and then REL-01/REL-02;
+CI-TASKS-01 additionally feeds Redis and proxy-Tasks compositions. The Redis
+backend remains optional to wire completeness and therefore does not feed the
+all-MCP release identity.
 An orphan check must reject any other terminal implementation or
 verification issue. REL-01 is deliberately not a sink: it seals a
 non-authorizing handoff, and only REL-02 can complete the separately
@@ -34425,7 +34675,7 @@ The likely critical path is:
    correlation registry.
 8. HTTP-01 as soon as its own prerequisites land; STD-01 and
    HTTP-02/03 after their exact EXT-01 edges.
-9. OBS-01/02 establish the logging/progress substrate. OPS-01 then
+9. OBS-01/02 establish the trace-context/logging substrate. OPS-01 then
    establishes bounded operational state for the core server, client,
    stdio, and HTTP surfaces; every later auth/cache/subscription/proxy/
    task integration owns its additive contributor semantics.
@@ -34435,11 +34685,13 @@ The likely critical path is:
 12. CACHE-01 plus AUTH-01 through AUTH-05/AUTH-07, then CACHE-02
     and CACHE-03 where their exact dependencies permit.
 13. HTTP-04 through HTTP-06 and XPORT-01.
-14. MAC-01 precedes API-01. Once API-01 and the final extension/
-    transport/schema prerequisites land, CLI-01 and EXT-DEV-01 can
-    proceed in parallel; DX-TEST-01 then freezes the public production-
-    faithful test kit. DOC-01 can materialize the resulting provisional
-    documentation after both CLI-01 and DX-TEST-01.
+14. MAC-01 precedes API-CORE-01, and API-CORE-01 precedes CLI-CORE-01 on
+    the ModernOnly core path. Full API-01 and CLI-01 remain on the dual-era
+    path. Once the core API plus final extension/transport/schema
+    prerequisites land, CLI-CORE-01 and EXT-DEV-01 can proceed in parallel;
+    DX-TEST-01 then freezes the public production-faithful test kit. DOC-01
+    can materialize the resulting provisional documentation after both the
+    applicable CLI surface and DX-TEST-01.
 15. TST-01 through TST-04 and GATE-CORE-READY.
 16. CONF-01 closes only after GATE-CORE-READY so its complete fixture
     inventory cannot outrun the implementation it exercises; CONF-02
@@ -34601,7 +34853,9 @@ Result/cache proxying follows MRTR and client caching.
 
 Core subscription proxying waits for subscription streams.
 
-PXY-LEG-01 and PXY-TASK-01 independently add legacy and Tasks behavior.
+PXY-LEG-01 waits for PXY-01, LEG-01, LEG-03, LEG-HTTP-01, and
+LEG-NEG-01 and then adds exact mixed-era stdio/HTTP routing;
+PXY-TASK-01 independently adds Tasks behavior.
 
 HTTP/auth reconstruction waits for the auth credential store and
 header projection.
@@ -34706,6 +34960,8 @@ Required:
 - SRV-01 through SRV-04 and SRV-MW-01.
 - CLT-01 and CLT-02.
 - STD-01, HTTP-01 through HTTP-06, and XPORT-01.
+- DEPR-01 is excluded; its cross-profile registry is not a core
+  readiness prerequisite.
 - MRTR-01 through MRTR-03.
 - SUB-01 through SUB-03.
 - TOOL-01/02, RES-01/02, PRM-01/02, and CMP-01.
@@ -34718,7 +34974,8 @@ Required:
   enabled.
 - EXT-DEV-01's compile-linked external authoring contract, with no
   dynamic plugin ABI or implicitly installed extension.
-- MAC-01, API-01, and CLI-01.
+- MAC-01, API-CORE-01, and CLI-CORE-01; full API-01/CLI-01 belong to
+  the dual-era profile and GATE-DUAL-READY.
 - DX-TEST-01's production-faithful public testing toolkit; its Lab-only
   helpers remain separately feature-gated.
 - TST-01 through TST-04.
@@ -34733,21 +34990,14 @@ Required:
   authorized retained bounded qualification receipts where read-only
   proof is impossible, and provider-sandbox evidence.
 - DOC-01 and DOC-02 core documentation.
-- REL-01's sealed non-authorizing handoff.
-- REL-02's separately authorized resumable publication transaction,
-  public-artifact receipt/anchor, independently observed cleanup and
-  docs.rs success, terminal rollback-anchor read-back, `H_final`, and
-  `FinalizerQuiescedObserved::Stable`, retained under the exact stable-evidence
-  bundle/capture receipt.
+- CI-FINAL-CORE-01 is the terminal sealed core-component qualification.
+  REL-01 and REL-02 are downstream all-MCP release packages, not members of
+  the core-only profile.
 
-This inventory is the minimum for claiming a published stable core
-`0.4.0` release. CI-FINAL-CORE-01 and REL-01 may establish an evidence-
-backed but explicitly unpublished release candidate. Refusal, expiry,
-or absence of publication authorization leaves REL-02 open and must not
-falsify the candidate's technical conformance evidence or turn the
-candidate into a published-release claim.
-Its first planned release is `0.4.0`.
-Its transport/version identity binds FND-03's immutable v2 profiles in
+This inventory is the minimum for claiming a qualified but unpublished core
+component. It cannot claim a product release or satisfy REL-01 without the
+complete CI-ALL-MCP-01 identity. Its transport/version identity binds
+FND-03's immutable v2 profiles in
 `ModernOnly` mode with the legacy feature absent. The stdio server is
 preselected Modern and the client discovers first with no initialize
 or fallback; HTTP keeps every body-bearing message on the modern
@@ -34764,29 +35014,31 @@ extension-policy case.
 
 `CoreImplementationInventory` is the exact direct dependency set
 listed under GATE-CORE-READY.
-It contains exactly 66 packages: implementation packages and
-CI-BASE-01, but not the gate
+It contains exactly 66 formal package prerequisites: implementation packages
+and CI-BASE-01, but not the gate
 itself or downstream conformance, interop, evidence, documentation, or
 release packages.
 
-`CoreReleaseCandidateInventory` is the complete transitive closure of
-REL-01 plus REL-01 itself. It contains exactly 83 packages and is the
-release-ready, no-publish evidence boundary.
-
-`CoreReleaseProfileInventory` is the complete transitive closure of
-REL-02 plus REL-02 itself. It contains exactly 84 packages and is the
-published-stable boundary. Both include GATE-CORE-READY, CONF-01/02,
+`CoreQualificationInventory` is the complete transitive closure of
+CI-FINAL-CORE-01 plus that endpoint itself. It contains exactly 82 packages
+and is the sealed, unpublished core-component evidence boundary. It includes
+GATE-CORE-READY, CONF-01/02,
 INTEROP-01, TST-01..04, CI-BASE-01, OPS-01, EXT-DEV-01,
 DX-TEST-01, PERF-01, REL-PREP-01, CI-CORE-01,
-CI-FINAL-CORE-01, DOC-01/02, REL-QUAR-00, REL-01, and the
-implementation closure;
-only the published inventory includes REL-02.
+CI-FINAL-CORE-01, DOC-01/02, REL-QUAR-00, and the implementation closure.
 It excludes every optional profile gate and evidence package.
 
-The generated Beads checks compare all three named inventories
-separately. REL-01 acceptance references
-`CoreReleaseCandidateInventory`; REL-02 acceptance references
-`CoreReleaseProfileInventory`.
+`AllMcpReleaseCandidateInventory` is the complete transitive closure of
+REL-01 plus REL-01 itself. After the separately owned stale profile-name
+correction, it contains exactly 141 packages and is the complete no-publish
+product boundary. `AllMcpReleaseProfileInventory` is REL-02's self-inclusive
+closure, contains exactly 142 packages, and is the published-stable boundary.
+Both exclude only the three-package optional Redis Tasks operational overlay.
+
+The generated Beads checks compare all four named inventories separately.
+CI-FINAL-CORE-01 references `CoreQualificationInventory`; REL-01 references
+`AllMcpReleaseCandidateInventory`; REL-02 references
+`AllMcpReleaseProfileInventory`.
 
 ### 25.2 Dual-era profile
 
@@ -34795,12 +35047,25 @@ Adds:
 - LEG-01.
 - LEG-02.
 - LEG-03.
+- LEG-HTTP-01.
+- LEG-NEG-01.
+- LEG-TST-01.
+- LEG-INTEROP-01.
+- API-01.
+- CLI-01.
 - GATE-DUAL-READY.
 - CI-DUAL-01.
 - dual-era conformance and interop matrix.
 - exact-2024 HTTP+SSE endpoint-event transport tests.
 - an assertion that the legacy two-endpoint transport is reachable only through
   LEG-HTTP-01 and absent from the modern route.
+
+GATE-DUAL-READY consumes exactly GATE-CORE-READY, FND-06, the full
+API-01 and CLI-01 aggregates, LEG-01, LEG-02, LEG-03, LEG-HTTP-01,
+LEG-NEG-01, LEG-TST-01, LEG-INTEROP-01, CONF-01, and CI-BASE-01.
+STD-01 enters this profile only through the sealed GATE-CORE-READY
+receipt; the `LEG-*` packages add the optional selection, adapter, and
+exact-2024 behavior without rewriting STD-01 or adding DEPR-01.
 
 The core profile does not require legacy support and retains its sealed
 `ModernOnly` table unchanged.
@@ -35190,9 +35455,10 @@ endpoint itself. They are inventory checks, not support claims:
 
 | Profile endpoint | Canonical full-closure Beads label | Exact transitive closure |
 |---|---|---:|
-| `REL-01` core release candidate | `profile-core-candidate` | 83 |
-| `REL-02` core release | `profile-core-published` | 84 |
-| `CI-DUAL-01` dual era | `profile-dual-era` | 87 |
+| `CI-FINAL-CORE-01` qualified core component | `profile-core-qualified` | 82 |
+| `REL-01` complete all-MCP release candidate | `profile-all-mcp-candidate` | 141 |
+| `REL-02` complete all-MCP published release | `profile-all-mcp-published` | 142 |
+| `CI-DUAL-01` dual era | `profile-dual-era` | 93 |
 | `CI-TASKS-01` Tasks | `profile-tasks` | 90 |
 | `CI-REDIS-TASKS-01` Redis Tasks | `profile-redis-tasks` | 93 |
 | `CI-APPS-01` Apps | `profile-apps` | 86 |
@@ -35201,7 +35467,7 @@ endpoint itself. They are inventory checks, not support claims:
 | `CI-EMA-BUILTIN-01` enterprise + built-in composition | `profile-enterprise-builtin` | 92 |
 | `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01` official pinned-Draft OAuth Client Credentials | `profile-oauth-client-credentials-draft` | 86 |
 | `CI-PROXY-01` modern proxy | `profile-proxy` | 88 |
-| `CI-PROXY-DUAL-01` proxy + dual era | `profile-proxy-dual` | 96 |
+| `CI-PROXY-DUAL-01` proxy + dual era | `profile-proxy-dual` | 102 |
 | `CI-PROXY-TASKS-01` proxy + Tasks | `profile-proxy-tasks` | 99 |
 
 Every label names the endpoint's complete transitive closure, including
@@ -35210,10 +35476,17 @@ formal issue may therefore carry multiple labels when it belongs to
 multiple closures. The checker derives membership from package edges and
 rejects an omitted/extra label or a delta-only projection.
 
-The formal graph has exactly 129 work packages and 663 prerequisite
-edges in this plan revision, two intentional seeds (`FND-01` and
-`REL-QUAR-00`), no unresolved package IDs, no cycles, and the seven
-terminal sinks named in Section 24.1.
+The formal corpus has exactly 145 work packages and 782 prerequisite bullets
+in this plan revision. Three separately owned authorization-profile bullets
+still use retired package IDs and therefore keep the canonical graph
+fail-closed: two `GATE-EXPERIMENTAL-AUTH-BUILD` references and one
+`CI-EXPERIMENTAL-AUTH-01` reference. After their security owner performs the
+name-only replacements with `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY` and
+`CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01`, the graph has two intentional seeds
+(`FND-01` and `REL-QUAR-00`), no unresolved package ID, no cycle, two sinks
+(`REL-02` and the separately optional `CI-REDIS-TASKS-01`), and a longest
+formal path of 33 packages. Until that independent correction lands, none of
+those resolved-graph facts is claim evidence.
 Changing any package or dependency regenerates this table, the release
 inventories, the canonical graph artifact, and the Beads projection in
 one reviewed transaction.
@@ -37167,9 +37440,10 @@ Entry criteria for the release-candidate qualification phase:
 
 These criteria start qualification; they do not themselves authorize a
 “release candidate” claim. That claim begins only when
-CI-FINAL-CORE-01 seals the exact post-documentation candidate and REL-01
-completes the 83-member `CoreReleaseCandidateInventory` plus its
-non-authorizing handoff.
+CI-FINAL-CORE-01 seals the exact 82-member
+`CoreQualificationInventory`; REL-01 separately completes the
+141-member `AllMcpReleaseCandidateInventory` plus its non-authorizing
+handoff.
 
 ### 31.5 Stable
 
@@ -37387,9 +37661,9 @@ For wire correctness defects:
   store, and migration/recovery destination qualification—provider/
   signer sandboxes, and every-boundary terminate/resume suite
   are qualified;
-- CI-FINAL-CORE-01 seals the candidate and REL-01 emits the exact
-  machine-verifiable non-authorizing handoff for the exact 83-member
-  `CoreReleaseCandidateInventory`. At this point Phase 11A may be
+- CI-FINAL-CORE-01 seals the 82-member core qualification and REL-01
+  emits the exact machine-verifiable non-authorizing handoff for the
+  141-member `AllMcpReleaseCandidateInventory`. At this point Phase 11A may be
   reported `release-ready, unpublished`, with REL-02 still open when
   publication authorization is absent;
 - every candidate-stage core and explicitly claimed optional-profile
@@ -37414,8 +37688,8 @@ For wire correctness defects:
   `IncidentEvidenceCaptureReceipt::Initial` are read back; it
   cannot be disguised as rollback or green documentation evidence. Only
   the all-pass branch is the published-stable
-  completion boundary and the exact 84-member
-  `CoreReleaseProfileInventory`;
+  completion boundary and the exact 142-member
+  `AllMcpReleaseProfileInventory`;
 - support claims distinguish technical candidate evidence from actual
   publication state and are evidence-backed.
 
@@ -37653,12 +37927,14 @@ This ledger records both the original review sequence and the
 fresh-eyes audit that found material defects after that conclusion.
 The old materialization fingerprints, mappings, closure counts, and
 checker outputs retained in Sections 36.2–36.3 are timestamped historical
-evidence. Section 36.1's formal-plan and live-tracker counts are current
-diagnostic truth but not release/readiness evidence. No Section 36
-materialization is current until the revised 129-package/663-edge plan is
-rematerialized through `br`, strictly exported, independently decoded,
-and revalidated after the active tracker owner hands off and the stale
-lock/base-anchor repair is explicitly authorized.
+evidence. Section 36.1's formal-plan counts are current diagnostic truth;
+its dated live-tracker block is historical, while Section 36.4 owns the
+current 902-physical/879-non-tombstone/143-parent/456-associated/
+391-work-package-child pre-bridge baseline. None is
+release/readiness evidence. No Section 36 materialization is current until
+the amended 145-package/782-prerequisite plan is rematerialized through
+the pinned schema-15 `br`, strictly exported, independently decoded, and
+revalidated after a fresh single-writer/no-concurrent-drift preflight.
 
 Round 1 — normative completeness:
 
@@ -37848,10 +38124,12 @@ Round 11 — FND-01 execution-schema correction:
 - pinned `br 0.2.16` misclassifies required retained child
   dependencies as dead and can simultaneously report a child as fully
   unblocked without surfacing it through `br ready` because it treats
-  parent hierarchy as readiness. Section 36.4 permits only those two
-  exact independently reconciled dependency-detector false positives;
-  stale locks, stale merge anchors, unexpected edge/readiness drift,
-  and every other doctor finding remain hard failures.
+  parent hierarchy as readiness. At that round Section 36.4 permitted
+  only those two independently reconciled dependency-detector false
+  positives. The current Section 36.4 rule supersedes that historical
+  wording with exact, narrowly conditioned write-lock and schema-15
+  merge-anchor exceptions; unexpected edge/readiness drift and every
+  unlisted doctor finding remain hard failures.
 
 Round 12 — FND-01 qualification/production sequencing clarification:
 
@@ -37971,8 +38249,9 @@ Round 17 — refinement pass: graph and profile consistency:
   OPS-01 to avoid a projected cycle, made REL-02 the publication sink,
   and separated Checkpoint H's no-authority candidate from Checkpoint I's
   authorized publication;
-- recomputed the 66-member gate inventory, 82-member release-candidate
-  closure, 83-member published closure, and every optional closure;
+- recomputed the 66-member gate inventory, 82-member CI-final/core-
+  qualification closure, 83-member candidate closure, 84-member
+  published closure, and every optional closure;
 - added exact `testing`/`testing-lab` Cargo equations and documented the
   honest Cargo limitation that explicitly selecting a feature makes it
   visible in that selected normal tree.
@@ -38100,10 +38379,10 @@ Round 22 — end-to-end project reality check and release-artifact audit:
   `jwt-resource-auth` experimental/unclaimed pending their own future
   gates;
 - made FND-02 consume REL-QUAR-00 so traceability cannot proceed while
-  public claims remain unsafe; the current formal graph is therefore
+  public claims remain unsafe; the then-current Round 22 graph was
   129 packages and 663 unique prerequisite edges, with roots, sinks,
   longest path, direct gate inventory, and profile closures otherwise
-  unchanged;
+  unchanged and is superseded by Sections 25.9 and 36.1;
 - read-only provider evidence at `2026-08-01T02:09:45Z` proved historical
   release workflow ID `224760884` is still active and the Actions secret
   inventory still includes `CARGO_REGISTRY_TOKEN`; there are no active
@@ -38123,7 +38402,8 @@ Round 22 — end-to-end project reality check and release-artifact audit:
   not skipped; no issue, status, edge, label, owner, lock, or merge anchor
   was mutated.
 
-Round 23 — final adversarial evidence-state refinement:
+Round 23 — final adversarial evidence-state refinement (historical graph
+snapshot, superseded by Section 36.1):
 
 - split immutable, store-independent logical aggregate-bundle bytes from
   provider-specific capture envelopes/receipts; sealed automatic atomic
@@ -38146,7 +38426,7 @@ Round 23 — final adversarial evidence-state refinement:
   unresolved capture failure can reach authorized terminal closeout only
   through its durable failed-attempt lineage, and no branch can cross-
   substitute a stable, docs-terminal, or failure disposition;
-- reran independent current-byte structure checks after the refinements:
+- reran independent then-current-byte structure checks after the refinements:
   129 packages, 663 unique prerequisite edges, two roots, seven sinks,
   no duplicate/unresolved/self edge or cycle, longest path 30, direct
   gate count 66, and exact CI-final/candidate/published closures 82/83/84.
@@ -38212,25 +38492,36 @@ mean it cannot authorize a claim, close, schedule, or release decision.
 Current formal-plan truth, independently extracted from the package-local
 `Dependencies:` blocks, is:
 
-- 129 unique packages and 663 unique prerequisite edges;
-- no duplicate ID/edge, unresolved ID, self-edge, or cycle;
+- 145 unique packages and 782 prerequisite bullets;
+- no duplicate ID/edge or self-edge. The raw canonical text still has
+  three externally owned authorization-profile name defects: two
+  references to `GATE-EXPERIMENTAL-AUTH-BUILD` must become
+  `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY`, and one reference to
+  `CI-EXPERIMENTAL-AUTH-01` must become
+  `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01`. Until that separate owner
+  synchronizes those package bodies, raw graph resolution is not clean
+  and no aggregate claim may consume an alias silently;
+- applying only those exact intended renames in a read-only diagnostic
+  projection yields no unresolved ID, duplicate edge, self-edge, or cycle;
 - two intentional seeds: implementation-evidence seed `FND-01` and
   emergency release-safety seed `REL-QUAR-00`;
-- seven terminal sinks: `REL-02`, `CI-APPS-01`,
-  `CI-EMA-BUILTIN-01`, `CI-EXPERIMENTAL-AUTH-01`,
-  `CI-PROXY-DUAL-01`, `CI-PROXY-TASKS-01`, and
+- two terminal sinks in that intended projection: `REL-02` and
   `CI-REDIS-TASKS-01`;
-- longest formal path: 30 packages;
+- longest formal path in that intended projection: 33 packages;
 - `CoreImplementationInventory`: 66 direct gate dependencies;
-- `CoreReleaseCandidateInventory`: 83 packages through REL-01;
-- `CoreReleaseProfileInventory`: 84 packages through REL-02;
-- optional endpoint closures: dual 87, Tasks 90, Redis Tasks 93,
-  Apps 86, enterprise auth 85, built-in auth 86,
-  enterprise+built-in 92, experimental auth 86, modern proxy 88,
-  proxy+dual 96, and proxy+Tasks 99.
+- `CoreQualificationInventory`: 82 packages through CI-FINAL-CORE-01;
+- `AllMcpReleaseCandidateInventory`: 141 packages through REL-01;
+- `AllMcpReleaseProfileInventory`: 142 packages through REL-02;
+- optional endpoint closures in that intended projection: dual 93,
+  Tasks 90, Redis Tasks 93, Apps 86, enterprise auth 85, built-in auth
+  86, enterprise+built-in 92, OAuth client-credentials Draft 86,
+  modern proxy 88, proxy+dual 102, and proxy+Tasks 99. CI-ALL-MCP-01's
+  self-inclusive closure is 140.
 
-Current live tracker truth, reconfirmed during the volatile read-only
-audit interval `2026-08-01T02:47:55Z–03:02:50Z`, is:
+The following live-tracker snapshot was reconfirmed during the historical
+volatile read-only audit interval `2026-08-01T02:47:55Z–03:02:50Z`. It is
+retained as incident provenance, not current execution authority, and is
+superseded for current baselines by Section 36.4:
 
 - epic `bd-mcp-2026-07-28-support-ahet`;
 - 416 issues: 290 closed, 125 open, and one in progress;
@@ -38263,8 +38554,8 @@ audit interval `2026-08-01T02:47:55Z–03:02:50Z`, is:
   existing formal bodies/dependencies are not synchronized to their
   historical issues.
 
-Current release-provider/repository truth from the read-only audit at
-`2026-08-01T02:09:45Z` is also unsafe: GitHub workflow ID `224760884`
+That audit's release-provider/repository snapshot at
+`2026-08-01T02:09:45Z` was also unsafe: GitHub workflow ID `224760884`
 for `.github/workflows/release.yml` is `active`; the Actions secret
 inventory still contains `CARGO_REGISTRY_TOKEN`; and the repository has
 no protected environments. There are zero queued, in-progress, waiting,
@@ -38276,15 +38567,14 @@ has modified plus numerous untracked tracker/verifier backup artifacts.
 No push, cleanup, workflow disablement, secret rotation, or other
 provider mutation was authorized or performed by this audit.
 
-Therefore the exact Phase 3a Beads-generation sequence and exact Phase 5
-Bead-refinement sequence below are pending at a hard safety gate. Do not
-move/copy the lock or base anchor, reopen/reassign/decompose issues,
-restore edges, create the seven issues, edit labels/profiles, or
-strictly export until all Beads writers explicitly pause, `.1.14`'s
-owner checkpoints/hands off, a repeated read-only snapshot proves a
-quiescent interval, and the user authorizes the exact filesystem repair
-commands and their effects. A generic “proceed” does not substitute for
-that exact destructive/filesystem authorization.
+That historical snapshot blocked the then-proposed Phase 3a/Phase 5
+mutation. Current execution instead follows Section 36.4's fresh-baseline,
+single-writer, schema-15 bridge, strict-export, and no-concurrent-drift
+preconditions. It never moves, deletes, renames, replaces, or timestamp-
+touches the lock or base anchor. A first nonempty serialized strict export
+may refresh the stale base anchor only through the pinned schema-15 bridge;
+any destructive filesystem repair still requires its own exact written
+authorization.
 
 REL-QUAR-00 is the sole emergency exception to the ordinary tracker stop,
 because waiting to neutralize ambient release authority increases risk.
@@ -38313,12 +38603,15 @@ not execute the exception.
 
 After the ordinary safety gate clears, use only `br` for issue,
 dependency, status, comment, and label changes. Execute the following
-deterministic sequence against all 129 packages, synchronize every
-changed canonical body and acceptance block, create mappings for the
-seven new packages without inventing IDs in advance, restore exact graph
-equality, and implement the complete Section 11 aggregate/staged-
-aggregate projections. Only the final strict export may refresh the
-merge anchor under separately approved exact commands.
+deterministic sequence against all 145 packages, synchronize every
+changed canonical body and acceptance block, create the missing
+API-CORE-01 and CLI-CORE-01 formal parents plus the missing decomposition
+topology without inventing IDs in advance, restore exact graph equality,
+and implement the complete Section 11 aggregate/staged-aggregate
+projections. The first nonempty serialized strict export through the
+pinned schema-15 bridge refreshes the derived merge anchor; it must be
+followed immediately by byte/hash/integrity verification and must never
+use merge, force, repair, rebuild, or import-only modes.
 
 Phase 3a frozen prompt (verbatim):
 
@@ -38370,16 +38663,19 @@ The epic is hierarchy only, never an implementation prerequisite. The
 mandatory aggregate list and closure-chain schema are exactly Section
 11's current list; no stale shorter list in historical evidence may be
 used. Rematerialization replaces the ambiguous historical `profile-core`
-label with two canonical affinity labels:
+label with three canonical affinity labels:
 
-- `profile-core-candidate` on exactly the 83 members of
-  `CoreReleaseCandidateInventory`;
-- `profile-core-published` on exactly the 84 members of
-  `CoreReleaseProfileInventory`.
+- `profile-core-qualified` on exactly the 82 members of
+  `CoreQualificationInventory`;
+- `profile-all-mcp-candidate` on exactly the 141 members of
+  `AllMcpReleaseCandidateInventory`;
+- `profile-all-mcp-published` on exactly the 142 members of
+  `AllMcpReleaseProfileInventory`.
 
-The published label is a superset and therefore appears with the
-candidate label on the 83 shared members; only REL-02 has published
-without candidate. The checker rejects the old unqualified
+The published all-MCP label is a superset of the candidate label; only
+REL-02 has published without candidate. The core-qualified set is a strict
+component subset and never implies either product label. The checker rejects
+the old unqualified
 `profile-core` label after the one reviewed migration. Labels remain
 affinity/inventory data, never a claim that an issue is complete or
 publication is authorized. Section 25.9 defines every canonical optional
@@ -38392,8 +38688,8 @@ authoritative and no live `profile-*` label count is current evidence.
 The table below is retained only to audit the 122 older mappings. It is
 not a current equality proof: canonical bodies/dependencies have changed,
 some mapped child/status evidence is false or incomplete, and the seven
-new packages are intentionally unmapped. Do not allocate placeholder IDs
-or infer readiness from this table.
+then-new packages were unmapped at that snapshot. Do not allocate placeholder
+IDs or infer readiness from this table.
 
 | Work package | Beads issue |
 |---|---|
@@ -38520,9 +38816,9 @@ or infer readiness from this table.
 | `TST-04` | `bd-mcp-2026-07-28-support-ahet.81` |
 | `XPORT-01` | `bd-mcp-2026-07-28-support-ahet.48` |
 
-Current unmapped formal packages:
+Formal packages unmapped at that historical snapshot:
 
-| Work package | Current status |
+| Work package | Historical snapshot status |
 |---|---|
 | `REL-QUAR-00` | not materialized; pending safe tracker reconciliation |
 | `OPS-01` | not materialized; pending safe tracker reconciliation |
@@ -38531,6 +38827,9 @@ Current unmapped formal packages:
 | `PERF-01` | not materialized; pending safe tracker reconciliation |
 | `REL-PREP-01` | not materialized; pending safe tracker reconciliation |
 | `REL-02` | not materialized; pending safe tracker reconciliation |
+
+The current unmapped formal parents are API-CORE-01 and CLI-CORE-01;
+Section 36.4 supersedes this table.
 
 ### 36.3 Independent graph evidence
 
@@ -38705,11 +39004,119 @@ required closure/provenance edges or inventing readiness.
 #### 36.4.1 Canonical mandatory-topology rework ledger
 
 This is a normative decomposition ledger, not a capability, readiness, test,
-or release claim. Its independent inventory has exactly 143 formal parents:
-59 already conform to `A + B → I → V → parent`; 84 violate it. Of the 84,
-81 have `0/0/0` implementation/integration/verification children, API-01 and
-CLI-01 have only one bounded A leaf, and FND-01 has a nonconforming `15/1/1`
-shape. Every row below must be rematerialized before its parent is claimable.
+or release claim. Its independent inventory has exactly 145 formal parents:
+59 already have four A/B/I/V child records and 86 violate the frozen
+decomposition contract. Of those 59 existing quartets, 56 already conform to
+`A + B → I → V → parent`; the FND-03, PRT-01, and LEG-01 quartets have the
+correct blocking chain but still require the twelve-record cleanup below.
+Of the 86 decomposition-contract violators, 50 already have four child records
+that require contract/edge rematerialization rather than duplicate creation, 33 have no
+quartet records, API-01 and CLI-01 each retain one bounded A record that moves
+to a newly created API-CORE-01 or CLI-CORE-01 parent, and FND-01 retains its
+18-record staged shape while gaining two A/B staging aggregates. Every row
+below must be rematerialized before its parent is claimable.
+
+Against the frozen pre-bridge baseline of 902 physical records, 879
+non-tombstone records, 143 formal parents, 456 non-tombstone parent-associated
+decomposition records, and 391 executable records labeled
+`work-package-child`, complete topology materialization adds 140 children and
+two formal parent records: 1044 physical records, 1021 non-tombstone records,
+145 formal parents, 596 non-tombstone parent-associated decomposition records,
+595 executable `work-package-child` records, and 580 canonical A/B/I/V role
+records. All 140 new children receive `work-package-child`; 64 existing
+executable associated records are normalized to that label. The retained
+FND-01 `.1.14` planning subaggregate is the sole associated non-executable
+record, so it cannot earn capability credit. The arithmetic is exact: 31
+ordinary zero-record parents add 124 children;
+the two new core parents reuse the moved API/CLI A records and add six B/I/V
+children; the now-empty full API/CLI parents add eight children; and FND-01
+adds two A/B staging aggregates. The 50 existing weak quartets are updated in
+place and add no records. The bridge must re-read every baseline immediately
+before mutation and fail closed on concurrent drift; these numbers are
+acceptance predicates, not a license to overwrite another actor's tracker
+changes.
+
+“Canonical A/B/I/V role records” is a designated-identity count, not a raw
+count of rows carrying one of the generic child-role labels. It contains
+exactly one A, B, I, and V identity for each formal package, selected by the
+canonical external references frozen in this ledger. FND-01's fifteen
+pre-existing executable production leaves continue to carry
+`implementation-child`, but they are inputs beneath the designated FND-01 A/B
+grouping identities and are not fifteen additional canonical quartet roles.
+Consequently the complete designated count is `145 * 4 = 580`, while the raw
+executable role-label and `work-package-child` count is 595. At the
+non-security checkpoint those counts are respectively `131 * 4 = 524` and
+539. A checker must compute both predicates separately and may not infer the
+designated count from labels alone.
+
+The currently separated non-security bridge cohort has exactly 22 incomplete
+parents. Seventeen existing parents have zero quartet records:
+FND-05, FND-06, PRT-03, CLT-02, PXY-01, PXY-LEG-01, PXY-03, PXY-TASK-01,
+GATE-CORE-READY, GATE-DUAL-READY, GATE-PROXY-READY,
+GATE-PROXY-DUAL-READY, GATE-PROXY-TASKS-READY, CI-DUAL-01, CI-PROXY-01,
+CI-PROXY-DUAL-01, and CI-PROXY-TASKS-01. API-CORE-01 and CLI-CORE-01 are
+the two absent zero-record parents; API-01 and CLI-01 each have one A record
+that moves to its corresponding core parent; and FND-01 retains its staged
+shape. The exact addition is `17 * 4 + 2 * 3 + 2 * 4 + 2 = 84` children plus
+the two core parent records, producing the
+mandatory intermediate checkpoint of 988 physical records, 965 non-tombstone
+records, 540 associated children, 539 executable `work-package-child` records,
+and 524 canonical A/B/I/V roles. The separately owned 14-package
+authorization/security cohort adds the remaining 56 children. Its owner must
+also update, not duplicate, the two existing parents whose external references
+still use the superseded experimental-auth names. Only the combined
+1044/1021/596/595/580 physical/non-tombstone/associated/executable/
+canonical-role result is the complete topology; neither cohort alone
+establishes aggregate support or readiness.
+
+The excluded authorization/security cohort is exactly AUTH-01, AUTH-05,
+AUTH-07, CI-BUILTIN-AUTH-01, CI-EMA-01, CI-EMA-BUILTIN-01,
+CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01, FND-07, GATE-BUILTIN-AUTH-READY,
+GATE-EMA-BUILTIN-READY, GATE-EMA-READY,
+GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY, HTTP-06, and PXY-04. Cohort
+membership is defined by this exact package-ID set, not inferred from broad
+domain or historical `profile-core` labels. The non-security bridge must not
+mutate those parents or their children.
+
+The non-security bridge also performs a zero-record-count cleanup on exactly
+twelve existing children:
+`bd-mcp-2026-07-28-support-ahet.3.1` through `.3.4`,
+`bd-mcp-2026-07-28-support-ahet.5.1` through `.5.4`, and
+`bd-mcp-2026-07-28-support-ahet.9.1` through `.9.4`. For each record it removes
+only the forbidden native `parent-child` edge to its formal parent, retains
+the exact A/B-to-I-to-V blocking chain, replaces the stale plan-anchor
+external reference with the canonical `<PACKAGE>/<role-slug>` reference,
+and rechecks its stable-parent label, role label, acceptance IDs, exact tests,
+ownership card, consumers, proof configuration, and no-claim boundary. These
+twelve updates add no Beads, remove no Beads, change no formal prerequisite,
+and earn no new capability credit.
+
+Topology-conformant does not mean contract-complete. Before the bridge may
+certify any existing quartet, it semantically validates every one of the 236
+children under the 59 pre-existing quartet parents and rematerializes any
+missing frozen leaf requirement in place. At minimum, every executable child
+must retain its existing stronger requirements while adding, where absent:
+the four-field `Owned`/`Shared`/`Reservation`/`Integrator` preclaim card; exact
+positive and one-variable planted-negative acceptance/test IDs; named public
+consumer and no-claim boundary; exact profile/target/features/public-surface
+proof binding; positive evaluator, observed field, predicate, and minimum
+count; `required = discovered = started = passed`; zero ignored, filtered,
+feature-disabled, skipped, zero-run, or early-aborted tests; and unchanged-
+state proof for rejection. This validation adds no records and must never
+replace a more specific existing contract with a generic weaker template.
+
+The non-security bridge additionally repairs current-plan prerequisite drift
+without adding records. APP-01, AUTHX-01, AUTHX-02, and TASK-01 remove the
+obsolete EXT-SRC-01 edge from the parent and any A/B slice that retained it;
+REL-QUAR-00 likewise removes the obsolete CI-ALL-MCP-01 edge. DX-TEST-01 is
+reconciled to FND-04, API-CORE-01, MAC-01, EXT-DEV-01, STD-01, HTTP-01,
+HTTP-02, HTTP-03, and XPORT-01. EXT-DEV-01 is reconciled to EXT-01, FND-04,
+MAC-01, and API-CORE-01. CI-BASE-01 and FND-02 add REL-QUAR-00; CI-CORE-01
+adds DX-TEST-01, PERF-01, and REL-PREP-01; LEG-NEG-01 adds SUB-02, LEG-02,
+and LEG-03; and TASK-02 adds OPS-01. Parent edges follow the canonical
+`Dependencies:` blocks exactly. A/B receives a changed prerequisite only when
+its named production slice actually consumes it; no bridge blindly copies all
+parent prerequisites onto both implementation children.
 
 For every ledger row, A and B are disjoint real-production slices with their
 own same-Bead positives and planted negatives; I depends on A and B and wires
@@ -38722,6 +39129,26 @@ parent dependency or changes an existing external edge. `none` means no
 exception: the ordinary topology is required. The only supported eras are
 `2026-07-28` and `2024-11-05`; a `2025-11-25` value is an unsupported planted
 negative, never an A/B slice or positive I observation.
+
+The structure-owner allocation rule is deterministic. For a pre-existing
+quartet, each A/B record retains exactly its current `blocks` edges whose
+targets remain in the parent's canonical `Dependencies:` set; obsolete formal
+targets are removed. A formal prerequisite newly added to the parent by this
+plan revision remains parent-level unless this ledger or a package-local
+tracker-mapping block explicitly assigns it to A, B, or both. The bridge does
+not guess, copy every parent edge onto both children, or treat a parent-level
+closure gate as proof that both production slices consume it. For every newly
+created quartet, the bridge freezes an explicit A/B allocation before create;
+no unallocated dependency is permitted. This rule preserves real prior slice
+ownership, prevents accidental early bypass through removed dependencies, and
+avoids nonsemantic overblocking.
+
+Here and throughout Section 36, “the parent depends on V” identifies V as the
+sole decomposition-terminal child edge. It does not remove, replace, or bypass
+any formal prerequisite from the parent's canonical `Dependencies:` list. The
+parent retains that complete formal prerequisite set byte-for-byte unless the
+package body itself is normatively amended; only obsolete direct edges to A,
+B, or I and forbidden native `parent-child` execution edges are removed.
 
 | Violating parent | A — disjoint production slice | B — disjoint production slice | I — exact public wiring | V — receipt-only independent check | Rationale |
 |---|---|---|---|---|---|
@@ -38750,7 +39177,7 @@ negative, never an A/B slice or positive I observation.
 | DOC-01 | provisional documentation source and examples | executable example validation and negative claim checks | public docs/example package surface | source/example revision receipt | none |
 | DOC-02 | evidence-derived support matrix generation | claim denial, link and artifact consistency | public documentation publication inputs | evidence/wording receipt | none |
 | FND-05 | DNS/TLS/HTTP feasibility primitives | target, feature, crypto and failure-boundary qualification | public network capability boundary | source/target/test receipt | none |
-| FND-06 | secret/configuration typed custody primitives | configuration loading, redaction and rotation boundaries | public auth/config builder boundary | custody/revision receipt | none |
+| FND-06 | Cargo feature declarations and per-crate propagation equations | compiled-out boundaries, dependency-graph isolation and packaged profile qualification | public feature/profile builder and facade boundary | feature/tree/profile receipt | none |
 | FND-07 | filesystem capability/path policy primitives | bounded I/O, symlink and error isolation | public filesystem provider boundary | capability/path receipt | none |
 | GATE-APPS-READY | Apps closure-set evaluation | stale/missing/mixed-revision rejection | public Apps readiness evaluator | zero-capability gate receipt | none |
 | GATE-BUILTIN-AUTH-READY | issuer closure-set evaluation | stale/missing/mixed-revision rejection | public issuer readiness evaluator | zero-capability gate receipt | none |
@@ -38774,18 +39201,18 @@ negative, never an A/B slice or positive I observation.
 | MAC-TASK-01 | Tasks attribute parsing and feature gating | task result conversion and runtime registration denial | packaged Tasks macro consumer | feature/use receipt | none |
 | MRTR-01 | input-required wire/state model | request validation, errors and result transitions | public MRTR protocol boundary | state/schema receipt | none |
 | MRTR-02 | server resolver/broker ownership and correlation | consent, cancellation, expiry and persistence behavior | public MRTR resolver entrypoint | owner/terminal receipt | none |
-| OBS-01 | structured event/log model and redaction | sink filtering, bounds and failure behavior | public observability API | event/redaction receipt | none |
-| OBS-02 | untrusted display text and terminal-safe rendering | log attribution, suppression and diagnostics | public CLI/server diagnostics path | display/attribution receipt | none |
-| OBS-03 | metrics/export snapshot model | cardinality, privacy and sink failure handling | public observability export path | metric/cardinality receipt | none |
+| OBS-01 | typed W3C trace metadata parsing, cross-field validation, exact field recovery and `McpContext` preservation | versioned outbound trace policy, origin/trust-boundary forwarding, cache isolation and redacted diagnostics | public server/client/proxy trace-context path | W3C corpus, recovery, propagation-policy and revision receipt | none |
+| OBS-02 | final logging wire types, request metadata/capability/opt-in policy and HTTP/stdio attribution | bounded sink/queue/drop handling, disclosure classification/redaction and terminal-safe rendering | public server/client/CLI request-logging path | wire/capability, attribution, bounds, disclosure/display and revision receipt | none |
+| OBS-03 | progress wire/token model, exact bounded-number representation and monotonic validation | active-token ownership, terminal lifecycle, stdio/HTTP routing and bounded queue/coalescing | public client/server progress path through stdio and HTTP | token/number, routing, terminal-state and test-inventory receipt | none |
 | PRM-01 | prompt model/schema and registration | prompt rendering, arguments and dispatch behavior | public prompt API | schema/result receipt | none |
 | PRM-02 | prompt handler macro/builder integration | prompt bounds, metadata and errors | public prompt registration path | handler/observable receipt | none |
 | PRT-03 | final protocol-version/header semantics | request admission precedence and typed errors | public modern protocol ingress | version/error receipt | none |
 | PRT-04 | result discriminator/open-member model | typed decode, unknown preservation and rejection | public result codec/API | discriminator/round-trip receipt | none |
 | PRT-05 | official schema artifact generation | schema parity, golden and drift verification | public schema export boundary | artifact/parity receipt | none |
-| PXY-01 | upstream discovery/catalog and route identity | proxy leg auth, routing, failure and isolation | public gateway downstream/upstream path | leg/isolation receipt | none |
-| PXY-03 | proxy error/diagnostic translation | retry, failover and cancellation propagation | public gateway execution path | error/failover receipt | none |
+| PXY-01 | upstream discovery, Tool admission, union catalog, trusted route identity, and typed EXT-DEV descriptor routing | proxy-leg role/routing/fan-out, failure/isolation, and bounded OPS observations | public gateway downstream/upstream path | catalog/leg/isolation/telemetry receipt | none |
+| PXY-03 | downstream/upstream subscription mapping, opaque-ID retagging, and filter narrowing | leg-specific guard revalidation, first-terminal/upstream-loss teardown, slow-consumer bounds, and no-replay behavior | public gateway subscription listen/event/cancel path | mapping/filter/terminal/no-replay receipt | none |
 | PXY-04 | proxy catalog/extension composition | configuration revision and route capability isolation | public gateway catalog path | catalog/revision receipt | none |
-| PXY-LEG-01 | exact-2024 upstream route selection | lossless translation and mixed-era rejection | public mixed-era gateway path | era/translation receipt | none |
+| PXY-LEG-01 | exact-2024 upstream selection plus immutable ModernOnly/Auto/LegacyOnly stdio/HTTP transport binding | lossless translation, mixed-era isolation, and planted-2025 rejection | public mixed-era stdio/HTTP gateway path | era/transport/translation/isolation receipt | none |
 | PXY-TASK-01 | Tasks upstream route and handle mapping | task state/cancellation and cross-owner denial | public Tasks gateway path | task/owner receipt | none |
 | RES-01 | resource model/schema and registration | read/list/template dispatch and errors | public resource API | schema/result receipt | none |
 | RES-02 | resource handler/builder integration | provider bounds, metadata and cache behavior | public resource registration path | handler/observable receipt | none |
@@ -38806,9 +39233,11 @@ negative, never an A/B slice or positive I observation.
 | TST-03 | real end-to-end process harness | failure, cancellation and cleanup diagnosis | public E2E runner | process/result receipt | none |
 | TST-04 | differential/reference test harness | discrepancy triage and regression corpus | public differential runner | peer/result receipt | none |
 | XPORT-01 | modern/exact-2024 transport disposition table | role/direction codec and experimental transport isolation | public transport builder/codec path | disposition/role receipt | none |
-| API-01 | existing bounded ModernOnly leaf, retained as A | Auto/Legacy composition, legacy module and feature-gated endpoint bundle | full public builder/facade exports through A+B | independent public export/profile receipt | prior one-leaf shape is not an exception |
-| CLI-01 | existing bounded ModernOnly run/inspect leaf, retained as A | Auto/Legacy commands, endpoint bundle and diagnostics | full shipped binary policy surface through A+B | independent binary/profile receipt | prior one-leaf shape is not an exception |
-| FND-01 | regroup the 15 existing production leaves into one A aggregate: authoritative source/toolchain/dependency/provenance and core primitive slices | regroup the remaining production leaves into one B aggregate: migration, crypto/provider, SDK and external-capability qualification slices | retain the single existing baseline assembly as I, now depending only on A+B aggregates | retain final attestation as V with exact I tree/inventory receipt | 15/1/1 is not an exception; only its internal A/B staging remains narrow |
+| API-CORE-01 | existing bounded ModernOnly facade/builders/prelude Bead, rematerialized and retained as A | legacy-off feature admission, unavailable-policy diagnostics, and renamed-facade generated paths | shipped no-legacy public facade through A+B | independent export/feature/profile receipt | formalizes the former API-01 child as a core package |
+| CLI-CORE-01 | existing bounded ModernOnly run/inspect Bead, rematerialized and retained as A | machine JSON, diagnostic/display, process cleanup, and legacy-off denial surface | shipped no-legacy binary through A+B | independent binary/feature/profile receipt | formalizes the former CLI-01 child as a core package |
+| API-01 | Auto policy, immutable endpoint-bundle composition, and selection handoff | exact-2024 module, adapter receipts, and feature-gated transport exports | full Auto/exact-2024 public facade through A+B plus API-CORE-01 | independent public export/profile receipt | full aggregate receives no credit from the moved core child |
+| CLI-01 | Auto run/inspect orchestration and selected-era reporting | LegacyOnly commands, exact-2024 endpoints, receipts, and diagnostics | full shipped dual-era binary through A+B plus CLI-CORE-01/API-01 | independent binary/profile receipt | full aggregate receives no credit from the moved core child |
+| FND-01 | regroup authoritative source/toolchain/dependency/provenance/core-primitive units `.1.2`, `.1.3`, `.1.4`, `.1.6`, `.1.7`, `.1.8`, `.1.9`, `.1.12`, and nested planning subaggregate `.1.14` into A | regroup SDK/migration/provider/external-capability units `.1.5`, `.1.10`, `.1.11`, and `.1.13` into B | retain `.1.1` as I, now depending only on A+B | retain `.1.15` as V with exact I tree/inventory receipt | the partition consumes all 15 executable production leaves transitively and A reaches the three residual verifier leaves only through `.1.14` |
 
 Use the following fail-closed sequence for every implementation turn.
 
@@ -38821,8 +39250,10 @@ protected evidence files. Section 36.4 continues to govern every formal
 package transition; the current hardening work records no such
 transition.
 
-The 2026-08-03 projection contains the amended 143 formal packages and
-their bounded children, but source/version audit found normative 2025-era
+The 2026-08-03 projection currently contains 143 of the amended 145 formal
+packages, but is missing the two core parents and 140 decomposition children;
+the bridge adds API-CORE-01, CLI-CORE-01, and those missing children.
+Source/version audit found normative 2025-era
 semantics in affected package bodies. A package with stale policy, transport,
 feature, extension, gate, CI, documentation, or release acceptance text is not
 claim-ready until its body and children are rematerialized. This targeted
@@ -38846,10 +39277,13 @@ evidence status, strict export, and clean graph/checker evidence.
    waiting.
 
 1. Run `br doctor --json` and
-   `br sync --status --json`. Require doctor `ok: true`, healthy
-   workspace state, zero dirty issues, neither DB nor JSONL newer, and
-   no reliability anomaly. Under pinned `br 0.2.16`, the sole permitted
-   exceptions are findings
+   `br sync --status --json`. Require healthy workspace state, zero dirty
+   issues, neither DB nor JSONL newer, and no unallowlisted reliability
+   anomaly. Doctor `ok: true` is the ordinary passing state; `ok: false` is
+   acceptable only when every finding is one of the exact conditioned false
+   positives below and every condition for each finding is independently
+   satisfied. Under pinned `br 0.2.16`, the permitted
+   dependency-detector exceptions are findings
    `fm-dependencies-dead-closed-blocking-edges` and
    `fm-dependencies-fully-unblocked-open-issues` when an exact
    independent reconciliation proves every referenced issue exists,
@@ -38861,20 +39295,35 @@ evidence status, strict export, and clean graph/checker evidence.
    hierarchy-obscured child readiness; neither detector can itself
    grant readiness, and deleting those edges would destroy the
    required closure proof. Their exact allowlisted occurrences may
-   make top-level `ok` false without blocking. Any other finding, any
-   change in the independently reconstructed edge/ready sets, or any
+   make top-level `ok` false without blocking. The separately conditioned
+   `fm-state_files-orphaned-write-lock` finding is allowlisted only under
+   the exact successful-flock/no-live-holder conditions below; its mtime
+   observation grants no broader health exception. Except for the exact
+   one-batch stale-base condition below, any other finding, any change in
+   the independently reconstructed edge/ready sets, or any
    failure of that reconciliation remains blocking. Resolve a failure
    without `--force`.
-   A sole stale `.beads/.write.lock` warning or stale merge anchor is
-   still a failed
-   precondition: do not infer permission from a zero-byte file or the
-   absence of a live process, and do not delete, move, overwrite, or
-   timestamp-touch it. Stop and obtain explicit written human approval
-   naming the exact remediation command and effects, then rerun doctor
-   and require a clean result. The current tracker additionally has 24
-   missing provenance edges and seven unmapped packages, neither of which
-   is an allowlisted detector quirk. Historical Section 36.3 snapshots
-   cannot waive this gate.
+   `.beads/.write.lock` is the persistent advisory-flock target, not a
+   disposable per-run sentinel. Its zero length or old mtime is not evidence
+   of staleness. Never delete, rename, replace, or timestamp-touch it merely
+   to silence the pinned `br 0.2.16` mtime detector: doing so can split mutual
+   exclusion from a concurrent holder. Require the normal nonblocking flock
+   acquisition to succeed and independently confirm no live holder; the
+   detector's mtime-only warning is then an allowlisted tool-version false
+   positive and grants no other exception. The exact
+   `fm-state_files-base-jsonl-missing-or-stale` finding is also temporarily
+   allowlisted only for one serialized schema-15 mutation batch followed
+   immediately by its first nonempty strict flush and the full post-flush
+   byte/hash/integrity checks; it remains a failed publication/merge
+   precondition and authorizes no merge. Repair it only with a schema-15
+   bridge pinned to
+   `d1b906404677d0089f7a3536d44a47c4cc37302c`, either through its targeted,
+   receipt-backed base-anchor fixer or as part of the first nonempty strict
+   export after a serialized mutation batch. Never run merge against a stale
+   anchor. The frozen pre-bridge tracker additionally has 24 provenance
+   edges requiring current reconciliation, two unmapped formal parents, and
+   140 missing decomposition children; none is an allowlisted detector quirk.
+   Historical Section 36.3 snapshots cannot waive this gate.
 2. Run
    `br ready --epic bd-mcp-2026-07-28-support-ahet --json`.
    Only after exact rematerialization is this the formal-package
@@ -38937,11 +39386,12 @@ evidence status, strict export, and clean graph/checker evidence.
    labels, retain every child's real external prerequisite, and make
    the integration child `blocks`-depend on every implementation
    child. If a verification child exists, make it `blocks`-depend on
-   the integration child and make the aggregate `blocks`-depend only
-   on the verification child. Otherwise make the aggregate
-   `blocks`-depend on the integration child. Voluntary decomposition
-   uses the same chain. The verification attester identity must differ
-   from the integration producer identity and may not write any
+   the integration child and make the aggregate's sole decomposition-
+   child edge point to the verification child. Otherwise point that sole
+   decomposition-child edge to the integration child. Always retain the
+   aggregate's complete canonical formal-prerequisite set. Voluntary
+   decomposition uses the same chain. The verification attester identity
+   must differ from the integration producer identity and may not write any
    implementation output or integration receipt. Once decomposed, the
    aggregate is intentionally no longer directly ready; the checker
    validates readiness through the contracted child projection.
@@ -38987,16 +39437,23 @@ evidence status, strict export, and clean graph/checker evidence.
     history contiguous. A lease gap requires human conflict
     adjudication and reinspection, not a fabricated replacement
     history.
-12. Run the package's named positive, negative, boundary,
-    cancellation, feature-isolation, security, conformance, and
-    packaging checks plus the required workspace format, compiler,
-    Clippy, test, and changed-file UBS gates. Route every agent-operated
-    Cargo build/check/test/Clippy/doc/package/bench command through RCH,
-    serialize same-project build lanes unless their target identities
-    are deliberately disjoint, and record the RCH job identity. A local
-    fail-open fallback is a reported infrastructure condition, not an
-    unrecorded qualification result.
-13. Export the final Agent Mail reservation history and run:
+12. The coding agent stops after real implementation plus its same-Bead tests,
+    records the exact changed scope and required test inventory, and submits
+    the Bead as tracker status `review` with label `batch-pending`. It does not
+    self-close and does not run a per-agent full build or test sweep. Only a
+    narrowly scoped syntax check explicitly assigned by the batch orchestrator
+    is permitted, and that check also runs through RCH.
+13. The central batch-verification orchestrator owns the single serialized RCH
+    lane. It compiles first, derives the batch from the revision diff and
+    reverse dependents, and runs every mapped positive, negative, boundary,
+    cancellation, feature-isolation, conformance, packaging, formatting,
+    compiler, Clippy, test, and changed-file UBS gate. It records the exact RCH
+    job, revision/tree, dirty inventory, profile/target/features, required/
+    discovered/started/passed IDs, first attempt, failures, retries, and final
+    result. A local fail-open fallback is a reported infrastructure condition,
+    not qualification evidence.
+14. After a fully green mapped batch, the batch orchestrator exports the final
+    Agent Mail reservation history and runs:
 
     ```bash
     cargo xtask plan-tracker-check preclose <issue-id> \
@@ -39004,22 +39461,24 @@ evidence status, strict export, and clean graph/checker evidence.
     ```
 
     Attach the checker, test, source-provenance, and acceptance evidence
-    to the issue.
-14. Close without bypasses, then export strictly:
+    to the issue. On failure, return the same Bead to `open` with label
+    `rework` and the exact diagnostic; do not create a test follow-up.
+15. Only the batch orchestrator closes without bypasses, then exports strictly:
 
     ```bash
     br close <issue-id> --reason "<evidence summary>" \
-      --actor <agent-name> --json
+      --actor <batch-orchestrator-name> --json
     br sync --flush-only --error-policy strict --orphans strict --json
     ```
 
     `--force` and `--bypass-policy` are forbidden except after explicit
     written human emergency approval naming the exact command and
     consequence.
-15. Include `.beads/issues.jsonl` in the same reviewed implementation
+16. Include `.beads/issues.jsonl` in the same reviewed implementation
     or integrator commit as the state change. Beads never commits it
     automatically. Do not edit JSONL by hand.
-16. Send `[<PACKAGE-ID>] Completed`, release reservations, rerun
+17. The batch orchestrator sends `[<PACKAGE-ID>] Completed`, releases
+    reservations, reruns
     doctor and sync status, and require:
 
     ```bash
@@ -39043,10 +39502,10 @@ verification children. A future `bv` version may become a readiness
 source only after a pinned regression proves all three audited
 hierarchy defects absent.
 
-The epic does not yet contain every one of the 129 formal packages, so
+The epic does not yet contain every one of the 145 formal packages, so
 it is not close-eligible and no current command result may imply that it
 is. After rematerialization, `br epic close-eligible --json` may close it
-only after all 129 formal children and their validated descendants are
+only after all 145 formal children and their validated descendants are
 closed. Reaching a selected profile terminal promotes that profile but
 does not close or bypass the umbrella epic; a core-only release leaves
 the umbrella epic open.
