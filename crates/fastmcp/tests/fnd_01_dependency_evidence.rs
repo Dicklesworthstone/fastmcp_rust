@@ -28248,16 +28248,16 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     const CANDIDATE_SYMLINK_HOP_CAP: usize = 8;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct ToolIdentity {
-        device: u64,
-        inode: u64,
-        mode: u32,
-        nlink: u64,
-        length: u64,
-        mtime_seconds: i64,
-        mtime_nanoseconds: u32,
-        ctime_seconds: i64,
-        ctime_nanoseconds: u32,
+    pub(super) struct ToolIdentity {
+        pub(super) device: u64,
+        pub(super) inode: u64,
+        pub(super) mode: u32,
+        pub(super) nlink: u64,
+        pub(super) length: u64,
+        pub(super) mtime_seconds: i64,
+        pub(super) mtime_nanoseconds: u32,
+        pub(super) ctime_seconds: i64,
+        pub(super) ctime_nanoseconds: u32,
     }
 
     fn tool_identity_from_metadata(metadata: &Metadata, length: u64) -> TrustResult<ToolIdentity> {
@@ -28951,114 +28951,685 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )
     }
 
-    fn parse_version_stream(parser: &str, stream: &[u8]) -> TrustResult<()> {
-        if stream.is_empty() || stream.contains(&0) || stream.contains(&b'\r') {
-            return Err(phase_b_error(
-                "E_PHASE_B_TOOL_VERSION",
-                format!("{parser}: empty/NUL/CR version stream"),
-            ));
+    fn tool_version_error(detail: impl Into<String>) -> TrustError {
+        phase_b_error("E_PHASE_B_TOOL_VERSION", detail)
+    }
+
+    #[derive(Clone, Copy)]
+    struct StrictVersionLines<'a> {
+        body: &'a str,
+        line_count: usize,
+    }
+
+    impl<'a> StrictVersionLines<'a> {
+        fn len(self) -> usize {
+            self.line_count
         }
-        if !stream.ends_with(b"\n") {
-            return Err(phase_b_error(
-                "E_PHASE_B_TOOL_VERSION",
-                format!("{parser}: version stream must be LF-terminated"),
-            ));
+
+        fn first(self) -> Option<&'a str> {
+            self.get(0)
         }
-        let text = std::str::from_utf8(stream).map_err(|_| {
-            phase_b_error(
-                "E_PHASE_B_TOOL_VERSION",
-                format!("{parser}: version stream UTF-8"),
-            )
-        })?;
-        // Strict pin checks for the qualified host. Unknown parsers fail closed.
-        match parser {
-            "rustc-vv-pinned-1.99" => {
-                if !text.contains("release: 1.99.0-nightly")
-                    || !text.contains("commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14")
-                    || !text.contains("host: x86_64-unknown-linux-gnu")
-                    || !text.contains("LLVM version: 22.1.8")
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        "rustc -Vv does not match pinned 1.99 authority",
-                    ));
-                }
-            }
-            "cargo-vv-pinned-1.99" => {
-                if !text.contains("release: 1.99.0-nightly")
-                    || !text.contains("commit-hash: 59800466c5c41c444d264b1010b4d57e85a7117f")
-                    || !text.contains("host: x86_64-unknown-linux-gnu")
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        "cargo -Vv does not match pinned 1.99 authority",
-                    ));
-                }
-            }
-            "rustdoc-pinned-1.99" => {
-                if !text.contains("1.99.0-nightly")
-                    || !text.contains("375b1431b7d89d1c2e2bc168c011848ae12b7d14")
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        "rustdoc version does not match pinned 1.99 authority",
-                    ));
-                }
-            }
-            "rustfmt-pinned-nightly" | "clippy-pinned-nightly" => {
-                if text.trim().is_empty() {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        format!("{parser}: empty identity line"),
-                    ));
-                }
-            }
-            "lld-gnu-version" => {
-                if !text.contains("LLD 22") && !text.to_ascii_lowercase().contains("lld") {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        "rust-lld version does not identify LLD",
-                    ));
-                }
-            }
-            "llvm-version-family" | "llvm-lib-help" | "lld-coff-version" => {
-                if !text.to_ascii_lowercase().contains("llvm")
-                    && !text.to_ascii_lowercase().contains("lld")
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        format!("{parser}: missing LLVM/LLD identity"),
-                    ));
-                }
-            }
-            "openssl-version-a" => {
-                if !text.contains("OpenSSL") {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        "openssl version -a missing OpenSSL identity",
-                    ));
-                }
-            }
-            "host-c-compiler-v"
-            | "aarch64-c-compiler-v"
-            | "apple-clang-version"
-            | "windows-clang-cl-version"
-            | "archiver-version" => {
-                if text.trim().is_empty() {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_TOOL_VERSION",
-                        format!("{parser}: empty compiler/archiver stream"),
-                    ));
-                }
-            }
-            _ => {
-                return Err(phase_b_error(
-                    "E_PHASE_B_TOOL_VERSION",
-                    format!("unknown version parser {parser}"),
-                ));
+
+        fn get(self, index: usize) -> Option<&'a str> {
+            self.body.split('\n').nth(index)
+        }
+
+        fn iter(self) -> impl Iterator<Item = &'a str> {
+            self.body.split('\n')
+        }
+    }
+
+    impl std::ops::Index<usize> for StrictVersionLines<'_> {
+        type Output = str;
+
+        fn index(&self, index: usize) -> &Self::Output {
+            self.get(index).expect("validated strict version line index")
+        }
+    }
+
+    fn version_stream_lines<'a>(parser: &str, stream: &'a [u8]) -> TrustResult<StrictVersionLines<'a>> {
+        if stream.is_empty() {
+            return Err(tool_version_error(format!("{parser}: global.empty")));
+        }
+        if stream.iter().any(|byte| *byte == 0) {
+            return Err(tool_version_error(format!("{parser}: global.nul")));
+        }
+        if stream.iter().any(|byte| *byte == b'\r') {
+            return Err(tool_version_error(format!("{parser}: global.cr")));
+        }
+        let text = std::str::from_utf8(stream)
+            .map_err(|_| tool_version_error(format!("{parser}: global.utf8")))?;
+        let body = text
+            .strip_suffix('\n')
+            .ok_or_else(|| tool_version_error(format!("{parser}: global.terminal-lf")))?;
+        if body.ends_with('\n') {
+            return Err(tool_version_error(format!(
+                "{parser}: global.extra-terminal-lf"
+            )));
+        }
+        let line_count = body
+            .as_bytes()
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            .checked_add(1)
+            .ok_or_else(|| tool_version_error(format!("{parser}: global.line-count")))?;
+        Ok(StrictVersionLines { body, line_count })
+    }
+
+    fn require_exact_version_lines(
+        parser: &str,
+        lines: StrictVersionLines<'_>,
+        expected: &[&str],
+        field: &str,
+    ) -> TrustResult<()> {
+        if lines.len() != expected.len()
+            || !lines.iter().zip(expected).all(|(actual, expected)| actual == *expected)
+        {
+            return Err(tool_version_error(format!("{parser}: {field}")));
+        }
+        Ok(())
+    }
+
+    fn require_nonempty_version_field<'a>(
+        parser: &str,
+        line: &'a str,
+        prefix: &str,
+        field: &str,
+    ) -> TrustResult<&'a str> {
+        let value = line
+            .strip_prefix(prefix)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| tool_version_error(format!("{parser}: {field}")))?;
+        Ok(value)
+    }
+
+    fn require_clang_version_lines(
+        parser: &str,
+        lines: StrictVersionLines<'_>,
+        target: &str,
+        allow_extra_host_lines: bool,
+    ) -> TrustResult<()> {
+        let expected_count = if allow_extra_host_lines { 8 } else { 4 };
+        if lines.len() != expected_count
+            || lines.first() != Some("Ubuntu clang version 22.1.2 (1ubuntu1)")
+            || lines.get(1) != Some(target)
+            || lines.get(2) != Some("Thread model: posix")
+        {
+            return Err(tool_version_error(format!("{parser}: clang identity/target grammar")));
+        }
+        let installed = lines
+            .get(3)
+            .and_then(|line| line.strip_prefix("InstalledDir: "))
+            .ok_or_else(|| tool_version_error(format!("{parser}: installed-directory field")))?;
+        validate_absolute_lexical_path(installed, "clang InstalledDir")
+            .map_err(|_| tool_version_error(format!("{parser}: installed-directory path")))?;
+        if allow_extra_host_lines {
+            for (line, prefix) in lines.iter().skip(4).zip([
+                "Found candidate GCC installation: ",
+                "Selected GCC installation: ",
+                "Candidate multilib: ",
+                "Selected multilib: ",
+            ]) {
+                require_nonempty_version_field(parser, line, prefix, "host clang discovery field")?;
             }
         }
         Ok(())
+    }
+
+    fn require_gcc_version_lines(
+        parser: &str,
+        selected_lexical: &str,
+        lines: StrictVersionLines<'_>,
+        target: &str,
+        cross: bool,
+    ) -> TrustResult<()> {
+        let expected_count = if cross { 8 } else { 10 };
+        if lines.len() != expected_count || lines.first() != Some("Using built-in specs.") {
+            return Err(tool_version_error(format!("{parser}: gcc line count/header")));
+        }
+        if lines.get(1).and_then(|line| line.strip_prefix("COLLECT_GCC="))
+            != Some(selected_lexical)
+        {
+            return Err(tool_version_error(format!("{parser}: gcc selected lexical argv0")));
+        }
+        let wrapper = require_nonempty_version_field(
+            parser,
+            lines[2],
+            "COLLECT_LTO_WRAPPER=",
+            "gcc LTO wrapper",
+        )?;
+        validate_absolute_lexical_path(wrapper, "GCC LTO wrapper")
+            .map_err(|_| tool_version_error(format!("{parser}: gcc LTO wrapper path")))?;
+        let target_index = if cross { 3 } else { 5 };
+        if !cross
+            && (require_nonempty_version_field(
+                parser,
+                lines[3],
+                "OFFLOAD_TARGET_NAMES=",
+                "gcc offload target names",
+            )?
+            .split(':')
+            .any(str::is_empty)
+                || lines[4] != "OFFLOAD_TARGET_DEFAULT=1")
+        {
+            return Err(tool_version_error(format!("{parser}: gcc offload fields")));
+        }
+        if lines[target_index] != target {
+            return Err(tool_version_error(format!("{parser}: gcc target field")));
+        }
+        let configured_index = target_index + 1;
+        let configured = require_nonempty_version_field(
+            parser,
+            lines[configured_index],
+            "Configured with: ",
+            "gcc configure field",
+        )?;
+        let configured_target = match target {
+            "Target: x86_64-linux-gnu" => "--target=x86_64-linux-gnu",
+            "Target: aarch64-linux-gnu" => "--target=aarch64-linux-gnu",
+            _ => return Err(tool_version_error(format!("{parser}: compiled GCC target"))),
+        };
+        if !configured.split(' ').any(|field| field == configured_target) {
+            return Err(tool_version_error(format!("{parser}: gcc configured target")));
+        }
+        if lines[configured_index + 1] != "Thread model: posix"
+            || lines[configured_index + 2]
+                != "Supported LTO compression algorithms: zlib zstd"
+            || !lines[configured_index + 3].starts_with("gcc version 15.2.0 ")
+        {
+            return Err(tool_version_error(format!("{parser}: gcc trailer grammar")));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_version_stream_for_role(
+        tool_id: &str,
+        parser: &str,
+        selected_lexical: &str,
+        stream: &[u8],
+    ) -> TrustResult<()> {
+        let lines = version_stream_lines(parser, stream)?;
+        match (parser, tool_id) {
+            ("rustc-vv-pinned-1.99", "rustc") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "rustc 1.99.0-nightly (375b1431b 2026-07-10)",
+                    "binary: rustc",
+                    "commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14",
+                    "commit-date: 2026-07-10",
+                    "host: x86_64-unknown-linux-gnu",
+                    "release: 1.99.0-nightly",
+                    "LLVM version: 22.1.8",
+                ],
+                "rustc complete -Vv grammar",
+            ),
+            ("cargo-vv-pinned-1.99", "cargo") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "cargo 1.99.0-nightly (59800466c 2026-07-07)",
+                    "release: 1.99.0-nightly",
+                    "commit-hash: 59800466c5c41c444d264b1010b4d57e85a7117f",
+                    "commit-date: 2026-07-07",
+                    "host: x86_64-unknown-linux-gnu",
+                    "libgit2: 1.9.4 (sys:0.21.0 vendored)",
+                    "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
+                    "ssl: OpenSSL 3.6.3 9 Jun 2026",
+                    "os: Ubuntu 26.4.0 (resolute) [64-bit]",
+                ],
+                "cargo complete -Vv grammar",
+            ),
+            ("rustdoc-pinned-1.99", "rustdoc") => require_exact_version_lines(
+                parser,
+                lines,
+                &["rustdoc 1.99.0-nightly (375b1431b 2026-07-10)"],
+                "rustdoc short commit/date grammar",
+            ),
+            ("rustfmt-pinned-nightly", "rustfmt" | "cargo-fmt") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &["rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)"],
+                    "rustfmt pinned version/commit/date grammar",
+                )
+            }
+            ("clippy-pinned-nightly", "cargo-clippy" | "clippy-driver") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &["clippy 0.1.99 (375b1431b7 2026-07-10)"],
+                    "clippy pinned version/commit/date grammar",
+                )
+            }
+            ("lld-gnu-version", "rust-lld") => require_exact_version_lines(
+                parser,
+                lines,
+                &["LLD 22.1.8 (/checkout/src/llvm-project/llvm a04c1eced55f2f3ea8dbd3d17db0b6df271c0809) (compatible with GNU linkers)"],
+                "rust-lld LLVM 22 GNU-driver grammar",
+            ),
+            ("llvm-version-family", "llvm-nm") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "llvm-nm, compatible with GNU nm",
+                    "Ubuntu LLVM version 22.1.2",
+                    "  Optimized build.",
+                ],
+                "llvm-nm LLVM 22 grammar",
+            ),
+            ("llvm-version-family", "apple-ar") => require_exact_version_lines(
+                parser,
+                lines,
+                &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                "llvm-ar LLVM 22 grammar",
+            ),
+            ("openssl-version-a", "openssl") => {
+                if lines.len() != 10
+                    || lines[0]
+                        != "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)"
+                    || lines[2] != "platform: debian-amd64"
+                {
+                    return Err(tool_version_error(format!(
+                        "{parser}: OpenSSL identity/platform grammar"
+                    )));
+                }
+                for (line, prefix, field) in [
+                    (lines[1], "built on: ", "built-on"),
+                    (lines[3], "options:  ", "options"),
+                    (lines[4], "compiler: ", "compiler"),
+                    (lines[8], "Seeding source: ", "seeding-source"),
+                    (lines[9], "CPUINFO: ", "CPUINFO"),
+                ] {
+                    require_nonempty_version_field(parser, line, prefix, field)?;
+                }
+                for (line, prefix, field) in [
+                    (lines[5], "OPENSSLDIR: \"", "OPENSSLDIR"),
+                    (lines[6], "ENGINESDIR: \"", "ENGINESDIR"),
+                    (lines[7], "MODULESDIR: \"", "MODULESDIR"),
+                ] {
+                    let value = line
+                        .strip_prefix(prefix)
+                        .and_then(|value| value.strip_suffix('"'))
+                        .ok_or_else(|| tool_version_error(format!("{parser}: {field}")))?;
+                    validate_absolute_lexical_path(value, field)
+                        .map_err(|_| tool_version_error(format!("{parser}: {field} path")))?;
+                }
+                Ok(())
+            }
+            ("host-c-compiler-v", "host-cc") => {
+                if matches!(
+                    selected_lexical.rsplit('/').next(),
+                    Some("clang-22" | "clang")
+                ) {
+                    require_clang_version_lines(
+                        parser,
+                        lines,
+                        "Target: x86_64-pc-linux-gnu",
+                        true,
+                    )
+                } else {
+                    require_gcc_version_lines(
+                        parser,
+                        selected_lexical,
+                        lines,
+                        "Target: x86_64-linux-gnu",
+                        false,
+                    )
+                }
+            }
+            ("archiver-version", "host-ar" | "aarch64-linux-ar") => {
+                if matches!(
+                    selected_lexical.rsplit('/').next(),
+                    Some("llvm-ar-22" | "llvm-ar")
+                ) {
+                    require_exact_version_lines(
+                        parser,
+                        lines,
+                        &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                        "LLVM archiver 22 complete grammar",
+                    )
+                } else {
+                    require_exact_version_lines(
+                        parser,
+                        lines,
+                        &[
+                            "GNU ar (GNU Binutils for Ubuntu) 2.46",
+                            "Copyright (C) 2026 Free Software Foundation, Inc.",
+                            "This program is free software; you may redistribute it under the terms of",
+                            "the GNU General Public License version 3 or (at your option) any later version.",
+                            "This program has absolutely no warranty.",
+                        ],
+                        "GNU ar complete grammar",
+                    )
+                }
+            }
+            ("archiver-version", "host-ranlib") => {
+                if matches!(
+                    selected_lexical.rsplit('/').next(),
+                    Some("llvm-ranlib-22" | "llvm-ranlib")
+                ) {
+                    require_exact_version_lines(
+                        parser,
+                        lines,
+                        &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                        "LLVM ranlib 22 complete grammar",
+                    )
+                } else {
+                    require_exact_version_lines(
+                        parser,
+                        lines,
+                        &[
+                            "GNU ranlib (GNU Binutils for Ubuntu) 2.46",
+                            "Copyright (C) 2026 Free Software Foundation, Inc.",
+                            "This program is free software; you may redistribute it under the terms of",
+                            "the GNU General Public License version 3 or (at your option) any later version.",
+                            "This program has absolutely no warranty.",
+                        ],
+                        "GNU ranlib complete grammar",
+                    )
+                }
+            }
+            ("aarch64-c-compiler-v", "aarch64-linux-cc") => require_gcc_version_lines(
+                parser,
+                selected_lexical,
+                lines,
+                "Target: aarch64-linux-gnu",
+                true,
+            ),
+            ("apple-clang-version", "apple-clang") => require_clang_version_lines(
+                parser,
+                lines,
+                "Target: aarch64-apple-darwin",
+                false,
+            ),
+            ("windows-clang-cl-version", "windows-clang-cl") => require_clang_version_lines(
+                parser,
+                lines,
+                "Target: x86_64-pc-windows-msvc",
+                false,
+            ),
+            ("llvm-lib-help", "windows-lib") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "OVERVIEW: LLVM Lib",
+                    "",
+                    "USAGE: llvm-lib [options] file...",
+                    "",
+                    "OPTIONS:",
+                    "  /def:<value>            def file to use to generate import library",
+                    "  /defArm64Native:<value> def file to use to generate native ARM64 symbols in ARM64EC import library",
+                    "  /ignore:<value>         Specify warning codes to ignore",
+                    "  /libpath:<value>        Object file search path",
+                    "  /list                   List contents of .lib file on stdout",
+                    "  /llvmlibempty           When given no contents, produce an empty .lib file",
+                    "  /llvmlibindex:no        Do not write an index to the output",
+                    "  /llvmlibindex           Write an index to the output (default)",
+                    "  /llvmlibthin            Make .lib point to .obj files instead of copying their contents",
+                    "  /machine:<value>        Specify target platform",
+                    "  /out:<value>            Path to file to write output",
+                    "  /WX:no                  Don't treat warnings as errors (default)",
+                    "  /WX                     Treat warnings as errors",
+                ],
+                "llvm-lib complete help grammar",
+            ),
+            ("lld-coff-version", "windows-lld-link") => require_exact_version_lines(
+                parser,
+                lines,
+                &["Ubuntu LLD 22.1.2"],
+                "lld-link LLVM 22 COFF-driver grammar",
+            ),
+            _ => Err(tool_version_error(format!(
+                "unknown version parser/role {parser}|{tool_id}"
+            ))),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct ToolProbeAuthority {
+        pub(super) ordinal: usize,
+        pub(super) tool_id: String,
+        pub(super) parser_id: String,
+        pub(super) selected_lexical: String,
+        pub(super) final_path: String,
+        pub(super) final_identity: ToolIdentity,
+        pub(super) final_sha256: [u8; 32],
+        pub(super) argv: Vec<String>,
+        pub(super) selected_stream: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct ToolProbeInput {
+        pub(super) ordinal: usize,
+        pub(super) tool_id: String,
+        pub(super) parser_id: String,
+        pub(super) selected_lexical: String,
+        pub(super) final_path: String,
+        pub(super) final_identity: ToolIdentity,
+        pub(super) final_sha256: [u8; 32],
+        pub(super) argv: Vec<String>,
+        pub(super) selected_stream: String,
+        pub(super) exit_code: i32,
+        pub(super) stdout: Vec<u8>,
+        pub(super) stderr: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct ValidatedToolProbeObservation {
+        pub(super) ordinal: usize,
+        pub(super) tool_id: String,
+        pub(super) parser_id: String,
+        pub(super) selected_lexical: String,
+        pub(super) final_path: String,
+        pub(super) final_identity: ToolIdentity,
+        pub(super) final_sha256: [u8; 32],
+        pub(super) argv: Vec<String>,
+        pub(super) selected_stream: String,
+        pub(super) raw_bytes: Vec<u8>,
+        pub(super) raw_sha256: [u8; 32],
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct ValidatedToolProbeBatch {
+        pub(super) observations: Vec<ValidatedToolProbeObservation>,
+        pub(super) tool_set_sha256: [u8; 32],
+    }
+
+    fn candidate_template_accepts_selected(template: &str, selected: &str) -> bool {
+        if template.starts_with('/') {
+            return template == selected;
+        }
+        for prefix in ["{pinned-toolchain-bin}/", "{pinned-rust-sysroot}/"] {
+            if let Some(suffix) = template.strip_prefix(prefix) {
+                return selected.starts_with('/')
+                    && !selected.contains("//")
+                    && selected.ends_with(&format!("/{suffix}"));
+            }
+        }
+        false
+    }
+
+    fn validate_tool_probe_authority(authority: &ToolProbeAuthority) -> TrustResult<&'static NativeTool> {
+        let descriptor = NATIVE_TOOLS.get(authority.ordinal).ok_or_else(|| {
+            tool_version_error("context.ordinal: outside exact 20-role registry")
+        })?;
+        if authority.tool_id != descriptor.id {
+            return Err(tool_version_error("context.tool_id: descriptor mismatch"));
+        }
+        if authority.parser_id != descriptor.parser {
+            return Err(tool_version_error("context.parser_id: descriptor mismatch"));
+        }
+        if !descriptor
+            .candidates
+            .iter()
+            .any(|candidate| candidate_template_accepts_selected(candidate, &authority.selected_lexical))
+        {
+            return Err(tool_version_error(
+                "context.selected_lexical: outside role candidate registry",
+            ));
+        }
+        validate_absolute_lexical_path(&authority.selected_lexical, "tool probe selected lexical")
+            .map_err(|_| tool_version_error("context.selected_lexical: non-lexical path"))?;
+        validate_absolute_lexical_path(&authority.final_path, "tool probe final path")
+            .map_err(|_| tool_version_error("context.final_path: non-lexical path"))?;
+        if authority.final_identity.length == 0 || authority.final_sha256 == [0; 32] {
+            return Err(tool_version_error(
+                "context.final_identity: empty final executable binding",
+            ));
+        }
+        if authority.argv.first() != Some(&authority.selected_lexical) {
+            return Err(tool_version_error("context.argv0: selected lexical mismatch"));
+        }
+        if authority.argv.get(1..).unwrap_or_default() != descriptor.version_argv {
+            return Err(tool_version_error("context.argv_tail: descriptor mismatch"));
+        }
+        if authority.selected_stream != descriptor.stream {
+            return Err(tool_version_error("context.selected_stream: descriptor mismatch"));
+        }
+        Ok(descriptor)
+    }
+
+    pub(super) fn validate_tool_probe_observation(
+        authority: &ToolProbeAuthority,
+        input: &ToolProbeInput,
+    ) -> TrustResult<ValidatedToolProbeObservation> {
+        let _descriptor = validate_tool_probe_authority(authority)?;
+        for (equal, detail) in [
+            (input.ordinal == authority.ordinal, "context.ordinal"),
+            (input.tool_id == authority.tool_id, "context.tool_id"),
+            (input.parser_id == authority.parser_id, "context.parser_id"),
+            (
+                input.selected_lexical == authority.selected_lexical,
+                "context.selected_lexical",
+            ),
+            (input.final_path == authority.final_path, "context.final_path"),
+            (
+                input.final_identity == authority.final_identity,
+                "context.final_identity",
+            ),
+            (input.final_sha256 == authority.final_sha256, "context.final_sha256"),
+            (input.argv.first() == authority.argv.first(), "context.argv0"),
+            (
+                input.argv.get(1..) == authority.argv.get(1..),
+                "context.argv_tail",
+            ),
+            (
+                input.selected_stream == authority.selected_stream,
+                "context.selected_stream",
+            ),
+        ] {
+            if !equal {
+                return Err(tool_version_error(format!("{detail}: observed mismatch")));
+            }
+        }
+        if input.exit_code != 0 {
+            return Err(tool_version_error("context.exit_code: expected zero"));
+        }
+        let (selected, unselected) = match input.selected_stream.as_str() {
+            "stdout" => (&input.stdout, &input.stderr),
+            "stderr" => (&input.stderr, &input.stdout),
+            _ => return Err(tool_version_error("context.selected_stream: unknown stream")),
+        };
+        if !unselected.is_empty() {
+            return Err(tool_version_error(
+                "context.unselected_stream_nonempty: expected empty bytes",
+            ));
+        }
+        validate_version_stream_for_role(
+            &input.tool_id,
+            &input.parser_id,
+            &input.selected_lexical,
+            selected,
+        )?;
+        Ok(ValidatedToolProbeObservation {
+            ordinal: input.ordinal,
+            tool_id: input.tool_id.clone(),
+            parser_id: input.parser_id.clone(),
+            selected_lexical: input.selected_lexical.clone(),
+            final_path: input.final_path.clone(),
+            final_identity: input.final_identity.clone(),
+            final_sha256: input.final_sha256,
+            argv: input.argv.clone(),
+            selected_stream: input.selected_stream.clone(),
+            raw_bytes: selected.clone(),
+            raw_sha256: sha256(selected)?,
+        })
+    }
+
+    pub(super) fn validate_tool_probe_batch(
+        authorities: &[ToolProbeAuthority],
+        inputs: &[ToolProbeInput],
+    ) -> TrustResult<ValidatedToolProbeBatch> {
+        if authorities.len() != 20 || inputs.len() != 20 || authorities.len() != inputs.len() {
+            return Err(tool_version_error(
+                "batch.cardinality: exact 20-role inventory required",
+            ));
+        }
+        let mut observations = Vec::new();
+        observations.try_reserve_exact(20).map_err(|_| {
+            tool_version_error("batch.allocation: observation reservation")
+        })?;
+        for (ordinal, (authority, input)) in authorities.iter().zip(inputs).enumerate() {
+            if authority.ordinal != ordinal || input.ordinal != ordinal {
+                return Err(tool_version_error("batch.order: policy ordinal mismatch"));
+            }
+            observations.push(validate_tool_probe_observation(authority, input)?);
+        }
+        let rustc = observations
+            .iter()
+            .find(|observation| observation.tool_id == "rustc")
+            .ok_or_else(|| tool_version_error("batch.rustc-rustdoc-join: rustc missing"))?;
+        let rustdoc = observations
+            .iter()
+            .find(|observation| observation.tool_id == "rustdoc")
+            .ok_or_else(|| tool_version_error("batch.rustc-rustdoc-join: rustdoc missing"))?;
+        let rustc_text = std::str::from_utf8(&rustc.raw_bytes)
+            .map_err(|_| tool_version_error("batch.rustc-rustdoc-join: rustc UTF-8"))?;
+        let rustdoc_text = std::str::from_utf8(&rustdoc.raw_bytes)
+            .map_err(|_| tool_version_error("batch.rustc-rustdoc-join: rustdoc UTF-8"))?;
+        if !rustc_text.contains("commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14\n")
+            || !rustc_text.contains("commit-date: 2026-07-10\n")
+            || rustdoc_text != "rustdoc 1.99.0-nightly (375b1431b 2026-07-10)\n"
+        {
+            return Err(tool_version_error(
+                "batch.rustc-rustdoc-join: short/full commit or date mismatch",
+            ));
+        }
+        let mut preimage = b"FND01TOOLPROBEBATCHv1\0".to_vec();
+        preimage.extend_from_slice(&20u32.to_be_bytes());
+        for observation in &observations {
+            preimage.extend_from_slice(
+                &usize_u32(observation.ordinal, "probe batch ordinal")?.to_be_bytes(),
+            );
+            for value in [
+                observation.tool_id.as_bytes(),
+                observation.parser_id.as_bytes(),
+                observation.selected_lexical.as_bytes(),
+                observation.final_path.as_bytes(),
+                observation.selected_stream.as_bytes(),
+            ] {
+                append_u32_bytes(&mut preimage, value, "probe batch field")?;
+            }
+            append_tool_identity(&mut preimage, &observation.final_identity)?;
+            preimage.extend_from_slice(&observation.final_sha256);
+            preimage.extend_from_slice(
+                &usize_u32(observation.argv.len(), "probe batch argv count")?.to_be_bytes(),
+            );
+            for argument in &observation.argv {
+                append_u32_bytes(&mut preimage, argument.as_bytes(), "probe batch argv")?;
+            }
+            preimage.extend_from_slice(
+                &usize_u64(observation.raw_bytes.len(), "probe batch raw length")?.to_be_bytes(),
+            );
+            preimage.extend_from_slice(&observation.raw_sha256);
+            preimage.extend_from_slice(&observation.raw_bytes);
+        }
+        Ok(ValidatedToolProbeBatch {
+            observations,
+            tool_set_sha256: sha256(&preimage)?,
+        })
     }
 
     fn probe_tool_version(
@@ -29068,6 +29639,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         expected_execution_bin_sha256: [u8; 32],
         authority: &ProduceAcquisitionAuthority,
         space_guard: &PhaseBSpaceGuard<'_>,
+        ordinal: usize,
         selected_path: &str,
         tool: &NativeTool,
         execution_bin: &str,
@@ -29140,31 +29712,98 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             (Ok(_), Err(post_error)) => return Err(post_error),
             (Ok(capture), Ok(())) => capture,
         };
-        if capture.exit_code != 0 {
-            return Err(phase_b_error(
-                "E_PHASE_B_TOOL_VERSION",
-                format!("{}: version probe exit {}", tool.id, capture.exit_code),
-            ));
-        }
-        let (selected_stream, unselected_stream) = match tool.stream {
-            "stdout" => (&capture.stdout.bytes, &capture.stderr.bytes),
-            "stderr" => (&capture.stderr.bytes, &capture.stdout.bytes),
-            other => {
-                return Err(phase_b_error(
-                    "E_PHASE_B_TOOL_VERSION",
-                    format!("{}: unknown version stream {other}", tool.id),
-                ));
-            }
+        let selected_authority = selected_tools.get(ordinal).ok_or_else(|| {
+            tool_version_error("context.ordinal: missing selected-tool authority")
+        })?;
+        let probe_authority = ToolProbeAuthority {
+            ordinal,
+            tool_id: selected_authority.id.to_owned(),
+            parser_id: tool.parser.to_owned(),
+            selected_lexical: selected_authority.selected_lexical.clone(),
+            final_path: selected_authority.final_path.clone(),
+            final_identity: selected_authority.final_identity.clone(),
+            final_sha256: selected_authority.final_sha256,
+            argv: argv.clone(),
+            selected_stream: tool.stream.to_owned(),
         };
-        if !unselected_stream.is_empty() {
-            return Err(phase_b_error(
-                "E_PHASE_B_TOOL_VERSION",
-                format!("{}: unselected stream must be empty", tool.id),
+        let input = ToolProbeInput {
+            ordinal,
+            tool_id: tool.id.to_owned(),
+            parser_id: tool.parser.to_owned(),
+            selected_lexical: selected_path.to_owned(),
+            final_path: selected_authority.final_path.clone(),
+            final_identity: selected_authority.final_identity.clone(),
+            final_sha256: selected_authority.final_sha256,
+            argv,
+            selected_stream: tool.stream.to_owned(),
+            exit_code: capture.exit_code,
+            stdout: capture.stdout.bytes,
+            stderr: capture.stderr.bytes,
+        };
+        let validated = validate_tool_probe_observation(&probe_authority, &input)?;
+        Ok((validated.raw_bytes, validated.raw_sha256))
+    }
+
+    fn validate_selected_tool_probe_batch(
+        tools: &[SelectedTool],
+    ) -> TrustResult<ValidatedToolProbeBatch> {
+        if tools.len() != NATIVE_TOOLS.len() {
+            return Err(tool_version_error(
+                "batch.cardinality: selected-tool inventory is not exact",
             ));
         }
-        parse_version_stream(tool.parser, selected_stream)?;
-        let digest = sha256(selected_stream)?;
-        Ok((selected_stream.clone(), digest))
+        let mut authorities = Vec::new();
+        let mut inputs = Vec::new();
+        authorities.try_reserve_exact(tools.len()).map_err(|_| {
+            tool_version_error("batch.allocation: authority reservation")
+        })?;
+        inputs.try_reserve_exact(tools.len()).map_err(|_| {
+            tool_version_error("batch.allocation: input reservation")
+        })?;
+        for (ordinal, (tool, descriptor)) in tools.iter().zip(NATIVE_TOOLS).enumerate() {
+            let mut argv = Vec::new();
+            argv.try_reserve_exact(descriptor.version_argv.len() + 1).map_err(|_| {
+                tool_version_error("batch.allocation: argv reservation")
+            })?;
+            argv.push(tool.selected_lexical.clone());
+            argv.extend(descriptor.version_argv.iter().map(|argument| (*argument).to_owned()));
+            let authority = ToolProbeAuthority {
+                ordinal,
+                tool_id: tool.id.to_owned(),
+                parser_id: descriptor.parser.to_owned(),
+                selected_lexical: tool.selected_lexical.clone(),
+                final_path: tool.final_path.clone(),
+                final_identity: tool.final_identity.clone(),
+                final_sha256: tool.final_sha256,
+                argv: argv.clone(),
+                selected_stream: tool.version_stream.to_owned(),
+            };
+            let (stdout, stderr) = match tool.version_stream {
+                "stdout" => (tool.version_bytes.clone(), Vec::new()),
+                "stderr" => (Vec::new(), tool.version_bytes.clone()),
+                _ => {
+                    return Err(tool_version_error(
+                        "batch.selected_stream: unknown selected stream",
+                    ));
+                }
+            };
+            inputs.push(ToolProbeInput {
+                ordinal,
+                tool_id: tool.id.to_owned(),
+                parser_id: descriptor.parser.to_owned(),
+                selected_lexical: tool.selected_lexical.clone(),
+                final_path: tool.final_path.clone(),
+                final_identity: tool.final_identity.clone(),
+                final_sha256: tool.final_sha256,
+                argv,
+                selected_stream: tool.version_stream.to_owned(),
+                exit_code: 0,
+                stdout,
+                stderr,
+            });
+            authorities.push(authority);
+        }
+        validate_tool_probe_batch(&authorities, &inputs)
     }
 
     fn append_resolved_candidate(
@@ -29502,13 +30141,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 execution_bin_sha256,
                 authority,
                 space_guard,
+                ordinal,
                 &selected_lexical,
                 tool,
                 &execution_bin_abs,
                 &clippy,
                 &rustfmt,
             )?;
-            let _ = ordinal;
             selected_tools.push(SelectedTool {
                 id: tool.id,
                 selected_lexical,
@@ -29523,6 +30162,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         validate_selected_tool_aliases(&selected_tools)?;
         validate_required_tool_probe_aliases(&selected_tools)?;
+        let validated_probe_batch = validate_selected_tool_probe_batch(&selected_tools)?;
+        if validated_probe_batch.observations.len() != selected_tools.len() {
+            return Err(tool_version_error(
+                "batch.cardinality: validated observation count drifted",
+            ));
+        }
 
         // Phase 4: encode tool_set_preimage and digest.
         let mut output = Vec::new();
@@ -29532,6 +30177,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             authority.tool_probe_working_directory.as_bytes(),
             "tool probe working directory",
         )?;
+        output.extend_from_slice(&validated_probe_batch.tool_set_sha256);
         output.extend_from_slice(&20u32.to_be_bytes());
         for (ordinal, tool) in selected_tools.iter().enumerate() {
             output.extend_from_slice(&usize_u32(ordinal, "tool ordinal")?.to_be_bytes());
@@ -30970,6 +31616,34 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             )
             .expect_err("Gate cannot obtain an ordinary tool inventory");
             assert_eq!(gate.code(), "E_PHASE_B_MODE");
+        }
+
+        #[test]
+        fn windows_clang_cl_version_parser_binds_target_and_complete_stream() {
+            let positive = b"Ubuntu clang version 21.1.8 (6ubuntu1)\nTarget: x86_64-pc-windows-msvc\nThread model: posix\nInstalledDir: /usr/lib/llvm-21/bin\n";
+            assert_eq!(positive.len(), 125, "hz2 live identity fixture length");
+            assert_eq!(
+                encode_lower_hex(&sha256(positive).expect("clang-cl fixture digest")),
+                "5b352eaeab380ee29d29a77f72dc758f66a6743cf0f3d1fe97132c8ff0ef700e",
+                "hz2 live identity fixture digest",
+            );
+            parse_version_stream("windows-clang-cl-version", positive)
+                .expect("exact four-line Windows clang-cl identity");
+
+            let mut target_drift = positive.to_vec();
+            let target_offset = target_drift
+                .windows(4)
+                .position(|window| window == b"msvc")
+                .expect("fixture target suffix");
+            target_drift[target_offset + 3] = b'x';
+            assert_eq!(target_drift.len(), positive.len(), "one-byte same-length drift");
+            let error = parse_version_stream("windows-clang-cl-version", &target_drift)
+                .expect_err("msvc-to-msvx target drift must fail closed");
+            assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+            assert_eq!(
+                error.detail(),
+                "windows-clang-cl-version: target is not x86_64-pc-windows-msvc",
+            );
         }
 
         #[test]
@@ -33625,6 +34299,13 @@ mod bootstrap {
 // formatted manually rather than applying a whole-file formatter.
 #[rustfmt::skip]
 mod ordinary {
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    use super::phase_b_std::{
+        validate_tool_probe_batch, validate_tool_probe_observation,
+        validate_version_stream_for_role, ToolIdentity, ToolProbeAuthority,
+        ToolProbeInput,
+    };
 
     use super::trust_std::{
         bootstrap_role_name, checked_read, checked_snapshot, emit_entry_diagnostic,
@@ -86958,6 +87639,173 @@ fn fallible(value: Option<u8>) {
         })
     }
 
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_RUSTC_B64: &str = "cnVzdGMgMS45OS4wLW5pZ2h0bHkgKDM3NWIxNDMxYiAyMDI2LTA3LTEwKQpiaW5hcnk6IHJ1c3RjCmNvbW1pdC1oYXNoOiAzNzViMTQzMWI3ZDg5ZDFjMmUyYmMxNjhjMDExODQ4YWUxMmI3ZDE0CmNvbW1pdC1kYXRlOiAyMDI2LTA3LTEwCmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpMTFZNIHZlcnNpb246IDIyLjEuOAo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_CARGO_B64: &str = "Y2FyZ28gMS45OS4wLW5pZ2h0bHkgKDU5ODAwNDY2YyAyMDI2LTA3LTA3KQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpjb21taXQtaGFzaDogNTk4MDA0NjZjNWM0MWM0NDRkMjY0YjEwMTBiNGQ1N2U4NWE3MTE3Zgpjb21taXQtZGF0ZTogMjAyNi0wNy0wNwpob3N0OiB4ODZfNjQtdW5rbm93bi1saW51eC1nbnUKbGliZ2l0MjogMS45LjQgKHN5czowLjIxLjAgdmVuZG9yZWQpCmxpYmN1cmw6IDguMjEuMC1ERVYgKHN5czowLjQuOTArY3VybC04LjIxLjAgdmVuZG9yZWQgc3NsOk9wZW5TU0wvMy42LjMpCnNzbDogT3BlblNTTCAzLjYuMyA5IEp1biAyMDI2Cm9zOiBVYnVudHUgMjYuNC4wIChyZXNvbHV0ZSkgWzY0LWJpdF0K";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_RUSTDOC_B64: &str = "cnVzdGRvYyAxLjk5LjAtbmlnaHRseSAoMzc1YjE0MzFiIDIwMjYtMDctMTApCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_RUSTFMT_B64: &str = "cnVzdGZtdCAxLjkuMC1uaWdodGx5ICgzNzViMTQzMWI3IDIwMjYtMDctMTApCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_CLIPPY_B64: &str = "Y2xpcHB5IDAuMS45OSAoMzc1YjE0MzFiNyAyMDI2LTA3LTEwKQo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_RUST_LLD_B64: &str = "TExEIDIyLjEuOCAoL2NoZWNrb3V0L3NyYy9sbHZtLXByb2plY3QvbGx2bSBhMDRjMWVjZWQ1NWYyZjNlYThkYmQzZDE3ZGIwYjZkZjI3MWMwODA5KSAoY29tcGF0aWJsZSB3aXRoIEdOVSBsaW5rZXJzKQo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_LLVM_NM_B64: &str = "bGx2bS1ubSwgY29tcGF0aWJsZSB3aXRoIEdOVSBubQpVYnVudHUgTExWTSB2ZXJzaW9uIDIyLjEuMgogIE9wdGltaXplZCBidWlsZC4K";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_LLVM_TOOL_B64: &str = "VWJ1bnR1IExMVk0gdmVyc2lvbiAyMi4xLjIKICBPcHRpbWl6ZWQgYnVpbGQuCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_OPENSSL_B64: &str = "T3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNiAoTGlicmFyeTogT3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNikKYnVpbHQgb246IFdlZCBKdWwgMjkgMTY6NTA6NTMgMjAyNiBVVEMKcGxhdGZvcm06IGRlYmlhbi1hbWQ2NApvcHRpb25zOiAgYm4oNjQsNjQpCmNvbXBpbGVyOiBnY2MgLWZQSUMgLXB0aHJlYWQgLW02NCAtV2EsLS1ub2V4ZWNzdGFjayAtV2FsbCAtZnplcm8tY2FsbC11c2VkLXJlZ3M9dXNlZC1ncHIgLVdhLC0tbm9leGVjc3RhY2sgLWcgLU8yIC1XZXJyb3I9aW1wbGljaXQtZnVuY3Rpb24tZGVjbGFyYXRpb24gLWZuby1vbWl0LWZyYW1lLXBvaW50ZXIgLW1uby1vbWl0LWxlYWYtZnJhbWUtcG9pbnRlciAtZmZpbGUtcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC16cHczQkcvb3BlbnNzbC0zLjUuNT0uIC1mc3RhY2stcHJvdGVjdG9yLXN0cm9uZyAtZnN0YWNrLWNsYXNoLXByb3RlY3Rpb24gLVdmb3JtYXQgLVdlcnJvcj1mb3JtYXQtc2VjdXJpdHkgLWZjZi1wcm90ZWN0aW9uIC1mZGVidWctcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC16cHczQkcvb3BlbnNzbC0zLjUuNT0vdXNyL3NyYy9vcGVuc3NsLTMuNS41LTF1YnVudHUzLjMgLURPUEVOU1NMX1VTRV9OT0RFTEVURSAtRExfRU5ESUFOIC1ET1BFTlNTTF9QSUMgLURPUEVOU1NMX0JVSUxESU5HX09QRU5TU0wgLURaTElCIC1EWlNURCAtRE5ERUJVRyAtV2RhdGUtdGltZSAtRF9GT1JUSUZZX1NPVVJDRT0zCk9QRU5TU0xESVI6ICIvdXNyL2xpYi9zc2wiCkVOR0lORVNESVI6ICIvdXNyL2xpYi94ODZfNjQtbGludXgtZ251L2VuZ2luZXMtMyIKTU9EVUxFU0RJUjogIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvb3NzbC1tb2R1bGVzIgpTZWVkaW5nIHNvdXJjZTogb3Mtc3BlY2lmaWMgSklUVEVSICgzMDYwMzAwKQpDUFVJTkZPOiBPUEVOU1NMX2lhMzJjYXA9MHhmZWZhMzIwMzA3OGJmZmZmOjB4MDA0MTVmNWVmMWJmMDdhOToweDAwMDAwMDIwMDAwMDAwMTA6MHgwMDAwMDAwMDAwMDAwMDAwOjB4MDAwMDAwMDAwMDAwMDAwMAo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_HOST_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtbGludXgtZ251ClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2JpbgpGb3VuZCBjYW5kaWRhdGUgR0NDIGluc3RhbGxhdGlvbjogL3Vzci9saWIvZ2NjL3g4Nl82NC1saW51eC1nbnUvMTUKU2VsZWN0ZWQgR0NDIGluc3RhbGxhdGlvbjogL3Vzci9saWIvZ2NjL3g4Nl82NC1saW51eC1nbnUvMTUKQ2FuZGlkYXRlIG11bHRpbGliOiAuO0BtNjQKU2VsZWN0ZWQgbXVsdGlsaWI6IC47QG02NAo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_HOST_GCC_B64: &str = "VXNpbmcgYnVpbHQtaW4gc3BlY3MuCkNPTExFQ1RfR0NDPS91c3IvYmluL2NjCkNPTExFQ1RfTFRPX1dSQVBQRVI9L3Vzci9saWJleGVjL2djYy94ODZfNjQtbGludXgtZ251LzE1L2x0by13cmFwcGVyCk9GRkxPQURfVEFSR0VUX05BTUVTPW52cHR4LW5vbmU6YW1kZ2NuLWFtZGhzYQpPRkZMT0FEX1RBUkdFVF9ERUZBVUxUPTEKVGFyZ2V0OiB4ODZfNjQtbGludXgtZ251CkNvbmZpZ3VyZWQgd2l0aDogLi4vc3JjL2NvbmZpZ3VyZSAtdiAtLXdpdGgtcGtndmVyc2lvbj0nVWJ1bnR1IDE1LjIuMC0xNnVidW50dTEnIC0td2l0aC1idWd1cmw9ZmlsZTovLy91c3Ivc2hhcmUvZG9jL2djYy0xNS9SRUFETUUuQnVncyAtLWVuYWJsZS1sYW5ndWFnZXM9YyxhZGEsYysrLGdvLGQsZm9ydHJhbixvYmpjLG9iai1jKyssbTIscnVzdCxjb2JvbCxhbGdvbDY4IC0tcHJlZml4PS91c3IgLS13aXRoLWdjYy1tYWpvci12ZXJzaW9uLW9ubHkgLS1wcm9ncmFtLXN1ZmZpeD0tMTUgLS1wcm9ncmFtLXByZWZpeD14ODZfNjQtbGludXgtZ251LSAtLWVuYWJsZS1zaGFyZWQgLS1lbmFibGUtbGlua2VyLWJ1aWxkLWlkIC0tbGliZXhlY2Rpcj0vdXNyL2xpYmV4ZWMgLS13aXRob3V0LWluY2x1ZGVkLWdldHRleHQgLS1lbmFibGUtdGhyZWFkcz1wb3NpeCAtLWxpYmRpcj0vdXNyL2xpYiAtLWVuYWJsZS1ubHMgLS1lbmFibGUtYm9vdHN0cmFwIC0tZW5hYmxlLWNsb2NhbGU9Z251IC0tZW5hYmxlLWxpYnN0ZGN4eC1kZWJ1ZyAtLWVuYWJsZS1saWJzdGRjeHgtdGltZT15ZXMgLS13aXRoLWRlZmF1bHQtbGlic3RkY3h4LWFiaT1uZXcgLS1lbmFibGUtbGlic3RkY3h4LWJhY2t0cmFjZSAtLWVuYWJsZS1nbnUtdW5pcXVlLW9iamVjdCAtLWRpc2FibGUtdnRhYmxlLXZlcmlmeSAtLWVuYWJsZS1wbHVnaW4gLS1lbmFibGUtZGVmYXVsdC1waWUgLS13aXRoLXN5c3RlbS16bGliIC0tZW5hYmxlLWxpYnBob2Jvcy1jaGVja2luZz1yZWxlYXNlIC0td2l0aC10YXJnZXQtc3lzdGVtLXpsaWI9YXV0byAtLWVuYWJsZS1vYmpjLWdjPWF1dG8gLS1lbmFibGUtbXVsdGlhcmNoIC0tZGlzYWJsZS13ZXJyb3IgLS1lbmFibGUtY2V0IC0td2l0aC1hcmNoLTMyPWk2ODYgLS13aXRoLWFiaT1tNjQgLS13aXRoLW11bHRpbGliLWxpc3Q9bTMyLG02NCxteDMyIC0tZW5hYmxlLW11bHRpbGliIC0td2l0aC10dW5lPWdlbmVyaWMgLS1lbmFibGUtb2ZmbG9hZC10YXJnZXRzPW52cHR4LW5vbmU9L2J1aWxkL2djYy0xNS1qMzVUQVgvZ2NjLTE1LTE1LjIuMC9kZWJpYW4vdG1wLW52cHR4L3VzcixhbWRnY24tYW1kaHNhPS9idWlsZC9nY2MtMTUtajM1VEFYL2djYy0xNS0xNS4yLjAvZGViaWFuL3RtcC1nY24vdXNyIC0tZW5hYmxlLW9mZmxvYWQtZGVmYXVsdGVkIC0td2l0aG91dC1jdWRhLWRyaXZlciAtLWVuYWJsZS1jaGVja2luZz1yZWxlYXNlIC0tYnVpbGQ9eDg2XzY0LWxpbnV4LWdudSAtLWhvc3Q9eDg2XzY0LWxpbnV4LWdudSAtLXRhcmdldD14ODZfNjQtbGludXgtZ251IC0td2l0aC1idWlsZC1jb25maWc9Ym9vdHN0cmFwLWx0by1sZWFuIC0tZW5hYmxlLWxpbmstc2VyaWFsaXphdGlvbj0yClRocmVhZCBtb2RlbDogcG9zaXgKU3VwcG9ydGVkIExUTyBjb21wcmVzc2lvbiBhbGdvcml0aG1zOiB6bGliIHpzdGQKZ2NjIHZlcnNpb24gMTUuMi4wIChVYnVudHUgMTUuMi4wLTE2dWJ1bnR1MSkgCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_GNU_AR_B64: &str = "R05VIGFyIChHTlUgQmludXRpbHMgZm9yIFVidW50dSkgMi40NgpDb3B5cmlnaHQgKEMpIDIwMjYgRnJlZSBTb2Z0d2FyZSBGb3VuZGF0aW9uLCBJbmMuClRoaXMgcHJvZ3JhbSBpcyBmcmVlIHNvZnR3YXJlOyB5b3UgbWF5IHJlZGlzdHJpYnV0ZSBpdCB1bmRlciB0aGUgdGVybXMgb2YKdGhlIEdOVSBHZW5lcmFsIFB1YmxpYyBMaWNlbnNlIHZlcnNpb24gMyBvciAoYXQgeW91ciBvcHRpb24pIGFueSBsYXRlciB2ZXJzaW9uLgpUaGlzIHByb2dyYW0gaGFzIGFic29sdXRlbHkgbm8gd2FycmFudHkuCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_AARCH64_GCC_B64: &str = "VXNpbmcgYnVpbHQtaW4gc3BlY3MuCkNPTExFQ1RfR0NDPS91c3IvYmluL2FhcmNoNjQtbGludXgtZ251LWdjYwpDT0xMRUNUX0xUT19XUkFQUEVSPS91c3IvbGliZXhlYy9nY2MtY3Jvc3MvYWFyY2g2NC1saW51eC1nbnUvMTUvbHRvLXdyYXBwZXIKVGFyZ2V0OiBhYXJjaDY0LWxpbnV4LWdudQpDb25maWd1cmVkIHdpdGg6IC4uL3NyYy9jb25maWd1cmUgLXYgLS13aXRoLXBrZ3ZlcnNpb249J1VidW50dSAxNS4yLjAtMTZ1YnVudHUxJyAtLXdpdGgtYnVndXJsPWZpbGU6Ly8vdXNyL3NoYXJlL2RvYy9nY2MtMTUvUkVBRE1FLkJ1Z3MgLS1lbmFibGUtbGFuZ3VhZ2VzPWMsYWRhLGMrKyxnbyxkLGZvcnRyYW4sb2JqYyxvYmotYysrLG0yLGNvYm9sLGFsZ29sNjggLS1wcmVmaXg9L3VzciAtLXdpdGgtZ2NjLW1ham9yLXZlcnNpb24tb25seSAtLXByb2dyYW0tc3VmZml4PS0xNSAtLWVuYWJsZS1zaGFyZWQgLS1lbmFibGUtbGlua2VyLWJ1aWxkLWlkIC0tbGliZXhlY2Rpcj0vdXNyL2xpYmV4ZWMgLS13aXRob3V0LWluY2x1ZGVkLWdldHRleHQgLS1lbmFibGUtdGhyZWFkcz1wb3NpeCAtLWxpYmRpcj0vdXNyL2xpYiAtLWVuYWJsZS1ubHMgLS13aXRoLXN5c3Jvb3Q9LyAtLWVuYWJsZS1jbG9jYWxlPWdudSAtLWVuYWJsZS1saWJzdGRjeHgtZGVidWcgLS1lbmFibGUtbGlic3RkY3h4LXRpbWU9eWVzIC0td2l0aC1kZWZhdWx0LWxpYnN0ZGN4eC1hYmk9bmV3IC0tZW5hYmxlLWxpYnN0ZGN4eC1iYWNrdHJhY2UgLS1lbmFibGUtZ251LXVuaXF1ZS1vYmplY3QgLS1kaXNhYmxlLWxpYnF1YWRtYXRoIC0tZGlzYWJsZS1saWJxdWFkbWF0aC1zdXBwb3J0IC0tZW5hYmxlLXBsdWdpbiAtLWVuYWJsZS1kZWZhdWx0LXBpZSAtLXdpdGgtc3lzdGVtLXpsaWIgLS1lbmFibGUtbGlicGhvYm9zLWNoZWNraW5nPXJlbGVhc2UgLS13aXRob3V0LXRhcmdldC1zeXN0ZW0temxpYiAtLWVuYWJsZS1tdWx0aWFyY2ggLS1lbmFibGUtZml4LWNvcnRleC1hNTMtODQzNDE5IC0tZGlzYWJsZS13ZXJyb3IgLS1lbmFibGUtY2hlY2tpbmc9cmVsZWFzZSAtLWJ1aWxkPXg4Nl82NC1saW51eC1nbnUgLS1ob3N0PXg4Nl82NC1saW51eC1nbnUgLS10YXJnZXQ9YWFyY2g2NC1saW51eC1nbnUgLS1wcm9ncmFtLXByZWZpeD1hYXJjaDY0LWxpbnV4LWdudS0gLS1pbmNsdWRlZGlyPS91c3IvYWFyY2g2NC1saW51eC1nbnUvaW5jbHVkZSAtLXdpdGgtYnVpbGQtY29uZmlnPWJvb3RzdHJhcC1sdG8tbGVhbiAtLWVuYWJsZS1saW5rLXNlcmlhbGl6YXRpb249MgpUaHJlYWQgbW9kZWw6IHBvc2l4ClN1cHBvcnRlZCBMVE8gY29tcHJlc3Npb24gYWxnb3JpdGhtczogemxpYiB6c3RkCmdjYyB2ZXJzaW9uIDE1LjIuMCAoVWJ1bnR1IDE1LjIuMC0xNnVidW50dTEpIAo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_APPLE_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiBhYXJjaDY0LWFwcGxlLWRhcndpbgpUaHJlYWQgbW9kZWw6IHBvc2l4Ckluc3RhbGxlZERpcjogL3Vzci9saWIvbGx2bS0yMi9iaW4K";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_WINDOWS_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtd2luZG93cy1tc3ZjClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2Jpbgo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_LLVM_LIB_B64: &str = "T1ZFUlZJRVc6IExMVk0gTGliCgpVU0FHRTogbGx2bS1saWIgW29wdGlvbnNdIGZpbGUuLi4KCk9QVElPTlM6CiAgL2RlZjo8dmFsdWU+ICAgICAgICAgICAgZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIGltcG9ydCBsaWJyYXJ5CiAgL2RlZkFybTY0TmF0aXZlOjx2YWx1ZT4gZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIG5hdGl2ZSBBUk02NCBzeW1ib2xzIGluIEFSTTY0RUMgaW1wb3J0IGxpYnJhcnkKICAvaWdub3JlOjx2YWx1ZT4gICAgICAgICBTcGVjaWZ5IHdhcm5pbmcgY29kZXMgdG8gaWdub3JlCiAgL2xpYnBhdGg6PHZhbHVlPiAgICAgICAgT2JqZWN0IGZpbGUgc2VhcmNoIHBhdGgKICAvbGlzdCAgICAgICAgICAgICAgICAgICBMaXN0IGNvbnRlbnRzIG9mIC5saWIgZmlsZSBvbiBzdGRvdXQKICAvbGx2bWxpYmVtcHR5ICAgICAgICAgICBXaGVuIGdpdmVuIG5vIGNvbnRlbnRzLCBwcm9kdWNlIGFuIGVtcHR5IC5saWIgZmlsZQogIC9sbHZtbGliaW5kZXg6bm8gICAgICAgIERvIG5vdCB3cml0ZSBhbiBpbmRleCB0byB0aGUgb3V0cHV0CiAgL2xsdm1saWJpbmRleCAgICAgICAgICAgV3JpdGUgYW4gaW5kZXggdG8gdGhlIG91dHB1dCAoZGVmYXVsdCkKICAvbGx2bWxpYnRoaW4gICAgICAgICAgICBNYWtlIC5saWIgcG9pbnQgdG8gLm9iaiBmaWxlcyBpbnN0ZWFkIG9mIGNvcHlpbmcgdGhlaXIgY29udGVudHMKICAvbWFjaGluZTo8dmFsdWU+ICAgICAgICBTcGVjaWZ5IHRhcmdldCBwbGF0Zm9ybQogIC9vdXQ6PHZhbHVlPiAgICAgICAgICAgIFBhdGggdG8gZmlsZSB0byB3cml0ZSBvdXRwdXQKICAvV1g6bm8gICAgICAgICAgICAgICAgICBEb24ndCB0cmVhdCB3YXJuaW5ncyBhcyBlcnJvcnMgKGRlZmF1bHQpCiAgL1dYICAgICAgICAgICAgICAgICAgICAgVHJlYXQgd2FybmluZ3MgYXMgZXJyb3JzCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_PROBE_LLD_LINK_B64: &str = "VWJ1bnR1IExMRCAyMi4xLjIK";
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_probe_decode_base64(encoded: &str) -> Vec<u8> {
+        fn sextet(byte: u8) -> u8 {
+            match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("non-canonical fixture base64 byte"),
+            }
+        }
+
+        let bytes = encoded.as_bytes();
+        assert!(!bytes.is_empty() && bytes.len() % 4 == 0, "fixture base64 framing");
+        let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+        for (ordinal, chunk) in bytes.chunks_exact(4).enumerate() {
+            let final_chunk = ordinal + 1 == bytes.len() / 4;
+            let padding = usize::from(chunk[3] == b'=') + usize::from(chunk[2] == b'=');
+            assert!(padding <= 2 && (padding == 0 || final_chunk), "fixture base64 padding");
+            assert!(chunk[0] != b'=' && chunk[1] != b'=', "fixture base64 leading padding");
+            assert!(chunk[2] != b'=' || chunk[3] == b'=', "fixture base64 split padding");
+            let a = sextet(chunk[0]);
+            let b = sextet(chunk[1]);
+            let c = if chunk[2] == b'=' { 0 } else { sextet(chunk[2]) };
+            let d = if chunk[3] == b'=' { 0 } else { sextet(chunk[3]) };
+            decoded.push((a << 2) | (b >> 4));
+            if padding < 2 {
+                decoded.push((b << 4) | (c >> 2));
+            }
+            if padding == 0 {
+                decoded.push((c << 6) | d);
+            }
+        }
+        decoded
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    #[derive(Clone, Copy)]
+    struct OrdinaryToolProbeFixture {
+        tool_id: &'static str,
+        parser_id: &'static str,
+        selected_lexical: &'static str,
+        final_path: &'static str,
+        argv_tail: &'static [&'static str],
+        selected_stream: &'static str,
+        raw_base64: &'static str,
+        raw_sha256: &'static str,
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_tool_probe_fixtures() -> [OrdinaryToolProbeFixture; 20] {
+        [
+            OrdinaryToolProbeFixture { tool_id: "rustc", parser_id: "rustc-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustc", final_path: "/fixture/finals/rustc", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTC_B64, raw_sha256: "d2a0a4fa48442a6c214130f08b2e9041725872a05d74680d9fd803ff8cb99c04" },
+            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", final_path: "/fixture/finals/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "f0e418b5bcf565955351a398b34570dbd5548f362ec2964c6b85ccf1c6ac336b" },
+            OrdinaryToolProbeFixture { tool_id: "rustdoc", parser_id: "rustdoc-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustdoc", final_path: "/fixture/finals/rustdoc", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTDOC_B64, raw_sha256: "8b9d7c46d8dc09d41da9e1b590b12a6b3b82b1a00c866623067104618a7b1a88" },
+            OrdinaryToolProbeFixture { tool_id: "rustfmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustfmt", final_path: "/fixture/finals/rustfmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
+            OrdinaryToolProbeFixture { tool_id: "cargo-fmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-fmt", final_path: "/fixture/finals/cargo-fmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
+            OrdinaryToolProbeFixture { tool_id: "cargo-clippy", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-clippy", final_path: "/fixture/finals/cargo-clippy", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
+            OrdinaryToolProbeFixture { tool_id: "clippy-driver", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/clippy-driver", final_path: "/fixture/finals/clippy-driver", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
+            OrdinaryToolProbeFixture { tool_id: "rust-lld", parser_id: "lld-gnu-version", selected_lexical: "/fixture/sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld", final_path: "/fixture/finals/rust-lld", argv_tail: &["-flavor", "gnu", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUST_LLD_B64, raw_sha256: "cf7558b748e63be07ad8a4ea32997ff7315fe798159af4194065e4e852008bd3" },
+            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-nm-22", final_path: "/fixture/finals/llvm-nm", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a68721459737cfa09b9215344fed1aa8d05068472fc496b5ec1ba53fa9dff24b" },
+            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-version-a", selected_lexical: "/usr/bin/openssl", final_path: "/fixture/finals/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca" },
+            OrdinaryToolProbeFixture { tool_id: "host-cc", parser_id: "host-c-compiler-v", selected_lexical: "/usr/bin/clang-22", final_path: "/fixture/finals/host-cc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_HOST_CLANG_B64, raw_sha256: "fbab69bc31638e38b444a45b8a73635d8b6ccaa801e2d958dbd8948182c45964" },
+            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ar-22", final_path: "/fixture/finals/host-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ranlib-22", final_path: "/fixture/finals/host-ranlib", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-cc", parser_id: "aarch64-c-compiler-v", selected_lexical: "/usr/bin/aarch64-linux-gnu-gcc", final_path: "/fixture/finals/aarch64-linux-cc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_AARCH64_GCC_B64, raw_sha256: "20a5376b7b7e218a03789f05f3d4c29e49d31eb0e54c0356d20e2747629243ae" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", final_path: "/fixture/finals/aarch64-linux-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "43f5d0d9d22ba26ea2f3bf7843526d9397252213091aed88da1d21894008536e" },
+            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-version", selected_lexical: "/usr/bin/clang-22", final_path: "/fixture/finals/apple-clang", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "921c5adaf09212c716a5405f4c8e3142f73213575ee60d31811a04aa68f28f91" },
+            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-ar-22", final_path: "/fixture/finals/apple-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", final_path: "/fixture/finals/windows-clang-cl", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "4cf331bc93b25c3c6c31cc7654125723dadbdb9e8806571f56dd6354786beb76" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-help", selected_lexical: "/usr/bin/llvm-lib-22", final_path: "/fixture/finals/windows-lib", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", final_path: "/fixture/finals/windows-lld-link", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "170a202b75f25f80cbb26fa3e6e3c7ec02e74a8a7f190aa861d31d59774ff8eb" },
+        ]
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_tool_probe_fixture_batch() -> (Vec<ToolProbeAuthority>, Vec<ToolProbeInput>) {
+        let fixtures = ordinary_tool_probe_fixtures();
+        let mut authorities = Vec::with_capacity(fixtures.len());
+        let mut inputs = Vec::with_capacity(fixtures.len());
+        for (ordinal, fixture) in fixtures.iter().enumerate() {
+            let raw = ordinary_probe_decode_base64(fixture.raw_base64);
+            assert_eq!(encode_lower_hex(&trust_sha256(&raw)), fixture.raw_sha256, "{} raw capture", fixture.tool_id);
+            let identity = ToolIdentity {
+                device: 7,
+                inode: 10_000 + u64::try_from(ordinal).expect("fixture ordinal"),
+                mode: 0o100755,
+                nlink: 1,
+                length: u64::try_from(raw.len()).expect("fixture raw length") + 1,
+                mtime_seconds: 1_784_000_000,
+                mtime_nanoseconds: u32::try_from(ordinal).expect("fixture ordinal"),
+                ctime_seconds: 1_784_000_000,
+                ctime_nanoseconds: u32::try_from(ordinal).expect("fixture ordinal"),
+            };
+            let final_sha256 = [u8::try_from(ordinal + 1).expect("fixture ordinal byte"); 32];
+            let mut argv = vec![fixture.selected_lexical.to_owned()];
+            argv.extend(fixture.argv_tail.iter().map(|argument| (*argument).to_owned()));
+            authorities.push(ToolProbeAuthority {
+                ordinal,
+                tool_id: fixture.tool_id.to_owned(),
+                parser_id: fixture.parser_id.to_owned(),
+                selected_lexical: fixture.selected_lexical.to_owned(),
+                final_path: fixture.final_path.to_owned(),
+                final_identity: identity.clone(),
+                final_sha256,
+                argv: argv.clone(),
+                selected_stream: fixture.selected_stream.to_owned(),
+            });
+            let (stdout, stderr) = if fixture.selected_stream == "stdout" {
+                (raw, Vec::new())
+            } else {
+                (Vec::new(), raw)
+            };
+            inputs.push(ToolProbeInput {
+                ordinal,
+                tool_id: fixture.tool_id.to_owned(),
+                parser_id: fixture.parser_id.to_owned(),
+                selected_lexical: fixture.selected_lexical.to_owned(),
+                final_path: fixture.final_path.to_owned(),
+                final_identity: identity,
+                final_sha256,
+                argv,
+                selected_stream: fixture.selected_stream.to_owned(),
+                exit_code: 0,
+                stdout,
+                stderr,
+            });
+        }
+        (authorities, inputs)
+    }
+
     const ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID: &str =
         "ordinary::ordinary_b_r2_sealed_production_e2e";
 
@@ -91335,43 +92183,145 @@ fn fallible(value: Option<u8>) {
 
     #[test]
     fn ordinary_b_r3_unqualified_platform_fails_before_ledger_open() {
-        let repository_root = repository_root();
-        let current_executable = std::env::current_exe().expect("current test executable");
-        let invocation = OrdinaryHandoffArguments {
-            mode: BootstrapMode::Produce,
-            executable_path: current_executable,
-            repository_root: repository_root.clone(),
-            run_root: repository_root
-                .join(".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef"),
-            run_id: "0123456789abcdef0123456789abcdef".to_owned(),
-            run_id_bytes: [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
-                0xcd, 0xef,
-            ],
-            control_ledger_path: ".fnd01-run/does-not-exist/control-ledger.bin".to_owned(),
-        };
-        let environment = BootstrapEnvironment {
-            authoring_marker: "unreached-platform-refusal".to_owned(),
-            closed_path: "/unreached-tool-bin".to_owned(),
-            integration_seal: None,
-            producer_outer_record_path: None,
-            attester_outer_record_path: None,
-            final_gate_seal: None,
-        };
-        let mut effects = OrdinaryPlatformRefusalEffects::default();
-        let error = validate_ordinary_handoff_entry_with_effects(
-            &invocation,
-            &environment,
-            false,
-            &mut effects,
-        )
-        .expect_err("the real ordinary entry seam must refuse before ledger work");
-        assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
-        assert_eq!(error.site, OrdinaryFailureSite::HandoffRepositoryPlatform);
-        assert_eq!(error.route(), OrdinaryFailureRoute::InitialPlatform);
-        assert_eq!(error.observed, "ordinary handoff requires Linux x86_64");
-        assert_eq!(effects.ledger_open_attempts, 0);
-        assert_eq!(effects.evidence_dispatch_attempts, 0);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            use super::trust_std::AUTHORING_PATHS;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            static NEXT_PLATFORM_SUBJECT: AtomicU64 = AtomicU64::new(1);
+            let sequence = NEXT_PLATFORM_SUBJECT.fetch_add(1, Ordering::Relaxed);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("platform A/B fixture clock")
+                .as_nanos();
+            let fresh_root = std::env::temp_dir().join(format!(
+                "fastmcp-fnd01-platform-ab-{:032x}",
+                now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),
+            ));
+            fs::create_dir(&fresh_root).expect("exclusive fresh platform A/B root");
+            let source_root = repository_root();
+            for path in AUTHORING_PATHS {
+                let bytes = fs::read(source_root.join(path))
+                    .unwrap_or_else(|error| panic!("read platform A/B authoring {path}: {error}"));
+                ordinary_fixture_write_new(&fresh_root, path, &bytes)
+                    .unwrap_or_else(|error| panic!("write platform A/B authoring {path}: {error}"));
+            }
+
+            let run_id = "0123456789abcdef0123456789abcdef";
+            let current_executable = std::env::current_exe().expect("current test executable");
+            let invocation = OrdinaryHandoffArguments {
+                mode: BootstrapMode::Produce,
+                executable_path: current_executable,
+                repository_root: fresh_root.clone(),
+                run_root: fresh_root.join(format!(
+                    ".fnd01-run/integration-producer/{run_id}"
+                )),
+                run_id: run_id.to_owned(),
+                run_id_bytes: [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+                    0x89, 0xab, 0xcd, 0xef,
+                ],
+                control_ledger_path: format!(
+                    ".fnd01-run/integration-producer/{run_id}/control-ledger.bin"
+                ),
+            };
+            let environment = BootstrapEnvironment {
+                authoring_marker: live_authoring_marker_text(&fresh_root),
+                closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+                integration_seal: None,
+                producer_outer_record_path: None,
+                attester_outer_record_path: None,
+                final_gate_seal: None,
+            };
+            let before = ordinary_fixture_tree_state(&fresh_root)
+                .expect("platform A/B initial fresh-root state");
+            let evaluate = |platform_qualified| {
+                let mut effects = OrdinaryPlatformRefusalEffects::default();
+                let result = validate_ordinary_handoff_entry_with_effects(
+                    &invocation,
+                    &environment,
+                    platform_qualified,
+                    &mut effects,
+                );
+                (result, effects)
+            };
+
+            let (negative, negative_effects) = evaluate(false);
+            let error = negative.expect_err("false is the sole platform-refusal dimension");
+            assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
+            assert_eq!(error.site, OrdinaryFailureSite::HandoffRepositoryPlatform);
+            assert_eq!(error.route(), OrdinaryFailureRoute::InitialPlatform);
+            assert_eq!(error.observed, "ordinary handoff requires Linux x86_64");
+            assert_eq!(negative_effects.ledger_open_attempts, 0);
+            assert_eq!(negative_effects.evidence_dispatch_attempts, 0);
+            assert_eq!(
+                ordinary_fixture_tree_state(&fresh_root)
+                    .expect("platform-refusal fresh-root state"),
+                before,
+                "the rejected one-variable platform dimension leaves the fresh root unchanged",
+            );
+
+            let (positive, positive_effects) = evaluate(true);
+            let advanced = positive.expect_err(
+                "the true twin advances to the intentionally absent first non-tool binding",
+            );
+            assert_eq!(advanced.site, OrdinaryFailureSite::PreLedgerAuthority);
+            assert!(
+                advanced.observed.starts_with("ordinary scratch binding 0:"),
+                "the true twin must advance through platform and complete pre-ledger authority: {advanced}",
+            );
+            assert_eq!(positive_effects.ledger_open_attempts, 0);
+            assert_eq!(positive_effects.evidence_dispatch_attempts, 0);
+            assert_eq!(
+                ordinary_fixture_tree_state(&fresh_root)
+                    .expect("platform-positive fresh-root state"),
+                before,
+                "the advancing true twin remains read-only before the first scratch binding",
+            );
+        }
+
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let repository_root = repository_root();
+            let run_id = "0123456789abcdef0123456789abcdef";
+            let invocation = OrdinaryHandoffArguments {
+                mode: BootstrapMode::Produce,
+                executable_path: std::env::current_exe().expect("current test executable"),
+                repository_root: repository_root.clone(),
+                run_root: repository_root.join(format!(
+                    ".fnd01-run/integration-producer/{run_id}"
+                )),
+                run_id: run_id.to_owned(),
+                run_id_bytes: [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+                    0x89, 0xab, 0xcd, 0xef,
+                ],
+                control_ledger_path: format!(
+                    ".fnd01-run/integration-producer/{run_id}/control-ledger.bin"
+                ),
+            };
+            let environment = BootstrapEnvironment {
+                authoring_marker: live_authoring_marker_text(&repository_root),
+                closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+                integration_seal: None,
+                producer_outer_record_path: None,
+                attester_outer_record_path: None,
+                final_gate_seal: None,
+            };
+            let mut effects = OrdinaryPlatformRefusalEffects::default();
+            let error = validate_ordinary_handoff_entry_with_effects(
+                &invocation,
+                &environment,
+                false,
+                &mut effects,
+            )
+            .expect_err("unqualified host must fail before ledger work");
+            assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
+            assert_eq!(error.site, OrdinaryFailureSite::HandoffRepositoryPlatform);
+            assert_eq!(effects.ledger_open_attempts, 0);
+            assert_eq!(effects.evidence_dispatch_attempts, 0);
+        }
         assert_eq!(
             OrdinaryFailureSite::HandoffRepositoryPlatform
                 .route()
