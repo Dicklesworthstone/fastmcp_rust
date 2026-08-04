@@ -32828,6 +32828,7 @@ mod bootstrap {
         )
     }
 
+    #[cfg(fnd01_bootstrap)]
     pub fn harness_main<I>(arguments: I) -> i32
     where
         I: IntoIterator<Item = OsString>,
