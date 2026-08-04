@@ -902,13 +902,13 @@ self_exclusion_contract = "Self-exclude only the two scalar RHS tokens: the ASCI
 execution_receipt_policy = "byte-absent typed-unverified: this manifest records expected closures and execution inputs, not live receipts. proof_environment.network_denial_execution_status and every peers.lock offline_resolution_status/current_execution_status remain unverified until the batch-owned verifier supplies execution facts."
 artifact_count = 13
 artifact_total_bytes = 35759
-preimage_byte_length = 96192
-digest = "8a4cf60d1fb64643d1bfa13b23cc31d4a4b945685485afc7dd216fc847361784"
+preimage_byte_length = 96185
+digest = "d81e321f79fa336ec93f8d05b7eef1df09b51485eba46fa3126d0fc1bf76a57b"
 reacceptance_rule = "A production validator must recompute this complete-input preimage from the live manifest and live lock_root bytes before positive or one-component negative evaluation. Any digest, size, manifest, artifact, command, authority, era, matrix, capability, negative-dimension, or drift-status difference is a reacceptance failure; changing only the derived fields cannot reaccept input."
 
 [validator_contract]
 production_validator_entrypoint = "fnd_01_sdk_matrix_validate"
-production_validator_binding = "unbound_pending_phase_b"
+production_validator_binding = "bound_revision_6"
 positive_harness_id = "ordinary::fnd_01_sdk_matrix_is_derived_from_locks_artifacts_and_execution_facts"
 negative_harness_id = "ordinary::fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations"
 entrypoint_semantics = "Both harness IDs must invoke the same production validator over the same parsed manifest and complete_input_binding preimage; test-only fixture branches and copied result vectors are forbidden."

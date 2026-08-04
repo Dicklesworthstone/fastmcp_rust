@@ -759,7 +759,7 @@ member_count = 9
 member_package_ids = ["fastmcp-cli", "fastmcp-client", "fastmcp-console", "fastmcp-core", "fastmcp-derive", "fastmcp-protocol", "fastmcp-rust", "fastmcp-server", "fastmcp-transport"]
 root_manifest_rule = "parse the workspace_snapshot root Cargo.toml as strict duplicate-key-free TOML; require [workspace].resolver exact string 3, exactly nine existing member paths resolving to member_package_ids, and [workspace.package] version/edition/rust-version/license exact values above; integer resolver, resolver 2, rust-version 1.85, omitted/inherited-from-elsewhere values, unknown duplicate tables, or a member identity mismatch fails before any Cargo command"
 member_manifest_rule = "parse all nine exact member Cargo.toml files and require package.version.workspace, edition.workspace, rust-version.workspace, and license.workspace exactly true with no local value or package-level override; their effective values therefore equal the one root workspace package contract"
-toolchain_relationship_rule = "require toolchain_path raw bytes exactly `[toolchain]\\nchannel = \"nightly-2026-07-11\"\\nprofile = \"minimal\"\\ncomponents = [\"rustfmt\", \"clippy\"]\\ntargets = [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-apple-darwin\", \"x86_64-pc-windows-msvc\", \"x86_64-unknown-linux-gnu\"]\\n`; reject BOM, CR/CRLF, comments, duplicate/reordered keys or array members, alternate whitespace/quoting, missing or extra targets/components, and trailing bytes. The selected cargo executable's own complete verbose self-report release `1.99.0-nightly`, commit-hash `59800466c5c41c444d264b1010b4d57e85a7117f`, commit-date `2026-07-10`, host `x86_64-unknown-linux-gnu`, and retained library/platform fields is the Cargo identity authority; the separately selected rustc executable's complete verbose self-report binds commit-hash `375b1431b7d89d1c2e2bc168c011848ae12b7d14` and LLVM version `22.1.8`. A rustup distribution manifest `0.99.0` label is component metadata only and cannot override either executable self-report. This binds the MSRV 1.99 declaration to the dated evidence toolchain without claiming stable-1.99 compatibility beyond Cargo's declared rust-version"
+toolchain_relationship_rule = "require toolchain_path raw bytes exactly `[toolchain]\\nchannel = \"nightly-2026-07-11\"\\nprofile = \"minimal\"\\ncomponents = [\"rustfmt\", \"clippy\"]\\ntargets = [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"x86_64-apple-darwin\", \"x86_64-pc-windows-msvc\", \"x86_64-unknown-linux-gnu\"]\\n`; reject BOM, CR/CRLF, comments, duplicate/reordered keys or array members, alternate whitespace/quoting, missing or extra targets/components, and trailing bytes. The selected cargo executable's own complete verbose self-report release `1.99.0-nightly`, commit-hash `59800466c5c41c444d264b1010b4d57e85a7117f`, commit-date `2026-07-07`, host `x86_64-unknown-linux-gnu`, and retained library/platform fields is the Cargo identity authority; the separately selected rustc executable's complete verbose self-report binds commit-hash `375b1431b7d89d1c2e2bc168c011848ae12b7d14` and LLVM version `22.1.8`. A rustup distribution manifest `0.99.0` label is component metadata only and cannot override either executable self-report. This binds the MSRV 1.99 declaration to the dated evidence toolchain without claiming stable-1.99 compatibility beyond Cargo's declared rust-version"
 resolver_authority_rule = "resolver 3 is the sole final root/workspace, consumer, and projection authority; every resolver-2 graph is an immutable explicitly noncanonical comparison candidate used only to calculate resolver-delta evidence and can never be promoted into package, consumer, workspace-gate, or support decisions"
 validation_phase = "role-entry-preflight before source snapshot acceptance, lock generation, package-list, metadata, build, test, or receipt output"
 
@@ -3718,15 +3718,15 @@ tool_partition_rule = "rustup_toolchain_binary_ids, sysroot_tool_ids, host_nativ
 native_tool_candidate_count = 20
 native_tool_candidate_row_fields = ["ordinal", "id", "candidate_paths", "version_argv", "version_stream", "version_parse", "identity_rule"]
 native_tool_candidate_registry_encoding = "ASCII FND01BOOTSTRAPNATIVETOOLSv1 followed by NUL, u32be 20, then each row as u32be ordinal, length-prefixed id, u32be candidate count and each length-prefixed exact path template, u32be version argv-suffix count and each length-prefixed argument, then length-prefixed version stream, version parser, and identity rule"
-native_tool_candidate_registry_bytes = 3795
-native_tool_candidate_registry_sha256 = "befae42e497195a3377e7895a14eb92fd314aff6825aa8f607c601331e66927f"
+native_tool_candidate_registry_bytes = 3911
+native_tool_candidate_registry_sha256 = "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b"
 candidate_symlink_hop_cap = 8
 candidate_disposition_domain = ["absent", "selected", "shadowed"]
 version_parse_ids = ["rustc-vv-pinned-1.99", "cargo-vv-pinned-1.99", "rustdoc-pinned-1.99", "rustfmt-pinned-nightly", "clippy-pinned-nightly", "lld-gnu-version", "llvm-version-family", "openssl-version-a", "host-c-compiler-v", "archiver-version", "aarch64-c-compiler-v", "apple-clang-version", "windows-clang-cl-version", "llvm-lib-help", "lld-coff-version"]
-version_parse_rules = ["complete LF-terminated rustc -Vv stream with exact binary rustc, release 1.99.0-nightly, commit 375b1431b7d89d1c2e2bc168c011848ae12b7d14, commit date 2026-07-10, host x86_64-unknown-linux-gnu, and LLVM 22.1.8", "complete LF-terminated cargo -Vv stream with exact release 1.99.0-nightly, commit 59800466c5c41c444d264b1010b4d57e85a7117f, host x86_64-unknown-linux-gnu, closed unique field names/order, and every library/platform value retained rather than discarded", "one LF-terminated rustdoc line with release 1.99.0-nightly and commit 375b1431b7d89d1c2e2bc168c011848ae12b7d14", "one LF-terminated rustfmt identity line; cargo-fmt and rustfmt must resolve through their distinct argv0 chains to the same final executable identity and emit byte-identical streams", "one LF-terminated clippy identity line; cargo-clippy and clippy-driver preserve distinct argv0 and must carry the pinned rustc commit identity", "complete LF-terminated rust-lld -flavor gnu --version stream identifying LLD 22 and GNU driver mode", "complete LF-terminated LLVM tool stream identifying LLVM 22; all lines and bytes retained", "complete LF-terminated openssl version -a stream with one OpenSSL identity line and closed unique build/platform/options/directories fields; all values retained", "complete stderr-only compiler -v stream selected by exact candidate basename as GCC or Clang, requiring x86_64-unknown-linux-gnu host identity and retaining every line", "complete LF-terminated GNU or LLVM archiver identity stream selected by exact candidate basename, with every line retained", "complete stderr-only GCC -v stream requiring aarch64-linux-gnu target identity and retaining every line", "complete stdout-only clang stream requiring target aarch64-apple-darwin and retaining every line", "complete stdout-only clang-cl stream requiring x86_64-pc-windows-msvc target and CL driver identity, retaining every line", "complete stdout-only /help text with LLVM librarian identity and usage grammar, joined to an allowed archive-multicall final executable identity; help bytes are identity evidence, not a semantic version claim", "complete stdout-only LLD version stream executed with lexical argv0 windows-lld-link and requiring the COFF driver identity; every line retained"]
+version_parse_rules = ["complete LF-terminated rustc -Vv stream with exact binary rustc, release 1.99.0-nightly, commit 375b1431b7d89d1c2e2bc168c011848ae12b7d14, commit date 2026-07-10, host x86_64-unknown-linux-gnu, and LLVM 22.1.8", "complete LF-terminated cargo -Vv stream with exact release 1.99.0-nightly, commit 59800466c5c41c444d264b1010b4d57e85a7117f, commit date 2026-07-07, host x86_64-unknown-linux-gnu, closed unique field names/order, and every library/platform value retained rather than discarded", "one LF-terminated rustdoc line with release 1.99.0-nightly, exact short commit 375b1431b, and commit date 2026-07-10, joined to the separately pinned full rustc commit authority", "one LF-terminated rustfmt identity line; cargo-fmt and rustfmt must resolve through their distinct argv0 chains to the same final executable identity and emit byte-identical streams", "one LF-terminated clippy identity line; cargo-clippy and clippy-driver preserve distinct argv0 and must carry the pinned rustc commit identity", "complete LF-terminated rust-lld -flavor gnu --version stream identifying LLD 22 and GNU driver mode", "complete LF-terminated LLVM tool stream identifying LLVM 22; all lines and bytes retained", "complete LF-terminated openssl version -a stream with one OpenSSL identity line and closed unique build/platform/options/directories fields; all values retained", "complete stderr-only compiler -v stream selected by exact candidate basename as GCC or Clang, requiring x86_64-linux-gnu for GCC or x86_64-pc-linux-gnu for Clang and retaining every line; Rust host identity remains x86_64-unknown-linux-gnu", "complete LF-terminated GNU or LLVM archiver identity stream selected by exact candidate basename, with every line retained", "complete stderr-only GCC -v stream requiring aarch64-linux-gnu target identity and retaining every line", "complete stdout-only clang stream requiring target aarch64-apple-darwin and retaining every line", "complete stdout-only clang-cl stream requiring x86_64-pc-windows-msvc target and CL driver identity, retaining every line", "complete stdout-only /help text with LLVM librarian identity and usage grammar, joined to an allowed archive-multicall final executable identity; help bytes are identity evidence, not a semantic version claim", "complete stdout-only LLD version stream executed with lexical argv0 windows-lld-link and requiring the COFF driver identity; every line retained"]
 version_parse_rule = "version_parse_ids and version_parse_rules are exact parallel arrays and the std-only compiled parser dispatch accepts every byte exactly once: no prefix-only match, ignored line, lossy decoding, alternate stream, unknown field, or fallback parser is admitted"
 tool_alias_allowed_role_pairs = ["rustfmt|cargo-fmt", "cargo-clippy|clippy-driver", "rust-lld|windows-lld-link", "host-cc|apple-clang", "host-cc|windows-clang-cl", "apple-clang|windows-clang-cl", "host-ar|host-ranlib", "host-ar|aarch64-linux-ar", "host-ar|apple-ar", "host-ar|windows-lib", "host-ranlib|aarch64-linux-ar", "host-ranlib|apple-ar", "host-ranlib|windows-lib", "aarch64-linux-ar|apple-ar", "aarch64-linux-ar|windows-lib", "apple-ar|windows-lib"]
-tool_alias_rule = "only an exact unordered pair in tool_alias_allowed_role_pairs may share a final device/inode/hash; each role retains its own selected lexical candidate, complete symlink chain, argv0, mode/parser, and version bytes. Policy-list lexical duplicates are only /usr/bin/clang for host-cc/apple-clang and /usr/bin/llvm-ar for host-ar/apple-ar; no inferred group transitivity, basename substitution, or hidden alias is admitted"
+tool_alias_rule = "only an exact unordered pair in tool_alias_allowed_role_pairs may share a final device/inode/hash; each role retains its own selected lexical candidate, complete symlink chain, argv0, mode/parser, and version bytes. Policy-list lexical duplicates are only /usr/bin/clang-22 and /usr/bin/clang for host-cc/apple-clang plus /usr/bin/llvm-ar-22 and /usr/bin/llvm-ar for host-ar/apple-ar; no inferred group transitivity, basename substitution, or hidden alias is admitted"
 tool_probe_working_directory = "/"
 version_probe_rule = "for every selected role in both the bootstrap pass and ordinary_tool_reprobe_rule, execute exactly the selected lexical path as argv0 plus version_argv in the closed tool_identity environment under bootstrap_control_plane_contract.tool_probe_timeout_seconds and its common poll/direct-kill/wait semantics, require zero exit and the unselected stream exactly empty, strict-parse the complete selected stream under version_parse with no NUL/CR/extra bytes and one terminal LF where that parser requires it, and bind raw version bytes/length/SHA-256 plus the full candidate/chain/final executable identity in tool_set_preimage; compiler and archiver probes are bounded inventory children rather than top-level command-matrix or Cargo rows. Both bootstrap and ordinary probes set current_dir to the exact absolute lexical value command_environment_profiles.tool_probe_working_directory. It is exactly /; it must be established as a physical directory and not a symlink, is never inherited or current_dir-derived, and is neither canonicalized nor normalized to another spelling"
 tool_resolution_rule = "rustup run supplies one leading pinned-toolchain bin directory; bootstrap parses the exact closed PATH as that one absolute physical directory followed only by /usr/bin and /bin, derives pinned-rust-sysroot as its physical parent, and substitutes {pinned-toolchain-bin} or {pinned-rust-sysroot} exactly once only at the leading whole path component of a policy candidate. Every expanded candidate is absolute, normalized, UTF-8, contained beneath its named checked root when templated, and contains no remaining brace. Select each rustup_toolchain_binary_id only at that exact directory/name, never from a shim or later PATH component. Resolve rust-lld only at the pinned sysroot's qualified-host rustlib bin path. Resolve llvm-nm, OpenSSL, and other native roles strictly by the finite role-specific candidate ordinal list: symlink_metadata ErrorKind::NotFound at any ordinal records absent, any other metadata/open/read_link error fails, the first existing candidate that resolves to an executable is selected, and every later existing executable is shadowed. Every selected/shadowed chain has at most eight links; each hop retains the lexical link path, exact raw read_link bytes, and portable Unix lstat identity, repeated paths or identities are a cycle and fail, and the final regular executable is handle-opened and identity/hash bound. Absent candidates carry no invented chain/final target, existing nonexecutables fail, and selection/hash drift fails"
@@ -3849,7 +3849,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 8
 id = "llvm-nm"
-candidate_paths = ["/usr/bin/llvm-nm", "/usr/bin/llvm-nm-22", "/usr/bin/llvm-nm-21", "/usr/bin/llvm-nm-20", "/usr/bin/llvm-nm-19", "/usr/bin/llvm-nm-18", "/usr/bin/llvm-nm-17", "/usr/bin/llvm-nm-16"]
+candidate_paths = ["/usr/bin/llvm-nm-22", "/usr/bin/llvm-nm", "/usr/bin/llvm-nm-21", "/usr/bin/llvm-nm-20", "/usr/bin/llvm-nm-19", "/usr/bin/llvm-nm-18", "/usr/bin/llvm-nm-17", "/usr/bin/llvm-nm-16"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "llvm-version-family"
@@ -3867,7 +3867,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 10
 id = "host-cc"
-candidate_paths = ["/usr/bin/cc", "/usr/bin/gcc", "/usr/bin/clang"]
+candidate_paths = ["/usr/bin/clang-22", "/usr/bin/cc", "/usr/bin/gcc", "/usr/bin/clang"]
 version_argv = ["-v"]
 version_stream = "stderr"
 version_parse = "host-c-compiler-v"
@@ -3876,7 +3876,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 11
 id = "host-ar"
-candidate_paths = ["/usr/bin/ar", "/usr/bin/gcc-ar", "/usr/bin/llvm-ar"]
+candidate_paths = ["/usr/bin/llvm-ar-22", "/usr/bin/ar", "/usr/bin/gcc-ar", "/usr/bin/llvm-ar"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "archiver-version"
@@ -3885,7 +3885,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 12
 id = "host-ranlib"
-candidate_paths = ["/usr/bin/ranlib", "/usr/bin/gcc-ranlib", "/usr/bin/llvm-ranlib"]
+candidate_paths = ["/usr/bin/llvm-ranlib-22", "/usr/bin/ranlib", "/usr/bin/gcc-ranlib", "/usr/bin/llvm-ranlib"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "archiver-version"
@@ -3912,7 +3912,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 15
 id = "apple-clang"
-candidate_paths = ["/usr/bin/clang", "/usr/local/swift/usr/bin/clang"]
+candidate_paths = ["/usr/bin/clang-22", "/usr/bin/clang", "/usr/local/swift/usr/bin/clang"]
 version_argv = ["--target=aarch64-apple-darwin", "--version"]
 version_stream = "stdout"
 version_parse = "apple-clang-version"
@@ -3921,7 +3921,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 16
 id = "apple-ar"
-candidate_paths = ["/usr/bin/llvm-ar", "/usr/bin/llvm-ar-22", "/usr/bin/llvm-ar-21", "/usr/bin/llvm-ar-20", "/usr/bin/llvm-ar-19", "/usr/bin/llvm-ar-18", "/usr/bin/llvm-ar-17", "/usr/bin/llvm-ar-16"]
+candidate_paths = ["/usr/bin/llvm-ar-22", "/usr/bin/llvm-ar", "/usr/bin/llvm-ar-21", "/usr/bin/llvm-ar-20", "/usr/bin/llvm-ar-19", "/usr/bin/llvm-ar-18", "/usr/bin/llvm-ar-17", "/usr/bin/llvm-ar-16"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "llvm-version-family"
@@ -3930,7 +3930,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 17
 id = "windows-clang-cl"
-candidate_paths = ["/usr/bin/clang-cl", "/usr/local/swift/usr/bin/clang-cl"]
+candidate_paths = ["/usr/bin/clang-cl-22", "/usr/bin/clang-cl", "/usr/local/swift/usr/bin/clang-cl"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "windows-clang-cl-version"
@@ -3939,7 +3939,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 18
 id = "windows-lib"
-candidate_paths = ["/usr/bin/llvm-lib", "/usr/bin/llvm-lib-22", "/usr/bin/llvm-lib-21", "/usr/bin/llvm-lib-20", "/usr/bin/llvm-lib-19", "/usr/bin/llvm-lib-18", "/usr/bin/llvm-lib-17", "/usr/bin/llvm-lib-16"]
+candidate_paths = ["/usr/bin/llvm-lib-22", "/usr/bin/llvm-lib", "/usr/bin/llvm-lib-21", "/usr/bin/llvm-lib-20", "/usr/bin/llvm-lib-19", "/usr/bin/llvm-lib-18", "/usr/bin/llvm-lib-17", "/usr/bin/llvm-lib-16"]
 version_argv = ["/help"]
 version_stream = "stdout"
 version_parse = "llvm-lib-help"
@@ -3948,7 +3948,7 @@ identity_rule = "selected-executable-and-raw-version"
 [[bootstrap_native_tool_candidate]]
 ordinal = 19
 id = "windows-lld-link"
-candidate_paths = ["/usr/bin/lld-link", "/usr/bin/lld-link-22", "/usr/bin/lld-link-21", "/usr/bin/lld-link-20", "/usr/bin/lld-link-19", "/usr/bin/lld-link-18", "/usr/bin/lld-link-17", "/usr/bin/lld-link-16"]
+candidate_paths = ["/usr/bin/lld-link-22", "/usr/bin/lld-link", "/usr/bin/lld-link-21", "/usr/bin/lld-link-20", "/usr/bin/lld-link-19", "/usr/bin/lld-link-18", "/usr/bin/lld-link-17", "/usr/bin/lld-link-16"]
 version_argv = ["--version"]
 version_stream = "stdout"
 version_parse = "lld-coff-version"
