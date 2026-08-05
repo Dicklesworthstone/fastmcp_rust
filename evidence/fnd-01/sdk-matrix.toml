@@ -902,8 +902,8 @@ self_exclusion_contract = "Self-exclude only the two scalar RHS tokens: the ASCI
 execution_receipt_policy = "byte-absent typed-unverified: this manifest records expected closures and execution inputs, not live receipts. proof_environment.network_denial_execution_status and every peers.lock offline_resolution_status/current_execution_status remain unverified until the batch-owned verifier supplies execution facts."
 artifact_count = 13
 artifact_total_bytes = 35759
-preimage_byte_length = 96185
-digest = "d81e321f79fa336ec93f8d05b7eef1df09b51485eba46fa3126d0fc1bf76a57b"
+preimage_byte_length = 96449
+digest = "86c0e91c2c249803539395fc325b504254a9b93240838b9da7bd8fdeeb16d782"
 reacceptance_rule = "A production validator must recompute this complete-input preimage from the live manifest and live lock_root bytes before positive or one-component negative evaluation. Any digest, size, manifest, artifact, command, authority, era, matrix, capability, negative-dimension, or drift-status difference is a reacceptance failure; changing only the derived fields cannot reaccept input."
 
 [validator_contract]
