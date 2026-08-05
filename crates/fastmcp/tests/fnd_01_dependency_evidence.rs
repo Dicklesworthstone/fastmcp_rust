@@ -35203,6 +35203,129 @@ activate = 1\n";
     ];
 
     const SDK_IDS: &[&str] = &["typescript", "python", "csharp", "go"];
+    struct SdkCatalogExpectation {
+        id: &'static str,
+        display_name: &'static str,
+        icon: &'static str,
+        documentation_url: Option<&'static str>,
+        repository_slug: &'static str,
+        tier: u64,
+        badge_color: &'static str,
+    }
+    const SDK_CATALOG_EXPECTATIONS: [SdkCatalogExpectation; 10] = [
+        SdkCatalogExpectation { id: "typescript", display_name: "TypeScript", icon: "square-js", documentation_url: Some("https://ts.sdk.modelcontextprotocol.io"), repository_slug: "typescript-sdk", tier: 1, badge_color: "blue" },
+        SdkCatalogExpectation { id: "python", display_name: "Python", icon: "python", documentation_url: Some("https://py.sdk.modelcontextprotocol.io"), repository_slug: "python-sdk", tier: 1, badge_color: "blue" },
+        SdkCatalogExpectation { id: "csharp", display_name: "C#", icon: "square-c", documentation_url: Some("https://csharp.sdk.modelcontextprotocol.io"), repository_slug: "csharp-sdk", tier: 1, badge_color: "blue" },
+        SdkCatalogExpectation { id: "go", display_name: "Go", icon: "golang", documentation_url: Some("https://go.sdk.modelcontextprotocol.io"), repository_slug: "go-sdk", tier: 1, badge_color: "blue" },
+        SdkCatalogExpectation { id: "java", display_name: "Java", icon: "java", documentation_url: Some("https://java.sdk.modelcontextprotocol.io"), repository_slug: "java-sdk", tier: 2, badge_color: "purple" },
+        SdkCatalogExpectation { id: "rust", display_name: "Rust", icon: "rust", documentation_url: Some("https://rust.sdk.modelcontextprotocol.io"), repository_slug: "rust-sdk", tier: 2, badge_color: "purple" },
+        SdkCatalogExpectation { id: "swift", display_name: "Swift", icon: "swift", documentation_url: None, repository_slug: "swift-sdk", tier: 3, badge_color: "orange" },
+        SdkCatalogExpectation { id: "ruby", display_name: "Ruby", icon: "gem", documentation_url: Some("https://ruby.sdk.modelcontextprotocol.io"), repository_slug: "ruby-sdk", tier: 3, badge_color: "orange" },
+        SdkCatalogExpectation { id: "php", display_name: "PHP", icon: "php", documentation_url: Some("https://php.sdk.modelcontextprotocol.io"), repository_slug: "php-sdk", tier: 3, badge_color: "orange" },
+        SdkCatalogExpectation { id: "kotlin", display_name: "Kotlin", icon: "square-k", documentation_url: Some("https://kotlin.sdk.modelcontextprotocol.io"), repository_slug: "kotlin-sdk", tier: 3, badge_color: "orange" },
+    ];
+    struct SdkPeerExpectation {
+        id: &'static str,
+        display_name: &'static str,
+        ecosystem: &'static str,
+        repository_slug: &'static str,
+        version: &'static str,
+        source_commit: &'static str,
+        capability_path: &'static str,
+        capability_byte_length: u64,
+        capability_sha256: &'static str,
+        legacy_wire_era: &'static str,
+        modern_wire_era: &'static str,
+        legacy_evidence: &'static str,
+        modern_evidence: &'static str,
+        reproduction_script_sha256: &'static str,
+    }
+    const SDK_PEER_EXPECTATIONS: [SdkPeerExpectation; 4] = [
+        SdkPeerExpectation {
+            id: "typescript", display_name: "TypeScript", ecosystem: "npm",
+            repository_slug: "typescript-sdk", version: "2.0.0",
+            source_commit: "cc4b41617ce3601b1290d67216ea0b194a3cd9ac",
+            capability_path: "packages/core-internal/src/shared/protocolEras.ts",
+            capability_byte_length: 2300,
+            capability_sha256: "cf1a910994701c5d3d1924720844c406f95e5482217a8d809580266a45e4866f",
+            legacy_wire_era: "legacy initialize-handshake",
+            modern_wire_era: "modern server/discover plus per-request _meta envelope",
+            legacy_evidence: "The source classifies 2025-11-25 and earlier as the legacy initialize-handshake era; 2024-11-05 is in that earlier set.",
+            modern_evidence: "The source declares 2026-07-28 the first modern version, negotiable through server/discover with an envelope on every request.",
+            reproduction_script_sha256: "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9",
+        },
+        SdkPeerExpectation {
+            id: "python", display_name: "Python", ecosystem: "PyPI",
+            repository_slug: "python-sdk", version: "2.0.0",
+            source_commit: "6f69a3758ebf2ee55ce050f58b470ce11af71133",
+            capability_path: "src/mcp-types/mcp_types/version.py",
+            capability_byte_length: 2785,
+            capability_sha256: "e244c0bb0dda774b50af4a2f1a2145be6511794fdfd63e6a6c7afe60ee62e51e",
+            legacy_wire_era: "legacy initialize-handshake",
+            modern_wire_era: "modern server/discover plus per-request metadata",
+            legacy_evidence: "The exact known-version registry includes 2024-11-05, and its handshake-version registry includes that version.",
+            modern_evidence: "The exact known-version registry includes 2026-07-28 as the sole modern version and documents its per-request-envelope path.",
+            reproduction_script_sha256: "9c733d9399c77ab8411662ab39f12bf5755a306817250fb8523f10b56057291d",
+        },
+        SdkPeerExpectation {
+            id: "csharp", display_name: "C#", ecosystem: "NuGet",
+            repository_slug: "csharp-sdk", version: "2.0.0",
+            source_commit: "15f8b2da110b574a1c20a35a8c629cea4095c7be",
+            capability_path: "src/Common/McpProtocolVersions.cs",
+            capability_byte_length: 5360,
+            capability_sha256: "394b012e4f53bac0e0d6fa46652b099727d58ce02c074f2bcac79ad333f7d628",
+            legacy_wire_era: "legacy initialize-handshake",
+            modern_wire_era: "per-request metadata without initialize",
+            legacy_evidence: "The exact supported-version array includes November2024ProtocolVersion in its initialize-handshake subset.",
+            modern_evidence: "The exact supported-version array includes July2026ProtocolVersion in its per-request-metadata subset.",
+            reproduction_script_sha256: "a5b3c164dde83de2edb27027eb413d7979f71bfd95b99517bfc38cf76af4f19c",
+        },
+        SdkPeerExpectation {
+            id: "go", display_name: "Go", ecosystem: "Go modules",
+            repository_slug: "go-sdk", version: "v1.7.0",
+            source_commit: "bc72835f62eb94d0fb484439f886b6885b075f36",
+            capability_path: "README.md",
+            capability_byte_length: 6182,
+            capability_sha256: "b139b8fe162c6b79a160d4b0c10ab73b56ed9ae437a7ef21c6d184d7e2e38bab",
+            legacy_wire_era: "legacy initialize-handshake",
+            modern_wire_era: "modern stateless/per-request metadata",
+            legacy_evidence: "The v1.7.0+ compatibility table lists 2024-11-05 among all supported MCP specifications.",
+            modern_evidence: "The v1.7.0+ compatibility table lists 2026-07-28 as latest and supported.",
+            reproduction_script_sha256: "f493691b8fce43938bcfa4fd27ec834fac970a3e863f86bcfbf0948e48dddebf",
+        },
+    ];
+    const SDK_VENDORED_EXPECTATIONS: [(&str, &str, u64, &str); 13] = [
+        ("sdk-tier-catalog", "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx", 4330, "c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77"),
+        ("typescript-consumer-manifest", "evidence/fnd-01/sdk-locks/typescript-package.json", 193, "042241e616629b524bb259fe0b4ffb75c055b8564cfdd5a2b78ac3ef0d4d83b5"),
+        ("typescript-package-lock", "evidence/fnd-01/sdk-locks/typescript-package-lock.json", 6011, "0a068c8f409b9c09e57a16280a7bc56859d6810cf91b98317176bc7a1a87c70a"),
+        ("python-requirements-lock", "evidence/fnd-01/sdk-locks/python-requirements.lock", 2727, "735dc6f345e180c780bd44284e993ed3550669d19424285b9856b39a74b7a1e9"),
+        ("csharp-consumer-project", "evidence/fnd-01/sdk-locks/csharp-consumer.csproj", 299, "42bb711ecc3bfae27c203a664b32b44f049861e729cd78bfd2034691d1fc6f73"),
+        ("csharp-packages-lock", "evidence/fnd-01/sdk-locks/csharp-packages.lock.json", 5928, "2fa1a5a2d9e57debe29e41b34b6e08dc8dae988937e717663d22f5ee51ada2f2"),
+        ("csharp-project-assets-closure", "evidence/fnd-01/sdk-locks/csharp-project-assets-closure.json", 5565, "6b3b7195ced5b6e3f2a7bc6236b7795c91f2c6cadd623f051cdce571ce8f11b3"),
+        ("go-consumer-module", "evidence/fnd-01/sdk-locks/go-consumer.mod", 108, "c64b1f4d3915d52422d4b37a174458f37faa922faa3bcb910a68d9fe64165fd8"),
+        ("go-consumer-sum", "evidence/fnd-01/sdk-locks/go-consumer.sum", 2028, "3217ba72b22c5fffe92b8c0d35c6925a2564d8100a9b4b9fa5080a4fae91a4e4"),
+        ("go-consumer-resolved-modules-lock", "evidence/fnd-01/sdk-locks/go-consumer-modules.lock.json", 2679, "ca8c375c4090d64f8658a081a4c815206ccfef126ed28692ca446eb504e73b61"),
+        ("go-module-file", "evidence/fnd-01/sdk-locks/go-sdk.mod", 480, "8679c6a4a8447d6d2d7e3ac99e922161ba1a0eaa881d7666d503cc473cdbc8a3"),
+        ("go-sum-file", "evidence/fnd-01/sdk-locks/go-sdk.sum", 1833, "1c855ba6f1dbddbe295ac0027add07877cd022198bc32e7bec3731dcb8df3142"),
+        ("go-publisher-context-modules", "evidence/fnd-01/sdk-locks/go-modules.lock.json", 3578, "e3539049baab393d2cdeb585c3762e39f179f65dca1e32d44abcece05f419285"),
+    ];
+    const SDK_REGISTRY_ARTIFACT_SHA256: [(&str, &str); 9] = [
+        ("npm-core-2.0.0", "e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6"),
+        ("npm-client-2.0.0", "cb470b0249b4a06e262145ab2281ea25344e77608f312a5a52ab4dcc26bfa732"),
+        ("npm-server-2.0.0", "b4f0dfda3b73b322f1091b86fabe568994eb2fedef873b12db2c54adc3cfe198"),
+        ("pypi-mcp-2.0.0-wheel", "1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6"),
+        ("pypi-mcp-2.0.0-sdist", "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728"),
+        ("nuget-modelcontextprotocol-2.0.0", "20c858661ef286c0e32ef06a18408b761f71821d2999a8b38cb0dad46f45358d"),
+        ("go-sdk-v1.7.0-info", "8a5347c2c7af752bf873c9cb3be2042d83d581681b524ec8171a21646d33d49e"),
+        ("go-sdk-v1.7.0-mod", "8679c6a4a8447d6d2d7e3ac99e922161ba1a0eaa881d7666d503cc473cdbc8a3"),
+        ("go-sdk-v1.7.0-zip", "324a2a6956be6b4aa8a92057cf2ac71ad91bdbbf4dd3d9a00a192e789843a320"),
+    ];
+    const SDK_ARTIFACT_SET_SHA256: [(&str, &str); 4] = [
+        ("typescript", "46b505d94e0aa37b2f57ef1abaa121ce85b6996ebb98ff72e150e9497963463c"),
+        ("python", "8f72fd6f900f45042c267bb08459b75ff65056cc8d21ea3796e5168600af86f7"),
+        ("csharp", "59d0b1482863fa058d0e5b5eed6c63c8712a7f4b6149766980d074d254deddd6"),
+        ("go", "28a4c26f4798912de71bf367d5277e1285040c207845aceb2e58fe881d5c18ef"),
+    ];
     const RNG_PACKAGE_IDS: &[&str] = &[
         "fastrand",
         "getrandom",
@@ -36988,6 +37111,206 @@ activate = 1\n";
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSdkMatrix {
         results: Vec<ParsedSdkPeerResult>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ValidatedSdkStaticPeer {
+        sdk_id: String,
+        ecosystem: String,
+        source_selector: String,
+        source_commit: String,
+        reproduction_script_sha256: String,
+        checked_lock_sha256: String,
+        artifact_count: usize,
+        artifact_set_sha256: String,
+        expected_execution: SdkExpectedExecution,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ValidatedSdkStaticEvidence {
+        complete_input_sha256: String,
+        peers: Vec<ValidatedSdkStaticPeer>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SdkExpectedExecution {
+        Npm {
+            closure_sha256: String,
+        },
+        Pip {
+            filename_closure_sha256: String,
+            content_closure_sha256: String,
+        },
+        Nuget {
+            canonical_lock_sha256: String,
+            project_assets_sha256: String,
+            package_count: usize,
+        },
+        Go {
+            resolved_module_lock_sha256: String,
+            closure_sha256: String,
+            module_count: usize,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkObservationBinding {
+        sdk_id: String,
+        source_selector: String,
+        source_commit: String,
+        reproduction_script_sha256: String,
+        script_exit: i64,
+        result: String,
+        network_denial_probe_observed: bool,
+        online_offline_equal: bool,
+        offline_resolution_succeeded: bool,
+        checked_lock_sha256: String,
+        artifact_set_sha256: String,
+        observed_at_utc: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SdkExecutionObservation {
+        Npm {
+            binding: SdkObservationBinding,
+            node_version: String,
+            npm_version: String,
+            online_exit: i64,
+            offline_exit: i64,
+            closure_compare_exit: i64,
+            network_denial_exit: i64,
+            network_denial_stderr: String,
+            portable_directory_name_verified: bool,
+            native_package_filenames_staged: bool,
+            install_scripts_disabled: bool,
+            offline_cache_only: bool,
+            online_offline_closure_equal: bool,
+            online_closure_sha256: String,
+            offline_closure_sha256: String,
+            checked_in_lock_sha256_after_install: String,
+        },
+        Pip {
+            binding: SdkObservationBinding,
+            python_version: String,
+            pip_version: String,
+            online_exit: i64,
+            offline_exit: i64,
+            filename_compare_exit: i64,
+            content_compare_exit: i64,
+            network_denial_exit: i64,
+            network_denial_stderr: String,
+            no_index: bool,
+            require_hashes: bool,
+            wheels_only: bool,
+            filename_closure_equal: bool,
+            content_closure_equal: bool,
+            downloaded_wheel_count: usize,
+            online_filename_closure_sha256: String,
+            offline_filename_closure_sha256: String,
+            online_content_closure_sha256: String,
+            offline_content_closure_sha256: String,
+            checked_in_lock_sha256_after_download: String,
+        },
+        Nuget {
+            binding: SdkObservationBinding,
+            dotnet_sdk_version: String,
+            resolver_sdk_archive_sha256: String,
+            online_restore_exit: i64,
+            offline_restore_exit: i64,
+            assets_compare_exit: i64,
+            network_denial_exit: i64,
+            network_denial_stderr: String,
+            online_lock_matches_vendored_canonical_json: bool,
+            offline_lock_unchanged: bool,
+            raw_assets_digest_is_path_specific: bool,
+            online_offline_project_assets_equal: bool,
+            vendored_project_assets_projection_equal: bool,
+            locked_mode: bool,
+            no_cache: bool,
+            empty_feed_only: bool,
+            restored_package_count: usize,
+            generated_lock_canonical_sha256: String,
+            offline_restore_stdout_raw_sha256: String,
+            offline_restore_stderr_sha256: String,
+            offline_project_assets_raw_sha256: String,
+            online_project_assets_sha256: String,
+            offline_project_assets_sha256: String,
+            checked_in_lock_sha256_before_restore: String,
+            checked_in_lock_sha256_after_restore: String,
+        },
+        Go {
+            binding: SdkObservationBinding,
+            go_version: String,
+            online_download_exit: i64,
+            online_list_exit: i64,
+            offline_download_exit: i64,
+            offline_list_exit: i64,
+            lock_compare_exit: i64,
+            closure_compare_exit: i64,
+            network_denial_exit: i64,
+            network_denial_stderr: String,
+            offline_goenv: String,
+            offline_gotoolchain: String,
+            offline_goproxy: String,
+            offline_gosumdb: String,
+            offline_govcs: String,
+            fresh_task_gocache: bool,
+            online_seeded_gomodcache: bool,
+            sandbox_network_denial_active: bool,
+            root_sdk_module_entry_verified: bool,
+            external_consumer_root_sdk_entry_verified: bool,
+            online_offline_lock_and_module_list_equal: bool,
+            resolved_module_count: usize,
+            online_resolved_module_lock_sha256: String,
+            offline_resolved_module_lock_sha256: String,
+            online_closure_sha256: String,
+            offline_closure_sha256: String,
+            checked_in_consumer_sum_sha256: String,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkExecutionBundle {
+        source_id: String,
+        raw_byte_length: u64,
+        raw_sha256: String,
+        raw_bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ParsedSdkExecutionBundle {
+        complete_input_sha256: String,
+        observations: Vec<SdkExecutionObservation>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ExternalSdkExecutionFacts {
+        Absent,
+        Present(SdkExecutionBundle),
+    }
+
+    impl ExternalSdkExecutionFacts {
+        fn present_from_batch_owned_json(raw_bytes: Vec<u8>) -> Self {
+            Self::Present(SdkExecutionBundle {
+                source_id: "batch_verify/sdk-execution-facts-v1".to_owned(),
+                raw_byte_length: u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+                raw_sha256: lower_hex(&sha256(&raw_bytes)),
+                raw_bytes,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ExecutionValidation {
+        Unverified,
+        Verified(Vec<ParsedSdkPeerResult>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkValidation {
+        static_evidence: ValidatedSdkStaticEvidence,
+        execution: ExecutionValidation,
+        support_claim: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71525,10 +71848,20 @@ activate = 1\n";
         policy_bytes: &[u8],
         _source_tree: [u8; 32],
         source_files: &[LoadedFile],
+        external_sdk_facts: ExternalSdkExecutionFacts,
         report: &mut Report,
     ) -> VResult<()> {
         let rs256_vectors = parse_rs256_source_vectors(source_files)?;
-        let sdk_source_results = parse_sdk_source_evidence(source_files, policy)?;
+        let sdk_static_validation = fnd_01_sdk_matrix_validate(
+            source_files,
+            policy,
+            ExternalSdkExecutionFacts::Absent,
+        )?;
+        if sdk_static_validation.execution != ExecutionValidation::Unverified
+            || sdk_static_validation.support_claim
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", "SDK static boundary"));
+        }
         let expected_relative = validate_receipt_matrix(policy)?;
         let integration = resolve_safe(root, &policy.paths.integration_root, "integration root")?;
         let final_attestation = resolve_safe(
@@ -71616,6 +71949,12 @@ activate = 1\n";
                 return Ok(());
             }
         }
+
+        let sdk_source_results = parse_sdk_source_evidence(
+            source_files,
+            policy,
+            external_sdk_facts,
+        )?;
 
         let authoring = load_actual_authoring_bindings(root, policy, policy_bytes)?;
         let output_by_id = policy
@@ -72448,6 +72787,2013 @@ activate = 1\n";
             .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", subject).at(sdk_id))
     }
 
+    fn sdk_json_error(subject: &str, field: &str) -> Diagnostic {
+        Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at(field)
+    }
+
+    fn sdk_json_object<'a>(
+        value: &'a StrictJson,
+        subject: &str,
+        field: &str,
+    ) -> VResult<&'a BTreeMap<String, StrictJson>> {
+        match value {
+            StrictJson::Object(value) => Ok(value),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_json_array<'a>(
+        value: &'a StrictJson,
+        subject: &str,
+        field: &str,
+    ) -> VResult<&'a [StrictJson]> {
+        match value {
+            StrictJson::Array(value) => Ok(value),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_json_exact_fields(
+        object: &BTreeMap<String, StrictJson>,
+        required: &[&str],
+        optional: &[&str],
+        subject: &str,
+    ) -> VResult<()> {
+        if required.iter().any(|field| !object.contains_key(*field))
+            || object.keys().any(|field| {
+                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+            })
+        {
+            return Err(sdk_json_error(subject, "exact object fields"));
+        }
+        Ok(())
+    }
+
+    fn sdk_json_field<'a>(
+        object: &'a BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<&'a StrictJson> {
+        object
+            .get(field)
+            .ok_or_else(|| sdk_json_error(subject, field))
+    }
+
+    fn sdk_json_string<'a>(
+        object: &'a BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<&'a str> {
+        match sdk_json_field(object, field, subject)? {
+            StrictJson::String(value)
+                if !value.is_empty()
+                    && !value.as_bytes().contains(&0)
+                    && !value.chars().any(char::is_control) => Ok(value),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_json_u64(
+        object: &BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<u64> {
+        match sdk_json_field(object, field, subject)? {
+            StrictJson::Number(value) => value
+                .as_u64()
+                .ok_or_else(|| sdk_json_error(subject, field)),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_json_i64(
+        object: &BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<i64> {
+        match sdk_json_field(object, field, subject)? {
+            StrictJson::Number(value) => value
+                .as_i64()
+                .ok_or_else(|| sdk_json_error(subject, field)),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_json_usize(
+        object: &BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<usize> {
+        usize::try_from(sdk_json_u64(object, field, subject)?)
+            .map_err(|_| sdk_json_error(subject, field))
+    }
+
+    fn sdk_json_bool(
+        object: &BTreeMap<String, StrictJson>,
+        field: &str,
+        subject: &str,
+    ) -> VResult<bool> {
+        match sdk_json_field(object, field, subject)? {
+            StrictJson::Bool(value) => Ok(*value),
+            _ => Err(sdk_json_error(subject, field)),
+        }
+    }
+
+    fn sdk_base64_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    fn validate_sdk_base64(text: &str, decoded_bytes: usize, subject: &str) -> VResult<()> {
+        let expected_length = decoded_bytes
+            .checked_add(2)
+            .and_then(|length| length.checked_div(3))
+            .and_then(|length| length.checked_mul(4))
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_HASH", subject))?;
+        if text.len() != expected_length || !text.is_ascii() {
+            return Err(Diagnostic::error("E_SDK_NATIVE_HASH", subject));
+        }
+        let padding = match decoded_bytes % 3 {
+            0 => 0,
+            1 => 2,
+            2 => 1,
+            _ => unreachable!("modulo three"),
+        };
+        let data_length = text.len()
+            .checked_sub(padding)
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_HASH", subject))?;
+        if text.as_bytes()[..data_length]
+            .iter()
+            .any(|byte| sdk_base64_value(*byte).is_none())
+            || text.as_bytes()[data_length..].iter().any(|byte| *byte != b'=')
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_HASH", subject));
+        }
+        let last = sdk_base64_value(text.as_bytes()[data_length - 1])
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_HASH", subject))?;
+        if (padding == 2 && last & 0x0f != 0) || (padding == 1 && last & 0x03 != 0) {
+            return Err(Diagnostic::error("E_SDK_NATIVE_HASH", subject)
+                .at("noncanonical tail bits"));
+        }
+        Ok(())
+    }
+
+    fn validate_sdk_h1(text: &str, subject: &str) -> VResult<()> {
+        let encoded = text
+            .strip_prefix("h1:")
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_HASH", subject))?;
+        validate_sdk_base64(encoded, 32, subject)
+    }
+
+    fn validate_sdk_sha512_integrity(text: &str, subject: &str) -> VResult<()> {
+        let encoded = text
+            .strip_prefix("sha512-")
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_HASH", subject))?;
+        validate_sdk_base64(encoded, 64, subject)
+    }
+
+    fn sdk_canonical_ids(ids: &[String]) -> Vec<u8> {
+        let mut canonical = ids.to_vec();
+        canonical.sort();
+        let mut encoded = canonical.join("\n").into_bytes();
+        encoded.push(b'\n');
+        encoded
+    }
+
+    fn sdk_catalog_cells<'a>(line: &'a str, subject: &str) -> VResult<[&'a str; 3]> {
+        let cells = line.split('|').collect::<Vec<_>>();
+        if cells.len() != 5 || !cells[0].is_empty() || !cells[4].trim().is_empty() {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("MDX row grammar"));
+        }
+        Ok([cells[1].trim(), cells[2].trim(), cells[3].trim()])
+    }
+
+    fn validate_sdk_catalog(
+        root: &toml::map::Map<String, toml::Value>,
+        files: &[LoadedFile],
+    ) -> VResult<()> {
+        let subject = "SDK matrix structural catalog";
+        let catalog = record_table(root, "catalog", subject)?;
+        let catalog_file = source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx",
+        )?;
+        if record_string(catalog, "repository", subject)?
+                != "https://github.com/modelcontextprotocol/modelcontextprotocol"
+            || record_string(catalog, "revision", subject)?
+                != "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+            || record_string(catalog, "upstream_path", subject)?
+                != "docs/docs/2026-07-28/sdk.mdx"
+            || record_string(catalog, "vendored_path", subject)? != catalog_file.contract.path
+            || record_string(catalog, "media_type", subject)? != "text/mdx; charset=utf-8"
+            || record_u64(catalog, "byte_length", subject)?
+                != u64::try_from(catalog_file.bytes.len()).unwrap_or(u64::MAX)
+            || record_string(catalog, "sha256", subject)?
+                != lower_hex(&sha256(&catalog_file.bytes))
+            || !record_bool(catalog, "retrieval_url_is_commit_addressed", subject)?
+            || !record_bool(catalog, "bytes_unmodified_requirement", subject)?
+            || record_bool(catalog, "matrix_order_significant", subject)?
+            || !record_bool(catalog, "duplicate_check_precedes_set_comparison", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject));
+        }
+        let source_page = format!(
+            "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/{}/{}",
+            record_string(catalog, "revision", subject)?,
+            record_string(catalog, "upstream_path", subject)?,
+        );
+        let retrieval = format!(
+            "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/{}/{}",
+            record_string(catalog, "revision", subject)?,
+            record_string(catalog, "upstream_path", subject)?,
+        );
+        if record_string(catalog, "source_page_url", subject)? != source_page
+            || record_string(catalog, "retrieval_url", subject)? != retrieval
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("commit URL"));
+        }
+        let drift = record_table(catalog, "live_drift_observation", subject)?;
+        if record_string(drift, "inspected_on", subject)? != "2026-08-03"
+            || record_string(drift, "repository_default_branch", subject)? != "main"
+            || record_string(drift, "inspected_revision", subject)?
+                != "e24f0099b60f7c00e165a0faa02a72029d2fa654"
+            || record_string(drift, "inspected_revision_author_date_utc", subject)?
+                != "2026-08-02T23:44:41Z"
+            || record_string(drift, "upstream_path", subject)?
+                != "docs/docs/2026-07-28/sdk.mdx"
+            || record_u64(drift, "byte_length", subject)? != 4_330
+            || record_string(drift, "sha256", subject)?
+                != "ac79b8a85bc451e63343d2c0feff9ed4277927d68b19276c5befb753eb73f065"
+            || !record_bool(drift, "byte_drift_from_frozen_catalog", subject)?
+            || !record_bool(drift, "tier_assignment_drift_from_frozen_catalog", subject)?
+            || record_bool(drift, "tier1_peer_set_drift_from_frozen_catalog", subject)?
+            || !string_sequence_is(
+                &record_string_array(drift, "reported_drift", subject)?,
+                &[
+                    "catalog bytes changed after the freeze",
+                    "ruby moved from Tier 3 to Tier 2 after the freeze",
+                ],
+            )
+            || record_bool(drift, "frozen_catalog_or_peer_artifacts_replaced", subject)?
+            || record_bool(drift, "authority_changed", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("live drift"));
+        }
+
+        let text = std::str::from_utf8(&catalog_file.bytes)
+            .map_err(|_| Diagnostic::error("E_SDK_CATALOG", subject).at("UTF-8"))?;
+        if text.as_bytes().contains(&b'\r') || !text.ends_with('\n') {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("line endings"));
+        }
+        let lines = text.lines().collect::<Vec<_>>();
+        let header_offsets = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                sdk_catalog_cells(line, subject)
+                    .ok()
+                    .filter(|cells| *cells == ["SDK", "Repository", "Tier"])
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        if header_offsets.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("table header"));
+        }
+        let header = header_offsets[0];
+        let alignment = lines
+            .get(header + 1)
+            .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at("alignment row"))?;
+        let alignment_cells = sdk_catalog_cells(alignment, subject)?;
+        if !alignment_cells[0].starts_with(':')
+            || alignment_cells[0].trim_matches(&[':', '-'][..]).len() != 0
+            || !alignment_cells[1].starts_with(':')
+            || alignment_cells[1].trim_matches(&[':', '-'][..]).len() != 0
+            || !alignment_cells[2].ends_with(':')
+            || alignment_cells[2].trim_matches(&[':', '-'][..]).len() != 0
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("alignment row"));
+        }
+        for (index, expected) in SDK_CATALOG_EXPECTATIONS.iter().enumerate() {
+            let row = lines
+                .get(header + 2 + index)
+                .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at("missing row"))?;
+            let cells = sdk_catalog_cells(row, subject)?;
+            let sdk_cell = match expected.documentation_url {
+                Some(url) => format!(
+                    "<Icon icon=\"{}\" size={{24}} /> &nbsp; [{}]({url})",
+                    expected.icon,
+                    expected.display_name,
+                ),
+                None => format!(
+                    "<Icon icon=\"{}\" size={{24}} /> &nbsp; {}",
+                    expected.icon,
+                    expected.display_name,
+                ),
+            };
+            let repository_cell = format!(
+                "[modelcontextprotocol/{}](https://github.com/modelcontextprotocol/{})",
+                expected.repository_slug,
+                expected.repository_slug,
+            );
+            let tier_cell = format!(
+                "<Badge color=\"{}\" shape=\"pill\">Tier&nbsp;{}</Badge>",
+                expected.badge_color,
+                expected.tier,
+            );
+            if cells != [sdk_cell.as_str(), repository_cell.as_str(), tier_cell.as_str()] {
+                return Err(Diagnostic::error("E_SDK_CATALOG", subject)
+                    .at(format!("catalog row {}", expected.id)));
+            }
+        }
+        if lines.get(header + 2 + SDK_CATALOG_EXPECTATIONS.len()).is_some_and(|line| {
+            sdk_catalog_cells(line, subject).is_ok()
+        }) {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("extra SDK row"));
+        }
+
+        let entries = record_array(catalog, "entries", subject)?;
+        if entries.len() != SDK_CATALOG_EXPECTATIONS.len() {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("entry count"));
+        }
+        let mut tier_ids = BTreeMap::<u64, Vec<String>>::new();
+        let mut seen = BTreeSet::new();
+        for (value, expected) in entries.iter().zip(&SDK_CATALOG_EXPECTATIONS) {
+            let entry = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at(expected.id))?;
+            let repository = format!(
+                "https://github.com/modelcontextprotocol/{}",
+                expected.repository_slug,
+            );
+            if record_string(entry, "id", subject)? != expected.id
+                || record_string(entry, "display_name", subject)? != expected.display_name
+                || record_u64(entry, "tier", subject)? != expected.tier
+                || record_string(entry, "repository", subject)? != repository
+                || record_bool(entry, "included", subject)? != (expected.tier == 1)
+                || !seen.insert(expected.id)
+                || (expected.tier != 1
+                    && record_string(entry, "exclusion_reason", subject)?.is_empty())
+            {
+                return Err(Diagnostic::error("E_SDK_CATALOG", subject).at(expected.id));
+            }
+            tier_ids
+                .entry(expected.tier)
+                .or_default()
+                .push(expected.id.to_owned());
+        }
+        let tier1 = tier_ids.get(&1).cloned().unwrap_or_default();
+        let tier2 = tier_ids.get(&2).cloned().unwrap_or_default();
+        let tier3 = tier_ids.get(&3).cloned().unwrap_or_default();
+        let tier1_canonical = sdk_canonical_ids(&tier1);
+        let tier2_canonical = sdk_canonical_ids(&tier2);
+        let tier3_canonical = sdk_canonical_ids(&tier3);
+        if !string_sequence_is(&tier1, SDK_IDS)
+            || !string_sequence_is(
+                &record_string_array(catalog, "tier1_ids_in_catalog_order", subject)?,
+                SDK_IDS,
+            )
+            || !string_sequence_is(
+                &record_string_array(catalog, "tier1_ids_canonical", subject)?,
+                &["csharp", "go", "python", "typescript"],
+            )
+            || !string_sequence_is(
+                &record_string_array(catalog, "tier2_ids_canonical", subject)?,
+                &["java", "rust"],
+            )
+            || !string_sequence_is(
+                &record_string_array(catalog, "tier3_ids_canonical", subject)?,
+                &["kotlin", "php", "ruby", "swift"],
+            )
+            || record_string(catalog, "tier1_canonical_serialization", subject)?.as_bytes()
+                != tier1_canonical.as_slice()
+            || record_string(catalog, "tier1_canonical_sha256", subject)?
+                != lower_hex(&sha256(&tier1_canonical))
+            || record_string(catalog, "tier2_canonical_sha256", subject)?
+                != lower_hex(&sha256(&tier2_canonical))
+            || record_string(catalog, "tier3_canonical_sha256", subject)?
+                != lower_hex(&sha256(&tier3_canonical))
+            || record_usize(catalog, "tier1_count", subject)? != SDK_IDS.len()
+            || !string_sequence_is(
+                &record_string_array(catalog, "matrix_peer_ids", subject)?,
+                SDK_IDS,
+            )
+            || record_usize(catalog, "matrix_peer_count", subject)? != SDK_IDS.len()
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("tier joins"));
+        }
+        Ok(())
+    }
+
+    fn validate_sdk_vendored_artifacts<'a>(
+        root: &'a toml::map::Map<String, toml::Value>,
+        files: &'a [LoadedFile],
+    ) -> VResult<BTreeMap<String, &'a toml::map::Map<String, toml::Value>>> {
+        let subject = "SDK matrix vendored artifact bijection";
+        let values = record_array(root, "vendored_artifacts", subject)?;
+        if values.len() != SDK_VENDORED_EXPECTATIONS.len()
+            || record_usize(root, "artifact_count", subject)? != SDK_VENDORED_EXPECTATIONS.len()
+            || record_u64(root, "artifact_total_bytes", subject)? != 35_759
+        {
+            return Err(Diagnostic::error("E_SDK_LOCK_COUNT", subject));
+        }
+        let mut by_id = BTreeMap::new();
+        let mut paths = BTreeSet::new();
+        let mut total = 0u64;
+        for (value, (expected_id, expected_path, expected_length, expected_digest)) in
+            values.iter().zip(SDK_VENDORED_EXPECTATIONS)
+        {
+            let row = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject))?;
+            let id = record_string(row, "id", subject)?;
+            let path = record_string(row, "path", subject)?;
+            let byte_length = record_u64(row, "byte_length", subject)?;
+            let digest = record_string(row, "sha256", subject)?;
+            let file = source_lookup(files, path)?;
+            if id != expected_id
+                || path != expected_path
+                || byte_length != expected_length
+                || digest != expected_digest
+                || byte_length != u64::try_from(file.bytes.len()).unwrap_or(u64::MAX)
+                || digest != lower_hex(&sha256(&file.bytes))
+                || !paths.insert(path)
+                || by_id.insert(id.to_owned(), row).is_some()
+            {
+                return Err(Diagnostic::error("E_SDK_LOCK", subject).at(expected_id));
+            }
+            total = total
+                .checked_add(byte_length)
+                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject))?;
+        }
+        let binding = record_table(root, "complete_input_binding", subject)?;
+        if total != 35_759
+            || record_usize(binding, "artifact_count", subject)? != SDK_VENDORED_EXPECTATIONS.len()
+            || record_u64(binding, "artifact_total_bytes", subject)? != total
+        {
+            return Err(Diagnostic::error("E_SDK_LOCK", subject).at("artifact total"));
+        }
+        Ok(by_id)
+    }
+
+    fn validate_sdk_peer_identity_and_eras(
+        peer: &toml::map::Map<String, toml::Value>,
+        expected: &SdkPeerExpectation,
+    ) -> VResult<()> {
+        let subject = format!("SDK peer {}", expected.id);
+        let repository = format!(
+            "https://github.com/modelcontextprotocol/{}",
+            expected.repository_slug,
+        );
+        let source_commit_url = format!("{repository}/commit/{}", expected.source_commit);
+        if record_string(peer, "id", &subject)? != expected.id
+            || record_string(peer, "display_name", &subject)? != expected.display_name
+            || record_string(peer, "ecosystem", &subject)? != expected.ecosystem
+            || record_u64(peer, "tier_at_freeze", &subject)? != 1
+            || record_string(peer, "repository", &subject)? != repository
+            || record_string(peer, "version", &subject)? != expected.version
+            || record_string(peer, "source_commit", &subject)? != expected.source_commit
+            || record_string(peer, "source_commit_url", &subject)? != source_commit_url
+        {
+            return Err(Diagnostic::error("E_SDK_PEER_ORDER", &subject));
+        }
+        match expected.id {
+            "typescript" => {
+                let tags = record_array(peer, "tags", &subject)?;
+                let expected_names = [
+                    "@modelcontextprotocol/client@2.0.0",
+                    "@modelcontextprotocol/core@2.0.0",
+                    "@modelcontextprotocol/server@2.0.0",
+                ];
+                if record_string(peer, "tag_kind", &subject)? != "annotated"
+                    || tags.len() != expected_names.len()
+                {
+                    return Err(Diagnostic::error("E_SDK_SOURCE", &subject).at("tags"));
+                }
+                for (value, name) in tags.iter().zip(expected_names) {
+                    let tag = value
+                        .as_table()
+                        .ok_or_else(|| Diagnostic::error("E_SDK_SOURCE", &subject).at("tag"))?;
+                    let object = record_string(tag, "tag_object_sha1", &subject)?;
+                    if record_string(tag, "name", &subject)? != name
+                        || record_string(tag, "peeled_commit", &subject)?
+                            != expected.source_commit
+                        || object.len() != 40
+                        || !object.bytes().all(|byte| {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                        })
+                    {
+                        return Err(Diagnostic::error("E_SDK_SOURCE", &subject).at("tag"));
+                    }
+                }
+            }
+            "python" | "csharp" => {
+                if record_string(peer, "source_tag", &subject)? != "v2.0.0"
+                    || record_string(peer, "source_tag_kind", &subject)? != "lightweight"
+                {
+                    return Err(Diagnostic::error("E_SDK_SOURCE", &subject).at("source tag"));
+                }
+            }
+            "go" => {
+                let object = record_string(peer, "source_tag_object_sha1", &subject)?;
+                if record_string(peer, "source_tag", &subject)? != "v1.7.0"
+                    || record_string(peer, "source_tag_kind", &subject)? != "annotated"
+                    || object != "25cb00203c6b693780f602ab4041c06f7f4b9570"
+                {
+                    return Err(Diagnostic::error("E_SDK_SOURCE", &subject).at("source tag"));
+                }
+            }
+            _ => return Err(Diagnostic::error("E_SDK_POLICY", &subject)),
+        }
+        let eras = record_array(peer, "era_capabilities", &subject)?;
+        if eras.len() != 2 {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                &subject,
+            ));
+        }
+        let mut by_version = BTreeMap::new();
+        for value in eras {
+            let era = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error(
+                    "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                    &subject,
+                ))?;
+            let version = record_string(era, "protocol_version", &subject)?;
+            if by_version.insert(version, era).is_some() {
+                return Err(Diagnostic::error(
+                    "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                    &subject,
+                ));
+            }
+        }
+        for (version, wire, evidence) in [
+            ("2024-11-05", expected.legacy_wire_era, expected.legacy_evidence),
+            ("2026-07-28", expected.modern_wire_era, expected.modern_evidence),
+        ] {
+            let era = by_version.get(version).ok_or_else(|| Diagnostic::error(
+                "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                &subject,
+            ))?;
+            let source_page = format!(
+                "{repository}/blob/{}/{}",
+                expected.source_commit,
+                expected.capability_path,
+            );
+            let retrieval = format!(
+                "https://raw.githubusercontent.com/modelcontextprotocol/{}/{}/{}",
+                expected.repository_slug,
+                expected.source_commit,
+                expected.capability_path,
+            );
+            if record_string(era, "support_state", &subject)? != "supported"
+                || record_string(era, "wire_era", &subject)? != wire
+                || record_string(era, "source_page_url", &subject)? != source_page
+                || record_string(era, "retrieval_url", &subject)? != retrieval
+                || record_u64(era, "byte_length", &subject)?
+                    != expected.capability_byte_length
+                || record_string(era, "sha256", &subject)? != expected.capability_sha256
+                || record_string(era, "evidence", &subject)? != evidence
+            {
+                return Err(Diagnostic::error(
+                    "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                    &subject,
+                ).at(version));
+            }
+        }
+        Ok(())
+    }
+
+    fn derive_sdk_registry_artifacts(
+        document: &toml::Value,
+        policy: &Policy,
+    ) -> VResult<BTreeMap<String, Vec<SdkArtifactObservation>>> {
+        let subject = "SDK registry artifact joins";
+        let root = document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject))?;
+        let peers = record_array(root, "peers", subject)?;
+        let blueprints = policy_unmodeled_array(policy, "sdk_artifact_blueprint")?;
+        let expected_sdk_ids = [
+            "typescript", "typescript", "typescript",
+            "python", "python", "csharp", "go", "go", "go",
+        ];
+        if blueprints.len() != expected_sdk_ids.len() || peers.len() != SDK_IDS.len() {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        let mut artifacts_by_sdk = BTreeMap::<String, Vec<SdkArtifactObservation>>::new();
+        let mut artifact_ids = BTreeSet::new();
+        let mut next_artifact_index = BTreeMap::<&str, usize>::new();
+        for (index, (value, expected_sdk_id)) in
+            blueprints.iter().zip(expected_sdk_ids).enumerate()
+        {
+            let logical = format!("sdk_artifact_blueprint[{index}]");
+            let blueprint = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
+            let sdk_id = record_string(blueprint, "sdk_id", &logical)?;
+            if sdk_id != expected_sdk_id {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT_ORDER", &logical));
+            }
+            let sdk_index = SDK_IDS
+                .iter()
+                .position(|candidate| *candidate == sdk_id)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
+            let source_index = next_artifact_index.entry(sdk_id).or_default();
+            let expected_selector = format!("/peers/{sdk_index}/registry_artifacts/{}", *source_index);
+            let source_selector = record_string(blueprint, "source_selector", &logical)?;
+            if source_selector != expected_selector {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT_ORDER", &logical));
+            }
+            *source_index = (*source_index)
+                .checked_add(1)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
+            let source = pointer_get(document, source_selector, &logical)?
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
+            let peer = peers[sdk_index]
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
+            let artifact_id = record_string(blueprint, "artifact_id", &logical)?;
+            let ecosystem = record_string(blueprint, "ecosystem", &logical)?;
+            let package_id = record_string(blueprint, "package_id", &logical)?;
+            let version = record_string(blueprint, "version", &logical)?;
+            let artifact_kind = record_string(blueprint, "artifact_kind", &logical)?;
+            let source_kind = source.get("kind").and_then(toml::Value::as_str);
+            if !artifact_ids.insert(artifact_id)
+                || record_string(source, "package", &logical)? != package_id
+                || record_string(source, "version", &logical)? != version
+                || record_string(peer, "version", &logical)? != version
+                || (ecosystem == "npm" && source_kind.is_some())
+                || (ecosystem != "npm" && source_kind != Some(artifact_kind))
+            {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical));
+            }
+            let url = sdk_nonempty_source_string(source, "url", policy, &logical)?;
+            let byte_length = record_u64(source, "byte_length", &logical)?;
+            if !url.is_ascii() || !url.starts_with("https://") || byte_length == 0 {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical).at("registry URL"));
+            }
+            let sha256_source_field = record_string(blueprint, "sha256_source_field", &logical)?;
+            let artifact_sha256 = record_string(source, sha256_source_field, &logical)?;
+            validate_sha256(artifact_sha256, &logical)?;
+            let expected_artifact_sha256 = SDK_REGISTRY_ARTIFACT_SHA256
+                .iter()
+                .find(|(candidate, _)| *candidate == artifact_id)
+                .map(|(_, digest)| *digest)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical)
+                    .at("artifact identity"))?;
+            if artifact_sha256 != expected_artifact_sha256 {
+                return Err(Diagnostic::error(
+                    "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                    &logical,
+                ));
+            }
+            let integrity_fields =
+                record_string_array(blueprint, "native_integrity_source_fields", &logical)?;
+            if integrity_fields.iter().collect::<BTreeSet<_>>().len() != integrity_fields.len() {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical)
+                    .at("duplicate native integrity field"));
+            }
+            let mut native_integrity = Vec::with_capacity(integrity_fields.len());
+            for field in integrity_fields {
+                let value = sdk_nonempty_source_string(source, &field, policy, &logical)?;
+                native_integrity.push((field, value.to_owned()));
+            }
+            let commit_field = record_string(blueprint, "embedded_commit_source_field", &logical)?;
+            let embedded_commit = if commit_field.is_empty() {
+                String::new()
+            } else {
+                let commit = sdk_nonempty_source_string(source, commit_field, policy, &logical)?;
+                if commit != record_string(peer, "source_commit", &logical)?
+                    || commit.len() != 40
+                    || !commit.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    })
+                {
+                    return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical).at(commit_field));
+                }
+                commit.to_owned()
+            };
+            artifacts_by_sdk
+                .entry(sdk_id.to_owned())
+                .or_default()
+                .push(SdkArtifactObservation {
+                    sdk_id: sdk_id.to_owned(),
+                    artifact_id: artifact_id.to_owned(),
+                    source_selector: source_selector.to_owned(),
+                    ecosystem: ecosystem.to_owned(),
+                    package_id: package_id.to_owned(),
+                    version: version.to_owned(),
+                    artifact_kind: artifact_kind.to_owned(),
+                    url: url.to_owned(),
+                    byte_length,
+                    sha256_source_field: sha256_source_field.to_owned(),
+                    sha256: artifact_sha256.to_owned(),
+                    native_integrity,
+                    embedded_commit_source_field: commit_field.to_owned(),
+                    embedded_commit,
+                });
+        }
+        let counts = artifacts_by_sdk
+            .iter()
+            .map(|(id, values)| (id.as_str(), values.len()))
+            .collect::<BTreeMap<_, _>>();
+        if counts != BTreeMap::from([
+            ("csharp", 1usize),
+            ("go", 3usize),
+            ("python", 2usize),
+            ("typescript", 3usize),
+        ]) {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        Ok(artifacts_by_sdk)
+    }
+
+    fn sdk_json_string_map(
+        value: &StrictJson,
+        subject: &str,
+        field: &str,
+    ) -> VResult<BTreeMap<String, String>> {
+        let object = sdk_json_object(value, subject, field)?;
+        let mut output = BTreeMap::new();
+        for (key, value) in object {
+            if key.is_empty()
+                || key.as_bytes().contains(&0)
+                || key.chars().any(char::is_control)
+            {
+                return Err(sdk_json_error(subject, field));
+            }
+            let StrictJson::String(value) = value else {
+                return Err(sdk_json_error(subject, field));
+            };
+            if value.is_empty()
+                || value.as_bytes().contains(&0)
+                || value.chars().any(char::is_control)
+                || output.insert(key.clone(), value.clone()).is_some()
+            {
+                return Err(sdk_json_error(subject, field));
+            }
+        }
+        Ok(output)
+    }
+
+    fn sdk_artifact_integrity<'a>(
+        artifact: &'a SdkArtifactObservation,
+        field: &str,
+        subject: &str,
+    ) -> VResult<&'a str> {
+        let values = artifact
+            .native_integrity
+            .iter()
+            .filter(|(candidate, _)| candidate == field)
+            .collect::<Vec<_>>();
+        if values.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT", subject).at(field));
+        }
+        Ok(values[0].1.as_str())
+    }
+
+    fn validate_sdk_reproduction_contract(
+        peer: &toml::map::Map<String, toml::Value>,
+        expected: &SdkPeerExpectation,
+        policy: &Policy,
+    ) -> VResult<()> {
+        let subject = format!("SDK reproduction contract {}", expected.id);
+        let lock = record_table(peer, "lock", &subject)?;
+        let script = sdk_nonempty_source_string(lock, "reproduction_script", policy, &subject)?;
+        if !script.is_ascii()
+            || script.as_bytes().contains(&b'\r')
+            || !script.ends_with('\n')
+            || lower_hex(&sha256(script.as_bytes())) != expected.reproduction_script_sha256
+            || record_string(lock, "execution_fact_input", &subject)? != "external_batch_owned"
+            || record_string(lock, "offline_resolution_status", &subject)?
+                != "unverified_current_execution"
+            || record_string(lock, "current_execution_status", &subject)?
+                != "unverified_current_rch_execution"
+            || record_string(lock, "run_from", &subject)? != "repository root"
+            || !record_bool(lock, "online_offline_equality_required", &subject)?
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.execution_command_mismatch",
+                &subject,
+            ));
+        }
+        let tool_contract_holds = match expected.id {
+            "typescript" => {
+                record_string(lock, "resolver_node_version", &subject)? == "v24.12.0"
+                    && record_string(lock, "resolver_npm_version", &subject)? == "11.14.0"
+                    && record_string(lock, "lock_format", &subject)? == "npm package-lock v3"
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_tools", &subject)?,
+                        &[
+                            "node v24.12.0",
+                            "npm 11.14.0",
+                            "jq",
+                            "shasum",
+                            "/usr/bin/sandbox-exec",
+                            "/usr/bin/curl",
+                        ],
+                    )
+            }
+            "python" => {
+                record_string(lock, "resolver_host_python", &subject)? == "Python 3.14.4"
+                    && record_string(lock, "resolver_pip_version", &subject)? == "26.1"
+                    && record_string(lock, "lock_format", &subject)?
+                        == "pip requirements with exact versions and one SHA-256 wheel hash per line"
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_tools", &subject)?,
+                        &[
+                            "Python 3.14.4",
+                            "pip 26.1",
+                            "shasum",
+                            "/usr/bin/sandbox-exec",
+                            "/usr/bin/curl",
+                        ],
+                    )
+            }
+            "csharp" => {
+                record_string(lock, "resolver_dotnet_sdk", &subject)? == "10.0.100"
+                    && record_string(lock, "resolver_sdk_archive_url", &subject)?
+                        == "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.100/dotnet-sdk-10.0.100-osx-arm64.tar.gz"
+                    && record_u64(lock, "resolver_sdk_archive_byte_length", &subject)?
+                        == 229_936_839
+                    && record_string(lock, "resolver_sdk_archive_sha256", &subject)?
+                        == "71b3815ef8d83a6bbebf8627a56639600193f22d4ea6a6de2f71855c4b3e63fd"
+                    && record_string(lock, "lock_format", &subject)?
+                        == "NuGet packages.lock.json v1"
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_environment", &subject)?,
+                        &[
+                            "DOTNET_ARCHIVE points to dotnet-sdk-10.0.100-osx-arm64.tar.gz",
+                            "DOTNET_SDK points to that archive extracted without modification",
+                        ],
+                    )
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_tools", &subject)?,
+                        &[
+                            ".NET SDK 10.0.100",
+                            "jq",
+                            "shasum",
+                            "/usr/bin/sandbox-exec",
+                            "/usr/bin/curl",
+                        ],
+                    )
+            }
+            "go" => {
+                record_string(lock, "resolver_go_version", &subject)?
+                    == "go1.25.0 darwin/arm64"
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_environment", &subject)?,
+                        &["GO_1_25 points to an extracted local go1.25.0 toolchain root"],
+                    )
+                    && string_sequence_is(
+                        &record_string_array(lock, "required_tools", &subject)?,
+                        &[
+                            "go1.25.0 darwin/arm64",
+                            "jq",
+                            "shasum",
+                            "/usr/bin/sandbox-exec",
+                            "/usr/bin/curl",
+                        ],
+                    )
+            }
+            _ => return Err(Diagnostic::error("E_SDK_POLICY", &subject)),
+        };
+        if !tool_contract_holds {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.execution_command_mismatch",
+                &subject,
+            ));
+        }
+        let (online, offline) = match expected.id {
+            "typescript" => (
+                r#"cd "$ts_online" && npm_config_update_notifier=false npm ci --ignore-scripts --no-audit --no-fund --cache "$ts_cache""#,
+                r#"cd "$ts_offline" && sandbox-exec -p "(version 1) (allow default) (deny network*)" /usr/bin/env npm_config_update_notifier=false npm ci --ignore-scripts --offline --no-audit --no-fund --cache "$ts_cache""#,
+            ),
+            "python" => (
+                r#"python3 -m pip download --disable-pip-version-check --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_online" --requirement "$py_stage/requirements.lock""#,
+                r#"sandbox-exec -p "(version 1) (allow default) (deny network*)" python3 -m pip download --disable-pip-version-check --no-index --find-links "$py_online" --only-binary=:all: --platform manylinux2014_x86_64 --python-version 3.12 --implementation cp --abi cp312 --require-hashes --dest "$py_offline" --requirement "$py_stage/requirements.lock""#,
+            ),
+            "csharp" => (
+                r#"cd "$cs_online" && DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --use-lock-file -p:NuGetAudit=false"#,
+                r#"cd "$cs_offline" && sandbox-exec -p "(version 1) (allow default) (deny network*)" /usr/bin/env DOTNET_ROOT="$DOTNET_SDK" DOTNET_CLI_HOME="$cs_cli_home" NUGET_PACKAGES="$cs_cache" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 NUGET_XMLDOC_MODE=skip "$DOTNET_SDK/dotnet" restore csharp-consumer.csproj --locked-mode --no-cache --ignore-failed-sources --source "$cs_empty_feed" -p:NuGetAudit=false"#,
+            ),
+            "go" => {
+                if lock.contains_key("online_command")
+                    || lock.contains_key("offline_command")
+                    || record_string(lock, "stable_projection_command", &subject)?
+                        != "jq -s 'map({GoModSum, Origin: (.Origin // null), Path, Sum, Version}) | sort_by(.Path)'"
+                    || !string_sequence_is(
+                        &record_string_array(lock, "offline_environment", &subject)?,
+                        &[
+                            "GOENV=off",
+                            "GOTOOLCHAIN=local",
+                            "GOPROXY=off",
+                            "GOSUMDB=off",
+                            "GOVCS=*:off",
+                            "fresh task-specific GOCACHE",
+                            "online-seeded task-specific GOMODCACHE",
+                            "sandbox-exec deny network*",
+                        ],
+                    )
+                {
+                    return Err(Diagnostic::error(
+                        "fnd01.sdk_matrix.execution_command_mismatch",
+                        &subject,
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Err(Diagnostic::error("E_SDK_POLICY", &subject)),
+        };
+        if record_string(lock, "online_command", &subject)? != online
+            || record_string(lock, "offline_command", &subject)? != offline
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.execution_command_mismatch",
+                &subject,
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_sdk_npm_lock(
+        peer: &toml::map::Map<String, toml::Value>,
+        artifacts: &[SdkArtifactObservation],
+        files: &[LoadedFile],
+    ) -> VResult<SdkExpectedExecution> {
+        let subject = "TypeScript npm native lock";
+        let manifest = parse_strict_json(
+            &source_lookup(files, "evidence/fnd-01/sdk-locks/typescript-package.json")?.bytes,
+            subject,
+        )?;
+        let manifest = sdk_json_object(&manifest, subject, "package.json")?;
+        sdk_json_exact_fields(manifest, &["name", "dependencies"], &[], subject)?;
+        let expected_direct = BTreeMap::from([
+            ("@modelcontextprotocol/client".to_owned(), "2.0.0".to_owned()),
+            ("@modelcontextprotocol/core".to_owned(), "2.0.0".to_owned()),
+            ("@modelcontextprotocol/server".to_owned(), "2.0.0".to_owned()),
+        ]);
+        let direct = sdk_json_string_map(
+            sdk_json_field(manifest, "dependencies", subject)?,
+            subject,
+            "dependencies",
+        )?;
+        if sdk_json_string(manifest, "name", subject)? != "typescript-consumer"
+            || direct != expected_direct
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("package.json"));
+        }
+
+        let lock_document = parse_strict_json(
+            &source_lookup(
+                files,
+                "evidence/fnd-01/sdk-locks/typescript-package-lock.json",
+            )?.bytes,
+            subject,
+        )?;
+        let lock_root = sdk_json_object(&lock_document, subject, "package-lock.json")?;
+        sdk_json_exact_fields(
+            lock_root,
+            &["name", "lockfileVersion", "requires", "packages"],
+            &[],
+            subject,
+        )?;
+        if sdk_json_string(lock_root, "name", subject)? != "typescript-consumer"
+            || sdk_json_u64(lock_root, "lockfileVersion", subject)? != 3
+            || !sdk_json_bool(lock_root, "requires", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("lock header"));
+        }
+        let packages = sdk_json_object(
+            sdk_json_field(lock_root, "packages", subject)?,
+            subject,
+            "packages",
+        )?;
+        if packages.len() != 15 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("installed count"));
+        }
+        let root_package = sdk_json_object(
+            packages
+                .get("")
+                .ok_or_else(|| sdk_json_error(subject, "root package"))?,
+            subject,
+            "root package",
+        )?;
+        sdk_json_exact_fields(root_package, &["name", "dependencies"], &[], subject)?;
+        if sdk_json_string(root_package, "name", subject)? != "typescript-consumer"
+            || sdk_json_string_map(
+                sdk_json_field(root_package, "dependencies", subject)?,
+                subject,
+                "root dependencies",
+            )? != direct
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("root package"));
+        }
+        let mut installed = BTreeMap::<String, (&str, &str, &str)>::new();
+        let mut dependency_maps = BTreeMap::<String, BTreeMap<String, String>>::new();
+        let mut edge_count = direct.len();
+        for (path, value) in packages {
+            if path.is_empty() {
+                continue;
+            }
+            let package_id = path
+                .strip_prefix("node_modules/")
+                .filter(|value| !value.is_empty() && !value.contains("/node_modules/"))
+                .ok_or_else(|| sdk_json_error(subject, "package path"))?;
+            let row = sdk_json_object(value, subject, package_id)?;
+            sdk_json_exact_fields(
+                row,
+                &["version", "resolved", "integrity", "license"],
+                &["dependencies", "engines", "funding", "bin"],
+                subject,
+            )?;
+            let version = sdk_json_string(row, "version", subject)?;
+            SemverVersion::parse(version)
+                .map_err(|_| sdk_json_error(subject, "npm version"))?;
+            let resolved = sdk_json_string(row, "resolved", subject)?;
+            let integrity = sdk_json_string(row, "integrity", subject)?;
+            if !resolved.starts_with("https://registry.npmjs.org/") {
+                return Err(sdk_json_error(subject, "resolved URL"));
+            }
+            validate_sdk_sha512_integrity(integrity, subject)?;
+            let dependencies = match row.get("dependencies") {
+                Some(value) => sdk_json_string_map(value, subject, "package dependencies")?,
+                None => BTreeMap::new(),
+            };
+            edge_count = edge_count
+                .checked_add(dependencies.len())
+                .ok_or_else(|| sdk_json_error(subject, "dependency edge count"))?;
+            if installed
+                .insert(package_id.to_owned(), (version, resolved, integrity))
+                .is_some()
+                || dependency_maps.insert(package_id.to_owned(), dependencies).is_some()
+            {
+                return Err(sdk_json_error(subject, "duplicate installed identity"));
+            }
+        }
+        if installed.len() != 14 || edge_count != 19 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("closure cardinality"));
+        }
+        let mut reachable = BTreeSet::new();
+        let mut frontier = direct.keys().cloned().collect::<Vec<_>>();
+        while let Some(package_id) = frontier.pop() {
+            if !reachable.insert(package_id.clone()) {
+                continue;
+            }
+            let dependencies = dependency_maps
+                .get(&package_id)
+                .ok_or_else(|| sdk_json_error(subject, "reachable package"))?;
+            frontier.extend(dependencies.keys().cloned());
+        }
+        if reachable != installed.keys().cloned().collect() {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("unreachable installed package"));
+        }
+        for (dependency_id, requirement) in direct.iter().chain(
+            dependency_maps.values().flat_map(|dependencies| dependencies.iter()),
+        ) {
+            let (resolved_version, _, _) = installed
+                .get(dependency_id)
+                .ok_or_else(|| sdk_json_error(subject, "unresolved dependency edge"))?;
+            let requirement = SemverVersionReq::parse(requirement)
+                .map_err(|_| sdk_json_error(subject, "npm semver requirement"))?;
+            let resolved = SemverVersion::parse(resolved_version)
+                .map_err(|_| sdk_json_error(subject, "npm resolved version"))?;
+            if !requirement.matches(&resolved) {
+                return Err(sdk_json_error(subject, "npm semver mismatch"));
+            }
+        }
+        if artifacts.len() != 3 {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        for artifact in artifacts {
+            if ![
+                "npm-core-2.0.0",
+                "npm-client-2.0.0",
+                "npm-server-2.0.0",
+            ].contains(&artifact.artifact_id.as_str())
+                || artifact.version != "2.0.0"
+                || artifact.artifact_kind != "npm-tarball"
+            {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT", subject).at(&artifact.artifact_id));
+            }
+            let (version, resolved, integrity) = installed
+                .get(&artifact.package_id)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject)
+                    .at(&artifact.package_id))?;
+            if *version != artifact.version
+                || *resolved != artifact.url
+                || *integrity != sdk_artifact_integrity(artifact, "integrity", subject)?
+            {
+                return Err(Diagnostic::error(
+                    "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                    subject,
+                ).at(&artifact.artifact_id));
+            }
+        }
+        let lock = record_table(peer, "lock", subject)?;
+        let closure = record_string(lock, "expected_online_closure_sha256", subject)?;
+        validate_sha256(closure, subject)?;
+        if record_usize(lock, "direct_package_count", subject)? != direct.len()
+            || record_usize(lock, "installed_package_count", subject)? != installed.len()
+            || !string_sequence_is(
+                &record_string_array(lock, "exact_direct_requirements", subject)?,
+                &[
+                    "@modelcontextprotocol/client=2.0.0",
+                    "@modelcontextprotocol/core=2.0.0",
+                    "@modelcontextprotocol/server=2.0.0",
+                ],
+            )
+            || record_string(lock, "expected_offline_closure_sha256", subject)? != closure
+            || record_string(lock, "closure_canonicalization", subject)?
+                != "npm ls --all --json, select .dependencies, jq -S"
+            || !record_bool(lock, "portable_directory_name_requirement", subject)?
+            || !record_bool(lock, "install_scripts_disabled", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("manifest join"));
+        }
+        Ok(SdkExpectedExecution::Npm {
+            closure_sha256: closure.to_owned(),
+        })
+    }
+
+    fn sdk_python_normalized_name(name: &str, subject: &str) -> VResult<String> {
+        if name.is_empty()
+            || !name.is_ascii()
+            || !name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            || !name.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+            || name.bytes().any(|byte| {
+                !byte.is_ascii_alphanumeric() && ![b'-', b'_', b'.'].contains(&byte)
+            })
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("Python name"));
+        }
+        let mut normalized = String::new();
+        let mut separator = false;
+        for byte in name.bytes() {
+            if [b'-', b'_', b'.'].contains(&byte) {
+                separator = true;
+            } else {
+                if separator && !normalized.is_empty() {
+                    normalized.push('-');
+                }
+                separator = false;
+                normalized.push(char::from(byte.to_ascii_lowercase()));
+            }
+        }
+        Ok(normalized)
+    }
+
+    fn validate_sdk_python_lock(
+        peer: &toml::map::Map<String, toml::Value>,
+        artifacts: &[SdkArtifactObservation],
+        files: &[LoadedFile],
+    ) -> VResult<SdkExpectedExecution> {
+        let subject = "Python pip native lock";
+        let bytes = &source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/python-requirements.lock",
+        )?.bytes;
+        if bytes.is_empty()
+            || bytes.contains(&b'\r')
+            || bytes.contains(&0)
+            || !bytes.ends_with(b"\n")
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("line framing"));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("UTF-8"))?;
+        let lines = text[..text.len() - 1].split('\n').collect::<Vec<_>>();
+        if lines.len() != 28 || lines.iter().any(|line| line.is_empty()) {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("row count"));
+        }
+        let mut rows = BTreeMap::<String, (String, String)>::new();
+        for line in lines {
+            let (requirement, digest) = line
+                .split_once(" --hash=sha256:")
+                .filter(|(_, digest)| !digest.contains(' '))
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("row grammar"))?;
+            let (name, version) = requirement
+                .split_once("==")
+                .filter(|(name, version)| !name.contains('=') && !version.contains('='))
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("requirement"))?;
+            let normalized_name = sdk_python_normalized_name(name, subject)?;
+            if version.is_empty()
+                || version.split('.').any(|component| {
+                    component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("Python version"));
+            }
+            validate_sha256(digest, subject)?;
+            if rows
+                .insert(normalized_name, (version.to_owned(), digest.to_owned()))
+                .is_some()
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("duplicate normalized Python name"));
+            }
+        }
+        let (mcp_version, mcp_digest) = rows
+            .get("mcp")
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("mcp"))?;
+        if mcp_version != "2.0.0" || artifacts.len() != 2 {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        let wheel = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "pypi-mcp-2.0.0-wheel")
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("wheel"))?;
+        let sdist = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "pypi-mcp-2.0.0-sdist")
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("sdist"))?;
+        if wheel.package_id != "mcp"
+            || wheel.version != "2.0.0"
+            || wheel.artifact_kind != "wheel"
+            || wheel.sha256.as_str() != mcp_digest.as_str()
+            || sdist.package_id != "mcp"
+            || sdist.version != "2.0.0"
+            || sdist.artifact_kind != "sdist"
+            || sdist.sha256 == wheel.sha256
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                subject,
+            ));
+        }
+        let source_artifacts = record_array(peer, "registry_artifacts", subject)?;
+        let wheel_source = source_artifacts
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|row| row.get("kind").and_then(toml::Value::as_str) == Some("wheel"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("wheel source"))?;
+        let sdist_source = source_artifacts
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|row| row.get("kind").and_then(toml::Value::as_str) == Some("sdist"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("sdist source"))?;
+        if record_string(wheel_source, "filename", subject)? != "mcp-2.0.0-py3-none-any.whl"
+            || record_string(sdist_source, "filename", subject)? != "mcp-2.0.0.tar.gz"
+            || record_string(wheel_source, "url", subject)? != wheel.url.as_str()
+            || record_string(sdist_source, "url", subject)? != sdist.url.as_str()
+        {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT", subject).at("filename URL join"));
+        }
+        let lock = record_table(peer, "lock", subject)?;
+        let filename = record_string(lock, "expected_online_closure_filename_sha256", subject)?;
+        let content = record_string(lock, "expected_online_closure_content_sha256", subject)?;
+        validate_sha256(filename, subject)?;
+        validate_sha256(content, subject)?;
+        if record_string(lock, "direct_requirement", subject)? != "mcp==2.0.0"
+            || record_usize(lock, "resolved_wheel_count", subject)? != rows.len()
+            || record_string(lock, "expected_offline_closure_filename_sha256", subject)?
+                != filename
+            || record_string(lock, "expected_offline_closure_content_sha256", subject)?
+                != content
+            || record_string(lock, "target_python", subject)? != "CPython 3.12"
+            || record_string(lock, "target_implementation", subject)? != "cp"
+            || record_string(lock, "target_abi", subject)? != "cp312"
+            || record_string(lock, "target_platform", subject)? != "manylinux2014_x86_64"
+            || record_string(lock, "binary_policy", subject)? != "wheels only"
+            || !record_string_array(lock, "extras", subject)?.is_empty()
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("manifest join"));
+        }
+        Ok(SdkExpectedExecution::Pip {
+            filename_closure_sha256: filename.to_owned(),
+            content_closure_sha256: content.to_owned(),
+        })
+    }
+
+    fn sdk_nuget_requirement_matches(requirement: &str, resolved: &str) -> bool {
+        if requirement == resolved {
+            return SemverVersion::parse(resolved).is_ok();
+        }
+        let Some(inner) = requirement
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return false;
+        };
+        let endpoints = inner.split(',').map(str::trim).collect::<Vec<_>>();
+        (endpoints.len() == 1 && endpoints[0] == resolved)
+            || (endpoints.len() == 2
+                && endpoints[0] == resolved
+                && endpoints[1] == resolved)
+    }
+
+    fn validate_sdk_nuget_lock(
+        peer: &toml::map::Map<String, toml::Value>,
+        artifacts: &[SdkArtifactObservation],
+        files: &[LoadedFile],
+    ) -> VResult<SdkExpectedExecution> {
+        let subject = "C# NuGet native lock";
+        const PROJECT: &[u8] = b"<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include=\"ModelContextProtocol\" Version=\"[2.0.0]\" />\n  </ItemGroup>\n</Project>\n";
+        if source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/csharp-consumer.csproj",
+        )?.bytes != PROJECT
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("consumer project"));
+        }
+        let lock_document = parse_strict_json(
+            &source_lookup(
+                files,
+                "evidence/fnd-01/sdk-locks/csharp-packages.lock.json",
+            )?.bytes,
+            subject,
+        )?;
+        let root = sdk_json_object(&lock_document, subject, "packages.lock.json")?;
+        sdk_json_exact_fields(root, &["version", "dependencies"], &[], subject)?;
+        if sdk_json_u64(root, "version", subject)? != 1 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("lock version"));
+        }
+        let frameworks = sdk_json_object(
+            sdk_json_field(root, "dependencies", subject)?,
+            subject,
+            "frameworks",
+        )?;
+        if frameworks.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("framework count"));
+        }
+        let packages = sdk_json_object(
+            frameworks
+                .get("net8.0")
+                .ok_or_else(|| sdk_json_error(subject, "net8.0"))?,
+            subject,
+            "net8.0 packages",
+        )?;
+        if packages.len() != 17 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("package count"));
+        }
+        let mut parsed = BTreeMap::<
+            String,
+            (String, String, String, Option<String>, BTreeMap<String, String>),
+        >::new();
+        let mut direct_count = 0usize;
+        let mut edge_count = 0usize;
+        for (package_id, value) in packages {
+            let row = sdk_json_object(value, subject, package_id)?;
+            sdk_json_exact_fields(
+                row,
+                &["type", "resolved", "contentHash"],
+                &["requested", "dependencies"],
+                subject,
+            )?;
+            let kind = sdk_json_string(row, "type", subject)?;
+            if !["Direct", "Transitive"].contains(&kind) {
+                return Err(sdk_json_error(subject, "package type"));
+            }
+            let requested = match row.get("requested") {
+                Some(StrictJson::String(value)) if !value.is_empty() => Some(value.clone()),
+                Some(_) => return Err(sdk_json_error(subject, "requested")),
+                None => None,
+            };
+            if (kind == "Direct") != requested.is_some() {
+                return Err(sdk_json_error(subject, "direct requested binding"));
+            }
+            direct_count = direct_count
+                .checked_add(usize::from(kind == "Direct"))
+                .ok_or_else(|| sdk_json_error(subject, "direct count"))?;
+            let resolved = sdk_json_string(row, "resolved", subject)?;
+            SemverVersion::parse(resolved)
+                .map_err(|_| sdk_json_error(subject, "NuGet resolved version"))?;
+            let content_hash = sdk_json_string(row, "contentHash", subject)?;
+            validate_sdk_base64(content_hash, 64, subject)?;
+            let dependencies = match row.get("dependencies") {
+                Some(value) => sdk_json_string_map(value, subject, "NuGet dependencies")?,
+                None => BTreeMap::new(),
+            };
+            edge_count = edge_count
+                .checked_add(dependencies.len())
+                .ok_or_else(|| sdk_json_error(subject, "dependency edge count"))?;
+            if parsed
+                .insert(
+                    package_id.clone(),
+                    (
+                        kind.to_owned(),
+                        resolved.to_owned(),
+                        content_hash.to_owned(),
+                        requested,
+                        dependencies,
+                    ),
+                )
+                .is_some()
+            {
+                return Err(sdk_json_error(subject, "duplicate package"));
+            }
+        }
+        if direct_count != 1 || edge_count != 25 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("closure cardinality"));
+        }
+        for (_, _, _, _, dependencies) in parsed.values() {
+            for (dependency, requirement) in dependencies {
+                let target = parsed
+                    .get(dependency)
+                    .ok_or_else(|| sdk_json_error(subject, "unresolved NuGet dependency"))?;
+                if !sdk_nuget_requirement_matches(requirement, &target.1) {
+                    return Err(sdk_json_error(subject, "NuGet range mismatch"));
+                }
+            }
+        }
+        let direct = parsed
+            .get("ModelContextProtocol")
+            .ok_or_else(|| sdk_json_error(subject, "ModelContextProtocol"))?;
+        if direct.0 != "Direct"
+            || direct.1 != "2.0.0"
+            || direct.3.as_deref() != Some("[2.0.0, 2.0.0]")
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("direct package"));
+        }
+
+        let assets_document = parse_strict_json(
+            &source_lookup(
+                files,
+                "evidence/fnd-01/sdk-locks/csharp-project-assets-closure.json",
+            )?.bytes,
+            subject,
+        )?;
+        let assets = sdk_json_object(&assets_document, subject, "assets projection")?;
+        sdk_json_exact_fields(
+            assets,
+            &["format", "target", "target_packages", "libraries"],
+            &[],
+            subject,
+        )?;
+        if sdk_json_string(assets, "format", subject)?
+                != "fastmcp-fnd01-nuget-assets-closure-v1"
+            || sdk_json_string(assets, "target", subject)? != "net8.0"
+        {
+            return Err(sdk_json_error(subject, "assets projection header"));
+        }
+        let target_values = sdk_json_array(
+            sdk_json_field(assets, "target_packages", subject)?,
+            subject,
+            "target_packages",
+        )?;
+        let mut targets = Vec::with_capacity(target_values.len());
+        for value in target_values {
+            let StrictJson::String(value) = value else {
+                return Err(sdk_json_error(subject, "target package identity"));
+            };
+            targets.push(value.clone());
+        }
+        if targets.len() != 17
+            || targets.windows(2).any(|window| window[0] >= window[1])
+        {
+            return Err(sdk_json_error(subject, "target package order"));
+        }
+        let expected_targets = parsed
+            .iter()
+            .map(|(id, (_, version, _, _, _))| format!("{id}/{version}"))
+            .collect::<Vec<_>>();
+        if targets != expected_targets {
+            return Err(sdk_json_error(subject, "target package join"));
+        }
+        let library_values = sdk_json_array(
+            sdk_json_field(assets, "libraries", subject)?,
+            subject,
+            "libraries",
+        )?;
+        if library_values.len() != 17 {
+            return Err(sdk_json_error(subject, "library count"));
+        }
+        let mut prior = None::<String>;
+        let mut library_ids = BTreeSet::new();
+        for value in library_values {
+            let library = sdk_json_object(value, subject, "library")?;
+            sdk_json_exact_fields(
+                library,
+                &["id_version", "path", "sha512", "type"],
+                &[],
+                subject,
+            )?;
+            let id_version = sdk_json_string(library, "id_version", subject)?;
+            if prior.as_deref().is_some_and(|value| value >= id_version) {
+                return Err(sdk_json_error(subject, "library order"));
+            }
+            prior = Some(id_version.to_owned());
+            let (package_id, version) = id_version
+                .rsplit_once('/')
+                .ok_or_else(|| sdk_json_error(subject, "library identity"))?;
+            let package = parsed
+                .get(package_id)
+                .ok_or_else(|| sdk_json_error(subject, "library package join"))?;
+            let expected_path = format!("{}/{}", package_id.to_ascii_lowercase(), version);
+            if version != package.1
+                || sdk_json_string(library, "path", subject)? != expected_path
+                || sdk_json_string(library, "sha512", subject)? != package.2
+                || sdk_json_string(library, "type", subject)? != "package"
+                || !library_ids.insert(id_version)
+            {
+                return Err(sdk_json_error(subject, "library semantic join"));
+            }
+        }
+        if library_ids != targets.iter().map(String::as_str).collect() {
+            return Err(sdk_json_error(subject, "library target bijection"));
+        }
+
+        if artifacts.len() != 1
+            || artifacts[0].artifact_id != "nuget-modelcontextprotocol-2.0.0"
+            || artifacts[0].package_id != "ModelContextProtocol"
+            || artifacts[0].version != direct.1
+            || artifacts[0].artifact_kind != "nupkg"
+            || sdk_artifact_integrity(&artifacts[0], "nuget_lock_content_hash", subject)?
+                != direct.2
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                subject,
+            ));
+        }
+        let raw_sha512 = sdk_artifact_integrity(&artifacts[0], "raw_nupkg_sha512", subject)?;
+        validate_sdk_base64(raw_sha512, 64, subject)?;
+        if raw_sha512 == direct.2 {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT", subject).at("hash semantics"));
+        }
+        let lock = record_table(peer, "lock", subject)?;
+        let canonical_lock = record_string(lock, "canonical_json_sha256", subject)?;
+        let project_assets = record_string(lock, "project_assets_projection_sha256", subject)?;
+        validate_sha256(canonical_lock, subject)?;
+        validate_sha256(project_assets, subject)?;
+        if record_string(lock, "target_framework", subject)? != "net8.0"
+            || record_usize(lock, "direct_package_count", subject)? != direct_count
+            || record_usize(lock, "resolved_package_count", subject)? != parsed.len()
+            || record_string(lock, "direct_requirement", subject)?
+                != "ModelContextProtocol [2.0.0] (exact NuGet range)"
+            || record_string(lock, "project_assets_projection_format", subject)?
+                != "fastmcp-fnd01-nuget-assets-closure-v1"
+            || record_string(lock, "offline_lock_sha256_before", subject)?
+                != record_string(lock, "lock_sha256", subject)?
+            || record_string(lock, "offline_lock_sha256_after", subject)?
+                != record_string(lock, "lock_sha256", subject)?
+            || !record_bool(lock, "online_lock_must_match_vendored_canonical_json", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("manifest join"));
+        }
+        Ok(SdkExpectedExecution::Nuget {
+            canonical_lock_sha256: canonical_lock.to_owned(),
+            project_assets_sha256: project_assets.to_owned(),
+            package_count: parsed.len(),
+        })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ParsedGoModule {
+        module_path: String,
+        go_version: String,
+        requirements: BTreeMap<String, (String, bool)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ParsedGoProjectionRow {
+        path: String,
+        version: String,
+        sum: String,
+        go_mod_sum: String,
+    }
+
+    fn validate_sdk_go_version(version: &str, subject: &str) -> VResult<()> {
+        let semver = version
+            .strip_prefix('v')
+            .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("Go version"))?;
+        SemverVersion::parse(semver)
+            .map_err(|_| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("Go version"))?;
+        Ok(())
+    }
+
+    fn parse_sdk_go_mod(bytes: &[u8], subject: &str) -> VResult<ParsedGoModule> {
+        if bytes.is_empty()
+            || bytes.contains(&b'\r')
+            || bytes.contains(&0)
+            || !bytes.ends_with(b"\n")
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go.mod framing"));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go.mod UTF-8"))?;
+        let mut module_path = None::<String>;
+        let mut go_version = None::<String>;
+        let mut requirements = BTreeMap::new();
+        let mut in_require_block = false;
+        let mut require_block_count = 0usize;
+        for line in text[..text.len() - 1].split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if line == "require (" {
+                if in_require_block {
+                    return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                        .at("nested require block"));
+                }
+                in_require_block = true;
+                require_block_count = require_block_count
+                    .checked_add(1)
+                    .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject))?;
+                continue;
+            }
+            if line == ")" {
+                if !in_require_block {
+                    return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                        .at("orphan require close"));
+                }
+                in_require_block = false;
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("module ") {
+                if in_require_block
+                    || value.is_empty()
+                    || value.bytes().any(|byte| byte.is_ascii_whitespace())
+                    || !value.contains('/')
+                    || module_path.replace(value.to_owned()).is_some()
+                {
+                    return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("module"));
+                }
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("go ") {
+                if in_require_block
+                    || value.split('.').count() != 3
+                    || value.split('.').any(|part| {
+                        part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    || go_version.replace(value.to_owned()).is_some()
+                {
+                    return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go directive"));
+                }
+                continue;
+            }
+            let requirement = if in_require_block {
+                line.strip_prefix('\t')
+                    .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                        .at("require indentation"))?
+            } else {
+                line.strip_prefix("require ")
+                    .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                        .at("go.mod directive"))?
+            };
+            let (requirement, indirect) = match requirement.strip_suffix(" // indirect") {
+                Some(value) => (value, true),
+                None => (requirement, false),
+            };
+            let fields = requirement.split(' ').collect::<Vec<_>>();
+            if fields.len() != 2
+                || fields.iter().any(|field| field.is_empty())
+                || !fields[0].contains('/')
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("require grammar"));
+            }
+            validate_sdk_go_version(fields[1], subject)?;
+            if requirements
+                .insert(fields[0].to_owned(), (fields[1].to_owned(), indirect))
+                .is_some()
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("duplicate requirement"));
+            }
+        }
+        if in_require_block || require_block_count > 2 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("require block"));
+        }
+        Ok(ParsedGoModule {
+            module_path: module_path
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("module"))?,
+            go_version: go_version
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go"))?,
+            requirements,
+        })
+    }
+
+    fn parse_sdk_go_sum(
+        bytes: &[u8],
+        subject: &str,
+    ) -> VResult<BTreeMap<(String, String, bool), String>> {
+        if bytes.is_empty()
+            || bytes.contains(&b'\r')
+            || bytes.contains(&0)
+            || !bytes.ends_with(b"\n")
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go.sum framing"));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go.sum UTF-8"))?;
+        let mut rows = BTreeMap::new();
+        for line in text[..text.len() - 1].split('\n') {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            if fields.len() != 3
+                || fields.iter().any(|field| field.is_empty())
+                || !fields[0].contains('/')
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("go.sum row grammar"));
+            }
+            let (version, go_mod) = match fields[1].strip_suffix("/go.mod") {
+                Some(version) => (version, true),
+                None => (fields[1], false),
+            };
+            validate_sdk_go_version(version, subject)?;
+            validate_sdk_h1(fields[2], subject)?;
+            if rows
+                .insert(
+                    (fields[0].to_owned(), version.to_owned(), go_mod),
+                    fields[2].to_owned(),
+                )
+                .is_some()
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("duplicate go.sum identity"));
+            }
+        }
+        Ok(rows)
+    }
+
+    fn parse_sdk_go_projection(
+        bytes: &[u8],
+        subject: &str,
+    ) -> VResult<Vec<ParsedGoProjectionRow>> {
+        let document = parse_strict_json(bytes, subject)?;
+        let values = sdk_json_array(&document, subject, "module projection")?;
+        let mut rows = Vec::with_capacity(values.len());
+        let mut prior_path = None::<String>;
+        let mut identities = BTreeSet::new();
+        for value in values {
+            let row = sdk_json_object(value, subject, "module projection row")?;
+            sdk_json_exact_fields(
+                row,
+                &["GoModSum", "Origin", "Path", "Sum", "Version"],
+                &[],
+                subject,
+            )?;
+            if sdk_json_field(row, "Origin", subject)? != &StrictJson::Null {
+                return Err(sdk_json_error(subject, "projection Origin"));
+            }
+            let path = sdk_json_string(row, "Path", subject)?;
+            let version = sdk_json_string(row, "Version", subject)?;
+            let sum = sdk_json_string(row, "Sum", subject)?;
+            let go_mod_sum = sdk_json_string(row, "GoModSum", subject)?;
+            if !path.contains('/')
+                || prior_path.as_deref().is_some_and(|prior| prior >= path)
+                || !identities.insert((path, version))
+            {
+                return Err(sdk_json_error(subject, "projection order/identity"));
+            }
+            validate_sdk_go_version(version, subject)?;
+            validate_sdk_h1(sum, subject)?;
+            validate_sdk_h1(go_mod_sum, subject)?;
+            prior_path = Some(path.to_owned());
+            rows.push(ParsedGoProjectionRow {
+                path: path.to_owned(),
+                version: version.to_owned(),
+                sum: sum.to_owned(),
+                go_mod_sum: go_mod_sum.to_owned(),
+            });
+        }
+        Ok(rows)
+    }
+
+    fn sdk_go_projection_row<'a>(
+        rows: &'a [ParsedGoProjectionRow],
+        path: &str,
+        version: &str,
+        subject: &str,
+    ) -> VResult<&'a ParsedGoProjectionRow> {
+        let matches = rows
+            .iter()
+            .filter(|row| row.path == path && row.version == version)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("module projection lookup"));
+        }
+        Ok(matches[0])
+    }
+
+    fn validate_sdk_go_lock(
+        peer: &toml::map::Map<String, toml::Value>,
+        artifacts: &[SdkArtifactObservation],
+        files: &[LoadedFile],
+    ) -> VResult<SdkExpectedExecution> {
+        let subject = "Go native module locks";
+        let consumer_module_file = source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/go-consumer.mod",
+        )?;
+        let publisher_module_file = source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/go-sdk.mod",
+        )?;
+        let consumer_module = parse_sdk_go_mod(&consumer_module_file.bytes, subject)?;
+        let publisher_module = parse_sdk_go_mod(&publisher_module_file.bytes, subject)?;
+        if consumer_module.module_path != "fastmcp.invalid/fnd01/sdk-consumer"
+            || consumer_module.go_version != "1.25.0"
+            || consumer_module.requirements
+                != BTreeMap::from([(
+                    "github.com/modelcontextprotocol/go-sdk".to_owned(),
+                    ("v1.7.0".to_owned(), false),
+                )])
+            || publisher_module.module_path != "github.com/modelcontextprotocol/go-sdk"
+            || publisher_module.go_version != "1.25.0"
+            || publisher_module.requirements.len() != 11
+            || publisher_module.requirements.values().filter(|(_, indirect)| !*indirect).count()
+                != 8
+            || publisher_module.requirements.values().filter(|(_, indirect)| *indirect).count()
+                != 3
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("go.mod semantics"));
+        }
+
+        let consumer_sum = parse_sdk_go_sum(
+            &source_lookup(files, "evidence/fnd-01/sdk-locks/go-consumer.sum")?.bytes,
+            subject,
+        )?;
+        let publisher_sum = parse_sdk_go_sum(
+            &source_lookup(files, "evidence/fnd-01/sdk-locks/go-sdk.sum")?.bytes,
+            subject,
+        )?;
+        let consumer_projection = parse_sdk_go_projection(
+            &source_lookup(
+                files,
+                "evidence/fnd-01/sdk-locks/go-consumer-modules.lock.json",
+            )?.bytes,
+            subject,
+        )?;
+        let publisher_projection = parse_sdk_go_projection(
+            &source_lookup(files, "evidence/fnd-01/sdk-locks/go-modules.lock.json")?.bytes,
+            subject,
+        )?;
+        if consumer_sum.len() != 24
+            || consumer_projection.len() != 12
+            || publisher_sum.len() != 22
+            || publisher_projection.len() != 16
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("Go closure cardinality"));
+        }
+        for row in &consumer_projection {
+            let sum = consumer_sum
+                .get(&(row.path.clone(), row.version.clone(), false))
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("consumer zip sum"))?;
+            let go_mod_sum = consumer_sum
+                .get(&(row.path.clone(), row.version.clone(), true))
+                .ok_or_else(|| Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("consumer go.mod sum"))?;
+            if sum != &row.sum || go_mod_sum != &row.go_mod_sum {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("consumer sum projection join"));
+            }
+        }
+        for (path, (version, _)) in &publisher_module.requirements {
+            let row = sdk_go_projection_row(&publisher_projection, path, version, subject)?;
+            if publisher_sum.get(&(path.clone(), version.clone(), false)) != Some(&row.sum)
+                || publisher_sum.get(&(path.clone(), version.clone(), true))
+                    != Some(&row.go_mod_sum)
+            {
+                return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                    .at("publisher requirement/sum/projection join"));
+            }
+        }
+        let root_row = sdk_go_projection_row(
+            &consumer_projection,
+            "github.com/modelcontextprotocol/go-sdk",
+            "v1.7.0",
+            subject,
+        )?;
+        let mut expected_consumer_sum = publisher_sum.clone();
+        expected_consumer_sum.insert(
+            (root_row.path.clone(), root_row.version.clone(), false),
+            root_row.sum.clone(),
+        );
+        expected_consumer_sum.insert(
+            (root_row.path.clone(), root_row.version.clone(), true),
+            root_row.go_mod_sum.clone(),
+        );
+        if consumer_sum != expected_consumer_sum {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("consumer sum is not publisher sum plus root"));
+        }
+        if publisher_projection.iter().any(|row| {
+            row.path == "github.com/modelcontextprotocol/go-sdk"
+        }) {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("publisher projection contains main module"));
+        }
+        for (identity, sum) in &publisher_sum {
+            if let Some(consumer_value) = consumer_sum.get(identity) {
+                if consumer_value != sum {
+                    return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                        .at("consumer/publisher sum disagreement"));
+                }
+            }
+        }
+
+        if artifacts.len() != 3 {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        let info = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "go-sdk-v1.7.0-info")
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("module info"))?;
+        let module_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "go-sdk-v1.7.0-mod")
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("go.mod"))?;
+        let zip = artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "go-sdk-v1.7.0-zip")
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("module zip"))?;
+        if info.package_id != "github.com/modelcontextprotocol/go-sdk"
+            || info.version != "v1.7.0"
+            || info.artifact_kind != "module-info"
+            || info.embedded_commit
+                != "bc72835f62eb94d0fb484439f886b6885b075f36"
+            || module_artifact.package_id != info.package_id
+            || module_artifact.version != info.version
+            || module_artifact.artifact_kind != "go.mod"
+            || module_artifact.sha256 != lower_hex(&sha256(&publisher_module_file.bytes))
+            || sdk_artifact_integrity(module_artifact, "sumdb_h1", subject)?
+                != root_row.go_mod_sum
+            || zip.package_id != info.package_id
+            || zip.version != info.version
+            || zip.artifact_kind != "module-zip"
+            || sdk_artifact_integrity(zip, "sumdb_h1", subject)? != root_row.sum
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                subject,
+            ));
+        }
+        let source_artifacts = record_array(peer, "registry_artifacts", subject)?;
+        let info_source = source_artifacts
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|row| row.get("kind").and_then(toml::Value::as_str) == Some("module-info"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at("module info source"))?;
+        if record_string(info_source, "embedded_origin_ref", subject)? != "refs/tags/v1.7.0"
+            || record_string(info_source, "embedded_origin_commit", subject)?
+                != info.embedded_commit
+        {
+            return Err(Diagnostic::error("E_SDK_ARTIFACT", subject).at("module origin"));
+        }
+        let sumdb = record_table(peer, "sumdb", subject)?;
+        if record_string(sumdb, "lookup_url", subject)?
+                != "https://sum.golang.org/lookup/github.com/modelcontextprotocol/go-sdk@v1.7.0"
+            || record_u64(sumdb, "record_id", subject)? != 58_242_397
+            || record_string(sumdb, "module_sum", subject)? != root_row.sum
+            || record_string(sumdb, "go_mod_sum", subject)? != root_row.go_mod_sum
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("sumdb join"));
+        }
+        let lock = record_table(peer, "lock", subject)?;
+        let resolved_lock = record_string(
+            lock,
+            "expected_online_resolved_module_lock_sha256",
+            subject,
+        )?;
+        let closure = record_string(lock, "expected_online_closure_sha256", subject)?;
+        validate_sha256(resolved_lock, subject)?;
+        validate_sha256(closure, subject)?;
+        if record_string(lock, "consumer_module_identity", subject)?
+                != consumer_module.module_path
+            || record_string(lock, "consumer_exact_requirement", subject)?
+                != "github.com/modelcontextprotocol/go-sdk v1.7.0"
+            || record_usize(lock, "resolved_dependency_module_count", subject)?
+                != consumer_projection.len()
+            || record_usize(lock, "resolved_module_count_including_consumer_root", subject)?
+                != consumer_projection.len() + 1
+            || !record_bool(lock, "root_sdk_module_in_resolved_lock", subject)?
+            || record_string(lock, "root_sdk_module_path", subject)? != root_row.path
+            || record_string(lock, "root_sdk_module_version", subject)? != root_row.version
+            || record_string(lock, "root_sdk_module_sum", subject)? != root_row.sum
+            || record_string(lock, "root_sdk_go_mod_sum", subject)? != root_row.go_mod_sum
+            || record_string(lock, "publisher_module_sha256", subject)?
+                != module_artifact.sha256
+            || record_string(lock, "expected_offline_resolved_module_lock_sha256", subject)?
+                != resolved_lock
+            || record_string(lock, "expected_offline_closure_sha256", subject)? != closure
+            || !record_bool(lock, "network_denial_requirement", subject)?
+            || record_bool(lock, "publisher_context_is_interop_consumer_lock", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("manifest join"));
+        }
+        Ok(SdkExpectedExecution::Go {
+            resolved_module_lock_sha256: resolved_lock.to_owned(),
+            closure_sha256: closure.to_owned(),
+            module_count: consumer_projection.len(),
+        })
+    }
+
     fn validate_sdk_revalidation(
         sdk_id: &str,
         lock: &toml::map::Map<String, toml::Value>,
@@ -72778,11 +75124,10 @@ activate = 1\n";
         let manifest_tag = decode("manifest_record_tag_hex")?;
         let lock_tag = decode("lock_record_tag_hex")?;
         let separator = decode("field_separator_hex")?;
-        if domain_separator.is_empty()
-            || manifest_tag.is_empty()
-            || lock_tag.is_empty()
-            || separator.len() != 1
-            || separator[0] != 0
+        if domain_separator != b"fastmcp-fnd-01/sdk-matrix/complete-input/v1\0"
+            || manifest_tag != b"manifest-v1\0"
+            || lock_tag != b"sdk-lock-v1\0"
+            || separator != b"\0"
         {
             return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject));
         }
@@ -73007,9 +75352,9 @@ activate = 1\n";
     fn fnd_01_sdk_matrix_validate(
         files: &[LoadedFile],
         policy: &Policy,
-    ) -> VResult<Vec<ParsedSdkPeerResult>> {
+        external_facts: ExternalSdkExecutionFacts,
+    ) -> VResult<SdkValidation> {
         let document = parse_source_toml(files, "evidence/fnd-01/sdk-matrix.toml")?;
-        fnd_01_sdk_matrix_validate_revision_six_contract(&document)?;
         let preimage = fnd_01_sdk_matrix_validate_complete_input_binding(&document, files)?;
         let binding = record_table(
             document
@@ -73024,7 +75369,1355 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", "SDK matrix"));
         }
-        derive_sdk_source_evidence_from_document(&document, files, policy)
+        fnd_01_sdk_matrix_validate_revision_six_dimensions(&document, files)?;
+        fnd_01_sdk_matrix_validate_revision_six_contract(&document)?;
+        let static_evidence = derive_sdk_revision_six_static_evidence(&document, files, policy)?;
+        let execution = match external_facts {
+            ExternalSdkExecutionFacts::Absent => ExecutionValidation::Unverified,
+            ExternalSdkExecutionFacts::Present(bundle) => {
+                ExecutionValidation::Verified(validate_sdk_execution_observations(
+                    &static_evidence,
+                    &bundle,
+                )?)
+            }
+        };
+        Ok(SdkValidation {
+            static_evidence,
+            execution,
+            support_claim: false,
+        })
+    }
+
+    fn sdk_execution_timestamp_is_valid(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() != 20
+            || bytes[4] != b'-'
+            || bytes[7] != b'-'
+            || bytes[10] != b'T'
+            || bytes[13] != b':'
+            || bytes[16] != b':'
+            || bytes[19] != b'Z'
+            || bytes.iter().enumerate().any(|(index, byte)| {
+                !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+            })
+        {
+            return false;
+        }
+        let number = |start: usize, end: usize| {
+            std::str::from_utf8(&bytes[start..end])
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+        };
+        let Some(year) = number(0, 4) else { return false };
+        let Some(month) = number(5, 7) else { return false };
+        let Some(day) = number(8, 10) else { return false };
+        let Some(hour) = number(11, 13) else { return false };
+        let Some(minute) = number(14, 16) else { return false };
+        let Some(second) = number(17, 19) else { return false };
+        let leap = year.is_multiple_of(4)
+            && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        };
+        year != 0
+            && day != 0
+            && day <= days
+            && hour <= 23
+            && minute <= 59
+            && second <= 59
+    }
+
+    fn parse_sdk_observation_binding(
+        value: &StrictJson,
+        subject: &str,
+    ) -> VResult<SdkObservationBinding> {
+        let binding = sdk_json_object(value, subject, "binding")?;
+        sdk_json_exact_fields(
+            binding,
+            &[
+                "sdk_id",
+                "source_selector",
+                "source_commit",
+                "reproduction_script_sha256",
+                "script_exit",
+                "result",
+                "network_denial_probe_observed",
+                "online_offline_equal",
+                "offline_resolution_succeeded",
+                "checked_lock_sha256",
+                "artifact_set_sha256",
+                "observed_at_utc",
+            ],
+            &[],
+            subject,
+        )?;
+        Ok(SdkObservationBinding {
+            sdk_id: sdk_json_string(binding, "sdk_id", subject)?.to_owned(),
+            source_selector: sdk_json_string(binding, "source_selector", subject)?.to_owned(),
+            source_commit: sdk_json_string(binding, "source_commit", subject)?.to_owned(),
+            reproduction_script_sha256: sdk_json_string(
+                binding,
+                "reproduction_script_sha256",
+                subject,
+            )?
+            .to_owned(),
+            script_exit: sdk_json_i64(binding, "script_exit", subject)?,
+            result: sdk_json_string(binding, "result", subject)?.to_owned(),
+            network_denial_probe_observed: sdk_json_bool(
+                binding,
+                "network_denial_probe_observed",
+                subject,
+            )?,
+            online_offline_equal: sdk_json_bool(binding, "online_offline_equal", subject)?,
+            offline_resolution_succeeded: sdk_json_bool(
+                binding,
+                "offline_resolution_succeeded",
+                subject,
+            )?,
+            checked_lock_sha256: sdk_json_string(binding, "checked_lock_sha256", subject)?
+                .to_owned(),
+            artifact_set_sha256: sdk_json_string(binding, "artifact_set_sha256", subject)?
+                .to_owned(),
+            observed_at_utc: sdk_json_string(binding, "observed_at_utc", subject)?.to_owned(),
+        })
+    }
+
+    fn parse_sdk_execution_bundle(
+        bundle: &SdkExecutionBundle,
+    ) -> VResult<ParsedSdkExecutionBundle> {
+        const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
+        let subject = "batch-owned SDK execution facts";
+        validate_sha256(&bundle.raw_sha256, subject)?;
+        if bundle.source_id != "batch_verify/sdk-execution-facts-v1"
+            || bundle.raw_bytes.is_empty()
+            || bundle.raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES
+            || bundle.raw_byte_length != u64::try_from(bundle.raw_bytes.len()).unwrap_or(u64::MAX)
+            || bundle.raw_sha256 != lower_hex(&sha256(&bundle.raw_bytes))
+            || bundle.raw_bytes.contains(&0)
+            || bundle.raw_bytes.contains(&b'\r')
+            || !bundle.raw_bytes.ends_with(b"\n")
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("raw source binding"));
+        }
+        let document = parse_strict_json(&bundle.raw_bytes, subject)?;
+        let root = sdk_json_object(&document, subject, "root")?;
+        sdk_json_exact_fields(
+            root,
+            &[
+                "format",
+                "producer",
+                "complete_input_sha256",
+                "observation_count",
+                "observations",
+            ],
+            &[],
+            subject,
+        )?;
+        let complete_input_sha256 =
+            sdk_json_string(root, "complete_input_sha256", subject)?.to_owned();
+        validate_sha256(&complete_input_sha256, subject)?;
+        let values = sdk_json_array(
+            sdk_json_field(root, "observations", subject)?,
+            subject,
+            "observations",
+        )?;
+        if sdk_json_string(root, "format", subject)?
+                != "fastmcp-fnd01-sdk-execution-facts-v1"
+            || sdk_json_string(root, "producer", subject)? != "batch_verify"
+            || sdk_json_usize(root, "observation_count", subject)? != values.len()
+            || values.len() != SDK_IDS.len()
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("root contract"));
+        }
+
+        let mut observations = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let logical = format!("{subject}/observations[{index}]");
+            let row = sdk_json_object(value, &logical, "observation")?;
+            let ecosystem = sdk_json_string(row, "ecosystem", &logical)?;
+            let observation = match ecosystem {
+                "npm" => {
+                    sdk_json_exact_fields(
+                        row,
+                        &[
+                            "ecosystem",
+                            "binding",
+                            "node_version",
+                            "npm_version",
+                            "online_exit",
+                            "offline_exit",
+                            "closure_compare_exit",
+                            "network_denial_exit",
+                            "network_denial_stderr",
+                            "portable_directory_name_verified",
+                            "native_package_filenames_staged",
+                            "install_scripts_disabled",
+                            "offline_cache_only",
+                            "online_offline_closure_equal",
+                            "online_closure_sha256",
+                            "offline_closure_sha256",
+                            "checked_in_lock_sha256_after_install",
+                        ],
+                        &[],
+                        &logical,
+                    )?;
+                    SdkExecutionObservation::Npm {
+                        binding: parse_sdk_observation_binding(
+                            sdk_json_field(row, "binding", &logical)?,
+                            &logical,
+                        )?,
+                        node_version: sdk_json_string(row, "node_version", &logical)?.to_owned(),
+                        npm_version: sdk_json_string(row, "npm_version", &logical)?.to_owned(),
+                        online_exit: sdk_json_i64(row, "online_exit", &logical)?,
+                        offline_exit: sdk_json_i64(row, "offline_exit", &logical)?,
+                        closure_compare_exit: sdk_json_i64(
+                            row,
+                            "closure_compare_exit",
+                            &logical,
+                        )?,
+                        network_denial_exit: sdk_json_i64(
+                            row,
+                            "network_denial_exit",
+                            &logical,
+                        )?,
+                        network_denial_stderr: sdk_json_string(
+                            row,
+                            "network_denial_stderr",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        portable_directory_name_verified: sdk_json_bool(
+                            row,
+                            "portable_directory_name_verified",
+                            &logical,
+                        )?,
+                        native_package_filenames_staged: sdk_json_bool(
+                            row,
+                            "native_package_filenames_staged",
+                            &logical,
+                        )?,
+                        install_scripts_disabled: sdk_json_bool(
+                            row,
+                            "install_scripts_disabled",
+                            &logical,
+                        )?,
+                        offline_cache_only: sdk_json_bool(
+                            row,
+                            "offline_cache_only",
+                            &logical,
+                        )?,
+                        online_offline_closure_equal: sdk_json_bool(
+                            row,
+                            "online_offline_closure_equal",
+                            &logical,
+                        )?,
+                        online_closure_sha256: sdk_json_string(
+                            row,
+                            "online_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_closure_sha256: sdk_json_string(
+                            row,
+                            "offline_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        checked_in_lock_sha256_after_install: sdk_json_string(
+                            row,
+                            "checked_in_lock_sha256_after_install",
+                            &logical,
+                        )?
+                        .to_owned(),
+                    }
+                }
+                "pip" => {
+                    sdk_json_exact_fields(
+                        row,
+                        &[
+                            "ecosystem",
+                            "binding",
+                            "python_version",
+                            "pip_version",
+                            "online_exit",
+                            "offline_exit",
+                            "filename_compare_exit",
+                            "content_compare_exit",
+                            "network_denial_exit",
+                            "network_denial_stderr",
+                            "no_index",
+                            "require_hashes",
+                            "wheels_only",
+                            "filename_closure_equal",
+                            "content_closure_equal",
+                            "downloaded_wheel_count",
+                            "online_filename_closure_sha256",
+                            "offline_filename_closure_sha256",
+                            "online_content_closure_sha256",
+                            "offline_content_closure_sha256",
+                            "checked_in_lock_sha256_after_download",
+                        ],
+                        &[],
+                        &logical,
+                    )?;
+                    SdkExecutionObservation::Pip {
+                        binding: parse_sdk_observation_binding(
+                            sdk_json_field(row, "binding", &logical)?,
+                            &logical,
+                        )?,
+                        python_version: sdk_json_string(row, "python_version", &logical)?
+                            .to_owned(),
+                        pip_version: sdk_json_string(row, "pip_version", &logical)?.to_owned(),
+                        online_exit: sdk_json_i64(row, "online_exit", &logical)?,
+                        offline_exit: sdk_json_i64(row, "offline_exit", &logical)?,
+                        filename_compare_exit: sdk_json_i64(
+                            row,
+                            "filename_compare_exit",
+                            &logical,
+                        )?,
+                        content_compare_exit: sdk_json_i64(
+                            row,
+                            "content_compare_exit",
+                            &logical,
+                        )?,
+                        network_denial_exit: sdk_json_i64(
+                            row,
+                            "network_denial_exit",
+                            &logical,
+                        )?,
+                        network_denial_stderr: sdk_json_string(
+                            row,
+                            "network_denial_stderr",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        no_index: sdk_json_bool(row, "no_index", &logical)?,
+                        require_hashes: sdk_json_bool(row, "require_hashes", &logical)?,
+                        wheels_only: sdk_json_bool(row, "wheels_only", &logical)?,
+                        filename_closure_equal: sdk_json_bool(
+                            row,
+                            "filename_closure_equal",
+                            &logical,
+                        )?,
+                        content_closure_equal: sdk_json_bool(
+                            row,
+                            "content_closure_equal",
+                            &logical,
+                        )?,
+                        downloaded_wheel_count: sdk_json_usize(
+                            row,
+                            "downloaded_wheel_count",
+                            &logical,
+                        )?,
+                        online_filename_closure_sha256: sdk_json_string(
+                            row,
+                            "online_filename_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_filename_closure_sha256: sdk_json_string(
+                            row,
+                            "offline_filename_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        online_content_closure_sha256: sdk_json_string(
+                            row,
+                            "online_content_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_content_closure_sha256: sdk_json_string(
+                            row,
+                            "offline_content_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        checked_in_lock_sha256_after_download: sdk_json_string(
+                            row,
+                            "checked_in_lock_sha256_after_download",
+                            &logical,
+                        )?
+                        .to_owned(),
+                    }
+                }
+                "nuget" => {
+                    sdk_json_exact_fields(
+                        row,
+                        &[
+                            "ecosystem",
+                            "binding",
+                            "dotnet_sdk_version",
+                            "resolver_sdk_archive_sha256",
+                            "online_restore_exit",
+                            "offline_restore_exit",
+                            "assets_compare_exit",
+                            "network_denial_exit",
+                            "network_denial_stderr",
+                            "online_lock_matches_vendored_canonical_json",
+                            "offline_lock_unchanged",
+                            "raw_assets_digest_is_path_specific",
+                            "online_offline_project_assets_equal",
+                            "vendored_project_assets_projection_equal",
+                            "locked_mode",
+                            "no_cache",
+                            "empty_feed_only",
+                            "restored_package_count",
+                            "generated_lock_canonical_sha256",
+                            "offline_restore_stdout_raw_sha256",
+                            "offline_restore_stderr_sha256",
+                            "offline_project_assets_raw_sha256",
+                            "online_project_assets_sha256",
+                            "offline_project_assets_sha256",
+                            "checked_in_lock_sha256_before_restore",
+                            "checked_in_lock_sha256_after_restore",
+                        ],
+                        &[],
+                        &logical,
+                    )?;
+                    SdkExecutionObservation::Nuget {
+                        binding: parse_sdk_observation_binding(
+                            sdk_json_field(row, "binding", &logical)?,
+                            &logical,
+                        )?,
+                        dotnet_sdk_version: sdk_json_string(
+                            row,
+                            "dotnet_sdk_version",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        resolver_sdk_archive_sha256: sdk_json_string(
+                            row,
+                            "resolver_sdk_archive_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        online_restore_exit: sdk_json_i64(
+                            row,
+                            "online_restore_exit",
+                            &logical,
+                        )?,
+                        offline_restore_exit: sdk_json_i64(
+                            row,
+                            "offline_restore_exit",
+                            &logical,
+                        )?,
+                        assets_compare_exit: sdk_json_i64(
+                            row,
+                            "assets_compare_exit",
+                            &logical,
+                        )?,
+                        network_denial_exit: sdk_json_i64(
+                            row,
+                            "network_denial_exit",
+                            &logical,
+                        )?,
+                        network_denial_stderr: sdk_json_string(
+                            row,
+                            "network_denial_stderr",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        online_lock_matches_vendored_canonical_json: sdk_json_bool(
+                            row,
+                            "online_lock_matches_vendored_canonical_json",
+                            &logical,
+                        )?,
+                        offline_lock_unchanged: sdk_json_bool(
+                            row,
+                            "offline_lock_unchanged",
+                            &logical,
+                        )?,
+                        raw_assets_digest_is_path_specific: sdk_json_bool(
+                            row,
+                            "raw_assets_digest_is_path_specific",
+                            &logical,
+                        )?,
+                        online_offline_project_assets_equal: sdk_json_bool(
+                            row,
+                            "online_offline_project_assets_equal",
+                            &logical,
+                        )?,
+                        vendored_project_assets_projection_equal: sdk_json_bool(
+                            row,
+                            "vendored_project_assets_projection_equal",
+                            &logical,
+                        )?,
+                        locked_mode: sdk_json_bool(row, "locked_mode", &logical)?,
+                        no_cache: sdk_json_bool(row, "no_cache", &logical)?,
+                        empty_feed_only: sdk_json_bool(row, "empty_feed_only", &logical)?,
+                        restored_package_count: sdk_json_usize(
+                            row,
+                            "restored_package_count",
+                            &logical,
+                        )?,
+                        generated_lock_canonical_sha256: sdk_json_string(
+                            row,
+                            "generated_lock_canonical_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_restore_stdout_raw_sha256: sdk_json_string(
+                            row,
+                            "offline_restore_stdout_raw_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_restore_stderr_sha256: sdk_json_string(
+                            row,
+                            "offline_restore_stderr_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_project_assets_raw_sha256: sdk_json_string(
+                            row,
+                            "offline_project_assets_raw_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        online_project_assets_sha256: sdk_json_string(
+                            row,
+                            "online_project_assets_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_project_assets_sha256: sdk_json_string(
+                            row,
+                            "offline_project_assets_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        checked_in_lock_sha256_before_restore: sdk_json_string(
+                            row,
+                            "checked_in_lock_sha256_before_restore",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        checked_in_lock_sha256_after_restore: sdk_json_string(
+                            row,
+                            "checked_in_lock_sha256_after_restore",
+                            &logical,
+                        )?
+                        .to_owned(),
+                    }
+                }
+                "go" => {
+                    sdk_json_exact_fields(
+                        row,
+                        &[
+                            "ecosystem",
+                            "binding",
+                            "go_version",
+                            "online_download_exit",
+                            "online_list_exit",
+                            "offline_download_exit",
+                            "offline_list_exit",
+                            "lock_compare_exit",
+                            "closure_compare_exit",
+                            "network_denial_exit",
+                            "network_denial_stderr",
+                            "offline_goenv",
+                            "offline_gotoolchain",
+                            "offline_goproxy",
+                            "offline_gosumdb",
+                            "offline_govcs",
+                            "fresh_task_gocache",
+                            "online_seeded_gomodcache",
+                            "sandbox_network_denial_active",
+                            "root_sdk_module_entry_verified",
+                            "external_consumer_root_sdk_entry_verified",
+                            "online_offline_lock_and_module_list_equal",
+                            "resolved_module_count",
+                            "online_resolved_module_lock_sha256",
+                            "offline_resolved_module_lock_sha256",
+                            "online_closure_sha256",
+                            "offline_closure_sha256",
+                            "checked_in_consumer_sum_sha256",
+                        ],
+                        &[],
+                        &logical,
+                    )?;
+                    SdkExecutionObservation::Go {
+                        binding: parse_sdk_observation_binding(
+                            sdk_json_field(row, "binding", &logical)?,
+                            &logical,
+                        )?,
+                        go_version: sdk_json_string(row, "go_version", &logical)?.to_owned(),
+                        online_download_exit: sdk_json_i64(
+                            row,
+                            "online_download_exit",
+                            &logical,
+                        )?,
+                        online_list_exit: sdk_json_i64(row, "online_list_exit", &logical)?,
+                        offline_download_exit: sdk_json_i64(
+                            row,
+                            "offline_download_exit",
+                            &logical,
+                        )?,
+                        offline_list_exit: sdk_json_i64(row, "offline_list_exit", &logical)?,
+                        lock_compare_exit: sdk_json_i64(row, "lock_compare_exit", &logical)?,
+                        closure_compare_exit: sdk_json_i64(
+                            row,
+                            "closure_compare_exit",
+                            &logical,
+                        )?,
+                        network_denial_exit: sdk_json_i64(
+                            row,
+                            "network_denial_exit",
+                            &logical,
+                        )?,
+                        network_denial_stderr: sdk_json_string(
+                            row,
+                            "network_denial_stderr",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_goenv: sdk_json_string(row, "offline_goenv", &logical)?
+                            .to_owned(),
+                        offline_gotoolchain: sdk_json_string(
+                            row,
+                            "offline_gotoolchain",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_goproxy: sdk_json_string(row, "offline_goproxy", &logical)?
+                            .to_owned(),
+                        offline_gosumdb: sdk_json_string(row, "offline_gosumdb", &logical)?
+                            .to_owned(),
+                        offline_govcs: sdk_json_string(row, "offline_govcs", &logical)?
+                            .to_owned(),
+                        fresh_task_gocache: sdk_json_bool(
+                            row,
+                            "fresh_task_gocache",
+                            &logical,
+                        )?,
+                        online_seeded_gomodcache: sdk_json_bool(
+                            row,
+                            "online_seeded_gomodcache",
+                            &logical,
+                        )?,
+                        sandbox_network_denial_active: sdk_json_bool(
+                            row,
+                            "sandbox_network_denial_active",
+                            &logical,
+                        )?,
+                        root_sdk_module_entry_verified: sdk_json_bool(
+                            row,
+                            "root_sdk_module_entry_verified",
+                            &logical,
+                        )?,
+                        external_consumer_root_sdk_entry_verified: sdk_json_bool(
+                            row,
+                            "external_consumer_root_sdk_entry_verified",
+                            &logical,
+                        )?,
+                        online_offline_lock_and_module_list_equal: sdk_json_bool(
+                            row,
+                            "online_offline_lock_and_module_list_equal",
+                            &logical,
+                        )?,
+                        resolved_module_count: sdk_json_usize(
+                            row,
+                            "resolved_module_count",
+                            &logical,
+                        )?,
+                        online_resolved_module_lock_sha256: sdk_json_string(
+                            row,
+                            "online_resolved_module_lock_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_resolved_module_lock_sha256: sdk_json_string(
+                            row,
+                            "offline_resolved_module_lock_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        online_closure_sha256: sdk_json_string(
+                            row,
+                            "online_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        offline_closure_sha256: sdk_json_string(
+                            row,
+                            "offline_closure_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                        checked_in_consumer_sum_sha256: sdk_json_string(
+                            row,
+                            "checked_in_consumer_sum_sha256",
+                            &logical,
+                        )?
+                        .to_owned(),
+                    }
+                }
+                _ => {
+                    return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", &logical)
+                        .at("ecosystem tag"));
+                }
+            };
+            observations.push(observation);
+        }
+        Ok(ParsedSdkExecutionBundle {
+            complete_input_sha256,
+            observations,
+        })
+    }
+
+    fn validate_sdk_execution_observations(
+        static_evidence: &ValidatedSdkStaticEvidence,
+        bundle: &SdkExecutionBundle,
+    ) -> VResult<Vec<ParsedSdkPeerResult>> {
+        let subject = "SDK matrix execution observations";
+        let bundle = parse_sdk_execution_bundle(bundle).map_err(|diagnostic| {
+            Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at(diagnostic.stable())
+        })?;
+        if bundle.complete_input_sha256 != static_evidence.complete_input_sha256
+            || bundle.observations.len() != static_evidence.peers.len()
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject));
+        }
+        let mut results = Vec::with_capacity(static_evidence.peers.len());
+        for (index, (peer, observation)) in static_evidence
+            .peers
+            .iter()
+            .zip(&bundle.observations)
+            .enumerate()
+        {
+            let (binding, online, offline) = match (observation, &peer.expected_execution) {
+                (
+                    SdkExecutionObservation::Npm {
+                        binding,
+                        node_version,
+                        npm_version,
+                        online_exit,
+                        offline_exit,
+                        closure_compare_exit,
+                        network_denial_exit,
+                        network_denial_stderr,
+                        portable_directory_name_verified,
+                        native_package_filenames_staged,
+                        install_scripts_disabled,
+                        offline_cache_only,
+                        online_offline_closure_equal,
+                        online_closure_sha256,
+                        offline_closure_sha256,
+                        checked_in_lock_sha256_after_install,
+                    },
+                    SdkExpectedExecution::Npm { closure_sha256 },
+                ) => {
+                    if peer.sdk_id != "typescript"
+                        || peer.ecosystem != "npm"
+                        || node_version != "v24.12.0"
+                        || npm_version != "11.14.0"
+                        || *online_exit != 0
+                        || *offline_exit != 0
+                        || *closure_compare_exit != 0
+                        || *network_denial_exit != 6
+                        || network_denial_stderr
+                            != sdk_network_denial_stderr("typescript", subject)?
+                        || !*portable_directory_name_verified
+                        || !*native_package_filenames_staged
+                        || !*install_scripts_disabled
+                        || !*offline_cache_only
+                        || !*online_offline_closure_equal
+                        || online_closure_sha256 != closure_sha256
+                        || offline_closure_sha256 != closure_sha256
+                        || checked_in_lock_sha256_after_install != &peer.checked_lock_sha256
+                    {
+                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                            .at(&peer.sdk_id));
+                    }
+                    (binding, online_closure_sha256.as_str(), offline_closure_sha256.as_str())
+                }
+                (
+                    SdkExecutionObservation::Pip {
+                        binding,
+                        python_version,
+                        pip_version,
+                        online_exit,
+                        offline_exit,
+                        filename_compare_exit,
+                        content_compare_exit,
+                        network_denial_exit,
+                        network_denial_stderr,
+                        no_index,
+                        require_hashes,
+                        wheels_only,
+                        filename_closure_equal,
+                        content_closure_equal,
+                        downloaded_wheel_count,
+                        online_filename_closure_sha256,
+                        offline_filename_closure_sha256,
+                        online_content_closure_sha256,
+                        offline_content_closure_sha256,
+                        checked_in_lock_sha256_after_download,
+                    },
+                    SdkExpectedExecution::Pip {
+                        filename_closure_sha256,
+                        content_closure_sha256,
+                    },
+                ) => {
+                    if peer.sdk_id != "python"
+                        || peer.ecosystem != "PyPI"
+                        || python_version != "Python 3.14.4"
+                        || pip_version != "26.1"
+                        || *online_exit != 0
+                        || *offline_exit != 0
+                        || *filename_compare_exit != 0
+                        || *content_compare_exit != 0
+                        || *network_denial_exit != 6
+                        || network_denial_stderr
+                            != sdk_network_denial_stderr("python", subject)?
+                        || !*no_index
+                        || !*require_hashes
+                        || !*wheels_only
+                        || !*filename_closure_equal
+                        || !*content_closure_equal
+                        || *downloaded_wheel_count != 28
+                        || online_filename_closure_sha256 != filename_closure_sha256
+                        || offline_filename_closure_sha256 != filename_closure_sha256
+                        || online_content_closure_sha256 != content_closure_sha256
+                        || offline_content_closure_sha256 != content_closure_sha256
+                        || checked_in_lock_sha256_after_download != &peer.checked_lock_sha256
+                    {
+                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                            .at(&peer.sdk_id));
+                    }
+                    (
+                        binding,
+                        online_content_closure_sha256.as_str(),
+                        offline_content_closure_sha256.as_str(),
+                    )
+                }
+                (
+                    SdkExecutionObservation::Nuget {
+                        binding,
+                        dotnet_sdk_version,
+                        resolver_sdk_archive_sha256,
+                        online_restore_exit,
+                        offline_restore_exit,
+                        assets_compare_exit,
+                        network_denial_exit,
+                        network_denial_stderr,
+                        online_lock_matches_vendored_canonical_json,
+                        offline_lock_unchanged,
+                        raw_assets_digest_is_path_specific,
+                        online_offline_project_assets_equal,
+                        vendored_project_assets_projection_equal,
+                        locked_mode,
+                        no_cache,
+                        empty_feed_only,
+                        restored_package_count,
+                        generated_lock_canonical_sha256,
+                        offline_restore_stdout_raw_sha256,
+                        offline_restore_stderr_sha256,
+                        offline_project_assets_raw_sha256,
+                        online_project_assets_sha256,
+                        offline_project_assets_sha256,
+                        checked_in_lock_sha256_before_restore,
+                        checked_in_lock_sha256_after_restore,
+                    },
+                    SdkExpectedExecution::Nuget {
+                        canonical_lock_sha256,
+                        project_assets_sha256,
+                        package_count,
+                    },
+                ) => {
+                    if peer.sdk_id != "csharp"
+                        || peer.ecosystem != "NuGet"
+                        || dotnet_sdk_version != "10.0.100"
+                        || resolver_sdk_archive_sha256
+                            != "71b3815ef8d83a6bbebf8627a56639600193f22d4ea6a6de2f71855c4b3e63fd"
+                        || *online_restore_exit != 0
+                        || *offline_restore_exit != 0
+                        || *assets_compare_exit != 0
+                        || *network_denial_exit != 6
+                        || network_denial_stderr
+                            != sdk_network_denial_stderr("csharp", subject)?
+                        || !*online_lock_matches_vendored_canonical_json
+                        || !*offline_lock_unchanged
+                        || !*raw_assets_digest_is_path_specific
+                        || !*online_offline_project_assets_equal
+                        || !*vendored_project_assets_projection_equal
+                        || !*locked_mode
+                        || !*no_cache
+                        || !*empty_feed_only
+                        || restored_package_count != package_count
+                        || generated_lock_canonical_sha256 != canonical_lock_sha256
+                        || online_project_assets_sha256 != project_assets_sha256
+                        || offline_project_assets_sha256 != project_assets_sha256
+                        || checked_in_lock_sha256_before_restore != &peer.checked_lock_sha256
+                        || checked_in_lock_sha256_after_restore != &peer.checked_lock_sha256
+                    {
+                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                            .at(&peer.sdk_id));
+                    }
+                    for digest in [
+                        offline_restore_stdout_raw_sha256,
+                        offline_restore_stderr_sha256,
+                        offline_project_assets_raw_sha256,
+                    ] {
+                        validate_sha256(digest, subject)?;
+                    }
+                    (
+                        binding,
+                        online_project_assets_sha256.as_str(),
+                        offline_project_assets_sha256.as_str(),
+                    )
+                }
+                (
+                    SdkExecutionObservation::Go {
+                        binding,
+                        go_version,
+                        online_download_exit,
+                        online_list_exit,
+                        offline_download_exit,
+                        offline_list_exit,
+                        lock_compare_exit,
+                        closure_compare_exit,
+                        network_denial_exit,
+                        network_denial_stderr,
+                        offline_goenv,
+                        offline_gotoolchain,
+                        offline_goproxy,
+                        offline_gosumdb,
+                        offline_govcs,
+                        fresh_task_gocache,
+                        online_seeded_gomodcache,
+                        sandbox_network_denial_active,
+                        root_sdk_module_entry_verified,
+                        external_consumer_root_sdk_entry_verified,
+                        online_offline_lock_and_module_list_equal,
+                        resolved_module_count,
+                        online_resolved_module_lock_sha256,
+                        offline_resolved_module_lock_sha256,
+                        online_closure_sha256,
+                        offline_closure_sha256,
+                        checked_in_consumer_sum_sha256,
+                    },
+                    SdkExpectedExecution::Go {
+                        resolved_module_lock_sha256,
+                        closure_sha256,
+                        module_count,
+                    },
+                ) => {
+                    if peer.sdk_id != "go"
+                        || peer.ecosystem != "Go modules"
+                        || go_version != "go version go1.25.0 darwin/arm64"
+                        || *online_download_exit != 0
+                        || *online_list_exit != 0
+                        || *offline_download_exit != 0
+                        || *offline_list_exit != 0
+                        || *lock_compare_exit != 0
+                        || *closure_compare_exit != 0
+                        || *network_denial_exit != 6
+                        || network_denial_stderr != sdk_network_denial_stderr("go", subject)?
+                        || offline_goenv != "off"
+                        || offline_gotoolchain != "local"
+                        || offline_goproxy != "off"
+                        || offline_gosumdb != "off"
+                        || offline_govcs != "*:off"
+                        || !*fresh_task_gocache
+                        || !*online_seeded_gomodcache
+                        || !*sandbox_network_denial_active
+                        || !*root_sdk_module_entry_verified
+                        || !*external_consumer_root_sdk_entry_verified
+                        || !*online_offline_lock_and_module_list_equal
+                        || resolved_module_count != module_count
+                        || online_resolved_module_lock_sha256 != resolved_module_lock_sha256
+                        || offline_resolved_module_lock_sha256 != resolved_module_lock_sha256
+                        || online_closure_sha256 != closure_sha256
+                        || offline_closure_sha256 != closure_sha256
+                        || checked_in_consumer_sum_sha256 != &peer.checked_lock_sha256
+                    {
+                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                            .at(&peer.sdk_id));
+                    }
+                    (binding, online_closure_sha256.as_str(), offline_closure_sha256.as_str())
+                }
+                _ => {
+                    return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                        .at("ecosystem tag/order"));
+                }
+            };
+            if binding.sdk_id != peer.sdk_id
+                || binding.source_selector != peer.source_selector
+                || binding.source_commit != peer.source_commit
+                || binding.reproduction_script_sha256 != peer.reproduction_script_sha256
+                || binding.script_exit != 0
+                || binding.result != "pass"
+                || !binding.network_denial_probe_observed
+                || !binding.online_offline_equal
+                || !binding.offline_resolution_succeeded
+                || binding.checked_lock_sha256 != peer.checked_lock_sha256
+                || binding.artifact_set_sha256 != peer.artifact_set_sha256
+                || !sdk_execution_timestamp_is_valid(&binding.observed_at_utc)
+            {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at(&peer.sdk_id));
+            }
+            for digest in [
+                online,
+                offline,
+                binding.checked_lock_sha256.as_str(),
+                binding.artifact_set_sha256.as_str(),
+                binding.reproduction_script_sha256.as_str(),
+            ] {
+                validate_sha256(digest, subject)?;
+            }
+            if online != offline {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at("online/offline equality"));
+            }
+            results.push(ParsedSdkPeerResult {
+                sdk_id: peer.sdk_id.clone(),
+                source_selector: format!("/peers/{index}/lock/last_execution"),
+                checked_lock_sha256: peer.checked_lock_sha256.clone(),
+                online_closure_sha256: online.to_owned(),
+                offline_closure_sha256: offline.to_owned(),
+                artifact_count: peer.artifact_count,
+                artifact_set_sha256: peer.artifact_set_sha256.clone(),
+                observed_at_utc: binding.observed_at_utc.clone(),
+                evidence_verdict: "Pass".to_owned(),
+                support_claim: false,
+            });
+        }
+        Ok(results)
+    }
+
+    fn derive_sdk_revision_six_static_evidence(
+        document: &toml::Value,
+        files: &[LoadedFile],
+        policy: &Policy,
+    ) -> VResult<ValidatedSdkStaticEvidence> {
+        const LOCK_ROOT: &str = "evidence/fnd-01/sdk-locks/";
+        let subject = "SDK matrix revision-6 static evidence";
+        let root = document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        let direct_paths = files
+            .iter()
+            .filter_map(|file| file.contract.path.strip_prefix(LOCK_ROOT))
+            .collect::<Vec<_>>();
+        let direct_path_set = direct_paths.iter().copied().collect::<BTreeSet<_>>();
+        let expected_direct_paths = SDK_VENDORED_EXPECTATIONS
+            .iter()
+            .map(|(_, path, _, _)| {
+                path.strip_prefix(LOCK_ROOT)
+                    .expect("frozen SDK vendored path has the frozen root")
+            })
+            .collect::<BTreeSet<_>>();
+        if direct_paths.len() != direct_path_set.len()
+            || direct_path_set.len() != SDK_VENDORED_EXPECTATIONS.len()
+            || direct_path_set != expected_direct_paths
+        {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("direct lock set"));
+        }
+        validate_sdk_catalog(root, files)?;
+        let vendored_by_id = validate_sdk_vendored_artifacts(root, files)?;
+        let catalog = record_table(root, "catalog", subject)?;
+        let catalog_vendored = vendored_by_id
+            .get("sdk-tier-catalog")
+            .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject))?;
+        if record_string(catalog_vendored, "path", subject)?
+            != record_string(catalog, "vendored_path", subject)?
+            || record_u64(catalog_vendored, "byte_length", subject)?
+                != record_u64(catalog, "byte_length", subject)?
+            || record_string(catalog_vendored, "sha256", subject)?
+                != record_string(catalog, "sha256", subject)?
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject));
+        }
+        let canonical_peer_ids = sdk_canonical_ids(
+            &SDK_IDS.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>(),
+        );
+        let peer_matrix = record_table(root, "peer_era_matrix", subject)?;
+        if !string_sequence_is(
+            &record_string_array(peer_matrix, "peer_ids_in_catalog_order", subject)?,
+            SDK_IDS,
+        )
+            || !string_sequence_is(
+                &record_string_array(peer_matrix, "peer_ids_canonical", subject)?,
+                &["csharp", "go", "python", "typescript"],
+            )
+            || record_string(peer_matrix, "canonical_sha256", subject)?
+                != lower_hex(&sha256(&canonical_peer_ids))
+        {
+            return Err(Diagnostic::error("E_SDK_CATALOG", subject).at("peer matrix"));
+        }
+        let matrix_eras = record_array(peer_matrix, "eras", subject)?;
+        let mut matrix_by_version = BTreeMap::new();
+        for value in matrix_eras {
+            let era = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at("matrix era"))?;
+            let version = record_string(era, "protocol_version", subject)?;
+            if matrix_by_version.insert(version, era).is_some() {
+                return Err(Diagnostic::error("fnd01.sdk_matrix.duplicate_peer", subject));
+            }
+        }
+        for version in ["2024-11-05", "2026-07-28"] {
+            let era = matrix_by_version
+                .get(version)
+                .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at(version))?;
+            if !string_sequence_is(&record_string_array(era, "peer_ids", subject)?, SDK_IDS)
+                || record_usize(era, "unsupported_or_unproved_peer_count", subject)? != 0
+            {
+                return Err(Diagnostic::error("E_SDK_CATALOG", subject).at(version));
+            }
+        }
+
+        let peers = record_array(root, "peers", subject)?;
+        if peers.len() != SDK_PEER_EXPECTATIONS.len() {
+            return Err(Diagnostic::error("fnd01.sdk_matrix.missing_tier1_peer", subject));
+        }
+        let mut seen_peer_ids = BTreeSet::new();
+        for value in peers {
+            let peer = value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_PEER_ORDER", subject))?;
+            let id = record_string(peer, "id", subject)?;
+            if !seen_peer_ids.insert(id) {
+                return Err(Diagnostic::error("fnd01.sdk_matrix.duplicate_peer", subject));
+            }
+        }
+        if seen_peer_ids != SDK_IDS.iter().copied().collect() {
+            return Err(Diagnostic::error("fnd01.sdk_matrix.missing_tier1_peer", subject));
+        }
+        let artifacts_by_sdk = derive_sdk_registry_artifacts(document, policy)?;
+        let mut validated_peers = Vec::with_capacity(SDK_IDS.len());
+        for (peer_value, expected) in peers.iter().zip(&SDK_PEER_EXPECTATIONS) {
+            let peer = peer_value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_PEER_ORDER", subject))?;
+            validate_sdk_peer_identity_and_eras(peer, expected)?;
+            let lock = record_table(peer, "lock", subject)?;
+            let expected_lock_ids = SDK_LOCK_BLUEPRINT_IDENTITIES
+                .iter()
+                .filter_map(|(owner, lock_id, _)| (*owner == expected.id).then_some(*lock_id))
+                .collect::<Vec<_>>();
+            if !string_sequence_is(
+                &record_string_array(lock, "checked_in_artifact_ids", subject)?,
+                &expected_lock_ids,
+            ) {
+                return Err(Diagnostic::error("E_SDK_LOCK", subject)
+                    .at("checked_in_artifact_ids"));
+            }
+            for (lock_id, path_field, length_field, digest_field) in SDK_LOCK_SOURCE_FIELDS {
+                let (owner, _, _) = SDK_LOCK_BLUEPRINT_IDENTITIES
+                    .iter()
+                    .find(|(_, candidate, _)| *candidate == lock_id)
+                    .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject).at(lock_id))?;
+                if *owner != expected.id {
+                    continue;
+                }
+                let vendored = vendored_by_id
+                    .get(lock_id)
+                    .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject).at(lock_id))?;
+                if record_string(lock, path_field, subject)?
+                    != record_string(vendored, "path", subject)?
+                    || record_u64(lock, length_field, subject)?
+                        != record_u64(vendored, "byte_length", subject)?
+                    || record_string(lock, digest_field, subject)?
+                        != record_string(vendored, "sha256", subject)?
+                {
+                    return Err(Diagnostic::error("E_SDK_LOCK", subject).at(lock_id));
+                }
+            }
+            validate_sdk_reproduction_contract(peer, expected, policy)?;
+            let artifacts = artifacts_by_sdk
+                .get(expected.id)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at(expected.id))?;
+            let expected_execution = match expected.id {
+                "typescript" => validate_sdk_npm_lock(peer, artifacts, files)?,
+                "python" => validate_sdk_python_lock(peer, artifacts, files)?,
+                "csharp" => validate_sdk_nuget_lock(peer, artifacts, files)?,
+                "go" => validate_sdk_go_lock(peer, artifacts, files)?,
+                _ => return Err(Diagnostic::error("E_SDK_POLICY", subject).at(expected.id)),
+            };
+            let checked_lock_id = sdk_checked_lock_id(expected.id, subject)?;
+            let checked_lock = vendored_by_id
+                .get(checked_lock_id)
+                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject).at(checked_lock_id))?;
+            let artifact_set_sha256 = sdk_artifact_set_sha256(artifacts, subject)?;
+            let expected_artifact_set_sha256 = SDK_ARTIFACT_SET_SHA256
+                .iter()
+                .find(|(sdk_id, _)| *sdk_id == expected.id)
+                .map(|(_, digest)| *digest)
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject)
+                    .at(expected.id))?;
+            if artifact_set_sha256 != expected_artifact_set_sha256 {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT", subject)
+                    .at("artifact-set identity"));
+            }
+            validated_peers.push(ValidatedSdkStaticPeer {
+                sdk_id: expected.id.to_owned(),
+                ecosystem: expected.ecosystem.to_owned(),
+                source_selector: format!("/peers/by-id/{}", expected.id),
+                source_commit: expected.source_commit.to_owned(),
+                reproduction_script_sha256: expected.reproduction_script_sha256.to_owned(),
+                checked_lock_sha256: record_string(checked_lock, "sha256", subject)?.to_owned(),
+                artifact_count: artifacts.len(),
+                artifact_set_sha256,
+                expected_execution,
+            });
+        }
+        let complete_input_sha256 = record_string(
+            record_table(root, "complete_input_binding", subject)?,
+            "digest",
+            subject,
+        )?;
+        validate_sha256(complete_input_sha256, subject)?;
+        Ok(ValidatedSdkStaticEvidence {
+            complete_input_sha256: complete_input_sha256.to_owned(),
+            peers: validated_peers,
+        })
+    }
+
+    fn fnd_01_sdk_matrix_validate_revision_six_dimensions(
+        document: &toml::Value,
+        files: &[LoadedFile],
+    ) -> VResult<()> {
+        const TYPESCRIPT_CORE_SHA256: &str =
+            "e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6";
+        const TYPESCRIPT_REPRODUCTION_SHA256: &str =
+            "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9";
+
+        let subject = "SDK matrix revision-6 dimensions";
+        let root = document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        let catalog = record_table(root, "catalog", subject)?;
+        if !string_sequence_is(
+            &record_string_array(catalog, "tier1_ids_in_catalog_order", subject)?,
+            SDK_IDS,
+        ) {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.missing_tier1_peer",
+                subject,
+            ));
+        }
+
+        let peer_matrix = record_table(root, "peer_era_matrix", subject)?;
+        let matrix_ids = record_string_array(peer_matrix, "peer_ids_in_catalog_order", subject)?;
+        if matrix_ids.iter().collect::<BTreeSet<_>>().len() != matrix_ids.len() {
+            return Err(Diagnostic::error("fnd01.sdk_matrix.duplicate_peer", subject));
+        }
+        if matrix_ids.iter().any(|id| !SDK_IDS.contains(&id.as_str()))
+            || !string_sequence_is(&matrix_ids, SDK_IDS)
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.extra_non_tier1_peer",
+                subject,
+            ));
+        }
+        let matrix_eras = record_array(peer_matrix, "eras", subject)?;
+        let modern_era = matrix_eras
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|era| era.get("protocol_version").and_then(toml::Value::as_str) == Some("2026-07-28"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        let modern_ids = record_string_array(modern_era, "peer_ids", subject)?;
+        if modern_ids.iter().collect::<BTreeSet<_>>().len() != modern_ids.len() {
+            return Err(Diagnostic::error("fnd01.sdk_matrix.duplicate_peer", subject));
+        }
+        if modern_ids.iter().any(|id| !SDK_IDS.contains(&id.as_str()))
+            || !string_sequence_is(&modern_ids, SDK_IDS)
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.extra_non_tier1_peer",
+                subject,
+            ));
+        }
+
+        let peers = record_array(root, "peers", subject)?;
+        let python = peers
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|peer| peer.get("id").and_then(toml::Value::as_str) == Some("python"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        let python_eras = record_array(python, "era_capabilities", subject)?;
+        let python_legacy = python_eras
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|era| {
+                era.get("protocol_version").and_then(toml::Value::as_str)
+                    == Some("2024-11-05")
+            })
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        if record_string(python_legacy, "protocol_version", subject)? != "2024-11-05"
+            || record_string(python_legacy, "support_state", subject)? != "supported"
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                subject,
+            ));
+        }
+
+        let typescript = peers
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|peer| peer.get("id").and_then(toml::Value::as_str) == Some("typescript"))
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        let artifacts = record_array(typescript, "registry_artifacts", subject)?;
+        let core = artifacts
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .find(|artifact| {
+                artifact.get("package").and_then(toml::Value::as_str)
+                    == Some("@modelcontextprotocol/core")
+                    && artifact.get("version").and_then(toml::Value::as_str)
+                        == Some("2.0.0")
+            })
+            .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
+        if record_string(core, "sha256", subject)? != TYPESCRIPT_CORE_SHA256 {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                subject,
+            ));
+        }
+
+        let typescript_lock = record_table(typescript, "lock", subject)?;
+        let package_lock = source_lookup(
+            files,
+            "evidence/fnd-01/sdk-locks/typescript-package-lock.json",
+        )?;
+        if record_string(typescript_lock, "lock_sha256", subject)?
+            != lower_hex(&sha256(&package_lock.bytes))
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.lock_digest_mismatch",
+                subject,
+            ));
+        }
+        if lower_hex(&sha256(
+            record_string(typescript_lock, "reproduction_script", subject)?.as_bytes(),
+        )) != TYPESCRIPT_REPRODUCTION_SHA256
+        {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.execution_command_mismatch",
+                subject,
+            ));
+        }
+
+        let drift = record_table(catalog, "live_drift_observation", subject)?;
+        if record_string(drift, "sha256", subject)? == record_string(catalog, "sha256", subject)? {
+            return Err(Diagnostic::error(
+                "fnd01.sdk_matrix.frozen_baseline_substitution",
+                subject,
+            ));
+        }
+        Ok(())
     }
 
     fn sdk_matrix_raw_candidate(
@@ -73033,7 +76726,8 @@ activate = 1\n";
         needle: &[u8],
         replacement: &[u8],
     ) -> VResult<Vec<LoadedFile>> {
-        if needle == replacement
+        if needle.is_empty()
+            || needle == replacement
             || (target_path != "evidence/fnd-01/sdk-matrix.toml"
                 && needle.len() != replacement.len())
         {
@@ -73044,11 +76738,17 @@ activate = 1\n";
             .iter_mut()
             .find(|file| file.contract.path == target_path)
             .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", target_path))?;
-        let offset = target
+        let offsets = target
             .bytes
             .windows(needle.len())
-            .position(|window| window == needle)
-            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", target_path))?;
+            .enumerate()
+            .filter_map(|(offset, window)| (window == needle).then_some(offset))
+            .collect::<Vec<_>>();
+        if offsets.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path)
+                .at("mutation selector is not unique"));
+        }
+        let offset = offsets[0];
         target
             .bytes
             .splice(offset..offset + needle.len(), replacement.iter().copied());
@@ -73060,13 +76760,36 @@ activate = 1\n";
             .iter_mut()
             .find(|file| file.contract.path == "evidence/fnd-01/sdk-matrix.toml")
             .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "SDK matrix"))?;
-        let length_prefix = b"\npreimage_byte_length = ";
-        let length_start = manifest
+        let binding_header = b"[complete_input_binding]\n";
+        let binding_headers = manifest
             .bytes
-            .windows(length_prefix.len())
-            .position(|window| window == length_prefix)
-            .and_then(|offset| offset.checked_add(length_prefix.len()))
-            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "preimage length"))?;
+            .windows(binding_header.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == binding_header).then_some(offset))
+            .collect::<Vec<_>>();
+        if binding_headers.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", "complete input binding"));
+        }
+        let binding_start = binding_headers[0] + binding_header.len();
+        let binding_end = manifest.bytes[binding_start..]
+            .windows(2)
+            .position(|window| window == b"\n[")
+            .map(|offset| binding_start + offset + 1)
+            .unwrap_or(manifest.bytes.len());
+        let binding_offset = |bytes: &[u8], prefix: &[u8]| -> VResult<usize> {
+            let offsets = bytes[binding_start..binding_end]
+                .windows(prefix.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == prefix).then_some(binding_start + offset))
+                .collect::<Vec<_>>();
+            if offsets.len() != 1 {
+                return Err(Diagnostic::error("E_SDK_CANDIDATE", "complete input binding")
+                    .at("self-binding selector is not unique"));
+            }
+            Ok(offsets[0])
+        };
+        let length_prefix = b"\npreimage_byte_length = ";
+        let length_start = binding_offset(&manifest.bytes, length_prefix)? + length_prefix.len();
         let length_end = manifest.bytes[length_start..]
             .iter()
             .position(|byte| *byte == b'\n')
@@ -73077,12 +76800,7 @@ activate = 1\n";
             .bytes
             .splice(length_start..length_end, length.bytes());
         let digest_prefix = b"\ndigest = \"";
-        let digest_start = manifest
-            .bytes
-            .windows(digest_prefix.len())
-            .position(|window| window == digest_prefix)
-            .and_then(|offset| offset.checked_add(digest_prefix.len()))
-            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "digest"))?;
+        let digest_start = binding_offset(&manifest.bytes, digest_prefix)? + digest_prefix.len();
         let digest = lower_hex(&sha256(&preimage));
         manifest
             .bytes
@@ -73091,6 +76809,162 @@ activate = 1\n";
         Ok(candidate)
     }
 
+    fn sdk_matrix_normalize_self_binding_rhs(bytes: &[u8]) -> VResult<Vec<u8>> {
+        let subject = "SDK matrix self-binding normalization";
+        let header = b"[complete_input_binding]\n";
+        let headers = bytes
+            .windows(header.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == header).then_some(offset))
+            .collect::<Vec<_>>();
+        if headers.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", subject));
+        }
+        let table_start = headers[0] + header.len();
+        let table_end = bytes[table_start..]
+            .windows(2)
+            .position(|window| window == b"\n[")
+            .map(|offset| table_start + offset + 1)
+            .unwrap_or(bytes.len());
+        let mut ranges = Vec::new();
+        for prefix in [b"\npreimage_byte_length = ".as_slice(), b"\ndigest = ".as_slice()] {
+            let offsets = bytes[table_start..table_end]
+                .windows(prefix.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == prefix).then_some(table_start + offset))
+                .collect::<Vec<_>>();
+            if offsets.len() != 1 {
+                return Err(Diagnostic::error("E_SDK_CANDIDATE", subject));
+            }
+            let start = offsets[0] + prefix.len();
+            let end = bytes[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| start + offset)
+                .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", subject))?;
+            ranges.push((start, end));
+        }
+        ranges.sort_unstable();
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut cursor = 0usize;
+        for (start, end) in ranges {
+            normalized.extend_from_slice(&bytes[cursor..start]);
+            normalized.extend_from_slice(b"<self-binding-rhs>");
+            cursor = end;
+        }
+        normalized.extend_from_slice(&bytes[cursor..]);
+        Ok(normalized)
+    }
+
+    fn assert_sdk_matrix_single_delta(
+        baseline: &[LoadedFile],
+        candidate: &[LoadedFile],
+        target_path: &str,
+        needle: &[u8],
+        replacement: &[u8],
+    ) -> VResult<()> {
+        if baseline.len() != candidate.len() {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", "candidate input count"));
+        }
+        let mut target_count = 0usize;
+        for (before, after) in baseline.iter().zip(candidate) {
+            if before.contract.id != after.contract.id
+                || before.contract.family != after.contract.family
+                || before.contract.owner_bead != after.contract.owner_bead
+                || before.contract.path != after.contract.path
+                || before.contract.byte_length != after.contract.byte_length
+                || before.contract.sha256 != after.contract.sha256
+                || before.contract.parse_kind != after.contract.parse_kind
+                || before.contract.observation_kind != after.contract.observation_kind
+                || before.contract.bytes_available != after.contract.bytes_available
+                || before.contract.rehash_mode != after.contract.rehash_mode
+                || before.contract.claim_ceiling != after.contract.claim_ceiling
+                || before.contract.required != after.contract.required
+                || before.contract.source_tree_member != after.contract.source_tree_member
+                || before.digest != sha256(&before.bytes)
+                || after.digest != sha256(&after.bytes)
+            {
+                return Err(Diagnostic::error("E_SDK_CANDIDATE", "candidate contract map"));
+            }
+            if before.contract.path == target_path {
+                target_count = target_count
+                    .checked_add(1)
+                    .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", target_path))?;
+                let offsets = before
+                    .bytes
+                    .windows(needle.len())
+                    .enumerate()
+                    .filter_map(|(offset, window)| (window == needle).then_some(offset))
+                    .collect::<Vec<_>>();
+                if offsets.len() != 1 {
+                    return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path));
+                }
+                let mut expected = before.bytes.clone();
+                expected.splice(
+                    offsets[0]..offsets[0] + needle.len(),
+                    replacement.iter().copied(),
+                );
+                if target_path == "evidence/fnd-01/sdk-matrix.toml" {
+                    if sdk_matrix_normalize_self_binding_rhs(&expected)?
+                        != sdk_matrix_normalize_self_binding_rhs(&after.bytes)?
+                    {
+                        return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path));
+                    }
+                } else if expected != after.bytes {
+                    return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path));
+                }
+            } else if before.contract.path == "evidence/fnd-01/sdk-matrix.toml" {
+                if sdk_matrix_normalize_self_binding_rhs(&before.bytes)?
+                    != sdk_matrix_normalize_self_binding_rhs(&after.bytes)?
+                {
+                    return Err(Diagnostic::error("E_SDK_CANDIDATE", "self-binding delta"));
+                }
+            } else if before.bytes != after.bytes || before.digest != after.digest {
+                return Err(Diagnostic::error("E_SDK_CANDIDATE", before.contract.path.as_str()));
+            }
+        }
+        if target_count != 1 {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", target_path)
+                .at("target path cardinality"));
+        }
+        Ok(())
+    }
+
+    fn assert_sdk_loaded_file_vectors_equal(
+        expected: &[LoadedFile],
+        actual: &[LoadedFile],
+        subject: &str,
+    ) -> VResult<()> {
+        if expected.len() != actual.len() {
+            return Err(Diagnostic::error("E_SDK_CANDIDATE", subject).at("file count"));
+        }
+        for (before, after) in expected.iter().zip(actual) {
+            if before.contract.id != after.contract.id
+                || before.contract.family != after.contract.family
+                || before.contract.owner_bead != after.contract.owner_bead
+                || before.contract.path != after.contract.path
+                || before.contract.byte_length != after.contract.byte_length
+                || before.contract.sha256 != after.contract.sha256
+                || before.contract.parse_kind != after.contract.parse_kind
+                || before.contract.observation_kind != after.contract.observation_kind
+                || before.contract.bytes_available != after.contract.bytes_available
+                || before.contract.rehash_mode != after.contract.rehash_mode
+                || before.contract.claim_ceiling != after.contract.claim_ceiling
+                || before.contract.required != after.contract.required
+                || before.contract.source_tree_member != after.contract.source_tree_member
+                || before.bytes != after.bytes
+                || before.digest != after.digest
+                || before.digest != sha256(&before.bytes)
+                || after.digest != sha256(&after.bytes)
+            {
+                return Err(Diagnostic::error("E_SDK_CANDIDATE", subject)
+                    .at(&before.contract.path));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn derive_sdk_source_evidence_from_document(
         document: &toml::Value,
         files: &[LoadedFile],
@@ -73482,9 +77356,15 @@ activate = 1\n";
     fn parse_sdk_source_evidence(
         files: &[LoadedFile],
         policy: &Policy,
+        external_facts: ExternalSdkExecutionFacts,
     ) -> VResult<Vec<ParsedSdkPeerResult>> {
-        let document = parse_source_toml(files, "evidence/fnd-01/sdk-matrix.toml")?;
-        fnd_01_sdk_matrix_validate(files, policy)
+        let validation = fnd_01_sdk_matrix_validate(files, policy, external_facts)?;
+        match validation.execution {
+            ExecutionValidation::Unverified => Err(Diagnostic::pending(
+                "sdk_execution_facts_pending",
+            )),
+            ExecutionValidation::Verified(results) => Ok(results),
+        }
     }
 
     fn sdk_peer_result_mismatch_field(
@@ -75468,6 +79348,45 @@ activate = 1\n";
     /// rather than the compile-time facade root so an isolated role/run subject
     /// cannot silently validate the checkout that built the harness.
     fn run_verifier_at(root: &Path) -> VResult<Report> {
+        run_verifier_at_with_sdk_execution_facts(root, ExternalSdkExecutionFacts::Absent)
+    }
+
+    /// Batch ingress for raw SDK execution facts.  Parsing, complete-input
+    /// binding, and typed projection all occur inside the ordinary verifier.
+    fn run_verifier_at_with_sdk_execution_json(
+        root: &Path,
+        raw_bytes: Vec<u8>,
+    ) -> VResult<Report> {
+        run_verifier_at_with_sdk_execution_facts(
+            root,
+            ExternalSdkExecutionFacts::present_from_batch_owned_json(raw_bytes),
+        )
+    }
+
+    /// Externally callable batch-owned SDK-fact verifier surface.  The local
+    /// harness does not call this with repository-authored data; the batch
+    /// orchestrator must supply the raw execution JSON it produced.
+    pub fn sdk_batch_verify_json(
+        root: &Path,
+        raw_bytes: Vec<u8>,
+    ) -> Result<Vec<String>, String> {
+        let report = run_verifier_at_with_sdk_execution_json(root, raw_bytes)
+            .map_err(|diagnostic| diagnostic.stable())?;
+        let diagnostics = report.sorted_stable();
+        if report.has_errors() {
+            Err(diagnostics.join("\n"))
+        } else {
+            Ok(diagnostics)
+        }
+    }
+
+    /// The batch verifier uses this route when it owns a complete external SDK
+    /// execution bundle.  The ordinary local route supplies `Absent` and may
+    /// therefore validate static inputs but can never manufacture a Pass.
+    fn run_verifier_at_with_sdk_execution_facts(
+        root: &Path,
+        external_sdk_facts: ExternalSdkExecutionFacts,
+    ) -> VResult<Report> {
         let (policy, policy_bytes) = read_policy(root)?;
         validate_policy_shape(&policy)?;
         let marker = resolve_safe(root, "Cargo.toml", "repository marker")?;
@@ -75486,6 +79405,7 @@ activate = 1\n";
             &policy_bytes,
             source_tree,
             &files,
+            external_sdk_facts,
             &mut report,
         )?;
         Ok(report)
@@ -84417,250 +88337,262 @@ original = "value"
             read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         let files = load_sources(&root, &policy)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let expected = fnd_01_sdk_matrix_validate(&files, &policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let validation = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(validation.execution, ExecutionValidation::Unverified);
+        assert!(!validation.support_claim);
+        assert_eq!(validation.static_evidence.peers.len(), 4);
         assert_eq!(
-            expected
+            validation
+                .static_evidence
+                .peers
                 .iter()
-                .map(|result| (
-                    result.sdk_id.as_str(),
-                    result.artifact_count,
-                    result.artifact_set_sha256.as_str(),
-                ))
+                .map(|result| (result.sdk_id.as_str(), result.artifact_count))
                 .collect::<Vec<_>>(),
             [
-                (
-                    "typescript",
-                    3,
-                    "46b505d94e0aa37b2f57ef1abaa121ce85b6996ebb98ff72e150e9497963463c",
-                ),
-                (
-                    "python",
-                    2,
-                    "8f72fd6f900f45042c267bb08459b75ff65056cc8d21ea3796e5168600af86f7",
-                ),
-                (
-                    "csharp",
-                    1,
-                    "59d0b1482863fa058d0e5b5eed6c63c8712a7f4b6149766980d074d254deddd6",
-                ),
-                (
-                    "go",
-                    3,
-                    "28a4c26f4798912de71bf367d5277e1285040c207845aceb2e58fe881d5c18ef",
-                ),
+                ("typescript", 3),
+                ("python", 2),
+                ("csharp", 1),
+                ("go", 3),
             ]
         );
-        assert!(expected.iter().all(|result| {
-            result.online_closure_sha256 == result.offline_closure_sha256
-                && result.evidence_verdict == "Pass"
-                && !result.support_claim
+        assert!(validation.static_evidence.peers.iter().all(|peer| {
+            peer.source_selector.starts_with("/peers/by-id/")
+                && peer.checked_lock_sha256.len() == 64
         }));
-
-        let mut changed_result = ParsedSdkMatrix {
-            results: expected.clone(),
-        };
-        changed_result.results[2].artifact_set_sha256 = "00".repeat(32);
-        let error = validate_sdk_matrix_semantics(&changed_result, &expected)
-            .expect_err("changed derived SDK artifact set must fail");
-        assert_eq!(error.code, "E_SDK_RESULT");
-        assert_eq!(error.logical_path, "result[2].artifact_set_sha256");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations() {
-        let root = repository_root();
-        let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let files = load_sources(&root, &policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let document = parse_source_toml(&files, "evidence/fnd-01/sdk-matrix.toml")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-
-        let mut changed_exit = document.clone();
-        changed_exit
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peers"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|peers| peers.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|peer| peer.get_mut("lock"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|lock| lock.get_mut("last_execution"))
-            .and_then(toml::Value::as_table_mut)
-            .expect("TypeScript last execution")
-            .insert("online_exit".to_owned(), toml::Value::Integer(1));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("nonzero SDK execution must fail");
-        assert_eq!(error.code, "E_SDK_EXECUTION");
-
-        let mut changed_script = document.clone();
-        let script = changed_script
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peers"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|peers| peers.get_mut(1))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|peer| peer.get_mut("lock"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|lock| lock.get_mut("reproduction_script"))
-            .and_then(|value| value.as_str())
-            .expect("Python reproduction script")
-            .to_owned();
-        changed_script
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peers"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|peers| peers.get_mut(1))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|peer| peer.get_mut("lock"))
-            .and_then(toml::Value::as_table_mut)
-            .expect("Python lock")
-            .insert(
-                "reproduction_script".to_owned(),
-                toml::Value::String(format!("{script}# mutation\n")),
-            );
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("script bytes not matching the recorded hash must fail");
-        assert_eq!(error.code, "E_SDK_EXECUTION");
-
-        let mut changed_lock = document.clone();
-        changed_lock
-            .as_table_mut()
-            .and_then(|root| root.get_mut("vendored_artifacts"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|artifacts| artifacts.get_mut(1))
-            .and_then(toml::Value::as_table_mut)
-            .expect("TypeScript vendored manifest")
-            .insert("sha256".to_owned(), toml::Value::String("00".repeat(32)));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("vendored lock digest not matching local bytes must fail");
-        assert_eq!(error.code, "E_SDK_LOCK");
-
-        let mut omitted_tier_one = document.clone();
-        omitted_tier_one
-            .as_table_mut()
-            .and_then(|root| root.get_mut("catalog"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|catalog| catalog.get_mut("tier1_ids_in_catalog_order"))
-            .and_then(toml::Value::as_array_mut)
-            .expect("catalog Tier-1 IDs")
-            .remove(0);
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("omitting one Tier-1 peer must fail");
-        assert_eq!(error.code, "E_SDK_CATALOG");
-
-        let mut extra_lower_tier = document.clone();
-        extra_lower_tier
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peer_era_matrix"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|matrix| matrix.get_mut("peer_ids_in_catalog_order"))
-            .and_then(toml::Value::as_array_mut)
-            .expect("peer era matrix IDs")
-            .push(toml::Value::String("java".to_owned()));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("inserting a lower-tier peer must fail");
-        assert_eq!(error.code, "E_SDK_REVISION_6");
-
-        let mut duplicate_peer = document.clone();
-        duplicate_peer
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peer_era_matrix"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|matrix| matrix.get_mut("peer_ids_in_catalog_order"))
-            .and_then(toml::Value::as_array_mut)
-            .expect("peer era matrix IDs")
-            .push(toml::Value::String("go".to_owned()));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("duplicating a peer must fail");
-        assert_eq!(error.code, "E_SDK_REVISION_6");
-
-        let mut missing_legacy_capability = document.clone();
-        missing_legacy_capability
-            .as_table_mut()
-            .and_then(|root| root.get_mut("peers"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|peers| peers.get_mut(1))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|peer| peer.get_mut("era_capabilities"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|eras| eras.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .expect("Python legacy era capability")
-            .insert("support_state".to_owned(), toml::Value::String("unsupported".to_owned()));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("removing legacy capability support must fail");
-        assert_eq!(error.code, "E_SDK_REVISION_6");
-
-        let mut substituted_drift = document.clone();
-        let frozen_catalog_digest = substituted_drift
-            .as_table()
-            .and_then(|root| root.get("catalog"))
-            .and_then(toml::Value::as_table)
-            .and_then(|catalog| catalog.get("sha256"))
-            .and_then(toml::Value::as_str)
-            .expect("frozen catalog digest")
-            .to_owned();
-        substituted_drift
-            .as_table_mut()
-            .and_then(|root| root.get_mut("catalog"))
-            .and_then(toml::Value::as_table_mut)
-            .and_then(|catalog| catalog.get_mut("live_drift_observation"))
-            .and_then(toml::Value::as_table_mut)
-            .expect("live catalog drift observation")
-            .insert("sha256".to_owned(), toml::Value::String(frozen_catalog_digest));
-        let error = fnd_01_sdk_matrix_validate(&files, &policy)
-            .expect_err("substituting the frozen catalog for live drift must fail");
-        assert_eq!(error.code, "E_SDK_REVISION_6");
-
-        let mut changed_registry_artifact_files = files.clone();
-        let manifest = changed_registry_artifact_files
-            .iter_mut()
-            .find(|file| file.contract.path == "evidence/fnd-01/sdk-matrix.toml")
-            .expect("SDK matrix manifest source input");
-        let artifact_digest = b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6";
-        let offset = manifest
-            .bytes
-            .windows(artifact_digest.len())
-            .position(|window| window == artifact_digest)
-            .expect("TypeScript core registry artifact digest");
-        manifest.bytes[offset] = b'0';
-        manifest.digest = sha256(&manifest.bytes);
-        let error = fnd_01_sdk_matrix_validate(&changed_registry_artifact_files, &policy)
-            .expect_err("one registry-artifact digest byte must fail complete input binding");
-        assert_eq!(error.code, "E_SDK_COMPLETE_INPUT");
-
-        assert!(
-            fnd_01_sdk_matrix_validate(&files, &policy).is_ok(),
-            "each rejected one-variable mutation must leave the loaded baseline unchanged",
-        );
     }
 
     #[test]
     fn fnd_01_sdk_matrix_rejects_execution_script_and_lock_mutations() {
+        struct SdkMatrixPlant {
+            id: &'static str,
+            component: &'static str,
+            mutation: &'static str,
+            diagnostic: &'static str,
+            target: &'static str,
+            needle: &'static [u8],
+            replacement: &'static [u8],
+        }
+
         let root = repository_root();
         let (policy, _) = read_policy(&root).expect("policy");
         let files = load_sources(&root, &policy).expect("sources");
-        let cases = [
-            ("tier1-omission", b"tier1_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"tier1_ids_in_catalog_order = [\"python\", \"csharp\", \"go\"]".as_slice()),
-            ("lower-tier-insertion", b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\", \"java\"]".as_slice()),
-            ("peer-id-duplication", b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]".as_slice(), b"peer_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\", \"go\"]".as_slice()),
-            ("legacy-era-capability", b"support_state = \"supported\"".as_slice(), b"support_state = \"unsupported\"".as_slice()),
-            ("registry-artifact-digest", b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6".as_slice(), b"0000000000000000000000000000000000000000000000000000000000000000".as_slice()),
-            ("lock-byte-digest", b"\"lockfileVersion\"".as_slice(), b"\"lockfileXersion\"".as_slice()),
-            ("execution-command", b"npm_config_update_notifier=false npm ci".as_slice(), b"npm_config_update_notifier=true  npm ci".as_slice()),
-            ("live-drift-substitution", b"ac79b8a85bc451e63343d2c0feff9ed4277927d68b19276c5befb753eb73f065".as_slice(), b"c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77".as_slice()),
+        let raw_baseline = files.clone();
+        let cases: [SdkMatrixPlant; 8] = [
+            SdkMatrixPlant {
+                id: "tier1-omission",
+                component: "catalog.tier1_ids",
+                mutation: "remove_typescript",
+                diagnostic: "fnd01.sdk_matrix.missing_tier1_peer",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"tier1_ids_in_catalog_order = [\"typescript\", \"python\", \"csharp\", \"go\"]",
+                replacement: b"tier1_ids_in_catalog_order = [\"python\", \"csharp\", \"go\"]",
+            },
+            SdkMatrixPlant {
+                id: "lower-tier-insertion",
+                component: "peer_era_matrix.peer_ids",
+                mutation: "insert_java",
+                diagnostic: "fnd01.sdk_matrix.extra_non_tier1_peer",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"[[peer_era_matrix.eras]]\nprotocol_version = \"2026-07-28\"\npeer_ids = [\"typescript\", \"python\", \"csharp\", \"go\"]",
+                replacement: b"[[peer_era_matrix.eras]]\nprotocol_version = \"2026-07-28\"\npeer_ids = [\"typescript\", \"python\", \"csharp\", \"go\", \"java\"]",
+            },
+            SdkMatrixPlant {
+                id: "peer-id-duplication",
+                component: "peer_era_matrix.peer_ids",
+                mutation: "duplicate_go",
+                diagnostic: "fnd01.sdk_matrix.duplicate_peer",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"[[peer_era_matrix.eras]]\nprotocol_version = \"2026-07-28\"\npeer_ids = [\"typescript\", \"python\", \"csharp\", \"go\"]",
+                replacement: b"[[peer_era_matrix.eras]]\nprotocol_version = \"2026-07-28\"\npeer_ids = [\"typescript\", \"python\", \"csharp\", \"go\", \"go\"]",
+            },
+            SdkMatrixPlant {
+                id: "legacy-era-capability",
+                component: "python.era_capabilities.2024-11-05",
+                mutation: "remove_support",
+                diagnostic: "fnd01.sdk_matrix.peer_era_capability_mismatch",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"protocol_version = \"2024-11-05\"\nsupport_state = \"supported\"\nwire_era = \"legacy initialize-handshake\"\nsource_page_url = \"https://github.com/modelcontextprotocol/python-sdk",
+                replacement: b"protocol_version = \"2024-11-05\"\nsupport_state = \"unsupported\"\nwire_era = \"legacy initialize-handshake\"\nsource_page_url = \"https://github.com/modelcontextprotocol/python-sdk",
+            },
+            SdkMatrixPlant {
+                id: "registry-artifact-digest",
+                component: "typescript.registry_artifacts.core.sha256",
+                mutation: "replace_digest",
+                diagnostic: "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6",
+                replacement: b"0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            SdkMatrixPlant {
+                id: "lock-byte-digest",
+                component: "typescript-package-lock.json",
+                mutation: "change_one_byte",
+                diagnostic: "fnd01.sdk_matrix.lock_digest_mismatch",
+                target: "evidence/fnd-01/sdk-locks/typescript-package-lock.json",
+                needle: b"\"lockfileVersion\"",
+                replacement: b"\"lockfileXersion\"",
+            },
+            SdkMatrixPlant {
+                id: "execution-command",
+                component: "typescript.lock.reproduction_script",
+                mutation: "replace_one_offline_command_token",
+                diagnostic: "fnd01.sdk_matrix.execution_command_mismatch",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"cd \"$ts_offline\"\n  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env npm_config_update_notifier=false npm ci --ignore-scripts --offline --no-audit --no-fund --cache \"$ts_cache\"",
+                replacement: b"cd \"$ts_offline\"\n  sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/env npm_config_update_notifier=false npm ci --ignore-scripts --online  --no-audit --no-fund --cache \"$ts_cache\"",
+            },
+            SdkMatrixPlant {
+                id: "live-drift-substitution",
+                component: "catalog.live_drift_observation.sha256",
+                mutation: "substitute_for_frozen_catalog_sha256",
+                diagnostic: "fnd01.sdk_matrix.frozen_baseline_substitution",
+                target: "evidence/fnd-01/sdk-matrix.toml",
+                needle: b"ac79b8a85bc451e63343d2c0feff9ed4277927d68b19276c5befb753eb73f065",
+                replacement: b"c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77",
+            },
         ];
-        for (id, needle, replacement) in cases {
-            let target = if id == "lock-byte-digest" { "evidence/fnd-01/sdk-locks/typescript-package-lock.json" } else { "evidence/fnd-01/sdk-matrix.toml" };
-            let candidate = sdk_matrix_raw_candidate(&files, target, needle, replacement).expect("raw candidate");
-            let document = parse_source_toml(&candidate, "evidence/fnd-01/sdk-matrix.toml").expect("candidate manifest");
-            let expected = record_array(record_table(document.as_table().expect("root"), "validator_contract", "test").expect("contract"), "negative_dimensions", "test").expect("dimensions").iter().find_map(|value| { let row = value.as_table()?; (row.get("id")?.as_str()? == id).then(|| row.get("expected_diagnostic_kind")?.as_str()?.to_owned()) }).expect("declared diagnostic");
-            let error = fnd_01_sdk_matrix_validate(&candidate, &policy).expect_err("candidate must reject");
-            assert_eq!(error.code, expected, "{id}");
-            fnd_01_sdk_matrix_validate(&files, &policy).expect("pristine reacceptance");
+        let document = parse_source_toml(&files, "evidence/fnd-01/sdk-matrix.toml")
+            .expect("baseline manifest");
+        let declared = record_array(
+            record_table(
+                document.as_table().expect("manifest root"),
+                "validator_contract",
+                "test",
+            )
+            .expect("validator contract"),
+            "negative_dimensions",
+            "test",
+        )
+        .expect("negative dimensions")
+        .iter()
+        .map(|value| {
+            let row = value.as_table().expect("negative dimension row");
+            (
+                row.get("id")
+                    .and_then(toml::Value::as_str)
+                    .expect("negative dimension id"),
+                row.get("component")
+                    .and_then(toml::Value::as_str)
+                    .expect("negative dimension component"),
+                row.get("mutation")
+                    .and_then(toml::Value::as_str)
+                    .expect("negative dimension mutation"),
+                row.get("expected_diagnostic_kind")
+                    .and_then(toml::Value::as_str)
+                    .expect("negative dimension diagnostic"),
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            declared,
+            cases
+                .iter()
+                .map(|plant| {
+                    (
+                        plant.id,
+                        plant.component,
+                        plant.mutation,
+                        plant.diagnostic,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "literal plants equal the frozen validator contract"
+        );
+        let accepted = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )
+        .expect("baseline static validation");
+        for plant in cases {
+            assert_sdk_loaded_file_vectors_equal(
+                &raw_baseline,
+                &files,
+                "baseline before planted rejection",
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}: {}", plant.id, diagnostic.stable()));
+            let candidate = sdk_matrix_raw_candidate(
+                &files,
+                plant.target,
+                plant.needle,
+                plant.replacement,
+            )
+            .expect("raw candidate");
+            assert_sdk_matrix_single_delta(
+                &files,
+                &candidate,
+                plant.target,
+                plant.needle,
+                plant.replacement,
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}: {}", plant.id, diagnostic.stable()));
+            let candidate_document = parse_source_toml(
+                &candidate,
+                "evidence/fnd-01/sdk-matrix.toml",
+            )
+            .expect("candidate reparse");
+            let candidate_preimage =
+                fnd_01_sdk_matrix_validate_complete_input_binding(&candidate_document, &candidate)
+                    .expect("candidate preimage recomputation");
+            let candidate_binding = record_table(
+                candidate_document.as_table().expect("candidate root"),
+                "complete_input_binding",
+                "candidate binding",
+            )
+            .expect("candidate binding table");
+            assert_eq!(
+                record_u64(candidate_binding, "preimage_byte_length", "candidate binding")
+                    .expect("candidate binding length"),
+                u64::try_from(candidate_preimage.len()).expect("candidate preimage length"),
+                "{}: rebound preimage length",
+                plant.id
+            );
+            assert_eq!(
+                record_string(candidate_binding, "digest", "candidate binding")
+                    .expect("candidate binding digest"),
+                lower_hex(&sha256(&candidate_preimage)),
+                "{}: rebound preimage digest",
+                plant.id
+            );
+            let error = fnd_01_sdk_matrix_validate(
+                &candidate,
+                &policy,
+                ExternalSdkExecutionFacts::Absent,
+            )
+                .expect_err("candidate must reject");
+            assert_eq!(error.code, plant.diagnostic, "{}", plant.id);
+            let baseline_reaccepted = fnd_01_sdk_matrix_validate(
+                &files,
+                &policy,
+                ExternalSdkExecutionFacts::Absent,
+            )
+            .expect("baseline remains accepted");
+            assert_eq!(baseline_reaccepted, accepted, "{}: baseline typed validation", plant.id);
+            assert_sdk_loaded_file_vectors_equal(
+                &raw_baseline,
+                &files,
+                "baseline after planted rejection",
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}: {}", plant.id, diagnostic.stable()));
+            let reloaded = load_sources(&root, &policy).expect("fresh pristine source reload");
+            assert_sdk_loaded_file_vectors_equal(
+                &raw_baseline,
+                &reloaded,
+                "fresh pristine raw reload",
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}: {}", plant.id, diagnostic.stable()));
+            let reaccepted = fnd_01_sdk_matrix_validate(
+                &reloaded,
+                &policy,
+                ExternalSdkExecutionFacts::Absent,
+            )
+            .expect("pristine reacceptance");
+            assert_eq!(reaccepted, accepted, "{}: pristine typed validation", plant.id);
         }
     }
 
@@ -95924,7 +99856,7 @@ fn fallible(value: Option<u8>) {
 #[cfg(fnd01_bootstrap)]
 pub use bootstrap::harness_main;
 #[cfg(not(fnd01_bootstrap))]
-pub use ordinary::harness_main;
+pub use ordinary::{harness_main, sdk_batch_verify_json};
 
 #[cfg(all(fnd01_bootstrap, not(test)))]
 fn main() {
