@@ -55,6 +55,17 @@ mod sdk_producer {
         interpreter: evidence::SdkExecutableBinding,
         primary: evidence::SdkExecutableBinding,
         additional: Vec<evidence::SdkExecutableBinding>,
+        identities: Vec<ToolFileIdentity>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ToolFileIdentity {
+        id: String,
+        path: String,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
     }
 
     struct Outputs {
@@ -106,6 +117,56 @@ mod sdk_producer {
         })
     }
 
+    fn retain_capture_and_probe<T>(
+        result: Result<T>,
+        capture: &Capture,
+        probe: &evidence::SdkNetworkProbeBinding,
+    ) -> Result<T> {
+        result.map_err(|failure| {
+            format!(
+                "{failure}; reproduction_{}; network_probe_{}",
+                failure_stream_detail(&capture.stdout, &capture.stderr),
+                failure_stream_detail(&probe.stdout.raw, &probe.stderr.raw),
+            )
+        })
+    }
+
+    fn merge_capture_validation(
+        execution: Result<Capture>,
+        validation: Result<()>,
+    ) -> Result<Capture> {
+        match (execution, validation) {
+            (Ok(capture), Ok(())) => Ok(capture),
+            (Ok(capture), Err(failure)) => Err(failure_with_streams(
+                failure,
+                &capture.stdout,
+                &capture.stderr,
+            )),
+            (Err(failure), Ok(())) => Err(failure),
+            (Err(failure), Err(validation_failure)) => {
+                Err(format!("{failure}; {validation_failure}"))
+            }
+        }
+    }
+
+    fn merge_probe_validation(
+        probe: Result<evidence::SdkNetworkProbeBinding>,
+        validation: Result<()>,
+    ) -> Result<evidence::SdkNetworkProbeBinding> {
+        match (probe, validation) {
+            (Ok(probe), Ok(())) => Ok(probe),
+            (Ok(probe), Err(failure)) => Err(failure_with_streams(
+                failure,
+                &probe.stdout.raw,
+                &probe.stderr.raw,
+            )),
+            (Err(failure), Ok(())) => Err(failure),
+            (Err(failure), Err(validation_failure)) => {
+                Err(format!("{failure}; {validation_failure}"))
+            }
+        }
+    }
+
     fn read_bounded(path: &Path, limit: u64, subject: &str) -> Result<Vec<u8>> {
         let mut file = fs::File::open(path).map_err(|_| err("E_SDK_FILE", subject))?;
         let mut bytes = Vec::new();
@@ -155,6 +216,26 @@ mod sdk_producer {
             sha256: sha256(&bytes),
             version: version.to_owned(),
         })
+    }
+
+    fn exact_executable(
+        id: &str,
+        path: &Path,
+        version: &str,
+        subject: &str,
+    ) -> Result<evidence::SdkExecutableBinding> {
+        let lexical = path
+            .to_str()
+            .ok_or_else(|| err("E_SDK_TOOL_IDENTITY", subject))?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
+        if metadata.file_type().is_symlink()
+            || !is_executable_file(&metadata)
+            || canonical_utf8(path, subject)? != lexical
+        {
+            return Err(err("E_SDK_TOOL_IDENTITY", subject));
+        }
+        executable(id, path, version, subject)
     }
 
     fn transcript(raw: Vec<u8>, subject: &str) -> Result<evidence::SdkTranscriptBinding> {
@@ -407,6 +488,152 @@ mod sdk_producer {
             if resolve_path_program(paths, program)? != tool.path {
                 return Err(err("E_SDK_RUNNER_CONFIGURATION", &tool.id));
             }
+        }
+        Ok(())
+    }
+
+    fn tool_file_identity(
+        binding: &evidence::SdkExecutableBinding,
+        subject: &str,
+    ) -> Result<ToolFileIdentity> {
+        let metadata = fs::symlink_metadata(&binding.path)
+            .map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
+        if metadata.file_type().is_symlink()
+            || !is_executable_file(&metadata)
+            || metadata.len() != binding.byte_length
+        {
+            return Err(err("E_SDK_TOOL_IDENTITY", subject));
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(ToolFileIdentity {
+            id: binding.id.clone(),
+            path: binding.path.clone(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    fn validate_tool_surface(tools: &Tools, subject: &str) -> Result<()> {
+        let mut identities = tools.identities.iter();
+        for binding in std::iter::once(&tools.interpreter)
+            .chain(std::iter::once(&tools.primary))
+            .chain(&tools.additional)
+        {
+            let expected_identity = identities
+                .next()
+                .ok_or_else(|| err("E_SDK_TOOL_IDENTITY", subject))?;
+            let observed_binding = executable(
+                &binding.id,
+                Path::new(&binding.path),
+                &binding.version,
+                subject,
+            )?;
+            let observed_identity = tool_file_identity(&observed_binding, subject)?;
+            if &observed_binding != binding || &observed_identity != expected_identity {
+                return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
+            }
+        }
+        if identities.next().is_some() {
+            return Err(err("E_SDK_TOOL_IDENTITY", subject));
+        }
+
+        let mut path_values = tools
+            .environment
+            .iter()
+            .filter(|(name, _)| name == "PATH")
+            .map(|(_, value)| value);
+        let path = path_values
+            .next()
+            .ok_or_else(|| err("E_SDK_TOOL_IDENTITY", "PATH"))?;
+        if path_values.next().is_some() {
+            return Err(err("E_SDK_TOOL_IDENTITY", "PATH"));
+        }
+        let path_directories = std::env::split_paths(OsStr::new(path)).collect::<Vec<_>>();
+        if path_directories.is_empty()
+            || path_directories
+                .iter()
+                .any(|directory| !directory.is_absolute())
+        {
+            return Err(err("E_SDK_TOOL_IDENTITY", "PATH"));
+        }
+        validate_path_tool_bindings(&path_directories, &tools.primary, &tools.additional)
+            .map_err(|_| err("E_SDK_TOOL_IDENTITY", "PATH"))
+    }
+
+    fn tool_identity_digest(tools: &Tools, subject: &str) -> Result<String> {
+        let bindings = std::iter::once(&tools.interpreter)
+            .chain(std::iter::once(&tools.primary))
+            .chain(&tools.additional);
+        if tools.identities.len() != 2usize.saturating_add(tools.additional.len()) {
+            return Err(err("E_SDK_TOOL_IDENTITY", subject));
+        }
+        let mut values = Vec::with_capacity(
+            1usize.saturating_add(tools.identities.len().saturating_mul(8)),
+        );
+        values.push(tools.identities.len().to_string());
+        for (binding, expected_identity) in bindings.zip(&tools.identities) {
+            let observed_binding = executable(
+                &binding.id,
+                Path::new(&binding.path),
+                &binding.version,
+                subject,
+            )?;
+            let identity = tool_file_identity(&observed_binding, subject)?;
+            if &observed_binding != binding || &identity != expected_identity {
+                return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
+            }
+            values.extend([
+                observed_binding.id,
+                observed_binding.path,
+                observed_binding.byte_length.to_string(),
+                observed_binding.sha256,
+                observed_binding.version,
+            ]);
+            #[cfg(unix)]
+            values.extend([
+                "unix-device-inode".to_owned(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ]);
+            #[cfg(not(unix))]
+            values.push("identity-unavailable".to_owned());
+        }
+        Ok(evidence::sdk_sequence_sha256(
+            b"FND01SDKTOOLIDENTITYv1\0",
+            &values,
+        ))
+    }
+
+    fn validate_tool_identity_temporal_binding(
+        before: &str,
+        after: &str,
+        subject: &str,
+    ) -> Result<()> {
+        if before == after
+            && before.bytes().any(|byte| byte != b'0')
+            && after.bytes().any(|byte| byte != b'0')
+        {
+            Ok(())
+        } else {
+            Err(err("E_SDK_TOOL_IDENTITY", subject))
+        }
+    }
+
+    fn validate_executable_binding(
+        binding: &evidence::SdkExecutableBinding,
+        subject: &str,
+    ) -> Result<()> {
+        let observed = executable(
+            &binding.id,
+            Path::new(&binding.path),
+            &binding.version,
+            subject,
+        )?;
+        if &observed != binding {
+            return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
         }
         Ok(())
     }
@@ -710,7 +937,7 @@ mod sdk_producer {
                 "requires aarch64 macOS sandbox-exec evidence host",
             ));
         }
-        let interpreter = executable("zsh", Path::new("/bin/zsh"), "system", "zsh")?;
+        let interpreter = exact_executable("zsh", Path::new("/bin/zsh"), "system", "zsh")?;
         let (primary, mut additional, configured_path_order, sdk_environment): (
             _,
             _,
@@ -767,7 +994,7 @@ mod sdk_producer {
                     "dotnet archive",
                 )?;
                 (
-                    executable(
+                    exact_executable(
                         "dotnet",
                         &Path::new(&dotnet_root).join("dotnet"),
                         "10.0.100",
@@ -796,7 +1023,7 @@ mod sdk_producer {
             "go" => {
                 let go_root = configured_directory("GO_1_25", "go root")?;
                 (
-                    executable(
+                    exact_executable(
                         "go",
                         &Path::new(&go_root).join("bin/go"),
                         "go version go1.25.0 darwin/arm64",
@@ -852,11 +1079,17 @@ mod sdk_producer {
         ];
         environment.extend(sdk_environment);
         environment.sort_unstable();
+        let identities = std::iter::once(&interpreter)
+            .chain(std::iter::once(&primary))
+            .chain(&additional)
+            .map(|binding| tool_file_identity(binding, &binding.id))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Tools {
             environment,
             interpreter,
             primary,
             additional,
+            identities,
         })
     }
 
@@ -1007,6 +1240,8 @@ mod sdk_producer {
         launcher: &evidence::SdkExecutableBinding,
         target_tool: &evidence::SdkExecutableBinding,
     ) -> Result<evidence::SdkNetworkProbeBinding> {
+        validate_executable_binding(launcher, "network launcher")?;
+        validate_executable_binding(target_tool, "network target")?;
         let url = match sdk_id {
             "typescript" => "https://registry.npmjs.org/",
             "python" => "https://pypi.org/",
@@ -1025,7 +1260,7 @@ mod sdk_producer {
             "2".to_owned(),
             url.to_owned(),
         ];
-        let capture = execute_bounded(
+        let execution = execute_bounded(
             cx,
             &argv,
             environment,
@@ -1035,7 +1270,10 @@ mod sdk_producer {
             batch_clock,
             "network denial probe",
         )
-        .await?;
+        .await;
+        let post_validation = validate_executable_binding(launcher, "network launcher")
+            .and_then(|()| validate_executable_binding(target_tool, "network target"));
+        let capture = merge_capture_validation(execution, post_validation)?;
         let cwd = retain_capture(canonical_utf8(root, sdk_id), &capture)?;
         let elapsed_ns = retain_capture(
             capture
@@ -1082,9 +1320,15 @@ mod sdk_producer {
             return Err(err("E_SDK_EXECUTION_SCRIPT", sdk_id));
         }
         let tools = tool_surface(sdk_id)?;
+        validate_tool_surface(&tools, sdk_id)?;
+        let tool_identity_before_sha256 = tool_identity_digest(&tools, sdk_id)?;
         let before = tmp_snapshot(sdk_id)?;
-        let argv = vec!["/bin/zsh".to_owned(), "-f".to_owned(), "-s".to_owned()];
-        let capture = execute_bounded(
+        let argv = vec![
+            tools.interpreter.path.clone(),
+            "-f".to_owned(),
+            "-s".to_owned(),
+        ];
+        let execution = execute_bounded(
             cx,
             &argv,
             &tools.environment,
@@ -1094,7 +1338,8 @@ mod sdk_producer {
             batch_clock,
             sdk_id,
         )
-        .await?;
+        .await;
+        let capture = merge_capture_validation(execution, validate_tool_surface(&tools, sdk_id))?;
         let after = retain_capture(tmp_snapshot(sdk_id), &capture)?;
         let runtime_paths = retain_capture(runtime_paths(sdk_id, &before, &after), &capture)?;
         let outputs = retain_capture(observed_outputs(sdk_id, &runtime_paths), &capture)?;
@@ -1136,7 +1381,7 @@ mod sdk_producer {
                 .ok_or_else(|| err("E_SDK_NETWORK_PROBE", sdk_id)),
             &capture,
         )?;
-        let network_probe = network_probe(
+        let probe = network_probe(
             cx,
             sdk_id,
             &tools.environment,
@@ -1145,16 +1390,48 @@ mod sdk_producer {
             launcher,
             target_tool,
         )
-        .await?;
-        let elapsed_ns = retain_capture(
+        .await;
+        let network_probe = retain_capture(
+            merge_probe_validation(probe, validate_tool_surface(&tools, sdk_id)),
+            &capture,
+        )?;
+        retain_capture_and_probe(
+            validate_tool_surface(&tools, sdk_id),
+            &capture,
+            &network_probe,
+        )?;
+        let tool_identity_after_sha256 = retain_capture_and_probe(
+            tool_identity_digest(&tools, sdk_id),
+            &capture,
+            &network_probe,
+        )?;
+        retain_capture_and_probe(
+            validate_tool_identity_temporal_binding(
+                &tool_identity_before_sha256,
+                &tool_identity_after_sha256,
+                sdk_id,
+            ),
+            &capture,
+            &network_probe,
+        )?;
+        let elapsed_ns = retain_capture_and_probe(
             capture
                 .monotonic_finished_ns
                 .checked_sub(capture.monotonic_started_ns)
                 .ok_or_else(|| err("E_SDK_CLOCK", sdk_id)),
             &capture,
+            &network_probe,
         )?;
-        let cwd = retain_capture(canonical_utf8(root, sdk_id), &capture)?;
-        let stream_detail = failure_stream_detail(&capture.stdout, &capture.stderr);
+        let cwd = retain_capture_and_probe(
+            canonical_utf8(root, sdk_id),
+            &capture,
+            &network_probe,
+        )?;
+        let stream_detail = format!(
+            "reproduction_{}; network_probe_{}",
+            failure_stream_detail(&capture.stdout, &capture.stderr),
+            failure_stream_detail(&network_probe.stdout.raw, &network_probe.stderr.raw),
+        );
         let stdout = transcript(capture.stdout, sdk_id)
             .map_err(|failure| format!("{failure}; {stream_detail}"))?;
         let stderr = transcript(capture.stderr, sdk_id)
@@ -1169,6 +1446,8 @@ mod sdk_producer {
             interpreter: tools.interpreter,
             primary_tool: tools.primary,
             additional_tools: tools.additional,
+            tool_identity_before_sha256,
+            tool_identity_after_sha256,
             reproduction_script_byte_length: u64::try_from(script.len()).unwrap_or(u64::MAX),
             reproduction_script_sha256: peer.reproduction_script_sha256.clone(),
             composite_script_observer_sha256: String::new(),
