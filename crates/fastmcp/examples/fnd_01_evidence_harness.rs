@@ -10,6 +10,7 @@
 #[path = "../tests/fnd_01_dependency_evidence.rs"]
 mod evidence;
 
+#[cfg(not(fnd01_bootstrap))]
 mod sdk_producer {
     use super::evidence;
     use asupersync::Cx;
@@ -34,7 +35,10 @@ mod sdk_producer {
 
     const CHILD_STREAM_LIMIT: usize = 1_048_576;
     const CHILD_STREAM_READ_LIMIT: u64 = 1_048_577;
+    const CHILD_FAILURE_TAIL_LIMIT: usize = 4_096;
     const CHILD_HEARTBEAT: Duration = Duration::from_millis(100);
+    const CHILD_FAILURE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+    const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
     struct Capture {
         exit_code: i64,
@@ -74,6 +78,32 @@ mod sdk_producer {
 
     fn sha256(bytes: &[u8]) -> String {
         hex(&Sha256::digest(bytes))
+    }
+
+    fn stream_tail(bytes: &[u8]) -> &[u8] {
+        &bytes[bytes.len().saturating_sub(CHILD_FAILURE_TAIL_LIMIT)..]
+    }
+
+    fn failure_stream_detail(stdout: &[u8], stderr: &[u8]) -> String {
+        format!(
+            "stdout_captured_len={};stdout_captured_sha256={};stdout_captured_tail_hex={};stderr_captured_len={};stderr_captured_sha256={};stderr_captured_tail_hex={}",
+            stdout.len(),
+            sha256(stdout),
+            hex(stream_tail(stdout)),
+            stderr.len(),
+            sha256(stderr),
+            hex(stream_tail(stderr)),
+        )
+    }
+
+    fn failure_with_streams(failure: String, stdout: &[u8], stderr: &[u8]) -> String {
+        format!("{failure}; {}", failure_stream_detail(stdout, stderr))
+    }
+
+    fn retain_capture<T>(result: Result<T>, capture: &Capture) -> Result<T> {
+        result.map_err(|failure| {
+            failure_with_streams(failure, &capture.stdout, &capture.stderr)
+        })
     }
 
     fn read_bounded(path: &Path, limit: u64, subject: &str) -> Result<Vec<u8>> {
@@ -150,12 +180,235 @@ mod sdk_producer {
         Ok(value)
     }
 
-    fn configured_tool(name: &str, id: &str, version: &str) -> Result<evidence::SdkExecutableBinding> {
+    fn configured_tool(
+        name: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<evidence::SdkExecutableBinding> {
         let path = required_environment(name, "SDK configured tool")?;
         if !Path::new(&path).is_absolute() {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", name));
         }
         executable(id, Path::new(&path), version, name)
+    }
+
+    fn system_tool(id: &str) -> Result<evidence::SdkExecutableBinding> {
+        let path = match id {
+            "awk" => "/usr/bin/awk",
+            "basename" => "/usr/bin/basename",
+            "cmp" => "/usr/bin/cmp",
+            "curl" => "/usr/bin/curl",
+            "env" => "/usr/bin/env",
+            "find" => "/usr/bin/find",
+            "install" => "/usr/bin/install",
+            "mktemp" => "/usr/bin/mktemp",
+            "perl" => "/usr/bin/perl",
+            "sandbox-exec" => "/usr/bin/sandbox-exec",
+            "sed" => "/usr/bin/sed",
+            "shasum" => "/usr/bin/shasum",
+            "sort" => "/usr/bin/sort",
+            _ => return Err(err("E_SDK_RUNNER_CONFIGURATION", id)),
+        };
+        executable(id, Path::new(path), "system", id)
+    }
+
+    fn configured_directory(name: &str, subject: &str) -> Result<String> {
+        let configured = required_environment(name, subject)?;
+        if configured.ends_with('/')
+            || configured.ends_with("/.")
+            || configured.ends_with("/..")
+        {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", subject));
+        }
+        let path = Path::new(&configured);
+        if !path.is_absolute() {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", name));
+        }
+        let configured_metadata = fs::symlink_metadata(path)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", subject))?;
+        if configured_metadata.file_type().is_symlink() {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", subject));
+        }
+        let canonical = canonical_utf8(path, subject)?;
+        let metadata = fs::symlink_metadata(&canonical)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", subject))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", subject));
+        }
+        Ok(canonical)
+    }
+
+    fn directory_has_no_write_bits(metadata: &fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o222 == 0
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            false
+        }
+    }
+
+    fn same_directory_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            before.dev() == after.dev() && before.ino() == after.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (before, after);
+            false
+        }
+    }
+
+    fn configured_home() -> Result<String> {
+        let configured = required_environment("FND01_SDK_HOME", "home")?;
+        let canonical = configured_directory("FND01_SDK_HOME", "home")?;
+        if configured != canonical {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", "home"));
+        }
+        let before = fs::symlink_metadata(&canonical)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", "home"))?;
+        if !before.is_dir()
+            || before.file_type().is_symlink()
+            || !directory_has_no_write_bits(&before)
+        {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", "home"));
+        }
+        if fs::read_dir(&canonical)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", "home"))?
+            .next()
+            .is_some()
+        {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", "home"));
+        }
+        let after = fs::symlink_metadata(&canonical)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", "home"))?;
+        if !after.is_dir()
+            || after.file_type().is_symlink()
+            || !directory_has_no_write_bits(&after)
+            || !same_directory_identity(&before, &after)
+        {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", "home"));
+        }
+        Ok(canonical)
+    }
+
+    fn validate_observed_home(environment: &[(String, String)], subject: &str) -> Result<()> {
+        let configured = configured_home()?;
+        let observed = environment
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| value)
+            .ok_or_else(|| err("E_SDK_CHILD_CONTRACT", subject))?;
+        if observed != &configured {
+            return Err(err("E_SDK_CHILD_CONTRACT", subject));
+        }
+        Ok(())
+    }
+
+    fn append_post_home_failure(
+        environment: &[(String, String)],
+        subject: &str,
+        failure: String,
+    ) -> String {
+        match validate_observed_home(environment, subject) {
+            Ok(()) => failure,
+            Err(home_failure) => format!("{failure}; {home_failure}"),
+        }
+    }
+
+    fn configured_parent(name: &str) -> Result<PathBuf> {
+        let configured = required_environment(name, name)?;
+        let path = Path::new(&configured);
+        if !path.is_absolute() {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", name));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| err("E_SDK_RUNNER_CONFIGURATION", name))?;
+        Ok(PathBuf::from(canonical_utf8(parent, name)?))
+    }
+
+    fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
+    fn is_executable_file(metadata: &fs::Metadata) -> bool {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    fn resolve_path_program(paths: &[PathBuf], program: &str) -> Result<String> {
+        if program.is_empty()
+            || program.contains('/')
+            || program.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(err("E_SDK_RUNNER_CONFIGURATION", "PATH program"));
+        }
+        for directory in paths {
+            let candidate = directory.join(program);
+            if fs::metadata(&candidate).is_ok_and(|metadata| is_executable_file(&metadata)) {
+                return canonical_utf8(&candidate, program);
+            }
+        }
+        Err(err("E_SDK_RUNNER_CONFIGURATION", program))
+    }
+
+    fn path_program(tool_id: &str) -> Result<Option<&'static str>> {
+        let program = match tool_id {
+            "node" => Some("node"),
+            "npm" => Some("npm"),
+            "python" => Some("python3"),
+            "jq" => Some("jq"),
+            "awk" => Some("awk"),
+            "basename" => Some("basename"),
+            "cmp" => Some("cmp"),
+            "env" => Some("env"),
+            "find" => Some("find"),
+            "install" => Some("install"),
+            "mktemp" => Some("mktemp"),
+            "perl" => Some("perl"),
+            "shasum" => Some("shasum"),
+            "sandbox-exec" => Some("sandbox-exec"),
+            "sed" => Some("sed"),
+            "sort" => Some("sort"),
+            "curl" => Some("curl"),
+            "dotnet" | "go" => None,
+            _ => return Err(err("E_SDK_RUNNER_CONFIGURATION", tool_id)),
+        };
+        Ok(program)
+    }
+
+    fn validate_path_tool_bindings(
+        paths: &[PathBuf],
+        primary: &evidence::SdkExecutableBinding,
+        additional: &[evidence::SdkExecutableBinding],
+    ) -> Result<()> {
+        for tool in std::iter::once(primary).chain(additional) {
+            let Some(program) = path_program(&tool.id)? else {
+                continue;
+            };
+            if resolve_path_program(paths, program)? != tool.path {
+                return Err(err("E_SDK_RUNNER_CONFIGURATION", &tool.id));
+            }
+        }
+        Ok(())
     }
 
     fn epoch_seconds(subject: &str) -> Result<u64> {
@@ -172,75 +425,108 @@ mod sdk_producer {
         stderr: ChildStderr,
         stdin_bytes: &[u8],
         subject: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        stdout_capture: &mut Vec<u8>,
+        stderr_capture: &mut Vec<u8>,
+    ) -> Result<()> {
         let mut stdin_future = Box::pin(async move {
             stdin.write_all(stdin_bytes).await?;
             stdin.shutdown().await
         });
         let mut stdout_future = Box::pin(async move {
-            let mut output = Vec::new();
             let mut bounded = stdout.take(CHILD_STREAM_READ_LIMIT);
-            bounded.read_to_end(&mut output).await?;
-            Ok::<_, std::io::Error>(output)
+            bounded.read_to_end(stdout_capture).await
         });
         let mut stderr_future = Box::pin(async move {
-            let mut output = Vec::new();
             let mut bounded = stderr.take(CHILD_STREAM_READ_LIMIT);
-            bounded.read_to_end(&mut output).await?;
-            Ok::<_, std::io::Error>(output)
+            bounded.read_to_end(stderr_capture).await
         });
         let mut stdin_done = false;
         let mut stdout_done = None;
         let mut stderr_done = None;
         let mut heartbeat = Box::pin(time::sleep(cx.now(), CHILD_HEARTBEAT));
+        let mut first_failure = None;
+        let mut failure_drain = None;
 
         std::future::poll_fn(|task| {
-            if cx.checkpoint().is_err() {
-                return Poll::Ready(Err(err("E_SDK_CHILD_CANCELLED", subject)));
-            }
-
-            if !stdin_done {
-                match stdin_future.as_mut().poll(task) {
-                    Poll::Ready(Ok(())) => stdin_done = true,
-                    Poll::Ready(Err(_)) => {
-                        return Poll::Ready(Err(err("E_SDK_CHILD_STREAM", "stdin write")));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-            if stdout_done.is_none() {
-                match stdout_future.as_mut().poll(task) {
-                    Poll::Ready(Ok(output)) => stdout_done = Some(output),
-                    Poll::Ready(Err(_)) => {
-                        return Poll::Ready(Err(err("E_SDK_CHILD_STREAM", "stdout")));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-            if stderr_done.is_none() {
-                match stderr_future.as_mut().poll(task) {
-                    Poll::Ready(Ok(output)) => stderr_done = Some(output),
-                    Poll::Ready(Err(_)) => {
-                        return Poll::Ready(Err(err("E_SDK_CHILD_STREAM", "stderr")));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            if stdout_done
-                .as_ref()
-                .is_some_and(|output| output.len() > CHILD_STREAM_LIMIT)
-                || stderr_done
-                    .as_ref()
-                    .is_some_and(|output| output.len() > CHILD_STREAM_LIMIT)
             {
-                return Poll::Ready(Err(err("E_SDK_CHILD_STREAM", "bound exceeded")));
+                let mut latch_failure = |failure: String| {
+                    if first_failure.is_none() {
+                        first_failure = Some(failure);
+                        failure_drain = Some(Box::pin(time::sleep(
+                            cx.now(),
+                            CHILD_FAILURE_DRAIN_TIMEOUT,
+                        )));
+                    }
+                };
+
+                if cx.checkpoint().is_err() {
+                    stdin_done = true;
+                    latch_failure(err("E_SDK_CHILD_CANCELLED", subject));
+                }
+
+                if !stdin_done {
+                    match stdin_future.as_mut().poll(task) {
+                        Poll::Ready(Ok(())) => stdin_done = true,
+                        Poll::Ready(Err(_)) => {
+                            stdin_done = true;
+                            latch_failure(err("E_SDK_CHILD_STREAM", "stdin write"));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if stdout_done.is_none() {
+                    match stdout_future.as_mut().poll(task) {
+                        Poll::Ready(Ok(length)) => {
+                            stdout_done = Some(length);
+                            if length > CHILD_STREAM_LIMIT {
+                                latch_failure(err(
+                                    "E_SDK_CHILD_STREAM",
+                                    "stdout bound exceeded",
+                                ));
+                            }
+                        }
+                        Poll::Ready(Err(_)) => {
+                            stdout_done = Some(0);
+                            latch_failure(err("E_SDK_CHILD_STREAM", "stdout"));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if stderr_done.is_none() {
+                    match stderr_future.as_mut().poll(task) {
+                        Poll::Ready(Ok(length)) => {
+                            stderr_done = Some(length);
+                            if length > CHILD_STREAM_LIMIT {
+                                latch_failure(err(
+                                    "E_SDK_CHILD_STREAM",
+                                    "stderr bound exceeded",
+                                ));
+                            }
+                        }
+                        Poll::Ready(Err(_)) => {
+                            stderr_done = Some(0);
+                            latch_failure(err("E_SDK_CHILD_STREAM", "stderr"));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if first_failure.is_some() {
+                    stdin_done = true;
+                }
             }
-            if stdin_done && stdout_done.is_some() && stderr_done.is_some() {
-                return Poll::Ready(Ok((
-                    stdout_done.take().unwrap_or_default(),
-                    stderr_done.take().unwrap_or_default(),
-                )));
+
+            if stdout_done.is_some() && stderr_done.is_some() && stdin_done {
+                return Poll::Ready(match first_failure.take() {
+                    Some(failure) => Err(failure),
+                    None => Ok(()),
+                });
+            }
+            if let Some(deadline) = failure_drain.as_mut()
+                && deadline.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(first_failure
+                    .take()
+                    .unwrap_or_else(|| err("E_SDK_CHILD_STREAM", subject))));
             }
 
             if heartbeat.as_mut().poll(task).is_ready() {
@@ -255,12 +541,13 @@ mod sdk_producer {
         .await
     }
 
-    async fn cleanup_child(child: &mut Child, cx: &Cx, subject: &str) -> Result<()> {
+    async fn cleanup_child(cx: &Cx, child: &mut Child, subject: &str) -> Result<()> {
         if child.id().is_none() {
             return Ok(());
         }
         let _ = child.kill();
-        let _wait_result = child.wait_async(cx).await;
+        let cleanup_origin = cx.now();
+        let _ = time::timeout(cleanup_origin, CHILD_CLEANUP_TIMEOUT, child.wait_async(cx)).await;
         if child.id().is_none() {
             Ok(())
         } else {
@@ -269,12 +556,12 @@ mod sdk_producer {
     }
 
     async fn fail_after_cleanup(
-        child: &mut Child,
         cx: &Cx,
+        child: &mut Child,
         subject: &str,
         failure: String,
     ) -> String {
-        match cleanup_child(child, cx, subject).await {
+        match cleanup_child(cx, child, subject).await {
             Ok(()) => failure,
             Err(cleanup) => format!("{failure}; {cleanup}"),
         }
@@ -299,6 +586,7 @@ mod sdk_producer {
         {
             return Err(err("E_SDK_CHILD_CONTRACT", subject));
         }
+        validate_observed_home(environment, subject)?;
         cx.checkpoint()
             .map_err(|_| err("E_SDK_CHILD_CANCELLED", subject))?;
         let timeout_origin = cx.now();
@@ -329,46 +617,86 @@ mod sdk_producer {
             (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
             _ => {
                 let failure = err("E_SDK_CHILD_SPAWN", "stdio");
-                return Err(fail_after_cleanup(&mut child, cx, subject, failure).await);
+                let failure = fail_after_cleanup(cx, &mut child, subject, failure).await;
+                return Err(append_post_home_failure(environment, subject, failure));
             }
         };
+        let mut stdout_capture = Vec::new();
+        let mut stderr_capture = Vec::new();
         let outcome = {
             let communication = async {
                 // Keep the child handle unreaped while draining. A descendant may
                 // inherit a pipe, and the managed group must remain signalable if
                 // that pipe outlives the direct child.
-                let (stdout, stderr) =
-                    exchange_child_streams(cx, stdin, stdout, stderr, stdin_bytes, subject).await?;
+                exchange_child_streams(
+                    cx,
+                    stdin,
+                    stdout,
+                    stderr,
+                    stdin_bytes,
+                    subject,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                )
+                .await?;
                 let status = child
                     .wait_async(cx)
                     .await
                     .map_err(|_| err("E_SDK_CHILD_WAIT", subject))?;
-                Ok::<_, String>((status, stdout, stderr))
+                Ok::<_, String>(status)
             };
             time::timeout(timeout_origin, timeout, communication).await
         };
-        let (status, stdout, stderr) = match outcome {
+        let status = match outcome {
             Ok(Ok(value)) => value,
             Ok(Err(failure)) => {
-                return Err(fail_after_cleanup(&mut child, cx, subject, failure).await);
+                let failure = failure_with_streams(failure, &stdout_capture, &stderr_capture);
+                let failure = fail_after_cleanup(cx, &mut child, subject, failure).await;
+                return Err(append_post_home_failure(environment, subject, failure));
             }
             Err(_) => {
                 // Dropping the timed future above closes all pipe handles before
                 // the configured process group is killed and the leader reaped.
-                let failure = err("E_SDK_CHILD_DEADLINE", subject);
-                return Err(fail_after_cleanup(&mut child, cx, subject, failure).await);
+                let failure = failure_with_streams(
+                    err("E_SDK_CHILD_DEADLINE", subject),
+                    &stdout_capture,
+                    &stderr_capture,
+                );
+                let failure = fail_after_cleanup(cx, &mut child, subject, failure).await;
+                return Err(append_post_home_failure(environment, subject, failure));
             }
         };
-        let exit_code = status
-            .code()
-            .map(i64::from)
-            .ok_or_else(|| err("E_SDK_CHILD_WAIT", "signal"))?;
+        let exit_code = match status.code() {
+            Some(code) => i64::from(code),
+            None => {
+                let failure = failure_with_streams(
+                    err("E_SDK_CHILD_WAIT", "signal"),
+                    &stdout_capture,
+                    &stderr_capture,
+                );
+                return Err(append_post_home_failure(environment, subject, failure));
+            }
+        };
+        let finished_at_epoch_seconds = match epoch_seconds(subject) {
+            Ok(value) => value,
+            Err(failure) => {
+                let failure = failure_with_streams(
+                    failure,
+                    &stdout_capture,
+                    &stderr_capture,
+                );
+                return Err(append_post_home_failure(environment, subject, failure));
+            }
+        };
+        validate_observed_home(environment, subject).map_err(|failure| {
+            failure_with_streams(failure, &stdout_capture, &stderr_capture)
+        })?;
         Ok(Capture {
             exit_code,
-            stdout,
-            stderr,
+            stdout: stdout_capture,
+            stderr: stderr_capture,
             started_at_epoch_seconds,
-            finished_at_epoch_seconds: epoch_seconds(subject)?,
+            finished_at_epoch_seconds,
             monotonic_started_ns,
             monotonic_finished_ns: u64::try_from(batch_clock.elapsed().as_nanos())
                 .unwrap_or(u64::MAX),
@@ -383,91 +711,138 @@ mod sdk_producer {
             ));
         }
         let interpreter = executable("zsh", Path::new("/bin/zsh"), "system", "zsh")?;
-        let node = configured_tool("FND01_SDK_NODE", "node", "v24.12.0")?;
-        let npm = configured_tool("FND01_SDK_NPM", "npm", "11.14.0")?;
-        let python = configured_tool("FND01_SDK_PYTHON3", "python", "Python 3.14.4")?;
-        let jq = configured_tool("FND01_SDK_JQ", "jq", "byte-bound")?;
-        let shasum = executable("shasum", Path::new("/usr/bin/shasum"), "system", "shasum")?;
-        let sandbox = executable(
-            "sandbox-exec",
-            Path::new("/usr/bin/sandbox-exec"),
-            "system",
-            "sandbox-exec",
-        )?;
-        let curl = executable("curl", Path::new("/usr/bin/curl"), "system", "curl")?;
-        let dotnet_root = required_environment("DOTNET_SDK", "dotnet root")?;
-        let dotnet = executable(
-            "dotnet",
-            &Path::new(&dotnet_root).join("dotnet"),
-            "10.0.100",
-            "dotnet",
-        )?;
-        let go_root = required_environment("GO_1_25", "go root")?;
-        let go = executable(
-            "go",
-            &Path::new(&go_root).join("bin/go"),
-            "go version go1.25.0 darwin/arm64",
-            "go",
-        )?;
-        let dotnet_directory = Path::new(&dotnet.path)
-            .parent()
-            .ok_or_else(|| err("E_SDK_RUNNER_CONFIGURATION", "dotnet path"))?
-            .to_path_buf();
-        let go_directory = Path::new(&go.path)
-            .parent()
-            .ok_or_else(|| err("E_SDK_RUNNER_CONFIGURATION", "go path"))?
-            .to_path_buf();
-        let (primary, mut additional) = match sdk_id {
-            "typescript" => (npm, vec![node]),
-            "python" => (python, Vec::new()),
-            "csharp" => (dotnet, Vec::new()),
-            "go" => (go, Vec::new()),
+        let (primary, mut additional, configured_path_order, sdk_environment): (
+            _,
+            _,
+            &[&str],
+            Vec<(String, String)>,
+        ) = match sdk_id {
+            "typescript" => (
+                configured_tool("FND01_SDK_NPM", "npm", "11.14.0")?,
+                vec![
+                    system_tool("awk")?,
+                    system_tool("cmp")?,
+                    system_tool("curl")?,
+                    system_tool("env")?,
+                    system_tool("install")?,
+                    configured_tool("FND01_SDK_JQ", "jq", "byte-bound")?,
+                    system_tool("mktemp")?,
+                    configured_tool("FND01_SDK_NODE", "node", "v24.12.0")?,
+                    system_tool("perl")?,
+                    system_tool("sandbox-exec")?,
+                    system_tool("shasum")?,
+                ],
+                &["FND01_SDK_NPM", "FND01_SDK_NODE", "FND01_SDK_JQ"],
+                vec![
+                    ("NPM_CONFIG_GLOBALCONFIG".to_owned(), "/dev/null".to_owned()),
+                    ("NPM_CONFIG_USERCONFIG".to_owned(), "/dev/null".to_owned()),
+                ],
+            ),
+            "python" => (
+                configured_tool("FND01_SDK_PYTHON3", "python", "Python 3.14.4")?,
+                vec![
+                    system_tool("awk")?,
+                    system_tool("basename")?,
+                    system_tool("cmp")?,
+                    system_tool("curl")?,
+                    system_tool("find")?,
+                    system_tool("install")?,
+                    system_tool("mktemp")?,
+                    system_tool("perl")?,
+                    system_tool("sandbox-exec")?,
+                    system_tool("sed")?,
+                    system_tool("shasum")?,
+                    system_tool("sort")?,
+                ],
+                &["FND01_SDK_PYTHON3"],
+                vec![
+                    ("PIP_CONFIG_FILE".to_owned(), "/dev/null".to_owned()),
+                    ("PYTHONNOUSERSITE".to_owned(), "1".to_owned()),
+                ],
+            ),
+            "csharp" => {
+                let dotnet_root = configured_directory("DOTNET_SDK", "dotnet root")?;
+                let dotnet_archive = canonical_utf8(
+                    Path::new(&required_environment("DOTNET_ARCHIVE", "dotnet archive")?),
+                    "dotnet archive",
+                )?;
+                (
+                    executable(
+                        "dotnet",
+                        &Path::new(&dotnet_root).join("dotnet"),
+                        "10.0.100",
+                        "dotnet",
+                    )?,
+                    vec![
+                        system_tool("awk")?,
+                        system_tool("cmp")?,
+                        system_tool("curl")?,
+                        system_tool("env")?,
+                        system_tool("install")?,
+                        configured_tool("FND01_SDK_JQ", "jq", "byte-bound")?,
+                        system_tool("mktemp")?,
+                        system_tool("perl")?,
+                        system_tool("sandbox-exec")?,
+                        system_tool("shasum")?,
+                    ],
+                    &["FND01_SDK_JQ"],
+                    vec![
+                        ("DOTNET_ARCHIVE".to_owned(), dotnet_archive),
+                        ("DOTNET_ROOT".to_owned(), dotnet_root.clone()),
+                        ("DOTNET_SDK".to_owned(), dotnet_root),
+                    ],
+                )
+            }
+            "go" => {
+                let go_root = configured_directory("GO_1_25", "go root")?;
+                (
+                    executable(
+                        "go",
+                        &Path::new(&go_root).join("bin/go"),
+                        "go version go1.25.0 darwin/arm64",
+                        "go",
+                    )?,
+                    vec![
+                        system_tool("awk")?,
+                        system_tool("cmp")?,
+                        system_tool("curl")?,
+                        system_tool("env")?,
+                        system_tool("install")?,
+                        configured_tool("FND01_SDK_JQ", "jq", "byte-bound")?,
+                        system_tool("mktemp")?,
+                        system_tool("perl")?,
+                        system_tool("sandbox-exec")?,
+                        system_tool("shasum")?,
+                        system_tool("sort")?,
+                    ],
+                    &["FND01_SDK_JQ"],
+                    vec![
+                        ("GOENV".to_owned(), "off".to_owned()),
+                        ("GOROOT".to_owned(), go_root.clone()),
+                        ("GO_1_25".to_owned(), go_root),
+                    ],
+                )
+            }
             _ => return Err(err("E_SDK_RUNNER_CONFIGURATION", sdk_id)),
         };
-        additional.extend([jq, shasum, sandbox, curl]);
         additional.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         if additional.windows(2).any(|window| window[0].id == window[1].id) {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", "duplicate tool"));
         }
-        let mut path_directories = additional
-            .iter()
-            .chain(std::iter::once(&primary))
-            .filter_map(|tool| Path::new(&tool.path).parent())
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        path_directories.extend([dotnet_directory, go_directory]);
-        for name in [
-            "FND01_SDK_NODE",
-            "FND01_SDK_NPM",
-            "FND01_SDK_PYTHON3",
-            "FND01_SDK_JQ",
-        ] {
-            let configured = required_environment(name, name)?;
-            let parent = Path::new(&configured)
-                .parent()
-                .ok_or_else(|| err("E_SDK_RUNNER_CONFIGURATION", name))?;
-            path_directories.push(PathBuf::from(canonical_utf8(parent, name)?));
+        let mut path_directories = Vec::new();
+        for name in configured_path_order {
+            push_unique_path(&mut path_directories, configured_parent(name)?);
         }
-        path_directories.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-        path_directories.sort();
-        path_directories.dedup();
-        let path = path_directories
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(":");
-        let home = canonical_utf8(
-            Path::new(&required_environment("FND01_SDK_HOME", "home")?),
-            "home",
-        )?;
-        let dotnet_archive = canonical_utf8(
-            Path::new(&required_environment("DOTNET_ARCHIVE", "dotnet archive")?),
-            "dotnet archive",
-        )?;
+        for directory in [PathBuf::from("/usr/bin"), PathBuf::from("/bin")] {
+            push_unique_path(&mut path_directories, directory);
+        }
+        validate_path_tool_bindings(&path_directories, &primary, &additional)?;
+        let path = std::env::join_paths(&path_directories)
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", "PATH"))?
+            .into_string()
+            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", "PATH"))?;
+        let home = configured_home()?;
         let mut environment = vec![
-            ("DOTNET_ARCHIVE".to_owned(), dotnet_archive),
-            ("DOTNET_SDK".to_owned(), dotnet_root),
-            ("GO_1_25".to_owned(), go_root),
             ("HOME".to_owned(), home),
             ("LANG".to_owned(), "C".to_owned()),
             ("LC_ALL".to_owned(), "C".to_owned()),
@@ -475,6 +850,7 @@ mod sdk_producer {
             ("PATH".to_owned(), path),
             ("TMPDIR".to_owned(), "/tmp".to_owned()),
         ];
+        environment.extend(sdk_environment);
         environment.sort_unstable();
         Ok(Tools {
             environment,
@@ -628,7 +1004,8 @@ mod sdk_producer {
         environment: &[(String, String)],
         root: &Path,
         batch_clock: Instant,
-        curl: &evidence::SdkExecutableBinding,
+        launcher: &evidence::SdkExecutableBinding,
+        target_tool: &evidence::SdkExecutableBinding,
     ) -> Result<evidence::SdkNetworkProbeBinding> {
         let url = match sdk_id {
             "typescript" => "https://registry.npmjs.org/",
@@ -638,10 +1015,10 @@ mod sdk_producer {
             _ => return Err(err("E_SDK_NETWORK_PROBE", sdk_id)),
         };
         let argv = vec![
-            "/usr/bin/sandbox-exec".to_owned(),
+            launcher.path.clone(),
             "-p".to_owned(),
             "(version 1) (allow default) (deny network*)".to_owned(),
-            "/usr/bin/curl".to_owned(),
+            target_tool.path.clone(),
             "--silent".to_owned(),
             "--show-error".to_owned(),
             "--max-time".to_owned(),
@@ -659,12 +1036,33 @@ mod sdk_producer {
             "network denial probe",
         )
         .await?;
+        let cwd = retain_capture(canonical_utf8(root, sdk_id), &capture)?;
+        let elapsed_ns = retain_capture(
+            capture
+                .monotonic_finished_ns
+                .checked_sub(capture.monotonic_started_ns)
+                .ok_or_else(|| err("E_SDK_CLOCK", sdk_id)),
+            &capture,
+        )?;
+        let stream_detail = failure_stream_detail(&capture.stdout, &capture.stderr);
+        let stdout = transcript(capture.stdout, sdk_id)
+            .map_err(|failure| format!("{failure}; {stream_detail}"))?;
+        let stderr = transcript(capture.stderr, sdk_id)
+            .map_err(|failure| format!("{failure}; {stream_detail}"))?;
         Ok(evidence::SdkNetworkProbeBinding {
             argv,
-            executable: curl.clone(),
+            cwd,
+            environment_sha256: evidence::sdk_environment_sha256(environment),
+            launcher: launcher.clone(),
+            target_tool: target_tool.clone(),
+            stdout,
+            stderr,
             exit_code: capture.exit_code,
-            stdout: transcript(capture.stdout, sdk_id)?,
-            stderr: transcript(capture.stderr, sdk_id)?,
+            started_at_epoch_seconds: capture.started_at_epoch_seconds,
+            finished_at_epoch_seconds: capture.finished_at_epoch_seconds,
+            monotonic_started_ns: capture.monotonic_started_ns,
+            monotonic_finished_ns: capture.monotonic_finished_ns,
+            elapsed_ns,
         })
     }
 
@@ -697,8 +1095,9 @@ mod sdk_producer {
             sdk_id,
         )
         .await?;
-        let runtime_paths = runtime_paths(sdk_id, &before, &tmp_snapshot(sdk_id)?)?;
-        let outputs = observed_outputs(sdk_id, &runtime_paths)?;
+        let after = retain_capture(tmp_snapshot(sdk_id), &capture)?;
+        let runtime_paths = retain_capture(runtime_paths(sdk_id, &before, &after), &capture)?;
+        let outputs = retain_capture(observed_outputs(sdk_id, &runtime_paths), &capture)?;
         let (expected_primary, expected_secondary) = peer.expected_output_digests();
         let expected_digests = [
             expected_primary,
@@ -715,29 +1114,56 @@ mod sdk_producer {
                 .map(String::as_str)
                 .ne(expected_digests)
         {
-            return Err(format!(
-                "E_SDK_EXECUTION_ATTEMPT: {sdk_id}: exit={};stdout_hex={};stderr_hex={}",
-                capture.exit_code,
-                hex(&capture.stdout),
-                hex(&capture.stderr),
+            return Err(failure_with_streams(
+                format!("E_SDK_EXECUTION_ATTEMPT: {sdk_id}: exit={}", capture.exit_code),
+                &capture.stdout,
+                &capture.stderr,
             ));
         }
-        let curl = tools
-            .additional
-            .iter()
-            .find(|tool| tool.id == "curl")
-            .ok_or_else(|| err("E_SDK_NETWORK_PROBE", sdk_id))?;
-        let network_probe =
-            network_probe(cx, sdk_id, &tools.environment, root, batch_clock, curl).await?;
-        let elapsed_ns = capture
-            .monotonic_finished_ns
-            .checked_sub(capture.monotonic_started_ns)
-            .ok_or_else(|| err("E_SDK_CLOCK", sdk_id))?;
+        let launcher = retain_capture(
+            tools
+                .additional
+                .iter()
+                .find(|tool| tool.id == "sandbox-exec")
+                .ok_or_else(|| err("E_SDK_NETWORK_PROBE", sdk_id)),
+            &capture,
+        )?;
+        let target_tool = retain_capture(
+            tools
+                .additional
+                .iter()
+                .find(|tool| tool.id == "curl")
+                .ok_or_else(|| err("E_SDK_NETWORK_PROBE", sdk_id)),
+            &capture,
+        )?;
+        let network_probe = network_probe(
+            cx,
+            sdk_id,
+            &tools.environment,
+            root,
+            batch_clock,
+            launcher,
+            target_tool,
+        )
+        .await?;
+        let elapsed_ns = retain_capture(
+            capture
+                .monotonic_finished_ns
+                .checked_sub(capture.monotonic_started_ns)
+                .ok_or_else(|| err("E_SDK_CLOCK", sdk_id)),
+            &capture,
+        )?;
+        let cwd = retain_capture(canonical_utf8(root, sdk_id), &capture)?;
+        let stream_detail = failure_stream_detail(&capture.stdout, &capture.stderr);
+        let stdout = transcript(capture.stdout, sdk_id)
+            .map_err(|failure| format!("{failure}; {stream_detail}"))?;
+        let stderr = transcript(capture.stderr, sdk_id)
+            .map_err(|failure| format!("{failure}; {stream_detail}"))?;
         let mut process = evidence::SdkExecutionProcessBinding {
             command_id: format!("{sdk_id}-sdk-reproduction"),
             argv_sha256: evidence::sdk_sequence_sha256(b"FND01SDKARGVv3\0", &argv),
             argv,
-            cwd: canonical_utf8(root, sdk_id)?,
+            cwd,
             environment_sha256: evidence::sdk_environment_sha256(&tools.environment),
             environment: tools.environment,
             interpreter: tools.interpreter,
@@ -746,8 +1172,8 @@ mod sdk_producer {
             reproduction_script_byte_length: u64::try_from(script.len()).unwrap_or(u64::MAX),
             reproduction_script_sha256: peer.reproduction_script_sha256.clone(),
             composite_script_observer_sha256: String::new(),
-            stdout: transcript(capture.stdout, sdk_id)?,
-            stderr: transcript(capture.stderr, sdk_id)?,
+            stdout,
+            stderr,
             exit_code: capture.exit_code,
             started_at_epoch_seconds: capture.started_at_epoch_seconds,
             finished_at_epoch_seconds: capture.finished_at_epoch_seconds,
@@ -824,6 +1250,7 @@ mod sdk_producer {
     }
 }
 
+#[cfg(not(fnd01_bootstrap))]
 fn run_sdk_batch() -> i32 {
     let plan = match evidence::sdk_prepare_batch() {
         Ok(plan) => plan,
@@ -853,6 +1280,7 @@ fn run_sdk_batch() -> i32 {
 
 fn main() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
+    #[cfg(not(fnd01_bootstrap))]
     let code = if arguments.len() == 2
         && arguments.get(1).and_then(|value| value.to_str()) == Some("sdk-batch-run-json")
     {
@@ -860,5 +1288,7 @@ fn main() {
     } else {
         evidence::harness_main(arguments)
     };
+    #[cfg(fnd01_bootstrap)]
+    let code = evidence::harness_main(arguments);
     std::process::exit(code);
 }
