@@ -1,5 +1,5 @@
 schema_version = 1
-evidence_id = "fnd-01-tasks-apps-2026-07-29-v4"
+evidence_id = "fnd-01-tasks-apps-2026-08-04-v7-admission-classified"
 plan_package_id = "FND-01"
 bead_id = "bd-mcp-2026-07-28-support-ahet.1.3"
 retrieved_on = "2026-07-29"
@@ -7,10 +7,16 @@ byte_handling = "verbatim-upstream-bytes-no-generation-no-normalization"
 manual_update_policy = "Any source, artifact, import, direction, union, authority, quarantine, composition, executable same-validator contract, or profile change requires an explicit semantic diff, a new reviewed evidence identifier, and refreshed drift negatives."
 
 [verification_contract]
-tasks_artifact_count = 4
+tasks_extension_artifact_count = 4
 tasks_conformance_artifact_count = 1
-tasks_total_vendored_artifact_count = 5
-apps_artifact_count = 8
+tasks_admitted_vendor_input_count = 5
+apps_extension_artifact_count = 8
+apps_admitted_vendor_input_count = 8
+apps_admitted_external_authority_artifact_count = 0
+apps_preserved_blocked_candidate_count = 1
+tasks_repository_license_provenance_count = 1
+tasks_conformance_license_provenance_count = 1
+apps_repository_license_provenance_count = 1
 tasks_sdk_import_count = 10
 tasks_composition_path_count = 48
 tasks_closed_status_branch_count = 20
@@ -41,23 +47,24 @@ reject_aggregate_schema_digest_as_substitute = true
 reject_generated_schema_as_whole_message_or_direction_oracle = true
 
 [executable_same_validator_contract]
-contract_id = "fnd-01-tasks-apps-source-integrity-v1"
+contract_id = "fnd-01-tasks-apps-source-integrity-v2"
 shared_verifier_path = "crates/fastmcp/tests/fnd_01_dependency_evidence.rs"
 required_test_ids = [
   "ordinary::tests::fnd_01_tasks_apps_sources_positive",
   "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative",
 ]
-required_enclosing_module = "tests"
-phase_a_source_observation = "At Phase A the two required functions and an enclosing tests module are absent from the shared integration-test source; Phase B must add exactly those functions in exactly that module under the serialized shared-source handoff."
+required_enclosing_module = "ordinary::tests"
+phase_a_source_observation = "The two required functions now exist in the shared integration-test source under ordinary::tests. Source presence alone is not execution evidence or capability credit; the serialized shared-source handoff must still bind this v7 manifest contract and central batch verification must discover and pass both exact test IDs."
 production_validator_symbol = "validate_tasks_apps_sources"
-validator_identity_rule = "The positive test, every planted-negative case, and post-mutation baseline reacceptance call the identical production validator over a fresh virtual manifest plus the same virtual 13-vendor input map; helper-only checks, a second permissive validator, and direct assertion of fixture literals are forbidden."
+validator_identity_rule = "The positive test, every planted-negative case, and post-mutation baseline reacceptance call the identical production validator over a fresh virtual manifest, the same admitted 13-vendor input map, and the separately bound blocked WHATWG candidate; helper-only checks, a second permissive validator, and direct assertion of fixture literals are forbidden."
 baseline_result = "accept"
 baseline_reacceptance_rule = "The unmodified baseline must be accepted before the planted-negative loop and again after every fresh mutation has been discarded; no mutation state, digest, parser state, or diagnostic may cross case boundaries."
-virtual_input_count = 13
-virtual_input_total_bytes = 1173466
-vendor_family_digest_algorithm = "SHA-256 over ASCII FND01TASKSAPPSVENDORv1 then NUL, u32be entry count, then raw-UTF-8-path-sorted entries of u32be path length, path bytes, u64be byte length, and raw 32-byte SHA-256; tasks-apps.toml is intentionally excluded so this is not a manifest self-hash."
-vendor_family_digest_sha256 = "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a"
-unchanged_other_input_proof = "For each fresh virtual case, prove exact path, byte length, and SHA-256 equality for all twelve non-target vendor inputs and for every non-target manifest field before validator invocation; only the named target field or named target input may differ from baseline."
+admitted_vendor_input_count = 13
+admitted_vendor_input_total_bytes = 1173466
+admitted_vendor_family_digest_algorithm = "SHA-256 over ASCII FND01TASKSAPPSVENDORv1 then NUL, u32be entry count, then raw-UTF-8-path-sorted entries of u32be path length, path bytes, u64be byte length, and raw 32-byte SHA-256; tasks-apps.toml and the separately preserved blocked WHATWG candidate are intentionally excluded so this is neither a manifest self-hash nor an accidental authority admission."
+admitted_vendor_family_digest_sha256 = "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a"
+blocked_candidate_binding_rule = "The WHATWG candidate is read and bound independently under its quarantine-specific byte bound, must remain admission_status=blocked and admitted_as_source_input=false, and never enters the admitted vendor map, admitted vendor count, admitted vendor byte total, or admitted vendor family digest."
+unchanged_other_input_proof = "For each fresh virtual case, prove exact path, byte length, and SHA-256 equality for all twelve non-target admitted vendor inputs, the separately preserved blocked WHATWG candidate, and every non-target manifest field before validator invocation; only the named target field or named target input may differ from baseline."
 diagnostic_format = "FND01|Error|<stable-code>|<subject>|<field>"
 runtime_capability_credit = false
 remote_provenance_capability_credit = false
@@ -111,6 +118,41 @@ target = "apps.maturity_at_pin"
 replacement = "experimental"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin"
 
+[[executable_same_validator_contract.planted_mutation]]
+id = "whatwg-blocked-admission-drift"
+operation = "replace-one-manifest-field"
+target = "apps.whatwg_html_validation.admitted_as_source_input"
+replacement = true
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|admitted_as_source_input"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-license-class-drift"
+operation = "replace-one-manifest-field"
+target = "tasks.license_provenance.declared_license"
+replacement = "repository_transition_notice"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.license_provenance|declared_license"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-conformance-license-provenance-drift"
+operation = "replace-one-manifest-field"
+target = "tasks.conformance_license_provenance.sha256"
+replacement = "1382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.conformance_license_provenance|sha256"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "inventory-classification-drift"
+operation = "replace-one-manifest-field"
+target = "verification_contract.apps_preserved_blocked_candidate_count"
+replacement = 0
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_INVENTORY_CLASSIFICATION|verification_contract|apps_preserved_blocked_candidate_count"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "required-test-id-drift"
+operation = "replace-one-manifest-field"
+target = "executable_same_validator_contract.required_test_ids[0]"
+replacement = "tests::fnd_01_tasks_apps_sources_positive"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_TEST_IDENTITY|executable_same_validator_contract|required_test_ids[0]"
+
 [provenance_policy]
 floating_reference_rejection_scope = "evidence-controlled provenance fields only"
 evidence_controlled_provenance_fields = [
@@ -139,7 +181,18 @@ evidence_controlled_provenance_fields = [
   "apps.whatwg_html_validation.revision",
   "apps.whatwg_html_validation.tree",
   "apps.whatwg_html_validation.commit_url",
-  "apps.whatwg_html_validation.source_url",
+  "apps.whatwg_html_validation.candidate_source_url",
+  "apps.whatwg_html_validation.candidate_license_source_url",
+  "tasks.license_provenance.repository_revision",
+  "tasks.license_provenance.source_page_url",
+  "tasks.license_provenance.source_url",
+  "tasks.conformance_license_provenance.repository_revision",
+  "tasks.conformance_license_provenance.source_page_url",
+  "tasks.conformance_license_provenance.source_url",
+  "apps.license_provenance.repository_revision",
+  "apps.license_provenance.source_page_url",
+  "apps.license_provenance.source_url",
+  "apps.product_composition_authority[].source_url",
 ]
 rejection_rule = "Reject a default-branch name, mutable tag alias, latest selector, or unpinned browser page only when it replaces an immutable commit, tree, blob, versioned tarball, or source URL in an evidence-controlled provenance field."
 excluded_descriptive_links = ["tasks.repository", "tasks.overview_url", "tasks.conformance_artifact[].repository", "apps.repository", "apps.whatwg_html_validation.repository"]
@@ -164,6 +217,20 @@ tasks_contract_profile = "fastmcp-final-core-2026-07-28-tasks-2c1425d9-v1"
 task_notification_profile = "fastmcp-final-notification-open-v1"
 task_id_profile = "fastmcp-opaque-task-id-v1"
 task_duration_profile = "fastmcp-positive-integer-ms-v1"
+extension_identifier = "io.modelcontextprotocol/tasks"
+client_settings_schema = "tasks-2026-07-28-empty-object-v1"
+server_settings_schema = "tasks-2026-07-28-empty-object-v1"
+settings_exact_value = "exact closed {}"
+settings_authority = "tasks-prose: no extension-specific settings are defined; an empty object indicates support"
+source_precedence = [
+  "final core 2026-07-28 for MCP envelopes, request metadata, and final error allocation",
+  "the frozen FastMCP composed contract for explicit conflict resolutions",
+  "Tasks prose for negotiated extension semantics, identifier, empty settings, and method behavior",
+  "Tasks TypeScript schema for raw extension fields, unions, and old-SDK import inventory",
+  "pinned Tasks conformance wire-fields scenario for its explicitly limited observable assertions",
+  "lock-resolved SDK 1.29.0 only for pre-rebind compatibility shapes",
+  "generated Tasks schema only for drift and partial validation",
+]
 missing_capability_error = -32021
 status_union_order = ["working", "input_required", "completed", "failed", "cancelled"]
 task_creation_attachment = "client-origin tools/call only"
@@ -244,6 +311,32 @@ fixed_delay_probe_classification = "bounded post-helper-terminal liveness sanity
 fixed_delay_probe_sequence = ["require retained createdTaskId or classify UNTESTABLE", "await the helper-defined terminal condition via waitForTerminal(conn, createdTaskId) without asserting a completed status", "sleep unconditionally for 500ms", "issue tasks/get for createdTaskId and require request success", "assert returned after.taskId equals createdTaskId exactly"]
 fixed_delay_probe_untestable_rule = "when no task was created by the preceding step, record UNTESTABLE and do not execute the delay or tasks/get probe"
 fixed_delay_probe_does_not_compare = ["500ms against emitted ttlMs", "current time against createdAt plus ttlMs", "retention at the declared TTL boundary", "deletion after expiry"]
+
+[tasks.license_provenance]
+repository = "https://github.com/modelcontextprotocol/ext-tasks"
+repository_revision = "2c1425d9a288b9b1f489430fe1e00bb392b47e48"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/ext-tasks/blob/2c1425d9a288b9b1f489430fe1e00bb392b47e48/LICENSE"
+source_url = "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/2c1425d9a288b9b1f489430fe1e00bb392b47e48/LICENSE"
+retrieved_on = "2026-08-04"
+git_blob_sha1 = "83721348b21415bc1cda345305f21d17b9de95e2"
+byte_length = 10786
+sha256 = "70559d215777f20bb14de53b336db2bb41fc58712f1d6f43e6a7dd2c82b1d6df"
+declared_license = "Apache-2.0"
+artifact_license_resolution = "The immutable ext-tasks repository LICENSE is Apache License 2.0 and is the repository-level license authority for the exact frozen Tasks artifacts."
+
+[tasks.conformance_license_provenance]
+repository = "https://github.com/modelcontextprotocol/conformance"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/LICENSE"
+source_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/LICENSE"
+retrieved_on = "2026-08-04"
+git_blob_sha1 = "4a93985763241755401a10678395303de4e720ba"
+byte_length = 12227
+sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+declared_license = "repository_transition_notice"
+artifact_license_resolution = "The immutable conformance repository transition notice is bound only to the pinned Tasks conformance artifact baseline and does not establish scenario completeness or aggregate conformance."
 
 [tasks.sdk_1_29_0]
 package = "@modelcontextprotocol/sdk"
@@ -1147,6 +1240,7 @@ apps_projection_profile = "fastmcp-apps-sdk-1.29.0-projection-v1"
 apps_json_value_profile = "fastmcp-apps-json-value-binary64-roundtrip-v1"
 apps_host_cursor_substitution_profile = "fastmcp-apps-host-cursor-substitution-v1"
 apps_error_profile = "fastmcp-apps-sdk-1.29.0-error-v1"
+extension_identifier = "io.modelcontextprotocol/ui"
 apps_uncorrelatable_input_disposition = "no-response-drop"
 apps_duplicate_live_request_disposition = "no-response-preserve-original"
 apps_sampling_supported = false
@@ -1169,6 +1263,37 @@ source_precedence = [
   "lock-resolved SDK 1.29.0 for imported compatibility shapes before explicit rebind/projection",
   "generated schemas only for drift and partial validation",
 ]
+
+[[apps.product_composition_authority]]
+id = "APP-03-apps-plus-host-mediated-sampling"
+composition = "MCP Apps plus host-mediated Sampling"
+source_manifest = "evidence/fnd-01/core-conformance.toml"
+source_artifact_id = "core-schema-ts"
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+source_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
+sha256 = "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"
+authority_scope = "final-core Sampling request/result and embedded descriptor shapes used only when the product composes Apps with host-mediated Sampling"
+apps_only_normative_claim = false
+runtime_capability_credit = false
+
+[[apps.product_composition_authority]]
+id = "APP-04-apps-plus-tasks-mrtr"
+composition = "MCP Apps plus Tasks and MRTR"
+tasks_source_artifact_id = "tasks-prose"
+tasks_repository = "https://github.com/modelcontextprotocol/ext-tasks"
+tasks_repository_revision = "2c1425d9a288b9b1f489430fe1e00bb392b47e48"
+tasks_source_url = "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/2c1425d9a288b9b1f489430fe1e00bb392b47e48/specification/draft/tasks.md"
+tasks_sha256 = "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11"
+mrtr_source_manifest = "evidence/fnd-01/core-conformance.toml"
+mrtr_source_artifact_id = "core-schema-ts"
+mrtr_repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+mrtr_repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+source_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"
+mrtr_sha256 = "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"
+authority_scope = "final-core MRTR descriptor/result shapes and pinned experimental Tasks semantics used only in the mandatory product composition"
+apps_only_normative_claim = false
+runtime_capability_credit = false
 
 [[apps.artifact]]
 id = "apps-stable-spec"
@@ -1274,6 +1399,19 @@ authority_role = "dependency-resolution-and-sdk-import-closure"
 authoritative_for = ["exact SDK resolution", "npm tarball URL", "npm integrity"]
 not_authoritative_for = ["final-core type authority", "Apps-only behavior"]
 
+[apps.license_provenance]
+repository = "https://github.com/modelcontextprotocol/ext-apps"
+repository_revision = "92f46a574568a3ddac7600343b7d3c4c4ed7b588"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/ext-apps/blob/92f46a574568a3ddac7600343b7d3c4c4ed7b588/LICENSE"
+source_url = "https://raw.githubusercontent.com/modelcontextprotocol/ext-apps/92f46a574568a3ddac7600343b7d3c4c4ed7b588/LICENSE"
+retrieved_on = "2026-08-04"
+git_blob_sha1 = "4a93985763241755401a10678395303de4e720ba"
+byte_length = 12227
+sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+declared_license = "repository_transition_notice"
+artifact_license_resolution = "The frozen Apps specification and source artifacts are recorded with the repository's immutable transition notice; the evidence does not infer one blanket license for unrelicensed historical contributions."
+
 [apps.sdk_1_29_0]
 package = "@modelcontextprotocol/sdk"
 declared_range = "^1.29.0"
@@ -1340,10 +1478,27 @@ repository = "https://github.com/whatwg/html"
 revision = "24c5e48bf66ea61bc199ec6338c81258275ba9c6"
 tree = "53663806b56996a7a412ec87248de5657bed6ce7"
 commit_url = "https://github.com/whatwg/html/commit/24c5e48bf66ea61bc199ec6338c81258275ba9c6"
-source_url = "https://github.com/whatwg/html/tree/24c5e48bf66ea61bc199ec6338c81258275ba9c6"
-retrieved_on = "2026-07-29"
+admission_status = "blocked"
+admitted_as_source_input = false
+max_source_file_bytes = 1048576
+candidate_upstream_path = "source"
+candidate_source_page_url = "https://github.com/whatwg/html/blob/24c5e48bf66ea61bc199ec6338c81258275ba9c6/source"
+candidate_source_url = "https://raw.githubusercontent.com/whatwg/html/24c5e48bf66ea61bc199ec6338c81258275ba9c6/source"
+candidate_git_blob_sha1 = "90c6259281b1e457f53c2bf01e85aba7a27c0d19"
+candidate_preserved_path = "evidence/fnd-01/vendor/apps/whatwg-html-source"
+candidate_byte_length = 7892171
+candidate_sha256 = "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa"
+candidate_license_upstream_path = "LICENSE"
+candidate_license_source_url = "https://raw.githubusercontent.com/whatwg/html/24c5e48bf66ea61bc199ec6338c81258275ba9c6/LICENSE"
+candidate_license_git_blob_sha1 = "f2dcda46deccefd245749202a88a7837e35c6daa"
+candidate_license_byte_length = 16315
+candidate_license_sha256 = "85dc6f5ccb57a6fe8c33d158f9fc8fc7ee5655a5d3db2cdd131c6a3d0f48a864"
+candidate_declared_license = "CC-BY-4.0; source-code portions BSD-3-Clause"
+blocker = "The exact immutable WHATWG authoring-rule corpus is the monolithic source file, whose 7892171 bytes exceed max_source_file_bytes=1048576. The pinned repository tree exposes no bounded, separately versioned authoring-rule inventory or conformance-checker artifact. The preserved candidate is quarantine-only and cannot satisfy Apps authoring-conformance evidence."
+unblock_condition = "Admit only a reviewed immutable WHATWG-published bounded rule inventory or checker artifact whose raw file bytes are at or below max_source_file_bytes and whose scope demonstrably covers the required authoring rules."
+retrieved_on = "2026-08-04"
 validation_subject = "Apps UI content that claims to be a valid HTML document"
-role = "immutable Apps UI-content authoring-conformance validation input"
+role = "quarantine-preserved blocked candidate; not an admitted validation input"
 authoring_conformance_required = true
 tokenizer_or_tree_builder_is_conformance_checker = false
 mcp_core_authority = false
@@ -2744,7 +2899,7 @@ expected = "reject"
 [[drift_negative]]
 id = "apps-whatwg-html-validation-drift"
 scope = "immutable Apps HTML authoring-conformance validation input"
-mutation = "change revision, tree, URL, validation role, or authority; promote it to MCP core authority; or claim a tokenizer or tree builder alone establishes authoring conformance"
+mutation = "admit the oversized quarantined candidate as a source input; change its revision, tree, candidate identity, byte bound, or blocker; promote it to MCP core authority; claim a tokenizer or tree builder alone establishes authoring conformance; or substitute an unreviewed bounded fragment for the missing complete rule inventory"
 expected = "reject"
 
 [[drift_negative]]

@@ -7,6 +7,138 @@ artifact_count = 8
 artifact_bytes_are_unmodified = true
 source_rewriting_generator_used = false
 
+[immutable_tree_chain]
+purpose = "Manifest-only immutable tree-chain supplement for reproducible source-path ancestry."
+execution = "declarative_only"
+authority = "Each edge records the frozen Git object identifiers already selected by this manifest; it performs no verifier, policy, tracker, or source-authority function."
+scope = "The chain covers the exact repository commit tree and the selected dated/schema or scenario subtree for each frozen corpus. It does not claim complete repository inventory, object reachability beyond the stated edge, or aggregate MCP conformance."
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "commit"
+parent_object = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+child_path = "."
+child_object_kind = "tree"
+child_object = "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "tree"
+parent_object = "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"
+child_path = "docs"
+child_object_kind = "tree"
+child_object = "747d8c7ebbc593b3b72cbb4d7c45589cd9c7aafb"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "tree"
+parent_object = "747d8c7ebbc593b3b72cbb4d7c45589cd9c7aafb"
+child_path = "specification"
+child_object_kind = "tree"
+child_object = "faf3f941e824f442c3fbdb236c941534feb5c849"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "tree"
+parent_object = "faf3f941e824f442c3fbdb236c941534feb5c849"
+child_path = "2026-07-28"
+child_object_kind = "tree"
+child_object = "db87fd4f40e51d80325f21c0d99bcdaf6f52b1b1"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "tree"
+parent_object = "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1"
+child_path = "schema"
+child_object_kind = "tree"
+child_object = "a1a12037c72ca3fbe95090d310488d2478f61557"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2026_07_28"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+parent_object_kind = "tree"
+parent_object = "a1a12037c72ca3fbe95090d310488d2478f61557"
+child_path = "2026-07-28"
+child_object_kind = "tree"
+child_object = "8b5e263be073848f9531151cb363ccb764eb2da6"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2024_11_05"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+parent_object_kind = "commit"
+parent_object = "48234828288ec5e5011398f17b8736f61645f130"
+child_path = "."
+child_object_kind = "tree"
+child_object = "268325249340b611e0a2644cd2da15c19d1b899c"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2024_11_05"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+parent_object_kind = "tree"
+parent_object = "268325249340b611e0a2644cd2da15c19d1b899c"
+child_path = "schema"
+child_object_kind = "tree"
+child_object = "043f58f4067386664a03a648c73d90008e423110"
+
+[[immutable_tree_chain.edges]]
+corpus = "core_2024_11_05"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+parent_object_kind = "tree"
+parent_object = "043f58f4067386664a03a648c73d90008e423110"
+child_path = "2024-11-05"
+child_object_kind = "tree"
+child_object = "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d"
+
+[[immutable_tree_chain.edges]]
+corpus = "conformance_2026_07_28_baseline"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+parent_object_kind = "commit"
+parent_object = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+child_path = "."
+child_object_kind = "tree"
+child_object = "699705222f144a15fb7fdcc1b4f0b0a62825aef0"
+
+[[immutable_tree_chain.edges]]
+corpus = "conformance_2026_07_28_baseline"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+parent_object_kind = "tree"
+parent_object = "699705222f144a15fb7fdcc1b4f0b0a62825aef0"
+child_path = "src"
+child_object_kind = "tree"
+child_object = "3e6953112fc8929ce141293cfa98fe9211a0675d"
+
+[[immutable_tree_chain.edges]]
+corpus = "conformance_2026_07_28_baseline"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+parent_object_kind = "tree"
+parent_object = "3e6953112fc8929ce141293cfa98fe9211a0675d"
+child_path = "scenarios"
+child_object_kind = "tree"
+child_object = "ff0fe0f40e2421d511ae8485648783d12d6e6168"
+
+[[immutable_tree_chain.edges]]
+corpus = "conformance_2026_07_28_baseline"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+parent_object_kind = "tree"
+parent_object = "ff0fe0f40e2421d511ae8485648783d12d6e6168"
+child_path = "client"
+child_object_kind = "tree"
+child_object = "f79048ec4217cb583293e813d25610d43121babe"
+
+[[immutable_tree_chain.edges]]
+corpus = "conformance_2026_07_28_baseline"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+parent_object_kind = "tree"
+parent_object = "f79048ec4217cb583293e813d25610d43121babe"
+child_path = "auth"
+child_object_kind = "tree"
+child_object = "84d79c0194b649917a7143022e6c920e686bff8e"
+
 [authority_domains.wire_contract]
 applies_to = [
   "wire structures",
@@ -97,6 +229,45 @@ release_commit_url = "https://github.com/modelcontextprotocol/modelcontextprotoc
 dated_tag_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/releases/tag/2024-11-05"
 specification_url = "https://modelcontextprotocol.io/specification/2024-11-05"
 authority = "The exact 2024-11-05-final release tag freezes the supported legacy-era corpus. The similarly dated non-final tag is recorded only to make the release identity reproducible."
+
+[license_provenance.core_2024_11_05]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "48234828288ec5e5011398f17b8736f61645f130"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/48234828288ec5e5011398f17b8736f61645f130/LICENSE"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/48234828288ec5e5011398f17b8736f61645f130/LICENSE"
+retrieval_date = "2026-08-04"
+git_blob_sha1 = "3d48435454b105021b4f777c11b6b07d8d2ffea3"
+byte_length = 1071
+sha256 = "5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d"
+declared_license = "MIT"
+scope = "Immutable repository-level license authority for the exact 2024-11-05-final corpus."
+
+[license_provenance.core_2026_07_28]
+repository = "https://github.com/modelcontextprotocol/modelcontextprotocol"
+repository_revision = "5f5440bb26a62e2cf3440b92da5a667efa03b267"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/5f5440bb26a62e2cf3440b92da5a667efa03b267/LICENSE"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/LICENSE"
+retrieval_date = "2026-08-04"
+git_blob_sha1 = "4a93985763241755401a10678395303de4e720ba"
+byte_length = 12227
+sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+declared_license = "repository_transition_notice"
+scope = "The immutable repository-level notice distinguishes Apache-2.0 new code/specification contributions, CC-BY-4.0 documentation excluding specifications, and unrelicensed MIT contributions. It does not establish a single inferred per-artifact license for the frozen 2026 schema files."
+
+[license_provenance.conformance_2026_07_28_baseline]
+repository = "https://github.com/modelcontextprotocol/conformance"
+repository_revision = "49103de6ed70804e940637bf3e9e29e4a3f54e64"
+upstream_path = "LICENSE"
+source_page_url = "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/LICENSE"
+retrieval_url = "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/LICENSE"
+retrieval_date = "2026-08-04"
+git_blob_sha1 = "4a93985763241755401a10678395303de4e720ba"
+byte_length = 12227
+sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+declared_license = "repository_transition_notice"
+scope = "Immutable repository-level license provenance for the pinned conformance baseline only. It does not establish scenario completeness, upstream conformance, production-positive evidence, aggregate MCP support, or release readiness."
 
 [unsupported_third_era_negative]
 protocol_version = "2025-11-25"
