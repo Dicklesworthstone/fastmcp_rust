@@ -36954,7 +36954,7 @@ activate = 1\n";
     #[rustfmt::skip]
     sdk_record!(SdkTranscriptBinding { raw: Vec<u8>, byte_length: u64, sha256: String });
     #[rustfmt::skip]
-    sdk_record!(SdkExecutionProcessBinding { command_id: String, argv: Vec<String>, argv_sha256: String, cwd: String, environment: Vec<(String, String)>, environment_sha256: String, interpreter: SdkExecutableBinding, primary_tool: SdkExecutableBinding, additional_tools: Vec<SdkExecutableBinding>, reproduction_script_byte_length: u64, reproduction_script_sha256: String, composite_script_observer_sha256: String, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64, runtime_paths: Vec<String>, complete_input_sha256: String });
+    sdk_record!(SdkExecutionProcessBinding { command_id: String, argv: Vec<String>, argv_sha256: String, cwd: String, environment: Vec<(String, String)>, environment_sha256: String, interpreter: SdkExecutableBinding, primary_tool: SdkExecutableBinding, additional_tools: Vec<SdkExecutableBinding>, tool_identity_before_sha256: String, tool_identity_after_sha256: String, reproduction_script_byte_length: u64, reproduction_script_sha256: String, composite_script_observer_sha256: String, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64, runtime_paths: Vec<String>, complete_input_sha256: String });
     #[rustfmt::skip]
     sdk_record!(SdkRchReceiptBinding { path: String, byte_length: u64, sha256: String, bytes: Vec<u8> });
     #[rustfmt::skip]
@@ -75093,6 +75093,21 @@ activate = 1\n";
         Ok(())
     }
 
+    fn sdk_validate_tool_identity_binding(
+        process: &SdkExecutionProcessBinding,
+        subject: &str,
+    ) -> VResult<()> {
+        if validate_sha256(&process.tool_identity_before_sha256, subject).is_err()
+            || validate_sha256(&process.tool_identity_after_sha256, subject).is_err()
+            || process.tool_identity_before_sha256.bytes().all(|byte| byte == b'0')
+            || process.tool_identity_after_sha256.bytes().all(|byte| byte == b'0')
+            || process.tool_identity_before_sha256 != process.tool_identity_after_sha256
+        {
+            return Err(Diagnostic::error("E_SDK_TOOL_IDENTITY", subject));
+        }
+        Ok(())
+    }
+
     fn sdk_validate_closed_environment(
         observed: &[(String, String)],
         observed_sha256: &str,
@@ -75536,6 +75551,8 @@ activate = 1\n";
             process.environment_sha256.clone(),
             process.interpreter.sha256.clone(),
             process.primary_tool.sha256.clone(),
+            process.tool_identity_before_sha256.clone(),
+            process.tool_identity_after_sha256.clone(),
             process.reproduction_script_byte_length.to_string(),
             process.reproduction_script_sha256.clone(),
             process.composite_script_observer_sha256.clone(),
@@ -75649,6 +75666,7 @@ activate = 1\n";
                 runtime_spec.additional_tool_ids,
                 subject,
             )?;
+            sdk_validate_tool_identity_binding(process, subject)?;
             let expected_environment = sdk_expected_child_environment(&peer.sdk_id, subject)?;
             sdk_validate_closed_environment(
                 &process.environment,
@@ -88085,6 +88103,8 @@ original = "value"
             environment: Vec::new(), environment_sha256: environment_sha256.clone(),
             interpreter: sdk_test_binding("zsh", "/bin/zsh"),
             primary_tool: sdk_test_binding("npm", "/sdk/npm"), additional_tools: Vec::new(),
+            tool_identity_before_sha256: "11".repeat(32),
+            tool_identity_after_sha256: "11".repeat(32),
             reproduction_script_byte_length: 0, reproduction_script_sha256: String::new(),
             composite_script_observer_sha256: String::new(),
             stdout: sdk_test_transcript(&[]), stderr: sdk_test_transcript(&[]), exit_code: 0,
@@ -88579,6 +88599,27 @@ original = "value"
                 &pristine, spec.additional_tool_ids, "tool-closure pristine",
             ).expect("tool-closure pristine reacceptance");
         }
+
+        let (_, pristine_process, _, _, _) = sdk_test_network_contract();
+        sdk_validate_tool_identity_binding(&pristine_process, "tool-identity pristine")
+            .expect("tool-identity pristine acceptance");
+        let pristine_snapshot = pristine_process.clone();
+        let mut candidate_process = pristine_process.clone();
+        candidate_process.tool_identity_after_sha256 = "22".repeat(32);
+        let error = sdk_validate_tool_identity_binding(
+            &candidate_process,
+            "tool-identity after-only plant",
+        )
+        .expect_err("one changed after digest must reject");
+        assert_eq!(error.code, "E_SDK_TOOL_IDENTITY");
+        assert_eq!(pristine_process, pristine_snapshot, "plant leaves pristine state unchanged");
+        assert_ne!(
+            sdk_process_sha256(&candidate_process),
+            sdk_process_sha256(&pristine_process),
+            "the after digest is bound into the process receipt",
+        );
+        sdk_validate_tool_identity_binding(&pristine_process, "tool-identity pristine")
+            .expect("tool-identity pristine reacceptance");
 
         let pristine_environment = [
             ("PATH".to_owned(), "/sdk/npm:/sdk/node:/sdk/jq:/usr/bin:/bin".to_owned()),
