@@ -71769,6 +71769,8 @@ activate = 1\n";
         report: &mut Report,
     ) -> VResult<()> {
         let rs256_vectors = parse_rs256_source_vectors(source_files)?;
+        let tasks_apps_bundle = load_tasks_apps_source_bundle(root, source_files)?;
+        let _tasks_apps_accepted = validate_tasks_apps_sources(&tasks_apps_bundle)?;
         // Bind caller-supplied execution facts before any absent or partial
         // integration tree can return the ordinary Pending report.  The
         // Absent route remains static-only and is consumed after exact output
@@ -77300,12 +77302,283 @@ activate = 1\n";
     struct CoreConformanceAcceptedBinding {
         manifest_sha256: [u8; 32],
         artifact_tree_sha256: [u8; 32],
+        tree_chain_edges: usize,
+        final_error_codes: usize,
+        conformance_scenarios: usize,
+        scenario_local_checks: usize,
+        scenario_observations: usize,
+        conformance_findings: usize,
+        ambiguities: usize,
+    }
+
+    fn core_conformance_root(
+        document: &toml::Value,
+    ) -> VResult<&toml::map::Map<String, toml::Value>> {
+        document
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_MANIFEST", "core-conformance"))
+    }
+
+    fn validate_core_conformance_manifest_binding(
+        document: &toml::Value,
+        admitted_files: &[LoadedFile],
+    ) -> VResult<()> {
+        let admitted = parse_source_toml(admitted_files, "evidence/fnd-01/core-conformance.toml")?;
+        if document != &admitted {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_MANIFEST_BINDING",
+                "core-conformance",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_core_conformance_tree_chain(document: &toml::Value) -> VResult<usize> {
+        let root = core_conformance_root(document)?;
+        let chain = record_table(root, "immutable_tree_chain", "core-conformance")?;
+        if record_string(chain, "execution", "immutable_tree_chain")? != "declarative_only" {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_TREE_CHAIN",
+                "immutable_tree_chain",
+            ));
+        }
+        let edges = record_array(chain, "edges", "immutable_tree_chain")?;
+        let mut counts = BTreeMap::new();
+        for edge in edges {
+            let edge = edge.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", "immutable_tree_chain")
+            })?;
+            let corpus = record_string(edge, "corpus", "immutable_tree_chain")?;
+            let revision = record_string(edge, "repository_revision", corpus)?;
+            let parent_kind = record_string(edge, "parent_object_kind", corpus)?;
+            let parent = record_string(edge, "parent_object", corpus)?;
+            let child_path = record_string(edge, "child_path", corpus)?;
+            let child_kind = record_string(edge, "child_object_kind", corpus)?;
+            let child = record_string(edge, "child_object", corpus)?;
+            let expected_revision = match corpus {
+                "core_2026_07_28" => "5f5440bb26a62e2cf3440b92da5a667efa03b267",
+                "core_2024_11_05" => "48234828288ec5e5011398f17b8736f61645f130",
+                "conformance_2026_07_28_baseline" => "49103de6ed70804e940637bf3e9e29e4a3f54e64",
+                _ => {
+                    return Err(Diagnostic::error(
+                        "E_CORE_CONFORMANCE_TREE_CHAIN",
+                        "immutable_tree_chain",
+                    ));
+                }
+            };
+            if revision != expected_revision
+                || !matches!(parent_kind, "commit" | "tree")
+                || child_kind != "tree"
+                || child_path.is_empty()
+                || parent.len() != 40
+                || child.len() != 40
+                || !parent.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                || !child.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", corpus));
+            }
+            *counts.entry(corpus).or_insert(0usize) += 1;
+        }
+        if edges.len() != 14
+            || counts.get("core_2026_07_28") != Some(&6)
+            || counts.get("core_2024_11_05") != Some(&3)
+            || counts.get("conformance_2026_07_28_baseline") != Some(&5)
+        {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_TREE_CHAIN",
+                "immutable_tree_chain",
+            ));
+        }
+        Ok(edges.len())
+    }
+
+    fn validate_core_conformance_registries(
+        document: &toml::Value,
+    ) -> VResult<(usize, usize, usize, usize, usize, usize)> {
+        let root = core_conformance_root(document)?;
+        let conformance = record_table(root, "conformance", "core-conformance")?;
+        for field in [
+            "permanent_release_oracle",
+            "final_schema_alignment_established",
+            "default_suite_completeness_established",
+        ] {
+            if record_bool(conformance, field, "conformance")? {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_NO_CLAIM", "conformance").at(field));
+            }
+        }
+        let scope = record_table(conformance, "check_inventory_scope", "conformance")?;
+        if record_bool(scope, "complete_transitive_helper_inventory_established", "check_inventory_scope")?
+            || record_bool(scope, "exact_transitive_helper_closure_inspected", "check_inventory_scope")?
+        {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_NO_CLAIM",
+                "check_inventory_scope",
+            ));
+        }
+
+        let error_codes = record_array(root, "final_error_codes", "core-conformance")?;
+        if error_codes.len() != 3 {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "final_error_codes"));
+        }
+        for (row, (name, constant, code)) in error_codes.iter().zip([
+            ("HeaderMismatchError", "HEADER_MISMATCH", -32_020i64),
+            (
+                "MissingRequiredClientCapabilityError",
+                "MISSING_REQUIRED_CLIENT_CAPABILITY",
+                -32_021,
+            ),
+            (
+                "UnsupportedProtocolVersionError",
+                "UNSUPPORTED_PROTOCOL_VERSION",
+                -32_022,
+            ),
+        ]) {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "final_error_codes")
+            })?;
+            if record_string(row, "name", "final_error_codes")? != name
+                || record_string(row, "typescript_constant", "final_error_codes")? != constant
+                || record_i64(row, "code", "final_error_codes")? != code
+                || record_string(row, "typescript_artifact", "final_error_codes")? != "core-schema-ts"
+                || record_string(row, "json_schema_artifact", "final_error_codes")?
+                    != "core-schema-json"
+                || !record_string(row, "json_pointer", "final_error_codes")?.starts_with("#/")
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "final_error_codes"));
+            }
+        }
+
+        let scenarios = record_array(root, "conformance_scenarios", "core-conformance")?;
+        let declarations = record_array(root, "scenario_local_check_declarations", "core-conformance")?;
+        let observations = record_array(root, "scenario_observations", "core-conformance")?;
+        let findings = record_array(root, "conformance_findings", "core-conformance")?;
+        let ambiguities = record_array(root, "ambiguities", "core-conformance")?;
+        if scenarios.len() != 3 || declarations.len() != 9 || observations.len() != 3 || ambiguities.len() != 26 {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance"));
+        }
+        let mut scenario_checks = BTreeMap::new();
+        let mut scenario_success_checks = BTreeMap::new();
+        let mut scenario_failure_checks = BTreeMap::new();
+        let mut expected_findings = BTreeMap::new();
+        for row in scenarios {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance_scenarios")
+            })?;
+            let id = record_string(row, "id", "conformance_scenarios")?.to_owned();
+            let checks = record_string_array(row, "scenario_local_declared_check_ids", &id)?;
+            let success_checks = record_string_array(
+                row,
+                "scenario_local_expected_success_path_check_ids",
+                &id,
+            )?;
+            let failure_checks = record_string_array(
+                row,
+                "scenario_local_conditional_failure_check_ids",
+                &id,
+            )?;
+            let check_set = checks.iter().cloned().collect::<BTreeSet<_>>();
+            if checks.len() != record_usize(row, "scenario_local_declared_check_id_count", &id)?
+                || checks.is_empty()
+                || !success_checks.iter().all(|check| check_set.contains(check))
+                || !failure_checks.iter().all(|check| check_set.contains(check))
+                || !matches!(record_string(row, "source_artifact", &id)?, "conformance-enterprise-auth" | "conformance-client-credentials")
+                || record_bool(row, "upstream_pass_claimed", &id)?
+                || record_bool(row, "production_positive_claimed", &id)?
+                || scenario_checks.insert(id.clone(), check_set).is_some()
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance_scenarios"));
+            }
+            scenario_success_checks.insert(id.clone(), success_checks.into_iter().collect::<BTreeSet<_>>());
+            scenario_failure_checks.insert(id.clone(), failure_checks.into_iter().collect::<BTreeSet<_>>());
+            expected_findings.insert(id, record_usize(row, "source_audit_finding_count", "conformance_scenarios")?);
+        }
+        let mut declared = BTreeMap::<String, BTreeSet<String>>::new();
+        for row in declarations {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "scenario_local_check_declarations")
+            })?;
+            let scenario = record_string(row, "scenario_id", "scenario_local_check_declarations")?;
+            let check = record_string(row, "check_id", "scenario_local_check_declarations")?;
+            if !scenario_checks.get(scenario).is_some_and(|checks| checks.contains(check))
+                || !matches!(record_string(row, "source_artifact", check)?, "conformance-enterprise-auth" | "conformance-client-credentials")
+                || record_bool(row, "expected_success_path", check)?
+                    != scenario_success_checks
+                        .get(scenario)
+                        .is_some_and(|checks| checks.contains(check))
+                || record_bool(row, "conditional_failure", check)?
+                    != scenario_failure_checks
+                        .get(scenario)
+                        .is_some_and(|checks| checks.contains(check))
+                || declared.entry(scenario.to_owned()).or_default().insert(check.to_owned()) == false
+            {
+                return Err(Diagnostic::error(
+                    "E_CORE_CONFORMANCE_REGISTRY",
+                    "scenario_local_check_declarations",
+                ));
+            }
+        }
+        if declared != scenario_checks {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_REGISTRY",
+                "scenario_local_check_declarations",
+            ));
+        }
+        let mut observed = BTreeSet::new();
+        for row in observations {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "scenario_observations")
+            })?;
+            let scenario = record_string(row, "scenario_id", "scenario_observations")?;
+            if !scenario_checks.contains_key(scenario)
+                || record_string(row, "status", scenario)? != "pending_runtime_observation"
+                || !observed.insert(scenario.to_owned())
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "scenario_observations"));
+            }
+        }
+        let mut actual_findings = BTreeMap::new();
+        for row in findings {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance_findings")
+            })?;
+            let scenario = record_string(row, "scenario_id", "conformance_findings")?;
+            if !scenario_checks.contains_key(scenario)
+                || !matches!(record_string(row, "category", scenario)?, "forced_input_incompatibility" | "missing_or_overpermissive_oracle" | "missing_production_evidence")
+                || record_usize(row, "ordinal", scenario)? == 0
+                || record_string(row, "finding", scenario)?.is_empty()
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance_findings"));
+            }
+            *actual_findings.entry(scenario.to_owned()).or_insert(0usize) += 1;
+        }
+        if actual_findings != expected_findings {
+            return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "conformance_findings"));
+        }
+        for (index, row) in ambiguities.iter().enumerate() {
+            let row = row.as_table().ok_or_else(|| {
+                Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "ambiguities")
+            })?;
+            if record_string(row, "id", "ambiguities")? != format!("5.{}", index + 1)
+                || record_string(row, "status", "ambiguities")? != "recognized_with_frozen_resolution"
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "ambiguities"));
+            }
+        }
+        Ok((
+            error_codes.len(),
+            scenarios.len(),
+            declarations.len(),
+            observations.len(),
+            findings.len(),
+            ambiguities.len(),
+        ))
     }
 
     fn validate_core_conformance_license_provenance(document: &toml::Value) -> VResult<()> {
-        for (id, revision, blob, byte_length, digest, declared_license) in [
+        for (id, repository, revision, blob, byte_length, digest, declared_license) in [
             (
                 "core_2024_11_05",
+                "https://github.com/modelcontextprotocol/modelcontextprotocol",
                 "48234828288ec5e5011398f17b8736f61645f130",
                 "3d48435454b105021b4f777c11b6b07d8d2ffea3",
                 1_071usize,
@@ -77314,6 +77587,7 @@ activate = 1\n";
             ),
             (
                 "core_2026_07_28",
+                "https://github.com/modelcontextprotocol/modelcontextprotocol",
                 "5f5440bb26a62e2cf3440b92da5a667efa03b267",
                 "4a93985763241755401a10678395303de4e720ba",
                 12_227usize,
@@ -77322,6 +77596,7 @@ activate = 1\n";
             ),
             (
                 "conformance_2026_07_28_baseline",
+                "https://github.com/modelcontextprotocol/conformance",
                 "49103de6ed70804e940637bf3e9e29e4a3f54e64",
                 "4a93985763241755401a10678395303de4e720ba",
                 12_227usize,
@@ -77333,12 +77608,22 @@ activate = 1\n";
             let record = pointer_get(document, &format!("/license_provenance/{id}"), &subject)?
                 .as_table()
                 .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject))?;
-            if record_string(record, "repository_revision", &subject)? != revision
+            let source_page_url = format!("{repository}/blob/{revision}/LICENSE");
+            let retrieval_url = format!(
+                "https://raw.githubusercontent.com/{}/{revision}/LICENSE",
+                repository.trim_start_matches("https://github.com/"),
+            );
+            if record_string(record, "repository", &subject)? != repository
+                || record_string(record, "repository_revision", &subject)? != revision
+                || record_string(record, "upstream_path", &subject)? != "LICENSE"
+                || record_string(record, "source_page_url", &subject)? != source_page_url
+                || record_string(record, "retrieval_url", &subject)? != retrieval_url
+                || record_string(record, "retrieval_date", &subject)? != "2026-08-04"
                 || record_string(record, "git_blob_sha1", &subject)? != blob
                 || record_usize(record, "byte_length", &subject)? != byte_length
                 || record_string(record, "sha256", &subject)? != digest
                 || record_string(record, "declared_license", &subject)? != declared_license
-                || !record_string(record, "retrieval_url", &subject)?.contains(revision)
+                || record_string(record, "scope", &subject)?.is_empty()
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject));
             }
@@ -77645,7 +77930,17 @@ activate = 1\n";
             }
             let admitted = source_lookup(admitted_files, path)?;
             let bytes = &admitted.bytes;
-            if bytes.len() != byte_length {
+            let expected_parse_kind = if path.ends_with(".json") {
+                FileFamily::Json
+            } else {
+                FileFamily::Utf8Text
+            };
+            if admitted.contract.family != "core"
+                || admitted.contract.owner_bead != "bd-mcp-2026-07-28-support-ahet.1.2"
+                || admitted.contract.path != path
+                || admitted.contract.parse_kind != expected_parse_kind
+                || bytes.len() != byte_length
+            {
                 return Err(
                     Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("byte_length")
                 );
@@ -77661,6 +77956,16 @@ activate = 1\n";
             }
             admitted_artifacts.push(admitted);
         }
+        let tree_chain_edges = validate_core_conformance_tree_chain(document)?;
+        let (
+            final_error_codes,
+            conformance_scenarios,
+            scenario_local_checks,
+            scenario_observations,
+            conformance_findings,
+            ambiguities,
+        ) = validate_core_conformance_registries(document)?;
+        validate_core_conformance_manifest_binding(document, admitted_files)?;
         let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)?;
         Ok(CoreConformanceAcceptedBinding {
             manifest_sha256: source_lookup(
@@ -77669,6 +77974,13 @@ activate = 1\n";
             )?
             .digest,
             artifact_tree_sha256,
+            tree_chain_edges,
+            final_error_codes,
+            conformance_scenarios,
+            scenario_local_checks,
+            scenario_observations,
+            conformance_findings,
+            ambiguities,
         })
     }
 
@@ -85057,6 +85369,19 @@ original = "value"
             accepted.artifact_tree_sha256, artifact_tree_sha256,
             "accepted artifact binding is the independently derived eight-artifact tree"
         );
+        assert_eq!(
+            (
+                accepted.tree_chain_edges,
+                accepted.final_error_codes,
+                accepted.conformance_scenarios,
+                accepted.scenario_local_checks,
+                accepted.scenario_observations,
+                accepted.conformance_findings,
+                accepted.ambiguities,
+            ),
+            (14, 3, 3, 9, 3, 41, 26),
+            "accepted binding exposes the complete frozen core registries"
+        );
     }
 
     #[test]
@@ -85084,32 +85409,50 @@ original = "value"
         assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
         assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
 
+        let mut missing_artifact = baseline.clone();
+        remove_pointer(&mut missing_artifact, "/artifacts/0", "missing artifact")
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        let error = validate_core_conformance_sources(&missing_artifact, &files)
+            .expect_err("missing artifact must reject");
+        assert_eq!(
+            error.stable(),
+            "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count"
+        );
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+
         for (family, pointer, replacement, expected) in [
-        ("missing artifact", "/artifacts/0/id", "missing", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|0.id"),
         ("swapped artifact paths", "/artifacts/0/vendored_path", "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|vendored_path"),
-        ("truncated artifact", "/artifacts/0/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|sha256"),
+        ("truncated artifact", "/artifacts/0/byte_length", "98425", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong byte length", "/artifacts/0/byte_length", "1", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong SHA-256", "/artifacts/1/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|sha256"),
         ("wrong Git blob", "/artifacts/1/git_blob_sha1", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|git_blob_sha1"),
         ("changed retrieval URL", "/artifacts/4/retrieval_url", "http://example.invalid", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|retrieval_url"),
         ("floating revision or latest URL", "/artifacts/4/repository_revision", "main", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-changelog|repository_revision"),
         ("missing provenance field", "/artifacts/4/authority", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|authority"),
-        ("duplicate or missing scenario ID", "/artifacts/5/id", "core-changelog", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|5.id"),
-        ("missing, duplicate, or changed scenario-local declared check ID", "/artifacts/5/upstream_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-package|upstream_path"),
-        ("expected-success versus conditional-failure check-role mismatch", "/artifacts/5/kind", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-package|kind"),
-        ("incomplete transitive helper inventory mislabeled complete", "/artifacts/6/media_type", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|media_type"),
+        ("duplicate or missing scenario ID", "/conformance_scenarios/1/id", "auth/enterprise-managed-authorization", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|conformance_scenarios"),
+        ("missing, duplicate, or changed scenario-local declared check ID", "/scenario_local_check_declarations/0/check_id", "complete-flow-jwt-bearer", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
+        ("expected-success versus conditional-failure check-role mismatch", "/scenario_local_check_declarations/0/expected_success_path", "false", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
+        ("incomplete transitive helper inventory mislabeled complete", "/conformance/check_inventory_scope/complete_transitive_helper_inventory_established", "true", "FND01|Error|E_CORE_CONFORMANCE_NO_CLAIM|check_inventory_scope"),
         ("file-level auth scenario classification", "/artifacts/6/repository", "not-a-url", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|repository"),
         ("nonfatal missing cache header mislabeled as forced input", "/artifacts/6/git_tree", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|git_tree"),
         ("empty-scope omission mislabeled as a forced signed-scope failure", "/artifacts/6/source_page_url", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|source_page_url"),
         ("missing exact-issuer ID-JAG policy mislabeled as production-only evidence", "/artifacts/7/retrieval_date", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|retrieval_date"),
         ("expected policy rejection mislabeled as upstream pass", "/artifacts/7/vendored_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|vendored_path"),
-        ("wrong final error code", "/artifacts/7/git_blob_sha1", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|git_blob_sha1"),
-        ("missing or duplicate Section 5 ambiguity entry", "/artifact_count", "7", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count"),
-        ("MCP 2025-11-25 substituted for either exact supported core era", "/core_2024_11_05/release_tag", "2025-11-25", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core_2024_11_05|release_tag"),
+        ("wrong final error code", "/final_error_codes/2/code", "-32023", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|final_error_codes"),
+        ("missing or duplicate Section 5 ambiguity entry", "/ambiguities/1/id", "5.1", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|ambiguities"),
     ] {
         let mut drifted = baseline.clone();
-        let value = if pointer.ends_with("byte_length") || pointer == "/artifact_count" {
+        let value = if pointer.ends_with("byte_length")
+            || pointer == "/artifact_count"
+            || pointer.ends_with("/code")
+        {
             toml::Value::Integer(replacement.parse().expect("integer mutation"))
+        } else if pointer.ends_with("expected_success_path")
+            || pointer.ends_with("complete_transitive_helper_inventory_established")
+        {
+            toml::Value::Boolean(replacement.parse().expect("boolean mutation"))
         } else {
             toml::Value::String(replacement.to_owned())
         };
@@ -85121,6 +85464,31 @@ original = "value"
         assert_eq!(error.stable(), expected, "{family}");
         assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
         assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+    }
+
+        for (pointer, subject, field) in [
+            ("/core/tag", "core", "tag"),
+            ("/core_2024_11_05/release_tag", "core_2024_11_05", "release_tag"),
+        ] {
+            let mut drifted = baseline.clone();
+            set_pointer(
+                &mut drifted,
+                pointer,
+                toml::Value::String("2025-11-25".to_owned()),
+                "unsupported third-era substitution",
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+            let error = validate_core_conformance_sources(&drifted, &files)
+                .expect_err("either supported-era substitution must reject");
+            assert_eq!(
+                error.stable(),
+                format!("FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|{subject}|{field}"),
+            );
+            assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+            assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+        }
+
     }
 
     fn auth_standards_test_document() -> toml::Value {
@@ -98429,12 +98797,31 @@ fn fallible(value: Option<u8>) {
     ];
     const TASKS_APPS_VENDOR_DIGEST: &str =
         "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a";
+    const TASKS_APPS_BLOCKED_CANDIDATE_PATH: &str =
+        "evidence/fnd-01/vendor/apps/whatwg-html-source";
+    const TASKS_APPS_BLOCKED_CANDIDATE_READ_LIMIT: u64 = 8 * 1024 * 1024;
 
     #[derive(Clone, Debug)]
     struct TasksAppsSourceBundle {
         manifest: toml::Value,
         manifest_bytes: Vec<u8>,
         vendor_bytes: BTreeMap<String, Vec<u8>>,
+        blocked_candidate_bytes: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct AcceptedTasksAppsState {
+        tasks_artifact_count: usize,
+        tasks_conformance_artifact_count: usize,
+        apps_artifact_count: usize,
+        admitted_vendor_input_count: usize,
+        admitted_vendor_input_total_bytes: usize,
+        admitted_vendor_digest: String,
+        blocked_candidate_byte_length: usize,
+        blocked_candidate_sha256: String,
+        required_test_ids: [String; 2],
+        apps_maturity: String,
+        composition_ids: Vec<String>,
     }
 
     #[derive(Clone, Copy)]
@@ -98462,6 +98849,7 @@ fn fallible(value: Option<u8>) {
         None,
         ReplacementText(&'static str),
         ReplacementBool(bool),
+        ReplacementInteger(i64),
         ReplacementInput(&'static str),
     }
 
@@ -98635,6 +99023,44 @@ fn fallible(value: Option<u8>) {
         Ok(())
     }
 
+    fn tasks_apps_expect_string_array(
+        table: &toml::map::Map<String, toml::Value>,
+        field: &str,
+        expected: &[&str],
+        code: &str,
+        subject: &str,
+    ) -> VResult<()> {
+        let actual = tasks_apps_field(table, field, subject)?
+            .as_array()
+            .ok_or_else(|| tasks_apps_error(code, subject, field))?;
+        if actual.len() != expected.len()
+            || actual
+                .iter()
+                .zip(expected)
+                .any(|(value, expected)| value.as_str() != Some(*expected))
+        {
+            return Err(tasks_apps_error(code, subject, field));
+        }
+        Ok(())
+    }
+
+    fn tasks_apps_expect_triplets(
+        parent: &toml::map::Map<String, toml::Value>, field: &str, expected: &[(&str, &str, &str)],
+        code: &str, subject: &str,
+    ) -> VResult<()> {
+        let rows = tasks_apps_field(parent, field, subject)?.as_array()
+            .ok_or_else(|| tasks_apps_error(code, subject, field))?;
+        if rows.len() != expected.len() { return Err(tasks_apps_error(code, subject, field)); }
+        for (row, (method, role, direction)) in rows.iter().zip(expected) {
+            let row = tasks_apps_table(row, subject)?;
+            if row.len() != 3 { return Err(tasks_apps_error(code, subject, field)); }
+            for (name, value) in [("method", *method), ("role", *role), ("direction", *direction)] {
+                tasks_apps_expect_string(row, name, value, code, subject)?;
+            }
+        }
+        Ok(())
+    }
+
     fn tasks_apps_vendor_digest(vendor_bytes: &BTreeMap<String, Vec<u8>>) -> VResult<[u8; 32]> {
         if vendor_bytes.len() != TASKS_APPS_VENDOR_PATHS.len()
             || TASKS_APPS_VENDOR_PATHS
@@ -98668,18 +99094,13 @@ fn fallible(value: Option<u8>) {
         Ok(digest.finalize().into())
     }
 
-    fn load_tasks_apps_source_bundle(root: &Path) -> VResult<TasksAppsSourceBundle> {
-        let manifest_path = resolve_safe(root, TASKS_APPS_MANIFEST_PATH, TASKS_APPS_MANIFEST_PATH)?;
-        let manifest_bytes =
-            read_bounded(&manifest_path, 2 * 1024 * 1024, TASKS_APPS_MANIFEST_PATH)?;
-        let manifest_text = std::str::from_utf8(&manifest_bytes)
-            .map_err(|_| tasks_apps_error("E_TASKS_APPS_MANIFEST", "manifest", "utf8"))?;
-        let manifest = parse_toml_document(manifest_text, TASKS_APPS_MANIFEST_PATH)?;
+    fn load_tasks_apps_source_bundle(root: &Path, files: &[LoadedFile]) -> VResult<TasksAppsSourceBundle> {
+        let manifest_file = source_lookup(files, TASKS_APPS_MANIFEST_PATH)?;
+        let manifest = parse_source_toml(files, TASKS_APPS_MANIFEST_PATH)?;
         let mut vendor_bytes = BTreeMap::new();
         for path in TASKS_APPS_VENDOR_PATHS {
-            let absolute = resolve_safe(root, path, path)?;
-            let bytes = read_bounded(&absolute, 512 * 1024, path)?;
-            if vendor_bytes.insert(path.to_owned(), bytes).is_some() {
+            let file = source_lookup(files, path)?;
+            if vendor_bytes.insert(path.to_owned(), file.bytes.clone()).is_some() {
                 return Err(tasks_apps_error(
                     "E_TASKS_APPS_ARTIFACT_INVENTORY",
                     "vendor-inputs",
@@ -98687,10 +99108,23 @@ fn fallible(value: Option<u8>) {
                 ));
             }
         }
+        // The preserved WHATWG source is intentionally outside normal LoadedFile
+        // admission: its exact size proves it exceeds the one-MiB admission cap.
+        let blocked_candidate_path = resolve_safe(
+            root,
+            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
+            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
+        )?;
+        let blocked_candidate_bytes = read_bounded(
+            &blocked_candidate_path,
+            TASKS_APPS_BLOCKED_CANDIDATE_READ_LIMIT,
+            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
+        )?;
         Ok(TasksAppsSourceBundle {
             manifest,
-            manifest_bytes,
+            manifest_bytes: manifest_file.bytes.clone(),
             vendor_bytes,
+            blocked_candidate_bytes,
         })
     }
 
@@ -98848,6 +99282,50 @@ fn fallible(value: Option<u8>) {
                 "sdk_1_29_0",
             ));
         }
+        if subject == "tasks" {
+            tasks_apps_expect_string_array(sdk, "ordered_imports", &[
+                "CreateMessageRequest", "CreateMessageResult", "ElicitRequest", "ElicitResult",
+                "JSONRPCNotification", "JSONRPCRequest", "ListRootsRequest", "ListRootsResult",
+                "NotificationParams", "Result",
+            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
+            if tasks_apps_usize(sdk, "import_count", subject)? != 10 {
+                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "import_count"));
+            }
+        } else {
+            tasks_apps_expect_string_array(sdk, "direct_imports", &[
+                "CallToolResult", "ContentBlock", "EmbeddedResource", "Implementation", "RequestId", "ResourceLink", "Tool",
+            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
+            tasks_apps_expect_string_array(sdk, "standard_reuse_imports", &[
+                "CallToolRequest", "CallToolResult", "CreateMessageRequest", "CreateMessageResult", "CreateMessageResultWithTools", "EmptyResult", "ListPromptsRequest", "ListPromptsResult", "ListResourcesRequest", "ListResourcesResult", "ListResourceTemplatesRequest", "ListResourceTemplatesResult", "ListToolsRequest", "ListToolsResult", "LoggingMessageNotification", "PingRequest", "PromptListChangedNotification", "ReadResourceRequest", "ReadResourceResult", "ResourceListChangedNotification", "ToolListChangedNotification",
+            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
+            if tasks_apps_usize(sdk, "direct_import_count", subject)? != 7
+                || tasks_apps_usize(sdk, "standard_reuse_import_count", subject)? != 21 {
+                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "import_count"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tasks_apps_license(
+        parent: &toml::map::Map<String, toml::Value>,
+        field: &str,
+        repository: &str,
+        revision: &str,
+        blob: &str,
+        byte_length: usize,
+        sha256_value: &str,
+        declared: &str,
+    ) -> VResult<()> {
+        let subject = format!("{}.{}", if field.starts_with("conformance") { "tasks" } else if repository.ends_with("ext-apps") { "apps" } else { "tasks" }, field);
+        let row = tasks_apps_table(tasks_apps_field(parent, field, &subject)?, &subject)?;
+        for (name, value) in [
+            ("repository", repository), ("repository_revision", revision), ("upstream_path", "LICENSE"),
+            ("source_page_url", &format!("{repository}/blob/{revision}/LICENSE")),
+            ("source_url", &format!("https://raw.githubusercontent.com/{}/{revision}/LICENSE", repository.trim_start_matches("https://github.com/"))),
+            ("retrieved_on", "2026-08-04"), ("git_blob_sha1", blob), ("sha256", sha256_value),
+            ("declared_license", declared),
+        ] { tasks_apps_expect_string(row, name, value, "E_TASKS_APPS_LICENSE_PROVENANCE", &subject)?; }
+        if tasks_apps_usize(row, "byte_length", &subject)? != byte_length { return Err(tasks_apps_error("E_TASKS_APPS_LICENSE_PROVENANCE", &subject, "byte_length")); }
         Ok(())
     }
 
@@ -98917,12 +99395,47 @@ fn fallible(value: Option<u8>) {
                 "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin",
                 TasksAppsMutationPayload::ReplacementText("experimental"),
             ),
+            (
+                "whatwg-blocked-admission-drift",
+                "replace-one-manifest-field",
+                "apps.whatwg_html_validation.admitted_as_source_input",
+                "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|admitted_as_source_input",
+                TasksAppsMutationPayload::ReplacementBool(true),
+            ),
+            (
+                "tasks-license-class-drift",
+                "replace-one-manifest-field",
+                "tasks.license_provenance.declared_license",
+                "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.license_provenance|declared_license",
+                TasksAppsMutationPayload::ReplacementText("repository_transition_notice"),
+            ),
+            (
+                "tasks-conformance-license-provenance-drift",
+                "replace-one-manifest-field",
+                "tasks.conformance_license_provenance.sha256",
+                "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.conformance_license_provenance|sha256",
+                TasksAppsMutationPayload::ReplacementText("1382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"),
+            ),
+            (
+                "inventory-classification-drift",
+                "replace-one-manifest-field",
+                "verification_contract.apps_preserved_blocked_candidate_count",
+                "FND01|Error|E_TASKS_APPS_INVENTORY_CLASSIFICATION|verification_contract|apps_preserved_blocked_candidate_count",
+                TasksAppsMutationPayload::ReplacementInteger(0),
+            ),
+            (
+                "required-test-id-drift",
+                "replace-one-manifest-field",
+                "executable_same_validator_contract.required_test_ids[0]",
+                "FND01|Error|E_TASKS_APPS_TEST_IDENTITY|executable_same_validator_contract|required_test_ids[0]",
+                TasksAppsMutationPayload::ReplacementText("tests::fnd_01_tasks_apps_sources_positive"),
+            ),
         ];
         if mutations.len() != expected.len() {
             return Err(tasks_apps_error(
                 "E_TASKS_APPS_MUTATION_SCHEMA",
                 "executable_same_validator_contract",
-                "planted_mutation count",
+                "generic planted_mutation count",
             ));
         }
         let mut plans = Vec::with_capacity(expected.len());
@@ -98932,7 +99445,8 @@ fn fallible(value: Option<u8>) {
             match payload {
                 TasksAppsMutationPayload::None => {}
                 TasksAppsMutationPayload::ReplacementText(_)
-                | TasksAppsMutationPayload::ReplacementBool(_) => {
+                | TasksAppsMutationPayload::ReplacementBool(_)
+                | TasksAppsMutationPayload::ReplacementInteger(_) => {
                     allowed.push("replacement");
                 }
                 TasksAppsMutationPayload::ReplacementInput(_) => allowed.push("replacement_input"),
@@ -98974,6 +99488,16 @@ fn fallible(value: Option<u8>) {
                     }
                     (Some(toml::Value::Boolean(expected)), None)
                 }
+                TasksAppsMutationPayload::ReplacementInteger(expected) => {
+                    if tasks_apps_field(row, "replacement", id)?.as_integer() != Some(expected) {
+                        return Err(tasks_apps_error(
+                            "E_TASKS_APPS_MUTATION_SCHEMA",
+                            id,
+                            "replacement",
+                        ));
+                    }
+                    (Some(toml::Value::Integer(expected)), None)
+                }
                 TasksAppsMutationPayload::ReplacementInput(expected) => {
                     tasks_apps_expect_string(
                         row,
@@ -99004,6 +99528,21 @@ fn fallible(value: Option<u8>) {
             "tasks.final_core_authority" => Ok("/tasks/final_core_authority"),
             "apps.stable_spec_date" => Ok("/apps/stable_spec_date"),
             "apps.maturity_at_pin" => Ok("/apps/maturity_at_pin"),
+            "apps.whatwg_html_validation.admitted_as_source_input" => {
+                Ok("/apps/whatwg_html_validation/admitted_as_source_input")
+            }
+            "tasks.license_provenance.declared_license" => {
+                Ok("/tasks/license_provenance/declared_license")
+            }
+            "tasks.conformance_license_provenance.sha256" => {
+                Ok("/tasks/conformance_license_provenance/sha256")
+            }
+            "verification_contract.apps_preserved_blocked_candidate_count" => {
+                Ok("/verification_contract/apps_preserved_blocked_candidate_count")
+            }
+            "executable_same_validator_contract.required_test_ids[0]" => {
+                Ok("/executable_same_validator_contract/required_test_ids/0")
+            }
             _ => Err(tasks_apps_error(
                 "E_TASKS_APPS_MUTATION_SCHEMA",
                 "executable_same_validator_contract",
@@ -99012,12 +99551,12 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    fn validate_tasks_apps_sources(bundle: &TasksAppsSourceBundle) -> VResult<()> {
+    fn validate_tasks_apps_sources(bundle: &TasksAppsSourceBundle) -> VResult<AcceptedTasksAppsState> {
         let root = tasks_apps_table(&bundle.manifest, "manifest")?;
         tasks_apps_expect_string(
             root,
             "evidence_id",
-            "fnd-01-tasks-apps-2026-07-29-v4",
+            "fnd-01-tasks-apps-2026-08-04-v7-admission-classified",
             "E_TASKS_APPS_MANIFEST",
             "manifest",
         )?;
@@ -99026,9 +99565,14 @@ fn fallible(value: Option<u8>) {
             "executable_same_validator_contract",
         )?;
         for (field, expected) in [
+            ("contract_id", "fnd-01-tasks-apps-source-integrity-v2"),
+            (
+                "shared_verifier_path",
+                "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
+            ),
             ("production_validator_symbol", "validate_tasks_apps_sources"),
-            ("required_enclosing_module", "tests"),
-            ("vendor_family_digest_sha256", TASKS_APPS_VENDOR_DIGEST),
+            ("required_enclosing_module", "ordinary::tests"),
+            ("admitted_vendor_family_digest_sha256", TASKS_APPS_VENDOR_DIGEST),
             ("receipt_or_manifest_self_hash", "forbidden"),
         ] {
             tasks_apps_expect_string(
@@ -99041,12 +99585,12 @@ fn fallible(value: Option<u8>) {
         }
         if tasks_apps_usize(
             contract,
-            "virtual_input_count",
+            "admitted_vendor_input_count",
             "executable_same_validator_contract",
         )? != TASKS_APPS_VENDOR_PATHS.len()
             || tasks_apps_usize(
                 contract,
-                "virtual_input_total_bytes",
+                "admitted_vendor_input_total_bytes",
                 "executable_same_validator_contract",
             )? != 1_173_466
             || tasks_apps_bool(
@@ -99066,37 +99610,63 @@ fn fallible(value: Option<u8>) {
                 "capability boundary",
             ));
         }
-        let test_ids = tasks_apps_field(
+        let required_test_ids = [
+            "ordinary::tests::fnd_01_tasks_apps_sources_positive",
+            "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative",
+        ];
+        if tasks_apps_expect_string_array(
             contract,
             "required_test_ids",
+            &required_test_ids,
+            "E_TASKS_APPS_TEST_IDENTITY",
             "executable_same_validator_contract",
-        )?
-        .as_array()
-        .ok_or_else(|| {
-            tasks_apps_error(
-                "E_TASKS_APPS_MANIFEST",
-                "executable_same_validator_contract",
-                "required_test_ids",
-            )
-        })?;
-        if test_ids
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .collect::<Vec<_>>()
-            != [
-                "tests::fnd_01_tasks_apps_sources_positive",
-                "tests::fnd_01_tasks_apps_sources_planted_negative",
-            ]
+        )
+        .is_err()
         {
             return Err(tasks_apps_error(
-                "E_TASKS_APPS_MANIFEST",
+                "E_TASKS_APPS_TEST_IDENTITY",
                 "executable_same_validator_contract",
                 "required_test_ids",
             ));
         }
-        let _validated_mutations = validate_tasks_apps_planted_mutations(contract)?;
+        let validated_mutations = validate_tasks_apps_planted_mutations(contract)?;
+        if validated_mutations.len() != 12 {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_MUTATION_SCHEMA",
+                "executable_same_validator_contract",
+                "generic planted mutations",
+            ));
+        }
+
+        let verification = tasks_apps_table(
+            tasks_apps_field(root, "verification_contract", "manifest")?,
+            "verification_contract",
+        )?;
+        for (field, expected) in [
+            ("tasks_extension_artifact_count", 4usize),
+            ("tasks_conformance_artifact_count", 1),
+            ("tasks_admitted_vendor_input_count", 5),
+            ("apps_extension_artifact_count", 8),
+            ("apps_admitted_vendor_input_count", 8),
+            ("apps_admitted_external_authority_artifact_count", 0),
+            ("apps_preserved_blocked_candidate_count", 1),
+        ] {
+            if tasks_apps_usize(verification, field, "verification_contract")? != expected {
+                return Err(tasks_apps_error(
+                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                    "verification_contract",
+                    field,
+                ));
+            }
+        }
 
         let tasks = tasks_apps_table(tasks_apps_field(root, "tasks", "manifest")?, "tasks")?;
+        for (field, expected) in [("extension_identifier", "io.modelcontextprotocol/tasks"), ("client_settings_schema", "tasks-2026-07-28-empty-object-v1"), ("server_settings_schema", "tasks-2026-07-28-empty-object-v1"), ("settings_exact_value", "exact closed {}")] {
+            tasks_apps_expect_string(tasks, field, expected, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
+        }
+        tasks_apps_expect_string_array(tasks, "status_union_order", &["working", "input_required", "completed", "failed", "cancelled"], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
+        tasks_apps_expect_string_array(tasks, "source_precedence", &["final core 2026-07-28 for MCP envelopes, request metadata, and final error allocation", "the frozen FastMCP composed contract for explicit conflict resolutions", "Tasks prose for negotiated extension semantics, identifier, empty settings, and method behavior", "Tasks TypeScript schema for raw extension fields, unions, and old-SDK import inventory", "pinned Tasks conformance wire-fields scenario for its explicitly limited observable assertions", "lock-resolved SDK 1.29.0 only for pre-rebind compatibility shapes", "generated Tasks schema only for drift and partial validation"], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
+        tasks_apps_expect_triplets(tasks, "direction", &[("tasks/get", "request", "client_to_server"), ("tasks/update", "request", "client_to_server"), ("tasks/cancel", "request", "client_to_server"), ("notifications/tasks", "notification", "server_to_client")], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
         tasks_apps_expect_string(
             tasks,
             "repository",
@@ -99169,6 +99739,8 @@ fn fallible(value: Option<u8>) {
             "Apache-2.0",
             "tasks",
         )?;
+        validate_tasks_apps_license(tasks, "license_provenance", "https://github.com/modelcontextprotocol/ext-tasks", tasks_commit, "83721348b21415bc1cda345305f21d17b9de95e2", 10_786, "70559d215777f20bb14de53b336db2bb41fc58712f1d6f43e6a7dd2c82b1d6df", "Apache-2.0")?;
+        validate_tasks_apps_license(tasks, "conformance_license_provenance", "https://github.com/modelcontextprotocol/conformance", "49103de6ed70804e940637bf3e9e29e4a3f54e64", "4a93985763241755401a10678395303de4e720ba", 12_227, "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a", "repository_transition_notice")?;
 
         let conformance_rows = tasks_apps_field(tasks, "conformance_artifact", "tasks")?
             .as_array()
@@ -99317,11 +99889,6 @@ fn fallible(value: Option<u8>) {
                 "final_core_authority",
             ));
         }
-        let precedence = tasks_apps_field(apps, "source_precedence", "apps")?
-            .as_array()
-            .ok_or_else(|| {
-                tasks_apps_error("E_TASKS_APPS_MANIFEST", "apps", "source_precedence")
-            })?;
         let expected_precedence = [
         "final core 2026-07-28 for MCP envelopes and rebound core symbols",
         "the frozen FastMCP composed contract for explicit conflict resolutions",
@@ -99332,17 +99899,46 @@ fn fallible(value: Option<u8>) {
         "lock-resolved SDK 1.29.0 for imported compatibility shapes before explicit rebind/projection",
         "generated schemas only for drift and partial validation",
     ];
-        if precedence
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .collect::<Vec<_>>()
-            != expected_precedence
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "apps",
-                "source_precedence",
-            ));
+        tasks_apps_expect_string_array(apps, "source_precedence", &expected_precedence, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?;
+        for (field, expected) in [
+            ("extension_identifier", "io.modelcontextprotocol/ui"),
+            ("apps_client_settings_schema", "apps-2026-01-26-client-mime-types-v1"),
+            ("apps_server_settings_schema", "fastmcp-2026-07-28-apps-empty-server-marker-v1"),
+        ] { tasks_apps_expect_string(apps, field, expected, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?; }
+        tasks_apps_expect_triplets(apps, "direction", &[
+            ("ui/initialize", "request", "view_to_host"), ("ui/open-link", "request", "view_to_host"),
+            ("ui/download-file", "request", "view_to_host"), ("ui/message", "request", "view_to_host"),
+            ("ui/update-model-context", "request", "view_to_host"), ("ui/resource-teardown", "request", "host_to_view"),
+            ("ui/request-display-mode", "request", "view_to_host"), ("tools/call", "request", "bidirectional_by_capability"),
+            ("tools/list", "request", "host_to_view"), ("resources/list", "request", "view_to_host"),
+            ("resources/templates/list", "request", "view_to_host"), ("resources/read", "request", "view_to_host"),
+            ("prompts/list", "request", "view_to_host"), ("sampling/createMessage", "request", "view_to_host_raw_only_rejected"),
+            ("ping", "request", "bidirectional_inherited_control"),
+            ("ui/notifications/host-context-changed", "notification", "host_to_view"),
+            ("ui/notifications/tool-input", "notification", "host_to_view"), ("ui/notifications/tool-input-partial", "notification", "host_to_view"),
+            ("ui/notifications/tool-result", "notification", "host_to_view"), ("ui/notifications/tool-cancelled", "notification", "host_to_view"),
+            ("ui/notifications/sandbox-resource-ready", "notification", "host_to_sandbox_proxy"),
+            ("ui/notifications/initialized", "notification", "view_to_host"), ("ui/notifications/size-changed", "notification", "view_to_host"),
+            ("ui/notifications/sandbox-proxy-ready", "notification", "sandbox_proxy_to_host"), ("ui/notifications/request-teardown", "notification", "view_to_host"),
+            ("notifications/tools/list_changed", "notification", "bidirectional_by_capability"),
+            ("notifications/resources/list_changed", "notification", "host_to_view"), ("notifications/prompts/list_changed", "notification", "host_to_view"),
+            ("notifications/message", "notification", "view_to_host"),
+        ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?;
+        let unions = tasks_apps_field(apps, "source_union", "apps")?.as_array()
+            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union"))?;
+        let union_specs: &[(&str, &[&str])] = &[
+            ("AppRequest", &["McpUiInitializeRequest", "McpUiOpenLinkRequest", "McpUiDownloadFileRequest", "McpUiMessageRequest", "McpUiUpdateModelContextRequest", "McpUiResourceTeardownRequest", "McpUiRequestDisplayModeRequest", "CallToolRequest", "ListToolsRequest", "ListResourcesRequest", "ListResourceTemplatesRequest", "ReadResourceRequest", "ListPromptsRequest", "CreateMessageRequest", "PingRequest"]),
+            ("AppNotification", &["McpUiHostContextChangedNotification", "McpUiToolInputNotification", "McpUiToolInputPartialNotification", "McpUiToolResultNotification", "McpUiToolCancelledNotification", "McpUiSandboxResourceReadyNotification", "ToolListChangedNotification", "ResourceListChangedNotification", "PromptListChangedNotification", "McpUiInitializedNotification", "McpUiSizeChangedNotification", "McpUiSandboxProxyReadyNotification", "McpUiRequestTeardownNotification", "LoggingMessageNotification"]),
+            ("AppResult", &["McpUiInitializeResult", "McpUiOpenLinkResult", "McpUiDownloadFileResult", "McpUiMessageResult", "McpUiResourceTeardownResult", "McpUiRequestDisplayModeResult", "CallToolResult", "ListToolsResult", "ListResourcesResult", "ListResourceTemplatesResult", "ReadResourceResult", "ListPromptsResult", "CreateMessageResult", "CreateMessageResultWithTools", "EmptyResult"]),
+        ];
+        if unions.len() != union_specs.len() { return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union")); }
+        for (row, (name, members)) in unions.iter().zip(union_specs) {
+            let row = tasks_apps_table(row, "apps.source_union")?;
+            if row.len() != 3 || tasks_apps_usize(row, "expected_count", "apps.source_union")? != members.len() {
+                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union"));
+            }
+            tasks_apps_expect_string(row, "name", name, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps.source_union")?;
+            tasks_apps_expect_string_array(row, "ordered_members", members, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps.source_union")?;
         }
         validate_tasks_apps_artifacts(
             "apps",
@@ -99359,6 +99955,81 @@ fn fallible(value: Option<u8>) {
             "MIT",
             "apps",
         )?;
+        validate_tasks_apps_license(apps, "license_provenance", "https://github.com/modelcontextprotocol/ext-apps", apps_commit, "4a93985763241755401a10678395303de4e720ba", 12_227, "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a", "repository_transition_notice")?;
+
+        let whatwg = tasks_apps_table(tasks_apps_field(apps, "whatwg_html_validation", "apps")?, "apps.whatwg_html_validation")?;
+        for (field, expected) in [("standard", "WHATWG HTML"), ("revision", "24c5e48bf66ea61bc199ec6338c81258275ba9c6"), ("tree", "53663806b56996a7a412ec87248de5657bed6ce7"), ("admission_status", "blocked"), ("candidate_preserved_path", TASKS_APPS_BLOCKED_CANDIDATE_PATH), ("candidate_sha256", "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa")] { tasks_apps_expect_string(whatwg, field, expected, "E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation")?; }
+        if tasks_apps_bool(whatwg, "admitted_as_source_input", "apps.whatwg_html_validation")? || tasks_apps_usize(whatwg, "max_source_file_bytes", "apps.whatwg_html_validation")? != 1_048_576 || tasks_apps_usize(whatwg, "candidate_byte_length", "apps.whatwg_html_validation")? != bundle.blocked_candidate_bytes.len() || bundle.blocked_candidate_bytes.len() != 7_892_171 || lower_hex(&sha256(&bundle.blocked_candidate_bytes)) != tasks_apps_string(whatwg, "candidate_sha256", "apps.whatwg_html_validation")? { return Err(tasks_apps_error("E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation", "admitted_as_source_input")); }
+
+        let compositions = tasks_apps_field(apps, "product_composition_authority", "apps")?
+            .as_array()
+            .ok_or_else(|| {
+                tasks_apps_error(
+                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                    "apps",
+                    "product_composition_authority",
+                )
+            })?;
+        let expected_compositions = [
+            ("APP-03-apps-plus-host-mediated-sampling", "MCP Apps plus host-mediated Sampling"),
+            ("APP-04-apps-plus-tasks-mrtr", "MCP Apps plus Tasks and MRTR"),
+        ];
+        if compositions.len() != expected_compositions.len() {
+            return Err(tasks_apps_error(
+                "E_TASKS_APPS_ARTIFACT_INVENTORY",
+                "apps",
+                "product_composition_authority count",
+            ));
+        }
+        let mut composition_ids = Vec::with_capacity(compositions.len());
+        for (row, (id, composition)) in compositions.iter().zip(expected_compositions) {
+            let row = tasks_apps_table(row, id)?;
+            tasks_apps_expect_string(
+                row,
+                "id",
+                id,
+                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+                "apps.product_composition_authority",
+            )?;
+            tasks_apps_expect_string(
+                row,
+                "composition",
+                composition,
+                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+                id,
+            )?;
+            if tasks_apps_bool(row, "apps_only_normative_claim", id)?
+                || tasks_apps_bool(row, "runtime_capability_credit", id)?
+            {
+                return Err(tasks_apps_error(
+                    "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
+                    id,
+                    "composition boundary",
+                ));
+            }
+            let pins: &[(&str, &str)] = match id {
+                "APP-03-apps-plus-host-mediated-sampling" => &[
+                    ("source_manifest", "evidence/fnd-01/core-conformance.toml"),
+                    ("source_artifact_id", "core-schema-ts"),
+                    ("repository_revision", "5f5440bb26a62e2cf3440b92da5a667efa03b267"),
+                    ("source_url", "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"),
+                    ("sha256", "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"),
+                ],
+                _ => &[
+                    ("tasks_source_artifact_id", "tasks-prose"),
+                    ("tasks_repository_revision", tasks_commit),
+                    ("tasks_source_url", "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/2c1425d9a288b9b1f489430fe1e00bb392b47e48/specification/draft/tasks.md"),
+                    ("tasks_sha256", "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11"),
+                    ("mrtr_source_manifest", "evidence/fnd-01/core-conformance.toml"),
+                    ("mrtr_source_artifact_id", "core-schema-ts"),
+                    ("mrtr_repository_revision", "5f5440bb26a62e2cf3440b92da5a667efa03b267"),
+                    ("source_url", "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"),
+                    ("mrtr_sha256", "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"),
+                ],
+            };
+            for (field, value) in pins { tasks_apps_expect_string(row, field, value, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", id)?; }
+            composition_ids.push(id.to_owned());
+        }
 
         let digest = lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes)?);
         if digest != TASKS_APPS_VENDOR_DIGEST {
@@ -99376,7 +100047,19 @@ fn fallible(value: Option<u8>) {
                 "bundle length",
             ));
         }
-        Ok(())
+        Ok(AcceptedTasksAppsState {
+            tasks_artifact_count: TASKS_ARTIFACTS.len(),
+            tasks_conformance_artifact_count: conformance_rows.len(),
+            apps_artifact_count: APPS_ARTIFACTS.len(),
+            admitted_vendor_input_count: bundle.vendor_bytes.len(),
+            admitted_vendor_input_total_bytes: total_bytes,
+            admitted_vendor_digest: digest,
+            blocked_candidate_byte_length: bundle.blocked_candidate_bytes.len(),
+            blocked_candidate_sha256: lower_hex(&sha256(&bundle.blocked_candidate_bytes)),
+            required_test_ids: required_test_ids.map(str::to_owned),
+            apps_maturity: tasks_apps_string(apps, "maturity_at_pin", "apps")?.to_owned(),
+            composition_ids,
+        })
     }
 
     #[cfg(test)]
@@ -99384,7 +100067,10 @@ fn fallible(value: Option<u8>) {
         use super::*;
 
         fn baseline_tasks_apps_bundle() -> TasksAppsSourceBundle {
-            load_tasks_apps_source_bundle(&repository_root())
+            let root = repository_root();
+            let (policy, _) = read_policy(&root).expect("read source policy");
+            let files = load_sources(&root, &policy).expect("load admitted source files");
+            load_tasks_apps_source_bundle(&root, &files)
                 .expect("load immutable Tasks/Apps bundle")
         }
 
@@ -99405,6 +100091,16 @@ fn fallible(value: Option<u8>) {
                     assert_eq!(sha256(before), sha256(after), "unchanged sha256: {path}");
                 }
             }
+            assert_eq!(
+                baseline.blocked_candidate_bytes.len(),
+                candidate.blocked_candidate_bytes.len(),
+                "unchanged blocked candidate byte length"
+            );
+            assert_eq!(
+                sha256(&baseline.blocked_candidate_bytes),
+                sha256(&candidate.blocked_candidate_bytes),
+                "unchanged blocked candidate sha256"
+            );
         }
 
         fn assert_stable_diagnostic(bundle: &TasksAppsSourceBundle, expected: &str) {
@@ -99416,10 +100112,15 @@ fn fallible(value: Option<u8>) {
         fn assert_live_baseline_reloads_unchanged(
             baseline: &TasksAppsSourceBundle,
             baseline_digest: [u8; 32],
+            accepted: &AcceptedTasksAppsState,
         ) {
             let live = baseline_tasks_apps_bundle();
-            validate_tasks_apps_sources(&live)
-                .expect("untouched live baseline reaccepts after discarded virtual mutation");
+            assert_eq!(
+                validate_tasks_apps_sources(&live)
+                    .expect("untouched live baseline reaccepts after discarded virtual mutation"),
+                accepted.clone(),
+                "typed observable state persists after discarded virtual mutation",
+            );
             assert_eq!(
                 live.manifest_bytes, baseline.manifest_bytes,
                 "manifest bytes persist unchanged"
@@ -99428,6 +100129,8 @@ fn fallible(value: Option<u8>) {
                 live.vendor_bytes, baseline.vendor_bytes,
                 "all vendor bytes persist unchanged"
             );
+            assert_eq!(live.blocked_candidate_bytes, baseline.blocked_candidate_bytes,
+                "blocked candidate bytes persist unchanged");
             assert_eq!(
                 tasks_apps_vendor_digest(&live.vendor_bytes).expect("live baseline digest"),
                 baseline_digest,
@@ -99463,12 +100166,29 @@ fn fallible(value: Option<u8>) {
         fn fnd_01_tasks_apps_sources_positive() {
             let bundle = baseline_tasks_apps_bundle();
             assert_eq!(
-                1 + bundle.vendor_bytes.len(),
-                14,
-                "one manifest plus thirteen vendors"
+                2 + bundle.vendor_bytes.len(),
+                15,
+                "one manifest plus thirteen admitted vendors plus one blocked candidate"
             );
-            validate_tasks_apps_sources(&bundle)
+            let accepted = validate_tasks_apps_sources(&bundle)
                 .expect("same production validator accepts baseline");
+            assert_eq!(accepted.tasks_artifact_count, 4);
+            assert_eq!(accepted.tasks_conformance_artifact_count, 1);
+            assert_eq!(accepted.apps_artifact_count, 8);
+            assert_eq!(accepted.admitted_vendor_input_count, 13);
+            assert_eq!(accepted.admitted_vendor_input_total_bytes, 1_173_466);
+            assert_eq!(accepted.admitted_vendor_digest, TASKS_APPS_VENDOR_DIGEST);
+            assert_eq!(accepted.blocked_candidate_byte_length, 7_892_171);
+            assert_eq!(accepted.blocked_candidate_sha256, "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa");
+            assert_eq!(accepted.required_test_ids, ["ordinary::tests::fnd_01_tasks_apps_sources_positive", "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative"]);
+            assert_eq!(accepted.apps_maturity, "stable");
+            assert_eq!(
+                accepted.composition_ids,
+                [
+                    "APP-03-apps-plus-host-mediated-sampling",
+                    "APP-04-apps-plus-tasks-mrtr",
+                ],
+            );
             assert_eq!(
                 lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes).expect("bundle digest")),
                 TASKS_APPS_VENDOR_DIGEST,
@@ -99479,7 +100199,7 @@ fn fallible(value: Option<u8>) {
         #[test]
         fn fnd_01_tasks_apps_sources_planted_negative() {
             let baseline = baseline_tasks_apps_bundle();
-            validate_tasks_apps_sources(&baseline)
+            let accepted = validate_tasks_apps_sources(&baseline)
                 .expect("fresh baseline accepts before mutations");
             let baseline_digest =
                 tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest");
@@ -99491,7 +100211,7 @@ fn fallible(value: Option<u8>) {
                 .expect("validated manifest contract");
             let plans = validate_tasks_apps_planted_mutations(contract)
                 .expect("production validator's exact planted-mutation schema");
-            assert_eq!(plans.len(), 7, "all validated concrete plants are present");
+            assert_eq!(plans.len(), 12, "all validated concrete plants are present");
 
             for plan in plans {
                 let mut candidate = baseline.clone();
@@ -99592,11 +100312,15 @@ fn fallible(value: Option<u8>) {
                 }
                 assert_stable_diagnostic(&candidate, &plan.expected_diagnostic);
                 drop(candidate);
-                assert_live_baseline_reloads_unchanged(&baseline, baseline_digest);
+                assert_live_baseline_reloads_unchanged(&baseline, baseline_digest, &accepted);
             }
 
-            validate_tasks_apps_sources(&baseline)
-                .expect("fresh baseline reaccepts after every isolated mutation");
+            assert_eq!(
+                validate_tasks_apps_sources(&baseline)
+                    .expect("fresh baseline reaccepts after every isolated mutation"),
+                accepted,
+                "fresh baseline reaccepts with the same typed observable state",
+            );
             assert_eq!(
                 tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest"),
                 baseline_digest
