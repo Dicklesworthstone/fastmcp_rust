@@ -34343,6 +34343,7 @@ mod ordinary {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::str::FromStr;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const POLICY_SCHEMA_VERSION: u32 = 2;
     const RECEIPT_SCHEMA_VERSION: u32 = 2;
@@ -35203,6 +35204,22 @@ activate = 1\n";
     ];
 
     const SDK_IDS: &[&str] = &["typescript", "python", "csharp", "go"];
+    struct SdkRuntimeSpec {
+        id: &'static str,
+        checked_lock_id: &'static str,
+        primary_tool_id: &'static str,
+        additional_tool_ids: &'static [&'static str],
+        network_url: &'static str,
+        network_stderr: &'static str,
+        runtime_prefixes: &'static [&'static str],
+    }
+    #[rustfmt::skip]
+    const SDK_RUNTIME_SPECS: [SdkRuntimeSpec; 4] = [
+        SdkRuntimeSpec { id: "typescript", checked_lock_id: "typescript-package-lock", primary_tool_id: "npm", additional_tool_ids: &["curl", "jq", "node", "sandbox-exec", "shasum"], network_url: "https://registry.npmjs.org/", network_stderr: "curl: (6) Could not resolve host: registry.npmjs.org", runtime_prefixes: &["fastmcp-fnd01-ts-proof-cache.", "fastmcp-fnd01-ts-proof-online.", "fastmcp-fnd01-ts-proof-offline."] },
+        SdkRuntimeSpec { id: "python", checked_lock_id: "python-requirements-lock", primary_tool_id: "python", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://pypi.org/", network_stderr: "curl: (6) Could not resolve host: pypi.org", runtime_prefixes: &["fastmcp-fnd01-python-proof-stage.", "fastmcp-fnd01-python-proof-online.", "fastmcp-fnd01-python-proof-offline."] },
+        SdkRuntimeSpec { id: "csharp", checked_lock_id: "csharp-packages-lock", primary_tool_id: "dotnet", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://api.nuget.org/v3/index.json", network_stderr: "curl: (6) Could not resolve host: api.nuget.org", runtime_prefixes: &["fastmcp-fnd01-csharp-proof-cache.", "fastmcp-fnd01-csharp-proof-online.", "fastmcp-fnd01-csharp-proof-offline.", "fastmcp-fnd01-csharp-proof-empty.", "fastmcp-fnd01-csharp-proof-home."] },
+        SdkRuntimeSpec { id: "go", checked_lock_id: "go-consumer-sum", primary_tool_id: "go", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://proxy.golang.org/", network_stderr: "curl: (6) Could not resolve host: proxy.golang.org", runtime_prefixes: &["fastmcp-fnd01-go-proof-mod-cache.", "fastmcp-fnd01-go-proof-build-cache.", "fastmcp-fnd01-go-proof-online.", "fastmcp-fnd01-go-proof-offline."] },
+    ];
     struct SdkCatalogExpectation {
         id: &'static str,
         display_name: &'static str,
@@ -35343,12 +35360,6 @@ activate = 1\n";
         "rand_xorshift",
         "rand_xoshiro",
     ];
-    const SDK_CHECKED_LOCK_IDS: [(&str, &str); 4] = [
-        ("typescript", "typescript-package-lock"),
-        ("python", "python-requirements-lock"),
-        ("csharp", "csharp-packages-lock"),
-        ("go", "go-consumer-sum"),
-    ];
     const SDK_LOCK_BLUEPRINT_IDENTITIES: [(&str, &str, &str); 12] = [
         (
             "typescript",
@@ -35370,15 +35381,6 @@ activate = 1\n";
             "go-publisher-context-modules",
             "publisher-context-only",
         ),
-    ];
-    const SDK_NETWORK_DENIAL_STDERR: [(&str, &str); 4] = [
-        (
-            "typescript",
-            "curl: (6) Could not resolve host: registry.npmjs.org",
-        ),
-        ("python", "curl: (6) Could not resolve host: pypi.org"),
-        ("csharp", "curl: (6) Could not resolve host: api.nuget.org"),
-        ("go", "curl: (6) Could not resolve host: proxy.golang.org"),
     ];
     const SDK_LOCK_SOURCE_FIELDS: [(&str, &str, &str, &str); 12] = [
         (
@@ -37114,16 +37116,17 @@ activate = 1\n";
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct ValidatedSdkStaticPeer {
-        sdk_id: String,
+    pub(crate) struct ValidatedSdkStaticPeer {
+        pub(crate) sdk_id: String,
         ecosystem: String,
-        source_selector: String,
-        source_commit: String,
+        pub(crate) source_selector: String,
+        pub(crate) source_commit: String,
+        pub(crate) reproduction_script: Vec<u8>,
         reproduction_script_byte_length: u64,
-        reproduction_script_sha256: String,
-        checked_lock_sha256: String,
-        artifact_count: usize,
-        artifact_set_sha256: String,
+        pub(crate) reproduction_script_sha256: String,
+        pub(crate) checked_lock_sha256: String,
+        pub(crate) artifact_count: usize,
+        pub(crate) artifact_set_sha256: String,
         expected_execution: SdkExpectedExecution,
     }
 
@@ -37154,230 +37157,65 @@ activate = 1\n";
         },
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkObservationBinding {
-        sdk_id: String,
-        source_selector: String,
-        source_commit: String,
-        reproduction_script_sha256: String,
-        script_exit: i64,
-        result: String,
-        network_denial_probe_observed: bool,
-        online_offline_equal: bool,
-        offline_resolution_succeeded: bool,
-        checked_lock_sha256: String,
-        artifact_set_sha256: String,
-        observed_at_utc: String,
+    macro_rules! sdk_record {
+        ($name:ident { $($field:ident: $kind:ty),* $(,)? }) => {
+            #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+            pub(crate) struct $name { $(pub(crate) $field: $kind),* }
+        };
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum SdkExecutionObservation {
-        Npm {
-            process: SdkExecutionProcessBinding,
-            binding: SdkObservationBinding,
-            node_version: String,
-            npm_version: String,
-            online_exit: i64,
-            offline_exit: i64,
-            closure_compare_exit: i64,
-            network_denial_exit: i64,
-            network_denial_stderr: String,
-            portable_directory_name_verified: bool,
-            native_package_filenames_staged: bool,
-            install_scripts_disabled: bool,
-            offline_cache_only: bool,
-            online_offline_closure_equal: bool,
-            online_closure_sha256: String,
-            offline_closure_sha256: String,
-            checked_in_lock_sha256_after_install: String,
-        },
-        Pip {
-            process: SdkExecutionProcessBinding,
-            binding: SdkObservationBinding,
-            python_version: String,
-            pip_version: String,
-            online_exit: i64,
-            offline_exit: i64,
-            filename_compare_exit: i64,
-            content_compare_exit: i64,
-            network_denial_exit: i64,
-            network_denial_stderr: String,
-            no_index: bool,
-            require_hashes: bool,
-            wheels_only: bool,
-            filename_closure_equal: bool,
-            content_closure_equal: bool,
-            downloaded_wheel_count: usize,
-            online_filename_closure_sha256: String,
-            offline_filename_closure_sha256: String,
-            online_content_closure_sha256: String,
-            offline_content_closure_sha256: String,
-            checked_in_lock_sha256_after_download: String,
-        },
-        Nuget {
-            process: SdkExecutionProcessBinding,
-            binding: SdkObservationBinding,
-            dotnet_sdk_version: String,
-            resolver_sdk_archive_sha256: String,
-            online_restore_exit: i64,
-            offline_restore_exit: i64,
-            assets_compare_exit: i64,
-            network_denial_exit: i64,
-            network_denial_stderr: String,
-            online_lock_matches_vendored_canonical_json: bool,
-            offline_lock_unchanged: bool,
-            raw_assets_digest_is_path_specific: bool,
-            online_offline_project_assets_equal: bool,
-            vendored_project_assets_projection_equal: bool,
-            locked_mode: bool,
-            no_cache: bool,
-            empty_feed_only: bool,
-            restored_package_count: usize,
-            generated_lock_canonical_sha256: String,
-            offline_restore_stdout_raw_sha256: String,
-            offline_restore_stderr_sha256: String,
-            offline_project_assets_raw_sha256: String,
-            online_project_assets_sha256: String,
-            offline_project_assets_sha256: String,
-            checked_in_lock_sha256_before_restore: String,
-            checked_in_lock_sha256_after_restore: String,
-        },
-        Go {
-            process: SdkExecutionProcessBinding,
-            binding: SdkObservationBinding,
-            go_version: String,
-            online_download_exit: i64,
-            online_list_exit: i64,
-            offline_download_exit: i64,
-            offline_list_exit: i64,
-            lock_compare_exit: i64,
-            closure_compare_exit: i64,
-            network_denial_exit: i64,
-            network_denial_stderr: String,
-            offline_goenv: String,
-            offline_gotoolchain: String,
-            offline_goproxy: String,
-            offline_gosumdb: String,
-            offline_govcs: String,
-            fresh_task_gocache: bool,
-            online_seeded_gomodcache: bool,
-            sandbox_network_denial_active: bool,
-            root_sdk_module_entry_verified: bool,
-            external_consumer_root_sdk_entry_verified: bool,
-            online_offline_lock_and_module_list_equal: bool,
-            resolved_module_count: usize,
-            online_resolved_module_lock_sha256: String,
-            offline_resolved_module_lock_sha256: String,
-            online_closure_sha256: String,
-            offline_closure_sha256: String,
-            checked_in_consumer_sum_sha256: String,
-        },
-    }
+    #[rustfmt::skip]
+    sdk_record!(SdkExecutableBinding { id: String, path: String, byte_length: u64, sha256: String, version: String });
+    #[rustfmt::skip]
+    sdk_record!(SdkTranscriptBinding { raw: Vec<u8>, byte_length: u64, sha256: String });
+    #[rustfmt::skip]
+    sdk_record!(SdkExecutionProcessBinding { command_id: String, argv: Vec<String>, argv_sha256: String, cwd: String, environment: Vec<(String, String)>, environment_sha256: String, interpreter: SdkExecutableBinding, primary_tool: SdkExecutableBinding, additional_tools: Vec<SdkExecutableBinding>, reproduction_script_byte_length: u64, reproduction_script_sha256: String, composite_script_observer_sha256: String, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64, runtime_paths: Vec<String>, complete_input_sha256: String });
+    #[rustfmt::skip]
+    sdk_record!(SdkRepositoryRuntimeBinding { repository_root: String, head_commit: String, head_tree: String, dirty_inventory: Vec<String>, dirty_inventory_byte_length: u64, dirty_inventory_sha256: String, cargo_lock_sha256: String, rust_toolchain_sha256: String, sdk_complete_input_sha256: String, cargo_profile: String, target_triple: String, features: Vec<String>, rch_profile: String, rch_receipt_sha256: String, run_id: String, worker_id: String, platform: String, verifier_executable: SdkExecutableBinding });
+    #[rustfmt::skip]
+    sdk_record!(SdkNetworkProbeBinding { argv: Vec<String>, executable: SdkExecutableBinding, exit_code: i64, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding });
+    #[rustfmt::skip]
+    sdk_record!(SdkExecutionObservation { sdk_id: String, source_selector: String, source_commit: String, checked_lock_sha256: String, artifact_count: usize, artifact_set_sha256: String, online_closure_sha256: String, offline_closure_sha256: String, output_paths: Vec<String>, process: SdkExecutionProcessBinding, network_probe: SdkNetworkProbeBinding, first_attempt: bool });
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SdkExecutionProofClass {
-        BatchExecution,
-        ValidationFixture,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkExecutableBinding {
-        id: String,
-        path: String,
-        byte_length: u64,
-        sha256: String,
-        version: String,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkTranscriptBinding {
-        raw: String,
-        byte_length: u64,
-        sha256: String,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkExecutionProcessBinding {
-        command_id: String,
-        argv: Vec<String>,
-        argv_sha256: String,
-        cwd: String,
-        environment: Vec<(String, String)>,
-        environment_sha256: String,
-        interpreter: SdkExecutableBinding,
-        tool: SdkExecutableBinding,
-        reproduction_script_byte_length: u64,
-        reproduction_script_sha256: String,
-        stdout: SdkTranscriptBinding,
-        stderr: SdkTranscriptBinding,
-        started_at_utc: String,
-        finished_at_utc: String,
-        monotonic_started_ns: u64,
-        monotonic_finished_ns: u64,
-        elapsed_ns: u64,
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    struct SdkExecutionReceipt {
+        producer_runtime: SdkRepositoryRuntimeBinding,
+        #[serde(flatten)]
+        body: SdkBatchReceiptBody,
         complete_input_sha256: String,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkValidatorRuntimeBinding {
-        repository_root: String,
-        head_commit: String,
-        head_tree: String,
-        dirty_inventory: Vec<String>,
-        dirty_inventory_byte_length: u64,
-        dirty_inventory_sha256: String,
-        cargo_lock_sha256: String,
-        rust_toolchain_sha256: String,
-        cargo_profile: String,
-        target: String,
-        features: Vec<String>,
-        rch_profile: String,
-        argv: Vec<String>,
-        argv_sha256: String,
-        cwd: String,
-        environment: Vec<(String, String)>,
-        environment_sha256: String,
-        verifier_executable: SdkExecutableBinding,
+    #[rustfmt::skip]
+    sdk_record!(SdkBatchReceiptBody { batch_started_at_epoch_seconds: u64, batch_finished_at_epoch_seconds: u64, batch_monotonic_started_ns: u64, batch_monotonic_finished_ns: u64, required: usize, discovered: usize, started: usize, passed: usize, first_attempt_passed: usize, retries: usize, skipped: usize, stale: usize, mixed: usize, observations: Vec<SdkExecutionObservation> });
+
+    pub(crate) struct SdkBatchPlan {
+        root: PathBuf,
+        static_evidence: ValidatedSdkStaticEvidence,
+        producer_runtime: SdkRepositoryRuntimeBinding,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SdkExecutionBundle {
-        source_id: String,
-        repository_root: PathBuf,
-        raw_byte_length: u64,
-        raw_sha256: String,
-        raw_bytes: Vec<u8>,
+    impl SdkBatchPlan {
+        pub(crate) fn root(&self) -> &Path {
+            &self.root
+        }
+
+        pub(crate) fn peers(&self) -> &[ValidatedSdkStaticPeer] {
+            &self.static_evidence.peers
+        }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct ParsedSdkExecutionBundle {
-        proof_class: SdkExecutionProofClass,
-        repository_root: String,
-        batch_started_at_utc: String,
-        batch_finished_at_utc: String,
-        complete_input_sha256: String,
-        observations: Vec<SdkExecutionObservation>,
+    impl ValidatedSdkStaticPeer {
+        pub(crate) fn expected_output_digests(&self) -> (&str, &str) {
+            sdk_expected_output_digests(self)
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ExternalSdkExecutionFacts {
         Absent,
-        Present(SdkExecutionBundle),
-    }
-
-    impl ExternalSdkExecutionFacts {
-        fn present_from_batch_owned_json(root: &Path, raw_bytes: Vec<u8>) -> VResult<Self> {
-            let repository_root = fs::canonicalize(root).map_err(|_| {
-                Diagnostic::error("E_SDK_EXECUTION_FACTS", "SDK repository root")
-            })?;
-            Ok(Self::Present(SdkExecutionBundle {
-                source_id: "sdk-execution-facts-v2/external".to_owned(),
-                repository_root,
-                raw_byte_length: u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
-                raw_sha256: lower_hex(&sha256(&raw_bytes)),
-                raw_bytes,
-            }))
-        }
+        TrustedBatch(Box<SdkExecutionReceipt>),
+        ValidationFixture,
+        UntrustedReplay(Vec<u8>),
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72785,12 +72623,15 @@ activate = 1\n";
         Ok(lower_hex(&sha256(&encoded)))
     }
 
-    fn sdk_checked_lock_id(sdk_id: &str, subject: &str) -> VResult<&'static str> {
-        SDK_CHECKED_LOCK_IDS
+    fn sdk_runtime_spec(sdk_id: &str, subject: &str) -> VResult<&'static SdkRuntimeSpec> {
+        SDK_RUNTIME_SPECS
             .iter()
-            .find(|(candidate, _)| *candidate == sdk_id)
-            .map(|(_, lock_id)| *lock_id)
-            .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject).at(sdk_id))
+            .find(|spec| spec.id == sdk_id)
+            .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", subject).at(sdk_id))
+    }
+
+    fn sdk_checked_lock_id(sdk_id: &str, subject: &str) -> VResult<&'static str> {
+        Ok(sdk_runtime_spec(sdk_id, subject)?.checked_lock_id)
     }
 
     fn sdk_nonempty_source_string<'a>(
@@ -72808,14 +72649,6 @@ activate = 1\n";
         } else {
             Ok(value)
         }
-    }
-
-    fn sdk_network_denial_stderr(sdk_id: &str, subject: &str) -> VResult<&'static str> {
-        SDK_NETWORK_DENIAL_STDERR
-            .iter()
-            .find(|(candidate, _)| *candidate == sdk_id)
-            .map(|(_, stderr)| *stderr)
-            .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", subject).at(sdk_id))
     }
 
     fn sdk_json_error(subject: &str, field: &str) -> Diagnostic {
@@ -72895,28 +72728,6 @@ activate = 1\n";
                 .ok_or_else(|| sdk_json_error(subject, field)),
             _ => Err(sdk_json_error(subject, field)),
         }
-    }
-
-    fn sdk_json_i64(
-        object: &BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<i64> {
-        match sdk_json_field(object, field, subject)? {
-            StrictJson::Number(value) => value
-                .as_i64()
-                .ok_or_else(|| sdk_json_error(subject, field)),
-            _ => Err(sdk_json_error(subject, field)),
-        }
-    }
-
-    fn sdk_json_usize(
-        object: &BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<usize> {
-        usize::try_from(sdk_json_u64(object, field, subject)?)
-            .map_err(|_| sdk_json_error(subject, field))
     }
 
     fn sdk_json_bool(
@@ -74857,6 +74668,74 @@ activate = 1\n";
         })
     }
 
+    struct SdkSelfBindingRanges {
+        length: std::ops::Range<usize>,
+        digest: std::ops::Range<usize>,
+    }
+
+    fn sdk_self_binding_ranges(bytes: &[u8], subject: &str) -> VResult<SdkSelfBindingRanges> {
+        let header = b"[complete_input_binding]\n";
+        let headers = bytes
+            .windows(header.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == header).then_some(offset))
+            .collect::<Vec<_>>();
+        if headers.len() != 1 {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("table header"));
+        }
+        let table_start = headers[0]
+            .checked_add(header.len())
+            .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+        let table_end = bytes[table_start..]
+            .windows(2)
+            .position(|window| window == b"\n[")
+            .and_then(|offset| table_start.checked_add(offset + 1))
+            .unwrap_or(bytes.len());
+        let locate = |prefix: &[u8], digest: bool| -> VResult<std::ops::Range<usize>> {
+            let offsets = bytes[table_start..table_end]
+                .windows(prefix.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == prefix).then_some(offset))
+                .collect::<Vec<_>>();
+            if offsets.len() != 1 {
+                return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
+                    .at("self-excluded field count"));
+            }
+            let start = table_start
+                .checked_add(offsets[0])
+                .and_then(|offset| offset.checked_add(prefix.len()))
+                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+            let end = bytes[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .and_then(|length| start.checked_add(length))
+                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
+            let token = &bytes[start..end];
+            let valid = if digest {
+                token.len() == 66
+                    && token.first() == Some(&b'"')
+                    && token.last() == Some(&b'"')
+                    && token[1..65]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            } else {
+                !token.is_empty()
+                    && token.iter().all(u8::is_ascii_digit)
+                    && !(token.len() > 1 && token[0] == b'0')
+            };
+            valid.then_some(start..end).ok_or_else(|| {
+                Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
+                    .at("self-excluded field syntax")
+            })
+        };
+        let length = locate(b"\npreimage_byte_length = ", false)?;
+        let digest = locate(b"\ndigest = ", true)?;
+        if length.start >= digest.start {
+            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("field order"));
+        }
+        Ok(SdkSelfBindingRanges { length, digest })
+    }
+
     fn fnd_01_sdk_matrix_validate_complete_input_binding(
         document: &toml::Value,
         files: &[LoadedFile],
@@ -74918,77 +74797,12 @@ activate = 1\n";
         }
 
         let manifest = source_lookup(files, "evidence/fnd-01/sdk-matrix.toml")?;
-        let header = b"[complete_input_binding]\n";
-        let header_offsets = manifest
-            .bytes
-            .windows(header.len())
-            .enumerate()
-            .filter_map(|(offset, window)| (window == header).then_some(offset))
-            .collect::<Vec<_>>();
-        if header_offsets.len() != 1 {
-            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("table header"));
-        }
-        let table_start = header_offsets[0]
-            .checked_add(header.len())
-            .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
-        let table_end = manifest.bytes[table_start..]
-            .windows(2)
-            .position(|window| window == b"\n[")
-            .and_then(|offset| table_start.checked_add(offset + 1))
-            .unwrap_or(manifest.bytes.len());
-        let table_bytes = &manifest.bytes[table_start..table_end];
-        let excluded_ranges = [
-            (b"\npreimage_byte_length = ".as_slice(), false),
-            (b"\ndigest = ".as_slice(), true),
-        ]
-        .into_iter()
-        .map(|(prefix, quoted)| {
-            let matches = table_bytes
-                .windows(prefix.len())
-                .enumerate()
-                .filter_map(|(offset, window)| (window == prefix).then_some(offset))
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
-                    .at("self-excluded field count"));
-            }
-            let start = table_start
-                .checked_add(matches[0])
-                .and_then(|offset| offset.checked_add(prefix.len()))
-                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
-            let line_end = manifest.bytes[start..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .and_then(|length| start.checked_add(length))
-                .ok_or_else(|| Diagnostic::error("E_SDK_COMPLETE_INPUT", subject))?;
-            let token = &manifest.bytes[start..line_end];
-            let valid = if quoted {
-                token.len() == 66
-                    && token.first() == Some(&b'\"')
-                    && token.last() == Some(&b'\"')
-                    && token[1..65]
-                        .iter()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-            } else {
-                !token.is_empty()
-                    && token.iter().all(u8::is_ascii_digit)
-                    && !(token.len() > 1 && token[0] == b'0')
-            };
-            if !valid {
-                return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject)
-                    .at("self-excluded field syntax"));
-            }
-            Ok((start, line_end))
-        })
-        .collect::<VResult<Vec<_>>>()?;
-        if excluded_ranges[0].0 >= excluded_ranges[1].0 {
-            return Err(Diagnostic::error("E_SDK_COMPLETE_INPUT", subject).at("field order"));
-        }
+        let excluded = sdk_self_binding_ranges(&manifest.bytes, subject)?;
         let mut included_manifest = Vec::with_capacity(manifest.bytes.len());
         let mut cursor = 0usize;
-        for (start, end) in &excluded_ranges {
-            included_manifest.extend_from_slice(&manifest.bytes[cursor..*start]);
-            cursor = *end;
+        for range in [&excluded.length, &excluded.digest] {
+            included_manifest.extend_from_slice(&manifest.bytes[cursor..range.start]);
+            cursor = range.end;
         }
         included_manifest.extend_from_slice(&manifest.bytes[cursor..]);
 
@@ -75094,11 +74908,20 @@ activate = 1\n";
         let static_evidence = derive_sdk_revision_six_static_evidence(&document, files, policy)?;
         let execution = match external_facts {
             ExternalSdkExecutionFacts::Absent => ExecutionValidation::Unverified,
-            ExternalSdkExecutionFacts::Present(bundle) => {
+            ExternalSdkExecutionFacts::TrustedBatch(receipt) => {
                 ExecutionValidation::Verified(validate_sdk_execution_observations(
                     &static_evidence,
-                    &bundle,
+                    &receipt,
                 )?)
+            }
+            ExternalSdkExecutionFacts::ValidationFixture => {
+                return Err(Diagnostic::error(
+                    "E_SDK_PROOF_CLASS_NO_CREDIT",
+                    "validation fixture cannot enter the production proof path",
+                ));
+            }
+            ExternalSdkExecutionFacts::UntrustedReplay(raw_bytes) => {
+                return Err(validate_untrusted_sdk_replay(&raw_bytes));
             }
         };
         Ok(SdkValidation {
@@ -75108,7 +74931,7 @@ activate = 1\n";
         })
     }
 
-    fn sdk_string_sequence_sha256(domain: &[u8], values: &[String]) -> String {
+    pub(crate) fn sdk_sequence_sha256(domain: &[u8], values: &[String]) -> String {
         let mut preimage = Vec::new();
         preimage.extend_from_slice(domain);
         preimage.extend_from_slice(
@@ -75123,21 +74946,18 @@ activate = 1\n";
         lower_hex(&sha256(&preimage))
     }
 
-    fn sdk_environment_sha256(environment: &[(String, String)]) -> String {
-        let values = environment
-            .iter()
-            .flat_map(|(name, value)| [name.clone(), value.clone()])
-            .collect::<Vec<_>>();
-        sdk_string_sequence_sha256(b"FND01SDKCLOSEDENVv1\0", &values)
+    pub(crate) fn sdk_environment_sha256(environment: &[(String, String)]) -> String {
+        sdk_sequence_sha256(
+            b"FND01SDKCLOSEDENVv3\0",
+            &environment
+                .iter()
+                .flat_map(|(name, value)| [name.clone(), value.clone()])
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn sdk_git_output(root: &Path, arguments: &[&str], subject: &str) -> VResult<Vec<u8>> {
-        let git = Path::new("/usr/bin/git");
-        if !git.is_file() {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("/usr/bin/git is required for revision binding"));
-        }
-        let output = Command::new(git)
+        let output = Command::new("/usr/bin/git")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C")
@@ -75147,8 +74967,7 @@ activate = 1\n";
             .output()
             .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("git spawn"))?;
         if !output.status.success() || !output.stderr.is_empty() {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("git command did not produce a clean successful observation"));
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("git observation"));
         }
         Ok(output.stdout)
     }
@@ -75169,10 +74988,10 @@ activate = 1\n";
         Ok(value.to_owned())
     }
 
-    fn sdk_utf8_absolute_canonical(path: &Path, subject: &str) -> VResult<String> {
-        let canonical = fs::canonicalize(path)
+    fn sdk_canonical_utf8(path: &Path, subject: &str) -> VResult<String> {
+        let path = fs::canonicalize(path)
             .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("canonicalize"))?;
-        let value = canonical
+        let value = path
             .to_str()
             .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("UTF-8 path"))?;
         if !value.starts_with('/')
@@ -75183,8 +75002,7 @@ activate = 1\n";
             || value.contains("/../")
             || value.as_bytes().iter().any(|byte| byte.is_ascii_control())
         {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("absolute canonical path"));
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("canonical path"));
         }
         Ok(value.to_owned())
     }
@@ -75195,399 +75013,280 @@ activate = 1\n";
         version: &str,
         subject: &str,
     ) -> VResult<SdkExecutableBinding> {
-        let canonical = sdk_utf8_absolute_canonical(path, subject)?;
-        let bytes = read_bounded(Path::new(&canonical), 268_435_456, subject)?;
         if id.is_empty() || version.is_empty() {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("executable identity"));
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("tool identity"));
         }
+        let path = sdk_canonical_utf8(path, subject)?;
+        let bytes = read_bounded(Path::new(&path), 268_435_456, subject)?;
         Ok(SdkExecutableBinding {
             id: id.to_owned(),
-            path: canonical,
+            path,
             byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             sha256: lower_hex(&sha256(&bytes)),
             version: version.to_owned(),
         })
     }
 
-    fn sdk_closed_validator_environment() -> VResult<Vec<(String, String)>> {
-        const NAMES: &[&str] = &[
-            "CARGO_BUILD_TARGET",
-            "CARGO_PROFILE",
-            "CARGO_TARGET_DIR",
-            "CI",
-            "FND01_SDK_RCH_PROFILE",
-            "HOME",
-            "PATH",
-            "RCH_NO_SELF_HEALING",
-            "RCH_QUIET",
-            "RCH_REQUIRE_REMOTE",
-            "RCH_SOCKET_PATH",
-            "RCH_WORKER",
-            "RUSTFLAGS",
-            "RUSTUP_TOOLCHAIN",
-            "SHELL",
-            "TMPDIR",
-            "USER",
-        ];
-        let mut environment = Vec::new();
-        for name in NAMES {
-            if let Some(value) = std::env::var_os(name) {
-                let value = value.into_string().map_err(|_| {
-                    Diagnostic::error("E_SDK_EXECUTION_FACTS", "validator environment")
-                        .at(*name)
-                })?;
-                if value.as_bytes().contains(&0) {
-                    return Err(Diagnostic::error(
-                        "E_SDK_EXECUTION_FACTS",
-                        "validator environment",
-                    )
-                    .at(*name));
-                }
-                if !value.is_empty() {
-                    environment.push(((*name).to_owned(), value));
-                }
-            }
+    fn sdk_required_environment(name: &str, subject: &str) -> VResult<String> {
+        let value = std::env::var(name)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
+        if value.is_empty()
+            || value.len() > 4096
+            || value.as_bytes().contains(&0)
+            || value.chars().any(char::is_control)
+        {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
         }
+        Ok(value)
+    }
+
+    fn sdk_expected_tool(id: &str, subject: &str) -> VResult<SdkExecutableBinding> {
+        let (path, version) = match id {
+            "zsh" => (PathBuf::from("/bin/zsh"), "system"),
+            "node" => (PathBuf::from(sdk_required_environment("FND01_SDK_NODE", subject)?), "v24.12.0"),
+            "npm" => (PathBuf::from(sdk_required_environment("FND01_SDK_NPM", subject)?), "11.14.0"),
+            "python" => (PathBuf::from(sdk_required_environment("FND01_SDK_PYTHON3", subject)?), "Python 3.14.4"),
+            "jq" => (PathBuf::from(sdk_required_environment("FND01_SDK_JQ", subject)?), "byte-bound"),
+            "shasum" => (PathBuf::from("/usr/bin/shasum"), "system"),
+            "sandbox-exec" => (PathBuf::from("/usr/bin/sandbox-exec"), "system"),
+            "curl" => (PathBuf::from("/usr/bin/curl"), "system"),
+            "dotnet" => (
+                PathBuf::from(sdk_required_environment("DOTNET_SDK", subject)?).join("dotnet"),
+                "10.0.100",
+            ),
+            "go" => (
+                PathBuf::from(sdk_required_environment("GO_1_25", subject)?).join("bin/go"),
+                "go version go1.25.0 darwin/arm64",
+            ),
+            _ => return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("tool ID")),
+        };
+        sdk_executable_binding(id, &path, version, subject)
+    }
+
+    fn sdk_expected_child_environment(subject: &str) -> VResult<Vec<(String, String)>> {
+        let mut directories = [
+            "node", "npm", "python", "jq", "shasum", "sandbox-exec", "curl", "dotnet", "go",
+        ]
+        .into_iter()
+        .map(|id| sdk_expected_tool(id, subject))
+        .collect::<VResult<Vec<_>>>()?
+        .iter()
+        .filter_map(|tool| Path::new(&tool.path).parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+        for name in ["FND01_SDK_NODE", "FND01_SDK_NPM", "FND01_SDK_PYTHON3", "FND01_SDK_JQ"] {
+            let configured = sdk_required_environment(name, subject)?;
+            let parent = Path::new(&configured)
+                .parent()
+                .ok_or_else(|| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
+            directories.push(PathBuf::from(sdk_canonical_utf8(parent, subject)?));
+        }
+        directories.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        directories.sort();
+        directories.dedup();
+        let mut environment = vec![
+            ("DOTNET_ARCHIVE".to_owned(), sdk_canonical_utf8(Path::new(&sdk_required_environment("DOTNET_ARCHIVE", subject)?), subject)?),
+            ("DOTNET_SDK".to_owned(), sdk_required_environment("DOTNET_SDK", subject)?),
+            ("GO_1_25".to_owned(), sdk_required_environment("GO_1_25", subject)?),
+            ("HOME".to_owned(), sdk_canonical_utf8(Path::new(&sdk_required_environment("FND01_SDK_HOME", subject)?), subject)?),
+            ("LANG".to_owned(), "C".to_owned()),
+            ("LC_ALL".to_owned(), "C".to_owned()),
+            ("NO_COLOR".to_owned(), "1".to_owned()),
+            ("PATH".to_owned(), directories.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>().join(":")),
+            ("TMPDIR".to_owned(), "/tmp".to_owned()),
+        ];
+        environment.sort_unstable();
         Ok(environment)
     }
 
-    fn capture_sdk_validator_runtime(root: &Path) -> VResult<SdkValidatorRuntimeBinding> {
-        let subject = "SDK validator runtime binding";
-        let repository_root = sdk_utf8_absolute_canonical(root, subject)?;
+    fn sdk_identifier(value: &str) -> bool {
+        (1..=128).contains(&value.len())
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    }
+
+    fn sdk_repository_runtime(
+        root: &Path,
+        static_evidence: &ValidatedSdkStaticEvidence,
+    ) -> VResult<SdkRepositoryRuntimeBinding> {
+        let subject = "SDK repository runtime";
+        let repository_root = sdk_canonical_utf8(root, subject)?;
         let root = Path::new(&repository_root);
-        let head_commit = sdk_git_oid(root, "HEAD^{commit}", subject)?;
-        let head_tree = sdk_git_oid(root, "HEAD^{tree}", subject)?;
         let dirty_bytes = sdk_git_output(
             root,
             &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             subject,
         )?;
         if !dirty_bytes.is_empty() && !dirty_bytes.ends_with(&[0]) {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("dirty inventory framing"));
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("dirty framing"));
         }
         let dirty_inventory = dirty_bytes
             .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .map(|entry| {
-                std::str::from_utf8(entry).map(str::to_owned).map_err(|_| {
-                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                        .at("dirty inventory must be UTF-8")
-                })
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                std::str::from_utf8(value)
+                    .map(str::to_owned)
+                    .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("dirty UTF-8"))
             })
             .collect::<VResult<Vec<_>>>()?;
         let cargo_lock = read_bounded(&root.join("Cargo.lock"), 16_777_216, subject)?;
         let rust_toolchain = read_bounded(&root.join("rust-toolchain.toml"), 65_536, subject)?;
-        let argv = std::env::args_os()
-            .map(|value| {
-                value.into_string().map_err(|_| {
-                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("UTF-8 argv")
-                })
-            })
-            .collect::<VResult<Vec<_>>>()?;
-        if argv.is_empty() {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("empty argv"));
+        let cargo_profile = sdk_required_environment("FND01_SDK_CARGO_PROFILE", subject)?;
+        let expected_profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        if cargo_profile != expected_profile {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject)
+                .at("binary/profile mismatch"));
         }
-        let cwd = sdk_utf8_absolute_canonical(
-            &std::env::current_dir().map_err(|_| {
-                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current directory")
-            })?,
-            subject,
-        )?;
-        let environment = sdk_closed_validator_environment()?;
-        let current_executable = std::env::current_exe().map_err(|_| {
-            Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current executable")
-        })?;
-        let verifier_executable =
-            sdk_executable_binding("fnd01-sdk-verifier", &current_executable, "v2", subject)?;
-        Ok(SdkValidatorRuntimeBinding {
+        let target_triple = sdk_required_environment("FND01_SDK_TARGET_TRIPLE", subject)?;
+        if target_triple != "aarch64-apple-darwin"
+            || !cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        {
+            return Err(Diagnostic::error("E_SDK_RUNNER_PLATFORM", subject).at(target_triple));
+        }
+        let features_text = std::env::var("FND01_SDK_FEATURES").unwrap_or_default();
+        let features = if features_text.is_empty() {
+            Vec::new()
+        } else {
+            features_text.split(',').map(str::to_owned).collect::<Vec<_>>()
+        };
+        if features.iter().any(|value| !sdk_identifier(value))
+            || features.windows(2).any(|window| window[0] >= window[1])
+        {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("features"));
+        }
+        let rch_profile = sdk_required_environment("FND01_SDK_RCH_PROFILE", subject)?;
+        let rch_receipt_sha256 =
+            sdk_required_environment("FND01_SDK_RCH_RECEIPT_SHA256", subject)?;
+        validate_sha256(&rch_receipt_sha256, subject)?;
+        if !rch_profile.starts_with("rch:") {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("RCH profile"));
+        }
+        let run_id = sdk_required_environment("FND01_SDK_RUN_ID", subject)?;
+        let worker_id = sdk_required_environment("FND01_SDK_WORKER_ID", subject)?;
+        if !sdk_identifier(&run_id) || !sdk_identifier(&worker_id) {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("run/worker ID"));
+        }
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let current_executable = std::env::current_exe()
+            .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current exe"))?;
+        Ok(SdkRepositoryRuntimeBinding {
             repository_root,
-            head_commit,
-            head_tree,
+            head_commit: sdk_git_oid(root, "HEAD^{commit}", subject)?,
+            head_tree: sdk_git_oid(root, "HEAD^{tree}", subject)?,
             dirty_inventory,
             dirty_inventory_byte_length: u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX),
             dirty_inventory_sha256: lower_hex(&sha256(&dirty_bytes)),
             cargo_lock_sha256: lower_hex(&sha256(&cargo_lock)),
             rust_toolchain_sha256: lower_hex(&sha256(&rust_toolchain)),
-            cargo_profile: if cfg!(debug_assertions) {
-                "debug".to_owned()
-            } else {
-                "release".to_owned()
-            },
-            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-            features: Vec::new(),
-            rch_profile: std::env::var("FND01_SDK_RCH_PROFILE")
-                .unwrap_or_else(|_| "unbound".to_owned()),
-            argv_sha256: sdk_string_sequence_sha256(b"FND01SDKVALIDATORARGVv1\0", &argv),
-            argv,
-            cwd,
-            environment_sha256: sdk_environment_sha256(&environment),
-            environment,
-            verifier_executable,
+            sdk_complete_input_sha256: static_evidence.complete_input_sha256.clone(),
+            cargo_profile,
+            target_triple,
+            features,
+            rch_profile,
+            rch_receipt_sha256,
+            run_id,
+            worker_id,
+            platform,
+            verifier_executable: sdk_executable_binding(
+                "fnd01-sdk-runner",
+                &current_executable,
+                "v3",
+                subject,
+            )?,
         })
     }
 
-    fn sdk_execution_timestamp_is_valid(value: &str) -> bool {
-        let bytes = value.as_bytes();
-        if bytes.len() != 20
-            || bytes[4] != b'-'
-            || bytes[7] != b'-'
-            || bytes[10] != b'T'
-            || bytes[13] != b':'
-            || bytes[16] != b':'
-            || bytes[19] != b'Z'
-            || bytes.iter().enumerate().any(|(index, byte)| {
-                !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
-            })
+    fn sdk_validate_transcript(binding: &SdkTranscriptBinding, subject: &str) -> VResult<()> {
+        validate_sha256(&binding.sha256, subject)?;
+        if binding.raw.len() > 1_048_576
+            || binding.raw.contains(&0)
+            || std::str::from_utf8(&binding.raw).is_err()
+            || binding.byte_length != u64::try_from(binding.raw.len()).unwrap_or(u64::MAX)
+            || binding.sha256 != lower_hex(&sha256(&binding.raw))
         {
-            return false;
-        }
-        let number = |start: usize, end: usize| {
-            std::str::from_utf8(&bytes[start..end])
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-        };
-        let Some(year) = number(0, 4) else { return false };
-        let Some(month) = number(5, 7) else { return false };
-        let Some(day) = number(8, 10) else { return false };
-        let Some(hour) = number(11, 13) else { return false };
-        let Some(minute) = number(14, 16) else { return false };
-        let Some(second) = number(17, 19) else { return false };
-        let leap = year.is_multiple_of(4)
-            && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let days = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => 0,
-        };
-        year != 0
-            && day != 0
-            && day <= days
-            && hour <= 23
-            && minute <= 59
-            && second <= 59
-    }
-
-    fn sdk_timestamp_epoch_seconds(value: &str) -> Option<u64> {
-        if !sdk_execution_timestamp_is_valid(value) {
-            return None;
-        }
-        let bytes = value.as_bytes();
-        let number = |start: usize, end: usize| {
-            std::str::from_utf8(&bytes[start..end])
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-        };
-        let year = number(0, 4)?;
-        if !(1970..=9999).contains(&year) {
-            return None;
-        }
-        let month = number(5, 7)?;
-        let day = number(8, 10)?;
-        let hour = number(11, 13)?;
-        let minute = number(14, 16)?;
-        let second = number(17, 19)?;
-        let leap = |year: u64| {
-            year.is_multiple_of(4)
-                && (!year.is_multiple_of(100) || year.is_multiple_of(400))
-        };
-        let mut days = 0u64;
-        for prior_year in 1970..year {
-            days = days.checked_add(if leap(prior_year) { 366 } else { 365 })?;
-        }
-        let month_lengths = [
-            31u64,
-            if leap(year) { 29 } else { 28 },
-            31,
-            30,
-            31,
-            30,
-            31,
-            31,
-            30,
-            31,
-            30,
-            31,
-        ];
-        for length in month_lengths.iter().take(usize::try_from(month - 1).ok()?) {
-            days = days.checked_add(*length)?;
-        }
-        days = days.checked_add(day.checked_sub(1)?)?;
-        days.checked_mul(86_400)?
-            .checked_add(hour.checked_mul(3_600)?)?
-            .checked_add(minute.checked_mul(60)?)?
-            .checked_add(second)
-    }
-
-    fn sdk_validate_fresh_interval(
-        proof_class: SdkExecutionProofClass,
-        started_at_utc: &str,
-        finished_at_utc: &str,
-        monotonic_started_ns: u64,
-        monotonic_finished_ns: u64,
-        elapsed_ns: u64,
-        subject: &str,
-    ) -> VResult<()> {
-        let started = sdk_timestamp_epoch_seconds(started_at_utc)
-            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("start clock"))?;
-        let finished = sdk_timestamp_epoch_seconds(finished_at_utc)
-            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("finish clock"))?;
-        if started > finished
-            || monotonic_started_ns > monotonic_finished_ns
-            || monotonic_finished_ns - monotonic_started_ns != elapsed_ns
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("wall/monotonic interval"));
-        }
-        if proof_class == SdkExecutionProofClass::BatchExecution {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| {
-                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("system clock")
-                })?
-                .as_secs();
-            if finished > now.saturating_add(300)
-                || now.saturating_sub(finished) > 86_400
-                || finished.saturating_sub(started) > 43_200
-            {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at("stale or implausible batch interval"));
-            }
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("transcript"));
         }
         Ok(())
     }
 
-    fn sdk_json_string_values(
-        value: &StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<Vec<String>> {
-        sdk_json_array(value, subject, field)?
+    fn sdk_epoch_seconds(subject: &str) -> VResult<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("wall clock"))
+    }
+
+    fn sdk_expected_output_digests(peer: &ValidatedSdkStaticPeer) -> (&str, &str) {
+        match &peer.expected_execution {
+            SdkExpectedExecution::Npm { closure_sha256 } => (closure_sha256, closure_sha256),
+            SdkExpectedExecution::Pip {
+                filename_closure_sha256,
+                content_closure_sha256,
+            } => (content_closure_sha256, filename_closure_sha256),
+            SdkExpectedExecution::Nuget {
+                canonical_lock_sha256,
+                project_assets_sha256,
+                ..
+            } => (project_assets_sha256, canonical_lock_sha256),
+            SdkExpectedExecution::Go {
+                resolved_module_lock_sha256,
+                closure_sha256,
+                ..
+            } => (closure_sha256, resolved_module_lock_sha256),
+        }
+    }
+
+    fn sdk_runtime_directory<'a>(paths: &'a [String], marker: &str) -> VResult<&'a Path> {
+        let mut matches = paths.iter().filter(|path| {
+            Path::new(path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.contains(marker))
+        });
+        let path = matches
+            .next()
+            .ok_or_else(|| Diagnostic::error("E_SDK_RUNTIME_PATH", marker))?;
+        if matches.next().is_some() {
+            return Err(Diagnostic::error("E_SDK_RUNTIME_PATH", marker));
+        }
+        Ok(Path::new(path))
+    }
+
+    fn sdk_expected_output_paths(sdk_id: &str, paths: &[String]) -> VResult<Vec<String>> {
+        let online = sdk_runtime_directory(paths, "-online.")?;
+        let offline = sdk_runtime_directory(paths, "-offline.")?;
+        let expected = match sdk_id {
+            "typescript" => vec![online.join("closure.json"), offline.join("closure.json"), online.join("closure.json"), offline.join("closure.json"), offline.join("package-lock.json")],
+            "python" => {
+                let stage = sdk_runtime_directory(paths, "-stage.")?;
+                vec![online.join("closure.sha256"), offline.join("closure.sha256"), online.join("closure-filenames.txt"), offline.join("closure-filenames.txt"), stage.join("requirements.lock")]
+            }
+            "csharp" => vec![online.join("project-assets-closure.json"), offline.join("project-assets-closure.json"), online.join("generated-lock.canonical.json"), online.join("expected-lock.canonical.json"), offline.join("packages.lock.json")],
+            "go" => vec![online.join("modules.sorted.txt"), offline.join("modules.sorted.txt"), online.join("modules.lock.json"), offline.join("modules.lock.json"), offline.join("go.sum")],
+            _ => return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", sdk_id)),
+        };
+        expected
             .iter()
-            .map(|value| match value {
-                StrictJson::String(value)
-                    if !value.is_empty()
-                        && !value.as_bytes().contains(&0)
-                        && !value.chars().any(char::is_control) => Ok(value.clone()),
-                _ => Err(sdk_json_error(subject, field)),
-            })
+            .map(|path| sdk_canonical_utf8(path, sdk_id))
             .collect()
     }
 
-    fn parse_sdk_environment(
-        value: &StrictJson,
-        subject: &str,
-    ) -> VResult<Vec<(String, String)>> {
-        let values = sdk_json_array(value, subject, "environment")?;
-        let mut environment = Vec::with_capacity(values.len());
-        let mut prior = None::<String>;
-        for value in values {
-            let row = sdk_json_object(value, subject, "environment row")?;
-            sdk_json_exact_fields(row, &["name", "value"], &[], subject)?;
-            let name = sdk_json_string(row, "name", subject)?;
-            let value = sdk_json_string(row, "value", subject)?;
-            if !name
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-                || prior.as_deref().is_some_and(|candidate| candidate >= name)
-            {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at("closed environment order/name"));
-            }
-            prior = Some(name.to_owned());
-            environment.push((name.to_owned(), value.to_owned()));
-        }
-        Ok(environment)
-    }
-
-    fn parse_sdk_executable_binding(
-        value: &StrictJson,
-        subject: &str,
-    ) -> VResult<SdkExecutableBinding> {
-        let row = sdk_json_object(value, subject, "executable")?;
-        sdk_json_exact_fields(
-            row,
-            &["id", "path", "byte_length", "sha256", "version"],
-            &[],
-            subject,
-        )?;
-        let parsed = SdkExecutableBinding {
-            id: sdk_json_string(row, "id", subject)?.to_owned(),
-            path: sdk_json_string(row, "path", subject)?.to_owned(),
-            byte_length: sdk_json_u64(row, "byte_length", subject)?,
-            sha256: sdk_json_string(row, "sha256", subject)?.to_owned(),
-            version: sdk_json_string(row, "version", subject)?.to_owned(),
-        };
-        validate_sha256(&parsed.sha256, subject)?;
-        let observed = sdk_executable_binding(
-            &parsed.id,
-            Path::new(&parsed.path),
-            &parsed.version,
-            subject,
-        )?;
-        if observed != parsed {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("executable bytes changed"));
-        }
-        Ok(parsed)
-    }
-
-    fn parse_sdk_transcript_binding(
-        value: &StrictJson,
-        subject: &str,
-    ) -> VResult<SdkTranscriptBinding> {
-        let row = sdk_json_object(value, subject, "transcript")?;
-        sdk_json_exact_fields(row, &["raw", "byte_length", "sha256"], &[], subject)?;
-        let raw = match sdk_json_field(row, "raw", subject)? {
-            StrictJson::String(value)
-                if !value.as_bytes().contains(&0)
-                    && !value.chars().any(|character| character.is_control()) => value.clone(),
-            _ => return Err(sdk_json_error(subject, "raw transcript")),
-        };
-        let parsed = SdkTranscriptBinding {
-            byte_length: sdk_json_u64(row, "byte_length", subject)?,
-            sha256: sdk_json_string(row, "sha256", subject)?.to_owned(),
-            raw,
-        };
-        validate_sha256(&parsed.sha256, subject)?;
-        if parsed.byte_length != u64::try_from(parsed.raw.len()).unwrap_or(u64::MAX)
-            || parsed.sha256 != lower_hex(&sha256(parsed.raw.as_bytes()))
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("raw transcript binding"));
-        }
-        Ok(parsed)
-    }
-
-    fn sdk_process_complete_input_sha256(process: &SdkExecutionProcessBinding) -> String {
+    pub(crate) fn sdk_process_sha256(process: &SdkExecutionProcessBinding) -> String {
         let mut values = vec![
             process.command_id.clone(),
             process.argv_sha256.clone(),
             process.cwd.clone(),
             process.environment_sha256.clone(),
-            process.interpreter.id.clone(),
-            process.interpreter.path.clone(),
-            process.interpreter.byte_length.to_string(),
             process.interpreter.sha256.clone(),
-            process.interpreter.version.clone(),
-            process.tool.id.clone(),
-            process.tool.path.clone(),
-            process.tool.byte_length.to_string(),
-            process.tool.sha256.clone(),
-            process.tool.version.clone(),
+            process.primary_tool.sha256.clone(),
             process.reproduction_script_byte_length.to_string(),
             process.reproduction_script_sha256.clone(),
-            process.stdout.raw.clone(),
-            process.stdout.byte_length.to_string(),
+            process.composite_script_observer_sha256.clone(),
             process.stdout.sha256.clone(),
-            process.stderr.raw.clone(),
-            process.stderr.byte_length.to_string(),
             process.stderr.sha256.clone(),
-            process.started_at_utc.clone(),
-            process.finished_at_utc.clone(),
+            process.exit_code.to_string(),
+            process.started_at_epoch_seconds.to_string(),
+            process.finished_at_epoch_seconds.to_string(),
             process.monotonic_started_ns.to_string(),
             process.monotonic_finished_ns.to_string(),
             process.elapsed_ns.to_string(),
@@ -75599,1335 +75298,254 @@ activate = 1\n";
                 .iter()
                 .flat_map(|(name, value)| [name.clone(), value.clone()]),
         );
-        sdk_string_sequence_sha256(b"FND01SDKPROCESSv1\0", &values)
+        values.extend(process.additional_tools.iter().map(|tool| tool.sha256.clone()));
+        values.extend(process.runtime_paths.iter().cloned());
+        sdk_sequence_sha256(b"FND01SDKPROCESSv3\0", &values)
     }
 
-    fn parse_sdk_execution_process(
-        value: &StrictJson,
-        proof_class: SdkExecutionProofClass,
-        subject: &str,
-    ) -> VResult<SdkExecutionProcessBinding> {
-        let row = sdk_json_object(value, subject, "process")?;
-        sdk_json_exact_fields(
-            row,
-            &[
-                "command_id",
-                "argv",
-                "argv_sha256",
-                "cwd",
-                "environment",
-                "environment_sha256",
-                "interpreter",
-                "tool",
-                "reproduction_script_byte_length",
-                "reproduction_script_sha256",
-                "stdout",
-                "stderr",
-                "started_at_utc",
-                "finished_at_utc",
-                "monotonic_started_ns",
-                "monotonic_finished_ns",
-                "elapsed_ns",
-                "complete_input_sha256",
-            ],
-            &[],
-            subject,
-        )?;
-        let argv = sdk_json_string_values(sdk_json_field(row, "argv", subject)?, subject, "argv")?;
-        let environment =
-            parse_sdk_environment(sdk_json_field(row, "environment", subject)?, subject)?;
-        let parsed = SdkExecutionProcessBinding {
-            command_id: sdk_json_string(row, "command_id", subject)?.to_owned(),
-            argv_sha256: sdk_json_string(row, "argv_sha256", subject)?.to_owned(),
-            argv,
-            cwd: sdk_json_string(row, "cwd", subject)?.to_owned(),
-            environment_sha256: sdk_json_string(row, "environment_sha256", subject)?.to_owned(),
-            environment,
-            interpreter: parse_sdk_executable_binding(
-                sdk_json_field(row, "interpreter", subject)?,
-                subject,
-            )?,
-            tool: parse_sdk_executable_binding(sdk_json_field(row, "tool", subject)?, subject)?,
-            reproduction_script_byte_length: sdk_json_u64(
-                row,
-                "reproduction_script_byte_length",
-                subject,
-            )?,
-            reproduction_script_sha256: sdk_json_string(
-                row,
-                "reproduction_script_sha256",
-                subject,
-            )?
-            .to_owned(),
-            stdout: parse_sdk_transcript_binding(
-                sdk_json_field(row, "stdout", subject)?,
-                subject,
-            )?,
-            stderr: parse_sdk_transcript_binding(
-                sdk_json_field(row, "stderr", subject)?,
-                subject,
-            )?,
-            started_at_utc: sdk_json_string(row, "started_at_utc", subject)?.to_owned(),
-            finished_at_utc: sdk_json_string(row, "finished_at_utc", subject)?.to_owned(),
-            monotonic_started_ns: sdk_json_u64(row, "monotonic_started_ns", subject)?,
-            monotonic_finished_ns: sdk_json_u64(row, "monotonic_finished_ns", subject)?,
-            elapsed_ns: sdk_json_u64(row, "elapsed_ns", subject)?,
-            complete_input_sha256: sdk_json_string(row, "complete_input_sha256", subject)?
-                .to_owned(),
-        };
-        for digest in [
-            &parsed.argv_sha256,
-            &parsed.environment_sha256,
-            &parsed.reproduction_script_sha256,
-            &parsed.complete_input_sha256,
-        ] {
-            validate_sha256(digest, subject)?;
-        }
-        if parsed.argv.is_empty()
-            || parsed.argv[0] != parsed.interpreter.path
-            || parsed.argv_sha256
-                != sdk_string_sequence_sha256(b"FND01SDKPROCESSARGVv1\0", &parsed.argv)
-            || parsed.environment_sha256 != sdk_environment_sha256(&parsed.environment)
-            || parsed.stdout.raw.is_empty() && parsed.stderr.raw.is_empty()
-            || parsed.complete_input_sha256 != sdk_process_complete_input_sha256(&parsed)
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("complete process binding"));
-        }
-        sdk_validate_fresh_interval(
-            proof_class,
-            &parsed.started_at_utc,
-            &parsed.finished_at_utc,
-            parsed.monotonic_started_ns,
-            parsed.monotonic_finished_ns,
-            parsed.elapsed_ns,
-            subject,
-        )?;
-        Ok(parsed)
+    pub(crate) fn sdk_composite_binding(
+        script_sha256: &str,
+        environment: &[(String, String)],
+        interpreter: &SdkExecutableBinding,
+        primary: &SdkExecutableBinding,
+        additional: &[SdkExecutableBinding],
+    ) -> String {
+        let mut values = vec![
+            script_sha256.to_owned(),
+            "fnd01-sdk-output-and-network-observer-v3".to_owned(),
+            sdk_environment_sha256(environment),
+            interpreter.sha256.clone(),
+            primary.sha256.clone(),
+        ];
+        values.extend(additional.iter().map(|tool| tool.sha256.clone()));
+        sdk_sequence_sha256(b"FND01SDKCOMPOSITEv3\0", &values)
     }
 
-    fn parse_sdk_observation_binding(
-        value: &StrictJson,
-        subject: &str,
-    ) -> VResult<SdkObservationBinding> {
-        let binding = sdk_json_object(value, subject, "binding")?;
-        sdk_json_exact_fields(
-            binding,
-            &[
-                "sdk_id",
-                "source_selector",
-                "source_commit",
-                "reproduction_script_sha256",
-                "script_exit",
-                "result",
-                "network_denial_probe_observed",
-                "online_offline_equal",
-                "offline_resolution_succeeded",
-                "checked_lock_sha256",
-                "artifact_set_sha256",
-                "observed_at_utc",
-            ],
-            &[],
-            subject,
-        )?;
-        Ok(SdkObservationBinding {
-            sdk_id: sdk_json_string(binding, "sdk_id", subject)?.to_owned(),
-            source_selector: sdk_json_string(binding, "source_selector", subject)?.to_owned(),
-            source_commit: sdk_json_string(binding, "source_commit", subject)?.to_owned(),
-            reproduction_script_sha256: sdk_json_string(
-                binding,
-                "reproduction_script_sha256",
-                subject,
-            )?
-            .to_owned(),
-            script_exit: sdk_json_i64(binding, "script_exit", subject)?,
-            result: sdk_json_string(binding, "result", subject)?.to_owned(),
-            network_denial_probe_observed: sdk_json_bool(
-                binding,
-                "network_denial_probe_observed",
-                subject,
-            )?,
-            online_offline_equal: sdk_json_bool(binding, "online_offline_equal", subject)?,
-            offline_resolution_succeeded: sdk_json_bool(
-                binding,
-                "offline_resolution_succeeded",
-                subject,
-            )?,
-            checked_lock_sha256: sdk_json_string(binding, "checked_lock_sha256", subject)?
-                .to_owned(),
-            artifact_set_sha256: sdk_json_string(binding, "artifact_set_sha256", subject)?
-                .to_owned(),
-            observed_at_utc: sdk_json_string(binding, "observed_at_utc", subject)?.to_owned(),
-        })
-    }
-
-    fn parse_sdk_validator_runtime_binding(
-        value: &StrictJson,
-        proof_class: SdkExecutionProofClass,
-        subject: &str,
-    ) -> VResult<SdkValidatorRuntimeBinding> {
-        let row = sdk_json_object(value, subject, "validator_runtime")?;
-        sdk_json_exact_fields(
-            row,
-            &[
-                "repository_root",
-                "head_commit",
-                "head_tree",
-                "dirty_inventory",
-                "dirty_inventory_byte_length",
-                "dirty_inventory_sha256",
-                "cargo_lock_sha256",
-                "rust_toolchain_sha256",
-                "cargo_profile",
-                "target",
-                "features",
-                "rch_profile",
-                "argv",
-                "argv_sha256",
-                "cwd",
-                "environment",
-                "environment_sha256",
-                "verifier_executable",
-            ],
-            &[],
-            subject,
-        )?;
-        let dirty_inventory = sdk_json_string_values(
-            sdk_json_field(row, "dirty_inventory", subject)?,
-            subject,
-            "dirty_inventory",
-        )?;
-        let mut dirty_bytes = Vec::new();
-        for entry in &dirty_inventory {
-            dirty_bytes.extend_from_slice(entry.as_bytes());
-            dirty_bytes.push(0);
-        }
-        let argv = sdk_json_string_values(sdk_json_field(row, "argv", subject)?, subject, "argv")?;
-        let environment =
-            parse_sdk_environment(sdk_json_field(row, "environment", subject)?, subject)?;
-        let parsed = SdkValidatorRuntimeBinding {
-            repository_root: sdk_json_string(row, "repository_root", subject)?.to_owned(),
-            head_commit: sdk_json_string(row, "head_commit", subject)?.to_owned(),
-            head_tree: sdk_json_string(row, "head_tree", subject)?.to_owned(),
-            dirty_inventory,
-            dirty_inventory_byte_length: sdk_json_u64(
-                row,
-                "dirty_inventory_byte_length",
-                subject,
-            )?,
-            dirty_inventory_sha256: sdk_json_string(
-                row,
-                "dirty_inventory_sha256",
-                subject,
-            )?
-            .to_owned(),
-            cargo_lock_sha256: sdk_json_string(row, "cargo_lock_sha256", subject)?.to_owned(),
-            rust_toolchain_sha256: sdk_json_string(row, "rust_toolchain_sha256", subject)?
-                .to_owned(),
-            cargo_profile: sdk_json_string(row, "cargo_profile", subject)?.to_owned(),
-            target: sdk_json_string(row, "target", subject)?.to_owned(),
-            features: sdk_json_string_values(
-                sdk_json_field(row, "features", subject)?,
-                subject,
-                "features",
-            )?,
-            rch_profile: sdk_json_string(row, "rch_profile", subject)?.to_owned(),
-            argv_sha256: sdk_json_string(row, "argv_sha256", subject)?.to_owned(),
-            argv,
-            cwd: sdk_json_string(row, "cwd", subject)?.to_owned(),
-            environment_sha256: sdk_json_string(row, "environment_sha256", subject)?.to_owned(),
-            environment,
-            verifier_executable: parse_sdk_executable_binding(
-                sdk_json_field(row, "verifier_executable", subject)?,
-                subject,
-            )?,
-        };
-        for digest in [
-            &parsed.dirty_inventory_sha256,
-            &parsed.cargo_lock_sha256,
-            &parsed.rust_toolchain_sha256,
-            &parsed.argv_sha256,
-            &parsed.environment_sha256,
-        ] {
-            validate_sha256(digest, subject)?;
-        }
-        if parsed.head_commit.len() != 40
-            || parsed.head_tree.len() != 40
-            || !parsed
-                .head_commit
-                .bytes()
-                .chain(parsed.head_tree.bytes())
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || parsed.dirty_inventory_byte_length
-                != u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX)
-            || parsed.dirty_inventory_sha256 != lower_hex(&sha256(&dirty_bytes))
-            || parsed.argv.is_empty()
-            || parsed.argv_sha256
-                != sdk_string_sequence_sha256(b"FND01SDKVALIDATORARGVv1\0", &parsed.argv)
-            || parsed.environment_sha256 != sdk_environment_sha256(&parsed.environment)
-            || parsed.features.windows(2).any(|window| window[0] >= window[1])
-            || (proof_class == SdkExecutionProofClass::BatchExecution
-                && !parsed.rch_profile.starts_with("rch:"))
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("validator runtime self-binding"));
-        }
-        Ok(parsed)
-    }
-
-    fn parse_sdk_execution_bundle(
-        bundle: &SdkExecutionBundle,
-    ) -> VResult<ParsedSdkExecutionBundle> {
-        let subject = "batch-owned SDK execution facts";
-        validate_sha256(&bundle.raw_sha256, subject)?;
-        if bundle.source_id != "sdk-execution-facts-v2/external"
-            || bundle.raw_bytes.is_empty()
-            || bundle.raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES
-            || bundle.raw_byte_length != u64::try_from(bundle.raw_bytes.len()).unwrap_or(u64::MAX)
-            || bundle.raw_sha256 != lower_hex(&sha256(&bundle.raw_bytes))
-            || bundle.raw_bytes.contains(&0)
-            || bundle.raw_bytes.contains(&b'\r')
-            || !bundle.raw_bytes.ends_with(b"\n")
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("raw source binding"));
-        }
-        let document = parse_strict_json(&bundle.raw_bytes, subject)?;
-        let root = sdk_json_object(&document, subject, "root")?;
-        sdk_json_exact_fields(
-            root,
-            &[
-                "format",
-                "proof_class",
-                "producer",
-                "validator_runtime",
-                "batch_started_at_utc",
-                "batch_finished_at_utc",
-                "batch_monotonic_started_ns",
-                "batch_monotonic_finished_ns",
-                "batch_elapsed_ns",
-                "complete_input_sha256",
-                "observation_count",
-                "observations",
-            ],
-            &[],
-            subject,
-        )?;
-        let proof_class = match sdk_json_string(root, "proof_class", subject)? {
-            "batch_execution" => SdkExecutionProofClass::BatchExecution,
-            "validation_fixture" => SdkExecutionProofClass::ValidationFixture,
-            _ => {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at("proof class"));
-            }
-        };
-        let producer = sdk_json_string(root, "producer", subject)?;
-        if (proof_class == SdkExecutionProofClass::BatchExecution && producer != "batch_verify")
-            || (proof_class == SdkExecutionProofClass::ValidationFixture
-                && producer != "validation_fixture_no_credit")
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("producer/proof class"));
-        }
-        let validator_runtime = parse_sdk_validator_runtime_binding(
-            sdk_json_field(root, "validator_runtime", subject)?,
-            proof_class,
-            subject,
-        )?;
-        let observed_runtime = capture_sdk_validator_runtime(&bundle.repository_root)?;
-        if validator_runtime != observed_runtime {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("stale validator revision/runtime binding"));
-        }
-        let batch_started_at_utc =
-            sdk_json_string(root, "batch_started_at_utc", subject)?.to_owned();
-        let batch_finished_at_utc =
-            sdk_json_string(root, "batch_finished_at_utc", subject)?.to_owned();
-        let batch_monotonic_started_ns =
-            sdk_json_u64(root, "batch_monotonic_started_ns", subject)?;
-        let batch_monotonic_finished_ns =
-            sdk_json_u64(root, "batch_monotonic_finished_ns", subject)?;
-        let batch_elapsed_ns = sdk_json_u64(root, "batch_elapsed_ns", subject)?;
-        sdk_validate_fresh_interval(
-            proof_class,
-            &batch_started_at_utc,
-            &batch_finished_at_utc,
-            batch_monotonic_started_ns,
-            batch_monotonic_finished_ns,
-            batch_elapsed_ns,
-            subject,
-        )?;
-        let complete_input_sha256 =
-            sdk_json_string(root, "complete_input_sha256", subject)?.to_owned();
-        validate_sha256(&complete_input_sha256, subject)?;
-        let values = sdk_json_array(
-            sdk_json_field(root, "observations", subject)?,
-            subject,
-            "observations",
-        )?;
-        if sdk_json_string(root, "format", subject)?
-                != "fastmcp-fnd01-sdk-execution-facts-v2"
-            || sdk_json_usize(root, "observation_count", subject)? != values.len()
-            || values.len() != SDK_IDS.len()
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at("root contract"));
-        }
-
-        let mut observations = Vec::with_capacity(values.len());
-        for (index, value) in values.iter().enumerate() {
-            let logical = format!("{subject}/observations[{index}]");
-            let row = sdk_json_object(value, &logical, "observation")?;
-            let ecosystem = sdk_json_string(row, "ecosystem", &logical)?;
-            let observation = match ecosystem {
-                "npm" => {
-                    sdk_json_exact_fields(
-                        row,
-                        &[
-                            "ecosystem",
-                            "process",
-                            "binding",
-                            "node_version",
-                            "npm_version",
-                            "online_exit",
-                            "offline_exit",
-                            "closure_compare_exit",
-                            "network_denial_exit",
-                            "network_denial_stderr",
-                            "portable_directory_name_verified",
-                            "native_package_filenames_staged",
-                            "install_scripts_disabled",
-                            "offline_cache_only",
-                            "online_offline_closure_equal",
-                            "online_closure_sha256",
-                            "offline_closure_sha256",
-                            "checked_in_lock_sha256_after_install",
-                        ],
-                        &[],
-                        &logical,
-                    )?;
-                    SdkExecutionObservation::Npm {
-                        process: parse_sdk_execution_process(
-                            sdk_json_field(row, "process", &logical)?,
-                            proof_class,
-                            &logical,
-                        )?,
-                        binding: parse_sdk_observation_binding(
-                            sdk_json_field(row, "binding", &logical)?,
-                            &logical,
-                        )?,
-                        node_version: sdk_json_string(row, "node_version", &logical)?.to_owned(),
-                        npm_version: sdk_json_string(row, "npm_version", &logical)?.to_owned(),
-                        online_exit: sdk_json_i64(row, "online_exit", &logical)?,
-                        offline_exit: sdk_json_i64(row, "offline_exit", &logical)?,
-                        closure_compare_exit: sdk_json_i64(
-                            row,
-                            "closure_compare_exit",
-                            &logical,
-                        )?,
-                        network_denial_exit: sdk_json_i64(
-                            row,
-                            "network_denial_exit",
-                            &logical,
-                        )?,
-                        network_denial_stderr: sdk_json_string(
-                            row,
-                            "network_denial_stderr",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        portable_directory_name_verified: sdk_json_bool(
-                            row,
-                            "portable_directory_name_verified",
-                            &logical,
-                        )?,
-                        native_package_filenames_staged: sdk_json_bool(
-                            row,
-                            "native_package_filenames_staged",
-                            &logical,
-                        )?,
-                        install_scripts_disabled: sdk_json_bool(
-                            row,
-                            "install_scripts_disabled",
-                            &logical,
-                        )?,
-                        offline_cache_only: sdk_json_bool(
-                            row,
-                            "offline_cache_only",
-                            &logical,
-                        )?,
-                        online_offline_closure_equal: sdk_json_bool(
-                            row,
-                            "online_offline_closure_equal",
-                            &logical,
-                        )?,
-                        online_closure_sha256: sdk_json_string(
-                            row,
-                            "online_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_closure_sha256: sdk_json_string(
-                            row,
-                            "offline_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        checked_in_lock_sha256_after_install: sdk_json_string(
-                            row,
-                            "checked_in_lock_sha256_after_install",
-                            &logical,
-                        )?
-                        .to_owned(),
-                    }
-                }
-                "pip" => {
-                    sdk_json_exact_fields(
-                        row,
-                        &[
-                            "ecosystem",
-                            "process",
-                            "binding",
-                            "python_version",
-                            "pip_version",
-                            "online_exit",
-                            "offline_exit",
-                            "filename_compare_exit",
-                            "content_compare_exit",
-                            "network_denial_exit",
-                            "network_denial_stderr",
-                            "no_index",
-                            "require_hashes",
-                            "wheels_only",
-                            "filename_closure_equal",
-                            "content_closure_equal",
-                            "downloaded_wheel_count",
-                            "online_filename_closure_sha256",
-                            "offline_filename_closure_sha256",
-                            "online_content_closure_sha256",
-                            "offline_content_closure_sha256",
-                            "checked_in_lock_sha256_after_download",
-                        ],
-                        &[],
-                        &logical,
-                    )?;
-                    SdkExecutionObservation::Pip {
-                        process: parse_sdk_execution_process(
-                            sdk_json_field(row, "process", &logical)?,
-                            proof_class,
-                            &logical,
-                        )?,
-                        binding: parse_sdk_observation_binding(
-                            sdk_json_field(row, "binding", &logical)?,
-                            &logical,
-                        )?,
-                        python_version: sdk_json_string(row, "python_version", &logical)?
-                            .to_owned(),
-                        pip_version: sdk_json_string(row, "pip_version", &logical)?.to_owned(),
-                        online_exit: sdk_json_i64(row, "online_exit", &logical)?,
-                        offline_exit: sdk_json_i64(row, "offline_exit", &logical)?,
-                        filename_compare_exit: sdk_json_i64(
-                            row,
-                            "filename_compare_exit",
-                            &logical,
-                        )?,
-                        content_compare_exit: sdk_json_i64(
-                            row,
-                            "content_compare_exit",
-                            &logical,
-                        )?,
-                        network_denial_exit: sdk_json_i64(
-                            row,
-                            "network_denial_exit",
-                            &logical,
-                        )?,
-                        network_denial_stderr: sdk_json_string(
-                            row,
-                            "network_denial_stderr",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        no_index: sdk_json_bool(row, "no_index", &logical)?,
-                        require_hashes: sdk_json_bool(row, "require_hashes", &logical)?,
-                        wheels_only: sdk_json_bool(row, "wheels_only", &logical)?,
-                        filename_closure_equal: sdk_json_bool(
-                            row,
-                            "filename_closure_equal",
-                            &logical,
-                        )?,
-                        content_closure_equal: sdk_json_bool(
-                            row,
-                            "content_closure_equal",
-                            &logical,
-                        )?,
-                        downloaded_wheel_count: sdk_json_usize(
-                            row,
-                            "downloaded_wheel_count",
-                            &logical,
-                        )?,
-                        online_filename_closure_sha256: sdk_json_string(
-                            row,
-                            "online_filename_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_filename_closure_sha256: sdk_json_string(
-                            row,
-                            "offline_filename_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        online_content_closure_sha256: sdk_json_string(
-                            row,
-                            "online_content_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_content_closure_sha256: sdk_json_string(
-                            row,
-                            "offline_content_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        checked_in_lock_sha256_after_download: sdk_json_string(
-                            row,
-                            "checked_in_lock_sha256_after_download",
-                            &logical,
-                        )?
-                        .to_owned(),
-                    }
-                }
-                "nuget" => {
-                    sdk_json_exact_fields(
-                        row,
-                        &[
-                            "ecosystem",
-                            "process",
-                            "binding",
-                            "dotnet_sdk_version",
-                            "resolver_sdk_archive_sha256",
-                            "online_restore_exit",
-                            "offline_restore_exit",
-                            "assets_compare_exit",
-                            "network_denial_exit",
-                            "network_denial_stderr",
-                            "online_lock_matches_vendored_canonical_json",
-                            "offline_lock_unchanged",
-                            "raw_assets_digest_is_path_specific",
-                            "online_offline_project_assets_equal",
-                            "vendored_project_assets_projection_equal",
-                            "locked_mode",
-                            "no_cache",
-                            "empty_feed_only",
-                            "restored_package_count",
-                            "generated_lock_canonical_sha256",
-                            "offline_restore_stdout_raw_sha256",
-                            "offline_restore_stderr_sha256",
-                            "offline_project_assets_raw_sha256",
-                            "online_project_assets_sha256",
-                            "offline_project_assets_sha256",
-                            "checked_in_lock_sha256_before_restore",
-                            "checked_in_lock_sha256_after_restore",
-                        ],
-                        &[],
-                        &logical,
-                    )?;
-                    SdkExecutionObservation::Nuget {
-                        process: parse_sdk_execution_process(
-                            sdk_json_field(row, "process", &logical)?,
-                            proof_class,
-                            &logical,
-                        )?,
-                        binding: parse_sdk_observation_binding(
-                            sdk_json_field(row, "binding", &logical)?,
-                            &logical,
-                        )?,
-                        dotnet_sdk_version: sdk_json_string(
-                            row,
-                            "dotnet_sdk_version",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        resolver_sdk_archive_sha256: sdk_json_string(
-                            row,
-                            "resolver_sdk_archive_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        online_restore_exit: sdk_json_i64(
-                            row,
-                            "online_restore_exit",
-                            &logical,
-                        )?,
-                        offline_restore_exit: sdk_json_i64(
-                            row,
-                            "offline_restore_exit",
-                            &logical,
-                        )?,
-                        assets_compare_exit: sdk_json_i64(
-                            row,
-                            "assets_compare_exit",
-                            &logical,
-                        )?,
-                        network_denial_exit: sdk_json_i64(
-                            row,
-                            "network_denial_exit",
-                            &logical,
-                        )?,
-                        network_denial_stderr: sdk_json_string(
-                            row,
-                            "network_denial_stderr",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        online_lock_matches_vendored_canonical_json: sdk_json_bool(
-                            row,
-                            "online_lock_matches_vendored_canonical_json",
-                            &logical,
-                        )?,
-                        offline_lock_unchanged: sdk_json_bool(
-                            row,
-                            "offline_lock_unchanged",
-                            &logical,
-                        )?,
-                        raw_assets_digest_is_path_specific: sdk_json_bool(
-                            row,
-                            "raw_assets_digest_is_path_specific",
-                            &logical,
-                        )?,
-                        online_offline_project_assets_equal: sdk_json_bool(
-                            row,
-                            "online_offline_project_assets_equal",
-                            &logical,
-                        )?,
-                        vendored_project_assets_projection_equal: sdk_json_bool(
-                            row,
-                            "vendored_project_assets_projection_equal",
-                            &logical,
-                        )?,
-                        locked_mode: sdk_json_bool(row, "locked_mode", &logical)?,
-                        no_cache: sdk_json_bool(row, "no_cache", &logical)?,
-                        empty_feed_only: sdk_json_bool(row, "empty_feed_only", &logical)?,
-                        restored_package_count: sdk_json_usize(
-                            row,
-                            "restored_package_count",
-                            &logical,
-                        )?,
-                        generated_lock_canonical_sha256: sdk_json_string(
-                            row,
-                            "generated_lock_canonical_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_restore_stdout_raw_sha256: sdk_json_string(
-                            row,
-                            "offline_restore_stdout_raw_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_restore_stderr_sha256: sdk_json_string(
-                            row,
-                            "offline_restore_stderr_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_project_assets_raw_sha256: sdk_json_string(
-                            row,
-                            "offline_project_assets_raw_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        online_project_assets_sha256: sdk_json_string(
-                            row,
-                            "online_project_assets_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_project_assets_sha256: sdk_json_string(
-                            row,
-                            "offline_project_assets_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        checked_in_lock_sha256_before_restore: sdk_json_string(
-                            row,
-                            "checked_in_lock_sha256_before_restore",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        checked_in_lock_sha256_after_restore: sdk_json_string(
-                            row,
-                            "checked_in_lock_sha256_after_restore",
-                            &logical,
-                        )?
-                        .to_owned(),
-                    }
-                }
-                "go" => {
-                    sdk_json_exact_fields(
-                        row,
-                        &[
-                            "ecosystem",
-                            "process",
-                            "binding",
-                            "go_version",
-                            "online_download_exit",
-                            "online_list_exit",
-                            "offline_download_exit",
-                            "offline_list_exit",
-                            "lock_compare_exit",
-                            "closure_compare_exit",
-                            "network_denial_exit",
-                            "network_denial_stderr",
-                            "offline_goenv",
-                            "offline_gotoolchain",
-                            "offline_goproxy",
-                            "offline_gosumdb",
-                            "offline_govcs",
-                            "fresh_task_gocache",
-                            "online_seeded_gomodcache",
-                            "sandbox_network_denial_active",
-                            "root_sdk_module_entry_verified",
-                            "external_consumer_root_sdk_entry_verified",
-                            "online_offline_lock_and_module_list_equal",
-                            "resolved_module_count",
-                            "online_resolved_module_lock_sha256",
-                            "offline_resolved_module_lock_sha256",
-                            "online_closure_sha256",
-                            "offline_closure_sha256",
-                            "checked_in_consumer_sum_sha256",
-                        ],
-                        &[],
-                        &logical,
-                    )?;
-                    SdkExecutionObservation::Go {
-                        process: parse_sdk_execution_process(
-                            sdk_json_field(row, "process", &logical)?,
-                            proof_class,
-                            &logical,
-                        )?,
-                        binding: parse_sdk_observation_binding(
-                            sdk_json_field(row, "binding", &logical)?,
-                            &logical,
-                        )?,
-                        go_version: sdk_json_string(row, "go_version", &logical)?.to_owned(),
-                        online_download_exit: sdk_json_i64(
-                            row,
-                            "online_download_exit",
-                            &logical,
-                        )?,
-                        online_list_exit: sdk_json_i64(row, "online_list_exit", &logical)?,
-                        offline_download_exit: sdk_json_i64(
-                            row,
-                            "offline_download_exit",
-                            &logical,
-                        )?,
-                        offline_list_exit: sdk_json_i64(row, "offline_list_exit", &logical)?,
-                        lock_compare_exit: sdk_json_i64(row, "lock_compare_exit", &logical)?,
-                        closure_compare_exit: sdk_json_i64(
-                            row,
-                            "closure_compare_exit",
-                            &logical,
-                        )?,
-                        network_denial_exit: sdk_json_i64(
-                            row,
-                            "network_denial_exit",
-                            &logical,
-                        )?,
-                        network_denial_stderr: sdk_json_string(
-                            row,
-                            "network_denial_stderr",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_goenv: sdk_json_string(row, "offline_goenv", &logical)?
-                            .to_owned(),
-                        offline_gotoolchain: sdk_json_string(
-                            row,
-                            "offline_gotoolchain",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_goproxy: sdk_json_string(row, "offline_goproxy", &logical)?
-                            .to_owned(),
-                        offline_gosumdb: sdk_json_string(row, "offline_gosumdb", &logical)?
-                            .to_owned(),
-                        offline_govcs: sdk_json_string(row, "offline_govcs", &logical)?
-                            .to_owned(),
-                        fresh_task_gocache: sdk_json_bool(
-                            row,
-                            "fresh_task_gocache",
-                            &logical,
-                        )?,
-                        online_seeded_gomodcache: sdk_json_bool(
-                            row,
-                            "online_seeded_gomodcache",
-                            &logical,
-                        )?,
-                        sandbox_network_denial_active: sdk_json_bool(
-                            row,
-                            "sandbox_network_denial_active",
-                            &logical,
-                        )?,
-                        root_sdk_module_entry_verified: sdk_json_bool(
-                            row,
-                            "root_sdk_module_entry_verified",
-                            &logical,
-                        )?,
-                        external_consumer_root_sdk_entry_verified: sdk_json_bool(
-                            row,
-                            "external_consumer_root_sdk_entry_verified",
-                            &logical,
-                        )?,
-                        online_offline_lock_and_module_list_equal: sdk_json_bool(
-                            row,
-                            "online_offline_lock_and_module_list_equal",
-                            &logical,
-                        )?,
-                        resolved_module_count: sdk_json_usize(
-                            row,
-                            "resolved_module_count",
-                            &logical,
-                        )?,
-                        online_resolved_module_lock_sha256: sdk_json_string(
-                            row,
-                            "online_resolved_module_lock_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_resolved_module_lock_sha256: sdk_json_string(
-                            row,
-                            "offline_resolved_module_lock_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        online_closure_sha256: sdk_json_string(
-                            row,
-                            "online_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        offline_closure_sha256: sdk_json_string(
-                            row,
-                            "offline_closure_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                        checked_in_consumer_sum_sha256: sdk_json_string(
-                            row,
-                            "checked_in_consumer_sum_sha256",
-                            &logical,
-                        )?
-                        .to_owned(),
-                    }
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", &logical)
-                        .at("ecosystem tag"));
-                }
-            };
-            observations.push(observation);
-        }
-        Ok(ParsedSdkExecutionBundle {
-            proof_class,
-            repository_root: validator_runtime.repository_root,
-            batch_started_at_utc,
-            batch_finished_at_utc,
-            complete_input_sha256,
-            observations,
-        })
+    fn sdk_receipt_sha256(receipt: &SdkExecutionReceipt) -> VResult<String> {
+        let mut preimage = b"FND01SDKRECEIPTv3\0".to_vec();
+        let mut self_excluded = receipt.clone();
+        self_excluded.complete_input_sha256.clear();
+        preimage.extend(serde_json::to_vec(&self_excluded).map_err(|_| {
+            Diagnostic::error("E_SDK_EXECUTION_FACTS", "receipt serialization")
+        })?);
+        Ok(lower_hex(&sha256(&preimage)))
     }
 
     fn validate_sdk_execution_observations(
         static_evidence: &ValidatedSdkStaticEvidence,
-        bundle: &SdkExecutionBundle,
+        receipt: &SdkExecutionReceipt,
     ) -> VResult<Vec<ParsedSdkPeerResult>> {
-        let subject = "SDK matrix execution observations";
-        let bundle = parse_sdk_execution_bundle(bundle).map_err(|diagnostic| {
-            Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                .at(diagnostic.stable())
-        })?;
-        if bundle.complete_input_sha256 != static_evidence.complete_input_sha256
-            || bundle.observations.len() != static_evidence.peers.len()
+        let subject = "trusted SDK batch receipt";
+        let body = &receipt.body;
+        let current = sdk_repository_runtime(
+            Path::new(&receipt.producer_runtime.repository_root),
+            static_evidence,
+        )?;
+        if receipt.producer_runtime != current
+            || !receipt.producer_runtime.dirty_inventory.is_empty()
+            || receipt.producer_runtime.dirty_inventory_byte_length != 0
+            || body.required != SDK_IDS.len()
+            || body.discovered != body.required
+            || body.started != body.required
+            || body.passed != body.required
+            || body.first_attempt_passed != body.required
+            || body.retries != 0
+            || body.skipped != 0
+            || body.stale != 0
+            || body.mixed != 0
+            || body.observations.len() != body.required
+            || body.batch_started_at_epoch_seconds > body.batch_finished_at_epoch_seconds
+            || body.batch_monotonic_started_ns > body.batch_monotonic_finished_ns
+            || receipt.complete_input_sha256 != sdk_receipt_sha256(receipt)?
         {
-            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject));
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("batch closure"));
         }
-        let mut results = Vec::with_capacity(static_evidence.peers.len());
+        let now = sdk_epoch_seconds(subject)?;
+        if body.batch_finished_at_epoch_seconds > now.saturating_add(300)
+            || now.saturating_sub(body.batch_finished_at_epoch_seconds) > 86_400
+            || body
+                .batch_finished_at_epoch_seconds
+                .saturating_sub(body.batch_started_at_epoch_seconds)
+                > 43_200
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("stale clocks"));
+        }
+        let mut results = Vec::with_capacity(body.required);
         for (index, (peer, observation)) in static_evidence
             .peers
             .iter()
-            .zip(&bundle.observations)
+            .zip(&body.observations)
             .enumerate()
         {
-            let (process, binding, online, offline) =
-                match (observation, &peer.expected_execution) {
-                (
-                    SdkExecutionObservation::Npm {
-                        process,
-                        binding,
-                        node_version,
-                        npm_version,
-                        online_exit,
-                        offline_exit,
-                        closure_compare_exit,
-                        network_denial_exit,
-                        network_denial_stderr,
-                        portable_directory_name_verified,
-                        native_package_filenames_staged,
-                        install_scripts_disabled,
-                        offline_cache_only,
-                        online_offline_closure_equal,
-                        online_closure_sha256,
-                        offline_closure_sha256,
-                        checked_in_lock_sha256_after_install,
-                    },
-                    SdkExpectedExecution::Npm { closure_sha256 },
-                ) => {
-                    if peer.sdk_id != "typescript"
-                        || peer.ecosystem != "npm"
-                        || node_version != "v24.12.0"
-                        || npm_version != "11.14.0"
-                        || *online_exit != 0
-                        || *offline_exit != 0
-                        || *closure_compare_exit != 0
-                        || *network_denial_exit != 6
-                        || network_denial_stderr
-                            != sdk_network_denial_stderr("typescript", subject)?
-                        || !*portable_directory_name_verified
-                        || !*native_package_filenames_staged
-                        || !*install_scripts_disabled
-                        || !*offline_cache_only
-                        || !*online_offline_closure_equal
-                        || online_closure_sha256 != closure_sha256
-                        || offline_closure_sha256 != closure_sha256
-                        || checked_in_lock_sha256_after_install != &peer.checked_lock_sha256
-                    {
-                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                            .at(&peer.sdk_id));
-                    }
-                    (
-                        process,
-                        binding,
-                        online_closure_sha256.as_str(),
-                        offline_closure_sha256.as_str(),
-                    )
-                }
-                (
-                    SdkExecutionObservation::Pip {
-                        process,
-                        binding,
-                        python_version,
-                        pip_version,
-                        online_exit,
-                        offline_exit,
-                        filename_compare_exit,
-                        content_compare_exit,
-                        network_denial_exit,
-                        network_denial_stderr,
-                        no_index,
-                        require_hashes,
-                        wheels_only,
-                        filename_closure_equal,
-                        content_closure_equal,
-                        downloaded_wheel_count,
-                        online_filename_closure_sha256,
-                        offline_filename_closure_sha256,
-                        online_content_closure_sha256,
-                        offline_content_closure_sha256,
-                        checked_in_lock_sha256_after_download,
-                    },
-                    SdkExpectedExecution::Pip {
-                        filename_closure_sha256,
-                        content_closure_sha256,
-                    },
-                ) => {
-                    if peer.sdk_id != "python"
-                        || peer.ecosystem != "PyPI"
-                        || python_version != "Python 3.14.4"
-                        || pip_version != "26.1"
-                        || *online_exit != 0
-                        || *offline_exit != 0
-                        || *filename_compare_exit != 0
-                        || *content_compare_exit != 0
-                        || *network_denial_exit != 6
-                        || network_denial_stderr
-                            != sdk_network_denial_stderr("python", subject)?
-                        || !*no_index
-                        || !*require_hashes
-                        || !*wheels_only
-                        || !*filename_closure_equal
-                        || !*content_closure_equal
-                        || *downloaded_wheel_count != 28
-                        || online_filename_closure_sha256 != filename_closure_sha256
-                        || offline_filename_closure_sha256 != filename_closure_sha256
-                        || online_content_closure_sha256 != content_closure_sha256
-                        || offline_content_closure_sha256 != content_closure_sha256
-                        || checked_in_lock_sha256_after_download != &peer.checked_lock_sha256
-                    {
-                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                            .at(&peer.sdk_id));
-                    }
-                    (
-                        process,
-                        binding,
-                        online_content_closure_sha256.as_str(),
-                        offline_content_closure_sha256.as_str(),
-                    )
-                }
-                (
-                    SdkExecutionObservation::Nuget {
-                        process,
-                        binding,
-                        dotnet_sdk_version,
-                        resolver_sdk_archive_sha256,
-                        online_restore_exit,
-                        offline_restore_exit,
-                        assets_compare_exit,
-                        network_denial_exit,
-                        network_denial_stderr,
-                        online_lock_matches_vendored_canonical_json,
-                        offline_lock_unchanged,
-                        raw_assets_digest_is_path_specific,
-                        online_offline_project_assets_equal,
-                        vendored_project_assets_projection_equal,
-                        locked_mode,
-                        no_cache,
-                        empty_feed_only,
-                        restored_package_count,
-                        generated_lock_canonical_sha256,
-                        offline_restore_stdout_raw_sha256,
-                        offline_restore_stderr_sha256,
-                        offline_project_assets_raw_sha256,
-                        online_project_assets_sha256,
-                        offline_project_assets_sha256,
-                        checked_in_lock_sha256_before_restore,
-                        checked_in_lock_sha256_after_restore,
-                    },
-                    SdkExpectedExecution::Nuget {
-                        canonical_lock_sha256,
-                        project_assets_sha256,
-                        package_count,
-                    },
-                ) => {
-                    if peer.sdk_id != "csharp"
-                        || peer.ecosystem != "NuGet"
-                        || dotnet_sdk_version != "10.0.100"
-                        || resolver_sdk_archive_sha256
-                            != "71b3815ef8d83a6bbebf8627a56639600193f22d4ea6a6de2f71855c4b3e63fd"
-                        || *online_restore_exit != 0
-                        || *offline_restore_exit != 0
-                        || *assets_compare_exit != 0
-                        || *network_denial_exit != 6
-                        || network_denial_stderr
-                            != sdk_network_denial_stderr("csharp", subject)?
-                        || !*online_lock_matches_vendored_canonical_json
-                        || !*offline_lock_unchanged
-                        || !*raw_assets_digest_is_path_specific
-                        || !*online_offline_project_assets_equal
-                        || !*vendored_project_assets_projection_equal
-                        || !*locked_mode
-                        || !*no_cache
-                        || !*empty_feed_only
-                        || restored_package_count != package_count
-                        || generated_lock_canonical_sha256 != canonical_lock_sha256
-                        || online_project_assets_sha256 != project_assets_sha256
-                        || offline_project_assets_sha256 != project_assets_sha256
-                        || checked_in_lock_sha256_before_restore != &peer.checked_lock_sha256
-                        || checked_in_lock_sha256_after_restore != &peer.checked_lock_sha256
-                    {
-                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                            .at(&peer.sdk_id));
-                    }
-                    for digest in [
-                        offline_restore_stdout_raw_sha256,
-                        offline_restore_stderr_sha256,
-                        offline_project_assets_raw_sha256,
-                    ] {
-                        validate_sha256(digest, subject)?;
-                    }
-                    (
-                        process,
-                        binding,
-                        online_project_assets_sha256.as_str(),
-                        offline_project_assets_sha256.as_str(),
-                    )
-                }
-                (
-                    SdkExecutionObservation::Go {
-                        process,
-                        binding,
-                        go_version,
-                        online_download_exit,
-                        online_list_exit,
-                        offline_download_exit,
-                        offline_list_exit,
-                        lock_compare_exit,
-                        closure_compare_exit,
-                        network_denial_exit,
-                        network_denial_stderr,
-                        offline_goenv,
-                        offline_gotoolchain,
-                        offline_goproxy,
-                        offline_gosumdb,
-                        offline_govcs,
-                        fresh_task_gocache,
-                        online_seeded_gomodcache,
-                        sandbox_network_denial_active,
-                        root_sdk_module_entry_verified,
-                        external_consumer_root_sdk_entry_verified,
-                        online_offline_lock_and_module_list_equal,
-                        resolved_module_count,
-                        online_resolved_module_lock_sha256,
-                        offline_resolved_module_lock_sha256,
-                        online_closure_sha256,
-                        offline_closure_sha256,
-                        checked_in_consumer_sum_sha256,
-                    },
-                    SdkExpectedExecution::Go {
-                        resolved_module_lock_sha256,
-                        closure_sha256,
-                        module_count,
-                    },
-                ) => {
-                    if peer.sdk_id != "go"
-                        || peer.ecosystem != "Go modules"
-                        || go_version != "go version go1.25.0 darwin/arm64"
-                        || *online_download_exit != 0
-                        || *online_list_exit != 0
-                        || *offline_download_exit != 0
-                        || *offline_list_exit != 0
-                        || *lock_compare_exit != 0
-                        || *closure_compare_exit != 0
-                        || *network_denial_exit != 6
-                        || network_denial_stderr != sdk_network_denial_stderr("go", subject)?
-                        || offline_goenv != "off"
-                        || offline_gotoolchain != "local"
-                        || offline_goproxy != "off"
-                        || offline_gosumdb != "off"
-                        || offline_govcs != "*:off"
-                        || !*fresh_task_gocache
-                        || !*online_seeded_gomodcache
-                        || !*sandbox_network_denial_active
-                        || !*root_sdk_module_entry_verified
-                        || !*external_consumer_root_sdk_entry_verified
-                        || !*online_offline_lock_and_module_list_equal
-                        || resolved_module_count != module_count
-                        || online_resolved_module_lock_sha256 != resolved_module_lock_sha256
-                        || offline_resolved_module_lock_sha256 != resolved_module_lock_sha256
-                        || online_closure_sha256 != closure_sha256
-                        || offline_closure_sha256 != closure_sha256
-                        || checked_in_consumer_sum_sha256 != &peer.checked_lock_sha256
-                    {
-                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                            .at(&peer.sdk_id));
-                    }
-                    (
-                        process,
-                        binding,
-                        online_closure_sha256.as_str(),
-                        offline_closure_sha256.as_str(),
-                    )
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                        .at("ecosystem tag/order"));
-                }
-            };
-            let (expected_interpreter_id, expected_tool_id, expected_interpreter_version, expected_tool_version) =
-                match peer.sdk_id.as_str() {
-                    "typescript" => ("node", "npm", "v24.12.0", "11.14.0"),
-                    "python" => ("python", "pip", "Python 3.14.4", "26.1"),
-                    "csharp" => ("dotnet", "dotnet", "10.0.100", "10.0.100"),
-                    "go" => (
-                        "go",
-                        "go",
-                        "go version go1.25.0 darwin/arm64",
-                        "go version go1.25.0 darwin/arm64",
-                    ),
-                    _ => {
-                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                            .at("unknown SDK process identity"));
-                    }
-                };
-            let process_identity_valid = match bundle.proof_class {
-                SdkExecutionProofClass::BatchExecution => {
-                    process.interpreter.id == expected_interpreter_id
-                        && process.tool.id == expected_tool_id
-                        && process.interpreter.version == expected_interpreter_version
-                        && process.tool.version == expected_tool_version
-                }
-                SdkExecutionProofClass::ValidationFixture => {
-                    process.interpreter.id == "validation-fixture"
-                        && process.tool.id == "validation-fixture"
-                        && process.interpreter.version == "no-execution-no-credit"
-                        && process.tool.version == "no-execution-no-credit"
-                }
-            };
-            if !process_identity_valid
+            let runtime_spec = sdk_runtime_spec(&peer.sdk_id, subject)?;
+            let process = &observation.process;
+            let probe = &observation.network_probe;
+            let (expected_primary, expected_secondary) = sdk_expected_output_digests(peer);
+            let observed_stderr = std::str::from_utf8(&probe.stderr.raw)
+                .map_err(|_| Diagnostic::error("E_SDK_NETWORK_PROBE", subject))?
+                .trim_end_matches('\n');
+            sdk_validate_transcript(&process.stdout, subject)?;
+            sdk_validate_transcript(&process.stderr, subject)?;
+            sdk_validate_transcript(&probe.stdout, subject)?;
+            sdk_validate_transcript(&probe.stderr, subject)?;
+            let observed_additional_ids = process
+                .additional_tools
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>();
+            let expected_environment = sdk_expected_child_environment(subject)?;
+            let runtime_prefixes = runtime_spec.runtime_prefixes;
+            let runtime_paths = &process.runtime_paths;
+            let runtime_set = runtime_paths.iter().collect::<BTreeSet<_>>();
+            let runtime_paths_valid = runtime_paths.len() == runtime_prefixes.len()
+                && runtime_set.len() == runtime_paths.len()
+                && runtime_paths.windows(2).all(|window| window[0] < window[1])
+                && runtime_prefixes.iter().all(|prefix| {
+                    runtime_paths.iter().filter(|path| {
+                        Path::new(path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .is_some_and(|name| name.starts_with(prefix))
+                    }).count() == 1
+                })
+                && runtime_paths.iter().all(|path| {
+                    sdk_canonical_utf8(Path::new(path), subject)
+                        .is_ok_and(|canonical| canonical.as_str() == path.as_str())
+                        && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                            metadata.is_dir() && !metadata.file_type().is_symlink()
+                        })
+                });
+            let expected_output_paths = sdk_expected_output_paths(&peer.sdk_id, runtime_paths)?;
+            let output_digests = observation
+                .output_paths
+                .iter()
+                .map(|path| {
+                    read_bounded(Path::new(path), 16_777_216, subject)
+                        .map(|bytes| lower_hex(&sha256(&bytes)))
+                })
+                .collect::<VResult<Vec<_>>>()?;
+            let expected_output_digests = [
+                expected_primary,
+                expected_primary,
+                expected_secondary,
+                expected_secondary,
+                peer.checked_lock_sha256.as_str(),
+            ];
+            let expected_network_argv = [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                "(version 1) (allow default) (deny network*)",
+                "/usr/bin/curl",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "2",
+                runtime_spec.network_url,
+            ];
+            if observation.sdk_id != peer.sdk_id
+                || observation.source_selector != peer.source_selector
+                || observation.source_commit != peer.source_commit
+                || observation.checked_lock_sha256 != peer.checked_lock_sha256
+                || observation.artifact_count != peer.artifact_count
+                || observation.artifact_set_sha256 != peer.artifact_set_sha256
+                || observation.online_closure_sha256 != expected_primary
+                || observation.offline_closure_sha256 != expected_primary
+                || !observation.first_attempt
                 || process.command_id != format!("{}-sdk-reproduction", peer.sdk_id)
-                || process.cwd != bundle.repository_root
-                || !process.argv.iter().any(|argument| argument == &process.tool.path)
-                || process.reproduction_script_byte_length
-                    != peer.reproduction_script_byte_length
+                || process.argv != ["/bin/zsh", "-f", "-s"]
+                || process.argv_sha256 != sdk_sequence_sha256(b"FND01SDKARGVv3\0", &process.argv)
+                || process.cwd != receipt.producer_runtime.repository_root
+                || process.environment != expected_environment
+                || process.environment_sha256 != sdk_environment_sha256(&process.environment)
+                || process.interpreter != sdk_expected_tool("zsh", subject)?
+                || process.primary_tool
+                    != sdk_expected_tool(runtime_spec.primary_tool_id, subject)?
+                || observed_additional_ids != runtime_spec.additional_tool_ids
+                || process.additional_tools.iter().any(|tool| {
+                    !sdk_expected_tool(&tool.id, subject)
+                        .is_ok_and(|expected| &expected == tool)
+                })
+                || process.reproduction_script_byte_length != peer.reproduction_script_byte_length
                 || process.reproduction_script_sha256 != peer.reproduction_script_sha256
-                || process.started_at_utc.as_str() < bundle.batch_started_at_utc.as_str()
-                || process.finished_at_utc.as_str() > bundle.batch_finished_at_utc.as_str()
-                || process.finished_at_utc != binding.observed_at_utc
+                || process.exit_code != 0
+                || process.started_at_epoch_seconds < body.batch_started_at_epoch_seconds
+                || process.started_at_epoch_seconds > process.finished_at_epoch_seconds
+                || process.finished_at_epoch_seconds > body.batch_finished_at_epoch_seconds
+                || process.monotonic_started_ns < body.batch_monotonic_started_ns
+                || process.monotonic_started_ns > process.monotonic_finished_ns
+                || process.monotonic_finished_ns > body.batch_monotonic_finished_ns
+                || process.elapsed_ns
+                    != process
+                        .monotonic_finished_ns
+                        .saturating_sub(process.monotonic_started_ns)
+                || process.complete_input_sha256 != sdk_process_sha256(process)
+                || process.composite_script_observer_sha256
+                    != sdk_composite_binding(
+                        &process.reproduction_script_sha256,
+                        &process.environment,
+                        &process.interpreter,
+                        &process.primary_tool,
+                        &process.additional_tools,
+                    )
+                || !runtime_paths_valid
+                || observation.output_paths != expected_output_paths
+                || output_digests.len() != expected_output_digests.len()
+                || output_digests
+                    .iter()
+                    .zip(expected_output_digests)
+                    .any(|(observed, expected)| observed.as_str() != expected)
+                || probe.argv.len() != expected_network_argv.len()
+                || probe
+                    .argv
+                    .iter()
+                    .zip(expected_network_argv)
+                    .any(|(observed, expected)| observed != expected)
+                || probe.executable != sdk_expected_tool("curl", subject)?
+                || probe.exit_code != 6
+                || !probe.stdout.raw.is_empty()
+                || observed_stderr != runtime_spec.network_stderr
             {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at(format!("{} process provenance", peer.sdk_id)));
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at(&peer.sdk_id));
             }
-            if binding.sdk_id != peer.sdk_id
-                || binding.source_selector != peer.source_selector
-                || binding.source_commit != peer.source_commit
-                || binding.reproduction_script_sha256 != peer.reproduction_script_sha256
-                || binding.script_exit != 0
-                || binding.result != "pass"
-                || !binding.network_denial_probe_observed
-                || !binding.online_offline_equal
-                || !binding.offline_resolution_succeeded
-                || binding.checked_lock_sha256 != peer.checked_lock_sha256
-                || binding.artifact_set_sha256 != peer.artifact_set_sha256
-                || !sdk_execution_timestamp_is_valid(&binding.observed_at_utc)
-            {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at(&peer.sdk_id));
-            }
-            for digest in [
-                online,
-                offline,
-                binding.checked_lock_sha256.as_str(),
-                binding.artifact_set_sha256.as_str(),
-                binding.reproduction_script_sha256.as_str(),
-            ] {
-                validate_sha256(digest, subject)?;
-            }
-            if online != offline {
-                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at("online/offline equality"));
-            }
+            validate_sha256(&process.composite_script_observer_sha256, subject)?;
             results.push(ParsedSdkPeerResult {
                 sdk_id: peer.sdk_id.clone(),
                 source_selector: format!(
-                    "sdk-execution-facts-v2#/observations/{index}"
+                    "fnd01-sdk-batch-v3#/observations/{index}"
                 ),
                 checked_lock_sha256: peer.checked_lock_sha256.clone(),
-                online_closure_sha256: online.to_owned(),
-                offline_closure_sha256: offline.to_owned(),
+                online_closure_sha256: observation.online_closure_sha256.clone(),
+                offline_closure_sha256: observation.offline_closure_sha256.clone(),
                 artifact_count: peer.artifact_count,
                 artifact_set_sha256: peer.artifact_set_sha256.clone(),
-                observed_at_utc: binding.observed_at_utc.clone(),
-                evidence_verdict: match bundle.proof_class {
-                    SdkExecutionProofClass::BatchExecution => "Pass",
-                    SdkExecutionProofClass::ValidationFixture => "FixtureValidatedNoCredit",
-                }
-                .to_owned(),
+                observed_at_utc: process.finished_at_epoch_seconds.to_string(),
+                evidence_verdict: "Pass".to_owned(),
                 support_claim: false,
             });
         }
         Ok(results)
     }
 
+    fn validate_untrusted_sdk_replay(raw_bytes: &[u8]) -> Diagnostic {
+        let subject = "untrusted SDK replay";
+        if raw_bytes.is_empty()
+            || raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES
+            || raw_bytes.contains(&0)
+        {
+            return Diagnostic::error("E_SDK_UNTRUSTED_REPLAY", subject).at("invalid bounded JSON");
+        }
+        let proof_class = match parse_strict_json(raw_bytes, subject) {
+            Ok(StrictJson::Object(object)) => object.get("proof_class").cloned(),
+            Ok(_) => None,
+            Err(_) => return Diagnostic::error("E_SDK_UNTRUSTED_REPLAY", subject)
+                .at("invalid bounded JSON"),
+        };
+        if proof_class == Some(StrictJson::String("batch_execution".to_owned())) {
+            Diagnostic::error("E_SDK_PROOF_CLASS_INFLATION", subject)
+        } else {
+            Diagnostic::error("E_SDK_UNTRUSTED_REPLAY_NO_CREDIT", subject)
+        }
+    }
     fn derive_sdk_revision_six_static_evidence(
         document: &toml::Value,
         files: &[LoadedFile],
@@ -77029,7 +75647,9 @@ activate = 1\n";
         }
         let artifacts_by_sdk = derive_sdk_registry_artifacts(document, policy)?;
         let mut validated_peers = Vec::with_capacity(SDK_IDS.len());
-        for (peer_value, expected) in peers.iter().zip(&SDK_PEER_EXPECTATIONS) {
+        for (peer_index, (peer_value, expected)) in
+            peers.iter().zip(&SDK_PEER_EXPECTATIONS).enumerate()
+        {
             let peer = peer_value
                 .as_table()
                 .ok_or_else(|| Diagnostic::error("E_SDK_PEER_ORDER", subject))?;
@@ -77098,8 +75718,11 @@ activate = 1\n";
             validated_peers.push(ValidatedSdkStaticPeer {
                 sdk_id: expected.id.to_owned(),
                 ecosystem: expected.ecosystem.to_owned(),
-                source_selector: format!("/peers/by-id/{}", expected.id),
+                source_selector: format!(
+                    "evidence/fnd-01/sdk-matrix.toml#/peers/{peer_index}"
+                ),
                 source_commit: expected.source_commit.to_owned(),
+                reproduction_script: reproduction_script.as_bytes().to_vec(),
                 reproduction_script_byte_length: u64::try_from(reproduction_script.len())
                     .unwrap_or(u64::MAX),
                 reproduction_script_sha256: expected.reproduction_script_sha256.to_owned(),
@@ -77297,100 +75920,50 @@ activate = 1\n";
             .iter_mut()
             .find(|file| file.contract.path == "evidence/fnd-01/sdk-matrix.toml")
             .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "SDK matrix"))?;
-        let binding_header = b"[complete_input_binding]\n";
-        let binding_headers = manifest
-            .bytes
-            .windows(binding_header.len())
-            .enumerate()
-            .filter_map(|(offset, window)| (window == binding_header).then_some(offset))
-            .collect::<Vec<_>>();
-        if binding_headers.len() != 1 {
-            return Err(Diagnostic::error("E_SDK_CANDIDATE", "complete input binding"));
-        }
-        let binding_start = binding_headers[0] + binding_header.len();
-        let binding_end = manifest.bytes[binding_start..]
-            .windows(2)
-            .position(|window| window == b"\n[")
-            .map(|offset| binding_start + offset + 1)
-            .unwrap_or(manifest.bytes.len());
-        let binding_offset = |bytes: &[u8], prefix: &[u8]| -> VResult<usize> {
-            let offsets = bytes[binding_start..binding_end]
-                .windows(prefix.len())
-                .enumerate()
-                .filter_map(|(offset, window)| (window == prefix).then_some(binding_start + offset))
-                .collect::<Vec<_>>();
-            if offsets.len() != 1 {
-                return Err(Diagnostic::error("E_SDK_CANDIDATE", "complete input binding")
-                    .at("self-binding selector is not unique"));
-            }
-            Ok(offsets[0])
-        };
-        let length_prefix = b"\npreimage_byte_length = ";
-        let length_start = binding_offset(&manifest.bytes, length_prefix)? + length_prefix.len();
-        let length_end = manifest.bytes[length_start..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .and_then(|offset| length_start.checked_add(offset))
-            .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", "preimage length"))?;
+        let ranges = sdk_self_binding_ranges(&manifest.bytes, "candidate self binding")?;
         let length = preimage.len().to_string();
         manifest
             .bytes
-            .splice(length_start..length_end, length.bytes());
-        let digest_prefix = b"\ndigest = \"";
-        let digest_start = binding_offset(&manifest.bytes, digest_prefix)? + digest_prefix.len();
+            .splice(ranges.length, length.bytes());
+        let ranges = sdk_self_binding_ranges(&manifest.bytes, "candidate self binding")?;
         let digest = lower_hex(&sha256(&preimage));
         manifest
             .bytes
-            .splice(digest_start..digest_start + 64, digest.bytes());
+            .splice(ranges.digest.start + 1..ranges.digest.end - 1, digest.bytes());
         manifest.digest = sha256(&manifest.bytes);
         Ok(candidate)
     }
 
     fn sdk_matrix_normalize_self_binding_rhs(bytes: &[u8]) -> VResult<Vec<u8>> {
         let subject = "SDK matrix self-binding normalization";
-        let header = b"[complete_input_binding]\n";
-        let headers = bytes
-            .windows(header.len())
-            .enumerate()
-            .filter_map(|(offset, window)| (window == header).then_some(offset))
-            .collect::<Vec<_>>();
-        if headers.len() != 1 {
-            return Err(Diagnostic::error("E_SDK_CANDIDATE", subject));
-        }
-        let table_start = headers[0] + header.len();
-        let table_end = bytes[table_start..]
-            .windows(2)
-            .position(|window| window == b"\n[")
-            .map(|offset| table_start + offset + 1)
-            .unwrap_or(bytes.len());
-        let mut ranges = Vec::new();
-        for prefix in [b"\npreimage_byte_length = ".as_slice(), b"\ndigest = ".as_slice()] {
-            let offsets = bytes[table_start..table_end]
-                .windows(prefix.len())
-                .enumerate()
-                .filter_map(|(offset, window)| (window == prefix).then_some(table_start + offset))
-                .collect::<Vec<_>>();
-            if offsets.len() != 1 {
-                return Err(Diagnostic::error("E_SDK_CANDIDATE", subject));
-            }
-            let start = offsets[0] + prefix.len();
-            let end = bytes[start..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|offset| start + offset)
-                .ok_or_else(|| Diagnostic::error("E_SDK_CANDIDATE", subject))?;
-            ranges.push((start, end));
-        }
-        ranges.sort_unstable();
+        let ranges = sdk_self_binding_ranges(bytes, subject)?;
         let mut normalized = Vec::with_capacity(bytes.len());
         let mut cursor = 0usize;
-        for (start, end) in ranges {
-            normalized.extend_from_slice(&bytes[cursor..start]);
+        for range in [ranges.length, ranges.digest] {
+            normalized.extend_from_slice(&bytes[cursor..range.start]);
             normalized.extend_from_slice(b"<self-binding-rhs>");
-            cursor = end;
+            cursor = range.end;
         }
         normalized.extend_from_slice(&bytes[cursor..]);
         Ok(normalized)
+    }
+
+    fn sdk_loaded_file_contract_equal(before: &LoadedFile, after: &LoadedFile) -> bool {
+        before.contract.id == after.contract.id
+            && before.contract.family == after.contract.family
+            && before.contract.owner_bead == after.contract.owner_bead
+            && before.contract.path == after.contract.path
+            && before.contract.byte_length == after.contract.byte_length
+            && before.contract.sha256 == after.contract.sha256
+            && before.contract.parse_kind == after.contract.parse_kind
+            && before.contract.observation_kind == after.contract.observation_kind
+            && before.contract.bytes_available == after.contract.bytes_available
+            && before.contract.rehash_mode == after.contract.rehash_mode
+            && before.contract.claim_ceiling == after.contract.claim_ceiling
+            && before.contract.required == after.contract.required
+            && before.contract.source_tree_member == after.contract.source_tree_member
+            && before.digest == sha256(&before.bytes)
+            && after.digest == sha256(&after.bytes)
     }
 
     fn assert_sdk_matrix_single_delta(
@@ -77405,22 +75978,7 @@ activate = 1\n";
         }
         let mut target_count = 0usize;
         for (before, after) in baseline.iter().zip(candidate) {
-            if before.contract.id != after.contract.id
-                || before.contract.family != after.contract.family
-                || before.contract.owner_bead != after.contract.owner_bead
-                || before.contract.path != after.contract.path
-                || before.contract.byte_length != after.contract.byte_length
-                || before.contract.sha256 != after.contract.sha256
-                || before.contract.parse_kind != after.contract.parse_kind
-                || before.contract.observation_kind != after.contract.observation_kind
-                || before.contract.bytes_available != after.contract.bytes_available
-                || before.contract.rehash_mode != after.contract.rehash_mode
-                || before.contract.claim_ceiling != after.contract.claim_ceiling
-                || before.contract.required != after.contract.required
-                || before.contract.source_tree_member != after.contract.source_tree_member
-                || before.digest != sha256(&before.bytes)
-                || after.digest != sha256(&after.bytes)
-            {
+            if !sdk_loaded_file_contract_equal(before, after) {
                 return Err(Diagnostic::error("E_SDK_CANDIDATE", "candidate contract map"));
             }
             if before.contract.path == target_path {
@@ -77476,23 +76034,9 @@ activate = 1\n";
             return Err(Diagnostic::error("E_SDK_CANDIDATE", subject).at("file count"));
         }
         for (before, after) in expected.iter().zip(actual) {
-            if before.contract.id != after.contract.id
-                || before.contract.family != after.contract.family
-                || before.contract.owner_bead != after.contract.owner_bead
-                || before.contract.path != after.contract.path
-                || before.contract.byte_length != after.contract.byte_length
-                || before.contract.sha256 != after.contract.sha256
-                || before.contract.parse_kind != after.contract.parse_kind
-                || before.contract.observation_kind != after.contract.observation_kind
-                || before.contract.bytes_available != after.contract.bytes_available
-                || before.contract.rehash_mode != after.contract.rehash_mode
-                || before.contract.claim_ceiling != after.contract.claim_ceiling
-                || before.contract.required != after.contract.required
-                || before.contract.source_tree_member != after.contract.source_tree_member
+            if !sdk_loaded_file_contract_equal(before, after)
                 || before.bytes != after.bytes
                 || before.digest != after.digest
-                || before.digest != sha256(&before.bytes)
-                || after.digest != sha256(&after.bytes)
             {
                 return Err(Diagnostic::error("E_SDK_CANDIDATE", subject)
                     .at(&before.contract.path));
@@ -79472,6 +78016,112 @@ activate = 1\n";
         Ok(())
     }
 
+    fn sdk_receipt_json(receipt: &SdkExecutionReceipt) -> VResult<String> {
+        let value = serde_json::json!({
+            "format": "fastmcp-fnd01-sdk-batch-v3",
+            "producer": "sdk-batch-run-json",
+            "proof_class": "batch_execution",
+            "capability_credit": true,
+            "support_claim": false,
+            "receipt": receipt,
+        });
+        serde_json::to_string(&value)
+            .map(|mut rendered| {
+                rendered.push('\n');
+                rendered
+            })
+            .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", "receipt JSON"))
+    }
+    fn sdk_no_credit_json(code: &str, detail: &str) -> String {
+        let proof_class = if code.starts_with("sdk_batch_") {
+            "producer_rejected"
+        } else {
+            "untrusted_replay"
+        };
+        let mut value = serde_json::json!({
+            "format": "fastmcp-fnd01-sdk-no-credit-v1",
+            "proof_class": proof_class,
+            "capability_credit": false,
+            "support_claim": false,
+            "code": code,
+            "detail": detail,
+        })
+        .to_string();
+        value.push('\n');
+        value
+    }
+
+    fn sdk_prepare_batch_inner() -> VResult<SdkBatchPlan> {
+        let root = repository_root();
+        let canonical = fs::canonicalize(&root)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_ROOT", "repository root"))?;
+        if canonical != root {
+            return Err(Diagnostic::error("E_SDK_RUNNER_ROOT", "canonical root"));
+        }
+        validate_repository_root_layout(&root)?;
+        let (policy, _) = read_policy(&root)?;
+        validate_policy_shape(&policy)?;
+        let files = load_sources(&root, &policy)?;
+        let static_validation = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )?;
+        let producer_runtime =
+            sdk_repository_runtime(&root, &static_validation.static_evidence)?;
+        if !producer_runtime.dirty_inventory.is_empty() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_DIRTY", "clean checkout required"));
+        }
+        Ok(SdkBatchPlan {
+            root,
+            static_evidence: static_validation.static_evidence,
+            producer_runtime,
+        })
+    }
+
+    pub(crate) fn sdk_prepare_batch() -> Result<SdkBatchPlan, String> {
+        sdk_prepare_batch_inner().map_err(|diagnostic| {
+            sdk_no_credit_json("sdk_batch_prepare_failed", &diagnostic.stable())
+        })
+    }
+
+    fn sdk_admit_batch_inner(
+        plan: SdkBatchPlan,
+        body: SdkBatchReceiptBody,
+    ) -> VResult<String> {
+        let current = sdk_repository_runtime(&plan.root, &plan.static_evidence)?;
+        if current != plan.producer_runtime || !current.dirty_inventory.is_empty() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_DRIFT", "pre/post repository runtime"));
+        }
+        let mut receipt = SdkExecutionReceipt {
+            producer_runtime: plan.producer_runtime,
+            body,
+            complete_input_sha256: String::new(),
+        };
+        receipt.complete_input_sha256 = sdk_receipt_sha256(&receipt)?;
+        let report = run_verifier_at_with_sdk_execution_facts(
+            &plan.root,
+            ExternalSdkExecutionFacts::TrustedBatch(Box::new(receipt.clone())),
+        )?;
+        if report.has_errors() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_VERIFIER", "full verifier report"));
+        }
+        sdk_receipt_json(&receipt)
+    }
+
+    pub(crate) fn sdk_admit_batch(
+        plan: SdkBatchPlan,
+        body: SdkBatchReceiptBody,
+    ) -> Result<String, String> {
+        sdk_admit_batch_inner(plan, body).map_err(|diagnostic| {
+            sdk_no_credit_json("sdk_batch_admission_failed", &diagnostic.stable())
+        })
+    }
+
+    pub(crate) fn sdk_batch_failure_json(detail: &str) -> String {
+        sdk_no_credit_json("sdk_batch_execution_failed", detail)
+    }
+
     fn run_verifier() -> VResult<Report> {
         let root = repository_root();
         validate_repository_root_layout(&root)?;
@@ -79485,9 +78135,8 @@ activate = 1\n";
         run_verifier_at_with_sdk_execution_facts(root, ExternalSdkExecutionFacts::Absent)
     }
 
-    /// Externally callable batch-owned SDK-fact verifier surface.  The local
-    /// harness does not call this with repository-authored data; the batch
-    /// orchestrator must supply the raw execution JSON it produced.
+    /// Compatibility replay surface. Caller-provided JSON is intentionally
+    /// incapable of selecting the trusted batch proof class or earning credit.
     pub fn sdk_batch_verify_json(
         root: &Path,
         raw_bytes: Vec<u8>,
@@ -79495,73 +78144,51 @@ activate = 1\n";
         let (policy, _) = read_policy(root).map_err(|diagnostic| diagnostic.stable())?;
         validate_policy_shape(&policy).map_err(|diagnostic| diagnostic.stable())?;
         let files = load_sources(root, &policy).map_err(|diagnostic| diagnostic.stable())?;
-        let facts = ExternalSdkExecutionFacts::present_from_batch_owned_json(root, raw_bytes)
-            .map_err(|diagnostic| diagnostic.stable())?;
-        let validation = fnd_01_sdk_matrix_validate(&files, &policy, facts)
-            .map_err(|diagnostic| diagnostic.stable())?;
-        if validation.support_claim {
-            return Err("SDK fact validation cannot grant a support claim".to_owned());
-        }
-        let ExecutionValidation::Verified(results) = validation.execution else {
-            return Err("SDK execution facts were not verified".to_owned());
-        };
-        if results.len() != SDK_IDS.len() {
-            return Err("SDK execution fact result count mismatch".to_owned());
-        }
-        Ok(results
-            .into_iter()
-            .map(|result| {
-                format!(
-                    "sdk_id={};evidence_verdict={};support_claim=false;capability_credit=false",
-                    result.sdk_id, result.evidence_verdict,
-                )
-            })
-            .collect())
+        let diagnostic = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::UntrustedReplay(raw_bytes),
+        )
+        .expect_err("untrusted replay must never enter the trusted batch path");
+        Err(sdk_no_credit_json(&diagnostic.code, &diagnostic.stable()))
     }
 
     fn run_sdk_batch_verify_json_from_stdin() -> i32 {
-        let subject = "batch-owned SDK execution facts";
         let read_limit = match u64::try_from(MAX_SDK_EXECUTION_FACT_BYTES)
             .ok()
             .and_then(|limit| limit.checked_add(1))
         {
             Some(limit) => limit,
             None => {
-                eprintln!(
-                    "{}",
-                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                        .at("stdin bound cannot be represented")
-                        .stable(),
-                );
-                return 1;
+                print!("{}", sdk_no_credit_json(
+                    "E_SDK_UNTRUSTED_REPLAY",
+                    "stdin bound cannot be represented",
+                ));
+                return 2;
             }
         };
         let stdin = io::stdin();
         let mut bounded_stdin = stdin.lock().take(read_limit);
         let mut raw_bytes = Vec::new();
         if let Err(error) = bounded_stdin.read_to_end(&mut raw_bytes) {
-            eprintln!(
-                "{}",
-                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at(format!("stdin read: {error}"))
-                    .stable(),
-            );
-            return 1;
+            print!("{}", sdk_no_credit_json(
+                "E_SDK_UNTRUSTED_REPLAY",
+                &format!("stdin read: {error}"),
+            ));
+            return 2;
         }
         if raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES {
-            eprintln!(
-                "{}",
-                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
-                    .at("stdin byte bound exceeded")
-                    .stable(),
-            );
-            return 1;
+            print!("{}", sdk_no_credit_json(
+                "E_SDK_UNTRUSTED_REPLAY",
+                "stdin byte bound exceeded",
+            ));
+            return 2;
         }
         match sdk_batch_verify_json(&repository_root(), raw_bytes) {
-            Ok(_) => 0,
+            Ok(_) => unreachable!("replay can never receive credit"),
             Err(diagnostics) => {
-                eprintln!("{diagnostics}");
-                1
+                print!("{diagnostics}");
+                2
             }
         }
     }
@@ -88546,10 +87173,58 @@ original = "value"
                 ("go", 3),
             ]
         );
-        assert!(validation.static_evidence.peers.iter().all(|peer| {
-            peer.source_selector.starts_with("/peers/by-id/")
-                && peer.checked_lock_sha256.len() == 64
-        }));
+        assert_eq!(
+            validation
+                .static_evidence
+                .peers
+                .iter()
+                .map(|peer| peer.source_selector.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "evidence/fnd-01/sdk-matrix.toml#/peers/0",
+                "evidence/fnd-01/sdk-matrix.toml#/peers/1",
+                "evidence/fnd-01/sdk-matrix.toml#/peers/2",
+                "evidence/fnd-01/sdk-matrix.toml#/peers/3",
+            ],
+        );
+        assert!(validation
+            .static_evidence
+            .peers
+            .iter()
+            .all(|peer| peer.checked_lock_sha256.len() == 64));
+
+        let fixture_error = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::ValidationFixture,
+        )
+        .expect_err("a structural fixture cannot receive production execution credit");
+        assert_eq!(fixture_error.code, "E_SDK_PROOF_CLASS_NO_CREDIT");
+        let fixture = br#"{"format":"fastmcp-fnd01-sdk-batch-v3","proof_class":"validation_fixture"}
+"#;
+        let replay_error = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::UntrustedReplay(fixture.to_vec()),
+        )
+        .expect_err("a replay remains explicit no-credit input");
+        assert_eq!(replay_error.code, "E_SDK_UNTRUSTED_REPLAY_NO_CREDIT");
+        let inflated = br#"{"format":"fastmcp-fnd01-sdk-batch-v3","proof_class":"batch_execution"}
+"#;
+        let inflation_error = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::UntrustedReplay(inflated.to_vec()),
+        )
+        .expect_err("caller JSON cannot inflate its proof class");
+        assert_eq!(inflation_error.code, "E_SDK_PROOF_CLASS_INFLATION");
+        let pristine = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )
+        .expect("proof-class rejection leaves pristine static validation unchanged");
+        assert_eq!(pristine, validation);
     }
 
     #[test]
@@ -88620,8 +87295,8 @@ original = "value"
                 mutation: "change_one_byte",
                 diagnostic: "fnd01.sdk_matrix.lock_digest_mismatch",
                 target: "evidence/fnd-01/sdk-locks/typescript-package-lock.json",
-                needle: b"\"lockfileVersion\"",
-                replacement: b"\"lockfileXersion\"",
+                needle: b"\"lockfileVersion\": 3,",
+                replacement: b"\"lockfileVersion\":\t3,",
             },
             SdkMatrixPlant {
                 id: "execution-command",
@@ -88644,6 +87319,10 @@ original = "value"
         ];
         let document = parse_source_toml(&files, "evidence/fnd-01/sdk-matrix.toml")
             .expect("baseline manifest");
+        let baseline_preimage =
+            fnd_01_sdk_matrix_validate_complete_input_binding(&document, &files)
+                .expect("baseline complete-input preimage");
+        let baseline_preimage_sha256 = lower_hex(&sha256(&baseline_preimage));
         let declared = record_array(
             record_table(
                 document.as_table().expect("manifest root"),
@@ -88745,13 +87424,45 @@ original = "value"
                 "{}: rebound preimage digest",
                 plant.id
             );
+            assert_ne!(
+                candidate_preimage, baseline_preimage,
+                "{}: candidate preimage differs from the pristine baseline",
+                plant.id,
+            );
+            assert_ne!(
+                record_string(candidate_binding, "digest", "candidate binding")
+                    .expect("candidate digest"),
+                baseline_preimage_sha256,
+                "{}: candidate binding cannot self-assert the baseline digest",
+                plant.id,
+            );
+            if plant.id == "lock-byte-digest" {
+                let baseline_lock = source_lookup(&files, plant.target).expect("baseline lock");
+                let candidate_lock =
+                    source_lookup(&candidate, plant.target).expect("candidate lock");
+                assert_eq!(
+                    parse_strict_json(&baseline_lock.bytes, "baseline lock")
+                        .expect("baseline lock JSON"),
+                    parse_strict_json(&candidate_lock.bytes, "candidate lock")
+                        .expect("candidate lock JSON"),
+                    "whitespace plant preserves native lock semantics",
+                );
+            }
             let error = fnd_01_sdk_matrix_validate(
                 &candidate,
                 &policy,
                 ExternalSdkExecutionFacts::Absent,
             )
                 .expect_err("candidate must reject");
-            assert_eq!(error.code, plant.diagnostic, "{}", plant.id);
+            assert_eq!(
+                error.stable(),
+                format!(
+                    "FND01|Error|{}|SDK matrix revision-6 dimensions",
+                    plant.diagnostic,
+                ),
+                "{}: exact diagnostic excludes cotriggers",
+                plant.id,
+            );
             let baseline_reaccepted = fnd_01_sdk_matrix_validate(
                 &files,
                 &policy,
@@ -91172,13 +89883,6 @@ fn fallible(value: Option<u8>) {
         Ok(record)
     }
 
-    /// Pure field-join authority for a complete `ControlLedgerExpectation` without
-    /// opening ledger, spool, supply, archive, or workspace children.
-    ///
-    /// Full byte validation still happens later via `validate_control_ledger_bytes`
-    /// after the sealed control-ledger object is admitted. This type only proves
-    /// the pure mode/role/run/PID/env-set/tool-count/argv-arity join is compiled
-    /// and satisfied before any untrusted artifact read.
     #[derive(Debug)]
     struct ControlLedgerExpectationAuthority {
         role: &'static str,
@@ -91190,13 +89894,7 @@ fn fallible(value: Option<u8>) {
         native_tool_count: usize,
     }
 
-    /// Typed single-use ordinary handoff permit.
-    ///
-    /// Deliberately omits `Clone`/`Copy` so successful early authority cannot be
-    /// duplicated after the handoff path consumes it. Authorizes only progression
-    /// past the early ordinary gate (authoring rebind + independent twenty-tool
-    /// closed-PATH authority + pure ControlLedgerExpectation join) — never seal,
-    /// spool materialize, control-build, or evidence publication by itself.
+    /// Single-use pre-ledger authority; deliberately not `Clone` or `Copy`.
     struct OrdinaryAttestAuthority {
         seal: IntegrationSeal,
         retained: RetainedSnapshotSet<6>,
@@ -91208,7 +89906,6 @@ fn fallible(value: Option<u8>) {
         repository_root: PathBuf,
         mode: BootstrapMode,
         control: ControlLedgerExpectationAuthority,
-        /// Closed PATH already joined to the pinned toolchain bin pure grammar.
         closed_path: String,
     }
 
@@ -91243,8 +89940,7 @@ fn fallible(value: Option<u8>) {
         acquisition_spool_binding: Option<FileBinding>,
     }
 
-    /// Single-use capability for the exactly-20 live probes. It can be issued only
-    /// after every non-tool input and the opaque ledger byte stream are retained.
+    /// Single-use capability issued after non-tool inputs and opaque ledger retention.
     struct OrdinaryProbePermit {
         authority: OrdinaryPreLedgerAuthority,
         non_tool: OrdinaryNonToolExpectation,
@@ -91253,9 +89949,6 @@ fn fallible(value: Option<u8>) {
         qualified_platform: OrdinaryQualifiedPlatform,
     }
 
-    /// Private evidence that the public entry's first platform gate has passed.
-    /// Reprobe helpers require this token rather than re-emitting a dominated
-    /// platform diagnostic after authority already exists.
     struct OrdinaryQualifiedPlatform;
 
     struct OrdinaryProbedAuthority {
@@ -91285,8 +89978,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// Capability issued only after the complete strict ledger validator and all
-    /// immediate regular-file/tree rebinds succeed.
     struct OrdinaryArchivePermit {
         expectation: ControlLedgerExpectation,
         ledger_snapshot: CheckedSnapshot,
@@ -91297,17 +89988,12 @@ fn fallible(value: Option<u8>) {
         integration: Option<OrdinaryAttestAuthority>,
     }
 
-    /// Exact ordinary native-tool inventory cardinality (policy + compiled table).
     const ORDINARY_NATIVE_TOOL_COUNT: usize = 20;
     const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 3911;
     const ORDINARY_NATIVE_TOOL_REGISTRY_SHA256: &str =
         "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b";
-    /// Exact ordinary handoff argv arity from `expected_ordinary_handoff_argv`.
     const ORDINARY_HANDOFF_ARGV_ARITY: usize = 5;
 
-    /// Pure side of ordinary native-tool authority.  The frozen identity is
-    /// repeated in the ordinary image so a cardinality or descriptor-registry
-    /// drift cannot be hidden by exercising only the live inventory function.
     fn validate_ordinary_native_tool_descriptor_authority(
         expected_count: usize,
         expected_byte_length: usize,
@@ -91347,11 +90033,6 @@ fn fallible(value: Option<u8>) {
         )
     }
 
-    /// Pure dual-path readiness for ordinary reprobe (B-R1 pure half).
-    ///
-    /// Proves the always-compiled 20-row descriptor table is cardinality-aligned,
-    /// id-unique, and digest-pinned before any live `inventory_existing_native_tools`
-    /// call. This has no ledger-selected inputs, filesystem access, or children.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct OrdinaryDualPathPureAuthority {
         native_tool_count: usize,
@@ -91425,11 +90106,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Pure closed-PATH authority for the independent twenty-tool ordinary reprobe.
-    ///
-    /// Mirrors the produce `pinned_toolchain_bin` grammar without performing any
-    /// filesystem or child-process side effect: closed PATH must be exactly one
-    /// absolute `…/bin` component followed by `:/usr/bin:/bin`.
     fn ordinary_closed_path_toolchain_authority(
         closed_path: &str,
     ) -> Result<String, OrdinaryEntryFailure> {
@@ -91457,7 +90133,6 @@ fn fallible(value: Option<u8>) {
         Ok(tool_bin.to_owned())
     }
 
-    /// Pure ControlLedgerExpectation field authority for ordinary produce/attest.
     fn ordinary_control_ledger_expectation_authority(
         mode: BootstrapMode,
         run_id: &str,
@@ -91488,8 +90163,6 @@ fn fallible(value: Option<u8>) {
                 "ControlLedgerExpectation environment_set digest must be nonzero".to_owned(),
             );
         }
-        // Keep the relative control-ledger path exact to the live role/run grammar
-        // used by `expected_ordinary_handoff_argv` (index 4).
         let control_ledger_relative = format!(".fnd01-run/{role}/{run_id}/control-ledger.bin");
         if control_ledger_relative.contains("//")
             || control_ledger_relative.contains("/./")
@@ -91511,7 +90184,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Nonzero synthetic sealed digest — distinct per field class, never all-zero.
     fn ordinary_sealed_nonzero_digest(tag: u8) -> [u8; 32] {
         let mut digest = [tag; 32];
         digest[0] = tag.wrapping_add(1);
@@ -91529,8 +90201,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// Absolute role path formula matching production `expected_absolute_role_path`
-    /// without reaching into the private helper (keeps ordinary pure).
     fn ordinary_role_absolute_path(
         repository_root: &Path,
         role: &str,
@@ -91558,14 +90228,6 @@ fn fallible(value: Option<u8>) {
         ordinary_utf8_path(&repository_root.join(relative), "role path")
     }
 
-    /// B-R2 sealed full-field join: pure ControlLedgerExpectationAuthority plus
-    /// sealed synthetic bindings produce a complete `ControlLedgerExpectation`
-    /// covering every live struct field without ledger/FS/network children.
-    ///
-    /// Pure pre-open authority alone is insufficient for B-R2 Done-when; this
-    /// join proves layout-derived paths, mode-specific seal/spool rules, tool-set
-    /// digests, cargo executable, build environment, target snapshot, selected
-    /// executable, and bootstrap environment are all admitted together.
     fn ordinary_sealed_control_ledger_expectation_join(
         mode: BootstrapMode,
         repository_root: &Path,
@@ -91746,8 +90408,6 @@ fn fallible(value: Option<u8>) {
             BootstrapMode::Gate => unreachable!("Gate rejected above"),
         };
 
-        // Layout and mode rules mirror the production validator's early expectation
-        // checks (paths, sealed-local-registry id, selected executable, spool rules).
         if scratch_bindings
             .iter()
             .map(|binding| binding.path.as_str())
@@ -91811,8 +90471,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// B-R2 sealed fixture: synthetic Cargo JSON stream that `join_control_build_stream`
-    /// accepts as penultimate matching compiler-artifact + terminal build-finished.
     fn ordinary_sealed_control_build_stdout(
         package_root: &str,
         target_root: &str,
@@ -91831,8 +90489,6 @@ fn fallible(value: Option<u8>) {
             package_root = package_root,
             selected_executable = selected_executable,
         );
-        // Silence unused when format expands without target_root in the template;
-        // filenames still must stay under target_root for join validation.
         let _ = target_root;
         artifact
     }
@@ -91865,8 +90521,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Encode a complete FND01CONTROLv2 ledger that matches a sealed expectation and
-    /// a synthetic build stream. Used by B-R2 production-validator sealed e2e only.
     fn ordinary_sealed_encode_control_ledger_bytes(
         expected: &ControlLedgerExpectation,
         build_stdout: &[u8],
@@ -92087,7 +90741,6 @@ fn fallible(value: Option<u8>) {
         Ok(sealed_bytes)
     }
 
-    /// Shared sealed Produce fixture for B-R2/B-R3 (pure expectation + encoded ledger).
     fn ordinary_sealed_produce_control_fixture(
     ) -> Result<(ControlLedgerExpectation, Vec<u8>, String, String), String> {
         let run_id = "0123456789abcdef0123456789abcdef";
@@ -92135,9 +90788,6 @@ fn fallible(value: Option<u8>) {
         Ok((expectation, ledger_bytes, package_root, target_root))
     }
 
-    /// Test-only Attest fixture producer edge. It uses the shared trust_std outer
-    /// constructor, then binds the exact generated registry through the production
-    /// integration-seal preimage and marker paths.
     #[cfg(test)]
     struct OrdinaryAttestFixtureIntegration {
         producer_outer_bytes: Vec<u8>,
@@ -93125,9 +91775,7 @@ fn fallible(value: Option<u8>) {
         ),
     ];
 
-    /// Frozen executable acceptance manifest for B-R1 through B-R5.  The batch
-    /// verifier consumes exact libtest IDs; no prefix, filter, or zero-test run
-    /// can stand in for this list.
+    /// Frozen exact libtest IDs; filters and zero-test runs receive no credit.
     #[cfg(test)]
     const ORDINARY_B_REQUIRED_TEST_IDS: &[&str] = &[
         "ordinary::ordinary_b_r1_qualified_linux_dual_path_tool_reprobe",
@@ -93767,9 +92415,7 @@ fn fallible(value: Option<u8>) {
         let current_executable = std::env::current_exe()
             .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe recheck: {error}"))?;
 
-        // The parent never writes a PID-bound ledger. The child creates the
-        // execution-bin once, derives the live expectation with its own PID, and
-        // seals exactly one ledger before re-entering the production continuation.
+        // The child alone seals the PID-bound ledger before re-entry.
         let mut authority = require_ordinary_execution_authority(
             &invocation.repository_root,
             invocation.mode,
@@ -94519,18 +93165,7 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Admit ordinary execution only after a grammar-valid FND01AUTHORv2 marker
-    /// rebinds the three authoring paths on the live repository filesystem **and**
-    /// the independent twenty-tool closed-PATH authority plus pure
-    /// `ControlLedgerExpectation` field join succeed.
-    ///
-    /// Invalid or drifted markers remain fail-closed with
-    /// `E_ORDINARY_HANDOFF_PENDING` before any ledger/spool/supply/archive open.
-    /// A successful authoring rebind alone still does not authorize ledger access:
-    /// the typed `OrdinaryPreLedgerAuthority` is issued only after pure tool-PATH
-    /// and ControlLedgerExpectation authority also join. The separate non-Clone
-    /// `OrdinaryProbePermit` is issued only after non-tool bindings and opaque
-    /// ledger retention, and consumes the live 20-tool re-resolve exactly once.
+    /// Issues pre-ledger authority only after authoring, closed-PATH, and field joins.
     fn require_ordinary_execution_authority(
         repository_root: &Path,
         mode: BootstrapMode,
@@ -94569,15 +93204,11 @@ fn fallible(value: Option<u8>) {
                 })?;
         }
 
-        // Independent twenty-tool closed-PATH pure authority (no ledger/FS children).
         let _toolchain_bin = ordinary_closed_path_toolchain_authority(&environment.closed_path)?;
 
-        // Pure dual-path readiness (20-row table + registry pin) is part of
-        // pre-ledger authority, not deferred until after the opaque ledger opens.
         let pure_tools = ordinary_reprobe_dual_path_pure_authority()?;
         debug_assert_eq!(pure_tools.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
 
-        // Pure environment-set template digest (compiled authority; nonzero).
         let environment_set_sha256 = ordinary_environment_set_digest();
         if environment_set_sha256 == [0; 32] {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
@@ -94586,7 +93217,6 @@ fn fallible(value: Option<u8>) {
             ));
         }
 
-        // Complete pure ControlLedgerExpectation field join (no ledger open).
         let control = ordinary_control_ledger_expectation_authority(mode, run_id, environment_set_sha256)
             .map_err(|error| {
                 OrdinaryEntryFailure::from_site(OrdinaryFailureSite::PreLedgerAuthority, error)
@@ -94671,11 +93301,7 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Map each stable ordinary-entry failure code to the product stage that owns
-    /// the failed invariant.  This mapping is deliberately independent of the
-    /// untrusted diagnostic detail, except for the one shared executable code:
-    /// pre-ledger current-executable admission is `authority`, while a parsed
-    /// `selected_executable` mismatch is a `ledger` failure.
+    /// Maps stable failure codes without parsing untrusted diagnostic detail.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum OrdinaryProductStage {
         Authority,
@@ -94917,9 +93543,6 @@ fn fallible(value: Option<u8>) {
     }
 
     impl OrdinaryFailureRoute {
-        /// Exact non-test route inventory emitted by the shipped ordinary
-        /// entry. The seven legacy `cfg(test)` helper routes are deliberately
-        /// absent and cannot earn public or catch-only credit.
         #[cfg(test)]
         const SHIPPED: &'static [Self] = &[
             Self::Arguments,
@@ -94966,8 +93589,6 @@ fn fallible(value: Option<u8>) {
             Self::Evidence,
         ];
 
-        /// Exact `cfg(test)`-only route partition. These direct-helper seams are
-        /// retained for negative coverage and receive no shipped capability credit.
         #[cfg(test)]
         const LEGACY_TEST_ONLY: &'static [Self] = &[
             Self::Path,
@@ -94980,11 +93601,7 @@ fn fallible(value: Option<u8>) {
         ];
     }
 
-    /// Stable identifiers for the executable ordinary failure sites.  Unlike the
-    /// public route registry, this is a production-site inventory: a site can
-    /// select exactly one route, while several sites may legitimately share a
-    /// diagnostic code.  Keeping the two sets separate makes a reachable-site
-    /// bijection possible without recovering a route from error prose.
+    /// Stable production-site identifiers, independent of the public route registry.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum OrdinaryFailureSite {
         EntryArity,
@@ -95015,8 +93632,6 @@ fn fallible(value: Option<u8>) {
         PreLedgerAuthority,
         OpaqueLedger,
         #[cfg(test)]
-        /// Legacy direct-helper negative only; the shipped entry is already
-        /// dominated by initial platform admission before reprobe authority exists.
         ProbeToolPlatform,
         ProbeToolSet,
         LedgerJoin,
@@ -95056,12 +93671,8 @@ fn fallible(value: Option<u8>) {
             Self::BookendSpool, Self::BookendToolSet, Self::BookendExecutable, Self::EvidenceDispatch,
         ];
 
-        /// Defensive catch emitters that remain shipped but have no public
-        /// argv/environment/filesystem failure witness.
         const CATCH_ONLY: &'static [Self] = &[Self::HandoffPanic];
 
-        /// Direct-helper site retained only for the unqualified-platform
-        /// negative; initial platform admission dominates it in shipped entry.
         #[cfg(test)]
         const LEGACY_TEST_ONLY: &'static [Self] = &[Self::ProbeToolPlatform];
 
@@ -95426,10 +94037,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// The ordinary product diagnostic is structured rather than detail-parsed:
-    /// every mapped failure retains its role, available run identifier, expected
-    /// invariant, and observed fact.  Keep this formatter shared with the actual
-    /// stderr emitter so B-R4 cannot be satisfied by a test-only representation.
     fn ordinary_entry_failure_fields(
         mode: &str,
         run_id: &str,
@@ -95444,11 +94051,7 @@ fn fallible(value: Option<u8>) {
         ]
     }
 
-    /// The final ordinary handoff step deliberately has one production dispatch
-    /// surface.  It is called only after the probe permit, strict control-ledger
-    /// join, archive validation, and bookend rebinds.  Pending integration gates
-    /// are not rewritten as failures; verifier errors cannot fall back to the
-    /// pre-consume pending sentinel.
+    /// Sole post-admission dispatch after permit, ledger, archive, and bookend joins.
     fn dispatch_ordinary_evidence(
         result: VResult<Report>,
     ) -> Result<(), OrdinaryEntryFailure> {
@@ -95476,20 +94079,12 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// The only post-consume terminal continuation. It is reached after the
-    /// permit, archive, and bookend checks in `validate_ordinary_handoff_entry`;
-    /// verifier failure is deliberately translated here rather than allowing a
-    /// later handoff-pending sentinel to escape that completed path.
     fn complete_ordinary_post_consume_continuation(
         verifier: impl FnOnce() -> VResult<Report>,
     ) -> Result<(), OrdinaryEntryFailure> {
         dispatch_ordinary_evidence(verifier())
     }
 
-    /// Effect observation is deliberately injected only at the production entry
-    /// seam.  It gives the planted ordering tests a machine-checkable way to prove
-    /// that an admission failure occurred before ledger or evidence work, without
-    /// introducing a second handoff validator.
     trait OrdinaryEntryEffects {
         fn before_ledger_open(&mut self);
         fn before_evidence_dispatch(&mut self);
@@ -95501,18 +94096,7 @@ fn fallible(value: Option<u8>) {
         fn before_evidence_dispatch(&mut self) {}
     }
 
-    /// Ordinary same-PID handoff entry for produce/attest.
-    ///
-    /// Implements the first fail-closed checks from
-    /// `bootstrap_control_plane_contract.harness_entry_rule` that can run without
-    /// the full Phase-B producer ledger pipeline:
-    /// argv/env closedness, current-exe identity, repository root, and nonzero
-    /// process-id validation. External authoring/seal authority remains
-    /// fail-closed before any ledger, supply, spool, archive, child, or output
-    /// access until its complete matrix lands and freezes.
-    ///
-    /// A successful ordinary role handoff is stream-silent. Failure, pending, and
-    /// panic paths emit one bounded operational FND01ENTRYv1 line to stderr.
+    /// Same-PID fail-closed produce/attest handoff; success is stream-silent.
     fn ordinary_known_handoff_run_id(arguments: &[std::ffi::OsString]) -> Option<String> {
         let run_id = arguments.get(3)?.to_str()?;
         if arguments.len() != ORDINARY_HANDOFF_ARGV_ARITY
@@ -95637,7 +94221,6 @@ fn fallible(value: Option<u8>) {
             }
         };
         match validate_ordinary_handoff_entry(&invocation, &environment) {
-            // Success must not be conflated with admission failure (both used to return 3).
             Ok(()) => 0,
             Err(error) => {
                 emit_ordinary_entry_failure_route(mode, &invocation.run_id, error);
@@ -95658,11 +94241,7 @@ fn fallible(value: Option<u8>) {
         )
     }
 
-    /// The sole ordinary production continuation.  The shipped entry uses the
-    /// real platform predicate and no-op observer; focused tests inject only the
-    /// predicate/effect observer needed to prove fail-closed ordering.  Once the
-    /// permit is consumed, this same function owns ledger validation, archive
-    /// validation, bookend rechecks, and the real evidence dispatch.
+    /// Sole production continuation after the single-use permit is consumed.
     fn validate_ordinary_handoff_entry_with_effects(
         invocation: &OrdinaryHandoffArguments,
         environment: &BootstrapEnvironment,
@@ -95696,19 +94275,14 @@ fn fallible(value: Option<u8>) {
             ));
         }
         let qualified_platform = OrdinaryQualifiedPlatform;
-        // A self-described ledger or supply object cannot authorize its own use.
-        // Require a grammar-valid FND01AUTHORv2 marker that rebinds the three
-        // authoring paths on the live repository, plus independent twenty-tool
-        // closed-PATH authority and pure ControlLedgerExpectation field join,
-        // before opening ledger, spool, supply, archive, child, or output surfaces.
+        // Independent authoring, closed-PATH, and field joins precede every artifact open.
         let mut authority = require_ordinary_execution_authority(
             &invocation.repository_root,
             invocation.mode,
             &invocation.run_id,
             environment,
         )?;
-        // Join pure ControlLedgerExpectation authority to the live handoff argv
-        // before any untrusted ledger open. Mismatches stay E_ORDINARY_HANDOFF_PENDING.
+        // Join the expectation to live argv before the untrusted ledger opens.
         let expected_role = match invocation.mode {
             BootstrapMode::Produce => "integration-producer",
             BootstrapMode::Attest => "independent-attester",
@@ -95729,9 +94303,7 @@ fn fallible(value: Option<u8>) {
                 "pre-ledger authority desync from live handoff identity",
             ));
         }
-        // Derive and retain every non-tool expectation without consulting the
-        // ledger. Only then may the ledger be opened, and its bytes stay opaque
-        // until the single-use twenty-tool probe permit has been consumed.
+        // Retain non-tool expectations first; ledger bytes stay opaque until permit use.
         let non_tool = derive_ordinary_non_tool_expectation(
             &mut authority,
             invocation,
@@ -95774,10 +94346,7 @@ fn fallible(value: Option<u8>) {
             mut integration,
         } = archive_permit;
 
-        // This second direct read is deliberately redundant: the complete ledger
-        // validator and immediate file/tree rebinds have already issued archive
-        // authority. It preserves the existing retained-open race checks and must
-        // match the admitted opaque object exactly.
+        // The retained reread must exactly match the admitted opaque ledger.
         let ledger_path = invocation
             .repository_root
             .join(&invocation.control_ledger_path);
@@ -95933,9 +94502,7 @@ fn fallible(value: Option<u8>) {
             ));
         }
         let ledger_first_sha256 = sha256(&bytes);
-        // `validated_ledger` was produced from the admitted bytes before this
-        // direct retained read. Once byte equality holds, keep using its typed
-        // fields rather than structurally parsing the same immutable bytes again.
+        // After retained-byte equality, reuse the already parsed typed ledger.
         let selected = &validated_ledger.selected_executable;
         let selected_path_text = selected.path.as_str();
         let selected_path = Path::new(selected_path_text);
@@ -96075,8 +94642,7 @@ fn fallible(value: Option<u8>) {
             ));
         }
 
-        // Bind the role-appropriate acquisition-spool option before touching archive
-        // contents. Produce carries one exact immutable spool; Attest carries no value.
+        // Bind the role-specific spool before archive contents.
         let spool_present = validated_ledger.acquisition_spool.present;
         let spool_path = validated_ledger.acquisition_spool.path.as_deref();
         let spool_binding = validated_ledger.acquisition_spool.binding;
@@ -96198,9 +94764,7 @@ fn fallible(value: Option<u8>) {
                 unreachable!("ordinary argv parsing rejects Gate before ledger decoding")
             }
         };
-        // ordinary_archive_validation_rule step 2: parse the complete custom
-        // container first, then validate every already-bound 0x01 payload. No
-        // archive decompression occurs until framing/order/bounds/digests reach EOF.
+        // Decompression follows complete framing, ordering, bounds, and digest validation.
         let first_supply_framing =
             parse_ordinary_supply_framing(&supply_bytes, "ordinary handoff supply bundle")
                 .map_err(|error| {
@@ -96219,8 +94783,7 @@ fn fallible(value: Option<u8>) {
         drop(bytes);
         drop(supply_bytes);
 
-        // ordinary_archive_validation_rule step 3: after the final archive, reopen
-        // and independently strict-reparse/re-hash every first-bound handoff object.
+        // Reopen, strict-reparse, and rehash every first-bound handoff object.
         let (ledger_recheck_snapshot, ledger_recheck_bytes) = checked_read(
             &invocation.repository_root,
             &invocation.control_ledger_path,
@@ -96419,9 +94982,7 @@ fn fallible(value: Option<u8>) {
                 })?;
         }
 
-        // Join the pre-parse independent 20-tool observations to ledger digests
-        // (ordinary_tool_reprobe_rule). Reprobe already ran on opaque ledger bytes;
-        // only digest equality and post-archive no-child revalidation remain here.
+        // Join pre-parse tool observations to ledger digests and revalidate after archive.
         let tool_set = validated_ledger.tool_set_sha256;
         let environment_set = validated_ledger.environment_set_sha256;
         if tool_set == [0; 32] || environment_set == [0; 32] {
@@ -96496,10 +95057,7 @@ fn fallible(value: Option<u8>) {
                 "executable identity or owner-executable mode changed",
             ));
         }
-        // harness_entry_rule step 6: workspace snapshot + evidence-matrix dispatch.
-        // Integration receipts remain Severity::Pending (E_PENDING_GATE); only
-        // Severity::Error fails closed as E_ORDINARY_EVIDENCE. This is not a
-        // permanent E_ORDINARY_HANDOFF_PENDING stub on the happy path.
+        // Pending receipts stay pending; only errors fail the evidence dispatch.
         effects.before_evidence_dispatch();
         complete_ordinary_post_consume_continuation(|| run_verifier_at(&invocation.repository_root))
     }
@@ -96631,9 +95189,6 @@ fn fallible(value: Option<u8>) {
 
     #[test]
     fn ordinary_b_r4_handoff_source_order_keeps_probe_archive_and_bookend_authority() {
-        // This structural marker check complements the real pure/live fault
-        // tests. It scopes the exact function body and uses call names rather
-        // than whitespace-sensitive source fragments.
         let body = ordinary_function_body(
             include_str!("fnd_01_dependency_evidence.rs"),
             "validate_ordinary_handoff_entry_with_effects",
@@ -96679,10 +95234,6 @@ fn fallible(value: Option<u8>) {
             .zip(limits)
             .zip(bindings.iter_mut())
         {
-            // Test helper only: read authoring bytes without the Linux-only
-            // retained-evidence identity gate used by production checked_read.
-            // Production require_ordinary_execution_authority still uses
-            // checked_snapshot (Linux x86_64). Bounds remain enforced here.
             let abs = repository_root.join(path);
             let bytes = std::fs::read(&abs).unwrap_or_else(|error| panic!("read {path}: {error}"));
             let byte_length = u64::try_from(bytes.len()).expect("authoring length");
@@ -96722,7 +95273,6 @@ fn fallible(value: Option<u8>) {
         let marker = live_authoring_marker_text(&repository_root);
         let environment = BootstrapEnvironment {
             authoring_marker: marker,
-            // Incomplete closed PATH: missing pinned toolchain + :/usr/bin:/bin suffix.
             closed_path: "/usr/bin".to_owned(),
             integration_seal: None,
             producer_outer_record_path: None,
@@ -96739,9 +95289,6 @@ fn fallible(value: Option<u8>) {
         assert_eq!(error.code(), "E_ORDINARY_HANDOFF_PENDING");
         assert_eq!(error.site, OrdinaryFailureSite::PreLedgerAuthority);
         assert_eq!(error.route(), OrdinaryFailureRoute::Pending);
-        // On Linux x86_64 production identity binding, incomplete closed PATH surfaces
-        // here. On unqualified hosts, checked_snapshot fails at authoring rebind first
-        // (still E_ORDINARY_HANDOFF_PENDING, never ledger open).
         assert!(
             error.observed.contains("twenty-tool")
                 || error.observed.contains("closed PATH")
@@ -96751,8 +95298,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// Production `checked_snapshot` identity binding is Linux x86_64-only; the
-    /// pure permit happy path is therefore exercised on the qualified platform.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_preledger_authority_issues_after_path_and_control_join() {
@@ -96814,8 +95359,6 @@ fn fallible(value: Option<u8>) {
 
     #[test]
     fn ordinary_evidence_dispatch_code_is_named_and_stable() {
-        // Offline evidence-matrix failures must surface as E_ORDINARY_EVIDENCE, never
-        // as a permanent HANDOFF_PENDING after authoring admission completes.
         let code = "E_ORDINARY_EVIDENCE";
         assert!(entry_diagnostic_code_is_valid(code) || code.starts_with("E_ORDINARY_"));
         assert_ne!(code, "E_ORDINARY_HANDOFF_PENDING");
@@ -97066,7 +95609,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// B-R1 pure half: 20-row compiled table + registry pin join without live I/O.
     #[test]
     fn ordinary_reprobe_dual_path_pure_authority_aligns_table_and_registry() {
         let pure = ordinary_reprobe_dual_path_pure_authority()
@@ -97084,7 +95626,6 @@ fn fallible(value: Option<u8>) {
             super::trust_std::NATIVE_TOOL_DESCRIPTORS.len(),
             ORDINARY_NATIVE_TOOL_COUNT,
         );
-        // Closed-PATH pure grammar remains independent of live inventory.
         ordinary_closed_path_toolchain_authority(
             "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
         )
@@ -97107,7 +95648,6 @@ fn fallible(value: Option<u8>) {
         assert_ne!(control.process_id, 0);
     }
 
-    /// B-R2 sealed full-field ControlLedgerExpectation join (pure tier, no ledger/FS).
     #[test]
     fn ordinary_sealed_control_ledger_expectation_joins_all_live_fields() {
         let run_id = "0123456789abcdef0123456789abcdef";
@@ -97138,7 +95678,6 @@ fn fallible(value: Option<u8>) {
             bootstrap_environment.clone(),
         )
         .expect("Produce sealed full-field join");
-        // Every live ControlLedgerExpectation field is populated and layout-joined.
         assert_eq!(expectation.mode, BootstrapMode::Produce);
         assert_eq!(expectation.repository_root, repository_root);
         assert_eq!(expectation.run_id, run_id);
@@ -97180,7 +95719,6 @@ fn fallible(value: Option<u8>) {
         );
         assert_eq!(expectation.bootstrap_environment, bootstrap_environment);
         assert!(expectation.acquisition_spool_binding.is_some());
-        // Mode matrix: Attest requires nonzero seal and no spool.
         let attest_control = ordinary_control_ledger_expectation_authority(
             BootstrapMode::Attest,
             run_id,
@@ -97211,7 +95749,6 @@ fn fallible(value: Option<u8>) {
         assert_ne!(attest.integration_seal_sha256, [0; 32]);
         assert!(attest.acquisition_spool_binding.is_none());
         assert_eq!(attest.local_registry.id, "sealed-local-registry");
-        // Fail-closed: Gate, zero digests, incomplete env, relative cargo.
         let gate_err = ordinary_sealed_control_ledger_expectation_join(
             BootstrapMode::Gate,
             &repository_root,
@@ -97260,9 +95797,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// Frozen R2 acceptance: the parent copies the current libtest into a fresh,
-    /// sealed Attest role root, and the exact selected executable re-enters this
-    /// same test ID to consume the real production permit and ledger path.
     #[test]
     fn ordinary_b_r2_sealed_production_e2e() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -97282,9 +95816,7 @@ fn fallible(value: Option<u8>) {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID, false);
     }
 
-    /// Frozen R2 negatives: physical parent/file substitutions are refused by
-    /// the sealing boundary, then only the child-sealed bound tool-set digest
-    /// differs in self-reexec; both paths leave accepted state unchanged.
+    /// Independent substitutions leave the accepted baseline unchanged.
     #[test]
     fn ordinary_b_r2_sealed_field_desync_fails_closed() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -97324,9 +95856,6 @@ fn fallible(value: Option<u8>) {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID, true);
     }
 
-    /// B-R3 pure tier: compose dual-path pure authority + pure ControlLedgerExpectation
-    /// field join + environment digest without ledger/FS/network children.
-    /// // B-R3-PURE
     #[test]
     fn ordinary_b_r3_pure_matrix() {
         let pure = ordinary_reprobe_dual_path_pure_authority().expect("B-R3 pure dual-path");
@@ -97353,9 +95882,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// B-R3 sealed tier: reuse sealed ControlLedgerExpectation tables and production
-    /// validate_control_ledger_bytes on the encoded sealed fixture.
-    /// // B-R3-SEALED
     #[test]
     fn ordinary_b_r3_sealed_matrix() {
         let (expectation, ledger_bytes, _package_root, _target_root) =
@@ -97380,10 +95906,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// B-R3 live tier: on the qualified Linux executor, all twenty reprobes and
-    /// both live digests are mandatory.  Other platforms prove the separately
-    /// named pre-ledger platform negative below.
-    /// // B-R3-LIVE
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r3_live_matrix() {
@@ -97455,9 +95977,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// B-R1 qualified live half: only the qualified Linux executor is allowed to
-    /// claim the twenty-tool reprobe.  This is deliberately not a best-effort
-    /// host probe: all 20 rows and both live digests are mandatory on that tier.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
@@ -97492,8 +96011,7 @@ fn fallible(value: Option<u8>) {
         assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
     }
 
-    /// B-R3 ordering negative: an unqualified host reaches the platform gate
-    /// before any ledger open, validator, archive, or evidence dispatch.
+    /// Unqualified hosts reject before any ledger or evidence access.
     #[derive(Default)]
     struct OrdinaryPlatformRefusalEffects {
         ledger_open_attempts: usize,
@@ -97660,9 +96178,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// B-R1 live half: unqualified hosts must fail closed at reprobe stage with
-    /// E_UNQUALIFIED_PLATFORM after pure dual-path readiness succeeds. On Linux
-    /// x86_64 the live inventory path may proceed (execution-bin may still fail).
     #[test]
     fn ordinary_b_r1_live_half_unqualified_or_execution_bin_fails_closed() {
         let pure = ordinary_reprobe_dual_path_pure_authority()
@@ -97677,7 +96192,6 @@ fn fallible(value: Option<u8>) {
         );
         match result {
             Ok(reprobe) => {
-                // Qualified platform with a complete execution-bin surface.
                 assert_ne!(reprobe.tool_set_sha256, [0; 32]);
                 assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
                 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -97689,8 +96203,6 @@ fn fallible(value: Option<u8>) {
                 }
             }
             Err(error) => {
-                // Pure half already joined; residual must be live inventory /
-                // platform / execution-bin, never a silent pure-table skip.
                 assert!(
                     matches!(
                         (error.code(), error.site, error.route()),
@@ -97716,8 +96228,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// B-R4 product stages remain first-class entry_diagnostic_stage tokens and
-    /// must not collapse ordinary fail-closed codes to the legacy "ordinary" stage.
     #[test]
     fn ordinary_b_r4_product_stages_are_first_class_entry_tokens() {
         let mut route_ids = BTreeSet::new();
@@ -97745,9 +96255,6 @@ fn fallible(value: Option<u8>) {
             "bookend",
             "evidence",
         ] {
-            // entry_diagnostic_stage is private to trust_std; ordinary mapping is
-            // the product surface.  Unknown codes still default via the ordinary
-            // handoff stage mapper, but product stages themselves must be distinct.
             assert_ne!(stage, "ordinary");
             assert_ne!(stage, "bootstrap");
             assert_ne!(stage, "controller");
@@ -97861,9 +96368,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// B-R4 residual: production harness_main ordinary product branches must emit
-    /// typed failure sites — never hard-code stage=ordinary for known
-    /// E_ENTRY_ARGUMENTS / E_ENTRY_PANIC failures.
     #[test]
     fn ordinary_b_r4_harness_main_product_failures_emit_authority_stage() {
         #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -97899,7 +96403,6 @@ fn fallible(value: Option<u8>) {
             Err("ordinary harness must bind the real handoff callback and emitter"),
             "one emitter binding replacement must reject the wrapper evaluator",
         );
-        // All structural predicates consume the same normalized TokenStream text.
         assert!(
             handoff_core.contains("arguments.len()!=ORDINARY_HANDOFF_ARGV_ARITY"),
             "the typed core must reject malformed arity before callback dispatch",
@@ -97912,7 +96415,6 @@ fn fallible(value: Option<u8>) {
             handoff_core.contains("OrdinaryFailureSite::HandoffPanic"),
             "panic path must select the HandoffPanic site",
         );
-        // No hard-coded stage=ordinary at ordinary product call sites (branches 3/4).
         assert!(
             !body.contains("emit_entry_diagnostic(\"ordinary\","),
             "harness_main must not hard-code stage=ordinary for ordinary product failures",
@@ -97998,9 +96500,6 @@ fn fallible(value: Option<u8>) {
             "exactly one typed panic frame is emitted",
         );
 
-        // This direct callback injection proves only the defensive catch path.
-        // It receives zero public-reachability credit; public witnesses are a
-        // separate runtime obligation for the central verifier.
         let mut catch_only = OrdinaryCatchOnlyCommit::default();
         classify_and_commit_catch_only_claim(
             OrdinaryCatchOnlyClaim {
@@ -98035,8 +96534,6 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    /// Frozen R5 acceptance: this exact selected child reaches the sole real
-    /// post-consume dispatch and asserts its fresh-root verifier code and subject.
     #[test]
     fn ordinary_b_r5_post_consume_runtime_uses_evidence_code() {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID, false);
@@ -98058,7 +96555,6 @@ fn fallible(value: Option<u8>) {
         output.extend_from_slice(bytes);
     }
 
-    /// Pure environment-set template digest (must match produce encode_environment_set_digest).
     fn ordinary_environment_set_digest() -> [u8; 32] {
         const PROFILES: &[(&str, &[(&str, &str)])] = &[
             (
@@ -98203,7 +96699,6 @@ fn fallible(value: Option<u8>) {
 
     struct OrdinaryToolReprobe {
         tool_set_sha256: [u8; 32],
-        /// Bound on the qualified platform; retained for post-archive revalidation.
         #[allow(dead_code)]
         execution_bin_sha256: [u8; 32],
         acquisition_tools: AcquisitionToolPaths,
@@ -98246,8 +96741,6 @@ fn fallible(value: Option<u8>) {
         closed_path: &str,
         _qualified_platform: OrdinaryQualifiedPlatform,
     ) -> Result<OrdinaryToolReprobe, OrdinaryEntryFailure> {
-        // Pure dual-path readiness (20-row table + registry pin) runs before the
-        // live inventory. No ledger-selected inputs, filesystem access, or children.
         let pure = ordinary_reprobe_dual_path_pure_authority()?;
         debug_assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -98262,7 +96755,6 @@ fn fallible(value: Option<u8>) {
                 OrdinaryFailureSite::ProbeToolSet,
                 error.detail(),
             ))?;
-            // Live dual-path cardinality must join the pure 20-row table exactly.
             if inventory.native_tool_count() != pure.native_tool_count
                 || inventory.native_tool_count() != ORDINARY_NATIVE_TOOL_COUNT
             {
@@ -98281,8 +96773,6 @@ fn fallible(value: Option<u8>) {
                 acquisition_tools: inventory.acquisition_tools().clone(),
                 inventory,
             };
-            // Surface execution_bin_sha256 in a pure nonzero gate so the field is
-            // not dead while inventory remains the sole live digest source.
             if reprobe.execution_bin_sha256 == [0; 32] || reprobe.tool_set_sha256 == [0; 32] {
                 return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                     OrdinaryFailureSite::ProbeToolSet,
@@ -98298,9 +96788,6 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    /// Legacy direct-helper seam for test-only negatives.  Shipped production
-    /// enters `ordinary_reprobe_tool_set_qualified` only after the initial
-    /// platform capability is issued.
     #[cfg(test)]
     fn ordinary_reprobe_tool_set_shared(
         repository_root: &Path,
@@ -98672,10 +97159,6 @@ fn fallible(value: Option<u8>) {
         assert_eq!(run_ordinary_controller_entry(arguments), 3);
     }
 
-    /// The ordinary handoff branches share one small injectable core so malformed
-    /// arity and the defensive panic edge use the same typed emitter. The shipped
-    /// wrapper supplies the real handoff and stderr emitter; only the callback
-    /// boundary is parameterized.
     fn ordinary_handoff_harness_core<F, E>(
         arguments: Vec<std::ffi::OsString>,
         handoff: F,
@@ -98745,7 +97228,6 @@ fn fallible(value: Option<u8>) {
                 return run_sdk_batch_verify_json_from_stdin();
             }
             match arguments.len() {
-                // Local controller: exact single-item argv runs the dependency-backed verifier.
                 1 => {
                     branch.set(1);
                     match run_verifier() {
@@ -98766,14 +97248,11 @@ fn fallible(value: Option<u8>) {
                         }
                     }
                 }
-                // Ordinary local controller: validate exact admission, then fail closed because
-                // this policy supplies no external authority for a native controller build.
                 4 => {
                     branch.set(2);
                     mode.set("controller");
                     run_ordinary_controller_entry(arguments)
                 }
-                // Ordinary produce/attest handoff: exact five-item form only.
                 5 => {
                     branch.set(3);
                     mode.set(match arguments.get(1).and_then(|value| value.to_str()) {
@@ -98792,8 +97271,6 @@ fn fallible(value: Option<u8>) {
                         },
                     )
                 }
-                // Malformed arity is never conflated with role handoff or local verifier.
-                // B-R4 consumes the typed ordinary route registry at the production edge.
                 _ => {
                     branch.set(4);
                     ordinary_handoff_harness_core(
@@ -98817,7 +97294,6 @@ fn fallible(value: Option<u8>) {
                         "E_ENTRY_PANIC",
                         "panic payload suppressed",
                     ),
-                    // Ordinary produce/attest handoff panic: typed product route.
                     3 => {
                         let run_id = ordinary_run_id.borrow();
                         emit_ordinary_entry_failure_route(
@@ -98829,7 +97305,6 @@ fn fallible(value: Option<u8>) {
                             ),
                         );
                     }
-                    // Malformed-arity panic: typed product route.
                     4 => {
                         emit_ordinary_entry_failure_route(
                             "unknown",
@@ -100050,6 +98525,13 @@ fn fallible(value: Option<u8>) {
 pub use bootstrap::harness_main;
 #[cfg(not(fnd01_bootstrap))]
 pub use ordinary::{harness_main, sdk_batch_verify_json};
+#[cfg(not(fnd01_bootstrap))]
+pub(crate) use ordinary::{
+    SdkBatchPlan, SdkBatchReceiptBody, SdkExecutableBinding, SdkExecutionObservation,
+    SdkExecutionProcessBinding, SdkNetworkProbeBinding, SdkTranscriptBinding,
+    ValidatedSdkStaticPeer, sdk_admit_batch, sdk_batch_failure_json, sdk_composite_binding,
+    sdk_environment_sha256, sdk_prepare_batch, sdk_process_sha256, sdk_sequence_sha256,
+};
 
 #[cfg(all(fnd01_bootstrap, not(test)))]
 fn main() {
