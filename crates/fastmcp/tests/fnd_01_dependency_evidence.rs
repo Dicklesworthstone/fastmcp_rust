@@ -15013,6 +15013,88 @@ mod trust_std {
         pub registry: Option<String>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SparsePubtimeFailure {
+        Shape,
+        Calendar,
+    }
+
+    pub const SIF_REQ: &[&str] = &["name", "vers", "deps", "cksum"];
+    pub const SIF_OPT: &[&str] = &[
+        "features", "features2", "yanked", "links", "rust_version", "pubtime", "v",
+    ];
+    pub const SDF_REQ: &[&str] = &["name", "req"];
+    pub const SDF_OPT: &[&str] = &[
+        "features", "optional", "default_features", "target", "kind", "registry",
+        "package", "public", "artifact", "bindep_target", "lib",
+    ];
+
+    pub fn sparse_text_valid(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 4096
+            && !value.contains('\0')
+            && !value.chars().any(char::is_control)
+    }
+
+    pub fn sparse_fields_exact<'a>(
+        mut contains: impl FnMut(&str) -> bool,
+        mut fields: impl Iterator<Item = &'a str>,
+        field_count: usize,
+        required: &[&str],
+        optional: &[&str],
+    ) -> bool {
+        field_count >= required.len()
+            && field_count <= required.len() + optional.len()
+            && required.iter().all(|field| contains(field))
+            && fields.all(|field| {
+                required.contains(&field) || optional.contains(&field)
+            })
+    }
+
+    pub fn sparse_pubtime_valid(value: &str) -> Result<(), SparsePubtimeFailure> {
+        let bytes = value.as_bytes();
+        let valid_shape = bytes.len() == 20
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'T'
+            && bytes[13] == b':'
+            && bytes[16] == b':'
+            && bytes[19] == b'Z'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit());
+        if !valid_shape {
+            return Err(SparsePubtimeFailure::Shape);
+        }
+        let year = std::str::from_utf8(&bytes[..4])
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        let parse = |offset| {
+            std::str::from_utf8(&bytes[offset..offset + 2])
+                .ok()
+                .and_then(|value| value.parse::<u8>().ok())
+        };
+        let month = parse(5).unwrap_or(0);
+        let day = parse(8).unwrap_or(0);
+        let hour = parse(11).unwrap_or(24);
+        let minute = parse(14).unwrap_or(60);
+        let second = parse(17).unwrap_or(60);
+        let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        };
+        if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+            return Err(SparsePubtimeFailure::Calendar);
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SparseFeatureValue {
         Feature(String),
@@ -17816,7 +17898,8 @@ mod phase_b_std {
         validate_bootstrap_cargo_lock_v4_lexical,
         validate_cargo_config_discovery,
         snapshot_usage_roots_nofollow, validate_sparse_index_semantics,
-        validate_absolute_lexical_path,
+        validate_absolute_lexical_path, sparse_fields_exact, sparse_pubtime_valid,
+        sparse_text_valid, SparsePubtimeFailure, SDF_OPT, SDF_REQ, SIF_OPT, SIF_REQ,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
@@ -22309,7 +22392,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         optional: &[&str],
         subject: &str,
     ) -> TrustResult<()> {
-        if exact_json_fields(object, required, optional) {
+        if sparse_fields_exact(
+            |field| object.iter().any(|(candidate, _)| candidate == field),
+            object.iter().map(|(field, _)| field.as_str()),
+            object.len(),
+            required,
+            optional,
+        ) {
             return Ok(());
         }
         Err(sparse_index_error(
@@ -22331,11 +22420,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
     fn sparse_text<'a>(value: &'a JsonValue, subject: &str) -> TrustResult<&'a str> {
         let text = value.string(subject)?;
-        if text.is_empty()
-            || text.len() > 4096
-            || text.contains('\0')
-            || text.chars().any(char::is_control)
-        {
+        if !sparse_text_valid(text) {
             return Err(sparse_index_error(
                 "E_PHASE_B_CARGO_INDEX_TYPE",
                 subject,
@@ -22359,11 +22444,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let object = value.object(subject)?;
         let mut features = BTreeMap::new();
         for (feature, members) in object {
-            if feature.is_empty()
-                || feature.len() > 4096
-                || feature.contains('\0')
-                || feature.chars().any(char::is_control)
-            {
+            if !sparse_text_valid(feature) {
                 return Err(sparse_index_error(
                     "E_PHASE_B_CARGO_INDEX_TYPE",
                     subject,
@@ -22606,24 +22687,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         subject: &str,
     ) -> TrustResult<SparseDependencySemantic> {
         let object = value.object(subject)?;
-        sparse_exact_fields(
-            object,
-            &["name", "req"],
-            &[
-                "features",
-                "optional",
-                "default_features",
-                "target",
-                "kind",
-                "registry",
-                "package",
-                "public",
-                "artifact",
-                "bindep_target",
-                "lib",
-            ],
-            subject,
-        )?;
+        sparse_exact_fields(object, SDF_REQ, SDF_OPT, subject)?;
         let name = sparse_text(JsonValue::field(object, "name", subject)?, subject)?;
         validate_cargo_package_name(name, true, subject)?;
         let requirement = sparse_text(JsonValue::field(object, "req", subject)?, subject)?;
@@ -22749,60 +22813,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(())
     }
 
-    fn parse_two_ascii_digits(bytes: &[u8], offset: usize) -> Option<u8> {
-        let first = *bytes.get(offset)?;
-        let second = *bytes.get(offset + 1)?;
-        if !first.is_ascii_digit() || !second.is_ascii_digit() {
-            return None;
-        }
-        Some((first - b'0') * 10 + (second - b'0'))
-    }
-
     fn validate_sparse_pubtime(value: &str, subject: &str) -> TrustResult<()> {
-        let bytes = value.as_bytes();
-        let valid_shape = bytes.len() == 20
-            && bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes[10] == b'T'
-            && bytes[13] == b':'
-            && bytes[16] == b':'
-            && bytes[19] == b'Z'
-            && bytes
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit());
-        if !valid_shape {
-            return Err(sparse_index_error(
+        match sparse_pubtime_valid(value) {
+            Ok(()) => Ok(()),
+            Err(SparsePubtimeFailure::Shape) => Err(sparse_index_error(
                 "E_PHASE_B_CARGO_INDEX_TYPE",
                 subject,
                 "pubtime must use YYYY-MM-DDThh:mm:ssZ",
-            ));
-        }
-        let year = std::str::from_utf8(&bytes[..4])
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(0);
-        let month = parse_two_ascii_digits(bytes, 5).unwrap_or(0);
-        let day = parse_two_ascii_digits(bytes, 8).unwrap_or(0);
-        let hour = parse_two_ascii_digits(bytes, 11).unwrap_or(24);
-        let minute = parse_two_ascii_digits(bytes, 14).unwrap_or(60);
-        let second = parse_two_ascii_digits(bytes, 17).unwrap_or(60);
-        let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let days = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => 0,
-        };
-        if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
-            return Err(sparse_index_error(
+            )),
+            Err(SparsePubtimeFailure::Calendar) => Err(sparse_index_error(
                 "E_PHASE_B_CARGO_INDEX_TYPE",
                 subject,
                 "pubtime contains an invalid UTC calendar value",
-            ));
+            )),
         }
-        Ok(())
     }
 
     fn sparse_index_identity(
@@ -22812,20 +22836,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     ) -> TrustResult<SparseIndexIdentity> {
         let parsed = parse_json(json, subject)?;
         let object = parsed.object(subject)?;
-        sparse_exact_fields(
-            object,
-            &["name", "vers", "deps", "cksum"],
-            &[
-                "features",
-                "features2",
-                "yanked",
-                "links",
-                "rust_version",
-                "pubtime",
-                "v",
-            ],
-            subject,
-        )?;
+        sparse_exact_fields(object, SIF_REQ, SIF_OPT, subject)?;
         let name = sparse_text(JsonValue::field(object, "name", subject)?, subject)?;
         validate_cargo_package_name(name, true, subject)?;
         let version = sparse_text(JsonValue::field(object, "vers", subject)?, subject)?;
@@ -34313,7 +34324,9 @@ mod ordinary {
         ValidatedFileBinding, ValidatedTargetSnapshot, ACQUISITION_SPOOL_PREFIX,
         CONTROL_LEDGER_PREFIX, CONTROL_SCRATCH_MAXIMA, MAX_ACQUISITION_SPOOL_BYTES,
         MAX_CONTROL_LEDGER_BYTES, MAX_GATE_EXECUTABLE_BYTES, MAX_SPARSE_CACHE_INPUT_BYTES,
-        MAX_SUPPLY_BUNDLE_BYTES, MAX_VERIFIER_BYTES,
+        MAX_SUPPLY_BUNDLE_BYTES, MAX_VERIFIER_BYTES, sparse_fields_exact,
+        sparse_pubtime_valid, sparse_text_valid, SparsePubtimeFailure, SDF_OPT, SDF_REQ,
+        SIF_OPT, SIF_REQ,
     };
     use super::{
         FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX, RECORD_SET_PREFIX,
@@ -89603,11 +89616,13 @@ fn fallible(value: Option<u8>) {
         optional: &[&str],
         subject: &str,
     ) -> VResult<()> {
-        if required.iter().all(|field| object.contains_key(*field))
-            && object.keys().all(|field| {
-                required.contains(&field.as_str()) || optional.contains(&field.as_str())
-            })
-        {
+        if sparse_fields_exact(
+            |field| object.contains_key(field),
+            object.keys().map(String::as_str),
+            object.len(),
+            required,
+            optional,
+        ) {
             return Ok(());
         }
         Err(ordinary_index_error(
@@ -89618,14 +89633,7 @@ fn fallible(value: Option<u8>) {
 
     fn ordinary_index_text<'a>(value: &'a StrictJson, subject: &str) -> VResult<&'a str> {
         match value {
-            StrictJson::String(text)
-                if !text.is_empty()
-                    && text.len() <= 4096
-                    && !text.contains('\0')
-                    && !text.chars().any(char::is_control) =>
-            {
-                Ok(text)
-            }
+            StrictJson::String(text) if sparse_text_valid(text) => Ok(text),
             _ => Err(ordinary_index_error(
                 subject,
                 "nonempty bounded control-free string required",
@@ -89664,11 +89672,7 @@ fn fallible(value: Option<u8>) {
         let object = strict_json_object(value, subject)?;
         let mut features = BTreeMap::new();
         for (feature, members) in object {
-            if feature.is_empty()
-                || feature.len() > 4096
-                || feature.contains('\0')
-                || feature.chars().any(char::is_control)
-            {
+            if !sparse_text_valid(feature) {
                 return Err(ordinary_index_error(subject, "invalid feature-map key"));
             }
             let values = ordinary_index_string_array(members, &format!("{subject}.{feature}"))?;
@@ -89682,24 +89686,7 @@ fn fallible(value: Option<u8>) {
         subject: &str,
     ) -> VResult<SparseDependencySemantic> {
         let object = strict_json_object(value, subject)?;
-        ordinary_index_exact_fields(
-            object,
-            &["name", "req"],
-            &[
-                "features",
-                "optional",
-                "default_features",
-                "target",
-                "kind",
-                "registry",
-                "package",
-                "public",
-                "artifact",
-                "bindep_target",
-                "lib",
-            ],
-            subject,
-        )?;
+        ordinary_index_exact_fields(object, SDF_REQ, SDF_OPT, subject)?;
         let name = object
             .get("name")
             .ok_or_else(|| ordinary_index_error(subject, "name"))?;
@@ -89833,50 +89820,17 @@ fn fallible(value: Option<u8>) {
     }
 
     fn ordinary_index_pubtime(value: &str, subject: &str) -> VResult<()> {
-        let bytes = value.as_bytes();
-        if bytes.len() != 20
-            || bytes[4] != b'-'
-            || bytes[7] != b'-'
-            || bytes[10] != b'T'
-            || bytes[13] != b':'
-            || bytes[16] != b':'
-            || bytes[19] != b'Z'
-            || bytes.iter().enumerate().any(|(index, byte)| {
-                !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
-            })
-        {
-            return Err(ordinary_index_error(
+        match sparse_pubtime_valid(value) {
+            Ok(()) => Ok(()),
+            Err(SparsePubtimeFailure::Shape) => Err(ordinary_index_error(
                 subject,
                 "pubtime must use YYYY-MM-DDThh:mm:ssZ",
-            ));
-        }
-        let parse = |range: std::ops::Range<usize>| {
-            std::str::from_utf8(&bytes[range])
-                .ok()
-                .and_then(|value| value.parse::<u16>().ok())
-        };
-        let year = parse(0..4).unwrap_or(0);
-        let month = parse(5..7).unwrap_or(0);
-        let day = parse(8..10).unwrap_or(0);
-        let hour = parse(11..13).unwrap_or(24);
-        let minute = parse(14..16).unwrap_or(60);
-        let second = parse(17..19).unwrap_or(60);
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let days = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => 0,
-        };
-        if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
-            return Err(ordinary_index_error(
+            )),
+            Err(SparsePubtimeFailure::Calendar) => Err(ordinary_index_error(
                 subject,
                 "invalid pubtime calendar value",
-            ));
+            )),
         }
-        Ok(())
     }
 
     fn ordinary_supply_json_identity(
@@ -89886,20 +89840,7 @@ fn fallible(value: Option<u8>) {
     ) -> VResult<(OrdinarySupplyLockTriple, Option<bool>)> {
         let json = parse_strict_json(json_bytes, subject)?;
         let object = strict_json_object(&json, subject)?;
-        ordinary_index_exact_fields(
-            object,
-            &["name", "vers", "deps", "cksum"],
-            &[
-                "features",
-                "features2",
-                "yanked",
-                "links",
-                "rust_version",
-                "pubtime",
-                "v",
-            ],
-            subject,
-        )?;
+        ordinary_index_exact_fields(object, SIF_REQ, SIF_OPT, subject)?;
         let name = strict_json_string(object, "name", subject)?;
         let version = strict_json_string(object, "vers", subject)?;
         let checksum = match object.get("cksum") {
