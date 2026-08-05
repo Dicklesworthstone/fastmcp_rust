@@ -34341,7 +34341,6 @@ mod ordinary {
     #[cfg(windows)]
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
-    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     use std::process::Command;
     use std::str::FromStr;
 
@@ -34400,6 +34399,7 @@ mod ordinary {
     const EXPECTED_TARGETS: usize = 5;
     const EXPECTED_PACKAGES: usize = 9;
     const EXPECTED_SDKS: usize = 4;
+    const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
     const HARD_MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
     const EXACT_RUST_TOOLCHAIN_TOML: &str = concat!(
         "[toolchain]\n",
@@ -37119,6 +37119,7 @@ activate = 1\n";
         ecosystem: String,
         source_selector: String,
         source_commit: String,
+        reproduction_script_byte_length: u64,
         reproduction_script_sha256: String,
         checked_lock_sha256: String,
         artifact_count: usize,
@@ -37172,6 +37173,7 @@ activate = 1\n";
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SdkExecutionObservation {
         Npm {
+            process: SdkExecutionProcessBinding,
             binding: SdkObservationBinding,
             node_version: String,
             npm_version: String,
@@ -37190,6 +37192,7 @@ activate = 1\n";
             checked_in_lock_sha256_after_install: String,
         },
         Pip {
+            process: SdkExecutionProcessBinding,
             binding: SdkObservationBinding,
             python_version: String,
             pip_version: String,
@@ -37212,6 +37215,7 @@ activate = 1\n";
             checked_in_lock_sha256_after_download: String,
         },
         Nuget {
+            process: SdkExecutionProcessBinding,
             binding: SdkObservationBinding,
             dotnet_sdk_version: String,
             resolver_sdk_archive_sha256: String,
@@ -37239,6 +37243,7 @@ activate = 1\n";
             checked_in_lock_sha256_after_restore: String,
         },
         Go {
+            process: SdkExecutionProcessBinding,
             binding: SdkObservationBinding,
             go_version: String,
             online_download_exit: i64,
@@ -37269,9 +37274,76 @@ activate = 1\n";
         },
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SdkExecutionProofClass {
+        BatchExecution,
+        ValidationFixture,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkExecutableBinding {
+        id: String,
+        path: String,
+        byte_length: u64,
+        sha256: String,
+        version: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkTranscriptBinding {
+        raw: String,
+        byte_length: u64,
+        sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkExecutionProcessBinding {
+        command_id: String,
+        argv: Vec<String>,
+        argv_sha256: String,
+        cwd: String,
+        environment: Vec<(String, String)>,
+        environment_sha256: String,
+        interpreter: SdkExecutableBinding,
+        tool: SdkExecutableBinding,
+        reproduction_script_byte_length: u64,
+        reproduction_script_sha256: String,
+        stdout: SdkTranscriptBinding,
+        stderr: SdkTranscriptBinding,
+        started_at_utc: String,
+        finished_at_utc: String,
+        monotonic_started_ns: u64,
+        monotonic_finished_ns: u64,
+        elapsed_ns: u64,
+        complete_input_sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SdkValidatorRuntimeBinding {
+        repository_root: String,
+        head_commit: String,
+        head_tree: String,
+        dirty_inventory: Vec<String>,
+        dirty_inventory_byte_length: u64,
+        dirty_inventory_sha256: String,
+        cargo_lock_sha256: String,
+        rust_toolchain_sha256: String,
+        cargo_profile: String,
+        target: String,
+        features: Vec<String>,
+        rch_profile: String,
+        argv: Vec<String>,
+        argv_sha256: String,
+        cwd: String,
+        environment: Vec<(String, String)>,
+        environment_sha256: String,
+        verifier_executable: SdkExecutableBinding,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SdkExecutionBundle {
         source_id: String,
+        repository_root: PathBuf,
         raw_byte_length: u64,
         raw_sha256: String,
         raw_bytes: Vec<u8>,
@@ -37279,6 +37351,10 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSdkExecutionBundle {
+        proof_class: SdkExecutionProofClass,
+        repository_root: String,
+        batch_started_at_utc: String,
+        batch_finished_at_utc: String,
         complete_input_sha256: String,
         observations: Vec<SdkExecutionObservation>,
     }
@@ -37290,13 +37366,17 @@ activate = 1\n";
     }
 
     impl ExternalSdkExecutionFacts {
-        fn present_from_batch_owned_json(raw_bytes: Vec<u8>) -> Self {
-            Self::Present(SdkExecutionBundle {
-                source_id: "batch_verify/sdk-execution-facts-v1".to_owned(),
+        fn present_from_batch_owned_json(root: &Path, raw_bytes: Vec<u8>) -> VResult<Self> {
+            let repository_root = fs::canonicalize(root).map_err(|_| {
+                Diagnostic::error("E_SDK_EXECUTION_FACTS", "SDK repository root")
+            })?;
+            Ok(Self::Present(SdkExecutionBundle {
+                source_id: "sdk-execution-facts-v2/external".to_owned(),
+                repository_root,
                 raw_byte_length: u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
                 raw_sha256: lower_hex(&sha256(&raw_bytes)),
                 raw_bytes,
-            })
+            }))
         }
     }
 
@@ -56401,14 +56481,6 @@ activate = 1\n";
             }
             if result.sdk_id != *expected_sdk_id
                 || record_string(blueprint, "sdk_id", &logical)? != *expected_sdk_id
-                || result.source_selector != record_string(blueprint, "source_selector", &logical)?
-                || result.checked_lock_sha256
-                    != record_string(blueprint, "checked_lock_sha256", &logical)?
-                || result.online_closure_sha256
-                    != record_string(blueprint, "online_closure_sha256", &logical)?
-                || result.offline_closure_sha256
-                    != record_string(blueprint, "offline_closure_sha256", &logical)?
-                || result.observed_at_utc != record_string(blueprint, "observed_at_utc", &logical)?
                 || artifact_count_by_sdk.get(*expected_sdk_id).copied()
                     != Some(result.artifact_count)
                 || result.evidence_verdict != "Pass"
@@ -71852,14 +71924,13 @@ activate = 1\n";
         report: &mut Report,
     ) -> VResult<()> {
         let rs256_vectors = parse_rs256_source_vectors(source_files)?;
-        let sdk_static_validation = fnd_01_sdk_matrix_validate(
-            source_files,
-            policy,
-            ExternalSdkExecutionFacts::Absent,
-        )?;
-        if sdk_static_validation.execution != ExecutionValidation::Unverified
-            || sdk_static_validation.support_claim
-        {
+        // Bind caller-supplied execution facts before any absent or partial
+        // integration tree can return the ordinary Pending report.  The
+        // Absent route remains static-only and is consumed after exact output
+        // admission below.
+        let sdk_validation =
+            fnd_01_sdk_matrix_validate(source_files, policy, external_sdk_facts)?;
+        if sdk_validation.support_claim {
             return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", "SDK static boundary"));
         }
         let expected_relative = validate_receipt_matrix(policy)?;
@@ -71950,11 +72021,12 @@ activate = 1\n";
             }
         }
 
-        let sdk_source_results = parse_sdk_source_evidence(
-            source_files,
-            policy,
-            external_sdk_facts,
-        )?;
+        let sdk_source_results = match sdk_validation.execution {
+            ExecutionValidation::Unverified => {
+                return Err(Diagnostic::pending("sdk_execution_facts_pending"));
+            }
+            ExecutionValidation::Verified(results) => results,
+        };
 
         let authoring = load_actual_authoring_bindings(root, policy, policy_bytes)?;
         let output_by_id = policy
@@ -72713,47 +72785,6 @@ activate = 1\n";
         Ok(lower_hex(&sha256(&encoded)))
     }
 
-    fn sdk_count_map(
-        values: Vec<String>,
-        expected_total: usize,
-        subject: &str,
-    ) -> VResult<BTreeMap<String, usize>> {
-        let mut counts = BTreeMap::new();
-        let mut total = 0usize;
-        for value in values {
-            let (sdk_id, count) = value
-                .split_once('=')
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", subject).at(&value))?;
-            let count = count
-                .parse::<usize>()
-                .map_err(|_| Diagnostic::error("E_SDK_POLICY", subject).at(&value))?;
-            if !SDK_IDS.contains(&sdk_id)
-                || count == 0
-                || counts.insert(sdk_id.to_owned(), count).is_some()
-            {
-                return Err(Diagnostic::error("E_SDK_POLICY", subject).at(&value));
-            }
-            total = total
-                .checked_add(count)
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", subject))?;
-        }
-        if counts.len() != SDK_IDS.len() || total != expected_total {
-            return Err(Diagnostic::error("E_SDK_POLICY", subject).at("count partition"));
-        }
-        Ok(counts)
-    }
-
-    fn sdk_lock_source_field_binding(
-        lock_id: &str,
-        subject: &str,
-    ) -> VResult<(&'static str, &'static str, &'static str)> {
-        SDK_LOCK_SOURCE_FIELDS
-            .iter()
-            .find(|(candidate, _, _, _)| *candidate == lock_id)
-            .map(|(_, path, length, digest)| (*path, *length, *digest))
-            .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", subject).at(lock_id))
-    }
-
     fn sdk_checked_lock_id(sdk_id: &str, subject: &str) -> VResult<&'static str> {
         SDK_CHECKED_LOCK_IDS
             .iter()
@@ -73386,6 +73417,22 @@ activate = 1\n";
         ];
         if blueprints.len() != expected_sdk_ids.len() || peers.len() != SDK_IDS.len() {
             return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
+        }
+        let expected_source_counts = [3usize, 2, 1, 3];
+        for (index, (peer_value, expected_count)) in
+            peers.iter().zip(expected_source_counts).enumerate()
+        {
+            let logical = format!("{subject}/peers[{index}]");
+            let peer = peer_value
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
+            let sources = record_array(peer, "registry_artifacts", &logical)?;
+            if record_string(peer, "id", &logical)? != SDK_IDS[index]
+                || sources.len() != expected_count
+                || sources.iter().any(|source| source.as_table().is_none())
+            {
+                return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", &logical));
+            }
         }
         let mut artifacts_by_sdk = BTreeMap::<String, Vec<SdkArtifactObservation>>::new();
         let mut artifact_ids = BTreeSet::new();
@@ -74206,6 +74253,22 @@ activate = 1\n";
                 }
             }
         }
+        let mut reachable = BTreeSet::from(["ModelContextProtocol".to_owned()]);
+        let mut frontier = vec!["ModelContextProtocol".to_owned()];
+        while let Some(package_id) = frontier.pop() {
+            let (_, _, _, _, dependencies) = parsed
+                .get(&package_id)
+                .ok_or_else(|| sdk_json_error(subject, "NuGet reachability source"))?;
+            for dependency in dependencies.keys() {
+                if reachable.insert(dependency.clone()) {
+                    frontier.push(dependency.clone());
+                }
+            }
+        }
+        if reachable != parsed.keys().cloned().collect::<BTreeSet<_>>() {
+            return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject)
+                .at("packages unreachable from sole direct ModelContextProtocol root"));
+        }
         let direct = parsed
             .get("ModelContextProtocol")
             .ok_or_else(|| sdk_json_error(subject, "ModelContextProtocol"))?;
@@ -74794,284 +74857,6 @@ activate = 1\n";
         })
     }
 
-    fn validate_sdk_revalidation(
-        sdk_id: &str,
-        lock: &toml::map::Map<String, toml::Value>,
-        policy: &Policy,
-        subject: &str,
-    ) -> VResult<()> {
-        let script = sdk_nonempty_source_string(lock, "reproduction_script", policy, subject)?;
-        if !script.is_ascii() || script.as_bytes().contains(&b'\r') || !script.ends_with('\n') {
-            return Err(Diagnostic::error("E_SDK_EXECUTION", subject).at("reproduction_script"));
-        }
-        let revalidation = record_table(lock, "last_revalidation", subject)?;
-        let script_sha256 = record_string(revalidation, "reproduction_script_sha256", subject)?;
-        validate_sha256(script_sha256, subject)?;
-        let _ = sdk_nonempty_source_string(revalidation, "executed_at_utc", policy, subject)?;
-        if script_sha256 != lower_hex(&sha256(script.as_bytes()))
-            || record_i64(revalidation, "script_exit", subject)? != 0
-            || !record_bool(revalidation, "network_denial_probe_observed", subject)?
-            || record_string(revalidation, "result", subject)? != "pass"
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION", subject).at("last_revalidation"));
-        }
-        let ecosystem_facts_hold = match sdk_id {
-            "typescript" => {
-                record_bool(revalidation, "native_package_filenames_staged", subject)?
-                    && record_bool(revalidation, "online_offline_closure_equal", subject)?
-            }
-            "python" => {
-                record_bool(revalidation, "filename_closure_equal", subject)?
-                    && record_bool(revalidation, "content_closure_equal", subject)?
-            }
-            "csharp" => {
-                record_bool(revalidation, "online_offline_project_assets_equal", subject)?
-                    && record_bool(
-                        revalidation,
-                        "vendored_project_assets_projection_equal",
-                        subject,
-                    )?
-            }
-            "go" => {
-                record_bool(
-                    revalidation,
-                    "external_consumer_root_sdk_entry_verified",
-                    subject,
-                )? && record_bool(
-                    revalidation,
-                    "online_offline_lock_and_module_list_equal",
-                    subject,
-                )?
-            }
-            _ => return Err(Diagnostic::error("E_SDK_POLICY", subject).at(sdk_id)),
-        };
-        if !ecosystem_facts_hold {
-            return Err(Diagnostic::error("E_SDK_EXECUTION", subject)
-                .at("last_revalidation ecosystem facts"));
-        }
-        Ok(())
-    }
-
-    fn sdk_historical_execution(
-        sdk_id: &str,
-        lock: &toml::map::Map<String, toml::Value>,
-        execution: &toml::map::Map<String, toml::Value>,
-        policy: &Policy,
-        subject: &str,
-    ) -> VResult<(String, String, String, String)> {
-        if sdk_id != "go" {
-            for field in ["online_command", "offline_command"] {
-                let command = sdk_nonempty_source_string(lock, field, policy, subject)?;
-                if !command.is_ascii()
-                    || command.as_bytes().contains(&b'\r')
-                    || command.as_bytes().contains(&b'\n')
-                {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION", subject).at(field));
-                }
-            }
-        }
-        validate_sdk_revalidation(sdk_id, lock, policy, subject)?;
-        let observed_at_utc =
-            sdk_nonempty_source_string(execution, "executed_at_utc", policy, subject)?.to_owned();
-        if record_string(execution, "result", subject)? != "pass"
-            || record_i64(execution, "network_denial_probe_exit", subject)? != 6
-            || record_string(execution, "network_denial_probe_stderr", subject)?
-                != sdk_network_denial_stderr(sdk_id, subject)?
-            || !record_bool(lock, "online_offline_equal", subject)?
-            || !record_bool(lock, "offline_resolution_verified", subject)?
-        {
-            return Err(Diagnostic::error("E_SDK_EXECUTION", subject));
-        }
-        let (online, offline, checked_lock) = match sdk_id {
-            "typescript" => {
-                if record_i64(execution, "online_exit", subject)? != 0
-                    || record_i64(execution, "offline_exit", subject)? != 0
-                    || record_i64(execution, "closure_compare_exit", subject)? != 0
-                    || !record_bool(lock, "portable_directory_name_verified", subject)?
-                    || !record_bool(lock, "install_scripts_disabled", subject)?
-                    || record_string(lock, "online_closure_sha256", subject)?
-                        != record_string(execution, "online_closure_sha256", subject)?
-                    || record_string(lock, "offline_closure_sha256", subject)?
-                        != record_string(execution, "offline_closure_sha256", subject)?
-                {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION", subject));
-                }
-                (
-                    record_string(execution, "online_closure_sha256", subject)?,
-                    record_string(execution, "offline_closure_sha256", subject)?,
-                    record_string(execution, "checked_in_lock_sha256", subject)?,
-                )
-            }
-            "python" => {
-                if record_i64(execution, "online_exit", subject)? != 0
-                    || record_i64(execution, "offline_exit", subject)? != 0
-                    || record_i64(execution, "closure_compare_exit", subject)? != 0
-                    || record_string(lock, "online_closure_content_sha256", subject)?
-                        != record_string(execution, "online_closure_content_sha256", subject)?
-                    || record_string(lock, "offline_closure_content_sha256", subject)?
-                        != record_string(execution, "offline_closure_content_sha256", subject)?
-                {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION", subject));
-                }
-                (
-                    record_string(execution, "online_closure_content_sha256", subject)?,
-                    record_string(execution, "offline_closure_content_sha256", subject)?,
-                    record_string(execution, "checked_in_lock_sha256", subject)?,
-                )
-            }
-            "csharp" => {
-                if record_i64(execution, "offline_restore_exit", subject)? != 0
-                    || !record_bool(lock, "online_lock_matches_vendored_canonical_json", subject)?
-                    || !record_bool(execution, "raw_assets_digest_is_path_specific", subject)?
-                    || record_u64(execution, "offline_project_assets_package_count", subject)?
-                        != record_u64(lock, "resolved_package_count", subject)?
-                    || record_string(lock, "offline_lock_sha256_before", subject)?
-                        != record_string(
-                            execution,
-                            "checked_in_lock_sha256_after_restore",
-                            subject,
-                        )?
-                    || record_string(lock, "offline_lock_sha256_after", subject)?
-                        != record_string(
-                            execution,
-                            "checked_in_lock_sha256_after_restore",
-                            subject,
-                        )?
-                {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION", subject));
-                }
-                for field in [
-                    "offline_restore_stdout_raw_sha256",
-                    "offline_restore_stderr_sha256",
-                    "offline_project_assets_raw_sha256",
-                ] {
-                    validate_sha256(record_string(execution, field, subject)?, subject)?;
-                }
-                let projection = record_string(lock, "project_assets_projection_sha256", subject)?;
-                if projection
-                    != record_string(
-                        execution,
-                        "offline_project_assets_projection_sha256",
-                        subject,
-                    )?
-                {
-                    return Err(Diagnostic::error("E_SDK_EXECUTION", subject)
-                        .at("project assets projection"));
-                }
-                (
-                    projection,
-                    record_string(
-                        execution,
-                        "offline_project_assets_projection_sha256",
-                        subject,
-                    )?,
-                    record_string(execution, "checked_in_lock_sha256_after_restore", subject)?,
-                )
-            }
-            "go" => {
-                let stable_projection_command =
-                    sdk_nonempty_source_string(lock, "stable_projection_command", policy, subject)?;
-                let offline_environment =
-                    record_string_array(lock, "offline_environment", subject)?;
-                if record_i64(execution, "online_exit", subject)? != 0
-                || record_i64(execution, "offline_download_exit", subject)? != 0
-                || record_i64(execution, "offline_list_exit", subject)? != 0
-                || record_i64(
-                    execution,
-                    "online_offline_lock_compare_exit",
-                    subject,
-                )? != 0
-                || !record_bool(execution, "root_sdk_module_entry_verified", subject)?
-                || !record_bool(lock, "root_sdk_module_in_resolved_lock", subject)?
-                || !record_bool(lock, "network_denial_verified", subject)?
-                || record_bool(
-                    lock,
-                    "publisher_context_is_interop_consumer_lock",
-                    subject,
-                )?
-                || stable_projection_command
-                    != "jq -s 'map({GoModSum, Origin: (.Origin // null), Path, Sum, Version}) | sort_by(.Path)'"
-                || !string_sequence_is(
-                    &offline_environment,
-                    &[
-                        "GOENV=off",
-                        "GOTOOLCHAIN=local",
-                        "GOPROXY=off",
-                        "GOSUMDB=off",
-                        "GOVCS=*:off",
-                        "fresh task-specific GOCACHE",
-                        "online-seeded task-specific GOMODCACHE",
-                        "sandbox-exec deny network*",
-                    ],
-                )
-                || record_string(execution, "offline_environment_goproxy", subject)?
-                    != "off"
-                || record_string(execution, "offline_environment_gosumdb", subject)?
-                    != "off"
-                || record_string(execution, "offline_environment_govcs", subject)?
-                    != "*:off"
-                || record_string(
-                    lock,
-                    "online_resolved_module_lock_sha256",
-                    subject,
-                )? != record_string(
-                    execution,
-                    "offline_resolved_module_lock_sha256",
-                    subject,
-                )?
-                || record_string(
-                    lock,
-                    "offline_resolved_module_lock_sha256",
-                    subject,
-                )? != record_string(
-                    execution,
-                    "offline_resolved_module_lock_sha256",
-                    subject,
-                )?
-                || record_string(
-                    lock,
-                    "consumer_resolved_module_lock_sha256",
-                    subject,
-                )? != record_string(
-                    execution,
-                    "offline_resolved_module_lock_sha256",
-                    subject,
-                )?
-                || record_string(lock, "offline_closure_sha256", subject)?
-                    != record_string(execution, "offline_closure_sha256", subject)?
-                || record_string(lock, "consumer_sum_sha256", subject)?
-                    != record_string(
-                        execution,
-                        "checked_in_consumer_sum_sha256",
-                        subject,
-                    )?
-            {
-                return Err(Diagnostic::error("E_SDK_EXECUTION", subject));
-            }
-                (
-                    record_string(lock, "online_closure_sha256", subject)?,
-                    record_string(execution, "offline_closure_sha256", subject)?,
-                    record_string(execution, "checked_in_consumer_sum_sha256", subject)?,
-                )
-            }
-            _ => return Err(Diagnostic::error("E_SDK_POLICY", subject).at(sdk_id)),
-        };
-        for digest in [online, offline, checked_lock] {
-            validate_sha256(digest, subject)?;
-        }
-        if online != offline {
-            return Err(
-                Diagnostic::error("E_SDK_EXECUTION", subject).at("online/offline closure mismatch")
-            );
-        }
-        Ok((
-            observed_at_utc,
-            online.to_owned(),
-            offline.to_owned(),
-            checked_lock.to_owned(),
-        ))
-    }
-
     fn fnd_01_sdk_matrix_validate_complete_input_binding(
         document: &toml::Value,
         files: &[LoadedFile],
@@ -75252,71 +75037,6 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_SDK_REVISION_6", subject));
         }
-        let peer_matrix = record_table(root, "peer_era_matrix", subject)?;
-        if !string_sequence_is(
-            &record_string_array(peer_matrix, "peer_ids_in_catalog_order", subject)?,
-            SDK_IDS,
-        )
-            || !string_sequence_is(
-                &record_string_array(peer_matrix, "peer_ids_canonical", subject)?,
-                &["csharp", "go", "python", "typescript"],
-            )
-            || !record_bool(peer_matrix, "duplicate_peer_ids_rejected", subject)?
-        {
-            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer era matrix"));
-        }
-        let eras = record_array(peer_matrix, "eras", subject)?;
-        if eras.len() != 2 {
-            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer eras"));
-        }
-        for (value, version) in eras.iter().zip(["2024-11-05", "2026-07-28"]) {
-            let era = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
-            if record_string(era, "protocol_version", subject)? != version
-                || !string_sequence_is(
-                    &record_string_array(era, "peer_ids", subject)?,
-                    SDK_IDS,
-                )
-                || record_usize(era, "unsupported_or_unproved_peer_count", subject)? != 0
-            {
-                return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer era"));
-            }
-        }
-        let peers = record_array(root, "peers", subject)?;
-        if peers.len() != EXPECTED_SDKS {
-            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer count"));
-        }
-        for (value, id) in peers.iter().zip(SDK_IDS) {
-            let peer = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
-            let capabilities = record_array(peer, "era_capabilities", subject)?;
-            if record_string(peer, "id", subject)? != *id || capabilities.len() != 2 {
-                return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("peer capability"));
-            }
-            for (capability, version) in capabilities.iter().zip(["2024-11-05", "2026-07-28"]) {
-                let capability = capability
-                    .as_table()
-                    .ok_or_else(|| Diagnostic::error("E_SDK_REVISION_6", subject))?;
-                if record_string(capability, "protocol_version", subject)? != version
-                    || record_string(capability, "support_state", subject)? != "supported"
-                    || record_u64(capability, "byte_length", subject)? == 0
-                {
-                    return Err(Diagnostic::error("E_SDK_REVISION_6", subject)
-                        .at("peer era capability"));
-                }
-            }
-        }
-        let catalog = record_table(root, "catalog", subject)?;
-        let drift = record_table(catalog, "live_drift_observation", subject)?;
-        if record_string(drift, "sha256", subject)? == record_string(catalog, "sha256", subject)?
-            || !record_bool(drift, "byte_drift_from_frozen_catalog", subject)?
-            || !record_bool(drift, "tier_assignment_drift_from_frozen_catalog", subject)?
-            || record_bool(drift, "frozen_catalog_or_peer_artifacts_replaced", subject)?
-        {
-            return Err(Diagnostic::error("E_SDK_REVISION_6", subject).at("live drift"));
-        }
         let expected_negatives = [
             ("tier1-omission", "catalog.tier1_ids", "remove_typescript", "fnd01.sdk_matrix.missing_tier1_peer"),
             ("lower-tier-insertion", "peer_era_matrix.peer_ids", "insert_java", "fnd01.sdk_matrix.extra_non_tier1_peer"),
@@ -75388,6 +75108,226 @@ activate = 1\n";
         })
     }
 
+    fn sdk_string_sequence_sha256(domain: &[u8], values: &[String]) -> String {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(domain);
+        preimage.extend_from_slice(
+            &u64::try_from(values.len()).unwrap_or(u64::MAX).to_be_bytes(),
+        );
+        for value in values {
+            preimage.extend_from_slice(
+                &u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes(),
+            );
+            preimage.extend_from_slice(value.as_bytes());
+        }
+        lower_hex(&sha256(&preimage))
+    }
+
+    fn sdk_environment_sha256(environment: &[(String, String)]) -> String {
+        let values = environment
+            .iter()
+            .flat_map(|(name, value)| [name.clone(), value.clone()])
+            .collect::<Vec<_>>();
+        sdk_string_sequence_sha256(b"FND01SDKCLOSEDENVv1\0", &values)
+    }
+
+    fn sdk_git_output(root: &Path, arguments: &[&str], subject: &str) -> VResult<Vec<u8>> {
+        let git = Path::new("/usr/bin/git");
+        if !git.is_file() {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("/usr/bin/git is required for revision binding"));
+        }
+        let output = Command::new(git)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()
+            .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("git spawn"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("git command did not produce a clean successful observation"));
+        }
+        Ok(output.stdout)
+    }
+
+    fn sdk_git_oid(root: &Path, revision: &str, subject: &str) -> VResult<String> {
+        let output = sdk_git_output(root, &["rev-parse", "--verify", revision], subject)?;
+        let value = std::str::from_utf8(&output)
+            .ok()
+            .and_then(|value| value.strip_suffix('\n'))
+            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("git OID"))?;
+        if value.len() != 40
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("git OID"));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn sdk_utf8_absolute_canonical(path: &Path, subject: &str) -> VResult<String> {
+        let canonical = fs::canonicalize(path)
+            .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("canonicalize"))?;
+        let value = canonical
+            .to_str()
+            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("UTF-8 path"))?;
+        if !value.starts_with('/')
+            || value == "/"
+            || value.ends_with('/')
+            || value.contains("//")
+            || value.contains("/./")
+            || value.contains("/../")
+            || value.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("absolute canonical path"));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn sdk_executable_binding(
+        id: &str,
+        path: &Path,
+        version: &str,
+        subject: &str,
+    ) -> VResult<SdkExecutableBinding> {
+        let canonical = sdk_utf8_absolute_canonical(path, subject)?;
+        let bytes = read_bounded(Path::new(&canonical), 268_435_456, subject)?;
+        if id.is_empty() || version.is_empty() {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("executable identity"));
+        }
+        Ok(SdkExecutableBinding {
+            id: id.to_owned(),
+            path: canonical,
+            byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: lower_hex(&sha256(&bytes)),
+            version: version.to_owned(),
+        })
+    }
+
+    fn sdk_closed_validator_environment() -> VResult<Vec<(String, String)>> {
+        const NAMES: &[&str] = &[
+            "CARGO_BUILD_TARGET",
+            "CARGO_PROFILE",
+            "CARGO_TARGET_DIR",
+            "CI",
+            "FND01_SDK_RCH_PROFILE",
+            "HOME",
+            "PATH",
+            "RCH_NO_SELF_HEALING",
+            "RCH_QUIET",
+            "RCH_REQUIRE_REMOTE",
+            "RCH_SOCKET_PATH",
+            "RCH_WORKER",
+            "RUSTFLAGS",
+            "RUSTUP_TOOLCHAIN",
+            "SHELL",
+            "TMPDIR",
+            "USER",
+        ];
+        let mut environment = Vec::new();
+        for name in NAMES {
+            if let Some(value) = std::env::var_os(name) {
+                let value = value.into_string().map_err(|_| {
+                    Diagnostic::error("E_SDK_EXECUTION_FACTS", "validator environment")
+                        .at(*name)
+                })?;
+                if value.as_bytes().contains(&0) {
+                    return Err(Diagnostic::error(
+                        "E_SDK_EXECUTION_FACTS",
+                        "validator environment",
+                    )
+                    .at(*name));
+                }
+                if !value.is_empty() {
+                    environment.push(((*name).to_owned(), value));
+                }
+            }
+        }
+        Ok(environment)
+    }
+
+    fn capture_sdk_validator_runtime(root: &Path) -> VResult<SdkValidatorRuntimeBinding> {
+        let subject = "SDK validator runtime binding";
+        let repository_root = sdk_utf8_absolute_canonical(root, subject)?;
+        let root = Path::new(&repository_root);
+        let head_commit = sdk_git_oid(root, "HEAD^{commit}", subject)?;
+        let head_tree = sdk_git_oid(root, "HEAD^{tree}", subject)?;
+        let dirty_bytes = sdk_git_output(
+            root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            subject,
+        )?;
+        if !dirty_bytes.is_empty() && !dirty_bytes.ends_with(&[0]) {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("dirty inventory framing"));
+        }
+        let dirty_inventory = dirty_bytes
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                std::str::from_utf8(entry).map(str::to_owned).map_err(|_| {
+                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                        .at("dirty inventory must be UTF-8")
+                })
+            })
+            .collect::<VResult<Vec<_>>>()?;
+        let cargo_lock = read_bounded(&root.join("Cargo.lock"), 16_777_216, subject)?;
+        let rust_toolchain = read_bounded(&root.join("rust-toolchain.toml"), 65_536, subject)?;
+        let argv = std::env::args_os()
+            .map(|value| {
+                value.into_string().map_err(|_| {
+                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("UTF-8 argv")
+                })
+            })
+            .collect::<VResult<Vec<_>>>()?;
+        if argv.is_empty() {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("empty argv"));
+        }
+        let cwd = sdk_utf8_absolute_canonical(
+            &std::env::current_dir().map_err(|_| {
+                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current directory")
+            })?,
+            subject,
+        )?;
+        let environment = sdk_closed_validator_environment()?;
+        let current_executable = std::env::current_exe().map_err(|_| {
+            Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current executable")
+        })?;
+        let verifier_executable =
+            sdk_executable_binding("fnd01-sdk-verifier", &current_executable, "v2", subject)?;
+        Ok(SdkValidatorRuntimeBinding {
+            repository_root,
+            head_commit,
+            head_tree,
+            dirty_inventory,
+            dirty_inventory_byte_length: u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX),
+            dirty_inventory_sha256: lower_hex(&sha256(&dirty_bytes)),
+            cargo_lock_sha256: lower_hex(&sha256(&cargo_lock)),
+            rust_toolchain_sha256: lower_hex(&sha256(&rust_toolchain)),
+            cargo_profile: if cfg!(debug_assertions) {
+                "debug".to_owned()
+            } else {
+                "release".to_owned()
+            },
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            features: Vec::new(),
+            rch_profile: std::env::var("FND01_SDK_RCH_PROFILE")
+                .unwrap_or_else(|_| "unbound".to_owned()),
+            argv_sha256: sdk_string_sequence_sha256(b"FND01SDKVALIDATORARGVv1\0", &argv),
+            argv,
+            cwd,
+            environment_sha256: sdk_environment_sha256(&environment),
+            environment,
+            verifier_executable,
+        })
+    }
+
     fn sdk_execution_timestamp_is_valid(value: &str) -> bool {
         let bytes = value.as_bytes();
         if bytes.len() != 20
@@ -75429,6 +75369,341 @@ activate = 1\n";
             && hour <= 23
             && minute <= 59
             && second <= 59
+    }
+
+    fn sdk_timestamp_epoch_seconds(value: &str) -> Option<u64> {
+        if !sdk_execution_timestamp_is_valid(value) {
+            return None;
+        }
+        let bytes = value.as_bytes();
+        let number = |start: usize, end: usize| {
+            std::str::from_utf8(&bytes[start..end])
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let year = number(0, 4)?;
+        if !(1970..=9999).contains(&year) {
+            return None;
+        }
+        let month = number(5, 7)?;
+        let day = number(8, 10)?;
+        let hour = number(11, 13)?;
+        let minute = number(14, 16)?;
+        let second = number(17, 19)?;
+        let leap = |year: u64| {
+            year.is_multiple_of(4)
+                && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+        };
+        let mut days = 0u64;
+        for prior_year in 1970..year {
+            days = days.checked_add(if leap(prior_year) { 366 } else { 365 })?;
+        }
+        let month_lengths = [
+            31u64,
+            if leap(year) { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        for length in month_lengths.iter().take(usize::try_from(month - 1).ok()?) {
+            days = days.checked_add(*length)?;
+        }
+        days = days.checked_add(day.checked_sub(1)?)?;
+        days.checked_mul(86_400)?
+            .checked_add(hour.checked_mul(3_600)?)?
+            .checked_add(minute.checked_mul(60)?)?
+            .checked_add(second)
+    }
+
+    fn sdk_validate_fresh_interval(
+        proof_class: SdkExecutionProofClass,
+        started_at_utc: &str,
+        finished_at_utc: &str,
+        monotonic_started_ns: u64,
+        monotonic_finished_ns: u64,
+        elapsed_ns: u64,
+        subject: &str,
+    ) -> VResult<()> {
+        let started = sdk_timestamp_epoch_seconds(started_at_utc)
+            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("start clock"))?;
+        let finished = sdk_timestamp_epoch_seconds(finished_at_utc)
+            .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("finish clock"))?;
+        if started > finished
+            || monotonic_started_ns > monotonic_finished_ns
+            || monotonic_finished_ns - monotonic_started_ns != elapsed_ns
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("wall/monotonic interval"));
+        }
+        if proof_class == SdkExecutionProofClass::BatchExecution {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("system clock")
+                })?
+                .as_secs();
+            if finished > now.saturating_add(300)
+                || now.saturating_sub(finished) > 86_400
+                || finished.saturating_sub(started) > 43_200
+            {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at("stale or implausible batch interval"));
+            }
+        }
+        Ok(())
+    }
+
+    fn sdk_json_string_values(
+        value: &StrictJson,
+        subject: &str,
+        field: &str,
+    ) -> VResult<Vec<String>> {
+        sdk_json_array(value, subject, field)?
+            .iter()
+            .map(|value| match value {
+                StrictJson::String(value)
+                    if !value.is_empty()
+                        && !value.as_bytes().contains(&0)
+                        && !value.chars().any(char::is_control) => Ok(value.clone()),
+                _ => Err(sdk_json_error(subject, field)),
+            })
+            .collect()
+    }
+
+    fn parse_sdk_environment(
+        value: &StrictJson,
+        subject: &str,
+    ) -> VResult<Vec<(String, String)>> {
+        let values = sdk_json_array(value, subject, "environment")?;
+        let mut environment = Vec::with_capacity(values.len());
+        let mut prior = None::<String>;
+        for value in values {
+            let row = sdk_json_object(value, subject, "environment row")?;
+            sdk_json_exact_fields(row, &["name", "value"], &[], subject)?;
+            let name = sdk_json_string(row, "name", subject)?;
+            let value = sdk_json_string(row, "value", subject)?;
+            if !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                || prior.as_deref().is_some_and(|candidate| candidate >= name)
+            {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at("closed environment order/name"));
+            }
+            prior = Some(name.to_owned());
+            environment.push((name.to_owned(), value.to_owned()));
+        }
+        Ok(environment)
+    }
+
+    fn parse_sdk_executable_binding(
+        value: &StrictJson,
+        subject: &str,
+    ) -> VResult<SdkExecutableBinding> {
+        let row = sdk_json_object(value, subject, "executable")?;
+        sdk_json_exact_fields(
+            row,
+            &["id", "path", "byte_length", "sha256", "version"],
+            &[],
+            subject,
+        )?;
+        let parsed = SdkExecutableBinding {
+            id: sdk_json_string(row, "id", subject)?.to_owned(),
+            path: sdk_json_string(row, "path", subject)?.to_owned(),
+            byte_length: sdk_json_u64(row, "byte_length", subject)?,
+            sha256: sdk_json_string(row, "sha256", subject)?.to_owned(),
+            version: sdk_json_string(row, "version", subject)?.to_owned(),
+        };
+        validate_sha256(&parsed.sha256, subject)?;
+        let observed = sdk_executable_binding(
+            &parsed.id,
+            Path::new(&parsed.path),
+            &parsed.version,
+            subject,
+        )?;
+        if observed != parsed {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("executable bytes changed"));
+        }
+        Ok(parsed)
+    }
+
+    fn parse_sdk_transcript_binding(
+        value: &StrictJson,
+        subject: &str,
+    ) -> VResult<SdkTranscriptBinding> {
+        let row = sdk_json_object(value, subject, "transcript")?;
+        sdk_json_exact_fields(row, &["raw", "byte_length", "sha256"], &[], subject)?;
+        let raw = match sdk_json_field(row, "raw", subject)? {
+            StrictJson::String(value)
+                if !value.as_bytes().contains(&0)
+                    && !value.chars().any(|character| character.is_control()) => value.clone(),
+            _ => return Err(sdk_json_error(subject, "raw transcript")),
+        };
+        let parsed = SdkTranscriptBinding {
+            byte_length: sdk_json_u64(row, "byte_length", subject)?,
+            sha256: sdk_json_string(row, "sha256", subject)?.to_owned(),
+            raw,
+        };
+        validate_sha256(&parsed.sha256, subject)?;
+        if parsed.byte_length != u64::try_from(parsed.raw.len()).unwrap_or(u64::MAX)
+            || parsed.sha256 != lower_hex(&sha256(parsed.raw.as_bytes()))
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("raw transcript binding"));
+        }
+        Ok(parsed)
+    }
+
+    fn sdk_process_complete_input_sha256(process: &SdkExecutionProcessBinding) -> String {
+        let mut values = vec![
+            process.command_id.clone(),
+            process.argv_sha256.clone(),
+            process.cwd.clone(),
+            process.environment_sha256.clone(),
+            process.interpreter.id.clone(),
+            process.interpreter.path.clone(),
+            process.interpreter.byte_length.to_string(),
+            process.interpreter.sha256.clone(),
+            process.interpreter.version.clone(),
+            process.tool.id.clone(),
+            process.tool.path.clone(),
+            process.tool.byte_length.to_string(),
+            process.tool.sha256.clone(),
+            process.tool.version.clone(),
+            process.reproduction_script_byte_length.to_string(),
+            process.reproduction_script_sha256.clone(),
+            process.stdout.raw.clone(),
+            process.stdout.byte_length.to_string(),
+            process.stdout.sha256.clone(),
+            process.stderr.raw.clone(),
+            process.stderr.byte_length.to_string(),
+            process.stderr.sha256.clone(),
+            process.started_at_utc.clone(),
+            process.finished_at_utc.clone(),
+            process.monotonic_started_ns.to_string(),
+            process.monotonic_finished_ns.to_string(),
+            process.elapsed_ns.to_string(),
+        ];
+        values.extend(process.argv.iter().cloned());
+        values.extend(
+            process
+                .environment
+                .iter()
+                .flat_map(|(name, value)| [name.clone(), value.clone()]),
+        );
+        sdk_string_sequence_sha256(b"FND01SDKPROCESSv1\0", &values)
+    }
+
+    fn parse_sdk_execution_process(
+        value: &StrictJson,
+        proof_class: SdkExecutionProofClass,
+        subject: &str,
+    ) -> VResult<SdkExecutionProcessBinding> {
+        let row = sdk_json_object(value, subject, "process")?;
+        sdk_json_exact_fields(
+            row,
+            &[
+                "command_id",
+                "argv",
+                "argv_sha256",
+                "cwd",
+                "environment",
+                "environment_sha256",
+                "interpreter",
+                "tool",
+                "reproduction_script_byte_length",
+                "reproduction_script_sha256",
+                "stdout",
+                "stderr",
+                "started_at_utc",
+                "finished_at_utc",
+                "monotonic_started_ns",
+                "monotonic_finished_ns",
+                "elapsed_ns",
+                "complete_input_sha256",
+            ],
+            &[],
+            subject,
+        )?;
+        let argv = sdk_json_string_values(sdk_json_field(row, "argv", subject)?, subject, "argv")?;
+        let environment =
+            parse_sdk_environment(sdk_json_field(row, "environment", subject)?, subject)?;
+        let parsed = SdkExecutionProcessBinding {
+            command_id: sdk_json_string(row, "command_id", subject)?.to_owned(),
+            argv_sha256: sdk_json_string(row, "argv_sha256", subject)?.to_owned(),
+            argv,
+            cwd: sdk_json_string(row, "cwd", subject)?.to_owned(),
+            environment_sha256: sdk_json_string(row, "environment_sha256", subject)?.to_owned(),
+            environment,
+            interpreter: parse_sdk_executable_binding(
+                sdk_json_field(row, "interpreter", subject)?,
+                subject,
+            )?,
+            tool: parse_sdk_executable_binding(sdk_json_field(row, "tool", subject)?, subject)?,
+            reproduction_script_byte_length: sdk_json_u64(
+                row,
+                "reproduction_script_byte_length",
+                subject,
+            )?,
+            reproduction_script_sha256: sdk_json_string(
+                row,
+                "reproduction_script_sha256",
+                subject,
+            )?
+            .to_owned(),
+            stdout: parse_sdk_transcript_binding(
+                sdk_json_field(row, "stdout", subject)?,
+                subject,
+            )?,
+            stderr: parse_sdk_transcript_binding(
+                sdk_json_field(row, "stderr", subject)?,
+                subject,
+            )?,
+            started_at_utc: sdk_json_string(row, "started_at_utc", subject)?.to_owned(),
+            finished_at_utc: sdk_json_string(row, "finished_at_utc", subject)?.to_owned(),
+            monotonic_started_ns: sdk_json_u64(row, "monotonic_started_ns", subject)?,
+            monotonic_finished_ns: sdk_json_u64(row, "monotonic_finished_ns", subject)?,
+            elapsed_ns: sdk_json_u64(row, "elapsed_ns", subject)?,
+            complete_input_sha256: sdk_json_string(row, "complete_input_sha256", subject)?
+                .to_owned(),
+        };
+        for digest in [
+            &parsed.argv_sha256,
+            &parsed.environment_sha256,
+            &parsed.reproduction_script_sha256,
+            &parsed.complete_input_sha256,
+        ] {
+            validate_sha256(digest, subject)?;
+        }
+        if parsed.argv.is_empty()
+            || parsed.argv[0] != parsed.interpreter.path
+            || parsed.argv_sha256
+                != sdk_string_sequence_sha256(b"FND01SDKPROCESSARGVv1\0", &parsed.argv)
+            || parsed.environment_sha256 != sdk_environment_sha256(&parsed.environment)
+            || parsed.stdout.raw.is_empty() && parsed.stderr.raw.is_empty()
+            || parsed.complete_input_sha256 != sdk_process_complete_input_sha256(&parsed)
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("complete process binding"));
+        }
+        sdk_validate_fresh_interval(
+            proof_class,
+            &parsed.started_at_utc,
+            &parsed.finished_at_utc,
+            parsed.monotonic_started_ns,
+            parsed.monotonic_finished_ns,
+            parsed.elapsed_ns,
+            subject,
+        )?;
+        Ok(parsed)
     }
 
     fn parse_sdk_observation_binding(
@@ -75486,13 +75761,126 @@ activate = 1\n";
         })
     }
 
+    fn parse_sdk_validator_runtime_binding(
+        value: &StrictJson,
+        proof_class: SdkExecutionProofClass,
+        subject: &str,
+    ) -> VResult<SdkValidatorRuntimeBinding> {
+        let row = sdk_json_object(value, subject, "validator_runtime")?;
+        sdk_json_exact_fields(
+            row,
+            &[
+                "repository_root",
+                "head_commit",
+                "head_tree",
+                "dirty_inventory",
+                "dirty_inventory_byte_length",
+                "dirty_inventory_sha256",
+                "cargo_lock_sha256",
+                "rust_toolchain_sha256",
+                "cargo_profile",
+                "target",
+                "features",
+                "rch_profile",
+                "argv",
+                "argv_sha256",
+                "cwd",
+                "environment",
+                "environment_sha256",
+                "verifier_executable",
+            ],
+            &[],
+            subject,
+        )?;
+        let dirty_inventory = sdk_json_string_values(
+            sdk_json_field(row, "dirty_inventory", subject)?,
+            subject,
+            "dirty_inventory",
+        )?;
+        let mut dirty_bytes = Vec::new();
+        for entry in &dirty_inventory {
+            dirty_bytes.extend_from_slice(entry.as_bytes());
+            dirty_bytes.push(0);
+        }
+        let argv = sdk_json_string_values(sdk_json_field(row, "argv", subject)?, subject, "argv")?;
+        let environment =
+            parse_sdk_environment(sdk_json_field(row, "environment", subject)?, subject)?;
+        let parsed = SdkValidatorRuntimeBinding {
+            repository_root: sdk_json_string(row, "repository_root", subject)?.to_owned(),
+            head_commit: sdk_json_string(row, "head_commit", subject)?.to_owned(),
+            head_tree: sdk_json_string(row, "head_tree", subject)?.to_owned(),
+            dirty_inventory,
+            dirty_inventory_byte_length: sdk_json_u64(
+                row,
+                "dirty_inventory_byte_length",
+                subject,
+            )?,
+            dirty_inventory_sha256: sdk_json_string(
+                row,
+                "dirty_inventory_sha256",
+                subject,
+            )?
+            .to_owned(),
+            cargo_lock_sha256: sdk_json_string(row, "cargo_lock_sha256", subject)?.to_owned(),
+            rust_toolchain_sha256: sdk_json_string(row, "rust_toolchain_sha256", subject)?
+                .to_owned(),
+            cargo_profile: sdk_json_string(row, "cargo_profile", subject)?.to_owned(),
+            target: sdk_json_string(row, "target", subject)?.to_owned(),
+            features: sdk_json_string_values(
+                sdk_json_field(row, "features", subject)?,
+                subject,
+                "features",
+            )?,
+            rch_profile: sdk_json_string(row, "rch_profile", subject)?.to_owned(),
+            argv_sha256: sdk_json_string(row, "argv_sha256", subject)?.to_owned(),
+            argv,
+            cwd: sdk_json_string(row, "cwd", subject)?.to_owned(),
+            environment_sha256: sdk_json_string(row, "environment_sha256", subject)?.to_owned(),
+            environment,
+            verifier_executable: parse_sdk_executable_binding(
+                sdk_json_field(row, "verifier_executable", subject)?,
+                subject,
+            )?,
+        };
+        for digest in [
+            &parsed.dirty_inventory_sha256,
+            &parsed.cargo_lock_sha256,
+            &parsed.rust_toolchain_sha256,
+            &parsed.argv_sha256,
+            &parsed.environment_sha256,
+        ] {
+            validate_sha256(digest, subject)?;
+        }
+        if parsed.head_commit.len() != 40
+            || parsed.head_tree.len() != 40
+            || !parsed
+                .head_commit
+                .bytes()
+                .chain(parsed.head_tree.bytes())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || parsed.dirty_inventory_byte_length
+                != u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX)
+            || parsed.dirty_inventory_sha256 != lower_hex(&sha256(&dirty_bytes))
+            || parsed.argv.is_empty()
+            || parsed.argv_sha256
+                != sdk_string_sequence_sha256(b"FND01SDKVALIDATORARGVv1\0", &parsed.argv)
+            || parsed.environment_sha256 != sdk_environment_sha256(&parsed.environment)
+            || parsed.features.windows(2).any(|window| window[0] >= window[1])
+            || (proof_class == SdkExecutionProofClass::BatchExecution
+                && !parsed.rch_profile.starts_with("rch:"))
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("validator runtime self-binding"));
+        }
+        Ok(parsed)
+    }
+
     fn parse_sdk_execution_bundle(
         bundle: &SdkExecutionBundle,
     ) -> VResult<ParsedSdkExecutionBundle> {
-        const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
         let subject = "batch-owned SDK execution facts";
         validate_sha256(&bundle.raw_sha256, subject)?;
-        if bundle.source_id != "batch_verify/sdk-execution-facts-v1"
+        if bundle.source_id != "sdk-execution-facts-v2/external"
             || bundle.raw_bytes.is_empty()
             || bundle.raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES
             || bundle.raw_byte_length != u64::try_from(bundle.raw_bytes.len()).unwrap_or(u64::MAX)
@@ -75510,12 +75898,63 @@ activate = 1\n";
             root,
             &[
                 "format",
+                "proof_class",
                 "producer",
+                "validator_runtime",
+                "batch_started_at_utc",
+                "batch_finished_at_utc",
+                "batch_monotonic_started_ns",
+                "batch_monotonic_finished_ns",
+                "batch_elapsed_ns",
                 "complete_input_sha256",
                 "observation_count",
                 "observations",
             ],
             &[],
+            subject,
+        )?;
+        let proof_class = match sdk_json_string(root, "proof_class", subject)? {
+            "batch_execution" => SdkExecutionProofClass::BatchExecution,
+            "validation_fixture" => SdkExecutionProofClass::ValidationFixture,
+            _ => {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at("proof class"));
+            }
+        };
+        let producer = sdk_json_string(root, "producer", subject)?;
+        if (proof_class == SdkExecutionProofClass::BatchExecution && producer != "batch_verify")
+            || (proof_class == SdkExecutionProofClass::ValidationFixture
+                && producer != "validation_fixture_no_credit")
+        {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("producer/proof class"));
+        }
+        let validator_runtime = parse_sdk_validator_runtime_binding(
+            sdk_json_field(root, "validator_runtime", subject)?,
+            proof_class,
+            subject,
+        )?;
+        let observed_runtime = capture_sdk_validator_runtime(&bundle.repository_root)?;
+        if validator_runtime != observed_runtime {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("stale validator revision/runtime binding"));
+        }
+        let batch_started_at_utc =
+            sdk_json_string(root, "batch_started_at_utc", subject)?.to_owned();
+        let batch_finished_at_utc =
+            sdk_json_string(root, "batch_finished_at_utc", subject)?.to_owned();
+        let batch_monotonic_started_ns =
+            sdk_json_u64(root, "batch_monotonic_started_ns", subject)?;
+        let batch_monotonic_finished_ns =
+            sdk_json_u64(root, "batch_monotonic_finished_ns", subject)?;
+        let batch_elapsed_ns = sdk_json_u64(root, "batch_elapsed_ns", subject)?;
+        sdk_validate_fresh_interval(
+            proof_class,
+            &batch_started_at_utc,
+            &batch_finished_at_utc,
+            batch_monotonic_started_ns,
+            batch_monotonic_finished_ns,
+            batch_elapsed_ns,
             subject,
         )?;
         let complete_input_sha256 =
@@ -75527,8 +75966,7 @@ activate = 1\n";
             "observations",
         )?;
         if sdk_json_string(root, "format", subject)?
-                != "fastmcp-fnd01-sdk-execution-facts-v1"
-            || sdk_json_string(root, "producer", subject)? != "batch_verify"
+                != "fastmcp-fnd01-sdk-execution-facts-v2"
             || sdk_json_usize(root, "observation_count", subject)? != values.len()
             || values.len() != SDK_IDS.len()
         {
@@ -75547,6 +75985,7 @@ activate = 1\n";
                         row,
                         &[
                             "ecosystem",
+                            "process",
                             "binding",
                             "node_version",
                             "npm_version",
@@ -75568,6 +76007,11 @@ activate = 1\n";
                         &logical,
                     )?;
                     SdkExecutionObservation::Npm {
+                        process: parse_sdk_execution_process(
+                            sdk_json_field(row, "process", &logical)?,
+                            proof_class,
+                            &logical,
+                        )?,
                         binding: parse_sdk_observation_binding(
                             sdk_json_field(row, "binding", &logical)?,
                             &logical,
@@ -75642,6 +76086,7 @@ activate = 1\n";
                         row,
                         &[
                             "ecosystem",
+                            "process",
                             "binding",
                             "python_version",
                             "pip_version",
@@ -75667,6 +76112,11 @@ activate = 1\n";
                         &logical,
                     )?;
                     SdkExecutionObservation::Pip {
+                        process: parse_sdk_execution_process(
+                            sdk_json_field(row, "process", &logical)?,
+                            proof_class,
+                            &logical,
+                        )?,
                         binding: parse_sdk_observation_binding(
                             sdk_json_field(row, "binding", &logical)?,
                             &logical,
@@ -75752,6 +76202,7 @@ activate = 1\n";
                         row,
                         &[
                             "ecosystem",
+                            "process",
                             "binding",
                             "dotnet_sdk_version",
                             "resolver_sdk_archive_sha256",
@@ -75782,6 +76233,11 @@ activate = 1\n";
                         &logical,
                     )?;
                     SdkExecutionObservation::Nuget {
+                        process: parse_sdk_execution_process(
+                            sdk_json_field(row, "process", &logical)?,
+                            proof_class,
+                            &logical,
+                        )?,
                         binding: parse_sdk_observation_binding(
                             sdk_json_field(row, "binding", &logical)?,
                             &logical,
@@ -75912,6 +76368,7 @@ activate = 1\n";
                         row,
                         &[
                             "ecosystem",
+                            "process",
                             "binding",
                             "go_version",
                             "online_download_exit",
@@ -75944,6 +76401,11 @@ activate = 1\n";
                         &logical,
                     )?;
                     SdkExecutionObservation::Go {
+                        process: parse_sdk_execution_process(
+                            sdk_json_field(row, "process", &logical)?,
+                            proof_class,
+                            &logical,
+                        )?,
                         binding: parse_sdk_observation_binding(
                             sdk_json_field(row, "binding", &logical)?,
                             &logical,
@@ -76067,6 +76529,10 @@ activate = 1\n";
             observations.push(observation);
         }
         Ok(ParsedSdkExecutionBundle {
+            proof_class,
+            repository_root: validator_runtime.repository_root,
+            batch_started_at_utc,
+            batch_finished_at_utc,
             complete_input_sha256,
             observations,
         })
@@ -76093,9 +76559,11 @@ activate = 1\n";
             .zip(&bundle.observations)
             .enumerate()
         {
-            let (binding, online, offline) = match (observation, &peer.expected_execution) {
+            let (process, binding, online, offline) =
+                match (observation, &peer.expected_execution) {
                 (
                     SdkExecutionObservation::Npm {
+                        process,
                         binding,
                         node_version,
                         npm_version,
@@ -76137,10 +76605,16 @@ activate = 1\n";
                         return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
                             .at(&peer.sdk_id));
                     }
-                    (binding, online_closure_sha256.as_str(), offline_closure_sha256.as_str())
+                    (
+                        process,
+                        binding,
+                        online_closure_sha256.as_str(),
+                        offline_closure_sha256.as_str(),
+                    )
                 }
                 (
                     SdkExecutionObservation::Pip {
+                        process,
                         binding,
                         python_version,
                         pip_version,
@@ -76194,6 +76668,7 @@ activate = 1\n";
                             .at(&peer.sdk_id));
                     }
                     (
+                        process,
                         binding,
                         online_content_closure_sha256.as_str(),
                         offline_content_closure_sha256.as_str(),
@@ -76201,6 +76676,7 @@ activate = 1\n";
                 }
                 (
                     SdkExecutionObservation::Nuget {
+                        process,
                         binding,
                         dotnet_sdk_version,
                         resolver_sdk_archive_sha256,
@@ -76270,6 +76746,7 @@ activate = 1\n";
                         validate_sha256(digest, subject)?;
                     }
                     (
+                        process,
                         binding,
                         online_project_assets_sha256.as_str(),
                         offline_project_assets_sha256.as_str(),
@@ -76277,6 +76754,7 @@ activate = 1\n";
                 }
                 (
                     SdkExecutionObservation::Go {
+                        process,
                         binding,
                         go_version,
                         online_download_exit,
@@ -76343,13 +76821,62 @@ activate = 1\n";
                         return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
                             .at(&peer.sdk_id));
                     }
-                    (binding, online_closure_sha256.as_str(), offline_closure_sha256.as_str())
+                    (
+                        process,
+                        binding,
+                        online_closure_sha256.as_str(),
+                        offline_closure_sha256.as_str(),
+                    )
                 }
                 _ => {
                     return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
                         .at("ecosystem tag/order"));
                 }
             };
+            let (expected_interpreter_id, expected_tool_id, expected_interpreter_version, expected_tool_version) =
+                match peer.sdk_id.as_str() {
+                    "typescript" => ("node", "npm", "v24.12.0", "11.14.0"),
+                    "python" => ("python", "pip", "Python 3.14.4", "26.1"),
+                    "csharp" => ("dotnet", "dotnet", "10.0.100", "10.0.100"),
+                    "go" => (
+                        "go",
+                        "go",
+                        "go version go1.25.0 darwin/arm64",
+                        "go version go1.25.0 darwin/arm64",
+                    ),
+                    _ => {
+                        return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                            .at("unknown SDK process identity"));
+                    }
+                };
+            let process_identity_valid = match bundle.proof_class {
+                SdkExecutionProofClass::BatchExecution => {
+                    process.interpreter.id == expected_interpreter_id
+                        && process.tool.id == expected_tool_id
+                        && process.interpreter.version == expected_interpreter_version
+                        && process.tool.version == expected_tool_version
+                }
+                SdkExecutionProofClass::ValidationFixture => {
+                    process.interpreter.id == "validation-fixture"
+                        && process.tool.id == "validation-fixture"
+                        && process.interpreter.version == "no-execution-no-credit"
+                        && process.tool.version == "no-execution-no-credit"
+                }
+            };
+            if !process_identity_valid
+                || process.command_id != format!("{}-sdk-reproduction", peer.sdk_id)
+                || process.cwd != bundle.repository_root
+                || !process.argv.iter().any(|argument| argument == &process.tool.path)
+                || process.reproduction_script_byte_length
+                    != peer.reproduction_script_byte_length
+                || process.reproduction_script_sha256 != peer.reproduction_script_sha256
+                || process.started_at_utc.as_str() < bundle.batch_started_at_utc.as_str()
+                || process.finished_at_utc.as_str() > bundle.batch_finished_at_utc.as_str()
+                || process.finished_at_utc != binding.observed_at_utc
+            {
+                return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at(format!("{} process provenance", peer.sdk_id)));
+            }
             if binding.sdk_id != peer.sdk_id
                 || binding.source_selector != peer.source_selector
                 || binding.source_commit != peer.source_commit
@@ -76381,14 +76908,20 @@ activate = 1\n";
             }
             results.push(ParsedSdkPeerResult {
                 sdk_id: peer.sdk_id.clone(),
-                source_selector: format!("/peers/{index}/lock/last_execution"),
+                source_selector: format!(
+                    "sdk-execution-facts-v2#/observations/{index}"
+                ),
                 checked_lock_sha256: peer.checked_lock_sha256.clone(),
                 online_closure_sha256: online.to_owned(),
                 offline_closure_sha256: offline.to_owned(),
                 artifact_count: peer.artifact_count,
                 artifact_set_sha256: peer.artifact_set_sha256.clone(),
                 observed_at_utc: binding.observed_at_utc.clone(),
-                evidence_verdict: "Pass".to_owned(),
+                evidence_verdict: match bundle.proof_class {
+                    SdkExecutionProofClass::BatchExecution => "Pass",
+                    SdkExecutionProofClass::ValidationFixture => "FixtureValidatedNoCredit",
+                }
+                .to_owned(),
                 support_claim: false,
             });
         }
@@ -76535,6 +77068,8 @@ activate = 1\n";
                 }
             }
             validate_sdk_reproduction_contract(peer, expected, policy)?;
+            let reproduction_script =
+                sdk_nonempty_source_string(lock, "reproduction_script", policy, subject)?;
             let artifacts = artifacts_by_sdk
                 .get(expected.id)
                 .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", subject).at(expected.id))?;
@@ -76565,6 +77100,8 @@ activate = 1\n";
                 ecosystem: expected.ecosystem.to_owned(),
                 source_selector: format!("/peers/by-id/{}", expected.id),
                 source_commit: expected.source_commit.to_owned(),
+                reproduction_script_byte_length: u64::try_from(reproduction_script.len())
+                    .unwrap_or(u64::MAX),
                 reproduction_script_sha256: expected.reproduction_script_sha256.to_owned(),
                 checked_lock_sha256: record_string(checked_lock, "sha256", subject)?.to_owned(),
                 artifact_count: artifacts.len(),
@@ -76962,409 +77499,6 @@ activate = 1\n";
             }
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn derive_sdk_source_evidence_from_document(
-        document: &toml::Value,
-        files: &[LoadedFile],
-        policy: &Policy,
-    ) -> VResult<Vec<ParsedSdkPeerResult>> {
-        let subject = "SDK source evidence";
-        let root = document
-            .as_table()
-            .ok_or_else(|| Diagnostic::error("E_SDK_SOURCE", subject))?;
-        let contract = policy_unmodeled_table(policy, "sdk_contract")?;
-        if record_string(contract, "source_path", "sdk_contract")?
-            != "evidence/fnd-01/sdk-matrix.toml"
-            || !string_sequence_is(
-                &record_string_array(contract, "sdk_order", "sdk_contract")?,
-                SDK_IDS,
-            )
-            || record_usize(contract, "artifact_count", "sdk_contract")? != 9
-            || record_usize(contract, "lock_count", "sdk_contract")? != 12
-            || record_usize(contract, "peer_result_count", "sdk_contract")? != EXPECTED_SDKS
-            || record_bool(contract, "artifact_byte_proof", "sdk_contract")?
-        {
-            return Err(Diagnostic::error("E_SDK_POLICY", "sdk_contract"));
-        }
-        if record_string(root, "manifest_format", subject)? != "fastmcp-fnd-01-sdk-matrix-v1"
-            || record_u64(root, "manifest_revision", subject)? != 6
-            || record_string(root, "protocol_version", subject)? != "2026-07-28"
-        {
-            return Err(Diagnostic::error("E_SDK_SOURCE", subject));
-        }
-        let peer_values = record_array(root, "peers", subject)?;
-        if peer_values.len() != EXPECTED_SDKS {
-            return Err(Diagnostic::error("E_SDK_PEER_COUNT", subject));
-        }
-        let mut peers = BTreeMap::new();
-        for (index, (value, expected_id)) in peer_values.iter().zip(SDK_IDS).enumerate() {
-            let logical = format!("{subject}/peers[{index}]");
-            let peer = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_SOURCE", &logical))?;
-            if record_string(peer, "id", &logical)? != *expected_id
-                || record_u64(peer, "tier_at_freeze", &logical)? != 1
-                || peers.insert(*expected_id, peer).is_some()
-            {
-                return Err(Diagnostic::error("E_SDK_PEER_ORDER", &logical));
-            }
-        }
-
-        let catalog = record_table(root, "catalog", subject)?;
-        let catalog_entries = record_array(catalog, "entries", subject)?;
-        let mut catalog_ids = BTreeSet::new();
-        let mut tier_one = Vec::new();
-        for (index, value) in catalog_entries.iter().enumerate() {
-            let logical = format!("{subject}/catalog.entries[{index}]");
-            let entry = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", &logical))?;
-            let id = record_string(entry, "id", &logical)?;
-            let tier = record_u64(entry, "tier", &logical)?;
-            let included = record_bool(entry, "included", &logical)?;
-            if !catalog_ids.insert(id) || included != (tier == 1) {
-                return Err(Diagnostic::error("E_SDK_CATALOG", &logical));
-            }
-            if tier == 1 {
-                tier_one.push(id.to_owned());
-            }
-        }
-        if !string_sequence_is(&tier_one, SDK_IDS)
-            || !string_sequence_is(
-                &record_string_array(catalog, "tier1_ids_in_catalog_order", subject)?,
-                SDK_IDS,
-            )
-            || !string_sequence_is(
-                &record_string_array(catalog, "matrix_peer_ids", subject)?,
-                SDK_IDS,
-            )
-            || record_usize(catalog, "tier1_count", subject)? != EXPECTED_SDKS
-            || record_usize(catalog, "matrix_peer_count", subject)? != EXPECTED_SDKS
-            || !record_bool(catalog, "matrix_exact_set_equal", subject)?
-        {
-            return Err(Diagnostic::error("E_SDK_CATALOG", subject));
-        }
-
-        let vendored_values = record_array(root, "vendored_artifacts", subject)?;
-        if record_usize(root, "artifact_count", subject)? != vendored_values.len()
-            || vendored_values.len() != 13
-        {
-            return Err(Diagnostic::error("E_SDK_LOCK_COUNT", subject));
-        }
-        let mut vendored_by_id = BTreeMap::new();
-        let mut vendored_total_bytes = 0u64;
-        for (index, value) in vendored_values.iter().enumerate() {
-            let logical = format!("{subject}/vendored_artifacts[{index}]");
-            let row = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-            let id = record_string(row, "id", &logical)?;
-            let path = record_string(row, "path", &logical)?;
-            let byte_length = record_u64(row, "byte_length", &logical)?;
-            let digest = record_string(row, "sha256", &logical)?;
-            validate_ascii_posix_path(path, &logical)?;
-            validate_sha256(digest, &logical)?;
-            let file = source_lookup(files, path)?;
-            if u64::try_from(file.bytes.len()).unwrap_or(u64::MAX) != byte_length
-                || lower_hex(&sha256(&file.bytes)) != digest
-                || vendored_by_id.insert(id, row).is_some()
-            {
-                return Err(Diagnostic::error("E_SDK_LOCK", &logical));
-            }
-            vendored_total_bytes = vendored_total_bytes
-                .checked_add(byte_length)
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-        }
-        if record_u64(root, "artifact_total_bytes", subject)? != vendored_total_bytes {
-            return Err(Diagnostic::error("E_SDK_LOCK", subject).at("vendored total bytes"));
-        }
-        let catalog_vendored = vendored_by_id
-            .get("sdk-tier-catalog")
-            .ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject))?;
-        if record_string(catalog, "vendored_path", subject)?
-            != record_string(catalog_vendored, "path", subject)?
-            || record_u64(catalog, "byte_length", subject)?
-                != record_u64(catalog_vendored, "byte_length", subject)?
-            || record_string(catalog, "sha256", subject)?
-                != record_string(catalog_vendored, "sha256", subject)?
-        {
-            return Err(Diagnostic::error("E_SDK_CATALOG", subject));
-        }
-
-        let lock_blueprints = policy_unmodeled_array(policy, "sdk_lock_blueprint")?;
-        let lock_counts = sdk_count_map(
-            record_string_array(contract, "lock_count_by_sdk", "sdk_contract")?,
-            12,
-            "sdk_contract.lock_count_by_sdk",
-        )?;
-        if lock_blueprints.len() != 12
-            || SDK_LOCK_SOURCE_FIELDS.len() != lock_blueprints.len()
-            || SDK_LOCK_BLUEPRINT_IDENTITIES.len() != lock_blueprints.len()
-        {
-            return Err(Diagnostic::error("E_SDK_POLICY", "sdk_lock_blueprint"));
-        }
-        let mut actual_lock_counts = BTreeMap::<String, usize>::new();
-        let mut lock_digests = BTreeMap::<String, String>::new();
-        let mut lock_ids = BTreeSet::new();
-        let mut prior_sdk_index = 0usize;
-        for (index, value) in lock_blueprints.iter().enumerate() {
-            let logical = format!("sdk_lock_blueprint[{index}]");
-            let blueprint = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
-            let sdk_id = record_string(blueprint, "sdk_id", &logical)?;
-            let sdk_index = SDK_IDS
-                .iter()
-                .position(|candidate| *candidate == sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
-            let lock_id = record_string(blueprint, "lock_id", &logical)?;
-            let path = record_string(blueprint, "path", &logical)?;
-            let (expected_sdk_id, expected_lock_id, expected_role) =
-                SDK_LOCK_BLUEPRINT_IDENTITIES[index];
-            if !lock_ids.insert(lock_id)
-                || sdk_index < prior_sdk_index
-                || lock_id != SDK_LOCK_SOURCE_FIELDS[index].0
-                || sdk_id != expected_sdk_id
-                || lock_id != expected_lock_id
-                || record_string(blueprint, "role", &logical)? != expected_role
-            {
-                return Err(Diagnostic::error("E_SDK_LOCK_ORDER", &logical));
-            }
-            prior_sdk_index = sdk_index;
-            let vendored = vendored_by_id
-                .get(lock_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-            if record_string(vendored, "path", &logical)? != path {
-                return Err(Diagnostic::error("E_SDK_LOCK", &logical));
-            }
-            let (path_field, length_field, digest_field) =
-                sdk_lock_source_field_binding(lock_id, &logical)?;
-            let peer = peers
-                .get(sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-            let lock = record_table(peer, "lock", &logical)?;
-            let digest = record_string(vendored, "sha256", &logical)?;
-            if record_string(lock, path_field, &logical)? != path
-                || record_u64(lock, length_field, &logical)?
-                    != record_u64(vendored, "byte_length", &logical)?
-                || record_string(lock, digest_field, &logical)? != digest
-            {
-                return Err(Diagnostic::error("E_SDK_LOCK", &logical));
-            }
-            let count = actual_lock_counts.entry(sdk_id.to_owned()).or_default();
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-            lock_digests.insert(lock_id.to_owned(), digest.to_owned());
-        }
-        if actual_lock_counts != lock_counts {
-            return Err(Diagnostic::error("E_SDK_LOCK_COUNT", subject));
-        }
-
-        let artifact_blueprints = policy_unmodeled_array(policy, "sdk_artifact_blueprint")?;
-        let artifact_counts = sdk_count_map(
-            record_string_array(contract, "artifact_count_by_sdk", "sdk_contract")?,
-            9,
-            "sdk_contract.artifact_count_by_sdk",
-        )?;
-        if artifact_blueprints.len() != 9 {
-            return Err(Diagnostic::error("E_SDK_POLICY", "sdk_artifact_blueprint"));
-        }
-        let mut artifacts_by_sdk = BTreeMap::<String, Vec<SdkArtifactObservation>>::new();
-        let mut artifact_ids = BTreeSet::new();
-        let mut next_artifact_index = BTreeMap::<&str, usize>::new();
-        let mut prior_sdk_index = 0usize;
-        for (index, value) in artifact_blueprints.iter().enumerate() {
-            let logical = format!("sdk_artifact_blueprint[{index}]");
-            let blueprint = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
-            let sdk_id = record_string(blueprint, "sdk_id", &logical)?;
-            let sdk_index = SDK_IDS
-                .iter()
-                .position(|candidate| *candidate == sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
-            if sdk_index < prior_sdk_index {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT_ORDER", &logical));
-            }
-            prior_sdk_index = sdk_index;
-            let source_index = next_artifact_index.entry(sdk_id).or_default();
-            let expected_selector =
-                format!("/peers/{sdk_index}/registry_artifacts/{}", *source_index);
-            let source_selector = record_string(blueprint, "source_selector", &logical)?;
-            if source_selector != expected_selector {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT_ORDER", &logical));
-            }
-            *source_index = (*source_index)
-                .checked_add(1)
-                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
-            let source = pointer_get(document, source_selector, &logical)?
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
-            let peer = peers
-                .get(sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
-            let artifact_id = record_string(blueprint, "artifact_id", &logical)?;
-            let ecosystem = record_string(blueprint, "ecosystem", &logical)?;
-            let package_id = record_string(blueprint, "package_id", &logical)?;
-            let version = record_string(blueprint, "version", &logical)?;
-            let artifact_kind = record_string(blueprint, "artifact_kind", &logical)?;
-            let source_kind = source.get("kind").and_then(toml::Value::as_str);
-            if !artifact_ids.insert(artifact_id)
-                || record_string(source, "package", &logical)? != package_id
-                || record_string(source, "version", &logical)? != version
-                || record_string(peer, "version", &logical)? != version
-                || (ecosystem == "npm" && source_kind.is_some())
-                || (ecosystem != "npm" && source_kind != Some(artifact_kind))
-            {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical));
-            }
-            let url = sdk_nonempty_source_string(source, "url", policy, &logical)?;
-            if !url.is_ascii() || !url.starts_with("https://") {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical).at("url"));
-            }
-            let byte_length = record_u64(source, "byte_length", &logical)?;
-            if byte_length == 0 {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical).at("byte_length"));
-            }
-            let sha256_source_field = record_string(blueprint, "sha256_source_field", &logical)?;
-            let artifact_sha256 = record_string(source, sha256_source_field, &logical)?;
-            validate_sha256(artifact_sha256, &logical)?;
-            let integrity_fields =
-                record_string_array(blueprint, "native_integrity_source_fields", &logical)?;
-            if integrity_fields.iter().collect::<BTreeSet<_>>().len() != integrity_fields.len() {
-                return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical)
-                    .at("duplicate native integrity field"));
-            }
-            let mut native_integrity = Vec::with_capacity(integrity_fields.len());
-            for field in integrity_fields {
-                let value = sdk_nonempty_source_string(source, &field, policy, &logical)?;
-                native_integrity.push((field, value.to_owned()));
-            }
-            let embedded_commit_source_field =
-                record_string(blueprint, "embedded_commit_source_field", &logical)?;
-            let embedded_commit = if embedded_commit_source_field.is_empty() {
-                String::new()
-            } else {
-                let commit = sdk_nonempty_source_string(
-                    source,
-                    embedded_commit_source_field,
-                    policy,
-                    &logical,
-                )?;
-                if commit.len() != 40
-                    || !commit
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    || commit != record_string(peer, "source_commit", &logical)?
-                {
-                    return Err(Diagnostic::error("E_SDK_ARTIFACT", &logical)
-                        .at(embedded_commit_source_field));
-                }
-                commit.to_owned()
-            };
-            artifacts_by_sdk
-                .entry(sdk_id.to_owned())
-                .or_default()
-                .push(SdkArtifactObservation {
-                    sdk_id: sdk_id.to_owned(),
-                    artifact_id: artifact_id.to_owned(),
-                    source_selector: source_selector.to_owned(),
-                    ecosystem: ecosystem.to_owned(),
-                    package_id: package_id.to_owned(),
-                    version: version.to_owned(),
-                    artifact_kind: artifact_kind.to_owned(),
-                    url: url.to_owned(),
-                    byte_length,
-                    sha256_source_field: sha256_source_field.to_owned(),
-                    sha256: artifact_sha256.to_owned(),
-                    native_integrity,
-                    embedded_commit_source_field: embedded_commit_source_field.to_owned(),
-                    embedded_commit,
-                });
-        }
-        let actual_artifact_counts = artifacts_by_sdk
-            .iter()
-            .map(|(sdk_id, values)| (sdk_id.clone(), values.len()))
-            .collect::<BTreeMap<_, _>>();
-        if actual_artifact_counts != artifact_counts {
-            return Err(Diagnostic::error("E_SDK_ARTIFACT_COUNT", subject));
-        }
-
-        let peer_blueprints = policy_unmodeled_array(policy, "sdk_peer_blueprint")?;
-        if peer_blueprints.len() != EXPECTED_SDKS {
-            return Err(Diagnostic::error("E_SDK_POLICY", "sdk_peer_blueprint"));
-        }
-        let mut results = Vec::with_capacity(EXPECTED_SDKS);
-        for (index, (value, sdk_id)) in peer_blueprints.iter().zip(SDK_IDS).enumerate() {
-            let logical = format!("sdk_peer_blueprint[{index}]");
-            let blueprint = value
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_POLICY", &logical))?;
-            let expected_selector = format!("/peers/{index}/lock/last_execution");
-            if record_string(blueprint, "sdk_id", &logical)? != *sdk_id
-                || record_string(blueprint, "source_selector", &logical)? != expected_selector
-            {
-                return Err(Diagnostic::error("E_SDK_POLICY", &logical));
-            }
-            let peer = peers
-                .get(*sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_SOURCE", &logical))?;
-            let lock = record_table(peer, "lock", &logical)?;
-            let execution = pointer_get(document, &expected_selector, &logical)?
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_SDK_EXECUTION", &logical))?;
-            let (observed_at_utc, online, offline, checked_lock) =
-                sdk_historical_execution(*sdk_id, lock, execution, policy, &logical)?;
-            let checked_lock_id = sdk_checked_lock_id(*sdk_id, &logical)?;
-            let actual_checked_lock = lock_digests
-                .get(checked_lock_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_LOCK", &logical))?;
-            let artifacts = artifacts_by_sdk
-                .get(*sdk_id)
-                .ok_or_else(|| Diagnostic::error("E_SDK_ARTIFACT", &logical))?;
-            let result = ParsedSdkPeerResult {
-                sdk_id: (*sdk_id).to_owned(),
-                source_selector: expected_selector,
-                checked_lock_sha256: checked_lock,
-                online_closure_sha256: online,
-                offline_closure_sha256: offline,
-                artifact_count: artifacts.len(),
-                artifact_set_sha256: sdk_artifact_set_sha256(artifacts, &logical)?,
-                observed_at_utc,
-                evidence_verdict: "Pass".to_owned(),
-                support_claim: false,
-            };
-            if result.checked_lock_sha256 != *actual_checked_lock
-                || result.checked_lock_sha256
-                    != record_string(blueprint, "checked_lock_sha256", &logical)?
-                || result.online_closure_sha256
-                    != record_string(blueprint, "online_closure_sha256", &logical)?
-                || result.offline_closure_sha256
-                    != record_string(blueprint, "offline_closure_sha256", &logical)?
-                || result.observed_at_utc != record_string(blueprint, "observed_at_utc", &logical)?
-            {
-                return Err(Diagnostic::error("E_SDK_EXECUTION", &logical));
-            }
-            results.push(result);
-        }
-        Ok(results)
-    }
-
-    fn parse_sdk_source_evidence(
-        files: &[LoadedFile],
-        policy: &Policy,
-        external_facts: ExternalSdkExecutionFacts,
-    ) -> VResult<Vec<ParsedSdkPeerResult>> {
-        let validation = fnd_01_sdk_matrix_validate(files, policy, external_facts)?;
-        match validation.execution {
-            ExecutionValidation::Unverified => Err(Diagnostic::pending(
-                "sdk_execution_facts_pending",
-            )),
-            ExecutionValidation::Verified(results) => Ok(results),
-        }
     }
 
     fn sdk_peer_result_mismatch_field(
@@ -79351,18 +79485,6 @@ activate = 1\n";
         run_verifier_at_with_sdk_execution_facts(root, ExternalSdkExecutionFacts::Absent)
     }
 
-    /// Batch ingress for raw SDK execution facts.  Parsing, complete-input
-    /// binding, and typed projection all occur inside the ordinary verifier.
-    fn run_verifier_at_with_sdk_execution_json(
-        root: &Path,
-        raw_bytes: Vec<u8>,
-    ) -> VResult<Report> {
-        run_verifier_at_with_sdk_execution_facts(
-            root,
-            ExternalSdkExecutionFacts::present_from_batch_owned_json(raw_bytes),
-        )
-    }
-
     /// Externally callable batch-owned SDK-fact verifier surface.  The local
     /// harness does not call this with repository-authored data; the batch
     /// orchestrator must supply the raw execution JSON it produced.
@@ -79370,13 +79492,77 @@ activate = 1\n";
         root: &Path,
         raw_bytes: Vec<u8>,
     ) -> Result<Vec<String>, String> {
-        let report = run_verifier_at_with_sdk_execution_json(root, raw_bytes)
+        let (policy, _) = read_policy(root).map_err(|diagnostic| diagnostic.stable())?;
+        validate_policy_shape(&policy).map_err(|diagnostic| diagnostic.stable())?;
+        let files = load_sources(root, &policy).map_err(|diagnostic| diagnostic.stable())?;
+        let facts = ExternalSdkExecutionFacts::present_from_batch_owned_json(root, raw_bytes)
             .map_err(|diagnostic| diagnostic.stable())?;
-        let diagnostics = report.sorted_stable();
-        if report.has_errors() {
-            Err(diagnostics.join("\n"))
-        } else {
-            Ok(diagnostics)
+        let validation = fnd_01_sdk_matrix_validate(&files, &policy, facts)
+            .map_err(|diagnostic| diagnostic.stable())?;
+        if validation.support_claim {
+            return Err("SDK fact validation cannot grant a support claim".to_owned());
+        }
+        let ExecutionValidation::Verified(results) = validation.execution else {
+            return Err("SDK execution facts were not verified".to_owned());
+        };
+        if results.len() != SDK_IDS.len() {
+            return Err("SDK execution fact result count mismatch".to_owned());
+        }
+        Ok(results
+            .into_iter()
+            .map(|result| {
+                format!(
+                    "sdk_id={};evidence_verdict={};support_claim=false;capability_credit=false",
+                    result.sdk_id, result.evidence_verdict,
+                )
+            })
+            .collect())
+    }
+
+    fn run_sdk_batch_verify_json_from_stdin() -> i32 {
+        let subject = "batch-owned SDK execution facts";
+        let read_limit = match u64::try_from(MAX_SDK_EXECUTION_FACT_BYTES)
+            .ok()
+            .and_then(|limit| limit.checked_add(1))
+        {
+            Some(limit) => limit,
+            None => {
+                eprintln!(
+                    "{}",
+                    Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                        .at("stdin bound cannot be represented")
+                        .stable(),
+                );
+                return 1;
+            }
+        };
+        let stdin = io::stdin();
+        let mut bounded_stdin = stdin.lock().take(read_limit);
+        let mut raw_bytes = Vec::new();
+        if let Err(error) = bounded_stdin.read_to_end(&mut raw_bytes) {
+            eprintln!(
+                "{}",
+                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at(format!("stdin read: {error}"))
+                    .stable(),
+            );
+            return 1;
+        }
+        if raw_bytes.len() > MAX_SDK_EXECUTION_FACT_BYTES {
+            eprintln!(
+                "{}",
+                Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                    .at("stdin byte bound exceeded")
+                    .stable(),
+            );
+            return 1;
+        }
+        match sdk_batch_verify_json(&repository_root(), raw_bytes) {
+            Ok(_) => 0,
+            Err(diagnostics) => {
+                eprintln!("{diagnostics}");
+                1
+            }
         }
     }
 
@@ -98550,6 +98736,13 @@ fn fallible(value: Option<u8>) {
                     Ok(()) => 0,
                     Err(_) => 3,
                 };
+            }
+            if arguments.len() == 2
+                && arguments.get(1).and_then(|value| value.to_str())
+                    == Some("sdk-batch-verify-json")
+            {
+                branch.set(1);
+                return run_sdk_batch_verify_json_from_stdin();
             }
             match arguments.len() {
                 // Local controller: exact single-item argv runs the dependency-backed verifier.
