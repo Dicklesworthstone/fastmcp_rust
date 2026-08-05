@@ -77111,9 +77111,55 @@ activate = 1\n";
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CoreConformanceEra {
+        Legacy2024,
+        Modern2026,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CoreConformanceLicense {
+        Mit,
+        TransitionNotice,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct CoreConformanceTypedState {
+        eras: [CoreConformanceEra; 2],
+        artifact_ids: [&'static str; 8],
+        tree_corpus_edges: [usize; 3],
+        licenses: [CoreConformanceLicense; 3],
+        error_codes: [i64; 3],
+        no_claims: [bool; 5],
+    }
+
+    const CORE_CONFORMANCE_TYPED_STATE: CoreConformanceTypedState = CoreConformanceTypedState {
+        eras: [CoreConformanceEra::Legacy2024, CoreConformanceEra::Modern2026],
+        artifact_ids: [
+            "core-schema-ts", "core-schema-json", "legacy-core-schema-ts",
+            "legacy-core-schema-json", "core-changelog", "conformance-package",
+            "conformance-enterprise-auth", "conformance-client-credentials",
+        ],
+        tree_corpus_edges: [6, 3, 5],
+        licenses: [
+            CoreConformanceLicense::Mit,
+            CoreConformanceLicense::TransitionNotice,
+            CoreConformanceLicense::TransitionNotice,
+        ],
+        error_codes: [-32_020, -32_021, -32_022],
+        no_claims: [false; 5],
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct CoreConformanceAcceptedBinding {
         manifest_sha256: [u8; 32],
         artifact_tree_sha256: [u8; 32],
+        typed: CoreConformanceTypedState,
+        authority_sha256: [u8; 32],
+        artifact_records_sha256: [u8; 32],
+        tree_chain_sha256: [u8; 32],
+        license_provenance_sha256: [u8; 32],
+        no_claim_sha256: [u8; 32],
+        registries_sha256: [u8; 32],
         tree_chain_edges: usize,
         final_error_codes: usize,
         conformance_scenarios: usize,
@@ -77135,6 +77181,17 @@ activate = 1\n";
         document: &toml::Value,
         admitted_files: &[LoadedFile],
     ) -> VResult<()> {
+        let source = source_lookup(admitted_files, "evidence/fnd-01/core-conformance.toml")?;
+        if source.bytes.len() != 54_154
+            || source.digest != sha256(&source.bytes)
+            || lower_hex(&source.digest)
+                != "76403615758b3c6ee6eafebf4755d9eadbb7713e240421eceb4f1776c0083750"
+        {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_MANIFEST_BINDING",
+                "core-conformance",
+            ));
+        }
         let admitted = parse_source_toml(admitted_files, "evidence/fnd-01/core-conformance.toml")?;
         if document != &admitted {
             return Err(Diagnostic::error(
@@ -77143,6 +77200,45 @@ activate = 1\n";
             ));
         }
         Ok(())
+    }
+
+    const CORE_CONFORMANCE_OBSERVATION_DOMAIN: &[u8] =
+        b"FASTMCP-FND01-CORE-CONFORMANCE-OBS-V1";
+    const CORE_AUTHORITY_SHA256: &str =
+        "137fe3d42271ba8224c2611078c7b968aa9c5764fdeea4c158d391056ff72d7b";
+    const CORE_ARTIFACTS_SHA256: &str =
+        "2a7fc7ea7d6af52bc6ea6a0a58dd71cdcc25f0f6bd31f7a0f2c558507bc263c4";
+    const CORE_TREE_CHAIN_SHA256: &str =
+        "337d08562eb944592150f7ebd11d395aadf385dc1bc2ffa6ff32c54e798c704d";
+    const CORE_LICENSE_SHA256: &str =
+        "152f610ea3507cd0adceac94a1c59f3473c2743f61039033c66d9bd22a75b0a7";
+    const CORE_NO_CLAIM_SHA256: &str =
+        "fd19d44c34f603f84a09bd5ca85af2c768ab64b3ff71812ad555985907950664";
+    const CORE_REGISTRIES_SHA256: &str =
+        "d0fc399f615d789637d2a46d3637e52f879d384ce3154b9611daa4accc1b6556";
+
+    fn core_conformance_exact_group(
+        document: &toml::Value,
+        paths: &[&str],
+        expected_sha256: &str,
+        subject: &str,
+    ) -> VResult<[u8; 32]> {
+        let mut observation = ObservationEncoder::new(1 << 20, subject)?;
+        observation.extend(CORE_CONFORMANCE_OBSERVATION_DOMAIN)?;
+        observation.byte(0)?;
+        observation.u32(paths.len())?;
+        for path in paths {
+            observation.sized_u32(path.as_bytes())?;
+            encode_toml_observation(Some(pointer_get(document, path, subject)?), &mut observation)?;
+        }
+        let digest = sha256(&observation.bytes);
+        if lower_hex(&digest) != expected_sha256 {
+            return Err(Diagnostic::error(
+                "E_CORE_CONFORMANCE_EXACT_BINDING",
+                subject,
+            ));
+        }
+        Ok(digest)
     }
 
     fn validate_core_conformance_tree_chain(document: &toml::Value) -> VResult<usize> {
@@ -77156,6 +77252,7 @@ activate = 1\n";
         }
         let edges = record_array(chain, "edges", "immutable_tree_chain")?;
         let mut counts = BTreeMap::new();
+        let mut descendants = BTreeMap::<&str, BTreeSet<&str>>::new();
         for edge in edges {
             let edge = edge.as_table().ok_or_else(|| {
                 Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", "immutable_tree_chain")
@@ -77186,6 +77283,14 @@ activate = 1\n";
                 || child.len() != 40
                 || !parent.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                 || !child.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", corpus));
+            }
+            let seen = descendants.entry(corpus).or_default();
+            if (parent_kind == "commit"
+                && (parent != revision || child_path != "." || !seen.is_empty()))
+                || (parent_kind == "tree" && !seen.contains(parent))
+                || !seen.insert(child)
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_TREE_CHAIN", corpus));
             }
@@ -77232,17 +77337,24 @@ activate = 1\n";
         if error_codes.len() != 3 {
             return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "final_error_codes"));
         }
-        for (row, (name, constant, code)) in error_codes.iter().zip([
-            ("HeaderMismatchError", "HEADER_MISMATCH", -32_020i64),
+        for (row, (name, constant, code, pointer)) in error_codes.iter().zip([
+            (
+                "HeaderMismatchError",
+                "HEADER_MISMATCH",
+                -32_020i64,
+                "#/$defs/HeaderMismatchError/properties/error/allOf/1/properties/code/const",
+            ),
             (
                 "MissingRequiredClientCapabilityError",
                 "MISSING_REQUIRED_CLIENT_CAPABILITY",
                 -32_021,
+                "#/$defs/MissingRequiredClientCapabilityError/properties/error/allOf/1/properties/code/const",
             ),
             (
                 "UnsupportedProtocolVersionError",
                 "UNSUPPORTED_PROTOCOL_VERSION",
                 -32_022,
+                "#/$defs/UnsupportedProtocolVersionError/properties/error/allOf/1/properties/code/const",
             ),
         ]) {
             let row = row.as_table().ok_or_else(|| {
@@ -77254,7 +77366,8 @@ activate = 1\n";
                 || record_string(row, "typescript_artifact", "final_error_codes")? != "core-schema-ts"
                 || record_string(row, "json_schema_artifact", "final_error_codes")?
                     != "core-schema-json"
-                || !record_string(row, "json_pointer", "final_error_codes")?.starts_with("#/")
+                || record_i64(row, "http_status", "final_error_codes")? != 400
+                || record_string(row, "json_pointer", "final_error_codes")? != pointer
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_REGISTRY", "final_error_codes"));
             }
@@ -77321,7 +77434,10 @@ activate = 1\n";
                     != scenario_failure_checks
                         .get(scenario)
                         .is_some_and(|checks| checks.contains(check))
-                || declared.entry(scenario.to_owned()).or_default().insert(check.to_owned()) == false
+                || !declared
+                    .entry(scenario.to_owned())
+                    .or_default()
+                    .insert(check.to_owned())
             {
                 return Err(Diagnostic::error(
                     "E_CORE_CONFORMANCE_REGISTRY",
@@ -77387,7 +77503,7 @@ activate = 1\n";
     }
 
     fn validate_core_conformance_license_provenance(document: &toml::Value) -> VResult<()> {
-        for (id, repository, revision, blob, byte_length, digest, declared_license) in [
+        for (id, repository, revision, blob, byte_length, digest, declared_license, scope) in [
             (
                 "core_2024_11_05",
                 "https://github.com/modelcontextprotocol/modelcontextprotocol",
@@ -77396,6 +77512,7 @@ activate = 1\n";
                 1_071usize,
                 "5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d",
                 "MIT",
+                "Immutable repository-level license authority for the exact 2024-11-05-final corpus.",
             ),
             (
                 "core_2026_07_28",
@@ -77405,6 +77522,7 @@ activate = 1\n";
                 12_227usize,
                 "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
                 "repository_transition_notice",
+                "The immutable repository-level notice distinguishes Apache-2.0 new code/specification contributions, CC-BY-4.0 documentation excluding specifications, and unrelicensed MIT contributions. It does not establish a single inferred per-artifact license for the frozen 2026 schema files.",
             ),
             (
                 "conformance_2026_07_28_baseline",
@@ -77414,6 +77532,7 @@ activate = 1\n";
                 12_227usize,
                 "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
                 "repository_transition_notice",
+                "Immutable repository-level license provenance for the pinned conformance baseline only. It does not establish scenario completeness, upstream conformance, production-positive evidence, aggregate MCP support, or release readiness.",
             ),
         ] {
             let subject = format!("license_provenance.{id}");
@@ -77435,7 +77554,7 @@ activate = 1\n";
                 || record_usize(record, "byte_length", &subject)? != byte_length
                 || record_string(record, "sha256", &subject)? != digest
                 || record_string(record, "declared_license", &subject)? != declared_license
-                || record_string(record, "scope", &subject)?.is_empty()
+                || record_string(record, "scope", &subject)? != scope
             {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject));
             }
@@ -77572,6 +77691,19 @@ activate = 1\n";
                 )
                 .at(format!("{index}.id")));
             }
+            let exact_fields = [
+                "id", "kind", "authority", "repository", "repository_revision", "git_tree",
+                "git_blob_sha1", "upstream_path", "source_page_url", "retrieval_url",
+                "blob_url", "retrieval_date", "vendored_path", "media_type", "byte_length",
+                "sha256",
+            ];
+            if artifact.len() != exact_fields.len()
+                || !exact_fields.iter().all(|field| artifact.contains_key(*field))
+            {
+                return Err(
+                    Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id).at("fields"),
+                );
+            }
             let expected_revision = match expected_id {
                 "core-schema-ts"
                 | "core-schema-json"
@@ -77613,6 +77745,7 @@ activate = 1\n";
                 "upstream_path",
                 "source_page_url",
                 "retrieval_url",
+                "blob_url",
                 "retrieval_date",
                 "vendored_path",
                 "media_type",
@@ -77635,6 +77768,36 @@ activate = 1\n";
                             expected_id,
                         )?))
                 {
+                    return Err(
+                        Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id).at(field),
+                    );
+                }
+            }
+            let repository = record_string(artifact, "repository", expected_id)?;
+            let slug = repository
+                .strip_prefix("https://github.com/")
+                .ok_or_else(|| {
+                    Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id)
+                        .at("repository")
+                })?;
+            let revision = record_string(artifact, "repository_revision", expected_id)?;
+            let upstream_path = record_string(artifact, "upstream_path", expected_id)?;
+            let blob = record_string(artifact, "git_blob_sha1", expected_id)?;
+            for (field, expected) in [
+                (
+                    "source_page_url",
+                    format!("{repository}/blob/{revision}/{upstream_path}"),
+                ),
+                (
+                    "retrieval_url",
+                    format!("https://raw.githubusercontent.com/{slug}/{revision}/{upstream_path}"),
+                ),
+                (
+                    "blob_url",
+                    format!("https://api.github.com/repos/{slug}/git/blobs/{blob}"),
+                ),
+            ] {
+                if record_string(artifact, field, expected_id)? != expected {
                     return Err(
                         Diagnostic::error("E_CORE_CONFORMANCE_ARTIFACT", expected_id).at(field),
                     );
@@ -77777,6 +77940,66 @@ activate = 1\n";
             conformance_findings,
             ambiguities,
         ) = validate_core_conformance_registries(document)?;
+        let authority_sha256 = core_conformance_exact_group(
+            document,
+            &[
+                "/manifest_format",
+                "/work_package",
+                "/bead",
+                "/scope",
+                "/retrieval_date",
+                "/artifact_count",
+                "/artifact_bytes_are_unmodified",
+                "/source_rewriting_generator_used",
+                "/authority_domains",
+                "/core",
+                "/core_2024_11_05",
+                "/unsupported_third_era_negative",
+                "/verification",
+                "/derived_negative_policy",
+                "/fixture_provenance",
+                "/manual_update",
+            ],
+            CORE_AUTHORITY_SHA256,
+            "authority",
+        )?;
+        let artifact_records_sha256 = core_conformance_exact_group(
+            document,
+            &["/artifacts"],
+            CORE_ARTIFACTS_SHA256,
+            "artifacts",
+        )?;
+        let tree_chain_sha256 = core_conformance_exact_group(
+            document,
+            &["/immutable_tree_chain"],
+            CORE_TREE_CHAIN_SHA256,
+            "immutable_tree_chain",
+        )?;
+        let license_provenance_sha256 = core_conformance_exact_group(
+            document,
+            &["/license_provenance"],
+            CORE_LICENSE_SHA256,
+            "license_provenance",
+        )?;
+        let no_claim_sha256 = core_conformance_exact_group(
+            document,
+            &["/conformance"],
+            CORE_NO_CLAIM_SHA256,
+            "conformance",
+        )?;
+        let registries_sha256 = core_conformance_exact_group(
+            document,
+            &[
+                "/final_error_codes",
+                "/conformance_scenarios",
+                "/scenario_local_check_declarations",
+                "/scenario_observations",
+                "/conformance_findings",
+                "/ambiguities",
+            ],
+            CORE_REGISTRIES_SHA256,
+            "registries",
+        )?;
         validate_core_conformance_manifest_binding(document, admitted_files)?;
         let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)?;
         Ok(CoreConformanceAcceptedBinding {
@@ -77786,6 +78009,13 @@ activate = 1\n";
             )?
             .digest,
             artifact_tree_sha256,
+            typed: CORE_CONFORMANCE_TYPED_STATE,
+            authority_sha256,
+            artifact_records_sha256,
+            tree_chain_sha256,
+            license_provenance_sha256,
+            no_claim_sha256,
+            registries_sha256,
             tree_chain_edges,
             final_error_codes,
             conformance_scenarios,
@@ -85115,19 +85345,6 @@ original = "value"
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
     }
 
-    fn assert_core_conformance_admitted_tree(
-        files: &[LoadedFile],
-        baseline_source_tree_sha256: [u8; 32],
-    ) {
-        let references = files.iter().collect::<Vec<_>>();
-        let (source_tree_sha256, _) = source_tree_digest_refs(&references)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_eq!(
-            source_tree_sha256, baseline_source_tree_sha256,
-            "virtual manifest plants retain the admitted source-tree digest"
-        );
-    }
-
     fn assert_core_conformance_fresh_reacceptance(
         baseline_binding: CoreConformanceAcceptedBinding,
         baseline_source_tree_sha256: [u8; 32],
@@ -85182,6 +85399,21 @@ original = "value"
             "accepted artifact binding is the independently derived eight-artifact tree"
         );
         assert_eq!(
+            accepted.typed,
+            CORE_CONFORMANCE_TYPED_STATE,
+            "accepted state retains typed authority and registry identities"
+        );
+        for (subject, digest, expected) in [
+            ("authority", accepted.authority_sha256, CORE_AUTHORITY_SHA256),
+            ("artifacts", accepted.artifact_records_sha256, CORE_ARTIFACTS_SHA256),
+            ("tree", accepted.tree_chain_sha256, CORE_TREE_CHAIN_SHA256),
+            ("license", accepted.license_provenance_sha256, CORE_LICENSE_SHA256),
+            ("no-claim", accepted.no_claim_sha256, CORE_NO_CLAIM_SHA256),
+            ("registries", accepted.registries_sha256, CORE_REGISTRIES_SHA256),
+        ] {
+            assert_eq!(lower_hex(&digest), expected, "exact accepted {subject} binding");
+        }
+        assert_eq!(
             (
                 accepted.tree_chain_edges,
                 accepted.final_error_codes,
@@ -85193,6 +85425,57 @@ original = "value"
             ),
             (14, 3, 3, 9, 3, 41, 26),
             "accepted binding exposes the complete frozen core registries"
+        );
+    }
+
+    fn assert_core_conformance_restores(
+        baseline: &toml::Value,
+        candidate: &toml::Value,
+        replaced: &[&str],
+        removed: &[&str],
+    ) {
+        let mut restored = candidate.clone();
+        for pointer in replaced {
+            set_pointer(
+                &mut restored,
+                pointer,
+                pointer_get(baseline, pointer, "core plant restore")
+                    .expect("baseline replacement")
+                    .clone(),
+                "core plant restore",
+            )
+            .expect("restore replacement");
+        }
+        for pointer in removed {
+            insert_pointer(
+                &mut restored,
+                pointer,
+                pointer_get(baseline, pointer, "core plant restore")
+                    .expect("baseline removal")
+                    .clone(),
+                "core plant restore",
+            )
+            .expect("restore removal");
+        }
+        assert_eq!(restored, *baseline, "only the declared forbidden dimension changes");
+    }
+
+    fn assert_core_conformance_rejection(
+        candidate: &toml::Value,
+        files: &[LoadedFile],
+        expected: &str,
+        baseline_binding: CoreConformanceAcceptedBinding,
+        baseline_source_tree_sha256: [u8; 32],
+    ) {
+        assert_eq!(
+            validate_core_conformance_sources(candidate, files)
+                .expect_err("the one-variable core plant must reject")
+                .stable(),
+            expected
+        );
+        assert_core_conformance_fresh_reacceptance(
+            baseline_binding,
+            baseline_source_tree_sha256,
         );
     }
 
@@ -85211,38 +85494,149 @@ original = "value"
             "core immutable license negative",
         )
         .expect("one immutable license replacement");
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        let error = validate_core_conformance_sources(&license_drifted, &files)
-            .expect_err("one immutable license mutation must reject");
-        assert_eq!(
-            error.stable(),
-            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05"
+        assert_core_conformance_restores(&baseline, &license_drifted, &["/license_provenance/core_2024_11_05/declared_license"], &[]);
+        assert_core_conformance_rejection(
+            &license_drifted,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05",
+            baseline_binding,
+            baseline_source_tree_sha256,
         );
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+
+        let mut license_overclaim = baseline.clone();
+        set_pointer(
+            &mut license_overclaim,
+            "/license_provenance/core_2026_07_28/scope",
+            toml::Value::String(
+                "Immutable repository-level notice and blanket license for every frozen artifact."
+                    .to_owned(),
+            ),
+            "core license-scope overclaim",
+        )
+        .expect("one license scope replacement");
+        assert_core_conformance_restores(&baseline, &license_overclaim, &["/license_provenance/core_2026_07_28/scope"], &[]);
+        assert_core_conformance_rejection(
+            &license_overclaim,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2026_07_28",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
 
         let mut missing_artifact = baseline.clone();
         remove_pointer(&mut missing_artifact, "/artifacts/0", "missing artifact")
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        let error = validate_core_conformance_sources(&missing_artifact, &files)
-            .expect_err("missing artifact must reject");
-        assert_eq!(
-            error.stable(),
-            "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count"
+        let before_artifacts = pointer_get(&baseline, "/artifacts", "missing artifact").expect("baseline artifacts").as_array().expect("artifact array");
+        let after_artifacts = pointer_get(&missing_artifact, "/artifacts", "missing artifact").expect("candidate artifacts").as_array().expect("artifact array");
+        assert_eq!(after_artifacts, &before_artifacts[1..], "only the first artifact is removed");
+        assert_core_conformance_rejection(
+            &missing_artifact,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|count",
+            baseline_binding,
+            baseline_source_tree_sha256,
         );
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+
+        let mut swapped_paths = baseline.clone();
+        let ts_path = pointer_get(&baseline, "/artifacts/0/vendored_path", "core path swap")
+            .expect("first core path")
+            .clone();
+        let json_path = pointer_get(&baseline, "/artifacts/1/vendored_path", "core path swap")
+            .expect("second core path")
+            .clone();
+        set_pointer(&mut swapped_paths, "/artifacts/0/vendored_path", json_path, "core path swap")
+            .expect("first side of path swap");
+        set_pointer(&mut swapped_paths, "/artifacts/1/vendored_path", ts_path, "core path swap")
+            .expect("second side of path swap");
+        assert_core_conformance_restores(&baseline, &swapped_paths, &["/artifacts/0/vendored_path", "/artifacts/1/vendored_path"], &[]);
+        assert_core_conformance_rejection(
+            &swapped_paths,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|vendored_path",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
+
+        let truncated_path =
+            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts";
+        let mut truncated_files = files.clone();
+        truncated_files
+            .iter_mut()
+            .find(|file| file.contract.path == truncated_path)
+            .expect("modern core schema is admitted")
+            .bytes
+            .pop()
+            .expect("modern core schema is nonempty");
+        let changed = files
+            .iter()
+            .zip(&truncated_files)
+            .filter(|(before, after)| before.bytes != after.bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(changed.len(), 1, "exactly one admitted byte input changes");
+        assert_eq!(changed[0].0.contract.path, truncated_path);
+        assert_eq!(
+            &changed[0].1.bytes,
+            &changed[0].0.bytes[..changed[0].0.bytes.len() - 1]
+        );
+        assert_core_conformance_rejection(
+            &baseline,
+            &truncated_files,
+            "FND01|Error|E_CORE_CONFORMANCE_SOURCE_INTEGRITY|core-schema-ts|byte_length",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
+
+        let mut missing_provenance = baseline.clone();
+        remove_pointer(&mut missing_provenance, "/artifacts/4/authority", "missing provenance")
+            .expect("one provenance field removal");
+        assert_core_conformance_restores(&baseline, &missing_provenance, &[], &["/artifacts/4/authority"]);
+        assert_core_conformance_rejection(
+            &missing_provenance,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|fields",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
+
+        let mut ancestry_drift = baseline.clone();
+        set_pointer(
+            &mut ancestry_drift,
+            "/immutable_tree_chain/edges/1/parent_object",
+            toml::Value::String("747d8c7ebbc593b3b72cbb4d7c45589cd9c7aafb".to_owned()),
+            "tree ancestry drift",
+        )
+        .expect("one ancestry replacement");
+        assert_core_conformance_restores(&baseline, &ancestry_drift, &["/immutable_tree_chain/edges/1/parent_object"], &[]);
+        assert_core_conformance_rejection(
+            &ancestry_drift,
+            &files,
+            "FND01|Error|E_CORE_CONFORMANCE_TREE_CHAIN|core_2026_07_28",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
+
+        let mut missing_registry_field = baseline.clone();
+        remove_pointer(
+            &mut missing_registry_field,
+            "/final_error_codes/2/http_status",
+            "omitted registry field",
+        )
+        .expect("one registry field removal");
+        assert_core_conformance_restores(&baseline, &missing_registry_field, &[], &["/final_error_codes/2/http_status"]);
+        assert_core_conformance_rejection(
+            &missing_registry_field,
+            &files,
+            "FND01|Error|E_RECORD_TYPE|final_error_codes|http_status",
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
 
         for (family, pointer, replacement, expected) in [
-        ("swapped artifact paths", "/artifacts/0/vendored_path", "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|vendored_path"),
-        ("truncated artifact", "/artifacts/0/byte_length", "98425", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong byte length", "/artifacts/0/byte_length", "1", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong SHA-256", "/artifacts/1/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|sha256"),
         ("wrong Git blob", "/artifacts/1/git_blob_sha1", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|git_blob_sha1"),
-        ("changed retrieval URL", "/artifacts/4/retrieval_url", "http://example.invalid", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|retrieval_url"),
+        ("changed retrieval URL", "/artifacts/4/retrieval_url", "https://raw.githubusercontent.com/modelcontextprotocol/conformance/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|retrieval_url"),
         ("floating revision or latest URL", "/artifacts/4/repository_revision", "main", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-changelog|repository_revision"),
-        ("missing provenance field", "/artifacts/4/authority", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|authority"),
         ("duplicate or missing scenario ID", "/conformance_scenarios/1/id", "auth/enterprise-managed-authorization", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|conformance_scenarios"),
         ("missing, duplicate, or changed scenario-local declared check ID", "/scenario_local_check_declarations/0/check_id", "complete-flow-jwt-bearer", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
         ("expected-success versus conditional-failure check-role mismatch", "/scenario_local_check_declarations/0/expected_success_path", "false", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
@@ -85270,12 +85664,14 @@ original = "value"
         };
         set_pointer(&mut drifted, pointer, value, family)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        let error = validate_core_conformance_sources(&drifted, &files)
-            .expect_err("each registered core mutation must reject");
-        assert_eq!(error.stable(), expected, "{family}");
-        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
+        assert_core_conformance_restores(&baseline, &drifted, &[pointer], &[]);
+        assert_core_conformance_rejection(
+            &drifted,
+            &files,
+            expected,
+            baseline_binding,
+            baseline_source_tree_sha256,
+        );
     }
 
         for (pointer, subject, field) in [
@@ -85290,15 +85686,14 @@ original = "value"
                 "unsupported third-era substitution",
             )
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-            assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-            let error = validate_core_conformance_sources(&drifted, &files)
-                .expect_err("either supported-era substitution must reject");
-            assert_eq!(
-                error.stable(),
-                format!("FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|{subject}|{field}"),
+            assert_core_conformance_restores(&baseline, &drifted, &[pointer], &[]);
+            assert_core_conformance_rejection(
+                &drifted,
+                &files,
+                &format!("FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|{subject}|{field}"),
+                baseline_binding,
+                baseline_source_tree_sha256,
             );
-            assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
-            assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
         }
 
     }
