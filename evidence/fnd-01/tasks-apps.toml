@@ -1,5 +1,5 @@
 schema_version = 1
-evidence_id = "fnd-01-tasks-apps-2026-08-04-v7-admission-classified"
+evidence_id = "fnd-01-tasks-apps-2026-08-05-v8-closed-observation"
 plan_package_id = "FND-01"
 bead_id = "bd-mcp-2026-07-28-support-ahet.1.3"
 retrieved_on = "2026-07-29"
@@ -47,16 +47,16 @@ reject_aggregate_schema_digest_as_substitute = true
 reject_generated_schema_as_whole_message_or_direction_oracle = true
 
 [executable_same_validator_contract]
-contract_id = "fnd-01-tasks-apps-source-integrity-v2"
+contract_id = "fnd-01-tasks-apps-source-integrity-v3"
 shared_verifier_path = "crates/fastmcp/tests/fnd_01_dependency_evidence.rs"
 required_test_ids = [
   "ordinary::tests::fnd_01_tasks_apps_sources_positive",
   "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative",
 ]
 required_enclosing_module = "ordinary::tests"
-phase_a_source_observation = "The two required functions now exist in the shared integration-test source under ordinary::tests. Source presence alone is not execution evidence or capability credit; the serialized shared-source handoff must still bind this v7 manifest contract and central batch verification must discover and pass both exact test IDs."
+phase_a_source_observation = "The two required functions exist in the shared integration-test source under ordinary::tests. Source presence alone is not execution evidence or capability credit; the V8 production validator binds the reviewed closed-subtree observation contract, and central batch verification must discover and pass both exact test IDs."
 production_validator_symbol = "validate_tasks_apps_sources"
-validator_identity_rule = "The positive test, every planted-negative case, and post-mutation baseline reacceptance call the identical production validator over a fresh virtual manifest, the same admitted 13-vendor input map, and the separately bound blocked WHATWG candidate; helper-only checks, a second permissive validator, and direct assertion of fixture literals are forbidden."
+validator_identity_rule = "The positive test, every explicit and generated planted-negative case, and post-mutation baseline reacceptance call the identical V8 production validator over a fresh virtual manifest, the same admitted 13-vendor input map, and the separately bound blocked WHATWG candidate; helper-only checks, a second permissive validator, and direct assertion of fixture literals are forbidden."
 baseline_result = "accept"
 baseline_reacceptance_rule = "The unmodified baseline must be accepted before the planted-negative loop and again after every fresh mutation has been discarded; no mutation state, digest, parser state, or diagnostic may cross case boundaries."
 admitted_vendor_input_count = 13
@@ -66,92 +66,306 @@ admitted_vendor_family_digest_sha256 = "ecaace5e6d63951b490b8b4b94bff126ac156ecd
 blocked_candidate_binding_rule = "The WHATWG candidate is read and bound independently under its quarantine-specific byte bound, must remain admission_status=blocked and admitted_as_source_input=false, and never enters the admitted vendor map, admitted vendor count, admitted vendor byte total, or admitted vendor family digest."
 unchanged_other_input_proof = "For each fresh virtual case, prove exact path, byte length, and SHA-256 equality for all twelve non-target admitted vendor inputs, the separately preserved blocked WHATWG candidate, and every non-target manifest field before validator invocation; only the named target field or named target input may differ from baseline."
 diagnostic_format = "FND01|Error|<stable-code>|<subject>|<field>"
+observation_domain = "FND01TASKSAPPSOBSv1"
+explicit_planted_mutation_count = 39
+generated_planted_mutation_count = 49
+total_planted_mutation_count = 88
 runtime_capability_credit = false
 remote_provenance_capability_credit = false
 receipt_or_manifest_self_hash = "forbidden"
-central_source_rebind = "later-owned; Phase A must not edit the shared verifier, policy, or source-family bindings"
+central_source_rebind = "later-owned; V8 binds only this manifest and the shared verifier. FND14B alone owns policy, source-family, and aggregate rebinds."
+
+[executable_same_validator_contract.subtree_digest]
+tasks_artifact = "b0937d811fef8b37e104eb48025445483d8df2f18fcbbceaa765da4ad4997b42"
+tasks_conformance_artifact = "6b8e5ff0a8d078142ab1ae7e0e09d63e7f9b48c0f3d0350ffec2fde6b60dbc67"
+tasks_license_provenance = "c65a95f01843af2d60c1617b8dea51ef51f6a8d246fd4cd61a6bc2a7f230dca5"
+tasks_conformance_license_provenance = "c67c081143569c4dc3ff3a8ac6168341324a6e6c53842f790b84e23189ad0d85"
+tasks_sdk_1_29_0 = "02f5034dea56c3a706f91f74cc504e2d565e31c5f459c28e3335d4d1cbef2279"
+tasks_import_binding = "fa05cba709a8b576f12b0b86ca2fa9e94913003ccb799e23152f797c0c0f21f8"
+tasks_negotiated_settings_contract = "683999dfd9c98cfe580fdc3bd2d93dd0a7cac7ef6cf653ef4abcb898c2a3e382"
+apps_artifact = "cfcb6b3ad6120aa96b158eb1a2d941560806f2dcb881d843ec1f6a6e93e82113"
+apps_license_provenance = "c495b4a39e3989d082a1b87fd46ecd9bb27a2aafa38399f0ce132e92f5197fc1"
+apps_sdk_1_29_0 = "ab4540b2e74006f452504618e925da65a11e5b40171eed85925edc0a862ea87d"
+apps_whatwg_html_validation = "b437ec599e331c8a4f878cff17697933aec1459b77c761816da1ab0d454465d8"
+apps_product_composition_authority = "91097d46b97cc2823a8edc2d6c48506d570c3d908c19e8a975b494b6ccbd460e"
+apps_source_union = "c8bc82927274f0150554ba16a5e026875efdf8cc1a13feef17324579fdbbe8fe"
+apps_direction = "9c2f7d4a97ad085b5a1f853796e5c36f039d72e3298998329d0c9c281fe466dd"
+apps_standard_reuse = "d182ed1a33e0c8cd79242f2eb1ccef876b553c24c0b7a1f26c25197170af6661"
+apps_direct_import = "19023d6c59428e2b4aeac4527814d29b5d24bf69ff792d209b8b2781073ebf2a"
+apps_quarantine = "a00810b2d70a447640b2cbdfc148b1ee31464da14dfcca2395eb7d304623a0b6"
+apps_server_settings = "4f40ab390788bb075b18a807f65398f574a64f05bf7223d63c62dad7766b8a94"
+apps_negotiated_settings_contract = "c79afa6b4700f641845dc0b6751251f5f100e0b7323e548712dcf78211d6e86c"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "missing-required-artifact-id"
 operation = "remove-one-manifest-field"
-target = "tasks.artifact[0].id"
+target = "/manifest/tasks/artifact/0/id"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.artifact[0]|id"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "swapped-vendor-path"
 operation = "replace-one-manifest-field"
-target = "tasks.artifact[0].vendor_path"
+target = "/manifest/tasks/artifact/0/vendor_path"
 replacement = "evidence/fnd-01/vendor/apps/apps.mdx"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_BINDING|tasks-prose|vendor_path"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "truncated-vendor-bytes"
 operation = "remove-one-terminal-byte-from-one-virtual-input"
-target = "evidence/fnd-01/vendor/tasks/tasks.md"
+target = "/admitted_vendor_input/evidence~1fnd-01~1vendor~1tasks~1tasks.md"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "substituted-vendor-bytes"
 operation = "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input"
-target = "evidence/fnd-01/vendor/tasks/tasks.md"
-replacement_input = "evidence/fnd-01/vendor/apps/apps.mdx"
+target = "/admitted_vendor_input/evidence~1fnd-01~1vendor~1tasks~1tasks.md"
+replacement_input = "/admitted_vendor_input/evidence~1fnd-01~1vendor~1apps~1apps.mdx"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "tasks-authority-classification-promotion"
 operation = "replace-one-manifest-field"
-target = "tasks.final_core_authority"
+target = "/manifest/tasks/final_core_authority"
 replacement = true
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|final_core_authority"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "apps-2025-authority-leakage"
 operation = "replace-one-manifest-field"
-target = "apps.stable_spec_date"
+target = "/manifest/apps/stable_spec_date"
 replacement = "2025-11-25"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_LEGACY_2025_AUTHORITY|apps|stable_spec_date"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "apps-maturity-classification-drift"
 operation = "replace-one-manifest-field"
-target = "apps.maturity_at_pin"
+target = "/manifest/apps/maturity_at_pin"
 replacement = "experimental"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "whatwg-blocked-admission-drift"
 operation = "replace-one-manifest-field"
-target = "apps.whatwg_html_validation.admitted_as_source_input"
+target = "/manifest/apps/whatwg_html_validation/admitted_as_source_input"
 replacement = true
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|admitted_as_source_input"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "tasks-license-class-drift"
 operation = "replace-one-manifest-field"
-target = "tasks.license_provenance.declared_license"
+target = "/manifest/tasks/license_provenance/declared_license"
 replacement = "repository_transition_notice"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.license_provenance|declared_license"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "tasks-conformance-license-provenance-drift"
 operation = "replace-one-manifest-field"
-target = "tasks.conformance_license_provenance.sha256"
+target = "/manifest/tasks/conformance_license_provenance/sha256"
 replacement = "1382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.conformance_license_provenance|sha256"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "inventory-classification-drift"
 operation = "replace-one-manifest-field"
-target = "verification_contract.apps_preserved_blocked_candidate_count"
+target = "/manifest/verification_contract/apps_preserved_blocked_candidate_count"
 replacement = 0
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_INVENTORY_CLASSIFICATION|verification_contract|apps_preserved_blocked_candidate_count"
 
 [[executable_same_validator_contract.planted_mutation]]
 id = "required-test-id-drift"
 operation = "replace-one-manifest-field"
-target = "executable_same_validator_contract.required_test_ids[0]"
+target = "/manifest/executable_same_validator_contract/required_test_ids/0"
 replacement = "tests::fnd_01_tasks_apps_sources_positive"
 expected_diagnostic = "FND01|Error|E_TASKS_APPS_TEST_IDENTITY|executable_same_validator_contract|required_test_ids[0]"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-artifact-extra-field"
+operation = "add-one-manifest-field"
+target = "/manifest/tasks/artifact/0/unexpected"
+replacement = true
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.artifact[0]|closed tuple"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-conformance-extra-field"
+operation = "add-one-manifest-field"
+target = "/manifest/tasks/conformance_artifact/0/unexpected"
+replacement = true
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.conformance_artifact[0]|closed tuple"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-extension-identifier-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/extension_identifier"
+replacement = "io.modelcontextprotocol/tasks-v8-drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|extension_identifier"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-client-settings-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/client_settings"
+replacement = { unexpected = true }
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|client_settings"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-server-settings-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/server_settings"
+replacement = { unexpected = true }
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|server_settings"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-precedence-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/source_precedence/0"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|source_precedence"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-status-union-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/status_union_order/0"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|status_union_order"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-direction-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/direction/0/direction"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|direction"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-sdk-sri-pair-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/sdk_1_29_0/verified_integrity"
+replacement = "sha512-drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-sdk-module-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/sdk_1_29_0/import_module"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-sdk-kind-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/sdk_1_29_0/import_kind"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-sdk-authority-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/sdk_1_29_0/authority"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_OBSERVATION|executable_same_validator_contract.subtree_digest|tasks_sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "tasks-import-binding-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/tasks/import_binding/0/raw_use"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|import_binding"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-extension-identifier-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/extension_identifier"
+replacement = "io.modelcontextprotocol/ui-v8-drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|extension_identifier"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-client-settings-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/client_settings/activation_member"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_OBSERVATION|executable_same_validator_contract.subtree_digest|apps_negotiated_settings_contract"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-server-settings-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/server_settings/only_valid_value"
+replacement = { unexpected = true }
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps.server_settings|only_valid_value"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-source-union-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/source_union/0/ordered_members/0"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|source_union"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-direction-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/direction/0/direction"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|direction"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-direct-import-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/direct_import/0/composition"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|direct_import"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-sdk-sri-pair-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/sdk_1_29_0/verified_integrity"
+replacement = "sha512-drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-sdk-module-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/sdk_1_29_0/direct_import_module"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-sdk-authority-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/sdk_1_29_0/authority"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_OBSERVATION|executable_same_validator_contract.subtree_digest|apps_sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-closure-global-hash-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/sdk_1_29_0/standard_reuse_closure/canonical_global_sha256"
+replacement = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|sdk_1_29_0"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "apps-license-resolution-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/license_provenance/artifact_license_resolution"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|apps.license_provenance|closed tuple"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "whatwg-candidate-provenance-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/whatwg_html_validation/candidate_source_url"
+replacement = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|candidate_source_url"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "whatwg-candidate-license-drift"
+operation = "replace-one-manifest-field"
+target = "/manifest/apps/whatwg_html_validation/candidate_declared_license"
+replacement = "drift"
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|candidate_declared_license"
+
+[[executable_same_validator_contract.planted_mutation]]
+id = "blocked-candidate-loaded-file-injection"
+operation = "add-one-virtual-input"
+target = "/admitted_vendor_input/evidence~1fnd-01~1vendor~1apps~1whatwg-html-source"
+replacement = true
+expected_diagnostic = "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|admitted_as_source_input"
 
 [provenance_policy]
 floating_reference_rejection_scope = "evidence-controlled provenance fields only"
@@ -220,8 +434,9 @@ task_duration_profile = "fastmcp-positive-integer-ms-v1"
 extension_identifier = "io.modelcontextprotocol/tasks"
 client_settings_schema = "tasks-2026-07-28-empty-object-v1"
 server_settings_schema = "tasks-2026-07-28-empty-object-v1"
-settings_exact_value = "exact closed {}"
 settings_authority = "tasks-prose: no extension-specific settings are defined; an empty object indicates support"
+client_settings = {}
+server_settings = {}
 source_precedence = [
   "final core 2026-07-28 for MCP envelopes, request metadata, and final error allocation",
   "the frozen FastMCP composed contract for explicit conflict resolutions",
@@ -1521,7 +1736,7 @@ raw_mismatch_path = "$defs.McpUiClientCapabilities.required"
 [apps.server_settings]
 profile_id = "fastmcp-2026-07-28-apps-empty-server-marker-v1"
 extension_name = "io.modelcontextprotocol/ui"
-only_valid_value = "exact closed {}"
+only_valid_value = {}
 emit_condition = "local Apps runtime and frozen descriptor are both enabled"
 invalid_present_values = ["null", "non-object", "nonempty object", "object with any unknown member"]
 absent_or_one_sided_disposition = "registered ordinary non-Apps fallback"
