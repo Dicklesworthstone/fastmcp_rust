@@ -562,8 +562,8 @@ offline_resolution_status = "unverified_current_execution"
 current_execution_status = "unverified_current_rch_execution"
 run_from = "repository root"
 required_environment = [
-  "DOTNET_ARCHIVE points to dotnet-sdk-10.0.100-osx-arm64.tar.gz",
-  "DOTNET_SDK points to that archive extracted without modification",
+  "DOTNET_ARCHIVE points to the separately byte-bound dotnet-sdk-10.0.100-osx-arm64.tar.gz resolver distribution",
+  "DOTNET_SDK points to an independently admitted canonical .NET SDK 10.0.100 runtime; no archive-to-runtime-tree equality or full runtime closure is claimed",
 ]
 required_tools = [".NET SDK 10.0.100", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
 reproduction_script = '''
