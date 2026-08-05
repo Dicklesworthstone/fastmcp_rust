@@ -530,7 +530,8 @@ mod sdk_producer {
                 Path::new(&binding.path),
                 &binding.version,
                 subject,
-            )?;
+            )
+            .map_err(|_| err("E_SDK_TOOL_IDENTITY", &binding.id))?;
             let observed_identity = tool_file_identity(&observed_binding, subject)?;
             if &observed_binding != binding || &observed_identity != expected_identity {
                 return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
@@ -580,7 +581,8 @@ mod sdk_producer {
                 Path::new(&binding.path),
                 &binding.version,
                 subject,
-            )?;
+            )
+            .map_err(|_| err("E_SDK_TOOL_IDENTITY", &binding.id))?;
             let identity = tool_file_identity(&observed_binding, subject)?;
             if &observed_binding != binding || &identity != expected_identity {
                 return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
@@ -631,7 +633,8 @@ mod sdk_producer {
             Path::new(&binding.path),
             &binding.version,
             subject,
-        )?;
+        )
+        .map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
         if &observed != binding {
             return Err(err("E_SDK_TOOL_IDENTITY", &binding.id));
         }
