@@ -24,6 +24,7 @@ peer_capability_eras = ["2024-11-05", "2026-07-28"]
 source_rewriting_generator_used = false
 native_package_manager_locks_used = true
 cargo_invoked = false
+general_mutation_campaign_bridge = "The top-level catalog_negative_cases and peer_negative_cases arrays are the exact source-side identity bridge consumed by the general FND-01 mutation campaign. Their semantic assertions and executable evaluator contracts are frozen in dependency-verification.toml; these rows do not claim execution or duplicate validator_contract.negative_dimensions."
 
 authority_order = [
   "final tagged MCP schema and final normative prose",
@@ -201,6 +202,24 @@ tier = 3
 repository = "https://github.com/modelcontextprotocol/kotlin-sdk"
 included = false
 exclusion_reason = "Tier 3 at the immutable 2026-07-28 freeze; excluded by the exhaustive Tier-1-only rule, not by an implementation verdict."
+
+[[catalog_negative_cases]]
+id = "missing-tier1-typescript"
+
+[[catalog_negative_cases]]
+id = "extra-lower-tier-java"
+
+[[catalog_negative_cases]]
+id = "duplicate-go"
+
+[[catalog_negative_cases]]
+id = "catalog-byte-drift"
+
+[[catalog_negative_cases]]
+id = "catalog-tier-drift"
+
+[[catalog_negative_cases]]
+id = "floating-catalog-substitution"
 
 [[peers]]
 id = "typescript"
@@ -883,6 +902,24 @@ sha256 = "e3539049baab393d2cdeb585c3762e39f179f65dca1e32d44abcece05f419285"
 provenance = "Preserved go1.25.0 publisher-module projection. It is diagnostic upstream context only and is not the external interoperability consumer lock."
 transformation = "jq stable-field projection removes machine-local cache paths"
 
+[[peer_negative_cases]]
+id = "floating-version"
+
+[[peer_negative_cases]]
+id = "source-commit-drift"
+
+[[peer_negative_cases]]
+id = "registry-byte-drift"
+
+[[peer_negative_cases]]
+id = "swapped-ecosystem-artifact"
+
+[[peer_negative_cases]]
+id = "lock-byte-drift"
+
+[[peer_negative_cases]]
+id = "closure-drift"
+
 [complete_input_binding]
 algorithm = "sha256"
 domain_separator_hex = "666173746d63702d666e642d30312f73646b2d6d61747269782f636f6d706c6574652d696e7075742f763100"
@@ -902,8 +939,8 @@ self_exclusion_contract = "Self-exclude only the two scalar RHS tokens: the ASCI
 execution_receipt_policy = "byte-absent typed-unverified: this manifest records expected closures and execution inputs, not live receipts. proof_environment.network_denial_execution_status and every peers.lock offline_resolution_status/current_execution_status remain unverified until the batch-owned verifier supplies execution facts."
 artifact_count = 13
 artifact_total_bytes = 35759
-preimage_byte_length = 96449
-digest = "86c0e91c2c249803539395fc325b504254a9b93240838b9da7bd8fdeeb16d782"
+preimage_byte_length = 97482
+digest = "1614dde779da57a827fc69748ba842f66b71be04402d59ef8cad73476881279e"
 reacceptance_rule = "A production validator must recompute this complete-input preimage from the live manifest and live lock_root bytes before positive or one-component negative evaluation. Any digest, size, manifest, artifact, command, authority, era, matrix, capability, negative-dimension, or drift-status difference is a reacceptance failure; changing only the derived fields cannot reaccept input."
 
 [validator_contract]

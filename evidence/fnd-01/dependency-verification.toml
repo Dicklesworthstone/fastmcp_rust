@@ -14,8 +14,8 @@ hash_algorithm = "sha256"
 authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
-source_input_count = 66
-source_input_total_bytes = 2671887
+source_input_count = 68
+source_input_total_bytes = 3012794
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -135,7 +135,7 @@ max_policy_shape_registry_bytes = 1048576
 max_external_input_entry_count = 1000000
 max_external_input_member_bytes = 2147483648
 max_external_input_total_bytes = 68719476736
-exact_source_input_count = 66
+exact_source_input_count = 68
 exact_negative_case_count = 188
 exact_derived_output_count = 14
 exact_derived_toml_count = 10
@@ -151,14 +151,15 @@ path_scope = "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
 ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
-file_count = 66
-total_bytes = 2671887
-sha256 = "e9bb690856a404e4b3b10a9b86e1bec8f1dfc7005a4c42ee9d346f41216e368b"
+file_count = 68
+total_bytes = 3012794
+sha256 = "878c77d6d704b04e438da1e392bc598ca3d352b989aaa8c04df3b8984d2cf760"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
   "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
   "evidence/fnd-01/final-attestation.toml",
+  "evidence/fnd-01/vendor/apps/whatwg-html-source",
 ]
 excluded_exact_directory = "evidence/fnd-01/integration"
 wildcard_exclusions_allowed = false
@@ -204,7 +205,7 @@ binding_exact_fields = ["path", "owner_scope", "byte_length", "sha256"]
 binding_order = ["crates/fastmcp-core/src/crypto.rs", "crates/fastmcp-core/src/uri.rs", "crates/fastmcp-server/src/auth.rs", "crates/fastmcp-server/src/oauth.rs", "crates/fastmcp-server/src/oidc.rs", "crates/fastmcp-transport/src/websocket.rs"]
 baseline_rule = "before any integration-producer write or generated input, no-follow open every exact path, require one regular non-link file, and require exact byte length and SHA-256 equal its row; repeat after every producer command/write, immediately before directory publication, in ordinary read-only verification, and independently in final attestation"
 ownership_rule = "the .1.1 producer has no authority to create, rewrite, format, normalize, truncate, replace, move, or delete any bound path; byte drift is a terminal ownership violation even if sparse semantic surface rules and the final workspace snapshot would otherwise pass"
-closed_set_rule = "these six rows are the complete non-.1.1-owned implementation-output handoff set present outside the immutable 66-file evidence source tree; policy/verifier self-binding and .1.1-owned manifests, docs, workflows, facade wiring, and test integration remain governed by their explicit contracts rather than silently joining this set"
+closed_set_rule = "these six rows are the complete non-.1.1-owned implementation-output handoff set present outside the immutable 68-file evidence source tree; policy/verifier self-binding and .1.1-owned manifests, docs, workflows, facade wiring, and test integration remain governed by their explicit contracts rather than silently joining this set"
 registry_encoding = "ASCII FND01CHILDv1 followed by NUL and u32be binding_count, then each row in binding_order as u32be path length/path bytes, u32be owner_scope length/bytes, u64be byte_length, and raw 32-byte SHA-256"
 registry_sha256 = "93aec08a25abfa66fb6f7b8121cbe034ab6d2cf251e2c2a117b6d40859f11d61"
 
@@ -2484,8 +2485,8 @@ checked_in_archives_remain_local_exact_bytes = true
 
 [parse_inventory]
 toml = 22
-json = 14
-utf8_text = 23
+json = 15
+utf8_text = 24
 opaque_binary = 4
 gzip_tar = 3
 
@@ -2547,7 +2548,7 @@ forbid_result_field_mutation = true
 forbid_verified_field_mutation = true
 semantic_drift_meta_test_required = true
 semantic_drift_meta_test_rebinds_file_and_tree_hashes = true
-mutation_execution_isolation = "load the exact 66 source_input byte map read-only; for each negative_case create a fresh bounded in-memory copy of only target_path bytes, apply exactly that recipe, rebind only the virtual file/source-family/source-tree hashes required by integrity_mode, run the complete validator against the one virtual byte substitution, record the result, and discard it before the next case; no source, workspace, retained, scratch, or integration file is written, and mutations never accumulate"
+mutation_execution_isolation = "load the exact 68 source_input byte map read-only; for each negative_case create a fresh bounded in-memory copy of only target_path bytes, apply exactly that recipe, rebind only the virtual file/source-family/source-tree hashes required by integrity_mode, run the complete validator against the one virtual byte substitution, record the result, and discard it before the next case; no source, workspace, retained, scratch, or integration file is written, and mutations never accumulate"
 quarantine_meta_test_exception = "the sole recipe whose selector enters a quarantined source array is tasks_apps/quarantine-drift; it removes one table only from the fresh in-memory tasks-apps.toml clone to prove the exact quarantine set validator fires, never parses or executes the quarantined table as a payload, and therefore does not contradict quarantine mutation_allowed=false"
 structured_toml_mutation_allowed = true
 structured_json_mutation_allowed = true
@@ -2709,7 +2710,7 @@ canonical_allowed_cotrigger_ids_encoding = "u32be count followed by each canonic
 canonical_suppressed_ids_encoding = "u32be count followed by each canonical string in declared order"
 canonical_count = 188
 canonical_bytes = 77379
-canonical_sha256 = "29f2e159ce5f0febd11d59f3819a0feeb80e57337da940c081cc2be92a88bc24"
+canonical_sha256 = "fec2d08b49d7e8be67d0a1b4d3078e4ac168bffd76b0bd0d91544227701a4393"
 
 [observation_typing]
 allowed_kinds = [
@@ -5485,7 +5486,7 @@ schema_dispatch = "exact kind to exactly one receipt_schema row; no default, fla
 schema_registry_encoding = "ASCII FND01RECEIPTSCHEMAv1 followed by NUL and u32be row count, then rows sorted by raw UTF-8 receipt_id bytes; each row is u32be-length-prefixed kind, receipt_id, and table_name, u32be exact_fields count followed by each u32be-length-prefixed field in declared order, u32be-length-prefixed cardinality_rule and semantic_rule, then one presence byte 0x00 when typed_result_owner_rule is absent or 0x01 followed by its u32be-length-prefixed bytes when present. Every count/length/addition is checked, no other presence byte or trailing canonical byte exists"
 schema_registry_count = 10
 schema_registry_bytes = 21571
-schema_registry_sha256 = "078d93c8bf7c5098bc56f89268ce717a55d4dcde87774edc61579f7273381880"
+schema_registry_sha256 = "1f35257726d51f960b760a646996fed4b70ec36a1b89cc5005b0020f9a54b324"
 schema_registry_bound_rule = "the complete canonical registry must be nonempty and no larger than bounds.max_receipt_schema_registry_bytes before allocation; exact externally pinned count, byte length, and SHA-256 must match before schema_dispatch, and per-row checks cannot substitute for the total bound"
 schema_registry_verifier_authority_rule = "the verifier pins the literal FND01RECEIPTSCHEMAv1 encoding, all ten rows including ordered fields and optional ownership branch, exact canonical byte length, and SHA-256 in compiled Rust. Policy mirror values never authorize a changed receipt kind, table, field, cardinality rule, semantic rule, or optional field. Separately, the verifier encodes the complete receipt_contract table as ASCII FND01RECEIPTCONTRACTv1 followed by NUL and exactly one recursively tagged TOML table using assertion_contract value tags: tag 0x07, u64be exact member count, members sorted by raw UTF-8 key bytes, each key as u32be length and bytes, booleans as tag 0x02 plus one 0-or-1 byte, integers as tag 0x03 plus i64be, strings as tag 0x05 plus u64be length and bytes, and arrays as tag 0x06 plus u64be item count and recursively tagged items in declared order. The complete encoding, including digest_rule and its FND01METAGRAPHv1 family, has independently compiled exact field-count, byte-length, and SHA-256 pins; no policy-declared mirror value, per-field check, TOML serialization, missing field, extra field, alternate order, or trailing byte authorizes drift."
 common_required_fields = ["format", "schema_version", "receipt_id", "kind", "path", "generation_rank", "producer_bead", "producer_role", "run_id", "authoring_closure_sha256", "policy", "verifier", "harness", "source_tree_file_count", "source_tree_total_bytes", "source_tree_sha256", "evidence_verdict", "support_claim", "parent_count", "parent"]
@@ -5501,7 +5502,7 @@ kind = "source_snapshot"
 receipt_id = "source-snapshot"
 table_name = "source_snapshot"
 exact_fields = ["workspace_file_count", "workspace_total_bytes", "workspace_sha256", "workspace_binding", "source_input_count", "source_input", "source_family_count", "source_family", "archive_count", "archive", "quarantine_count", "quarantine", "closed_child_count", "closed_child", "authoring_count", "authoring", "set_digest_sha256"]
-cardinality_rule = "workspace 163, source_input 66, source_family 9, archive 3, quarantine 19, closed_child 6, authoring 3; every array is the exact corresponding policy registry and set_digest binds all arrays"
+cardinality_rule = "workspace 163, source_input 68, source_family 9, archive 3, quarantine 19, closed_child 6, authoring 3; every array is the exact corresponding policy registry and set_digest binds all arrays"
 semantic_rule = "checked_snapshot independently reads every byte, enforces exact source/workspace closure and exclusions, validates all local archive members and quarantine rows, and binds the external three-file authoring marker without hashing this receipt into its own input"
 
 [[receipt_schema]]
@@ -5551,7 +5552,7 @@ receipt_id = "mutation-receipt"
 table_name = "mutation_receipt"
 exact_fields = ["recipe_count", "recipe_registry_sha256", "fixture_count", "fixture_registry_sha256", "assertion_count", "assertion_registry_sha256", "baseline_pass_count", "executed_count", "exact_single_trigger_count", "stable_diagnostic_count", "raw_finding_count", "cotrigger_resolution_count", "suppression_resolution_count", "unexpected_finding_count", "result_count", "result", "result_set_sha256"]
 cardinality_rule = "recipe/assertion/result/baseline/executed/single-trigger/stable-diagnostic/cotrigger-resolution/suppression-resolution counts are exactly 188; fixture count equals fixture_contract; unexpected finding count is zero; raw finding count equals the checked sum across results; results are an exact global ID bijection in canonical family/source-index order"
-semantic_rule = "run exactly one fresh isolated in-memory mutation per ID against the checked 66-source baseline, preserve quarantined payload nonexecution, record every derived finding, partition it into primary/allowed-cotrigger/declared-suppressed sets from the assertion alone, require no unexpected finding and the exact stable diagnostic rendered from assertion.logical_path, and never write a source, output, or scratch mutation copy"
+semantic_rule = "run exactly one fresh isolated in-memory mutation per ID against the checked 68-source baseline, preserve quarantined payload nonexecution, record every derived finding, partition it into primary/allowed-cotrigger/declared-suppressed sets from the assertion alone, require no unexpected finding and the exact stable diagnostic rendered from assertion.logical_path, and never write a source, output, or scratch mutation copy"
 
 [[receipt_schema]]
 kind = "package_receipt"
@@ -5626,65 +5627,65 @@ excluded_work = ["Section 25.10 release-profile feature cells", "Section 25.10 p
 [[source_family]]
 id = "core"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.2"
-file_count = 7
-total_bytes = 367030
-tree_sha256 = "8dcb85833bcbba14c45a9643de0ef892a9cf1c16f32b9f96a2bba6fa29aa7021"
+file_count = 9
+total_bytes = 499445
+tree_sha256 = "1ea30061f547425bc96067725b58124227e1b9adc9dd805adb748d274f0d2fff"
 
 [[source_family]]
 id = "tasks_apps"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.3"
 file_count = 14
-total_bytes = 1374873
-tree_sha256 = "a48f8da9b1ebe4468230f1bdbc8a5e7ea2d1fb501b022b031d5b9f8a43d9cb49"
+total_bytes = 1401051
+tree_sha256 = "b4030a0a07246f72f96c93557566344f3bdaa8f9e568ca9b24d67223f95144ba"
 
 [[source_family]]
 id = "auth"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.4"
 file_count = 1
-total_bytes = 47484
-tree_sha256 = "666855be022cb35f34409050eb91622eb867d586ab4503207b436996c7647c2b"
+total_bytes = 91086
+tree_sha256 = "8362bb3ce7b9fbb3c2013609a84d98e4c1895962d40fddd9b93a27b0d10e98c7"
 
 [[source_family]]
 id = "sdk"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.5"
 file_count = 14
-total_bytes = 89103
-tree_sha256 = "7871c0ee9a815abe7b2b39355de0046b75b455e59e8448c019ac59543d5f8c25"
+total_bytes = 96975
+tree_sha256 = "41f9e921c87a02c24c00767c66b76bae1af5d3b37815a83b3b6de0795caa2bbd"
 
 [[source_family]]
 id = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
 file_count = 4
-total_bytes = 59659
-tree_sha256 = "6a6068bbd609193d8a53284226a0ca821d5203aaf36c21457a938946d06edf1a"
+total_bytes = 59668
+tree_sha256 = "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839"
 
 [[source_family]]
 id = "serialization"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.7"
 file_count = 2
-total_bytes = 57001
-tree_sha256 = "b3bf50f442b52c6775ca8001e4fb4e86acad8556558e7afe82d3c9dacf065d0d"
+total_bytes = 64187
+tree_sha256 = "d0c43f5edb32bd8a440716e30bcbef8da0705c08b9d24d0c4a1116d465f6f580"
 
 [[source_family]]
 id = "jose"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.11"
 file_count = 4
-total_bytes = 11364
-tree_sha256 = "ab70b0dd9d675825b9dda72a737fe296ee1de72116ea09e7490183972be85bbd"
+total_bytes = 11442
+tree_sha256 = "6a5f5d57a771c6a49b418093f8161d0c5cee74cfe708293edc6bcae99d62b0a7"
 
 [[source_family]]
 id = "media"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.12"
 file_count = 10
-total_bytes = 559330
-tree_sha256 = "8f8f0cd6503eaa6a31971f0e6ec93f9798b8799769dd6f895c6efff9d830cb15"
+total_bytes = 564485
+tree_sha256 = "abed2b6ee906b8c6694bbea0034b88eda013d0cfbab1e2d365a84f17ea396de9"
 
 [[source_family]]
 id = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 file_count = 10
-total_bytes = 106043
-tree_sha256 = "3df9af76991b048e402e15b807026e34df686896972bcf7ef44f8f256193e298"
+total_bytes = 224455
+tree_sha256 = "96e3e0568fbbc50be4207af73bdf8a2b4e7e4b895f4e2e454f2f0d6fb6734bc3"
 
 [[negative_family]]
 id = "sdk.catalog"
@@ -6328,8 +6329,8 @@ id = "s01"
 family = "auth"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.4"
 path = "evidence/fnd-01/auth-standards.toml"
-byte_length = 47484
-sha256 = "8f3daca7b9f774223648286be571834246e03bb863d67b6ca65fcf3e56310955"
+byte_length = 91086
+sha256 = "11a44679a62f25c3e331b37baeec7b1c73a5023e46f5f57db9ce931da6be41ca"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6343,8 +6344,8 @@ id = "s02"
 family = "core"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.2"
 path = "evidence/fnd-01/core-conformance.toml"
-byte_length = 40817
-sha256 = "d631ae1d52fac82c330bcf99576ac19d0ace394b579673030ef5397bb3533045"
+byte_length = 54154
+sha256 = "76403615758b3c6ee6eafebf4755d9eadbb7713e240421eceb4f1776c0083750"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6358,8 +6359,8 @@ id = "s03"
 family = "jose"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.11"
 path = "evidence/fnd-01/jose-ring.toml"
-byte_length = 4343
-sha256 = "c17a9474cc51eb842493d31263cd98e6d675359ff77813eaab3ed64b4585a561"
+byte_length = 4421
+sha256 = "a244ea6aa444ac58a855713b67102570f560d2cb9e5bb733754d40c9e7aa07af"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6373,8 +6374,8 @@ id = "s04"
 family = "media"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.12"
 path = "evidence/fnd-01/media-dependencies.toml"
-byte_length = 49050
-sha256 = "492659e97f354c263ad3de869aed326a8a0c4fddf02704d4eeadb5a1fdb2f468"
+byte_length = 54205
+sha256 = "6212bbfd7f353674ff353cdb8976ebdb7e7ddbe61449a2669753b313cbe7a8a3"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6463,8 +6464,8 @@ id = "s10"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/capability-fs/src/lib.rs"
-byte_length = 1829
-sha256 = "c153f99324014351695d27a448175e28e4c2863bfc08638ebbe5389da41682ec"
+byte_length = 2470
+sha256 = "b5405f2df4e07db90cb9326b8ebc9c95d5045a9d7d99c8294fb16879b6e09188"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -6508,8 +6509,8 @@ id = "s13"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/envelope/src/lib.rs"
-byte_length = 1655
-sha256 = "0b8f64e24c409242607f37fd00091eae22b4a287b6b3ea87aa2b21566778b6d7"
+byte_length = 2757
+sha256 = "8b245c7428f0041d65ec38592aaf6d5d2dcf1cde57e0426c1d95c250e9ab78b1"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -6553,8 +6554,8 @@ id = "s16"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/redis/src/lib.rs"
-byte_length = 1238
-sha256 = "bbaf811ab02689a612de695a7027b26396705391fc69ba74a66ae05d5299a6b1"
+byte_length = 112220
+sha256 = "2e0ade735fdecc50238836d6dc38d3fc7f34a47caa390091ec15a61211c625f2"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -6763,8 +6764,8 @@ id = "s30"
 family = "sdk"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.5"
 path = "evidence/fnd-01/sdk-matrix.toml"
-byte_length = 53344
-sha256 = "9e1be65844e1a2a16dcb91a4d3ce9e4aea31781ed7788ade66fa85c8686d1ee6"
+byte_length = 61216
+sha256 = "2230da0c1e40fb38e2dc7731a7c4f4b355dab4ed86f360c5c868883f393796b6"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6793,8 +6794,8 @@ id = "s32"
 family = "serialization"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.7"
 path = "evidence/fnd-01/serialization-uri-dependencies.toml"
-byte_length = 26275
-sha256 = "be5498f553fb138c4720cb4ae61985ad06075f3fb1ad80e9d37541079c26aa5c"
+byte_length = 33461
+sha256 = "ef0eee8ba450565773587f9d4825ea50f296f0270208a1054b3a12758cb4e22e"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6808,8 +6809,8 @@ id = "s33"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/state-capability-dependencies.toml"
-byte_length = 76120
-sha256 = "92e614183337d739ef7c4e1cf1f30e185142f83c4f8479e787799e64b327a54f"
+byte_length = 81807
+sha256 = "b9f1f2d7fdbcb029ae6536c1537d86e26240af5bee268b3a32c55cfed74c0325"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6823,8 +6824,8 @@ id = "s34"
 family = "tasks_apps"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.3"
 path = "evidence/fnd-01/tasks-apps.toml"
-byte_length = 201407
-sha256 = "5235db9ca564b9fc18d953b7a9739022308a07e5a47aa6519251a96bf4b92e83"
+byte_length = 227585
+sha256 = "e85f56543186797b299d345a6d965008a0bf89adc850c590410710aabe1674eb"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6838,8 +6839,8 @@ id = "s35"
 family = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
 path = "evidence/fnd-01/toolchain-asupersync.toml"
-byte_length = 39202
-sha256 = "c18236b79c98dcaaa7c61170d3251148213bb960130b179ff436da6c2ed838f8"
+byte_length = 39211
+sha256 = "5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -7305,6 +7306,36 @@ owner_bead = "bd-mcp-2026-07-28-support-ahet.1.3"
 path = "evidence/fnd-01/vendor/tasks/tasks.md"
 byte_length = 33967
 sha256 = "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11"
+parse_kind = "utf8_text"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s67"
+family = "core"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.2"
+path = "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json"
+byte_length = 87877
+sha256 = "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce"
+parse_kind = "json"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s68"
+family = "core"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.2"
+path = "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts"
+byte_length = 31201
+sha256 = "ad3264cdc22c5091b8ae96c5f5c769a2c7388473d84ca3de6fd55a4feeadfb1e"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -9375,7 +9406,7 @@ selector = "/peers/id=typescript"
 rule = "missing_tier1_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "911a13633633607b8940c15bb4e150e560dfb8af5b95ffd16a70d066b3c9ef73"
+baseline_observation_sha256 = "ce053101f8061c2828d070d5537bbfde40bfa4247f97710b85c07d5a38a3e8d6"
 violation_mode = "exact_observation_sha256"
 violating_observation_sha256 = "5647354d590ba4c9b949ee90eb20bc274f2ec957328bcbf5ab195761f2fce024"
 expected_trigger_count = 1
@@ -9391,9 +9422,9 @@ selector = "/peers"
 rule = "extra_non_tier1_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "06dc2c3feebdd1fb85404f12b1ccd2c8a997a506d1ee49629076a051dfaa6345"
+baseline_observation_sha256 = "cc75efc88c4199e1d6da5a8121a289d8e4e2066a525ad7b1908153dae3928a17"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "f1f6f6e507ed4337d426a9890aa4da128220b3e8af172fd3ca294727ea0396c2"
+violating_observation_sha256 = "33245b8095052334011e088cb288a4df2474bc9a03a09b507904fea7e1ea233f"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -9407,9 +9438,9 @@ selector = "/peers"
 rule = "duplicate_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "06dc2c3feebdd1fb85404f12b1ccd2c8a997a506d1ee49629076a051dfaa6345"
+baseline_observation_sha256 = "cc75efc88c4199e1d6da5a8121a289d8e4e2066a525ad7b1908153dae3928a17"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "0abcd25e5eec4f8eb8e8e8d3e082fb8664b19d3b40e847b731a413f51d2a1c7d"
+violating_observation_sha256 = "fdb86015ffc803d984e2263a497a246c076eda5e386472cd3553842fed76efbf"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -12477,7 +12508,7 @@ generation_rank = 3
 producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 pending_gate = "E_PENDING_GATE:FND01:OUTPUT:mutation-receipt"
 required_parent_ids = ["producer-environment", "source-snapshot"]
-parent_purposes = ["bind the verifier/tool/worker identity executing isolated in-memory mutations", "bind the exact 66-source baseline, recipes, fixtures, assertions, and quarantine registry"]
+parent_purposes = ["bind the verifier/tool/worker identity executing isolated in-memory mutations", "bind the exact 68-source baseline, recipes, fixtures, assertions, and quarantine registry"]
 min_bytes = 1
 max_bytes = 67108864
 

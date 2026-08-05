@@ -8,11 +8,63 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 902_540;
+const FROZEN_POLICY_BYTES: usize = 903_485;
 const FROZEN_POLICY_SHA256: &str =
-    "8638ebd3dd73ca3e4d3cb880a245e9500c94e28522062458629bb4ee41f4e1b6";
+    "b3803b7b7119bbcbb86d0587ff70ae92778c6669bd37f75ada20bfcfd75544a3";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
+
+struct SparseIndexFixtureCorpus {
+    checksum: &'static str,
+    valid_v1: String,
+    valid_v2: String,
+    invalid: [(&'static str, String); 21],
+    duplicate_key: String,
+    renamed_dependency: String,
+}
+
+#[rustfmt::skip]
+fn sparse_index_fixture_corpus() -> SparseIndexFixtureCorpus {
+    const CHECKSUM: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    SparseIndexFixtureCorpus {
+        checksum: CHECKSUM,
+        valid_v1: format!(
+            r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"1.2","features":["","std","std"],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null,"package":null,"public":null,"artifact":null,"bindep_target":null,"lib":false}}],"features":{{"default":["dep","dep"]}},"cksum":"{CHECKSUM}","yanked":false,"links":"","rust_version":"1","pubtime":"0000-02-29T00:00:00Z"}}"#
+        ),
+        valid_v2: format!(
+            r#"{{"name":"sample","vers":"2.0.0","deps":[{{"name":"optional","req":"*","optional":true,"kind":"build"}}],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","yanked":null,"v":2}}"#
+        ),
+        invalid: [
+            ("unknown-root-field", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","unknown":true}}"#)),
+            ("missing-deps", format!(r#"{{"name":"sample","vers":"1.2.3","cksum":"{CHECKSUM}"}}"#)),
+            ("version-zero", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":0}}"#)),
+            ("version-three", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":3}}"#)),
+            ("features2-without-v2", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{}},"cksum":"{CHECKSUM}"}}"#)),
+            ("unknown-dependency-field", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","unknown":true}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("artifact-before-v2", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","artifact":["bin"]}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("lib-before-v2", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","lib":true}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("uppercase-checksum", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{}"}}"#, "A".repeat(64))),
+            ("invalid-pubtime", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","pubtime":"2026-02-30T15:52:22Z"}}"#)),
+            ("optional-dev", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true,"kind":"dev"}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("nullable-optional", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":null}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("public-build", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","kind":"build","public":true}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("invalid-target-cfg", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","target":"cfg(any(unix,,windows))"}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("non-crates-io-registry", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","registry":"https://example.invalid/index"}}],"cksum":"{CHECKSUM}"}}"#)),
+            ("feature-name-dep-prefix", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"dep:bad":[]}},"cksum":"{CHECKSUM}"}}"#)),
+            ("missing-feature-reference", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"default":["missing"]}},"cksum":"{CHECKSUM}"}}"#)),
+            ("non-optional-dep-activation", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep:dep"]}},"cksum":"{CHECKSUM}"}}"#)),
+            ("weak-non-optional-dep", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep?/feature"]}},"cksum":"{CHECKSUM}"}}"#)),
+            ("implicit-optional-feature", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true}}],"features":{{"dep":[]}},"cksum":"{CHECKSUM}"}}"#)),
+            ("features2-missing-dependency", format!(r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","v":2}}"#)),
+        ],
+        duplicate_key: format!(
+            r#"{{"name":"sample","name":"other","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}"}}"#
+        ),
+        renamed_dependency: format!(
+            r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"alias","package":"actual","req":"*","optional":true}}],"features":{{"default":["dep:alias"]}},"cksum":"{CHECKSUM}"}}"#
+        ),
+    }
+}
 
 #[rustfmt::skip]
 #[allow(dead_code)]
@@ -17835,7 +17887,7 @@ mod trust_std {
 mod phase_b_std {
     use super::{
         FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX,
-        RECORD_SET_PREFIX,
+        RECORD_SET_PREFIX, sparse_index_fixture_corpus,
     };
     use super::trust_std::{
         AcquisitionCommandExpectation, AcquisitionCommandPreimageInput,
@@ -18349,7 +18401,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     #[derive(Debug)]
-    struct ProduceAcquisitionPermit {
+    struct BoundedProduceAcquisition {
         authority: ProduceAcquisitionAuthority,
         manifest: Vec<u8>,
         manifest_binding: FileBinding,
@@ -18364,6 +18416,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         offline_home: String,
         execution_bin: String,
     }
+
+    #[derive(Debug)]
+    struct ProduceAcquisitionPermit(BoundedProduceAcquisition);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PhaseBSpaceGroup {
@@ -18776,7 +18831,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         let role_root =
             format!(".fnd01-run/integration-producer/{}", arguments.run_id);
-        Ok(ProduceAcquisitionPermit {
+        Ok(ProduceAcquisitionPermit(BoundedProduceAcquisition {
             authority: authority.produce_acquisition,
             manifest: authority.manifest,
             manifest_binding: authority.manifest_binding,
@@ -18794,17 +18849,17 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             offline_home: format!("{role_root}/cargo-home/offline"),
             execution_bin: format!("{role_root}/execution-bin"),
             role_root,
-        })
+        }))
     }
 
     fn require_complete_produce_acquisition_policy_join(
         permit: &ProduceAcquisitionPermit,
     ) -> TrustResult<[u8; 32]> {
-        let preimage = encode_produce_acquisition_policy_join(&permit.authority)?;
+        let preimage = encode_produce_acquisition_policy_join(&permit.0.authority)?;
         let digest = sha256(&preimage)?;
         if preimage.len() != PRODUCE_POLICY_JOIN_BYTES
             || digest != PRODUCE_POLICY_JOIN_SHA256
-            || permit.authority.full_policy_join_sha256 != digest
+            || permit.0.authority.full_policy_join_sha256 != digest
             || digest == [0; 32]
         {
             return Err(phase_b_error(
@@ -18813,6 +18868,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ));
         }
         Ok(digest)
+    }
+
+    impl ProduceAcquisitionPermit {
+        fn consume(self) -> TrustResult<BoundedProduceAcquisition> {
+            require_complete_produce_acquisition_policy_join(&self)?;
+            Ok(self.0)
+        }
     }
 
     fn io_error(code: &'static str, subject: &str, error: &io::Error) -> TrustError {
@@ -28330,7 +28392,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct SelectedTool {
         id: &'static str,
         selected_lexical: String,
@@ -28468,13 +28530,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let cargo_fmt =
             unique_selected_tool(tools, "cargo-fmt", "tool identity aliases")?;
         if rustfmt.selected_lexical == cargo_fmt.selected_lexical
-            || rustfmt.final_path != cargo_fmt.final_path
-            || rustfmt.final_identity != cargo_fmt.final_identity
-            || rustfmt.final_sha256 != cargo_fmt.final_sha256
+            || (rustfmt.final_path == cargo_fmt.final_path
+                && (rustfmt.final_identity != cargo_fmt.final_identity
+                    || rustfmt.final_sha256 != cargo_fmt.final_sha256))
         {
             return Err(phase_b_error(
                 "E_PHASE_B_TOOL_ALIAS",
-                "rustfmt and cargo-fmt must have distinct lexical chains to one identical final executable",
+                "rustfmt and cargo-fmt require distinct lexical candidates and a consistent shared final path",
             ));
         }
         Ok(())
@@ -28977,7 +29039,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "libgit2: 1.9.4 (sys:0.21.0 vendored)",
                     "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
                     "ssl: OpenSSL 3.6.3 9 Jun 2026",
-                    "os: Ubuntu 26.4.0 (resolute) [64-bit]",
+                    "os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
                 ],
                 "cargo complete -Vv grammar",
             ),
@@ -30215,13 +30277,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         authoring_bytes: &[Vec<u8>; 3],
         authority: PhaseBAuthority,
     ) -> TrustResult<()> {
-        // phase_b_policy_authority_rule: consuming the private PhaseBAuthority
-        // yields one non-Clone permit for the bounded acquisition transaction.
-        // It admits fresh producer scratch, native-tool inventory,
-        // bootstrap.resolve/fetch, and construction plus validation of one
-        // in-memory SUPPLYv4 candidate.  The later dynamic authority barrier
-        // still forbids supply sealing, spool/materialization, control build,
-        // ledger publication, and handoff.
+        // The consumed permit covers acquisition only; the later authority
+        // still gates sealing, materialization, build, publication, and handoff.
         let permit = require_produce_acquisition_authority(
             authority,
             arguments,
@@ -30230,8 +30287,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             integration_digest,
             authoring_bytes,
         )?;
-        let _full_policy_join_sha256 =
-            require_complete_produce_acquisition_policy_join(&permit)?;
+        let acquisition = permit.consume()?;
+        let permit = &acquisition;
         let role = role_name(arguments.mode)?;
         let role_root = permit.role_root.as_str();
         let package_root = permit.package_root.as_str();
@@ -30265,15 +30322,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "produce role-entry layout/authoring binding incomplete",
             ));
         }
-        // Produce mode integration seal is the zero sentinel until seal write.
         if integration_digest != [0; 32] {
             return Err(phase_b_error(
                 "E_PHASE_B_SEAL",
                 "produce integration seal must be the zero sentinel before seal write",
             ));
         }
-        // Authoring triple: policy / verifier / harness — harness becomes
-        // src/main.rs; verifier becomes tests/fnd_01_dependency_evidence.rs.
         let harness_len = u64::try_from(authoring_bytes[2].len()).map_err(|_| {
             phase_b_error("E_PHASE_B_INPUT", "harness length conversion")
         })?;
@@ -30298,7 +30352,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "Phase-B Produce entry aggregate space",
         )?;
         directory_metadata(repository_root, "produce repository root")?;
-        // Fresh role scratch: package layout before lock generation.
         ensure_repository_directory(
             repository_root,
             &package_root,
@@ -30331,7 +30384,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             PhaseBSpaceGroup::RunOnly,
             "fresh acquisition CARGO_HOME",
         )?;
-        // Sealed pre-lock scratch files (Cargo.lock arrives from resolve).
         let sealed_manifest = create_sealed_file(
             repository_root,
             &format!("{package_root}/Cargo.toml"),
@@ -30451,7 +30503,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "shared acquisition command identity differs from compiled authority",
             ));
         }
-        // Online acquisition: resolve then fetch against empty CARGO_HOME.
         require_empty_directory_tree(
             &repository_root.join(&acquisition_home),
             "fresh acquisition CARGO_HOME",
@@ -30549,7 +30600,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ".fnd01-run/integration-producer/{}/supply-bundle.bin",
             arguments.run_id
         );
-        // Parent already under role root; ensure it exists (package root may share parent).
         if let Some(parent) = Path::new(&supply_relative).parent() {
             if let Some(parent) = parent.to_str() {
                 ensure_repository_directory(
@@ -30562,8 +30612,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 )?;
             }
         }
-        // SUPPLYv4 is not a FND01CONTROLv2-style canonical record schema; seal with
-        // create_sealed_file and reparse via parse_supply_bundle.
         let supply_bound = create_sealed_file(
             repository_root,
             &supply_relative,
@@ -30605,7 +30653,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &admitted_bootstrap_input,
             &space_guard,
         )?;
-        // Exact cargo-config for sealed local-registry (offline control-build).
         let registry_abs = utf8_absolute(
             &repository_root.join(&local_registry),
             "local-registry absolute",
@@ -30625,7 +30672,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &cargo_config,
             "bootstrap cargo-config.toml",
         )?;
-        // Acquisition spool: exact successful resolve/fetch pair + sealed supply binding.
         if resolve.argv != resolve_plan.argv
             || resolve.environment != resolve_plan.environment
             || resolve.working_directory != resolve_plan.working_directory
@@ -30749,7 +30795,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "reopened spool command preimages differ from captures",
             ));
         }
-        // Offline control-build against sealed local-registry.
         ensure_repository_directory(
             repository_root,
             &offline_home,
@@ -30880,7 +30925,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         let handoff_argv_values = handoff_argv(arguments, &selected)?;
         let handoff_env_values = handoff_environment(arguments, environment)?;
-        // Scratch bindings for the five sealed package files (absolute paths).
         let scratch_paths = [
             (
                 format!("{package_root}/Cargo.toml"),
@@ -30934,9 +30978,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         if process_id == 0 {
             return Err(phase_b_error("E_PHASE_B_PROCESS", "process id is zero"));
         }
-        // The live 20-tool inventory and execution-bin were completed before
-        // acquisition, so the same selected paths govern resolve/fetch and the
-        // ledger that ordinary later re-probes.
         let environment_set_sha256 = encode_environment_set_digest()?;
         if tool_set_sha256 == [0; 32] || environment_set_sha256 == [0; 32] {
             return Err(phase_b_error(
@@ -31001,7 +31042,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "Phase-B Produce handoff aggregate space",
         )?;
         let _ = supply.entries.len();
-        // Same-PID ordinary handoff (does not return on success).
         exec_handoff(
             repository_root,
             &selected,
@@ -31068,8 +31108,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     }
                 }
                 0x03 => {
-                    // sparse-cache-input: evidence-only SummariesCache v3 admission.
-                    // Never materialize; never promote as registry path.
                     sparse_count = sparse_count
                         .checked_add(1)
                         .ok_or_else(|| phase_b_error("E_PHASE_B_SUPPLY_BOUND", "sparse count"))?;
@@ -31101,10 +31139,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ));
         }
         let _ = (candidate, index_count, sparse_count);
-        // Phase B intentionally does not decompress gzip or parse tar members;
-        // those checks belong to same-PID ordinary admission. Attest remains
-        // fail-closed here until the independently frozen materialized-input,
-        // manifest, lock, and aggregate bootstrap authority is enrolled.
+        // Archive expansion stays fail-closed until root-frozen authority exists.
         Err(phase_b_error(
             "E_PHASE_B_ATTEST_INPUT_AUTHORITY",
             format!(
@@ -31226,10 +31261,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     fn validate_gzip_crate_prefix(payload: &[u8], relative: &str) -> TrustResult<()> {
-        // RFC 1952 gzip member header: ID1=0x1f ID2=0x8b CM=8 (deflate).
-        // Full deflate member expansion remains fail-closed until the std-only
-        // inflater is independently frozen; these checks are pure retained-byte
-        // admission only and perform no filesystem side effects.
+        // Pure RFC 1952 framing admission; no archive expansion or side effects.
         if payload.len() < 18 {
             return Err(phase_b_error(
                 "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
@@ -31243,27 +31275,21 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ));
         }
         let flags = payload[3];
-        // Forbid encrypted/reserved flag bits; allow FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT.
         if flags & 0xe0 != 0 {
             return Err(phase_b_error(
                 "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
                 format!("{relative}: reserved gzip flag bits set"),
             ));
         }
-        // MTIME is little-endian u32 at bytes 4..8; XFL at 8; OS at 9. Reject
-        // zero-length compressed members by requiring more than header+trailer.
         if payload.len() == 18 {
             return Err(phase_b_error(
                 "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
                 format!("{relative}: gzip member has empty deflate stream"),
             ));
         }
-        // Trailer exists (CRC32 + ISIZE); do not interpret without inflate.
         let _trailer = &payload[payload.len() - 8..];
-        // Optional FNAME/FCOMMENT must be NUL-terminated if present (bit 3/4).
         let mut offset = 10usize;
         if flags & 0x04 != 0 {
-            // FEXTRA: 2-byte XLEN little-endian then that many bytes.
             if payload.len() < offset + 2 {
                 return Err(phase_b_error(
                     "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
@@ -31288,7 +31314,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
         if flags & 0x08 != 0 {
-            // FNAME zero-terminated.
             match payload[offset..payload.len().saturating_sub(8)]
                 .iter()
                 .position(|byte| *byte == 0)
@@ -31317,7 +31342,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
         if flags & 0x02 != 0 {
-            // FHCRC: 2-byte header CRC after optional fields.
             offset = offset.checked_add(2).ok_or_else(|| {
                 phase_b_error(
                     "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
@@ -31367,6 +31391,87 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 ),
                 produce_acquisition:
                     compiled_produce_acquisition_authority(),
+            }
+        }
+
+        struct SyntheticPhaseBInputs {
+            policy: Vec<u8>,
+            manifest: Vec<u8>,
+            authoring_bytes: [Vec<u8>; 3],
+            marker: AuthoringMarker,
+            arguments: BootstrapArguments,
+            environment: BootstrapEnvironment,
+        }
+
+        fn synthetic_phase_b_inputs(
+            mode: BootstrapMode,
+            run_id_byte: u8,
+        ) -> SyntheticPhaseBInputs {
+            let policy = FROZEN_POLICY.to_vec();
+            let authoring_bytes = [
+                policy.clone(),
+                b"verifier".to_vec(),
+                b"harness".to_vec(),
+            ];
+            let mut marker = AuthoringMarker {
+                policy: binding_for_bytes(&authoring_bytes[0])
+                    .expect("policy binding"),
+                verifier: binding_for_bytes(&authoring_bytes[1])
+                    .expect("verifier binding"),
+                harness: binding_for_bytes(&authoring_bytes[2])
+                    .expect("harness binding"),
+                closure_sha256: [0; 32],
+            };
+            marker.closure_sha256 = sha256(
+                &authoring_closure_preimage(&marker)
+                    .expect("authoring marker preimage"),
+            )
+            .expect("authoring marker digest");
+            let marker_text = format!(
+                "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
+                marker.policy.byte_length,
+                encode_lower_hex(&marker.policy.sha256),
+                marker.verifier.byte_length,
+                encode_lower_hex(&marker.verifier.sha256),
+                marker.harness.byte_length,
+                encode_lower_hex(&marker.harness.sha256),
+                encode_lower_hex(&marker.closure_sha256),
+            );
+            let run_id_bytes = [run_id_byte; 16];
+            let run_id = encode_lower_hex(&run_id_bytes);
+            let repository_root = PathBuf::from("/repository");
+            let arguments = BootstrapArguments {
+                mode,
+                repository_root: repository_root.clone(),
+                run_root: repository_root
+                    .join(".fnd01-run")
+                    .join(role_name(mode).expect("synthetic Phase-B role"))
+                    .join(&run_id),
+                run_id,
+                run_id_bytes,
+                producer_outer_record_path: None,
+                final_attestation_path: None,
+                attester_outer_record_path: None,
+                gate_input_record_path: None,
+            };
+            let environment = BootstrapEnvironment {
+                authoring_marker: marker_text,
+                closed_path:
+                    "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin"
+                        .to_owned(),
+                integration_seal: None,
+                producer_outer_record_path: None,
+                attester_outer_record_path: None,
+                final_gate_seal: None,
+            };
+            SyntheticPhaseBInputs {
+                policy,
+                manifest: bootstrap_manifest()
+                    .expect("compiled bootstrap manifest"),
+                authoring_bytes,
+                marker,
+                arguments,
+                environment,
             }
         }
 
@@ -31422,6 +31527,64 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             )
             .expect_err("Gate cannot obtain an ordinary tool inventory");
             assert_eq!(gate.code(), "E_PHASE_B_MODE");
+        }
+
+        #[test]
+        fn tool_alias_policy_accepts_distinct_or_shared_finals_and_rejects_desync() {
+            let tool =
+                |id: &'static str,
+                 lexical: &str,
+                 final_path: &str,
+                 inode: u64,
+                 digest: u8| {
+                    SelectedTool {
+                        id,
+                        selected_lexical: lexical.to_owned(),
+                        final_path: final_path.to_owned(),
+                        final_identity: ToolIdentity {
+                            device: 1,
+                            inode,
+                            mode: 0o100_755,
+                            nlink: 1,
+                            length: 1,
+                            mtime_seconds: 1,
+                            mtime_nanoseconds: 0,
+                            ctime_seconds: 1,
+                            ctime_nanoseconds: 0,
+                        },
+                        final_sha256: [digest; 32],
+                        version_stream: "stdout",
+                        version_bytes:
+                            b"rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)\n".to_vec(),
+                        version_sha256: [9; 32],
+                        candidates: Vec::new(),
+                    }
+                };
+            let distinct = vec![
+                tool("rustfmt", "/tool/bin/rustfmt", "/final/rustfmt", 1, 1),
+                tool("cargo-fmt", "/tool/bin/cargo-fmt", "/final/cargo-fmt", 2, 2),
+            ];
+            validate_selected_tool_aliases(&distinct)
+                .expect("distinct pinned binaries are valid role endpoints");
+
+            let shared = vec![
+                tool("rustfmt", "/tool/bin/rustfmt", "/final/rustfmt", 3, 3),
+                tool("cargo-fmt", "/tool/bin/cargo-fmt", "/final/cargo-fmt", 3, 3),
+            ];
+            validate_selected_tool_aliases(&shared)
+                .expect("allow-listed hard-link aliases may share identity and digest");
+            let accepted = shared.clone();
+            let mut drifted = shared.clone();
+            drifted[1].final_sha256[0] ^= 1;
+            assert_eq!(
+                validate_selected_tool_aliases(&drifted)
+                    .expect_err("one digest desync must reject the shared alias")
+                    .code(),
+                "E_PHASE_B_TOOL_ALIAS",
+            );
+            assert_eq!(shared, accepted);
+            validate_selected_tool_aliases(&shared)
+                .expect("pristine shared alias must reaccept after the planted drift");
         }
 
         #[test]
@@ -31557,63 +31720,26 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         #[test]
-        fn produce_acquisition_authority_is_complete_pure_and_mutation_closed() {
-            let policy = b"policy".to_vec();
-            let verifier = b"verifier".to_vec();
-            let harness = b"harness".to_vec();
-            let manifest =
-                bootstrap_manifest().expect("compiled bootstrap manifest");
-            let authoring_bytes =
-                [policy.clone(), verifier.clone(), harness.clone()];
-            let mut marker = AuthoringMarker {
-                policy: binding_for_bytes(&policy).expect("policy binding"),
-                verifier: binding_for_bytes(&verifier)
-                    .expect("verifier binding"),
-                harness: binding_for_bytes(&harness)
-                    .expect("harness binding"),
-                closure_sha256: [0; 32],
-            };
-            marker.closure_sha256 = sha256(
-                &authoring_closure_preimage(&marker)
-                    .expect("authoring marker preimage"),
-            )
-            .expect("authoring marker digest");
-            let marker_text = format!(
-                "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
-                marker.policy.byte_length,
-                encode_lower_hex(&marker.policy.sha256),
-                marker.verifier.byte_length,
-                encode_lower_hex(&marker.verifier.sha256),
-                marker.harness.byte_length,
-                encode_lower_hex(&marker.harness.sha256),
-                encode_lower_hex(&marker.closure_sha256),
-            );
-            let run_id = "11".repeat(16);
-            let repository_root = PathBuf::from("/repository");
-            let arguments = BootstrapArguments {
-                mode: BootstrapMode::Produce,
-                repository_root: repository_root.clone(),
-                run_root: repository_root
-                    .join(".fnd01-run")
-                    .join("integration-producer")
-                    .join(&run_id),
-                run_id: run_id.clone(),
-                run_id_bytes: [0x11; 16],
-                producer_outer_record_path: None,
-                final_attestation_path: None,
-                attester_outer_record_path: None,
-                gate_input_record_path: None,
-            };
-            let environment = BootstrapEnvironment {
-                authoring_marker: marker_text,
-                closed_path:
-                    "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin"
-                        .to_owned(),
-                integration_seal: None,
-                producer_outer_record_path: None,
-                attester_outer_record_path: None,
-                final_gate_seal: None,
-            };
+        fn phase_b_authority_fails_before_side_effects() {
+            let SyntheticPhaseBInputs {
+                policy,
+                manifest,
+                authoring_bytes,
+                marker,
+                mut arguments,
+                environment,
+            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x11);
+            let run_id = arguments.run_id.clone();
+            let no_effect_root = std::env::temp_dir().join(format!(
+                "fastmcp-phase-b-no-effects-{}-{run_id}",
+                std::process::id(),
+            ));
+            assert!(!no_effect_root.exists());
+            arguments.repository_root = no_effect_root.clone();
+            arguments.run_root = no_effect_root
+                .join(".fnd01-run")
+                .join("integration-producer")
+                .join(&run_id);
             let mut permit = require_produce_acquisition_authority(
                 synthetic_phase_b_authority(&policy, &manifest),
                 &arguments,
@@ -31624,17 +31750,17 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             )
             .expect("exact Produce authority");
             assert_eq!(
-                permit.role_root,
+                permit.0.role_root,
                 format!(".fnd01-run/integration-producer/{run_id}")
             );
             assert_eq!(
-                permit.authority,
+                permit.0.authority,
                 compiled_produce_acquisition_authority()
             );
             let joined = require_complete_produce_acquisition_policy_join(&permit)
                 .expect("complete typed policy join must authorize bounded acquisition");
             assert_eq!(joined, PRODUCE_POLICY_JOIN_SHA256);
-            permit.authority.resolve.timeout_seconds -= 1;
+            permit.0.authority.resolve.timeout_seconds -= 1;
             let drift = require_complete_produce_acquisition_policy_join(&permit)
                 .expect_err("a mutated permit must stop before the first Produce effect");
             assert_eq!(drift.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
@@ -31644,8 +31770,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             );
             let compiled_authority = compiled_produce_acquisition_authority();
 
-            permit.authority = compiled_authority;
-            permit.authority.fetch.typed_result_kind = "untyped-fetch";
+            permit.0.authority = compiled_authority;
+            permit.0.authority.fetch.typed_result_kind = "untyped-fetch";
             assert_eq!(
                 require_complete_produce_acquisition_policy_join(&permit)
                     .expect_err("fetch typed-result drift must fail closed")
@@ -31653,8 +31779,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
-            permit.authority = compiled_authority;
-            permit.authority.tool_probe_stdout_limit -= 1;
+            permit.0.authority = compiled_authority;
+            permit.0.authority.tool_probe_stdout_limit -= 1;
             assert_eq!(
                 require_complete_produce_acquisition_policy_join(&permit)
                     .expect_err("tool-probe bound drift must fail closed")
@@ -31662,8 +31788,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
-            permit.authority = compiled_authority;
-            permit.authority.space_budget.max_control_plane_total_bytes -= 1;
+            permit.0.authority = compiled_authority;
+            permit.0.authority.space_budget.max_control_plane_total_bytes -= 1;
             assert_eq!(
                 require_complete_produce_acquisition_policy_join(&permit)
                     .expect_err("aggregate space-bound drift must fail closed")
@@ -31671,8 +31797,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
-            permit.authority = compiled_authority;
-            permit.authority.scratch_root_formula = ".fnd01-run/<run-id>/wrong-role";
+            permit.0.authority = compiled_authority;
+            permit.0.authority.scratch_root_formula = ".fnd01-run/<run-id>/wrong-role";
             assert_eq!(
                 require_complete_produce_acquisition_policy_join(&permit)
                     .expect_err("path-formula drift must fail closed")
@@ -31680,15 +31806,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
 
-            permit.authority = compiled_authority;
-            permit.authority.full_policy_join_sha256[0] ^= 1;
+            permit.0.authority = compiled_authority;
+            permit.0.authority.full_policy_join_sha256[0] ^= 1;
             assert_eq!(
                 require_complete_produce_acquisition_policy_join(&permit)
                     .expect_err("stored policy-join digest drift must fail closed")
                     .code(),
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
-            permit.authority = compiled_authority;
+            permit.0.authority = compiled_authority;
 
             let mut wrong_direct =
                 synthetic_phase_b_authority(&policy, &manifest);
@@ -31787,7 +31913,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             );
 
             let mut wrong_root = arguments.clone();
-            wrong_root.run_root = repository_root.join("wrong");
+            wrong_root.run_root = arguments.repository_root.join("wrong");
             assert_eq!(
                 require_produce_acquisition_authority(
                     synthetic_phase_b_authority(&policy, &manifest),
@@ -31880,6 +32006,96 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .code(),
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
             );
+            assert!(!no_effect_root.exists());
+        }
+
+        #[test]
+        fn phase_b_produce_acquisition_authority_matrix() {
+            let SyntheticPhaseBInputs {
+                policy,
+                manifest,
+                authoring_bytes,
+                marker,
+                arguments,
+                environment,
+            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x12);
+            let permit = require_produce_acquisition_authority(
+                validate_phase_b_authority(&policy)
+                    .expect("independently validated frozen Phase-B policy"),
+                &arguments,
+                &environment,
+                &marker,
+                [0; 32],
+                &authoring_bytes,
+            )
+            .expect("independently constructed Produce authority");
+            assert_eq!(
+                require_complete_produce_acquisition_policy_join(&permit)
+                    .expect("complete Produce authority matrix"),
+                PRODUCE_POLICY_JOIN_SHA256,
+            );
+            let acquisition = permit.consume().expect("bounded acquisition");
+            assert_eq!(
+                acquisition.authority,
+                compiled_produce_acquisition_authority(),
+            );
+        }
+
+        #[test]
+        fn phase_b_produce_permit_is_single_use_and_bounded() {
+            trait AmbiguousIfClone<A> {
+                fn check() {}
+            }
+            impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+            struct CloneMarker;
+            impl<T: ?Sized + Clone> AmbiguousIfClone<CloneMarker> for T {}
+            let _ = <ProduceAcquisitionPermit as AmbiguousIfClone<_>>::check;
+            let _ = <BoundedProduceAcquisition as AmbiguousIfClone<_>>::check;
+
+            let SyntheticPhaseBInputs {
+                policy,
+                manifest,
+                authoring_bytes,
+                marker,
+                arguments,
+                environment,
+            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x13);
+            let permit = require_produce_acquisition_authority(
+                synthetic_phase_b_authority(&policy, &manifest),
+                &arguments,
+                &environment,
+                &marker,
+                [0; 32],
+                &authoring_bytes,
+            )
+            .expect("single-use Produce permit");
+            let consume: fn(
+                ProduceAcquisitionPermit,
+            ) -> TrustResult<BoundedProduceAcquisition> =
+                ProduceAcquisitionPermit::consume;
+            let acquisition = consume(permit).expect("one acquisition use");
+            assert_eq!(
+                acquisition.authority.full_policy_join_sha256,
+                PRODUCE_POLICY_JOIN_SHA256,
+            );
+
+            let archive = [
+                0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ];
+            let supply = synthetic_valid_supply(&archive);
+            let validated = validate_supply_bundle_value(&supply)
+                .expect("validated bounded supply");
+            assert_eq!(
+                require_root_frozen_bootstrap_input_authority(
+                    &manifest,
+                    binding_for_bytes(&manifest).expect("manifest binding"),
+                    &validated,
+                )
+                .expect_err("acquisition cannot authorize later effects")
+                .code(),
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
+            );
         }
 
         #[test]
@@ -31963,16 +32179,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         fn sparse_index_json_enforces_the_frozen_v1_v2_surface() {
             const CHECKSUM: &str =
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-            let valid_v1 = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"1.2","features":["","std","std"],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null,"package":null,"public":null,"artifact":null,"bindep_target":null,"lib":false}}],"features":{{"default":["dep","dep"]}},"cksum":"{CHECKSUM}","yanked":false,"links":"","rust_version":"1","pubtime":"0000-02-29T00:00:00Z"}}"#
-            );
-            let v1 = sparse_index_identity(valid_v1.as_bytes(), Some("1.2.3"), "valid v1")
+            let corpus = sparse_index_fixture_corpus();
+            assert_eq!(corpus.checksum, CHECKSUM);
+            let v1 = sparse_index_identity(corpus.valid_v1.as_bytes(), Some("1.2.3"), "valid v1")
                 .expect("registered v1 fields and duplicate array members must pass");
             assert_eq!(v1.name, "sample");
             assert_eq!(v1.version, "1.2.3");
             assert_eq!(v1.checksum, CHECKSUM);
             assert_eq!(v1.yanked, Some(false));
-            let leap_second = valid_v1.replace(
+            let leap_second = corpus.valid_v1.replace(
                 "0000-02-29T00:00:00Z",
                 "2026-07-07T15:52:60Z",
             );
@@ -31997,181 +32212,52 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .expect(requirement);
             }
 
-            let valid_v2 = format!(
-                r#"{{"name":"sample","vers":"2.0.0","deps":[{{"name":"optional","req":"*","optional":true,"kind":"build"}}],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","yanked":null,"v":2}}"#
-            );
             assert_eq!(
-                sparse_index_identity(valid_v2.as_bytes(), Some("2.0.0"), "valid v2")
+                sparse_index_identity(corpus.valid_v2.as_bytes(), Some("2.0.0"), "valid v2")
                     .expect("registered v2 fields must pass")
                     .yanked,
                 None,
             );
 
-            let invalid = [
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","unknown":true}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_FIELDS",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_FIELDS",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":0}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_VERSION",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":3}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_VERSION",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_VERSION",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","unknown":true}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_FIELDS",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","artifact":["bin"]}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_VERSION",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","lib":true}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_VERSION",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{}"}}"#,
-                        "A".repeat(64),
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_IDENTITY",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","pubtime":"2026-02-30T15:52:22Z"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_TYPE",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true,"kind":"dev"}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":null}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_JSON_TYPE",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","kind":"build","public":true}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","target":"cfg(any(unix,,windows))"}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","registry":"https://example.invalid/index"}}],"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"dep:bad":[]}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"default":["missing"]}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep:dep"]}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep?/feature"]}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true}}],"features":{{"dep":[]}},"cksum":"{CHECKSUM}"}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
-                (
-                    format!(
-                        r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","v":2}}"#
-                    ),
-                    "1.2.3",
-                    "E_PHASE_B_CARGO_INDEX_SEMANTIC",
-                ),
+            let expected_cases = [
+                ("unknown-root-field", "E_PHASE_B_CARGO_INDEX_FIELDS"),
+                ("missing-deps", "E_PHASE_B_CARGO_INDEX_FIELDS"),
+                ("version-zero", "E_PHASE_B_CARGO_INDEX_VERSION"),
+                ("version-three", "E_PHASE_B_CARGO_INDEX_VERSION"),
+                ("features2-without-v2", "E_PHASE_B_CARGO_INDEX_VERSION"),
+                ("unknown-dependency-field", "E_PHASE_B_CARGO_INDEX_FIELDS"),
+                ("artifact-before-v2", "E_PHASE_B_CARGO_INDEX_VERSION"),
+                ("lib-before-v2", "E_PHASE_B_CARGO_INDEX_VERSION"),
+                ("uppercase-checksum", "E_PHASE_B_CARGO_INDEX_IDENTITY"),
+                ("invalid-pubtime", "E_PHASE_B_CARGO_INDEX_TYPE"),
+                ("optional-dev", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("nullable-optional", "E_PHASE_B_JSON_TYPE"),
+                ("public-build", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("invalid-target-cfg", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("non-crates-io-registry", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("feature-name-dep-prefix", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("missing-feature-reference", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("non-optional-dep-activation", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("weak-non-optional-dep", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("implicit-optional-feature", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
+                ("features2-missing-dependency", "E_PHASE_B_CARGO_INDEX_SEMANTIC"),
             ];
-            for (json, cache_version, expected_code) in invalid {
+            assert_eq!(corpus.invalid.len(), expected_cases.len());
+            for ((case_id, json), (expected_id, expected_code)) in
+                corpus.invalid.iter().zip(expected_cases)
+            {
+                assert_eq!(*case_id, expected_id);
                 assert_eq!(
-                    sparse_index_identity(json.as_bytes(), Some(cache_version), "invalid index")
+                    sparse_index_identity(json.as_bytes(), Some("1.2.3"), "invalid index")
                         .expect_err("invalid registered index JSON must fail")
                         .code(),
                     expected_code,
-                    "{json}",
+                    "{case_id}: {json}",
                 );
             }
             assert_eq!(
                 sparse_index_identity(
-                    format!(
-                        r#"{{"name":"sample","name":"other","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}"}}"#
-                    )
-                    .as_bytes(),
+                    corpus.duplicate_key.as_bytes(),
                     Some("1.2.3"),
                     "duplicate index key",
                 )
@@ -32180,23 +32266,21 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "E_PHASE_B_JSON",
             );
             assert_eq!(
-                sparse_index_identity(valid_v1.as_bytes(), Some("1.2.4"), "cache mismatch")
+                sparse_index_identity(corpus.valid_v1.as_bytes(), Some("1.2.4"), "cache mismatch")
                     .expect_err("outer cache version must equal vers")
                     .code(),
                 "E_PHASE_B_CARGO_INDEX_IDENTITY",
             );
 
-            let renamed_dependency = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"alias","package":"actual","req":"*","optional":true}}],"features":{{"default":["dep:alias"]}},"cksum":"{CHECKSUM}"}}"#
-            );
             sparse_index_identity(
-                renamed_dependency.as_bytes(),
+                corpus.renamed_dependency.as_bytes(),
                 Some("1.2.3"),
                 "renamed dependency alias",
             )
             .expect("feature references use the dependency alias");
-            let wrong_renamed_feature =
-                renamed_dependency.replace("dep:alias", "dep:actual");
+            let wrong_renamed_feature = corpus
+                .renamed_dependency
+                .replace("dep:alias", "dep:actual");
             assert_eq!(
                 sparse_index_identity(
                     wrong_renamed_feature.as_bytes(),
@@ -32240,9 +32324,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
-        fn synthetic_valid_supply(archive: &[u8]) -> SupplyBundle {
+        fn synthetic_supply_fixture(
+            archive: Vec<u8>,
+        ) -> (Vec<u8>, Vec<u8>, SupplyAcquisitionObservation) {
             let checksum = encode_lower_hex(
-                &sha256(archive).expect("archive digest"),
+                &sha256(&archive).expect("archive digest"),
             );
             let selected = format!(
                 r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
@@ -32251,7 +32337,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 synthetic_supply_entry(
                     0x01,
                     "sample-1.2.3.crate",
-                    archive.to_vec(),
+                    archive,
                 ),
                 synthetic_supply_entry(
                     0x02,
@@ -32267,12 +32353,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     )]),
                 ),
             ];
-            let encoded = encode_supply_bundle(
-                &synthetic_supply_lock(&checksum),
-                &synthetic_supply_acquisition(),
-                entries,
-            )
-            .expect("canonical synthetic supply");
+            let lock = synthetic_supply_lock(&checksum);
+            let acquisition = synthetic_supply_acquisition();
+            let encoded = encode_supply_bundle(&lock, &acquisition, entries)
+                .expect("canonical synthetic supply");
+            (encoded, lock, acquisition)
+        }
+
+        fn synthetic_valid_supply(archive: &[u8]) -> SupplyBundle {
+            let (encoded, _, _) = synthetic_supply_fixture(archive.to_vec());
             parse_supply_bundle(&encoded).expect("validated synthetic supply")
         }
 
@@ -32523,37 +32612,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         #[test]
         fn supply_v4_round_trips_and_rejects_header_drift() {
-            let archive = b"synthetic selected crate archive".to_vec();
-            let checksum =
-                encode_lower_hex(&sha256(&archive).expect("archive digest"));
-            let selected = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
-            );
-            let entries = vec![
-                synthetic_supply_entry(
-                    0x01,
-                    "sample-1.2.3.crate",
-                    archive,
-                ),
-                synthetic_supply_entry(
-                    0x02,
-                    "index/sa/mp/sample",
-                    format!("{selected}\n").into_bytes(),
-                ),
-                synthetic_supply_entry(
-                    0x03,
-                    "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
-                    synthetic_summaries_cache(&[(
-                        "1.2.3",
-                        selected.as_bytes(),
-                    )]),
-                ),
-            ];
-            let lock = synthetic_supply_lock(&checksum);
-            let acquisition = synthetic_supply_acquisition();
-            let encoded =
-                encode_supply_bundle(&lock, &acquisition, entries)
-                    .expect("synthetic supply-v4 encoding");
+            let (encoded, lock, acquisition) =
+                synthetic_supply_fixture(b"synthetic selected crate archive".to_vec());
             let parsed = parse_supply_bundle(&encoded)
                 .expect("synthetic supply-v4 parsing");
             assert_eq!(parsed.bootstrap_lock, lock);
@@ -32663,40 +32723,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 );
             }
 
-            let archive = b"bounded archive".to_vec();
-            let checksum =
-                encode_lower_hex(&sha256(&archive).expect("archive digest"));
-            let selected = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{checksum}","yanked":false}}"#
-            );
-            let entries = vec![
-                synthetic_supply_entry(
-                    0x01,
-                    "sample-1.2.3.crate",
-                    archive,
-                ),
-                synthetic_supply_entry(
-                    0x02,
-                    "index/sa/mp/sample",
-                    format!("{selected}\n").into_bytes(),
-                ),
-                synthetic_supply_entry(
-                    0x03,
-                    "sparse-cache/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sa/mp/sample",
-                    synthetic_summaries_cache(&[(
-                        "1.2.3",
-                        selected.as_bytes(),
-                    )]),
-                ),
-            ];
-            let lock = synthetic_supply_lock(&checksum);
-            let encoded = encode_supply_bundle(
-                &lock,
-                &synthetic_supply_acquisition(),
-                entries,
-            )
-            .expect("bounded synthetic supply");
-            let acquisition = synthetic_supply_acquisition();
+            let (encoded, lock, acquisition) =
+                synthetic_supply_fixture(b"bounded archive".to_vec());
             let first_entry_offset = SUPPLY_PREFIX.len()
                 + 8
                 + 32
@@ -33248,75 +33276,30 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         #[test]
-        fn attest_prefix_valid_supply_stops_at_input_authority_not_inflation() {
+        fn phase_b_attest_supply_archive_expansion_remains_fail_closed() {
             let mut archive = vec![
                 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0,
             ];
             archive.push(0x03);
             archive.extend_from_slice(&[0; 8]);
             let supply = synthetic_valid_supply(&archive);
-            let policy = b"policy".to_vec();
-            let verifier = b"verifier".to_vec();
-            let harness = b"harness".to_vec();
-            let authoring_bytes = [policy.clone(), verifier, harness];
-            let mut marker = AuthoringMarker {
-                policy: binding_for_bytes(&authoring_bytes[0])
-                    .expect("policy binding"),
-                verifier: binding_for_bytes(&authoring_bytes[1])
-                    .expect("verifier binding"),
-                harness: binding_for_bytes(&authoring_bytes[2])
-                    .expect("harness binding"),
-                closure_sha256: [0; 32],
-            };
-            marker.closure_sha256 = sha256(
-                &authoring_closure_preimage(&marker)
-                    .expect("authoring preimage"),
-            )
-            .expect("authoring digest");
-            let marker_text = format!(
-                "FND01AUTHORv2:{}:{}:{}:{}:{}:{}:{}",
-                marker.policy.byte_length,
-                encode_lower_hex(&marker.policy.sha256),
-                marker.verifier.byte_length,
-                encode_lower_hex(&marker.verifier.sha256),
-                marker.harness.byte_length,
-                encode_lower_hex(&marker.harness.sha256),
-                encode_lower_hex(&marker.closure_sha256),
-            );
-            let run_id = "22".repeat(16);
-            let repository_root = PathBuf::from("/repository");
-            let arguments = BootstrapArguments {
-                mode: BootstrapMode::Attest,
-                repository_root: repository_root.clone(),
-                run_root: repository_root
-                    .join(".fnd01-run")
-                    .join("independent-attester")
-                    .join(&run_id),
-                run_id,
-                run_id_bytes: [0x22; 16],
-                producer_outer_record_path: None,
-                final_attestation_path: None,
-                attester_outer_record_path: None,
-                gate_input_record_path: None,
-            };
-            let environment = BootstrapEnvironment {
-                authoring_marker: marker_text,
-                closed_path:
-                    "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin"
-                        .to_owned(),
-                integration_seal: None,
-                producer_outer_record_path: None,
-                attester_outer_record_path: None,
-                final_gate_seal: None,
-            };
-            let manifest = bootstrap_manifest().expect("compiled manifest");
+            let baseline = supply.clone();
+            let SyntheticPhaseBInputs {
+                policy,
+                manifest,
+                authoring_bytes,
+                marker,
+                arguments,
+                environment,
+            } = synthetic_phase_b_inputs(BootstrapMode::Attest, 0x22);
             let error = attest_phase_b_supply_validation(
                 &arguments,
                 &environment,
                 &marker,
                 [0x33; 32],
                 &authoring_bytes,
-                synthetic_phase_b_authority(&policy, &manifest),
+                validate_phase_b_authority(&policy)
+                    .expect("frozen Attest authority"),
                 &supply,
             )
             .expect_err(
@@ -33324,16 +33307,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             );
             assert_eq!(error.code(), "E_PHASE_B_ATTEST_INPUT_AUTHORITY");
             assert!(error.detail().contains("validated 1 crate archive framings"));
+            assert_eq!(supply, baseline);
 
-            let mut no_archive = supply;
+            let mut no_archive = supply.clone();
             no_archive.entries.retain(|entry| entry.kind != 0x01);
+            let no_archive_baseline = no_archive.clone();
             let no_archive_error = attest_phase_b_supply_validation(
                 &arguments,
                 &environment,
                 &marker,
                 [0x33; 32],
                 &authoring_bytes,
-                synthetic_phase_b_authority(&policy, &manifest),
+                validate_phase_b_authority(&policy)
+                    .expect("frozen Attest authority"),
                 &no_archive,
             )
             .expect_err("Attest requires at least one crate archive framing");
@@ -33341,6 +33327,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 no_archive_error.code(),
                 "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
             );
+            assert_eq!(no_archive, no_archive_baseline);
         }
 
         #[test]
@@ -34108,6 +34095,7 @@ mod ordinary {
     };
     use super::{
         FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX, RECORD_SET_PREFIX,
+        sparse_index_fixture_corpus,
     };
     use flate2::bufread::GzDecoder;
     use flate2::write::GzEncoder;
@@ -34138,21 +34126,21 @@ mod ordinary {
 
     const POLICY_SCHEMA_VERSION: u32 = 2;
     const RECEIPT_SCHEMA_VERSION: u32 = 2;
-    const EXPECTED_SOURCE_FILES: usize = 66;
+    const EXPECTED_SOURCE_FILES: usize = 68;
     const EXPECTED_NEGATIVES: usize = 188;
     const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
     const MUTATION_RECIPE_CANONICAL_SHA256: &str =
         "609f0ce94ad6403a3324f1afd705f641573469a833fd3271e84b0647e86f2f5a";
     const ASSERTION_CANONICAL_BYTES: usize = 77_379;
     const ASSERTION_CANONICAL_SHA256: &str =
-        "29f2e159ce5f0febd11d59f3819a0feeb80e57337da940c081cc2be92a88bc24";
+        "fec2d08b49d7e8be67d0a1b4d3078e4ac168bffd76b0bd0d91544227701a4393";
     const EXPECTED_RECEIPTS: usize = 14;
     const EXPECTED_RECEIPT_TOMLS: usize = 10;
     const EXPECTED_RECEIPT_BINARIES: usize = 4;
     const EXPECTED_DIRECT_PARENT_EDGES: usize = 47;
     const PARENT_PURPOSE_REGISTRY_BYTES: usize = 5_371;
     const PARENT_PURPOSE_REGISTRY_SHA256: &str =
-        "072d0d449700970a7127a8f9552b4dbb2c3ff2703f8bfb156b11f265aaa6c441";
+        "b249ee51c402a6664c95af7e7237e46ad7d0b38f0a991aca45e1cd524048c812";
     const POLICY_SHAPE_SCHEMA_ID: &str = "fastmcp-fnd01-policy-shape";
     const POLICY_SHAPE_SCHEMA_VERSION: u32 = 2;
     const POLICY_SHAPE_ROW_COUNT: usize = 104;
@@ -34178,11 +34166,11 @@ mod ordinary {
     const RECEIPT_SCHEMA_REGISTRY_COUNT: usize = 10;
     const RECEIPT_SCHEMA_REGISTRY_BYTES: usize = 21_571;
     const RECEIPT_SCHEMA_REGISTRY_SHA256: &str =
-        "078d93c8bf7c5098bc56f89268ce717a55d4dcde87774edc61579f7273381880";
+        "1f35257726d51f960b760a646996fed4b70ec36a1b89cc5005b0020f9a54b324";
     const RECEIPT_CONTRACT_REGISTRY_FIELD_COUNT: usize = 18;
     const RECEIPT_CONTRACT_REGISTRY_BYTES: usize = 5_602;
     const RECEIPT_CONTRACT_REGISTRY_SHA256: &str =
-        "500bf217820845648e847810a72e4324d3c44ed628bd26856e5739dab5fdcdc1";
+        "35731312a79c3d8746d6306f70f4d4e1df9170e737146e430196da5c7ec31166";
     const DIRECT_FIELD_TYPE_COUNT: usize = 1_264;
     const DIRECT_FIELD_TYPE_REGISTRY_BYTES: usize = 84_281;
     const DIRECT_FIELD_TYPE_REGISTRY_SHA256: &str =
@@ -34239,7 +34227,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "e9bb690856a404e4b3b10a9b86e1bec8f1dfc7005a4c42ee9d346f41216e368b";
+        "878c77d6d704b04e438da1e392bc598ca3d352b989aaa8c04df3b8984d2cf760";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -35264,65 +35252,65 @@ activate = 1\n";
         (
             "core",
             "bd-mcp-2026-07-28-support-ahet.1.2",
-            7,
-            367_030,
-            "8dcb85833bcbba14c45a9643de0ef892a9cf1c16f32b9f96a2bba6fa29aa7021",
+            9,
+            499_445,
+            "1ea30061f547425bc96067725b58124227e1b9adc9dd805adb748d274f0d2fff",
         ),
         (
             "tasks_apps",
             "bd-mcp-2026-07-28-support-ahet.1.3",
             14,
-            1_374_873,
-            "a48f8da9b1ebe4468230f1bdbc8a5e7ea2d1fb501b022b031d5b9f8a43d9cb49",
+            1_401_051,
+            "b4030a0a07246f72f96c93557566344f3bdaa8f9e568ca9b24d67223f95144ba",
         ),
         (
             "auth",
             "bd-mcp-2026-07-28-support-ahet.1.4",
             1,
-            47_484,
-            "666855be022cb35f34409050eb91622eb867d586ab4503207b436996c7647c2b",
+            91_086,
+            "8362bb3ce7b9fbb3c2013609a84d98e4c1895962d40fddd9b93a27b0d10e98c7",
         ),
         (
             "sdk",
             "bd-mcp-2026-07-28-support-ahet.1.5",
             14,
-            89_103,
-            "7871c0ee9a815abe7b2b39355de0046b75b455e59e8448c019ac59543d5f8c25",
+            96_975,
+            "41f9e921c87a02c24c00767c66b76bae1af5d3b37815a83b3b6de0795caa2bbd",
         ),
         (
             "toolchain",
             "bd-mcp-2026-07-28-support-ahet.1.6",
             4,
-            59_659,
-            "6a6068bbd609193d8a53284226a0ca821d5203aaf36c21457a938946d06edf1a",
+            59_668,
+            "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839",
         ),
         (
             "serialization",
             "bd-mcp-2026-07-28-support-ahet.1.7",
             2,
-            57_001,
-            "b3bf50f442b52c6775ca8001e4fb4e86acad8556558e7afe82d3c9dacf065d0d",
+            64_187,
+            "d0c43f5edb32bd8a440716e30bcbef8da0705c08b9d24d0c4a1116d465f6f580",
         ),
         (
             "jose",
             "bd-mcp-2026-07-28-support-ahet.1.11",
             4,
-            11_364,
-            "ab70b0dd9d675825b9dda72a737fe296ee1de72116ea09e7490183972be85bbd",
+            11_442,
+            "6a5f5d57a771c6a49b418093f8161d0c5cee74cfe708293edc6bcae99d62b0a7",
         ),
         (
             "media",
             "bd-mcp-2026-07-28-support-ahet.1.12",
             10,
-            559_330,
-            "8f8f0cd6503eaa6a31971f0e6ec93f9798b8799769dd6f895c6efff9d830cb15",
+            564_485,
+            "abed2b6ee906b8c6694bbea0034b88eda013d0cfbab1e2d365a84f17ea396de9",
         ),
         (
             "state",
             "bd-mcp-2026-07-28-support-ahet.1.13",
             10,
-            106_043,
-            "3df9af76991b048e402e15b807026e34df686896972bcf7ef44f8f256193e298",
+            224_455,
+            "96e3e0568fbbc50be4207af73bdf8a2b4e7e4b895f4e2e454f2f0d6fb6734bc3",
         ),
     ];
 
@@ -36408,7 +36396,7 @@ activate = 1\n";
     }
 
     #[derive(Debug)]
-    struct Corpus66<'a> {
+    struct Corpus<'a> {
         files: &'a [LoadedFile],
         by_path: BTreeMap<String, usize>,
         toml_documents: BTreeMap<String, toml::Value>,
@@ -41380,7 +41368,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 2_671_887
+            || policy.source_input_total_bytes != 3_012_794
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
@@ -41547,6 +41535,7 @@ activate = 1\n";
                     "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
                     "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
                     "evidence/fnd-01/final-attestation.toml",
+                    "evidence/fnd-01/vendor/apps/whatwg-html-source",
                 ],
             )
             || policy.source_tree.excluded_exact_directory != "evidence/fnd-01/integration"
@@ -41567,8 +41556,8 @@ activate = 1\n";
                 .source_input_contract
                 .checked_in_archives_remain_local_exact_bytes
             || policy.parse_inventory.toml != 22
-            || policy.parse_inventory.json != 14
-            || policy.parse_inventory.utf8_text != 23
+            || policy.parse_inventory.json != 15
+            || policy.parse_inventory.utf8_text != 24
             || policy.parse_inventory.opaque_binary != 4
             || policy.parse_inventory.gzip_tar != 3
         {
@@ -41695,7 +41684,7 @@ activate = 1\n";
             .mutation_contract
             .semantic_drift_meta_test_rebinds_file_and_tree_hashes
         || policy.mutation_contract.mutation_execution_isolation
-            != "load the exact 66 source_input byte map read-only; for each negative_case create a fresh bounded in-memory copy of only target_path bytes, apply exactly that recipe, rebind only the virtual file/source-family/source-tree hashes required by integrity_mode, run the complete validator against the one virtual byte substitution, record the result, and discard it before the next case; no source, workspace, retained, scratch, or integration file is written, and mutations never accumulate"
+            != "load the exact 68 source_input byte map read-only; for each negative_case create a fresh bounded in-memory copy of only target_path bytes, apply exactly that recipe, rebind only the virtual file/source-family/source-tree hashes required by integrity_mode, run the complete validator against the one virtual byte substitution, record the result, and discard it before the next case; no source, workspace, retained, scratch, or integration file is written, and mutations never accumulate"
         || policy.mutation_contract.quarantine_meta_test_exception
             != "the sole recipe whose selector enters a quarantined source array is tasks_apps/quarantine-drift; it removes one table only from the fresh in-memory tasks-apps.toml clone to prove the exact quarantine set validator fires, never parses or executes the quarantined table as a payload, and therefore does not contradict quarantine mutation_allowed=false"
         || !policy.mutation_contract.structured_toml_mutation_allowed
@@ -45870,29 +45859,29 @@ activate = 1\n";
         Ok(hasher.finalize().into())
     }
 
-    impl<'a> Corpus66<'a> {
+    impl<'a> Corpus<'a> {
         fn checked(files: &'a [LoadedFile], policy: &Policy) -> VResult<Self> {
             if files.len() != EXPECTED_SOURCE_FILES
                 || policy.source_tree.file_count != EXPECTED_SOURCE_FILES
             {
                 return Err(
-                    Diagnostic::error("E_CORPUS66_COUNT", "immutable mutation corpus")
+                    Diagnostic::error("E_CORPUS_COUNT", "immutable mutation corpus")
                         .at(files.len().to_string()),
                 );
             }
             let mut by_path = BTreeMap::new();
             for (index, file) in files.iter().enumerate() {
                 let byte_length = u64::try_from(file.bytes.len())
-                    .map_err(|_| Diagnostic::error("E_CORPUS66_BOUND", &file.contract.path))?;
+                    .map_err(|_| Diagnostic::error("E_CORPUS_BOUND", &file.contract.path))?;
                 if byte_length != file.contract.byte_length
                     || sha256(&file.bytes) != file.digest
                     || lower_hex(&file.digest) != file.contract.sha256
                 {
-                    return Err(Diagnostic::error("E_CORPUS66_BINDING", &file.contract.path));
+                    return Err(Diagnostic::error("E_CORPUS_BINDING", &file.contract.path));
                 }
                 if by_path.insert(file.contract.path.clone(), index).is_some() {
                     return Err(Diagnostic::error(
-                        "E_CORPUS66_DUPLICATE",
+                        "E_CORPUS_DUPLICATE",
                         &file.contract.path,
                     ));
                 }
@@ -45901,7 +45890,7 @@ activate = 1\n";
             let (tree, _) = source_tree_digest_refs(&references)?;
             if lower_hex(&tree) != policy.source_tree.sha256 {
                 return Err(
-                    Diagnostic::error("E_CORPUS66_TREE", "immutable mutation corpus")
+                    Diagnostic::error("E_CORPUS_TREE", "immutable mutation corpus")
                         .at(lower_hex(&tree)),
                 );
             }
@@ -45915,7 +45904,7 @@ activate = 1\n";
                     || byte_length != family.total_bytes
                     || lower_hex(&digest) != family.tree_sha256
                 {
-                    return Err(Diagnostic::error("E_CORPUS66_FAMILY", &family.id));
+                    return Err(Diagnostic::error("E_CORPUS_FAMILY", &family.id));
                 }
             }
 
@@ -45926,7 +45915,7 @@ activate = 1\n";
                     .get(assertion.source_path.as_str())
                     .copied()
                     .ok_or_else(|| {
-                        Diagnostic::error("E_CORPUS66_PATH", &assertion.id)
+                        Diagnostic::error("E_CORPUS_PATH", &assertion.id)
                             .at(&assertion.source_path)
                     })?;
                 let file = &files[index];
@@ -45968,7 +45957,7 @@ activate = 1\n";
             self.by_path
                 .get(path)
                 .and_then(|index| self.files.get(*index))
-                .ok_or_else(|| Diagnostic::error("E_CORPUS66_PATH", path))
+                .ok_or_else(|| Diagnostic::error("E_CORPUS_PATH", path))
         }
 
         fn toml(&self, path: &str, subject: &str) -> VResult<&toml::Value> {
@@ -45986,7 +45975,7 @@ activate = 1\n";
 
     impl<'a> Overlay<'a> {
         fn checked(
-            corpus: &Corpus66<'_>,
+            corpus: &Corpus<'_>,
             case: &'a NegativeCase,
             fixture: Option<&MutationFixture>,
             policy: &Policy,
@@ -46192,7 +46181,7 @@ activate = 1\n";
     }
 
     fn assertion_document<'view>(
-        corpus: &'view Corpus66<'_>,
+        corpus: &'view Corpus<'_>,
         overlay: Option<&'view Overlay<'_>>,
         assertion: &SemanticAssertion,
     ) -> VResult<ObservationDocument<'view>> {
@@ -46232,7 +46221,7 @@ activate = 1\n";
     }
 
     fn scan_assertion_registry(
-        corpus: &Corpus66<'_>,
+        corpus: &Corpus<'_>,
         overlay: Option<&Overlay<'_>>,
         case: Option<&NegativeCase>,
         policy: &Policy,
@@ -46770,7 +46759,7 @@ activate = 1\n";
         }
         validate_assertion_canonical_registry(policy)?;
 
-        let corpus = Corpus66::checked(files, policy)?;
+        let corpus = Corpus::checked(files, policy)?;
         for assertion in &policy.semantic_assertion {
             match assertion.observation_mode {
                 AssertionObservationMode::CanonicalSelectedToml => {
@@ -46833,7 +46822,7 @@ activate = 1\n";
         if !baseline_findings.is_empty() {
             return Err(Diagnostic::error(
                 "E_ASSERTION_BASELINE_FINDING",
-                "immutable Corpus66 baseline",
+                "immutable corpus baseline",
             )
             .at(format!(
                 "{:?}",
@@ -47023,7 +47012,7 @@ activate = 1\n";
         if !final_baseline_findings.is_empty() {
             return Err(Diagnostic::error(
                 "E_ASSERTION_BASELINE_FINDING",
-                "post-mutation immutable Corpus66 baseline",
+                "post-mutation immutable corpus baseline",
             ));
         }
         Ok(())
@@ -62604,9 +62593,54 @@ activate = 1\n";
         Ok(())
     }
 
-    fn metadata_error(subject: &str, field: &str) -> Diagnostic {
-        Diagnostic::error("E_METADATA_JSON_SCHEMA", subject).at(field)
+    macro_rules! strict_json_accessors {
+        ($error:ident, $object:ident, $exact:ident, $field_fn:ident, $text:ident,
+         $token:ident, $token_field:ident, $bool_field:ident, $array:ident,
+         $array_field:ident, $code:literal) => {
+            fn $error(subject: &str, field: &str) -> Diagnostic {
+                Diagnostic::error($code, subject).at(field)
+            }
+            fn $object<'a>(value: &'a StrictJson, subject: &str, field: &str) -> VResult<&'a BTreeMap<String, StrictJson>> {
+                match value { StrictJson::Object(object) => Ok(object), _ => Err($error(subject, field)) }
+            }
+            fn $exact(object: &BTreeMap<String, StrictJson>, required: &[&str], optional: &[&str], subject: &str) -> VResult<()> {
+                if required.iter().any(|field| !object.contains_key(*field))
+                    || object.keys().any(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+                { return Err($error(subject, "exact object fields")); }
+                Ok(())
+            }
+            fn $field_fn<'a>(object: &'a BTreeMap<String, StrictJson>, field: &str, subject: &str) -> VResult<&'a StrictJson> {
+                object.get(field).ok_or_else(|| $error(subject, field))
+            }
+            fn $text<'a>(value: &'a StrictJson, allow_empty: bool, subject: &str, field: &str) -> VResult<&'a str> {
+                match value {
+                    StrictJson::String(text) if !text.contains('\0') && (allow_empty || !text.is_empty()) => Ok(text),
+                    _ => Err($error(subject, field)),
+                }
+            }
+            fn $token<'a>(value: &'a StrictJson, subject: &str, field: &str) -> VResult<&'a str> {
+                let token = $text(value, false, subject, field)?;
+                if token.chars().any(char::is_control) { return Err($error(subject, field)); }
+                Ok(token)
+            }
+            fn $token_field<'a>(object: &'a BTreeMap<String, StrictJson>, field: &str, subject: &str) -> VResult<&'a str> {
+                $token($field_fn(object, field, subject)?, subject, field)
+            }
+            fn $bool_field(object: &BTreeMap<String, StrictJson>, field: &str, subject: &str) -> VResult<bool> {
+                match $field_fn(object, field, subject)? { StrictJson::Bool(value) => Ok(*value), _ => Err($error(subject, field)) }
+            }
+            fn $array<'a>(value: &'a StrictJson, subject: &str, field: &str) -> VResult<&'a [StrictJson]> {
+                match value { StrictJson::Array(values) => Ok(values), _ => Err($error(subject, field)) }
+            }
+            fn $array_field<'a>(object: &'a BTreeMap<String, StrictJson>, field: &str, subject: &str) -> VResult<&'a [StrictJson]> {
+                $array($field_fn(object, field, subject)?, subject, field)
+            }
+        };
     }
+
+    strict_json_accessors!(metadata_error, metadata_object, metadata_exact_fields, metadata_field,
+        metadata_text_value, metadata_token_value, metadata_token_field, metadata_bool_field,
+        metadata_array_value, metadata_array_field, "E_METADATA_JSON_SCHEMA");
 
     fn validate_metadata_value_bounds(
         value: &StrictJson,
@@ -62653,109 +62687,6 @@ activate = 1\n";
             StrictJson::Null | StrictJson::Bool(_) | StrictJson::Number(_) => {}
         }
         Ok(())
-    }
-
-    fn metadata_object<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a BTreeMap<String, StrictJson>> {
-        match value {
-            StrictJson::Object(object) => Ok(object),
-            _ => Err(metadata_error(subject, field)),
-        }
-    }
-
-    fn metadata_exact_fields(
-        object: &BTreeMap<String, StrictJson>,
-        required: &[&str],
-        optional: &[&str],
-        subject: &str,
-    ) -> VResult<()> {
-        if required.iter().any(|field| !object.contains_key(*field))
-            || object.keys().any(|field| {
-                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
-            })
-        {
-            return Err(metadata_error(subject, "exact object fields"));
-        }
-        Ok(())
-    }
-
-    fn metadata_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a StrictJson> {
-        object
-            .get(field)
-            .ok_or_else(|| metadata_error(subject, field))
-    }
-
-    fn metadata_text_value<'a>(
-        value: &'a StrictJson,
-        allow_empty: bool,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a str> {
-        match value {
-            StrictJson::String(text)
-                if !text.contains('\0') && (allow_empty || !text.is_empty()) =>
-            {
-                Ok(text)
-            }
-            _ => Err(metadata_error(subject, field)),
-        }
-    }
-
-    fn metadata_token_value<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a str> {
-        let token = metadata_text_value(value, false, subject, field)?;
-        if token.chars().any(char::is_control) {
-            return Err(metadata_error(subject, field));
-        }
-        Ok(token)
-    }
-
-    fn metadata_token_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a str> {
-        metadata_token_value(metadata_field(object, field, subject)?, subject, field)
-    }
-
-    fn metadata_bool_field(
-        object: &BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<bool> {
-        match metadata_field(object, field, subject)? {
-            StrictJson::Bool(value) => Ok(*value),
-            _ => Err(metadata_error(subject, field)),
-        }
-    }
-
-    fn metadata_array_value<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a [StrictJson]> {
-        match value {
-            StrictJson::Array(values) => Ok(values),
-            _ => Err(metadata_error(subject, field)),
-        }
-    }
-
-    fn metadata_array_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a [StrictJson]> {
-        metadata_array_value(metadata_field(object, field, subject)?, subject, field)
     }
 
     fn metadata_string_array(
@@ -68878,93 +68809,10 @@ activate = 1\n";
         Ok(())
     }
 
-    fn cargo_json_error(subject: &str, field: &str) -> Diagnostic {
-        Diagnostic::error("E_COMPILE_JSON_SCHEMA", subject).at(field)
-    }
-
-    fn cargo_json_object<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a BTreeMap<String, StrictJson>> {
-        match value {
-            StrictJson::Object(object) => Ok(object),
-            _ => Err(cargo_json_error(subject, field)),
-        }
-    }
-
-    fn cargo_json_exact_fields(
-        object: &BTreeMap<String, StrictJson>,
-        required: &[&str],
-        optional: &[&str],
-        subject: &str,
-    ) -> VResult<()> {
-        if required.iter().any(|field| !object.contains_key(*field))
-            || object.keys().any(|field| {
-                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
-            })
-        {
-            return Err(cargo_json_error(subject, "exact object fields"));
-        }
-        Ok(())
-    }
-
-    fn cargo_json_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a StrictJson> {
-        object
-            .get(field)
-            .ok_or_else(|| cargo_json_error(subject, field))
-    }
-
-    fn cargo_json_text_value<'a>(
-        value: &'a StrictJson,
-        allow_empty: bool,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a str> {
-        match value {
-            StrictJson::String(text)
-                if !text.contains('\0') && (allow_empty || !text.is_empty()) =>
-            {
-                Ok(text)
-            }
-            _ => Err(cargo_json_error(subject, field)),
-        }
-    }
-
-    fn cargo_json_token_value<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a str> {
-        let token = cargo_json_text_value(value, false, subject, field)?;
-        if token.chars().any(char::is_control) {
-            return Err(cargo_json_error(subject, field));
-        }
-        Ok(token)
-    }
-
-    fn cargo_json_token_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a str> {
-        cargo_json_token_value(cargo_json_field(object, field, subject)?, subject, field)
-    }
-
-    fn cargo_json_bool_field(
-        object: &BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<bool> {
-        match cargo_json_field(object, field, subject)? {
-            StrictJson::Bool(value) => Ok(*value),
-            _ => Err(cargo_json_error(subject, field)),
-        }
-    }
+    strict_json_accessors!(cargo_json_error, cargo_json_object, cargo_json_exact_fields,
+        cargo_json_field, cargo_json_text_value, cargo_json_token_value, cargo_json_token_field,
+        cargo_json_bool_field, cargo_json_array_value, cargo_json_array_field,
+        "E_COMPILE_JSON_SCHEMA");
 
     fn cargo_json_unsigned_field(
         object: &BTreeMap<String, StrictJson>,
@@ -68977,25 +68825,6 @@ activate = 1\n";
                 .ok_or_else(|| cargo_json_error(subject, field)),
             _ => Err(cargo_json_error(subject, field)),
         }
-    }
-
-    fn cargo_json_array_value<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a [StrictJson]> {
-        match value {
-            StrictJson::Array(values) => Ok(values),
-            _ => Err(cargo_json_error(subject, field)),
-        }
-    }
-
-    fn cargo_json_array_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a [StrictJson]> {
-        cargo_json_array_value(cargo_json_field(object, field, subject)?, subject, field)
     }
 
     fn cargo_json_token_array(
@@ -72454,71 +72283,9 @@ activate = 1\n";
         }
     }
 
-    fn sdk_json_error(subject: &str, field: &str) -> Diagnostic {
-        Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at(field)
-    }
-
-    fn sdk_json_object<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a BTreeMap<String, StrictJson>> {
-        match value {
-            StrictJson::Object(value) => Ok(value),
-            _ => Err(sdk_json_error(subject, field)),
-        }
-    }
-
-    fn sdk_json_array<'a>(
-        value: &'a StrictJson,
-        subject: &str,
-        field: &str,
-    ) -> VResult<&'a [StrictJson]> {
-        match value {
-            StrictJson::Array(value) => Ok(value),
-            _ => Err(sdk_json_error(subject, field)),
-        }
-    }
-
-    fn sdk_json_exact_fields(
-        object: &BTreeMap<String, StrictJson>,
-        required: &[&str],
-        optional: &[&str],
-        subject: &str,
-    ) -> VResult<()> {
-        if required.iter().any(|field| !object.contains_key(*field))
-            || object.keys().any(|field| {
-                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
-            })
-        {
-            return Err(sdk_json_error(subject, "exact object fields"));
-        }
-        Ok(())
-    }
-
-    fn sdk_json_field<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a StrictJson> {
-        object
-            .get(field)
-            .ok_or_else(|| sdk_json_error(subject, field))
-    }
-
-    fn sdk_json_string<'a>(
-        object: &'a BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a str> {
-        match sdk_json_field(object, field, subject)? {
-            StrictJson::String(value)
-                if !value.is_empty()
-                    && !value.as_bytes().contains(&0)
-                    && !value.chars().any(char::is_control) => Ok(value),
-            _ => Err(sdk_json_error(subject, field)),
-        }
-    }
+    strict_json_accessors!(sdk_json_error, sdk_json_object, sdk_json_exact_fields, sdk_json_field,
+        sdk_json_text_value, sdk_json_token_value, sdk_json_string, sdk_json_bool,
+        sdk_json_array, sdk_json_array_field, "E_SDK_NATIVE_LOCK");
 
     fn sdk_json_u64(
         object: &BTreeMap<String, StrictJson>,
@@ -72529,17 +72296,6 @@ activate = 1\n";
             StrictJson::Number(value) => value
                 .as_u64()
                 .ok_or_else(|| sdk_json_error(subject, field)),
-            _ => Err(sdk_json_error(subject, field)),
-        }
-    }
-
-    fn sdk_json_bool(
-        object: &BTreeMap<String, StrictJson>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<bool> {
-        match sdk_json_field(object, field, subject)? {
-            StrictJson::Bool(value) => Ok(*value),
             _ => Err(sdk_json_error(subject, field)),
         }
     }
@@ -73913,11 +73669,7 @@ activate = 1\n";
         {
             return Err(sdk_json_error(subject, "assets projection header"));
         }
-        let target_values = sdk_json_array(
-            sdk_json_field(assets, "target_packages", subject)?,
-            subject,
-            "target_packages",
-        )?;
+        let target_values = sdk_json_array_field(assets, "target_packages", subject)?;
         let mut targets = Vec::with_capacity(target_values.len());
         for value in target_values {
             let StrictJson::String(value) = value else {
@@ -73937,11 +73689,7 @@ activate = 1\n";
         if targets != expected_targets {
             return Err(sdk_json_error(subject, "target package join"));
         }
-        let library_values = sdk_json_array(
-            sdk_json_field(assets, "libraries", subject)?,
-            subject,
-            "libraries",
-        )?;
+        let library_values = sdk_json_array_field(assets, "libraries", subject)?;
         if library_values.len() != 17 {
             return Err(sdk_json_error(subject, "library count"));
         }
@@ -78644,7 +78392,381 @@ activate = 1\n";
         Ok(())
     }
 
-    fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
+    const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
+        ("Cargo.toml", 7_963, "972dfd2adc52a2fb93dda2c86c2f72a8f0a3cae75e226542edbf833f33210189"),
+        ("Cargo.lock", 90_683, "5dec0d659736b87c4cb93af2c0c6d9960624c10e1d062ebab469ae546a1f3ab3"),
+        ("rust-toolchain.toml", 239, "58ab2dcb0e12130199f0f404141dc333734cbc28c1f163f9f0c7ccd1f2a2a37f"),
+    ];
+    const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 4] = [
+        ("s05", "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml", FileFamily::Toml, 10_446, "e892edd804f93e09ba03bcc9042d0628f5e149c3ee48c24b184af4814eeb3aed"),
+        ("s06", "evidence/fnd-01/probes/asupersync/features-0.3.10.json", FileFamily::Json, 5_062, "df71c73a9e6ef657e612465afbfe907567f94f75bf3687c95fc5a73316fc7943"),
+        ("s07", "evidence/fnd-01/probes/asupersync/features-0.3.9.json", FileFamily::Json, 4_949, "c4479845b01d8ec9ec5a85dd5720e0d6d299971e88d43c509aa54562a4491d41"),
+        ("s35", "evidence/fnd-01/toolchain-asupersync.toml", FileFamily::Toml, 39_211, "5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314"),
+    ];
+
+    fn toolchain_asupersync_document(files: &[LoadedFile]) -> VResult<toml::Value> {
+        parse_source_toml(files, "evidence/fnd-01/toolchain-asupersync.toml")
+    }
+
+    fn toolchain_workspace_inputs(
+        root: &Path,
+        policy: &Policy,
+    ) -> VResult<Vec<Vec<u8>>> {
+        let mut inputs = Vec::with_capacity(TOOLCHAIN_WORKSPACE_INPUTS.len());
+        for (path, byte_length, expected_sha256) in TOOLCHAIN_WORKSPACE_INPUTS {
+            let sha256: [u8; 32] = decode_lower_hex(expected_sha256, path)?
+                .try_into()
+                .map_err(|_| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at("sha256"))?;
+            let (_, bytes) = checked_read(
+                root,
+                path,
+                policy.bounds.max_source_file_bytes,
+                Some(FileBinding { byte_length, sha256 }),
+            )
+            .map_err(|error| {
+                Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at(error.to_string())
+            })?;
+            inputs.push(bytes);
+        }
+        Ok(inputs)
+    }
+
+    fn validate_toolchain_source_family(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
+        const OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.6";
+        const TREE: &str = "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839";
+        let actual = files.iter().filter(|file| file.contract.family == "toolchain").collect::<Vec<_>>();
+        if actual.len() != TOOLCHAIN_SOURCE_INPUTS.len() {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("file count"));
+        }
+        for (file, (id, path, kind, bytes, digest)) in actual.iter().zip(TOOLCHAIN_SOURCE_INPUTS) {
+            let contract = &file.contract;
+            if contract.id != id || contract.path != path || contract.family != "toolchain"
+                || contract.owner_bead != OWNER || contract.parse_kind != kind
+                || contract.observation_kind != ObservationKind::LocalFile
+                || contract.byte_length != bytes || contract.sha256 != digest
+                || !contract.bytes_available || contract.rehash_mode != "exact_local"
+                || contract.claim_ceiling != "local-byte-proof" || !contract.required
+                || !contract.source_tree_member || file.bytes.len() as u64 != bytes
+                || file.digest != sha256(&file.bytes) || lower_hex(&file.digest) != digest
+            {
+                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at(path));
+            }
+        }
+        let (tree, bytes) = source_tree_digest_refs(&actual)?;
+        let families = policy.source_family.iter().filter(|family| family.id == "toolchain").collect::<Vec<_>>();
+        if families.len() != 1 || families[0].owner_bead != OWNER
+            || families[0].file_count != 4 || families[0].total_bytes != 59_668
+            || families[0].tree_sha256 != TREE || bytes != 59_668 || lower_hex(&tree) != TREE
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("family tree"));
+        }
+        Ok(())
+    }
+
+    fn exact_toolchain_document(
+        document: &toml::Value,
+        expected_sha256: &str,
+        subject: &str,
+    ) -> VResult<()> {
+        let mut observation = ObservationEncoder::new(1 << 20, subject)?;
+        observation.extend(b"FASTMCP-FND01-TOOLCHAIN-DOCUMENT-V1\0")?;
+        encode_toml_observation(Some(document), &mut observation)?;
+        if lower_hex(&sha256(&observation.bytes)) != expected_sha256 {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at("typed document"));
+        }
+        Ok(())
+    }
+
+    fn strict_json_string_sequence_is(value: Option<&StrictJson>, expected: &[&str]) -> bool {
+        matches!(value, Some(StrictJson::Array(actual)) if actual.len() == expected.len()
+            && actual.iter().zip(expected).all(|(item, expected)|
+                matches!(item, StrictJson::String(actual) if actual == expected)))
+    }
+
+    fn asupersync_feature_map(
+        files: &[LoadedFile],
+        path: &str,
+        feature_count: u64,
+    ) -> VResult<BTreeMap<String, StrictJson>> {
+        let document = parse_strict_json(&source_lookup(files, path)?.bytes, path)?;
+        let root = strict_json_object(&document, path)?;
+        let provenance = root
+            .get("_provenance")
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at("_provenance"))
+            .and_then(|value| strict_json_object(value, path))?;
+        let features = root
+            .get("features")
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at("features"))
+            .and_then(|value| strict_json_object(value, path))?;
+        let count = match provenance.get("feature_count") {
+            Some(StrictJson::Number(value)) => value.as_u64(),
+            _ => None,
+        };
+        if count != Some(feature_count)
+            || features.len() != usize::try_from(feature_count).unwrap_or(usize::MAX)
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at("feature graph"));
+        }
+        Ok(features.clone())
+    }
+
+    fn toolchain_prerequisites(
+        document: &toml::Value,
+        pointer: &str,
+        result_field: &str,
+        result: &str,
+        subject: &str,
+    ) -> VResult<Vec<String>> {
+        let rows = pointer_get(document, pointer, subject)?
+            .as_array()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(pointer))?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let table = row
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(pointer))?;
+            let id = table.get("id").and_then(toml::Value::as_str).ok_or_else(|| {
+                Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(format!("{pointer}/id"))
+            })?;
+            if table.get("status").and_then(toml::Value::as_str) != Some("unresolved")
+                || table.get(result_field).and_then(toml::Value::as_str) != Some(result)
+            {
+                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(id));
+            }
+            ids.push(id.to_owned());
+        }
+        Ok(ids)
+    }
+
+    fn validate_toolchain_asupersync_contract(
+        root: &Path,
+        files: &[LoadedFile],
+        policy: &Policy,
+        document: &toml::Value,
+    ) -> VResult<(String, String, Vec<String>)> {
+        const SUBJECT: &str = "toolchain/asupersync contract";
+        const BASELINE_SHA: &str =
+            "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe";
+        const CANDIDATE_SHA: &str =
+            "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7";
+        if pointer_get(
+            document,
+            "/asupersync/candidate/disposition/accepted_as_release_pin",
+            SUBJECT,
+        )?
+        .as_bool()
+            != Some(false)
+        {
+            return Err(Diagnostic::error(
+                "E_REJECTED_CANDIDATE_PROMOTION",
+                "asupersync 0.3.10",
+            )
+            .at("accepted_as_release_pin"));
+        }
+        if *document != toolchain_asupersync_document(files)? {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("document"));
+        }
+        validate_toolchain_source_family(files, policy)?;
+        let candidate = parse_source_toml(
+            files,
+            "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml",
+        )?;
+        if pointer_get(&candidate, "/archive/sha256", SUBJECT)?.as_str() != Some(CANDIDATE_SHA)
+            || pointer_get(&candidate, "/archive/registry_checksum", SUBJECT)?.as_str() != Some(CANDIDATE_SHA)
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("candidate checksum"));
+        }
+        exact_toolchain_document(
+            document,
+            "01acf6f2aecacb54f07a549a2dc130d18490c816c3d0a4e240a55769659dcf19",
+            SUBJECT,
+        )?;
+        exact_toolchain_document(
+            &candidate,
+            "a0bea322e26104f0551c3d96b380579429725495851da7f70f127263fd86a471",
+            SUBJECT,
+        )?;
+
+        let baseline = asupersync_feature_map(
+            files,
+            "evidence/fnd-01/probes/asupersync/features-0.3.9.json",
+            56,
+        )?;
+        let candidate_features = asupersync_feature_map(
+            files,
+            "evidence/fnd-01/probes/asupersync/features-0.3.10.json",
+            57,
+        )?;
+        let added = candidate_features
+            .keys()
+            .filter(|key| !baseline.contains_key(*key))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let changed = baseline
+            .iter()
+            .filter(|(key, value)| candidate_features.get(*key) != Some(*value))
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        if added != ["dependency-ledger"]
+            || changed != ["metrics", "test-internals"]
+            || !strict_json_string_sequence_is(candidate_features.get("dependency-ledger"), &["dep:toml"])
+            || !strict_json_string_sequence_is(candidate_features.get("metrics"), &["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:regex", "dep:retained-regex-syntax"])
+            || !strict_json_string_sequence_is(candidate_features.get("test-internals"), &["dep:tracing", "dep:tracing-log", "dep:tracing-subscriber", "dep:visibility"])
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("feature delta"));
+        }
+
+        let expected_prerequisites = ["FND-04-P1", "FND-04-P2", "FND-04-P3"];
+        let prerequisites = toolchain_prerequisites(
+            document,
+            "/asupersync/candidate/fnd_04_prerequisites",
+            "disposition",
+            "fails candidate qualification",
+            SUBJECT,
+        )?;
+        let fixture_prerequisites = toolchain_prerequisites(
+            &candidate,
+            "/prerequisites",
+            "candidate_result",
+            "fail",
+            SUBJECT,
+        )?;
+        if !string_sequence_is(&prerequisites, &expected_prerequisites)
+            || prerequisites != fixture_prerequisites
+            || pointer_get(document, "/asupersync/candidate/disposition/all_fnd_04_prerequisites_satisfied", SUBJECT)?.as_bool() != Some(false)
+            || pointer_get(&candidate, "/disposition/prerequisites_total", SUBJECT)?.as_integer() != Some(3)
+            || pointer_get(&candidate, "/disposition/prerequisites_satisfied", SUBJECT)?.as_integer() != Some(0)
+            || pointer_get(&candidate, "/disposition/prerequisites_unresolved", SUBJECT)?.as_integer() != Some(3)
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("FND-04 prerequisites"));
+        }
+
+        let workspace = toolchain_workspace_inputs(root, policy)?;
+        let manifest_text = std::str::from_utf8(&workspace[0])
+            .map_err(|_| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "Cargo.toml"))?;
+        let manifest = parse_toml_document(manifest_text, "Cargo.toml")?;
+        let dependency = pointer_get(&manifest, "/workspace/dependencies/asupersync", "Cargo.toml")?
+            .as_table()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "Cargo.toml"))?;
+        if dependency.len() != 2
+            || dependency.get("version").and_then(toml::Value::as_str) != Some("=0.3.9")
+            || !string_sequence_is(
+                &string_array(&manifest, "/workspace/dependencies/asupersync/features", "Cargo.toml")?,
+                &["test-internals"],
+            )
+            || !is_exact_rust_toolchain_document(&workspace[2])
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("workspace selection"));
+        }
+        let lock = parse_cargo_lock_strict(&workspace[1], &policy.bounds, "Cargo.lock")?;
+        let packages = registry_packages_from_lock(
+            &lock,
+            &policy.bounds,
+            &workspace_lock_local_packages(),
+            "Cargo.lock",
+        )?;
+        let selected = packages
+            .iter()
+            .filter(|package| package.name == "asupersync")
+            .collect::<Vec<_>>();
+        if selected.len() != 1
+            || selected[0].version != "0.3.9"
+            || selected[0].checksum != BASELINE_SHA
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release selection"));
+        }
+        let baseline_version = pointer_get(document, "/asupersync/baseline/version", SUBJECT)?
+            .as_str().ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("baseline version"))?;
+        let candidate_classification = pointer_get(&candidate, "/disposition/candidate_use", SUBJECT)?
+            .as_str().ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("candidate use"))?;
+        Ok((baseline_version.to_owned(), candidate_classification.to_owned(), prerequisites))
+    }
+
+    const MEDIA_INPUT_PATHS: &[&str] = &[
+        "evidence/fnd-01/media-dependencies.toml",
+        "evidence/fnd-01/vectors/media/graph-snapshot.toml",
+        "evidence/fnd-01/vectors/media/jpeg-metadata-valid-upstream.jpg",
+        "evidence/fnd-01/vectors/media/png-valid-upstream.png",
+        "evidence/fnd-01/vectors/media/security-vectors.toml",
+        "evidence/fnd-01/vectors/media/tiny-skia-0.12.0.crate",
+        "evidence/fnd-01/vectors/media/tiny-skia-path-0.12.0.crate",
+        "evidence/fnd-01/vectors/media/usvg-0.47.0.crate",
+        "evidence/fnd-01/vectors/media/webp-animated-upstream.webp",
+        "evidence/fnd-01/vectors/media/webp-static-valid-upstream.webp",
+    ];
+
+    #[derive(Clone)]
+    struct MediaDependencyBundle { files: Vec<LoadedFile>, security: toml::Value }
+
+    fn media_dependency_bundle(files: &[LoadedFile]) -> VResult<MediaDependencyBundle> {
+        let files = MEDIA_INPUT_PATHS.iter().map(|path| source_lookup(files, path).cloned()).collect::<VResult<Vec<_>>>()?;
+        let security = parse_source_toml(&files, MEDIA_INPUT_PATHS[4])?;
+        Ok(MediaDependencyBundle { files, security })
+    }
+
+    fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, corpus: &[LoadedFile], policy: &Policy) -> VResult<(String, usize, usize)> {
+        const SUBJECT: &str = "media-svg-external-resource-policy-drift";
+        const TARGET: &str = "/case/id=svg-external-use/expected";
+        if bundle.files.len() != MEDIA_INPUT_PATHS.len()
+            || bundle.files.iter().zip(MEDIA_INPUT_PATHS).any(|(file, path)| file.contract.path != *path)
+        {
+            return Err(Diagnostic::error("E_MEDIA_INPUT_SET", "media dependency bundle"));
+        }
+        if pointer_get(&bundle.security, TARGET, SUBJECT)?.as_str() != Some("reject_before_renderer_entry") {
+            return Err(Diagnostic::error("E_MEDIA_SVG_EXTERNAL_RESOURCE", SUBJECT).at("case[id=svg-external-use].expected"));
+        }
+        validate_negative_inventory(corpus, policy)?;
+        validate_mutation_dispatch(corpus, policy)?;
+        if bundle.security != parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[4])? {
+            return Err(Diagnostic::error("E_MEDIA_DOCUMENT", MEDIA_INPUT_PATHS[4]));
+        }
+        for file in &bundle.files {
+            let bytes = u64::try_from(file.bytes.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?;
+            if file.contract.family != "media" || file.contract.owner_bead != "bd-mcp-2026-07-28-support-ahet.1.12"
+                || bytes != file.contract.byte_length || sha256(&file.bytes) != file.digest
+                || lower_hex(&file.digest) != file.contract.sha256
+            {
+                return Err(Diagnostic::error("E_MEDIA_INPUT_BINDING", &file.contract.path));
+            }
+        }
+        let manifest = parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[0])?;
+        let declared = string_array(&manifest, "/phase_a_validation_contract/input_paths_ascending_raw_bytes", "media input paths")?;
+        if !string_sequence_is(&declared, MEDIA_INPUT_PATHS)
+            || pointer_get(&manifest, "/root_crate_count", "media manifest")?.as_integer() != Some(3)
+            || pointer_get(&manifest, "/substitution_negative_count", "media manifest")?.as_integer() != Some(34)
+            || pointer_get(&manifest, "/toolchain/target_authority_byte_length", "media toolchain")?.as_integer() != Some(39_211)
+            || pointer_get(&manifest, "/toolchain/target_authority_sha256", "media toolchain")?.as_str() != Some("5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314")
+        {
+            return Err(Diagnostic::error("E_MEDIA_MANIFEST", "media dependency bundle"));
+        }
+        let graph = parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[1])?;
+        let cases = pointer_get(&bundle.security, "/case", "media security cases")?.as_array()
+            .ok_or_else(|| Diagnostic::error("E_TOML_SCHEMA", "media security cases"))?;
+        if pointer_get(&graph, "/profile_count", "media graph")?.as_integer() != Some(3)
+            || pointer_get(&graph, "/target_count", "media graph")?.as_integer() != Some(5)
+            || pointer_get(&graph, "/authority/canonical_fastmcp_resolution", "media graph")?.as_bool() != Some(false)
+            || cases.len() != 48 || pointer_get(&bundle.security, "/case_count", "media security cases")?.as_integer() != Some(48)
+            || pointer_get(&bundle.security, "/runtime_results_claimed", "media security cases")?.as_bool() != Some(false)
+        {
+            return Err(Diagnostic::error("E_MEDIA_DECLARED_SURFACE", "media dependency bundle"));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"FND01MEDIAINPUTSv1\0");
+        for file in &bundle.files {
+            let path = file.contract.path.as_bytes();
+            digest.update(u32::try_from(path.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
+            digest.update(path);
+            digest.update(u64::try_from(file.bytes.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
+            digest.update(&file.bytes);
+        }
+        Ok((lower_hex(&digest.finalize()), 3, cases.len()))
+    }
+
+    fn validate_supplemental_contracts(
+        root: &Path,
+        files: &[LoadedFile],
+        policy: &Policy,
+    ) -> VResult<()> {
         let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
         validate_core_conformance_sources(&core, files)?;
 
@@ -78861,74 +78983,13 @@ activate = 1\n";
             ));
         }
 
-        let media =
-            parse_source_toml(files, "evidence/fnd-01/vectors/media/security-vectors.toml")?;
-        let media_cases = pointer_get(&media, "/case", "media security cases")?
-            .as_array()
-            .ok_or_else(|| Diagnostic::error("E_TOML_SCHEMA", "media security cases"))?;
-        let media_rejections = media_cases
-            .iter()
-            .filter(|case| {
-                case.as_table()
-                    .and_then(|table| table.get("expected"))
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|expected| expected.starts_with("reject_"))
-            })
-            .count();
-        if media_cases.len() != 48
-            || media_rejections != 36
-            || pointer_get(&media, "/case_count", "media security cases")?.as_integer() != Some(48)
-            || pointer_get(&media, "/runtime_results_claimed", "media security cases")?.as_bool()
-                != Some(false)
-            || pointer_get(
-                &media,
-                "/runtime_boundary/required_renderer_entry_count_for_every_rejection",
-                "media security cases",
-            )?
-            .as_integer()
-                != Some(0)
-        {
-            return Err(Diagnostic::error(
-                "E_QUARANTINE_MEDIA",
-                "security vector contract",
-            ));
-        }
+        validate_media_dependency_bundle(&media_dependency_bundle(files)?, files, policy)?;
 
         let auth = parse_source_toml(files, "evidence/fnd-01/auth-standards.toml")?;
         validate_auth_sources(&auth)?;
         validate_serialization_uri_dependency_contract(files)?;
-        let media_graph =
-            parse_source_toml(files, "evidence/fnd-01/vectors/media/graph-snapshot.toml")?;
-        if pointer_get(&media_graph, "/resolver", "media resolver")?.as_str() != Some("2")
-            || pointer_get(
-                &media_graph,
-                "/authority/canonical_fastmcp_resolution",
-                "media resolver",
-            )?
-            .as_bool()
-                != Some(false)
-        {
-            return Err(Diagnostic::error("E_RESOLVER_CANDIDATE", "media graph"));
-        }
-        let candidate = parse_source_toml(
-            files,
-            "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml",
-        )?;
-        if pointer_get(&candidate, "/verdict", "asupersync candidate")?.as_str()
-            != Some("rejected_as_release_pin")
-            || pointer_get(
-                &candidate,
-                "/disposition/prerequisites_unresolved",
-                "asupersync candidate",
-            )?
-            .as_integer()
-                != Some(3)
-        {
-            return Err(Diagnostic::error(
-                "E_REJECTED_CANDIDATE_PROMOTION",
-                "asupersync 0.3.10",
-            ));
-        }
+        let toolchain = toolchain_asupersync_document(files)?;
+        validate_toolchain_asupersync_contract(root, files, policy, &toolchain)?;
         Ok(())
     }
 
@@ -79152,7 +79213,7 @@ activate = 1\n";
         let source_tree = validate_source_tree(&files, &policy)?;
         validate_negative_inventory(&files, &policy)?;
         validate_mutation_dispatch(&files, &policy)?;
-        validate_supplemental_contracts(&files, &policy)?;
+        validate_supplemental_contracts(root, &files, &policy)?;
         let mut report = Report::default();
         verify_outputs(
             root,
@@ -79721,11 +79782,22 @@ activate = 1\n";
         assert_eq!(error.code, expected_code);
     }
 
+    trait Verified<T> {
+        fn verified(self) -> T;
+    }
+
+    impl<T> Verified<T> for VResult<T> {
+        #[track_caller]
+        fn verified(self) -> T {
+            self.unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+        }
+    }
+
     #[test]
     fn fnd_01_workspace_gate_digest_binds_both_retained_streams() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let stdout = b"formatted\n";
         let stderr = b"warning-free\n";
         let mut expanded = Vec::new();
@@ -79787,7 +79859,7 @@ activate = 1\n";
             &policy,
             "synthetic workspace gate",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
 
         let mut canonical = Vec::new();
         canonical.extend_from_slice(b"FND01WORKSPACEGATEv1\0");
@@ -79825,7 +79897,7 @@ activate = 1\n";
             &policy,
             "synthetic changed workspace gate",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_ne!(digest, changed);
     }
 
@@ -79888,7 +79960,7 @@ activate = 1\n";
             "          test -f binary\n",
         );
         parse_restricted_workflow_yaml(valid, "synthetic workflow")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         assert_eq!(
             parse_restricted_workflow_yaml(
                 "jobs:\n  build:\n    steps: []\n    steps: []\n",
@@ -79971,7 +80043,7 @@ activate = 1\n";
             "      - run: echo ok\n",
         );
         parse_restricted_workflow_yaml(quoted_on, "quoted on workflow")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
 
         let invalid_workflows = [
             (
@@ -80079,7 +80151,7 @@ activate = 1\n";
         for _ in 0..MAX_RESTRICTED_YAML_NODES {
             budget
                 .note_node(0, "node budget")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         }
         assert_eq!(
             budget
@@ -80103,7 +80175,7 @@ activate = 1\n";
             ),
         ] {
             parse_restricted_workflow_yaml(workflow, subject)
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         }
     }
 
@@ -80151,7 +80223,7 @@ activate = 1\n";
 
         for (reference, _, _) in WORKFLOW_ACTION_IDENTITIES {
             validate_workflow_action_reference(reference, "valid action")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         }
         let invalid_actions = [
             "actions/checkout@v4",
@@ -80180,10 +80252,10 @@ activate = 1\n";
             &format!("jobs:\n  build:\n    steps:\n      - \"uses\": {ACTION_CHECKOUT}\n"),
             "quoted uses workflow",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let mut references = Vec::new();
         collect_workflow_action_references(&quoted, "quoted uses workflow", &mut references)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         assert_eq!(references, [ACTION_CHECKOUT]);
 
         assert_eq!(
@@ -80225,7 +80297,7 @@ activate = 1\n";
                         .map(|diagnostic| diagnostic.code.clone()),
                     "pending gates",
                 )
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
             }
             Err(diagnostic) => {
                 panic!("FND-01 verifier failed: {}", diagnostic.stable());
@@ -80243,18 +80315,16 @@ activate = 1\n";
                 .map(|spec| format!("{}/{}", spec.family, spec.id)),
             "static negative registry",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
 
-        let outputs =
-            expected_receipt_paths().unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let outputs = expected_receipt_paths().verified();
         assert_eq!(outputs.len(), EXPECTED_RECEIPTS);
         assert_eq!(TOML_OUTPUT_IDS.len(), EXPECTED_RECEIPT_TOMLS);
         assert_eq!(BINARY_OUTPUT_IDS.len(), EXPECTED_RECEIPT_BINARIES);
         validate_case_unique(outputs, "static receipt matrix")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
 
-        let matrix = expected_derived_outputs()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let matrix = expected_derived_outputs().verified();
         assert_eq!(matrix.len(), EXPECTED_RECEIPTS);
         assert_eq!(
             matrix
@@ -80275,7 +80345,7 @@ activate = 1\n";
             .collect::<BTreeSet<_>>();
         assert_eq!(
             matrix_paths,
-            expected_receipt_paths().unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+            expected_receipt_paths().verified()
         );
     }
 
@@ -80292,7 +80362,7 @@ activate = 1\n";
                 number_text.as_bytes(),
                 "arbitrary-precision integer self-test",
             )
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
             let StrictJson::Number(number) = parsed else {
                 panic!("large JSON integer was not classified as a number");
             };
@@ -80303,8 +80373,7 @@ activate = 1\n";
             );
         }
 
-        let negative_zero = parse_strict_json(b"-0", "negative-zero self-test")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let negative_zero = parse_strict_json(b"-0", "negative-zero self-test").verified();
         let StrictJson::Number(negative_zero) = negative_zero else {
             panic!("negative zero was not classified as a number");
         };
@@ -80399,7 +80468,7 @@ activate = 1\n";
             ("beta-2.0.0.crate", &beta),
         ]);
         let framing = parse_ordinary_supply_framing(&valid, "ordinary supply self-test")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         assert_eq!(
             framing
                 .archives
@@ -80409,7 +80478,7 @@ activate = 1\n";
             ["alpha-1.2.3", "beta-2.0.0"],
         );
         validate_ordinary_supply_archives(&valid, &framing)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
 
         let lock_length_offset = b"FND01SUPPLYv4\0".len();
         let lock_length = usize::try_from(u64::from_be_bytes(
@@ -80449,7 +80518,7 @@ activate = 1\n";
         ]);
         let multi_version_framing =
             parse_ordinary_supply_framing(&multi_version, "multi-version ordinary supply")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         assert_eq!(
             multi_version_framing
                 .entries
@@ -80480,7 +80549,7 @@ activate = 1\n";
             multi_version_framing.closure_rows[1].derived_index_sha256,
         );
         validate_ordinary_supply_archives(&multi_version, &multi_version_framing)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
 
         let reversed = test_ordinary_supply_bundle(&[
             ("beta-2.0.0.crate", &beta),
@@ -80523,7 +80592,7 @@ activate = 1\n";
         let archive = test_gzip(&test_tar(&[("sample-1.2.3/src/lib.rs", b"sample", 0)]));
         let valid = test_ordinary_supply_bundle(&[("sample-1.2.3.crate", &archive)]);
         let framing = parse_ordinary_supply_framing(&valid, "supply-v4 header")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         assert_eq!(framing.sparse_config_path, ACQUISITION_SPARSE_CONFIG_PATH,);
         assert!(framing.acquisition_root_entry_count > 0);
         assert!(framing.acquisition_root_total_regular_file_bytes > 0);
@@ -80600,9 +80669,8 @@ activate = 1\n";
     fn fnd_01_final_attestation_is_not_a_receipt_or_source_tree_member() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let outputs = validate_receipt_matrix(&policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
+        let outputs = validate_receipt_matrix(&policy).verified();
         assert!(!outputs.contains("final-attestation.toml"));
         assert!(!policy
             .source_input
@@ -80911,9 +80979,8 @@ activate = 1\n";
     fn fnd_01_command_id_expansion_is_exact_and_canonical() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let ids = expected_command_ids(&policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
+        let ids = expected_command_ids(&policy).verified();
         assert_eq!(ids.len(), 206);
         assert_eq!(ids.first().map(String::as_str), Some("bootstrap.resolve"));
         assert_eq!(ids.get(1).map(String::as_str), Some("bootstrap.fetch"));
@@ -80971,13 +81038,13 @@ activate = 1\n";
     fn fnd_01_cargo_lock_semver_and_graph_rules_fail_closed() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         for version in [
             "1.2.3-alpha-beta.1+build-meta.7",
             "18446744073709551615.0.0",
         ] {
             validate_semver_text(version, &policy.bounds, "valid SemVer")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         }
         for version in ["18446744073709551616.0.0", "1.2.3-01", "1.2.3+"] {
             assert_eq!(
@@ -81138,14 +81205,14 @@ version = "0.0.0"
             fs::read(root.join("Cargo.lock")).expect("current Cargo.lock must be readable");
         let current_lock =
             parse_cargo_lock_strict(&current_lock_bytes, &policy.bounds, "current Cargo.lock")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         assert!(!registry_packages_from_lock(
             &current_lock,
             &policy.bounds,
             &workspace_lock_local_packages(),
             "current Cargo.lock",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+        .verified()
         .is_empty());
     }
 
@@ -81153,7 +81220,7 @@ version = "0.0.0"
     fn fnd_01_supply_package_sets_bind_full_rows_and_external_triples() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let source = r#"
 bootstrap_package_count = 1
 bootstrap_package_set_sha256 = ""
@@ -81200,12 +81267,12 @@ dependency_kinds = ["build", "normal"]
                     .expect("synthetic supply receipt body must be a table");
                 record_set_sha256(
                     record_array(table, rows_field, "synthetic supply receipt")
-                        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
+                        .verified(),
                     "supply-package",
                     &policy,
                     "synthetic supply receipt",
                 )
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+                .verified()
             };
             value
                 .as_table_mut()
@@ -81217,7 +81284,7 @@ dependency_kinds = ["build", "normal"]
             .expect("synthetic supply receipt body must remain a table");
         let (bootstrap_packages, downstream_packages, control_only_packages) =
             parse_supply_package_sets(body, &policy, "synthetic supply receipt")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         let triple = RegistryPackageTriple {
             name: "demo".to_owned(),
             version: "1.2.3".to_owned(),
@@ -81231,7 +81298,7 @@ dependency_kinds = ["build", "normal"]
             &external,
             &external,
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
 
         let mut mismatched = value.clone();
         let downstream_rows = mismatched
@@ -81252,7 +81319,7 @@ dependency_kinds = ["build", "normal"]
             &policy,
             "synthetic mismatched supply receipt",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         mismatched
             .as_table_mut()
             .expect("synthetic mismatched body must be mutable")
@@ -81292,7 +81359,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_cargo_metadata_parser_binds_canonical_identity_and_directories() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let valid = concat!(
             r#"{"packages":[{"name":"demo","version":"0.1.0","id":"path+file:///tmp/demo#0.1.0","license":null,"license_file":null,"description":null,"source":null,"dependencies":[],"targets":[{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true}],"features":{},"manifest_path":"/tmp/demo/Cargo.toml","metadata":null,"publish":null,"authors":[],"categories":[],"keywords":[],"readme":null,"repository":null,"homepage":null,"documentation":null,"edition":"2024","links":null,"default_run":null,"rust_version":null}],"workspace_members":["path+file:///tmp/demo#0.1.0"],"workspace_default_members":["path+file:///tmp/demo#0.1.0"],"resolve":{"nodes":[{"id":"path+file:///tmp/demo#0.1.0","dependencies":[],"deps":[],"features":[]}],"root":"path+file:///tmp/demo#0.1.0"},"target_directory":"/tmp/fnd01-metadata-target","build_directory":"/tmp/fnd01-metadata-target","version":1,"workspace_root":"/tmp/demo","metadata":null}"#,
             "\n",
@@ -81302,7 +81369,7 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "synthetic Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_eq!(summary.root.as_deref(), Some("path+file:///tmp/demo#0.1.0"));
         assert_eq!(summary.packages.len(), 1);
         assert_eq!(summary.nodes.len(), 1);
@@ -81327,7 +81394,7 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "synthetic Cargo metadata license authority",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let licensed_package = licensed
             .packages
             .get("path+file:///tmp/demo#0.1.0")
@@ -81362,7 +81429,7 @@ dependency_kinds = ["build", "normal"]
             &policy,
             "synthetic Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_eq!(canonical.nodes.len(), 1);
         assert!(canonical.edges.is_empty());
 
@@ -81372,14 +81439,14 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "role-local Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let role_local_canonical = build_canonical_metadata_graph(
             &role_local_summary,
             Path::new("/tmp"),
             &policy,
             "role-local Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_eq!(canonical.sha256, role_local_canonical.sha256);
 
         let changed_features = valid
@@ -81398,14 +81465,14 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "feature-mutated Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let changed_feature_graph = build_canonical_metadata_graph(
             &changed_feature_summary,
             Path::new("/tmp"),
             &policy,
             "feature-mutated Cargo metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_ne!(canonical.sha256, changed_feature_graph.sha256);
 
         let fabricated_id = valid.replace(
@@ -81478,7 +81545,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_projection_source_bytes_are_rebuilt_from_the_closed_blueprint() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let projection = policy
             .projection
             .iter()
@@ -81512,20 +81579,20 @@ dependency_kinds = ["build", "normal"]
             &policy,
             "workspace-baseline resolver 3",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let resolver2 = expected_projection_manifest_utf8(
             projection,
             "2",
             &policy,
             "workspace-baseline resolver 2",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_eq!(resolver3, format!("{expected_prefix}3\"\n"));
         assert_eq!(resolver2, format!("{expected_prefix}2\"\n"));
 
         let probe =
             expected_projection_probe_source_utf8(projection, &policy, "workspace-baseline probe")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         assert_eq!(
             probe,
             concat!(
@@ -81575,13 +81642,13 @@ dependency_kinds = ["build", "normal"]
 
     #[test]
     fn fnd_01_cargo_metadata_node_preserves_cargo_dependency_semantics() {
-        let value = parse_strict_json(
+    let value = parse_strict_json(
         br#"{"id":"root","dependencies":["package-one","package-two"],"deps":[{"name":"shared_extern","pkg":"package-one","dep_kinds":[{"kind":"build","target":"cfg(unix)"},{"kind":null,"target":null},{"kind":"build","target":"cfg(unix)"}]},{"name":"shared_extern","pkg":"package-two","dep_kinds":[{"kind":null,"target":null}]}],"features":[]}"#,
         "synthetic Cargo metadata node",
     )
-    .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+    .verified();
         let node = parse_metadata_node(&value, "synthetic Cargo metadata node")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         assert_eq!(node.dependencies.len(), 2);
         assert_eq!(node.dependencies[0].kinds.len(), 3);
         assert_eq!(
@@ -81597,6 +81664,28 @@ dependency_kinds = ["build", "normal"]
             node.dependencies[0].package_id,
             node.dependencies[1].package_id
         );
+    }
+
+    fn synthetic_toml_table<const N: usize>(fields: [(&str, toml::Value); N]) -> toml::Value {
+        let table = fields.into_iter().map(|(key, value)| (key.to_owned(), value)).collect::<toml::Table>();
+        assert_eq!(table.len(), N, "synthetic TOML fields must be unique");
+        toml::Value::Table(table)
+    }
+
+    fn synthetic_toml_string(value: impl Into<String>) -> toml::Value {
+        toml::Value::String(value.into())
+    }
+
+    fn synthetic_toml_integer(value: u64) -> toml::Value {
+        toml::Value::Integer(i64::try_from(value).expect("synthetic integer fits TOML"))
+    }
+
+    fn synthetic_toml_usize(value: usize) -> toml::Value {
+        synthetic_toml_integer(u64::try_from(value).expect("synthetic usize fits u64"))
+    }
+
+    fn synthetic_toml_optional(value: Option<&str>) -> toml::Value {
+        toml::Value::Array(value.into_iter().map(|value| synthetic_toml_string(value)).collect())
     }
 
     fn synthetic_workspace_binding_values(policy: &Policy, identity_base: u64) -> Vec<toml::Value> {
@@ -81617,43 +81706,19 @@ dependency_kinds = ["build", "normal"]
                 let inode = identity_base
                     .checked_add(byte_length)
                     .expect("synthetic inode does not overflow");
-                let mut row = toml::Table::new();
-                for (field, value) in [
-                    ("path", toml::Value::String(path.to_owned())),
-                    (
-                        "byte_length",
-                        toml::Value::Integer(
-                            i64::try_from(byte_length)
-                                .expect("synthetic byte length fits TOML integer"),
-                        ),
-                    ),
-                    (
-                        "sha256",
-                        toml::Value::String(lower_hex(&sha256(path.as_bytes()))),
-                    ),
-                    (
-                        "device",
-                        toml::Value::Integer(
-                            i64::try_from(identity_base)
-                                .expect("synthetic device fits TOML integer"),
-                        ),
-                    ),
-                    (
-                        "inode",
-                        toml::Value::Integer(
-                            i64::try_from(inode).expect("synthetic inode fits TOML integer"),
-                        ),
-                    ),
-                    ("mode", toml::Value::Integer(0o100_644)),
-                    ("nlink", toml::Value::Integer(1)),
-                    ("mtime_seconds", toml::Value::Integer(1)),
-                    ("mtime_nanoseconds", toml::Value::Integer(2)),
-                    ("ctime_seconds", toml::Value::Integer(3)),
-                    ("ctime_nanoseconds", toml::Value::Integer(4)),
-                ] {
-                    row.insert(field.to_owned(), value);
-                }
-                toml::Value::Table(row)
+                synthetic_toml_table([
+                    ("path", synthetic_toml_string(path)),
+                    ("byte_length", synthetic_toml_integer(byte_length)),
+                    ("sha256", synthetic_toml_string(lower_hex(&sha256(path.as_bytes())))),
+                    ("device", synthetic_toml_integer(identity_base)),
+                    ("inode", synthetic_toml_integer(inode)),
+                    ("mode", synthetic_toml_integer(0o100_644)),
+                    ("nlink", synthetic_toml_integer(1)),
+                    ("mtime_seconds", synthetic_toml_integer(1)),
+                    ("mtime_nanoseconds", synthetic_toml_integer(2)),
+                    ("ctime_seconds", synthetic_toml_integer(3)),
+                    ("ctime_nanoseconds", synthetic_toml_integer(4)),
+                ])
             })
             .collect()
     }
@@ -81665,10 +81730,10 @@ dependency_kinds = ["build", "normal"]
         file_values: &[toml::Value],
     ) -> Vec<toml::Value> {
         let files = parse_workspace_binding_rows(file_values, policy, "synthetic staging", "file")
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            .verified();
         let (total_bytes, snapshot_sha256) =
             workspace_binding_summary(&files, policy, "synthetic staging")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         let snapshot_format = record_string(
             policy_unmodeled_table(policy, "workspace_snapshot")
                 .expect("workspace snapshot policy must exist"),
@@ -81678,7 +81743,7 @@ dependency_kinds = ["build", "normal"]
         .expect("workspace snapshot format must be a string");
         let (ancestor_directory_count, probe_paths) =
             expected_staging_vcs_probe_registry(root_path, policy, "synthetic staging")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         let probe_values = probe_paths
             .iter()
             .enumerate()
@@ -81711,43 +81776,18 @@ dependency_kinds = ["build", "normal"]
                 } else {
                     format!("{directory_path}/.git")
                 };
-                let mut probe = toml::Table::new();
-                for (field, value) in [
-                    (
-                        "directory_path",
-                        toml::Value::String(directory_path.clone()),
-                    ),
-                    (
-                        "directory_device",
-                        toml::Value::Integer(
-                            i64::try_from(directory_device)
-                                .expect("synthetic probe device fits TOML integer"),
-                        ),
-                    ),
-                    (
-                        "directory_inode",
-                        toml::Value::Integer(
-                            i64::try_from(directory_inode)
-                                .expect("synthetic probe inode fits TOML integer"),
-                        ),
-                    ),
-                    ("directory_mode", toml::Value::Integer(0o040_755)),
-                    ("directory_nlink", toml::Value::Integer(2)),
-                    ("marker_name", toml::Value::String(".git".to_owned())),
-                    ("candidate_path", toml::Value::String(candidate_path)),
-                    (
-                        "probe_method",
-                        toml::Value::String("std::fs::symlink_metadata".to_owned()),
-                    ),
-                    (
-                        "probe_result",
-                        toml::Value::String("absent-not-found".to_owned()),
-                    ),
-                    ("evidence_verdict", toml::Value::String("Pass".to_owned())),
-                ] {
-                    probe.insert(field.to_owned(), value);
-                }
-                toml::Value::Table(probe)
+                synthetic_toml_table([
+                    ("directory_path", synthetic_toml_string(directory_path.clone())),
+                    ("directory_device", synthetic_toml_integer(directory_device)),
+                    ("directory_inode", synthetic_toml_integer(directory_inode)),
+                    ("directory_mode", synthetic_toml_integer(0o040_755)),
+                    ("directory_nlink", synthetic_toml_integer(2)),
+                    ("marker_name", synthetic_toml_string(".git")),
+                    ("candidate_path", synthetic_toml_string(candidate_path)),
+                    ("probe_method", synthetic_toml_string("std::fs::symlink_metadata")),
+                    ("probe_result", synthetic_toml_string("absent-not-found")),
+                    ("evidence_verdict", synthetic_toml_string("Pass")),
+                ])
             })
             .collect::<Vec<_>>();
         let anchors = [
@@ -81763,108 +81803,113 @@ dependency_kinds = ["build", "normal"]
         anchors
             .into_iter()
             .map(|(phase, previous, next)| {
-                let mut root = toml::Table::new();
-                root.insert("path".to_owned(), toml::Value::String(root_path.to_owned()));
-                root.insert(
-                    "device".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(root_identity)
-                            .expect("synthetic root device fits TOML integer"),
-                    ),
-                );
-                root.insert(
-                    "inode".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(
-                            root_identity
-                                .checked_add(1)
-                                .expect("synthetic root inode does not overflow"),
-                        )
-                        .expect("synthetic root inode fits TOML integer"),
-                    ),
-                );
-                root.insert("mode".to_owned(), toml::Value::Integer(0o040_755));
-                root.insert("nlink".to_owned(), toml::Value::Integer(2));
-
-                let mut snapshot = toml::Table::new();
-                snapshot.insert(
-                    "format".to_owned(),
-                    toml::Value::String(snapshot_format.to_owned()),
-                );
-                snapshot.insert(
-                    "file_count".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(files.len()).expect("synthetic file count fits TOML integer"),
-                    ),
-                );
-                snapshot.insert(
-                    "total_bytes".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(total_bytes).expect("synthetic total bytes fit TOML integer"),
-                    ),
-                );
-                snapshot.insert(
-                    "sha256".to_owned(),
-                    toml::Value::String(snapshot_sha256.clone()),
-                );
-
-                let optional_string = |value: Option<&str>| {
-                    toml::Value::Array(
-                        value
-                            .map(|value| vec![toml::Value::String(value.to_owned())])
-                            .unwrap_or_default(),
-                    )
-                };
-                let mut observation = toml::Table::new();
-                observation.insert("phase".to_owned(), toml::Value::String(phase.to_owned()));
-                observation.insert("previous_command_id".to_owned(), optional_string(previous));
-                observation.insert("next_command_id".to_owned(), optional_string(next));
-                observation.insert("root".to_owned(), toml::Value::Table(root));
-                observation.insert("snapshot".to_owned(), toml::Value::Table(snapshot));
-                observation.insert(
-                    "file_count".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(file_values.len())
-                            .expect("synthetic file count fits TOML integer"),
-                    ),
-                );
-                observation.insert("file".to_owned(), toml::Value::Array(file_values.to_vec()));
-                observation.insert(
-                    "ancestor_directory_count".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(ancestor_directory_count)
-                            .expect("synthetic ancestor count fits TOML integer"),
-                    ),
-                );
-                observation.insert(
-                    "vcs_probe_count".to_owned(),
-                    toml::Value::Integer(
-                        i64::try_from(probe_values.len())
-                            .expect("synthetic probe count fits TOML integer"),
-                    ),
-                );
-                observation.insert(
-                    "vcs_probe".to_owned(),
-                    toml::Value::Array(probe_values.clone()),
-                );
-                observation.insert(
-                    "present_vcs_marker_count".to_owned(),
-                    toml::Value::Integer(0),
-                );
-                observation.insert(
-                    "evidence_verdict".to_owned(),
-                    toml::Value::String("Pass".to_owned()),
-                );
-                toml::Value::Table(observation)
+                let root = synthetic_toml_table([
+                    ("path", synthetic_toml_string(root_path)),
+                    ("device", synthetic_toml_integer(root_identity)),
+                    ("inode", synthetic_toml_integer(root_identity.checked_add(1).expect("synthetic root inode does not overflow"))),
+                    ("mode", synthetic_toml_integer(0o040_755)),
+                    ("nlink", synthetic_toml_integer(2)),
+                ]);
+                let snapshot = synthetic_toml_table([
+                    ("format", synthetic_toml_string(snapshot_format)),
+                    ("file_count", synthetic_toml_usize(files.len())),
+                    ("total_bytes", synthetic_toml_integer(total_bytes)),
+                    ("sha256", synthetic_toml_string(snapshot_sha256.clone())),
+                ]);
+                synthetic_toml_table([
+                    ("phase", synthetic_toml_string(phase)),
+                    ("previous_command_id", synthetic_toml_optional(previous)),
+                    ("next_command_id", synthetic_toml_optional(next)),
+                    ("root", root),
+                    ("snapshot", snapshot),
+                    ("file_count", synthetic_toml_usize(file_values.len())),
+                    ("file", toml::Value::Array(file_values.to_vec())),
+                    ("ancestor_directory_count", synthetic_toml_usize(ancestor_directory_count)),
+                    ("vcs_probe_count", synthetic_toml_usize(probe_values.len())),
+                    ("vcs_probe", toml::Value::Array(probe_values.clone())),
+                    ("present_vcs_marker_count", synthetic_toml_integer(0)),
+                    ("evidence_verdict", synthetic_toml_string("Pass")),
+                ])
             })
             .collect()
+    }
+
+    fn synthetic_staging_observation_mut(values: &mut [toml::Value]) -> &mut toml::Table {
+        values[0].as_table_mut().expect("synthetic staging observation must be mutable")
+    }
+
+    fn synthetic_staging_array_mut<'a>(
+        values: &'a mut [toml::Value],
+        field: &str,
+    ) -> &'a mut Vec<toml::Value> {
+        synthetic_staging_observation_mut(values).get_mut(field).and_then(toml::Value::as_array_mut)
+            .expect("synthetic staging field must be a mutable array")
+    }
+
+    fn synthetic_staging_first_table_mut<'a>(
+        values: &'a mut [toml::Value],
+        field: &str,
+    ) -> &'a mut toml::Table {
+        synthetic_staging_array_mut(values, field).first_mut().and_then(toml::Value::as_table_mut)
+            .expect("synthetic staging array must contain a table")
+    }
+
+    fn mutate_staging_file_sha256(values: &mut [toml::Value]) {
+        synthetic_staging_first_table_mut(values, "file")
+            .insert("sha256".to_owned(), synthetic_toml_string("ff".repeat(32)));
+    }
+
+    fn mutate_staging_probe_inode(values: &mut [toml::Value]) {
+        synthetic_staging_first_table_mut(values, "vcs_probe")
+            .insert("directory_inode".to_owned(), synthetic_toml_integer(999_999));
+    }
+
+    fn mutate_staging_remove_posix_root_probe(values: &mut [toml::Value]) {
+        let remaining = {
+            let probes = synthetic_staging_array_mut(values, "vcs_probe");
+            let root = probes.iter().position(|probe| probe.as_table()
+                .and_then(|table| table.get("directory_path")).and_then(toml::Value::as_str) == Some("/"))
+                .expect("synthetic probes must include POSIX root");
+            probes.remove(root);
+            probes.len()
+        };
+        synthetic_staging_observation_mut(values)
+            .insert("vcs_probe_count".to_owned(), synthetic_toml_usize(remaining));
+    }
+
+    fn mutate_staging_reorder_probes(values: &mut [toml::Value]) {
+        synthetic_staging_array_mut(values, "vcs_probe").swap(0, 1);
+    }
+
+    fn mutate_staging_probe_method(values: &mut [toml::Value]) {
+        synthetic_staging_first_table_mut(values, "vcs_probe").insert(
+            "probe_method".to_owned(),
+            synthetic_toml_string("std::path::Path::exists"),
+        );
+    }
+
+    fn mutate_staging_present_marker(values: &mut [toml::Value]) {
+        synthetic_staging_observation_mut(values)
+            .insert("present_vcs_marker_count".to_owned(), synthetic_toml_integer(1));
+    }
+
+    #[derive(Clone, Copy)]
+    enum StagingFailureStage { Parse, Join }
+
+    struct StagingFixturePlant {
+        mutate: fn(&mut [toml::Value]),
+        subject: &'static str,
+        reason: &'static str,
+        code: &'static str,
+        stage: StagingFailureStage,
+        digest_changes: bool,
     }
 
     #[test]
     fn fnd_01_staging_snapshots_bind_every_file_and_role_local_identity() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let source_values = synthetic_workspace_binding_values(&policy, 1);
         let source_bindings = parse_workspace_binding_rows(
             &source_values,
@@ -81872,10 +81917,10 @@ dependency_kinds = ["build", "normal"]
             "synthetic source",
             "workspace_binding",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let (total_bytes, snapshot_sha256) =
             workspace_binding_summary(&source_bindings, &policy, "synthetic source")
-                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+                .verified();
         let expected_snapshot = ParsedWorkspaceSnapshotSummary {
             format: "FND01WORKv1".to_owned(),
             file_count: source_bindings.len(),
@@ -81896,7 +81941,7 @@ dependency_kinds = ["build", "normal"]
             "synthetic producer",
             "staging_snapshot",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         validate_staging_snapshot_joins(
             &producer,
             &expected_snapshot,
@@ -81905,7 +81950,7 @@ dependency_kinds = ["build", "normal"]
             &policy,
             "synthetic producer",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
 
         let attester_files = synthetic_workspace_binding_values(&policy, 30_000);
         let attester_values = synthetic_staging_snapshot_values(
@@ -81920,7 +81965,7 @@ dependency_kinds = ["build", "normal"]
             "synthetic attester",
             "attester_staging_snapshot",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         validate_staging_snapshot_joins(
             &attester,
             &expected_snapshot,
@@ -81938,186 +81983,35 @@ dependency_kinds = ["build", "normal"]
             &policy,
             "synthetic producer",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let mut changed_bytes = producer_values.clone();
-        changed_bytes[0]
-            .as_table_mut()
-            .and_then(|table| table.get_mut("file"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|files| files.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .expect("synthetic nested file row must be mutable")
-            .insert("sha256".to_owned(), toml::Value::String("ff".repeat(32)));
-        let changed_set_sha256 = record_set_sha256(
-            &changed_bytes,
-            "staging-snapshot-observation",
-            &policy,
-            "synthetic producer mutation",
-        )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_ne!(original_set_sha256, changed_set_sha256);
-        assert_eq!(
-            parse_staging_snapshot_observations(
-                &changed_bytes,
-                &policy,
-                "synthetic producer mutation",
-                "staging_snapshot",
-            )
-            .expect_err("a nested byte mutation must fail local snapshot recomputation")
-            .code,
-            "E_STAGING_SNAPSHOT_FILE_DIGEST"
-        );
-
-        let mut changed_probe = producer_values.clone();
-        changed_probe[0]
-            .as_table_mut()
-            .and_then(|table| table.get_mut("vcs_probe"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|probes| probes.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .expect("synthetic nested VCS probe row must be mutable")
-            .insert("directory_inode".to_owned(), toml::Value::Integer(999_999));
-        let changed_probe_set_sha256 = record_set_sha256(
-            &changed_probe,
-            "staging-snapshot-observation",
-            &policy,
-            "synthetic probe mutation",
-        )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_ne!(original_set_sha256, changed_probe_set_sha256);
-        let changed_probe = parse_staging_snapshot_observations(
-            &changed_probe,
-            &policy,
-            "synthetic probe mutation",
-            "staging_snapshot",
-        )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_eq!(
-            validate_staging_snapshot_joins(
-                &changed_probe,
-                &expected_snapshot,
-                &source_bindings,
-                "/tmp/fnd01-producer-staging",
-                &policy,
-                "synthetic probe mutation",
-            )
-            .expect_err("one-phase VCS directory identity drift must fail")
-            .code,
-            "E_STAGING_SNAPSHOT_JOIN"
-        );
-
-        let mut missing_posix_root_probe = producer_values.clone();
-        {
-            let observation = missing_posix_root_probe[0]
-                .as_table_mut()
-                .expect("synthetic staging observation must be a table");
-            let probes = observation
-                .get_mut("vcs_probe")
-                .and_then(toml::Value::as_array_mut)
-                .expect("synthetic VCS probes must be an array");
-            let root_index = probes
-                .iter()
-                .position(|probe| {
-                    probe
-                        .as_table()
-                        .and_then(|table| table.get("directory_path"))
-                        .and_then(toml::Value::as_str)
-                        == Some("/")
-                })
-                .expect("synthetic probes must include POSIX root");
-            probes.remove(root_index);
-            let remaining = probes.len();
-            observation.insert(
-                "vcs_probe_count".to_owned(),
-                toml::Value::Integer(
-                    i64::try_from(remaining)
-                        .expect("synthetic remaining probe count fits TOML integer"),
-                ),
+        .verified();
+        for plant in [
+            StagingFixturePlant { mutate: mutate_staging_file_sha256, subject: "synthetic producer mutation", reason: "a nested byte mutation must fail local snapshot recomputation", code: "E_STAGING_SNAPSHOT_FILE_DIGEST", stage: StagingFailureStage::Parse, digest_changes: true },
+            StagingFixturePlant { mutate: mutate_staging_probe_inode, subject: "synthetic probe mutation", reason: "one-phase VCS directory identity drift must fail", code: "E_STAGING_SNAPSHOT_JOIN", stage: StagingFailureStage::Join, digest_changes: true },
+            StagingFixturePlant { mutate: mutate_staging_remove_posix_root_probe, subject: "synthetic missing POSIX root probe", reason: "a truncated VCS discovery chain must fail exact scope", code: "E_STAGING_SNAPSHOT_JOIN", stage: StagingFailureStage::Join, digest_changes: false },
+            StagingFixturePlant { mutate: mutate_staging_reorder_probes, subject: "synthetic reordered probes", reason: "reordered probes must fail raw-path order", code: "E_STAGING_VCS_PROBE_ORDER", stage: StagingFailureStage::Parse, digest_changes: false },
+            StagingFixturePlant { mutate: mutate_staging_probe_method, subject: "synthetic wrong probe method", reason: "Path::exists cannot prove absence", code: "E_STAGING_VCS_PROBE_OBSERVATION", stage: StagingFailureStage::Parse, digest_changes: false },
+            StagingFixturePlant { mutate: mutate_staging_present_marker, subject: "synthetic present marker", reason: "a present VCS marker must fail", code: "E_STAGING_SNAPSHOT_OBSERVATION", stage: StagingFailureStage::Parse, digest_changes: false },
+        ] {
+            let mut planted = producer_values.clone();
+            (plant.mutate)(&mut planted);
+            if plant.digest_changes {
+                let planted_digest = record_set_sha256(
+                    &planted, "staging-snapshot-observation", &policy, plant.subject,
+                ).verified();
+                assert_ne!(original_set_sha256, planted_digest);
+            }
+            let parsed = parse_staging_snapshot_observations(
+                &planted, &policy, plant.subject, "staging_snapshot",
             );
+            let error = match plant.stage {
+                StagingFailureStage::Parse => parsed.expect_err(plant.reason),
+                StagingFailureStage::Join => validate_staging_snapshot_joins(
+                    &parsed.verified(), &expected_snapshot, &source_bindings,
+                    "/tmp/fnd01-producer-staging", &policy, plant.subject,
+                ).expect_err(plant.reason),
+            };
+            assert_eq!(error.code, plant.code);
         }
-        let missing_posix_root_probe = parse_staging_snapshot_observations(
-            &missing_posix_root_probe,
-            &policy,
-            "synthetic missing POSIX root probe",
-            "staging_snapshot",
-        )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        assert_eq!(
-            validate_staging_snapshot_joins(
-                &missing_posix_root_probe,
-                &expected_snapshot,
-                &source_bindings,
-                "/tmp/fnd01-producer-staging",
-                &policy,
-                "synthetic missing POSIX root probe",
-            )
-            .expect_err("a truncated VCS discovery chain must fail exact scope")
-            .code,
-            "E_STAGING_SNAPSHOT_JOIN"
-        );
-
-        let mut reordered_probes = producer_values.clone();
-        reordered_probes[0]
-            .as_table_mut()
-            .and_then(|table| table.get_mut("vcs_probe"))
-            .and_then(toml::Value::as_array_mut)
-            .expect("synthetic VCS probes must be mutable")
-            .swap(0, 1);
-        assert_eq!(
-            parse_staging_snapshot_observations(
-                &reordered_probes,
-                &policy,
-                "synthetic reordered probes",
-                "staging_snapshot",
-            )
-            .expect_err("reordered probes must fail raw-path order")
-            .code,
-            "E_STAGING_VCS_PROBE_ORDER"
-        );
-
-        let mut wrong_probe_method = producer_values.clone();
-        wrong_probe_method[0]
-            .as_table_mut()
-            .and_then(|table| table.get_mut("vcs_probe"))
-            .and_then(toml::Value::as_array_mut)
-            .and_then(|probes| probes.first_mut())
-            .and_then(toml::Value::as_table_mut)
-            .expect("synthetic VCS probe must be mutable")
-            .insert(
-                "probe_method".to_owned(),
-                toml::Value::String("std::path::Path::exists".to_owned()),
-            );
-        assert_eq!(
-            parse_staging_snapshot_observations(
-                &wrong_probe_method,
-                &policy,
-                "synthetic wrong probe method",
-                "staging_snapshot",
-            )
-            .expect_err("Path::exists cannot prove absence")
-            .code,
-            "E_STAGING_VCS_PROBE_OBSERVATION"
-        );
-
-        let mut present_marker = producer_values.clone();
-        present_marker[0]
-            .as_table_mut()
-            .expect("synthetic staging observation must be mutable")
-            .insert(
-                "present_vcs_marker_count".to_owned(),
-                toml::Value::Integer(1),
-            );
-        assert_eq!(
-            parse_staging_snapshot_observations(
-                &present_marker,
-                &policy,
-                "synthetic present marker",
-                "staging_snapshot",
-            )
-            .expect_err("a present VCS marker must fail")
-            .code,
-            "E_STAGING_SNAPSHOT_OBSERVATION"
-        );
 
         let mut identity_drift = producer.clone();
         identity_drift[1].files[0].inode = identity_drift[1].files[0]
@@ -82175,7 +82069,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_compile_stream_parser_accounts_for_every_cargo_json_line() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let valid = concat!(
             r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/tmp/demo/build.rs","edition":"2024","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/tmp/target/debug/build/demo/build-script-build"],"executable":"/tmp/target/debug/build/demo/build-script-build","fresh":false}"#,
             "\n",
@@ -82193,7 +82087,7 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "synthetic Cargo compile stream",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         assert_eq!(summary.crate_count, 1);
         assert_eq!(summary.artifact_count, 2);
         assert_eq!(summary.diagnostic_count, 1);
@@ -82208,7 +82102,7 @@ dependency_kinds = ["build", "normal"]
             &policy.bounds,
             "synthetic compile metadata",
         )
-        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        .verified();
         let host_debug_prefix = "/tmp/target/debug/";
         let target_debug_prefix = "/tmp/target/aarch64-unknown-linux-gnu/debug/";
         assert_eq!(
@@ -82597,9 +82491,8 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_sparse_selection_arrays_have_exact_types_counts_and_encoding() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let specs = build_direct_field_type_specs_unpinned(&policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
+        let specs = build_direct_field_type_specs_unpinned(&policy).verified();
         let code_for = |root: &str, field: &str| {
             specs
                 .iter()
@@ -82736,7 +82629,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_supply_entry_dispatch_accepts_one_variant_family() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let mut entry = toml::Table::new();
         for (field, value) in [
             ("kind", toml::Value::String("crate-archive".to_owned())),
@@ -82855,7 +82748,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_acquisition_anchor_dispatch_accepts_exact_tagged_family() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let mut config = toml::Table::new();
         for (field, value) in [
             ("kind", toml::Value::String("sparse-config".to_owned())),
@@ -83534,9 +83427,8 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_variant_authority_covers_both_compiled_supply_sites() {
         let root = repository_root();
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let authority = build_variant_authority(&policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
+        let authority = build_variant_authority(&policy).verified();
         let selector = "receipt/supply_receipt/supply_receipt/entry[]";
         let site = authority
             .sites
@@ -83601,7 +83493,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_variant_authority_rejects_wrong_and_unreachable_parent_sites() {
         let root = repository_root();
         let (mut wrong_parent, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         wrong_parent.record_variant_schema[0].parent_selector =
             "receipt/supply_receipt/supply_receipt/bootstrap_package[]".to_owned();
         assert_eq!(
@@ -83612,9 +83504,8 @@ dependency_kinds = ["build", "normal"]
         );
 
         let (policy, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let authority = build_variant_authority(&policy)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
+        let authority = build_variant_authority(&policy).verified();
         let reachable_nodes = authority
             .sites
             .values()
@@ -83632,7 +83523,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_variant_authority_rejects_discriminator_collision_and_type_drift() {
         let root = repository_root();
         let (mut collision, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         let duplicate_value = collision.record_variant_schema[0]
             .discriminator_value
             .clone();
@@ -83645,7 +83536,7 @@ dependency_kinds = ["build", "normal"]
         );
 
         let (mut wrong_type, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         wrong_type.record_variant_schema[1].discriminator_field = "selected_row_count".to_owned();
         assert_eq!(
             build_variant_authority(&wrong_type)
@@ -83659,7 +83550,7 @@ dependency_kinds = ["build", "normal"]
     fn fnd_01_variant_authority_rejects_invalid_child_suffix_and_variant_cycle() {
         let root = repository_root();
         let (mut invalid_child, _) =
-            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            read_policy(&root).verified();
         invalid_child.record_variant_schema[0]
             .child_fields
             .push("package_id[]=>supply-package".to_owned());
@@ -85252,6 +85143,155 @@ original = "value"
         )
         .expect_err("unreachable graph node must fail");
         assert_eq!(error.code, "E_RNG_GRAPH_REACHABILITY");
+    }
+
+    fn toolchain_asupersync_test_sources() -> (PathBuf, Policy, Vec<LoadedFile>) {
+        let root = repository_root();
+        let (policy, _) = read_policy(&root).verified();
+        validate_policy_shape(&policy).verified();
+        let files = load_sources(&root, &policy).verified();
+        validate_source_tree(&files, &policy).verified();
+        (root, policy, files)
+    }
+
+    #[test]
+    fn fnd_01_toolchain_asupersync_positive() {
+        let (root, policy, files) = toolchain_asupersync_test_sources();
+        let document = toolchain_asupersync_document(&files).verified();
+        let accepted =
+            validate_toolchain_asupersync_contract(&root, &files, &policy, &document).verified();
+        assert_eq!(accepted.0, "0.3.9");
+        assert_eq!(accepted.1, "feasibility-only");
+        assert_eq!(accepted.2, ["FND-04-P1", "FND-04-P2", "FND-04-P3"]);
+    }
+
+    #[test]
+    fn fnd_01_toolchain_asupersync_planted_negative() {
+        let (root, policy, files) = toolchain_asupersync_test_sources();
+        let loaded_before = files.clone();
+        let workspace_before = toolchain_workspace_inputs(&root, &policy).verified();
+        let accepted_document = toolchain_asupersync_document(&files).verified();
+        let accepted = validate_toolchain_asupersync_contract(
+            &root,
+            &files,
+            &policy,
+            &accepted_document,
+        )
+        .verified();
+        assert_eq!(
+            pointer_get(
+                &accepted_document,
+                "/asupersync/candidate/disposition/accepted_as_release_pin",
+                "pristine toolchain document",
+            )
+            .verified()
+            .as_bool(),
+            Some(false),
+        );
+
+        let mut planted = accepted_document.clone();
+        set_pointer(
+            &mut planted,
+            "/asupersync/candidate/disposition/accepted_as_release_pin",
+            toml::Value::Boolean(true),
+            "toolchain planted negative",
+        )
+        .verified();
+        let error = validate_toolchain_asupersync_contract(
+            &root,
+            &files,
+            &policy,
+            &planted,
+        )
+        .expect_err("candidate promotion must fail before acceptance");
+        assert_eq!(
+            error.stable(),
+            "FND01|Error|E_REJECTED_CANDIDATE_PROMOTION|asupersync 0.3.10|accepted_as_release_pin",
+        );
+        set_pointer(
+            &mut planted,
+            "/asupersync/candidate/disposition/accepted_as_release_pin",
+            toml::Value::Boolean(false),
+            "toolchain planted negative restore",
+        )
+        .verified();
+        assert_eq!(planted, accepted_document, "one-variable plant must restore exactly");
+        assert_sdk_loaded_file_vectors_equal(&loaded_before, &files, "toolchain retained inputs")
+            .verified();
+        assert_eq!(
+            toolchain_workspace_inputs(&root, &policy).verified(),
+            workspace_before,
+        );
+        assert_eq!(
+            validate_toolchain_asupersync_contract(
+                &root,
+                &files,
+                &policy,
+                &accepted_document,
+            )
+            .verified(),
+            accepted,
+        );
+
+        let (fresh_policy, _) = read_policy(&root).verified();
+        validate_policy_shape(&fresh_policy).verified();
+        let fresh_files = load_sources(&root, &fresh_policy).verified();
+        validate_source_tree(&fresh_files, &fresh_policy).verified();
+        assert_sdk_loaded_file_vectors_equal(&loaded_before, &fresh_files, "toolchain fresh inputs")
+            .verified();
+        assert_eq!(
+            toolchain_workspace_inputs(&root, &fresh_policy).verified(),
+            workspace_before,
+        );
+        let fresh_document = toolchain_asupersync_document(&fresh_files).verified();
+        assert_eq!(fresh_document, accepted_document);
+        assert_eq!(
+            validate_toolchain_asupersync_contract(
+                &root,
+                &fresh_files,
+                &fresh_policy,
+                &fresh_document,
+            )
+            .verified(),
+            accepted,
+        );
+    }
+
+    fn media_dependency_test_bundle() -> (Policy, Vec<LoadedFile>, MediaDependencyBundle) {
+        let (_, policy, files) = toolchain_asupersync_test_sources();
+        let bundle = media_dependency_bundle(&files).verified();
+        (policy, files, bundle)
+    }
+
+    #[test]
+    fn fnd_01_media_dependencies_positive() {
+        let (policy, files, bundle) = media_dependency_test_bundle();
+        let accepted = validate_media_dependency_bundle(&bundle, &files, &policy).verified();
+        assert_eq!(accepted.0, "415105fceac8e4c4bede1f72a28e37a4170cb8ef21dcfea8eeb58e8585bdc1b4");
+        assert_eq!(bundle.files.len(), 10);
+        assert_eq!((accepted.1, accepted.2), (3, 48));
+    }
+
+    #[test]
+    fn fnd_01_media_dependencies_planted_negative() {
+        let (policy, files, bundle) = media_dependency_test_bundle();
+        let accepted = validate_media_dependency_bundle(&bundle, &files, &policy).verified();
+        let mut planted = bundle.clone();
+        set_pointer(
+            &mut planted.security,
+            "/case/id=svg-external-use/expected",
+            toml::Value::String("admit_to_renderer_gate".to_owned()),
+            "media planted negative",
+        ).verified();
+        let error = validate_media_dependency_bundle(&planted, &files, &policy)
+            .expect_err("external SVG use must fail before renderer admission");
+        assert_eq!(error.stable(), "FND01|Error|E_MEDIA_SVG_EXTERNAL_RESOURCE|media-svg-external-resource-policy-drift|case[id=svg-external-use].expected");
+        assert_sdk_loaded_file_vectors_equal(&bundle.files, &planted.files, "media retained inputs").verified();
+        assert_eq!(validate_media_dependency_bundle(&bundle, &files, &policy).verified(), accepted);
+
+        let (fresh_policy, fresh_files, fresh) = media_dependency_test_bundle();
+        assert_sdk_loaded_file_vectors_equal(&bundle.files, &fresh.files, "media fresh inputs").verified();
+        assert_eq!(validate_media_dependency_bundle(&fresh, &fresh_files, &fresh_policy).verified(), accepted);
     }
 
     fn serialization_uri_contract_test_sources() -> Vec<LoadedFile> {
@@ -90168,17 +90208,18 @@ fn fallible(value: Option<u8>) {
 
         #[test]
         fn ordinary_sparse_index_json_matches_the_registered_v1_v2_surface() {
-            let valid_v1 = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"1.2","features":["","std","std"],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null,"package":null,"public":null,"artifact":null,"bindep_target":null,"lib":false}}],"features":{{"default":["dep","dep"]}},"cksum":"{CHECKSUM}","yanked":false,"links":"","rust_version":"1","pubtime":"0000-02-29T00:00:00Z"}}"#
-            );
+            let corpus = sparse_index_fixture_corpus();
+            assert_eq!(corpus.checksum, CHECKSUM);
             let (identity, yanked) =
-                ordinary_supply_json_identity(valid_v1.as_bytes(), Some("1.2.3"), "valid v1")
+                ordinary_supply_json_identity(corpus.valid_v1.as_bytes(), Some("1.2.3"), "valid v1")
                     .expect("registered v1 fields and duplicate array members must pass");
             assert_eq!(identity.name, "sample");
             assert_eq!(identity.version, "1.2.3");
             assert_eq!(identity.checksum, CHECKSUM);
             assert_eq!(yanked, Some(false));
-            let leap_second = valid_v1.replace("0000-02-29T00:00:00Z", "2026-07-07T15:52:60Z");
+            let leap_second = corpus
+                .valid_v1
+                .replace("0000-02-29T00:00:00Z", "2026-07-07T15:52:60Z");
             ordinary_supply_json_identity(
                 leap_second.as_bytes(),
                 Some("1.2.3"),
@@ -90186,95 +90227,27 @@ fn fallible(value: Option<u8>) {
             )
             .expect("pinned Cargo maps second 60 to 59");
 
-            let valid_v2 = format!(
-                r#"{{"name":"sample","vers":"2.0.0","deps":[{{"name":"optional","req":"*","optional":true,"kind":"build"}}],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","yanked":null,"v":2}}"#
-            );
             assert_eq!(
-                ordinary_supply_json_identity(valid_v2.as_bytes(), Some("2.0.0"), "valid v2")
+                ordinary_supply_json_identity(corpus.valid_v2.as_bytes(), Some("2.0.0"), "valid v2")
                     .expect("registered v2 fields must pass")
                     .1,
                 None,
             );
 
-            for invalid in [
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","unknown":true}}"#
-                ),
-                format!(r#"{{"name":"sample","vers":"1.2.3","cksum":"{CHECKSUM}"}}"#),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":0}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","v":3}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","unknown":true}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","artifact":["bin"]}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"^1","lib":true}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{}"}}"#,
-                    "A".repeat(64),
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}","pubtime":"2026-02-30T15:52:22Z"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true,"kind":"dev"}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":null}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","kind":"build","public":true}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","target":"cfg(any(unix,,windows))"}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","registry":"https://example.invalid/index"}}],"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"dep:bad":[]}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"features":{{"default":["missing"]}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep:dep"]}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*"}}],"features":{{"default":["dep?/feature"]}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"dep","req":"*","optional":true}}],"features":{{"dep":[]}},"cksum":"{CHECKSUM}"}}"#
-                ),
-                format!(
-                    r#"{{"name":"sample","vers":"1.2.3","deps":[],"features2":{{"feature":["dep:optional"]}},"cksum":"{CHECKSUM}","v":2}}"#
-                ),
-            ] {
+            assert_eq!(corpus.invalid.len(), 21);
+            for (case_id, invalid) in &corpus.invalid {
                 let error = ordinary_supply_json_identity(
                     invalid.as_bytes(),
                     Some("1.2.3"),
                     "invalid index",
                 )
                 .expect_err("invalid registered index JSON must fail");
-                assert!(!error.code.is_empty(), "{invalid}");
+                assert!(!error.code.is_empty(), "{case_id}: {invalid}");
             }
 
             assert_eq!(
             ordinary_supply_json_identity(
-                format!(
-                    r#"{{"name":"sample","name":"other","vers":"1.2.3","deps":[],"cksum":"{CHECKSUM}"}}"#
-                )
-                .as_bytes(),
+                corpus.duplicate_key.as_bytes(),
                 Some("1.2.3"),
                 "duplicate index key",
             )
@@ -90283,22 +90256,21 @@ fn fallible(value: Option<u8>) {
             "E_JSON_SCHEMA",
         );
             assert_eq!(
-                ordinary_supply_json_identity(valid_v1.as_bytes(), Some("1.2.4"), "cache mismatch")
+                ordinary_supply_json_identity(corpus.valid_v1.as_bytes(), Some("1.2.4"), "cache mismatch")
                     .expect_err("outer cache version must equal vers")
                     .code,
                 "E_ORDINARY_SUPPLY_VERSION",
             );
 
-            let renamed_dependency = format!(
-                r#"{{"name":"sample","vers":"1.2.3","deps":[{{"name":"alias","package":"actual","req":"*","optional":true}}],"features":{{"default":["dep:alias"]}},"cksum":"{CHECKSUM}"}}"#
-            );
             ordinary_supply_json_identity(
-                renamed_dependency.as_bytes(),
+                corpus.renamed_dependency.as_bytes(),
                 Some("1.2.3"),
                 "renamed dependency alias",
             )
             .expect("feature references use the dependency alias");
-            let wrong_renamed_feature = renamed_dependency.replace("dep:alias", "dep:actual");
+            let wrong_renamed_feature = corpus
+                .renamed_dependency
+                .replace("dep:alias", "dep:actual");
             assert_eq!(
                 ordinary_supply_json_identity(
                     wrong_renamed_feature.as_bytes(),
@@ -92495,7 +92467,7 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUSTC_B64: &str = "cnVzdGMgMS45OS4wLW5pZ2h0bHkgKDM3NWIxNDMxYiAyMDI2LTA3LTEwKQpiaW5hcnk6IHJ1c3RjCmNvbW1pdC1oYXNoOiAzNzViMTQzMWI3ZDg5ZDFjMmUyYmMxNjhjMDExODQ4YWUxMmI3ZDE0CmNvbW1pdC1kYXRlOiAyMDI2LTA3LTEwCmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpMTFZNIHZlcnNpb246IDIyLjEuOAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_CARGO_B64: &str = "Y2FyZ28gMS45OS4wLW5pZ2h0bHkgKDU5ODAwNDY2YyAyMDI2LTA3LTA3KQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpjb21taXQtaGFzaDogNTk4MDA0NjZjNWM0MWM0NDRkMjY0YjEwMTBiNGQ1N2U4NWE3MTE3Zgpjb21taXQtZGF0ZTogMjAyNi0wNy0wNwpob3N0OiB4ODZfNjQtdW5rbm93bi1saW51eC1nbnUKbGliZ2l0MjogMS45LjQgKHN5czowLjIxLjAgdmVuZG9yZWQpCmxpYmN1cmw6IDguMjEuMC1ERVYgKHN5czowLjQuOTArY3VybC04LjIxLjAgdmVuZG9yZWQgc3NsOk9wZW5TU0wvMy42LjMpCnNzbDogT3BlblNTTCAzLjYuMyA5IEp1biAyMDI2Cm9zOiBVYnVudHUgMjYuNC4wIChyZXNvbHV0ZSkgWzY0LWJpdF0K";
+    const ORDINARY_PROBE_CARGO_B64: &str = "Y2FyZ28gMS45OS4wLW5pZ2h0bHkgKDU5ODAwNDY2YyAyMDI2LTA3LTA3KQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpjb21taXQtaGFzaDogNTk4MDA0NjZjNWM0MWM0NDRkMjY0YjEwMTBiNGQ1N2U4NWE3MTE3Zgpjb21taXQtZGF0ZTogMjAyNi0wNy0wNwpob3N0OiB4ODZfNjQtdW5rbm93bi1saW51eC1nbnUKbGliZ2l0MjogMS45LjQgKHN5czowLjIxLjAgdmVuZG9yZWQpCmxpYmN1cmw6IDguMjEuMC1ERVYgKHN5czowLjQuOTArY3VybC04LjIxLjAgdmVuZG9yZWQgc3NsOk9wZW5TU0wvMy42LjMpCnNzbDogT3BlblNTTCAzLjYuMyA5IEp1biAyMDI2Cm9zOiBVYnVudHUgMjYuNC4wIChyZXNvbHV0ZSkgW3Vua25vd24gYml0bmVzc10K";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUSTDOC_B64: &str = "cnVzdGRvYyAxLjk5LjAtbmlnaHRseSAoMzc1YjE0MzFiIDIwMjYtMDctMTApCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -92583,7 +92555,7 @@ fn fallible(value: Option<u8>) {
     fn ordinary_tool_probe_fixtures() -> [OrdinaryToolProbeFixture; 20] {
         [
             OrdinaryToolProbeFixture { tool_id: "rustc", parser_id: "rustc-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustc", final_path: "/fixture/finals/rustc", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTC_B64, raw_sha256: "d2a0a4fa48442a6c214130f08b2e9041725872a05d74680d9fd803ff8cb99c04" },
-            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", final_path: "/fixture/finals/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "f0e418b5bcf565955351a398b34570dbd5548f362ec2964c6b85ccf1c6ac336b" },
+            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", final_path: "/fixture/finals/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "9f37a625adbcbf2fe66626c0a3a690432efba31c56de13e40cdd1fc1fe0f114d" },
             OrdinaryToolProbeFixture { tool_id: "rustdoc", parser_id: "rustdoc-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustdoc", final_path: "/fixture/finals/rustdoc", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTDOC_B64, raw_sha256: "8b9d7c46d8dc09d41da9e1b590b12a6b3b82b1a00c866623067104618a7b1a88" },
             OrdinaryToolProbeFixture { tool_id: "rustfmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustfmt", final_path: "/fixture/finals/rustfmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
             OrdinaryToolProbeFixture { tool_id: "cargo-fmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-fmt", final_path: "/fixture/finals/cargo-fmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
@@ -92811,10 +92783,7 @@ fn fallible(value: Option<u8>) {
     fn ordinary_parser_semantic_negative(parser_id: &str, raw: &[u8]) -> Vec<u8> {
         let (needle, replacement): (&[u8], &[u8]) = match parser_id {
             "rustc-vv-pinned-1.99" => (b"LLVM version: 22.1.8", b"LLVM version: 22.1.9"),
-            "cargo-vv-pinned-1.99" => (
-                b"commit-date: 2026-07-07",
-                b"commit-date: 2026-07-08",
-            ),
+            "cargo-vv-pinned-1.99" => (b"unknown bitness", b"unknown bigness"),
             "rustdoc-pinned-1.99" => (b"375b1431b", b"375b1431c"),
             "rustfmt-pinned-nightly" => (
                 b"rustfmt 1.9.0-nightly",
@@ -93720,7 +93689,7 @@ fn fallible(value: Option<u8>) {
             if run_id == "00000000000000000000000000000000" {
                 continue;
             }
-            let root = std::env::temp_dir().join(format!("fastmcp-fnd01-attest-{run_id}"));
+            let root = Path::new("/tmp").join(format!("fastmcp-fnd01-attest-{run_id}"));
             match fs::create_dir(&root) {
                 Ok(()) => {
                     fresh = Some((run_id, root));
@@ -94137,7 +94106,7 @@ fn fallible(value: Option<u8>) {
             ));
             }
             let nested = format!(
-                "E_CONTROL_AUTHORITY: tool_set_sha256 expected={} observed={}",
+                "E_CONTROL_AUTHORITY|tool_set_sha256 expected={} observed={}",
                 encode_lower_hex(&expected_tool_set_sha256),
                 encode_lower_hex(&observed_tool_set_sha256),
             );
@@ -95332,104 +95301,102 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(test)]
-    const ORDINARY_PUBLIC_FAILURE_SITE_ORACLE: &[(OrdinaryFailureSite, OrdinaryFailureRoute)] = &[
-        (OrdinaryFailureSite::EntryArity, OrdinaryFailureRoute::Arguments),
-        (OrdinaryFailureSite::HandoffArguments, OrdinaryFailureRoute::HandoffArguments),
-        (OrdinaryFailureSite::HandoffRunIdLength, OrdinaryFailureRoute::HandoffRunIdLength),
-        (OrdinaryFailureSite::HandoffRunIdFormat, OrdinaryFailureRoute::HandoffRunIdFormat),
-        (OrdinaryFailureSite::HandoffRunIdNonzero, OrdinaryFailureRoute::HandoffRunIdNonzero),
-        (OrdinaryFailureSite::HandoffExecutablePath, OrdinaryFailureRoute::HandoffExecutablePath),
-        (OrdinaryFailureSite::HandoffExecutable, OrdinaryFailureRoute::ExecutableAdmission),
-        (OrdinaryFailureSite::HandoffRepositoryCurrentDir, OrdinaryFailureRoute::HandoffRepository),
-        (OrdinaryFailureSite::HandoffRepositoryPath, OrdinaryFailureRoute::HandoffRepositoryPath),
-        (OrdinaryFailureSite::HandoffRepositoryPlatform, OrdinaryFailureRoute::InitialPlatform),
-        (OrdinaryFailureSite::HandoffRepositoryMetadata, OrdinaryFailureRoute::HandoffRepositoryMetadata),
-        (OrdinaryFailureSite::HandoffRepositoryType, OrdinaryFailureRoute::HandoffRepositoryType),
-        (OrdinaryFailureSite::HandoffEnvironmentEncoding, OrdinaryFailureRoute::HandoffEnvironmentEncoding),
-        (OrdinaryFailureSite::HandoffEnvironmentExtra, OrdinaryFailureRoute::HandoffEnvironmentExtra),
-        (OrdinaryFailureSite::HandoffEnvironmentDuplicate, OrdinaryFailureRoute::HandoffEnvironmentDuplicate),
-        (OrdinaryFailureSite::HandoffEnvironmentMissing, OrdinaryFailureRoute::HandoffEnvironmentMissing),
-        (OrdinaryFailureSite::HandoffEnvironmentMismatch, OrdinaryFailureRoute::EnvironmentAdmission),
-        (OrdinaryFailureSite::HandoffPathGrammar, OrdinaryFailureRoute::HandoffPathGrammar),
-        (OrdinaryFailureSite::HandoffPathLexical, OrdinaryFailureRoute::HandoffPathLexical),
-        (OrdinaryFailureSite::HandoffPathMetadata, OrdinaryFailureRoute::HandoffPathMetadata),
-        (OrdinaryFailureSite::HandoffPathType, OrdinaryFailureRoute::HandoffPathType),
-        (OrdinaryFailureSite::HandoffOuterRecord, OrdinaryFailureRoute::OuterRecord),
-        (OrdinaryFailureSite::PreflightAuthoring, OrdinaryFailureRoute::Authoring),
-        (OrdinaryFailureSite::PreflightExecutable, OrdinaryFailureRoute::ExecutableAdmission),
-        (OrdinaryFailureSite::PreLedgerAuthority, OrdinaryFailureRoute::Pending),
-        (OrdinaryFailureSite::OpaqueLedger, OrdinaryFailureRoute::LedgerOpen),
-        (OrdinaryFailureSite::ProbeToolSet, OrdinaryFailureRoute::ToolSet),
-        (OrdinaryFailureSite::LedgerJoin, OrdinaryFailureRoute::LedgerValidate),
-        (OrdinaryFailureSite::LedgerDirectRead, OrdinaryFailureRoute::LedgerDirectRead),
-        (OrdinaryFailureSite::LedgerDirectRecheck, OrdinaryFailureRoute::LedgerRecheck),
-        (OrdinaryFailureSite::LedgerRebind, OrdinaryFailureRoute::LedgerRebind),
-        (OrdinaryFailureSite::LedgerExecutable, OrdinaryFailureRoute::LedgerExecutable),
-        (OrdinaryFailureSite::LedgerSupply, OrdinaryFailureRoute::LedgerSupply),
-        (OrdinaryFailureSite::LedgerSpool, OrdinaryFailureRoute::LedgerSpool),
-        (OrdinaryFailureSite::ArchiveFraming, OrdinaryFailureRoute::ArchiveFraming),
-        (OrdinaryFailureSite::ArchiveValidation, OrdinaryFailureRoute::ArchiveValidate),
-        (OrdinaryFailureSite::BookendLedger, OrdinaryFailureRoute::BookendLedger),
-        (OrdinaryFailureSite::BookendSupply, OrdinaryFailureRoute::BookendSupply),
-        (OrdinaryFailureSite::BookendSpool, OrdinaryFailureRoute::BookendSpool),
-        (OrdinaryFailureSite::BookendToolSet, OrdinaryFailureRoute::ToolSetRecheck),
-        (OrdinaryFailureSite::BookendExecutable, OrdinaryFailureRoute::BookendExecutable),
-        (OrdinaryFailureSite::EvidenceDispatch, OrdinaryFailureRoute::Evidence),
+    type OFS = OrdinaryFailureSite;
+    #[cfg(test)]
+    type OFR = OrdinaryFailureRoute;
+    #[cfg(test)]
+    type ORO = (OFR, &'static str, &'static str, &'static str, &'static str);
+
+    #[cfg(test)]
+    const ORDINARY_PUBLIC_FAILURE_SITE_ORACLE: &[(OFS, OFR)] = &[
+        (OFS::EntryArity, OFR::Arguments),
+        (OFS::HandoffArguments, OFR::HandoffArguments),
+        (OFS::HandoffRunIdLength, OFR::HandoffRunIdLength),
+        (OFS::HandoffRunIdFormat, OFR::HandoffRunIdFormat),
+        (OFS::HandoffRunIdNonzero, OFR::HandoffRunIdNonzero),
+        (OFS::HandoffExecutablePath, OFR::HandoffExecutablePath),
+        (OFS::HandoffExecutable, OFR::ExecutableAdmission),
+        (OFS::HandoffRepositoryCurrentDir, OFR::HandoffRepository),
+        (OFS::HandoffRepositoryPath, OFR::HandoffRepositoryPath),
+        (OFS::HandoffRepositoryPlatform, OFR::InitialPlatform),
+        (OFS::HandoffRepositoryMetadata, OFR::HandoffRepositoryMetadata),
+        (OFS::HandoffRepositoryType, OFR::HandoffRepositoryType),
+        (OFS::HandoffEnvironmentEncoding, OFR::HandoffEnvironmentEncoding),
+        (OFS::HandoffEnvironmentExtra, OFR::HandoffEnvironmentExtra),
+        (OFS::HandoffEnvironmentDuplicate, OFR::HandoffEnvironmentDuplicate),
+        (OFS::HandoffEnvironmentMissing, OFR::HandoffEnvironmentMissing),
+        (OFS::HandoffEnvironmentMismatch, OFR::EnvironmentAdmission),
+        (OFS::HandoffPathGrammar, OFR::HandoffPathGrammar),
+        (OFS::HandoffPathLexical, OFR::HandoffPathLexical),
+        (OFS::HandoffPathMetadata, OFR::HandoffPathMetadata),
+        (OFS::HandoffPathType, OFR::HandoffPathType),
+        (OFS::HandoffOuterRecord, OFR::OuterRecord),
+        (OFS::PreflightAuthoring, OFR::Authoring),
+        (OFS::PreflightExecutable, OFR::ExecutableAdmission),
+        (OFS::PreLedgerAuthority, OFR::Pending),
+        (OFS::OpaqueLedger, OFR::LedgerOpen),
+        (OFS::ProbeToolSet, OFR::ToolSet),
+        (OFS::LedgerJoin, OFR::LedgerValidate),
+        (OFS::LedgerDirectRead, OFR::LedgerDirectRead),
+        (OFS::LedgerDirectRecheck, OFR::LedgerRecheck),
+        (OFS::LedgerRebind, OFR::LedgerRebind),
+        (OFS::LedgerExecutable, OFR::LedgerExecutable),
+        (OFS::LedgerSupply, OFR::LedgerSupply),
+        (OFS::LedgerSpool, OFR::LedgerSpool),
+        (OFS::ArchiveFraming, OFR::ArchiveFraming),
+        (OFS::ArchiveValidation, OFR::ArchiveValidate),
+        (OFS::BookendLedger, OFR::BookendLedger),
+        (OFS::BookendSupply, OFR::BookendSupply),
+        (OFS::BookendSpool, OFR::BookendSpool),
+        (OFS::BookendToolSet, OFR::ToolSetRecheck),
+        (OFS::BookendExecutable, OFR::BookendExecutable),
+        (OFS::EvidenceDispatch, OFR::Evidence),
     ];
 
     #[cfg(test)]
-    struct OrdinaryRouteOracle {
-        route: OrdinaryFailureRoute,
-        id: &'static str,
-        code: &'static str,
-        stage: &'static str,
-        expected: &'static str,
-    }
-
-    #[cfg(test)]
-    const ORDINARY_FAILURE_ROUTE_ORACLE: &[OrdinaryRouteOracle] = &[
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::Arguments, id: "entry.arguments", code: "E_ENTRY_ARGUMENTS", stage: "authority", expected: "valid ordinary handoff argv" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffArguments, id: "authority.handoff-arguments", code: "E_HANDOFF_ARGUMENTS", stage: "authority", expected: "valid ordinary handoff argv" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRunIdLength, id: "authority.handoff-run-id-length", code: "E_HEX_LENGTH", stage: "authority", expected: "canonical nonzero 32-character lowercase-hex run ID" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRunIdFormat, id: "authority.handoff-run-id-format", code: "E_HEX_FORMAT", stage: "authority", expected: "canonical nonzero 32-character lowercase-hex run ID" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRunIdNonzero, id: "authority.handoff-run-id-nonzero", code: "E_BOOTSTRAP_RUN_ID", stage: "authority", expected: "canonical nonzero 32-character lowercase-hex run ID" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffExecutablePath, id: "authority.handoff-executable-path", code: "E_ROOT_PATH", stage: "authority", expected: "absolute lexical handoff executable path" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::ExecutableAdmission, id: "authority.executable", code: "E_HANDOFF_EXECUTABLE", stage: "authority", expected: "admitted current executable" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRepository, id: "authority.repository-root", code: "E_BOOTSTRAP_CURRENT_DIR", stage: "authority", expected: "physical repository root" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRepositoryPath, id: "authority.repository-root-path", code: "E_ROOT_PATH", stage: "authority", expected: "physical repository root" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::InitialPlatform, id: "entry.platform", code: "E_UNQUALIFIED_PLATFORM", stage: "authority", expected: "qualified Linux x86_64" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRepositoryMetadata, id: "authority.repository-root-metadata", code: "E_ROOT_METADATA", stage: "authority", expected: "physical repository root" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffRepositoryType, id: "authority.repository-root-type", code: "E_ROOT_TYPE", stage: "authority", expected: "physical repository root" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffEnvironmentEncoding, id: "authority.environment-encoding", code: "E_ENV_ENCODING", stage: "authority", expected: "closed role-specific environment" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffEnvironmentExtra, id: "authority.environment-extra", code: "E_ENV_EXTRA", stage: "authority", expected: "closed role-specific environment" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffEnvironmentDuplicate, id: "authority.environment-duplicate", code: "E_ENV_DUPLICATE", stage: "authority", expected: "closed role-specific environment" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffEnvironmentMissing, id: "authority.environment-missing", code: "E_ENV_MISSING", stage: "authority", expected: "closed role-specific environment" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::EnvironmentAdmission, id: "authority.environment", code: "E_HANDOFF_ENVIRONMENT", stage: "authority", expected: "closed role-specific environment" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffPathGrammar, id: "authority.bootstrap-path", code: "E_BOOTSTRAP_PATH", stage: "authority", expected: "closed bootstrap PATH" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffPathLexical, id: "authority.bootstrap-path-lexical", code: "E_ROOT_PATH", stage: "authority", expected: "closed bootstrap PATH" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffPathMetadata, id: "authority.bootstrap-path-metadata", code: "E_ROOT_METADATA", stage: "authority", expected: "existing physical toolchain-bin directory" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::HandoffPathType, id: "authority.bootstrap-path-type", code: "E_ROOT_TYPE", stage: "authority", expected: "existing physical toolchain-bin directory" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::OuterRecord, id: "authority.outer-record", code: "E_HANDOFF_OUTER_RECORD", stage: "authority", expected: "bound producer outer record" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::Authoring, id: "entry.authoring", code: "E_HANDOFF_AUTHORING", stage: "authority", expected: "authoring authority" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::Pending, id: "entry.pending", code: "E_ORDINARY_HANDOFF_PENDING", stage: "authority", expected: "completed ordinary authority" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerOpen, id: "ledger.open", code: "E_HANDOFF_LEDGER", stage: "ledger", expected: "opaque control ledger" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::ToolSet, id: "reprobe.tool-set", code: "E_HANDOFF_TOOL_SET", stage: "reprobe", expected: "twenty-tool reprobe" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerValidate, id: "ledger.validate", code: "E_HANDOFF_LEDGER", stage: "ledger", expected: "complete ControlLedgerExpectation" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerDirectRead, id: "ledger.direct-read", code: "E_HANDOFF_LEDGER", stage: "ledger", expected: "unchanged direct control-ledger file" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerRecheck, id: "ledger.pre-archive-recheck", code: "E_HANDOFF_LEDGER_RECHECK", stage: "ledger", expected: "unchanged admitted ledger" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerRebind, id: "ledger.rebind", code: "E_HANDOFF_LEDGER_REBIND", stage: "ledger", expected: "unchanged control trees" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerExecutable, id: "ledger.executable", code: "E_HANDOFF_EXECUTABLE", stage: "ledger", expected: "bound selected executable" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerSupply, id: "ledger.supply", code: "E_HANDOFF_SUPPLY", stage: "ledger", expected: "bound supply bundle" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::LedgerSpool, id: "ledger.spool", code: "E_HANDOFF_SPOOL", stage: "ledger", expected: "bound acquisition spool" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::ArchiveFraming, id: "archive.framing", code: "E_HANDOFF_SUPPLY_PARSE", stage: "archive", expected: "strict supply framing" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::ArchiveValidate, id: "archive.validate", code: "E_HANDOFF_ARCHIVE", stage: "archive", expected: "validated crate archives" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::BookendLedger, id: "bookend.ledger", code: "E_HANDOFF_LEDGER_RECHECK", stage: "bookend", expected: "unchanged post-archive ledger" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::BookendSupply, id: "bookend.supply", code: "E_HANDOFF_SUPPLY_RECHECK", stage: "bookend", expected: "unchanged post-archive supply bundle" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::BookendSpool, id: "bookend.spool", code: "E_HANDOFF_SPOOL_RECHECK", stage: "bookend", expected: "unchanged post-archive spool" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::ToolSetRecheck, id: "bookend.tool-set-recheck", code: "E_HANDOFF_TOOL_SET_RECHECK", stage: "bookend", expected: "unchanged post-archive tool inventory" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::BookendExecutable, id: "bookend.executable", code: "E_HANDOFF_EXECUTABLE_RECHECK", stage: "bookend", expected: "unchanged post-archive executable" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::Evidence, id: "evidence.dispatch", code: "E_ORDINARY_EVIDENCE", stage: "evidence", expected: "accepted evidence report" },
-        OrdinaryRouteOracle { route: OrdinaryFailureRoute::Panic, id: "entry.panic", code: "E_ENTRY_PANIC", stage: "authority", expected: "ordinary handoff must not panic" },
+    const ORDINARY_FAILURE_ROUTE_ORACLE: &[ORO] = &[
+        (OFR::Arguments, "entry.arguments", "E_ENTRY_ARGUMENTS", "authority", "valid ordinary handoff argv"),
+        (OFR::HandoffArguments, "authority.handoff-arguments", "E_HANDOFF_ARGUMENTS", "authority", "valid ordinary handoff argv"),
+        (OFR::HandoffRunIdLength, "authority.handoff-run-id-length", "E_HEX_LENGTH", "authority", "canonical nonzero 32-character lowercase-hex run ID"),
+        (OFR::HandoffRunIdFormat, "authority.handoff-run-id-format", "E_HEX_FORMAT", "authority", "canonical nonzero 32-character lowercase-hex run ID"),
+        (OFR::HandoffRunIdNonzero, "authority.handoff-run-id-nonzero", "E_BOOTSTRAP_RUN_ID", "authority", "canonical nonzero 32-character lowercase-hex run ID"),
+        (OFR::HandoffExecutablePath, "authority.handoff-executable-path", "E_ROOT_PATH", "authority", "absolute lexical handoff executable path"),
+        (OFR::ExecutableAdmission, "authority.executable", "E_HANDOFF_EXECUTABLE", "authority", "admitted current executable"),
+        (OFR::HandoffRepository, "authority.repository-root", "E_BOOTSTRAP_CURRENT_DIR", "authority", "physical repository root"),
+        (OFR::HandoffRepositoryPath, "authority.repository-root-path", "E_ROOT_PATH", "authority", "physical repository root"),
+        (OFR::InitialPlatform, "entry.platform", "E_UNQUALIFIED_PLATFORM", "authority", "qualified Linux x86_64"),
+        (OFR::HandoffRepositoryMetadata, "authority.repository-root-metadata", "E_ROOT_METADATA", "authority", "physical repository root"),
+        (OFR::HandoffRepositoryType, "authority.repository-root-type", "E_ROOT_TYPE", "authority", "physical repository root"),
+        (OFR::HandoffEnvironmentEncoding, "authority.environment-encoding", "E_ENV_ENCODING", "authority", "closed role-specific environment"),
+        (OFR::HandoffEnvironmentExtra, "authority.environment-extra", "E_ENV_EXTRA", "authority", "closed role-specific environment"),
+        (OFR::HandoffEnvironmentDuplicate, "authority.environment-duplicate", "E_ENV_DUPLICATE", "authority", "closed role-specific environment"),
+        (OFR::HandoffEnvironmentMissing, "authority.environment-missing", "E_ENV_MISSING", "authority", "closed role-specific environment"),
+        (OFR::EnvironmentAdmission, "authority.environment", "E_HANDOFF_ENVIRONMENT", "authority", "closed role-specific environment"),
+        (OFR::HandoffPathGrammar, "authority.bootstrap-path", "E_BOOTSTRAP_PATH", "authority", "closed bootstrap PATH"),
+        (OFR::HandoffPathLexical, "authority.bootstrap-path-lexical", "E_ROOT_PATH", "authority", "closed bootstrap PATH"),
+        (OFR::HandoffPathMetadata, "authority.bootstrap-path-metadata", "E_ROOT_METADATA", "authority", "existing physical toolchain-bin directory"),
+        (OFR::HandoffPathType, "authority.bootstrap-path-type", "E_ROOT_TYPE", "authority", "existing physical toolchain-bin directory"),
+        (OFR::OuterRecord, "authority.outer-record", "E_HANDOFF_OUTER_RECORD", "authority", "bound producer outer record"),
+        (OFR::Authoring, "entry.authoring", "E_HANDOFF_AUTHORING", "authority", "authoring authority"),
+        (OFR::Pending, "entry.pending", "E_ORDINARY_HANDOFF_PENDING", "authority", "completed ordinary authority"),
+        (OFR::LedgerOpen, "ledger.open", "E_HANDOFF_LEDGER", "ledger", "opaque control ledger"),
+        (OFR::ToolSet, "reprobe.tool-set", "E_HANDOFF_TOOL_SET", "reprobe", "twenty-tool reprobe"),
+        (OFR::LedgerValidate, "ledger.validate", "E_HANDOFF_LEDGER", "ledger", "complete ControlLedgerExpectation"),
+        (OFR::LedgerDirectRead, "ledger.direct-read", "E_HANDOFF_LEDGER", "ledger", "unchanged direct control-ledger file"),
+        (OFR::LedgerRecheck, "ledger.pre-archive-recheck", "E_HANDOFF_LEDGER_RECHECK", "ledger", "unchanged admitted ledger"),
+        (OFR::LedgerRebind, "ledger.rebind", "E_HANDOFF_LEDGER_REBIND", "ledger", "unchanged control trees"),
+        (OFR::LedgerExecutable, "ledger.executable", "E_HANDOFF_EXECUTABLE", "ledger", "bound selected executable"),
+        (OFR::LedgerSupply, "ledger.supply", "E_HANDOFF_SUPPLY", "ledger", "bound supply bundle"),
+        (OFR::LedgerSpool, "ledger.spool", "E_HANDOFF_SPOOL", "ledger", "bound acquisition spool"),
+        (OFR::ArchiveFraming, "archive.framing", "E_HANDOFF_SUPPLY_PARSE", "archive", "strict supply framing"),
+        (OFR::ArchiveValidate, "archive.validate", "E_HANDOFF_ARCHIVE", "archive", "validated crate archives"),
+        (OFR::BookendLedger, "bookend.ledger", "E_HANDOFF_LEDGER_RECHECK", "bookend", "unchanged post-archive ledger"),
+        (OFR::BookendSupply, "bookend.supply", "E_HANDOFF_SUPPLY_RECHECK", "bookend", "unchanged post-archive supply bundle"),
+        (OFR::BookendSpool, "bookend.spool", "E_HANDOFF_SPOOL_RECHECK", "bookend", "unchanged post-archive spool"),
+        (OFR::ToolSetRecheck, "bookend.tool-set-recheck", "E_HANDOFF_TOOL_SET_RECHECK", "bookend", "unchanged post-archive tool inventory"),
+        (OFR::BookendExecutable, "bookend.executable", "E_HANDOFF_EXECUTABLE_RECHECK", "bookend", "unchanged post-archive executable"),
+        (OFR::Evidence, "evidence.dispatch", "E_ORDINARY_EVIDENCE", "evidence", "accepted evidence report"),
+        (OFR::Panic, "entry.panic", "E_ENTRY_PANIC", "authority", "ordinary handoff must not panic"),
     ];
 
     #[derive(Debug)]
@@ -95554,14 +95521,15 @@ fn fallible(value: Option<u8>) {
         if candidate.route != expected_route {
             return Err("candidate site-to-route mismatch");
         }
-        let row = ORDINARY_FAILURE_ROUTE_ORACLE
+        let &(route, id, code, stage, expected) = ORDINARY_FAILURE_ROUTE_ORACLE
             .iter()
-            .find(|row| row.route == candidate.route)
+            .find(|row| row.0 == candidate.route)
             .ok_or("missing literal ordinary route row")?;
-        if candidate.route.id() != row.id
-            || candidate.route.code() != row.code
-            || candidate.route.stage().as_str() != row.stage
-            || candidate.route.expected() != row.expected
+        if candidate.route != route
+            || candidate.route.id() != id
+            || candidate.route.code() != code
+            || candidate.route.stage().as_str() != stage
+            || candidate.route.expected() != expected
         {
             return Err("production route differs from literal ordinary row");
         }
@@ -97021,11 +96989,11 @@ fn fallible(value: Option<u8>) {
         );
         let oracle_routes = ORDINARY_FAILURE_ROUTE_ORACLE
             .iter()
-            .map(|row| row.route)
+            .map(|row| row.0)
             .collect::<BTreeSet<_>>();
         let oracle_route_ids = ORDINARY_FAILURE_ROUTE_ORACLE
             .iter()
-            .map(|row| row.id)
+            .map(|row| row.1)
             .collect::<BTreeSet<_>>();
         assert_eq!(
             oracle_routes.len(),
@@ -97641,7 +97609,7 @@ fn fallible(value: Option<u8>) {
                 .duration_since(UNIX_EPOCH)
                 .expect("platform A/B fixture clock")
                 .as_nanos();
-            let fresh_root = std::env::temp_dir().join(format!(
+            let fresh_root = Path::new("/tmp").join(format!(
                 "fastmcp-fnd01-platform-ab-{:032x}",
                 now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),
             ));
@@ -97870,26 +97838,23 @@ fn fallible(value: Option<u8>) {
     fn ordinary_b_r4_registry_selectors_and_frames_are_exact() {
         let run_id = "0123456789abcdef0123456789abcdef";
         let mut selectors = BTreeSet::new();
-        for row in ORDINARY_FAILURE_ROUTE_ORACLE {
-            let route = row.route;
+        for &(route, id, code, stage, expected) in ORDINARY_FAILURE_ROUTE_ORACLE {
             assert!(
                 selectors.insert(route.id()),
                 "duplicate selector: {}",
                 route.id()
             );
-            assert_eq!(route.id(), row.id, "literal route ID: {}", row.id);
-            assert_eq!(route.code(), row.code, "literal route code: {}", row.id);
+            assert_eq!(route.id(), id, "literal route ID: {id}");
+            assert_eq!(route.code(), code, "literal route code: {id}");
             assert_eq!(
                 route.stage().as_str(),
-                row.stage,
-                "literal route stage: {}",
-                row.id,
+                stage,
+                "literal route stage: {id}",
             );
             assert_eq!(
                 route.expected(),
-                row.expected,
-                "literal route expectation: {}",
-                row.id,
+                expected,
+                "literal route expectation: {id}",
             );
             let frame = OrdinaryRouteFixture::new(route, "route frame observation")
                 .frame("attest", run_id);
@@ -97899,7 +97864,7 @@ fn fallible(value: Option<u8>) {
                 [
                     "role=attest".to_owned(),
                     format!("run_id={run_id}"),
-                    format!("expected={}", row.expected),
+                    format!("expected={expected}"),
                     "observed=route frame observation".to_owned(),
                 ],
                 "route {} frame must retain the exact role/run/expected/observed contract",
@@ -97925,10 +97890,10 @@ fn fallible(value: Option<u8>) {
                 String::from_utf8(emitted).expect("entry frame UTF-8"),
                 format!(
                     "FND01ENTRYv1|{}|attest|{}|role=attest @ run_id={run_id} @ expected={} @ observed=route frame observation\n",
-                    row.stage, row.code, row.expected,
+                    stage, code, expected,
                 ),
                 "route {} writer must retain literal frame fields",
-                row.id,
+                id,
             );
         }
     }
