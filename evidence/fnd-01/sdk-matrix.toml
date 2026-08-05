@@ -334,7 +334,7 @@ portable_directory_name_requirement = true
 install_scripts_disabled = true
 current_execution_status = "unverified_current_rch_execution"
 run_from = "repository root"
-required_tools = ["node v24.12.0", "npm 11.14.0", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+required_tools = ["zsh", "npm", "awk", "cmp", "curl", "env", "install", "jq", "mktemp", "node", "perl", "sandbox-exec", "shasum"]
 reproduction_script = '''
 set -eu
 set -o pipefail
@@ -450,7 +450,7 @@ online_offline_equality_required = true
 offline_resolution_status = "unverified_current_execution"
 current_execution_status = "unverified_current_rch_execution"
 run_from = "repository root"
-required_tools = ["Python 3.14.4", "pip 26.1", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+required_tools = ["zsh", "python", "awk", "basename", "cmp", "curl", "find", "install", "mktemp", "perl", "sandbox-exec", "sed", "shasum", "sort"]
 reproduction_script = '''
 set -eu
 set -o pipefail
@@ -565,7 +565,7 @@ required_environment = [
   "DOTNET_ARCHIVE points to the separately byte-bound dotnet-sdk-10.0.100-osx-arm64.tar.gz resolver distribution",
   "DOTNET_SDK points to an independently admitted canonical .NET SDK 10.0.100 runtime; no archive-to-runtime-tree equality or full runtime closure is claimed",
 ]
-required_tools = [".NET SDK 10.0.100", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+required_tools = ["zsh", "dotnet", "awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum"]
 reproduction_script = '''
 set -eu
 set -o pipefail
@@ -728,7 +728,7 @@ network_denial_requirement = true
 current_execution_status = "unverified_current_rch_execution"
 run_from = "repository root"
 required_environment = ["GO_1_25 points to an extracted local go1.25.0 toolchain root"]
-required_tools = ["go1.25.0 darwin/arm64", "jq", "shasum", "/usr/bin/sandbox-exec", "/usr/bin/curl"]
+required_tools = ["zsh", "go", "awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum", "sort"]
 reproduction_script = '''
 set -eu
 set -o pipefail
