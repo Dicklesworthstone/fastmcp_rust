@@ -34313,7 +34313,7 @@ mod ordinary {
         ValidatedFileBinding, ValidatedTargetSnapshot, ACQUISITION_SPOOL_PREFIX,
         CONTROL_LEDGER_PREFIX, CONTROL_SCRATCH_MAXIMA, MAX_ACQUISITION_SPOOL_BYTES,
         MAX_CONTROL_LEDGER_BYTES, MAX_GATE_EXECUTABLE_BYTES, MAX_SPARSE_CACHE_INPUT_BYTES,
-        MAX_SUPPLY_BUNDLE_BYTES,
+        MAX_SUPPLY_BUNDLE_BYTES, MAX_VERIFIER_BYTES,
     };
     use super::{
         FROZEN_POLICY_BYTES, FROZEN_POLICY_SHA256, METADATA_GRAPH_PREFIX, RECORD_SET_PREFIX,
@@ -35215,10 +35215,10 @@ activate = 1\n";
     }
     #[rustfmt::skip]
     const SDK_RUNTIME_SPECS: [SdkRuntimeSpec; 4] = [
-        SdkRuntimeSpec { id: "typescript", checked_lock_id: "typescript-package-lock", primary_tool_id: "npm", additional_tool_ids: &["curl", "jq", "node", "sandbox-exec", "shasum"], network_url: "https://registry.npmjs.org/", network_stderr: "curl: (6) Could not resolve host: registry.npmjs.org", runtime_prefixes: &["fastmcp-fnd01-ts-proof-cache.", "fastmcp-fnd01-ts-proof-online.", "fastmcp-fnd01-ts-proof-offline."] },
-        SdkRuntimeSpec { id: "python", checked_lock_id: "python-requirements-lock", primary_tool_id: "python", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://pypi.org/", network_stderr: "curl: (6) Could not resolve host: pypi.org", runtime_prefixes: &["fastmcp-fnd01-python-proof-stage.", "fastmcp-fnd01-python-proof-online.", "fastmcp-fnd01-python-proof-offline."] },
-        SdkRuntimeSpec { id: "csharp", checked_lock_id: "csharp-packages-lock", primary_tool_id: "dotnet", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://api.nuget.org/v3/index.json", network_stderr: "curl: (6) Could not resolve host: api.nuget.org", runtime_prefixes: &["fastmcp-fnd01-csharp-proof-cache.", "fastmcp-fnd01-csharp-proof-online.", "fastmcp-fnd01-csharp-proof-offline.", "fastmcp-fnd01-csharp-proof-empty.", "fastmcp-fnd01-csharp-proof-home."] },
-        SdkRuntimeSpec { id: "go", checked_lock_id: "go-consumer-sum", primary_tool_id: "go", additional_tool_ids: &["curl", "jq", "sandbox-exec", "shasum"], network_url: "https://proxy.golang.org/", network_stderr: "curl: (6) Could not resolve host: proxy.golang.org", runtime_prefixes: &["fastmcp-fnd01-go-proof-mod-cache.", "fastmcp-fnd01-go-proof-build-cache.", "fastmcp-fnd01-go-proof-online.", "fastmcp-fnd01-go-proof-offline."] },
+        SdkRuntimeSpec { id: "typescript", checked_lock_id: "typescript-package-lock", primary_tool_id: "npm", additional_tool_ids: &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "node", "perl", "sandbox-exec", "shasum"], network_url: "https://registry.npmjs.org/", network_stderr: "curl: (6) Could not resolve host: registry.npmjs.org", runtime_prefixes: &["fastmcp-fnd01-ts-proof-cache.", "fastmcp-fnd01-ts-proof-online.", "fastmcp-fnd01-ts-proof-offline."] },
+        SdkRuntimeSpec { id: "python", checked_lock_id: "python-requirements-lock", primary_tool_id: "python", additional_tool_ids: &["awk", "basename", "cmp", "curl", "find", "install", "mktemp", "perl", "sandbox-exec", "sed", "shasum", "sort"], network_url: "https://pypi.org/", network_stderr: "curl: (6) Could not resolve host: pypi.org", runtime_prefixes: &["fastmcp-fnd01-python-proof-stage.", "fastmcp-fnd01-python-proof-online.", "fastmcp-fnd01-python-proof-offline."] },
+        SdkRuntimeSpec { id: "csharp", checked_lock_id: "csharp-packages-lock", primary_tool_id: "dotnet", additional_tool_ids: &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum"], network_url: "https://api.nuget.org/v3/index.json", network_stderr: "curl: (6) Could not resolve host: api.nuget.org", runtime_prefixes: &["fastmcp-fnd01-csharp-proof-cache.", "fastmcp-fnd01-csharp-proof-online.", "fastmcp-fnd01-csharp-proof-offline.", "fastmcp-fnd01-csharp-proof-empty.", "fastmcp-fnd01-csharp-proof-home."] },
+        SdkRuntimeSpec { id: "go", checked_lock_id: "go-consumer-sum", primary_tool_id: "go", additional_tool_ids: &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum", "sort"], network_url: "https://proxy.golang.org/", network_stderr: "curl: (6) Could not resolve host: proxy.golang.org", runtime_prefixes: &["fastmcp-fnd01-go-proof-mod-cache.", "fastmcp-fnd01-go-proof-build-cache.", "fastmcp-fnd01-go-proof-online.", "fastmcp-fnd01-go-proof-offline."] },
     ];
     struct SdkCatalogExpectation {
         id: &'static str,
@@ -37171,9 +37171,11 @@ activate = 1\n";
     #[rustfmt::skip]
     sdk_record!(SdkExecutionProcessBinding { command_id: String, argv: Vec<String>, argv_sha256: String, cwd: String, environment: Vec<(String, String)>, environment_sha256: String, interpreter: SdkExecutableBinding, primary_tool: SdkExecutableBinding, additional_tools: Vec<SdkExecutableBinding>, reproduction_script_byte_length: u64, reproduction_script_sha256: String, composite_script_observer_sha256: String, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64, runtime_paths: Vec<String>, complete_input_sha256: String });
     #[rustfmt::skip]
-    sdk_record!(SdkRepositoryRuntimeBinding { repository_root: String, head_commit: String, head_tree: String, dirty_inventory: Vec<String>, dirty_inventory_byte_length: u64, dirty_inventory_sha256: String, cargo_lock_sha256: String, rust_toolchain_sha256: String, sdk_complete_input_sha256: String, cargo_profile: String, target_triple: String, features: Vec<String>, rch_profile: String, rch_receipt_sha256: String, run_id: String, worker_id: String, platform: String, verifier_executable: SdkExecutableBinding });
+    sdk_record!(SdkRchReceiptBinding { path: String, byte_length: u64, sha256: String, bytes: Vec<u8> });
     #[rustfmt::skip]
-    sdk_record!(SdkNetworkProbeBinding { argv: Vec<String>, executable: SdkExecutableBinding, exit_code: i64, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding });
+    sdk_record!(SdkRepositoryRuntimeBinding { repository_root: String, head_commit: String, head_tree: String, dirty_inventory: Vec<String>, dirty_inventory_byte_length: u64, dirty_inventory_sha256: String, cargo_lock_sha256: String, rust_toolchain_sha256: String, sdk_complete_input_sha256: String, cargo_profile: String, target_triple: String, features: Vec<String>, rch_receipt: SdkRchReceiptBinding, platform: String, verifier_executable: SdkExecutableBinding });
+    #[rustfmt::skip]
+    sdk_record!(SdkNetworkProbeBinding { argv: Vec<String>, cwd: String, environment_sha256: String, launcher: SdkExecutableBinding, target_tool: SdkExecutableBinding, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64 });
     #[rustfmt::skip]
     sdk_record!(SdkExecutionObservation { sdk_id: String, source_selector: String, source_commit: String, checked_lock_sha256: String, artifact_count: usize, artifact_set_sha256: String, online_closure_sha256: String, offline_closure_sha256: String, output_paths: Vec<String>, process: SdkExecutionProcessBinding, network_probe: SdkNetworkProbeBinding, first_attempt: bool });
 
@@ -37188,6 +37190,7 @@ activate = 1\n";
     #[rustfmt::skip]
     sdk_record!(SdkBatchReceiptBody { batch_started_at_epoch_seconds: u64, batch_finished_at_epoch_seconds: u64, batch_monotonic_started_ns: u64, batch_monotonic_finished_ns: u64, required: usize, discovered: usize, started: usize, passed: usize, first_attempt_passed: usize, retries: usize, skipped: usize, stale: usize, mixed: usize, observations: Vec<SdkExecutionObservation> });
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) struct SdkBatchPlan {
         root: PathBuf,
         static_evidence: ValidatedSdkStaticEvidence,
@@ -37195,16 +37198,19 @@ activate = 1\n";
     }
 
     impl SdkBatchPlan {
+        #[cfg_attr(test, allow(dead_code))]
         pub(crate) fn root(&self) -> &Path {
             &self.root
         }
 
+        #[cfg_attr(test, allow(dead_code))]
         pub(crate) fn peers(&self) -> &[ValidatedSdkStaticPeer] {
             &self.static_evidence.peers
         }
     }
 
     impl ValidatedSdkStaticPeer {
+        #[cfg_attr(test, allow(dead_code))]
         pub(crate) fn expected_output_digests(&self) -> (&str, &str) {
             sdk_expected_output_digests(self)
         }
@@ -37213,6 +37219,7 @@ activate = 1\n";
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ExternalSdkExecutionFacts {
         Absent,
+        #[cfg_attr(test, allow(dead_code))]
         TrustedBatch(Box<SdkExecutionReceipt>),
         ValidationFixture,
         UntrustedReplay(Vec<u8>),
@@ -73489,8 +73496,8 @@ activate = 1\n";
                     && string_sequence_is(
                         &record_string_array(lock, "required_environment", &subject)?,
                         &[
-                            "DOTNET_ARCHIVE points to dotnet-sdk-10.0.100-osx-arm64.tar.gz",
-                            "DOTNET_SDK points to that archive extracted without modification",
+                            "DOTNET_ARCHIVE points to the separately byte-bound dotnet-sdk-10.0.100-osx-arm64.tar.gz resolver distribution",
+                            "DOTNET_SDK points to an independently admitted canonical .NET SDK 10.0.100 runtime; no archive-to-runtime-tree equality or full runtime closure is claimed",
                         ],
                     )
                     && string_sequence_is(
@@ -75040,6 +75047,90 @@ activate = 1\n";
         Ok(value)
     }
 
+    fn sdk_configured_directory(name: &str, subject: &str) -> VResult<String> {
+        let configured = sdk_required_environment(name, subject)?;
+        if configured.ends_with('/')
+            || configured.ends_with("/.")
+            || configured.ends_with("/..")
+        {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
+        }
+        let path = Path::new(&configured);
+        if !path.is_absolute() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
+        }
+        let configured_metadata = fs::symlink_metadata(path)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
+        if configured_metadata.file_type().is_symlink() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
+        }
+        let canonical = sdk_canonical_utf8(path, subject)?;
+        let metadata = fs::symlink_metadata(&canonical)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
+        }
+        Ok(canonical)
+    }
+
+    fn sdk_directory_has_no_write_bits(metadata: &fs::Metadata) -> bool {
+        #[cfg(unix)]
+        { metadata.mode() & 0o222 == 0 }
+        #[cfg(not(unix))]
+        { let _ = metadata; false }
+    }
+
+    fn sdk_configured_home(subject: &str) -> VResult<String> {
+        let configured = sdk_required_environment("FND01_SDK_HOME", subject)?;
+        let home = sdk_configured_directory("FND01_SDK_HOME", subject)?;
+        if configured != home {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject)
+                .at("canonical HOME"));
+        }
+        let path = Path::new(&home);
+        let before = fs::symlink_metadata(path)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("HOME"))?;
+        let mut entries = fs::read_dir(path)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("HOME"))?;
+        if !sdk_directory_has_no_write_bits(&before) || entries.next().is_some() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject)
+                .at("HOME must be empty and have no write bits"));
+        }
+        let after = fs::symlink_metadata(path)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("HOME"))?;
+        if after.file_type().is_symlink()
+            || !after.is_dir()
+            || !sdk_directory_has_no_write_bits(&after)
+        {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject)
+                .at("stable HOME boundary"));
+        }
+        Ok(home)
+    }
+
+    fn sdk_configured_parent(name: &str, subject: &str) -> VResult<PathBuf> {
+        let configured = sdk_required_environment(name, subject)?;
+        let path = Path::new(&configured);
+        if !path.is_absolute() {
+            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name));
+        }
+        let parent = path.parent()
+            .ok_or_else(|| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
+        Ok(PathBuf::from(sdk_canonical_utf8(parent, subject)?))
+    }
+
+    fn sdk_system_tool_path(id: &str, subject: &str) -> VResult<PathBuf> {
+        let name = match id {
+            "awk" => "awk", "basename" => "basename", "cmp" => "cmp", "curl" => "curl",
+            "env" => "env", "find" => "find", "install" => "install", "mktemp" => "mktemp",
+            "perl" => "perl",
+            "sandbox-exec" => "sandbox-exec", "sed" => "sed", "shasum" => "shasum",
+            "sort" => "sort",
+            _ => return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("tool ID")),
+        };
+        Ok(PathBuf::from("/usr/bin").join(name))
+    }
+
     fn sdk_expected_tool(id: &str, subject: &str) -> VResult<SdkExecutableBinding> {
         let (path, version) = match id {
             "zsh" => (PathBuf::from("/bin/zsh"), "system"),
@@ -75047,15 +75138,15 @@ activate = 1\n";
             "npm" => (PathBuf::from(sdk_required_environment("FND01_SDK_NPM", subject)?), "11.14.0"),
             "python" => (PathBuf::from(sdk_required_environment("FND01_SDK_PYTHON3", subject)?), "Python 3.14.4"),
             "jq" => (PathBuf::from(sdk_required_environment("FND01_SDK_JQ", subject)?), "byte-bound"),
-            "shasum" => (PathBuf::from("/usr/bin/shasum"), "system"),
-            "sandbox-exec" => (PathBuf::from("/usr/bin/sandbox-exec"), "system"),
-            "curl" => (PathBuf::from("/usr/bin/curl"), "system"),
+            "awk" | "basename" | "cmp" | "curl" | "env" | "find" | "install" | "mktemp" | "perl"
+            | "sandbox-exec" | "sed" | "shasum" | "sort" =>
+                (sdk_system_tool_path(id, subject)?, "system"),
             "dotnet" => (
-                PathBuf::from(sdk_required_environment("DOTNET_SDK", subject)?).join("dotnet"),
+                PathBuf::from(sdk_configured_directory("DOTNET_SDK", subject)?).join("dotnet"),
                 "10.0.100",
             ),
             "go" => (
-                PathBuf::from(sdk_required_environment("GO_1_25", subject)?).join("bin/go"),
+                PathBuf::from(sdk_configured_directory("GO_1_25", subject)?).join("bin/go"),
                 "go version go1.25.0 darwin/arm64",
             ),
             _ => return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("tool ID")),
@@ -75063,39 +75154,160 @@ activate = 1\n";
         sdk_executable_binding(id, &path, version, subject)
     }
 
-    fn sdk_expected_child_environment(subject: &str) -> VResult<Vec<(String, String)>> {
-        let mut directories = [
-            "node", "npm", "python", "jq", "shasum", "sandbox-exec", "curl", "dotnet", "go",
-        ]
-        .into_iter()
-        .map(|id| sdk_expected_tool(id, subject))
-        .collect::<VResult<Vec<_>>>()?
-        .iter()
-        .filter_map(|tool| Path::new(&tool.path).parent().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
-        for name in ["FND01_SDK_NODE", "FND01_SDK_NPM", "FND01_SDK_PYTHON3", "FND01_SDK_JQ"] {
-            let configured = sdk_required_environment(name, subject)?;
-            let parent = Path::new(&configured)
-                .parent()
-                .ok_or_else(|| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(name))?;
-            directories.push(PathBuf::from(sdk_canonical_utf8(parent, subject)?));
-        }
-        directories.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-        directories.sort();
-        directories.dedup();
+    enum SdkPeerChildEnvironment {
+        TypeScript,
+        Python,
+        Csharp { archive: String, sdk: String },
+        Go { root: String },
+    }
+
+    fn sdk_closed_child_environment(
+        home: String,
+        path: String,
+        peer: SdkPeerChildEnvironment,
+    ) -> Vec<(String, String)> {
         let mut environment = vec![
-            ("DOTNET_ARCHIVE".to_owned(), sdk_canonical_utf8(Path::new(&sdk_required_environment("DOTNET_ARCHIVE", subject)?), subject)?),
-            ("DOTNET_SDK".to_owned(), sdk_required_environment("DOTNET_SDK", subject)?),
-            ("GO_1_25".to_owned(), sdk_required_environment("GO_1_25", subject)?),
-            ("HOME".to_owned(), sdk_canonical_utf8(Path::new(&sdk_required_environment("FND01_SDK_HOME", subject)?), subject)?),
+            ("HOME".to_owned(), home),
             ("LANG".to_owned(), "C".to_owned()),
             ("LC_ALL".to_owned(), "C".to_owned()),
             ("NO_COLOR".to_owned(), "1".to_owned()),
-            ("PATH".to_owned(), directories.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>().join(":")),
+            ("PATH".to_owned(), path),
             ("TMPDIR".to_owned(), "/tmp".to_owned()),
         ];
+        match peer {
+            SdkPeerChildEnvironment::TypeScript => environment.extend([
+                ("NPM_CONFIG_USERCONFIG".to_owned(), "/dev/null".to_owned()),
+                ("NPM_CONFIG_GLOBALCONFIG".to_owned(), "/dev/null".to_owned()),
+            ]),
+            SdkPeerChildEnvironment::Python => environment.extend([
+                ("PIP_CONFIG_FILE".to_owned(), "/dev/null".to_owned()),
+                ("PYTHONNOUSERSITE".to_owned(), "1".to_owned()),
+            ]),
+            SdkPeerChildEnvironment::Csharp { archive, sdk } => environment.extend([
+                ("DOTNET_ARCHIVE".to_owned(), archive),
+                ("DOTNET_ROOT".to_owned(), sdk.clone()),
+                ("DOTNET_SDK".to_owned(), sdk),
+            ]),
+            SdkPeerChildEnvironment::Go { root } => environment.extend([
+                ("GOENV".to_owned(), "off".to_owned()),
+                ("GOROOT".to_owned(), root.clone()),
+                ("GO_1_25".to_owned(), root),
+            ]),
+        }
         environment.sort_unstable();
-        Ok(environment)
+        environment
+    }
+
+    fn sdk_expected_child_environment(sdk_id: &str, subject: &str) -> VResult<Vec<(String, String)>> {
+        let (configured_path_order, peer): (&[&str], SdkPeerChildEnvironment) = match sdk_id {
+            "typescript" => (
+                &["FND01_SDK_NPM", "FND01_SDK_NODE", "FND01_SDK_JQ"],
+                SdkPeerChildEnvironment::TypeScript,
+            ),
+            "python" => (
+                &["FND01_SDK_PYTHON3"],
+                SdkPeerChildEnvironment::Python,
+            ),
+            "csharp" => {
+                let archive = sdk_canonical_utf8(
+                    Path::new(&sdk_required_environment("DOTNET_ARCHIVE", subject)?),
+                    subject,
+                )?;
+                let sdk = sdk_configured_directory("DOTNET_SDK", subject)?;
+                (&["FND01_SDK_JQ"], SdkPeerChildEnvironment::Csharp { archive, sdk })
+            }
+            "go" => {
+                let root = sdk_configured_directory("GO_1_25", subject)?;
+                (&["FND01_SDK_JQ"], SdkPeerChildEnvironment::Go { root })
+            }
+            _ => return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(sdk_id)),
+        };
+        let mut directories = Vec::new();
+        for name in configured_path_order {
+            let directory = sdk_configured_parent(name, subject)?;
+            if !directories.contains(&directory) { directories.push(directory); }
+        }
+        for directory in [PathBuf::from("/usr/bin"), PathBuf::from("/bin")] {
+            if !directories.contains(&directory) { directories.push(directory); }
+        }
+        let path = std::env::join_paths(&directories)
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("PATH"))?
+            .into_string()
+            .map_err(|_| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("PATH"))?;
+        Ok(sdk_closed_child_environment(
+            sdk_configured_home(subject)?,
+            path,
+            peer,
+        ))
+    }
+
+    fn sdk_path_program(id: &str, subject: &str) -> VResult<Option<&'static str>> {
+        Ok(match id {
+            "node" => Some("node"), "npm" => Some("npm"), "python" => Some("python3"),
+            "jq" => Some("jq"), "awk" => Some("awk"), "basename" => Some("basename"),
+            "cmp" => Some("cmp"), "curl" => Some("curl"), "env" => Some("env"),
+            "find" => Some("find"), "install" => Some("install"), "mktemp" => Some("mktemp"),
+            "perl" => Some("perl"),
+            "sandbox-exec" => Some("sandbox-exec"), "sed" => Some("sed"),
+            "shasum" => Some("shasum"), "sort" => Some("sort"), "dotnet" | "go" => None,
+            _ => return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(id)),
+        })
+    }
+
+    fn sdk_is_executable_file(metadata: &fs::Metadata) -> bool {
+        if !metadata.is_file() { return false; }
+        #[cfg(unix)]
+        { metadata.mode() & 0o111 != 0 }
+        #[cfg(not(unix))]
+        { false }
+    }
+
+    fn sdk_validate_path_tool_bindings(process: &SdkExecutionProcessBinding, subject: &str) -> VResult<()> {
+        let path = process.environment.iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value)
+            .ok_or_else(|| Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("PATH"))?;
+        let directories = std::env::split_paths(path).collect::<Vec<_>>();
+        for tool in std::iter::once(&process.primary_tool).chain(&process.additional_tools) {
+            let Some(program) = sdk_path_program(&tool.id, subject)? else { continue; };
+            let mut selected = None;
+            for directory in &directories {
+                let candidate = directory.join(program);
+                if fs::metadata(&candidate).is_ok_and(|metadata| sdk_is_executable_file(&metadata)) {
+                    selected = Some(sdk_canonical_utf8(&candidate, subject)?);
+                    break;
+                }
+            }
+            if selected.as_deref() != Some(tool.path.as_str()) {
+                return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at(&tool.id));
+            }
+        }
+        Ok(())
+    }
+
+    fn sdk_validate_additional_tool_ids(
+        tools: &[SdkExecutableBinding],
+        expected: &[&str],
+        subject: &str,
+    ) -> VResult<()> {
+        if tools.iter().map(|tool| tool.id.as_str()).ne(expected.iter().copied()) {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("external command closure"));
+        }
+        Ok(())
+    }
+
+    fn sdk_validate_closed_environment(
+        observed: &[(String, String)],
+        observed_sha256: &str,
+        expected: &[(String, String)],
+        subject: &str,
+    ) -> VResult<()> {
+        if observed != expected || observed_sha256 != sdk_environment_sha256(observed) {
+            return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject)
+                .at("closed child environment"));
+        }
+        Ok(())
     }
 
     fn sdk_identifier(value: &str) -> bool {
@@ -75103,6 +75315,202 @@ activate = 1\n";
             && value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
             })
+    }
+
+    struct SdkRchLocal<'a> {
+        source_revision: &'a str,
+        source_tree: &'a str,
+        dirty_inventory_byte_length: u64,
+        dirty_inventory_sha256: &'a str,
+        rust_toolchain_sha256: &'a str,
+        cargo_lock_sha256: &'a str,
+        sdk_complete_input_sha256: &'a str,
+        verifier_source_sha256: &'a str,
+        harness_source_sha256: &'a str,
+        executable: &'a SdkExecutableBinding,
+    }
+
+    fn sdk_rch_error(field: &str) -> Diagnostic {
+        Diagnostic::error("E_SDK_RCH_RECEIPT", "RCH SDK build receipt").at(field)
+    }
+
+    fn sdk_rch_string<'a>(
+        object: &'a BTreeMap<String, StrictJson>,
+        field: &str,
+    ) -> VResult<&'a str> {
+        sdk_json_string(object, field, "RCH SDK build receipt")
+            .map_err(|_| sdk_rch_error(field))
+    }
+
+    fn sdk_rch_u64(object: &BTreeMap<String, StrictJson>, field: &str) -> VResult<u64> {
+        sdk_json_u64(object, field, "RCH SDK build receipt")
+            .map_err(|_| sdk_rch_error(field))
+    }
+
+    fn sdk_rch_validate_string_array(
+        object: &BTreeMap<String, StrictJson>,
+        field: &str,
+        expected: &[&str],
+    ) -> VResult<()> {
+        let values = sdk_json_array(
+            sdk_json_field(object, field, "RCH SDK build receipt")
+                .map_err(|_| sdk_rch_error(field))?,
+            "RCH SDK build receipt",
+            field,
+        ).map_err(|_| sdk_rch_error(field))?;
+        if values.len() != expected.len() || values.iter().zip(expected).any(|(value, expected)| {
+            !matches!(value, StrictJson::String(value) if value.as_str() == *expected)
+        }) {
+            return Err(sdk_rch_error(field));
+        }
+        Ok(())
+    }
+
+    fn sdk_validate_rch_receipt(bytes: &[u8], local: &SdkRchLocal<'_>) -> VResult<()> {
+        const FIELDS: &[&str] = &[
+            "format", "rch_version", "execution_location", "selected_worker", "run_id",
+            "source_revision", "source_tree", "dirty_inventory_byte_length",
+            "dirty_inventory_sha256", "rust_toolchain", "rust_toolchain_sha256",
+            "cargo_lock_sha256", "sdk_complete_input_sha256", "cargo_profile",
+            "target_triple", "features", "public_surface", "cargo_command",
+            "verifier_source_sha256", "harness_source_sha256", "executable_byte_length",
+            "executable_sha256", "success",
+        ];
+        const CARGO_COMMAND: &[&str] = &[
+            "cargo", "build", "--locked", "--jobs", "2", "--profile", "dev", "--target",
+            "aarch64-apple-darwin", "-p", "fastmcp-rust", "--example",
+            "fnd_01_evidence_harness",
+        ];
+        let value = parse_strict_json(bytes, "RCH SDK build receipt")
+            .map_err(|_| sdk_rch_error("strict JSON"))?;
+        let object = sdk_json_object(&value, "RCH SDK build receipt", "root")
+            .map_err(|_| sdk_rch_error("root"))?;
+        sdk_json_exact_fields(object, FIELDS, &[], "RCH SDK build receipt")
+            .map_err(|_| sdk_rch_error("exact fields"))?;
+        let success = sdk_json_bool(object, "success", "RCH SDK build receipt")
+            .map_err(|_| sdk_rch_error("success"))?;
+        for field in [
+            "dirty_inventory_sha256", "rust_toolchain_sha256", "cargo_lock_sha256",
+            "sdk_complete_input_sha256", "verifier_source_sha256", "harness_source_sha256",
+            "executable_sha256",
+        ] {
+            validate_sha256(sdk_rch_string(object, field)?, "RCH SDK build receipt")
+                .map_err(|_| sdk_rch_error(field))?;
+        }
+        if sdk_rch_string(object, "format")? != "fastmcp-rch-sdk-build-v1"
+            || sdk_rch_string(object, "execution_location")? != "remote"
+            || !sdk_identifier(sdk_rch_string(object, "rch_version")?)
+            || !sdk_identifier(sdk_rch_string(object, "selected_worker")?)
+            || !sdk_identifier(sdk_rch_string(object, "run_id")?)
+            || sdk_rch_string(object, "source_revision")? != local.source_revision
+            || sdk_rch_string(object, "source_tree")? != local.source_tree
+            || sdk_rch_u64(object, "dirty_inventory_byte_length")?
+                != local.dirty_inventory_byte_length
+            || sdk_rch_string(object, "dirty_inventory_sha256")?
+                != local.dirty_inventory_sha256
+            || sdk_rch_string(object, "rust_toolchain")? != "nightly-2026-07-11"
+            || sdk_rch_string(object, "rust_toolchain_sha256")?
+                != local.rust_toolchain_sha256
+            || sdk_rch_string(object, "cargo_lock_sha256")? != local.cargo_lock_sha256
+            || sdk_rch_string(object, "sdk_complete_input_sha256")?
+                != local.sdk_complete_input_sha256
+            || sdk_rch_string(object, "cargo_profile")? != "dev"
+            || sdk_rch_string(object, "target_triple")? != "aarch64-apple-darwin"
+            || sdk_rch_string(object, "public_surface")?
+                != "fastmcp-rust/example:fnd_01_evidence_harness:sdk-batch-run-json"
+            || sdk_rch_string(object, "verifier_source_sha256")?
+                != local.verifier_source_sha256
+            || sdk_rch_string(object, "harness_source_sha256")?
+                != local.harness_source_sha256
+            || sdk_rch_u64(object, "executable_byte_length")? != local.executable.byte_length
+            || sdk_rch_string(object, "executable_sha256")?
+                != local.executable.sha256.as_str()
+            || !success
+        {
+            return Err(sdk_rch_error("locally observed fields"));
+        }
+        sdk_rch_validate_string_array(object, "features", &[])?;
+        sdk_rch_validate_string_array(object, "cargo_command", CARGO_COMMAND)
+    }
+
+    fn sdk_rch_metadata_valid(metadata: &fs::Metadata) -> bool {
+        #[cfg(unix)]
+        { metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o222 == 0 }
+        #[cfg(not(unix))]
+        { let _ = metadata; false }
+    }
+
+    fn sdk_rch_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+        #[cfg(unix)]
+        { left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len() }
+        #[cfg(not(unix))]
+        { let _ = (left, right); false }
+    }
+
+    fn sdk_rch_receipt_binding(root: &Path, local: &SdkRchLocal<'_>) -> VResult<SdkRchReceiptBinding> {
+        const MAX_BYTES: u64 = 65_536;
+        let configured = sdk_required_environment(
+            "FND01_SDK_RCH_RECEIPT_PATH",
+            "RCH SDK build receipt",
+        )?;
+        let raw_path = Path::new(&configured);
+        if !raw_path.is_absolute() {
+            return Err(sdk_rch_error("absolute path"));
+        }
+        let before = fs::symlink_metadata(raw_path).map_err(|_| sdk_rch_error("path metadata"))?;
+        if before.file_type().is_symlink() || !sdk_rch_metadata_valid(&before)
+            || before.len() == 0 || before.len() > MAX_BYTES
+        {
+            return Err(sdk_rch_error("read-only regular file"));
+        }
+        let canonical = sdk_canonical_utf8(raw_path, "RCH SDK build receipt")?;
+        if canonical != configured || Path::new(&canonical).starts_with(root) {
+            return Err(sdk_rch_error("canonical path outside repository"));
+        }
+        let mut file = File::open(&canonical).map_err(|_| sdk_rch_error("open"))?;
+        let opened = file.metadata().map_err(|_| sdk_rch_error("open metadata"))?;
+        if !sdk_rch_metadata_valid(&opened) || !sdk_rch_same_file(&before, &opened) {
+            return Err(sdk_rch_error("open identity"));
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take(MAX_BYTES + 1).read_to_end(&mut bytes)
+            .map_err(|_| sdk_rch_error("bounded read"))?;
+        let after_file = file.metadata().map_err(|_| sdk_rch_error("post-read descriptor"))?;
+        let after_path = fs::symlink_metadata(&canonical)
+            .map_err(|_| sdk_rch_error("post-read path"))?;
+        if !sdk_rch_metadata_valid(&after_file) || !sdk_rch_metadata_valid(&after_path)
+            || !sdk_rch_same_file(&before, &after_file)
+            || !sdk_rch_same_file(&before, &after_path)
+            || sdk_canonical_utf8(Path::new(&canonical), "RCH SDK build receipt")? != canonical
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != before.len()
+        {
+            return Err(sdk_rch_error("stable identity and length"));
+        }
+        sdk_validate_rch_receipt(&bytes, local)?;
+        Ok(SdkRchReceiptBinding {
+            path: canonical,
+            byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: lower_hex(&sha256(&bytes)),
+            bytes,
+        })
+    }
+
+    fn sdk_validate_rch_reopen(
+        frozen: &SdkRchReceiptBinding,
+        reopened: &SdkRchReceiptBinding,
+    ) -> VResult<()> {
+        if frozen != reopened {
+            return Err(sdk_rch_error("receipt changed between validation phases"));
+        }
+        Ok(())
+    }
+
+    fn sdk_validate_verifier_source_bound(byte_length: u64) -> VResult<()> {
+        if byte_length > MAX_VERIFIER_BYTES {
+            return Err(Diagnostic::error("E_FILE_BOUND", "SDK verifier source")
+                .at(byte_length.to_string()));
+        }
+        Ok(())
     }
 
     fn sdk_repository_runtime(
@@ -75129,70 +75537,73 @@ activate = 1\n";
                     .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("dirty UTF-8"))
             })
             .collect::<VResult<Vec<_>>>()?;
+        let head_commit = sdk_git_oid(root, "HEAD^{commit}", subject)?;
+        let head_tree = sdk_git_oid(root, "HEAD^{tree}", subject)?;
         let cargo_lock = read_bounded(&root.join("Cargo.lock"), 16_777_216, subject)?;
         let rust_toolchain = read_bounded(&root.join("rust-toolchain.toml"), 65_536, subject)?;
-        let cargo_profile = sdk_required_environment("FND01_SDK_CARGO_PROFILE", subject)?;
-        let expected_profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-        if cargo_profile != expected_profile {
-            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject)
-                .at("binary/profile mismatch"));
-        }
-        let target_triple = sdk_required_environment("FND01_SDK_TARGET_TRIPLE", subject)?;
-        if target_triple != "aarch64-apple-darwin"
+        if rust_toolchain != EXACT_RUST_TOOLCHAIN_TOML.as_bytes()
+            || !cfg!(debug_assertions)
             || !cfg!(all(target_os = "macos", target_arch = "aarch64"))
         {
-            return Err(Diagnostic::error("E_SDK_RUNNER_PLATFORM", subject).at(target_triple));
+            return Err(Diagnostic::error("E_SDK_RUNNER_PLATFORM", subject).at("build configuration"));
         }
-        let features_text = std::env::var("FND01_SDK_FEATURES").unwrap_or_default();
-        let features = if features_text.is_empty() {
-            Vec::new()
-        } else {
-            features_text.split(',').map(str::to_owned).collect::<Vec<_>>()
-        };
-        if features.iter().any(|value| !sdk_identifier(value))
-            || features.windows(2).any(|window| window[0] >= window[1])
-        {
-            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("features"));
-        }
-        let rch_profile = sdk_required_environment("FND01_SDK_RCH_PROFILE", subject)?;
-        let rch_receipt_sha256 =
-            sdk_required_environment("FND01_SDK_RCH_RECEIPT_SHA256", subject)?;
-        validate_sha256(&rch_receipt_sha256, subject)?;
-        if !rch_profile.starts_with("rch:") {
-            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("RCH profile"));
-        }
-        let run_id = sdk_required_environment("FND01_SDK_RUN_ID", subject)?;
-        let worker_id = sdk_required_environment("FND01_SDK_WORKER_ID", subject)?;
-        if !sdk_identifier(&run_id) || !sdk_identifier(&worker_id) {
-            return Err(Diagnostic::error("E_SDK_RUNNER_CONFIGURATION", subject).at("run/worker ID"));
-        }
+        let cargo_profile = "dev".to_owned();
+        let target_triple = "aarch64-apple-darwin".to_owned();
+        let features = Vec::new();
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let current_executable = std::env::current_exe()
             .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current exe"))?;
+        let verifier_executable = sdk_executable_binding(
+            "fnd01-sdk-runner", &current_executable, "v3", subject,
+        )?;
+        let dirty_inventory_byte_length = u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX);
+        let dirty_inventory_sha256 = lower_hex(&sha256(&dirty_bytes));
+        let cargo_lock_sha256 = lower_hex(&sha256(&cargo_lock));
+        let rust_toolchain_sha256 = lower_hex(&sha256(&rust_toolchain));
+        let verifier_source = read_bounded(
+            &root.join("crates/fastmcp/tests/fnd_01_dependency_evidence.rs"),
+            MAX_VERIFIER_BYTES,
+            subject,
+        )?;
+        sdk_validate_verifier_source_bound(
+            u64::try_from(verifier_source.len()).unwrap_or(u64::MAX),
+        )?;
+        let harness_source = read_bounded(
+            &root.join("crates/fastmcp/examples/fnd_01_evidence_harness.rs"),
+            1_048_576,
+            subject,
+        )?;
+        let verifier_source_sha256 = lower_hex(&sha256(&verifier_source));
+        let harness_source_sha256 = lower_hex(&sha256(&harness_source));
+        let local = SdkRchLocal {
+            source_revision: &head_commit,
+            source_tree: &head_tree,
+            dirty_inventory_byte_length,
+            dirty_inventory_sha256: &dirty_inventory_sha256,
+            rust_toolchain_sha256: &rust_toolchain_sha256,
+            cargo_lock_sha256: &cargo_lock_sha256,
+            sdk_complete_input_sha256: &static_evidence.complete_input_sha256,
+            verifier_source_sha256: &verifier_source_sha256,
+            harness_source_sha256: &harness_source_sha256,
+            executable: &verifier_executable,
+        };
+        let rch_receipt = sdk_rch_receipt_binding(root, &local)?;
         Ok(SdkRepositoryRuntimeBinding {
             repository_root,
-            head_commit: sdk_git_oid(root, "HEAD^{commit}", subject)?,
-            head_tree: sdk_git_oid(root, "HEAD^{tree}", subject)?,
+            head_commit,
+            head_tree,
             dirty_inventory,
-            dirty_inventory_byte_length: u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX),
-            dirty_inventory_sha256: lower_hex(&sha256(&dirty_bytes)),
-            cargo_lock_sha256: lower_hex(&sha256(&cargo_lock)),
-            rust_toolchain_sha256: lower_hex(&sha256(&rust_toolchain)),
+            dirty_inventory_byte_length,
+            dirty_inventory_sha256,
+            cargo_lock_sha256,
+            rust_toolchain_sha256,
             sdk_complete_input_sha256: static_evidence.complete_input_sha256.clone(),
             cargo_profile,
             target_triple,
             features,
-            rch_profile,
-            rch_receipt_sha256,
-            run_id,
-            worker_id,
+            rch_receipt,
             platform,
-            verifier_executable: sdk_executable_binding(
-                "fnd01-sdk-runner",
-                &current_executable,
-                "v3",
-                subject,
-            )?,
+            verifier_executable,
         })
     }
 
@@ -75205,6 +75616,56 @@ activate = 1\n";
             || binding.sha256 != lower_hex(&sha256(&binding.raw))
         {
             return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("transcript"));
+        }
+        Ok(())
+    }
+
+    fn sdk_validate_network_probe(
+        probe: &SdkNetworkProbeBinding,
+        process: &SdkExecutionProcessBinding,
+        body: &SdkBatchReceiptBody,
+        runtime_spec: &SdkRuntimeSpec,
+        expected_launcher: &SdkExecutableBinding,
+        expected_target: &SdkExecutableBinding,
+    ) -> VResult<()> {
+        let subject = "trusted SDK network probe";
+        sdk_validate_transcript(&probe.stdout, subject)?;
+        sdk_validate_transcript(&probe.stderr, subject)?;
+        let expected_stderr = format!("{}\n", runtime_spec.network_stderr);
+        let expected_argv = [
+            expected_launcher.path.as_str(),
+            "-p",
+            "(version 1) (allow default) (deny network*)",
+            expected_target.path.as_str(),
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "2",
+            runtime_spec.network_url,
+        ];
+        let elapsed = probe.monotonic_finished_ns.checked_sub(probe.monotonic_started_ns);
+        if probe.argv.len() != expected_argv.len()
+            || probe.argv.iter().zip(expected_argv).any(|(observed, expected)| observed != expected)
+            || probe.argv.first().map(String::as_str) != Some(probe.launcher.path.as_str())
+            || probe.argv.get(3).map(String::as_str) != Some(probe.target_tool.path.as_str())
+            || probe.cwd != process.cwd
+            || probe.environment_sha256 != process.environment_sha256
+            || &probe.launcher != expected_launcher
+            || &probe.target_tool != expected_target
+            || probe.exit_code != 6
+            || !probe.stdout.raw.is_empty()
+            || probe.stderr.raw.as_slice() != expected_stderr.as_bytes()
+            || probe.started_at_epoch_seconds < process.finished_at_epoch_seconds
+            || probe.started_at_epoch_seconds < body.batch_started_at_epoch_seconds
+            || probe.started_at_epoch_seconds > probe.finished_at_epoch_seconds
+            || probe.finished_at_epoch_seconds > body.batch_finished_at_epoch_seconds
+            || probe.monotonic_started_ns < process.monotonic_finished_ns
+            || probe.monotonic_started_ns < body.batch_monotonic_started_ns
+            || probe.monotonic_started_ns > probe.monotonic_finished_ns
+            || probe.monotonic_finished_ns > body.batch_monotonic_finished_ns
+            || elapsed != Some(probe.elapsed_ns)
+        {
+            return Err(Diagnostic::error("E_SDK_NETWORK_PROBE", subject));
         }
         Ok(())
     }
@@ -75341,6 +75802,10 @@ activate = 1\n";
             Path::new(&receipt.producer_runtime.repository_root),
             static_evidence,
         )?;
+        sdk_validate_rch_reopen(
+            &receipt.producer_runtime.rch_receipt,
+            &current.rch_receipt,
+        )?;
         if receipt.producer_runtime != current
             || !receipt.producer_runtime.dirty_inventory.is_empty()
             || receipt.producer_runtime.dirty_inventory_byte_length != 0
@@ -75381,19 +75846,29 @@ activate = 1\n";
             let process = &observation.process;
             let probe = &observation.network_probe;
             let (expected_primary, expected_secondary) = sdk_expected_output_digests(peer);
-            let observed_stderr = std::str::from_utf8(&probe.stderr.raw)
-                .map_err(|_| Diagnostic::error("E_SDK_NETWORK_PROBE", subject))?
-                .trim_end_matches('\n');
             sdk_validate_transcript(&process.stdout, subject)?;
             sdk_validate_transcript(&process.stderr, subject)?;
-            sdk_validate_transcript(&probe.stdout, subject)?;
-            sdk_validate_transcript(&probe.stderr, subject)?;
-            let observed_additional_ids = process
-                .additional_tools
-                .iter()
-                .map(|tool| tool.id.as_str())
-                .collect::<Vec<_>>();
-            let expected_environment = sdk_expected_child_environment(subject)?;
+            sdk_validate_additional_tool_ids(
+                &process.additional_tools,
+                runtime_spec.additional_tool_ids,
+                subject,
+            )?;
+            let expected_environment = sdk_expected_child_environment(&peer.sdk_id, subject)?;
+            sdk_validate_closed_environment(
+                &process.environment,
+                &process.environment_sha256,
+                &expected_environment,
+                subject,
+            )?;
+            sdk_validate_path_tool_bindings(process, subject)?;
+            sdk_validate_network_probe(
+                probe,
+                process,
+                body,
+                runtime_spec,
+                &sdk_expected_tool("sandbox-exec", subject)?,
+                &sdk_expected_tool("curl", subject)?,
+            )?;
             let runtime_prefixes = runtime_spec.runtime_prefixes;
             let runtime_paths = &process.runtime_paths;
             let runtime_set = runtime_paths.iter().collect::<BTreeSet<_>>();
@@ -75431,17 +75906,6 @@ activate = 1\n";
                 expected_secondary,
                 peer.checked_lock_sha256.as_str(),
             ];
-            let expected_network_argv = [
-                "/usr/bin/sandbox-exec",
-                "-p",
-                "(version 1) (allow default) (deny network*)",
-                "/usr/bin/curl",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "2",
-                runtime_spec.network_url,
-            ];
             if observation.sdk_id != peer.sdk_id
                 || observation.source_selector != peer.source_selector
                 || observation.source_commit != peer.source_commit
@@ -75455,12 +75919,9 @@ activate = 1\n";
                 || process.argv != ["/bin/zsh", "-f", "-s"]
                 || process.argv_sha256 != sdk_sequence_sha256(b"FND01SDKARGVv3\0", &process.argv)
                 || process.cwd != receipt.producer_runtime.repository_root
-                || process.environment != expected_environment
-                || process.environment_sha256 != sdk_environment_sha256(&process.environment)
                 || process.interpreter != sdk_expected_tool("zsh", subject)?
                 || process.primary_tool
                     != sdk_expected_tool(runtime_spec.primary_tool_id, subject)?
-                || observed_additional_ids != runtime_spec.additional_tool_ids
                 || process.additional_tools.iter().any(|tool| {
                     !sdk_expected_tool(&tool.id, subject)
                         .is_ok_and(|expected| &expected == tool)
@@ -75494,16 +75955,6 @@ activate = 1\n";
                     .iter()
                     .zip(expected_output_digests)
                     .any(|(observed, expected)| observed.as_str() != expected)
-                || probe.argv.len() != expected_network_argv.len()
-                || probe
-                    .argv
-                    .iter()
-                    .zip(expected_network_argv)
-                    .any(|(observed, expected)| observed != expected)
-                || probe.executable != sdk_expected_tool("curl", subject)?
-                || probe.exit_code != 6
-                || !probe.stdout.raw.is_empty()
-                || observed_stderr != runtime_spec.network_stderr
             {
                 return Err(Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at(&peer.sdk_id));
             }
@@ -76845,7 +77296,60 @@ activate = 1\n";
         lower_hex(ring_digest(&SHA1_FOR_LEGACY_USE_ONLY, &canonical).as_ref())
     }
 
-    fn validate_core_conformance_sources(document: &toml::Value, root: &Path) -> VResult<()> {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct CoreConformanceAcceptedBinding {
+        manifest_sha256: [u8; 32],
+        artifact_tree_sha256: [u8; 32],
+    }
+
+    fn validate_core_conformance_license_provenance(document: &toml::Value) -> VResult<()> {
+        for (id, revision, blob, byte_length, digest, declared_license) in [
+            (
+                "core_2024_11_05",
+                "48234828288ec5e5011398f17b8736f61645f130",
+                "3d48435454b105021b4f777c11b6b07d8d2ffea3",
+                1_071usize,
+                "5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d",
+                "MIT",
+            ),
+            (
+                "core_2026_07_28",
+                "5f5440bb26a62e2cf3440b92da5a667efa03b267",
+                "4a93985763241755401a10678395303de4e720ba",
+                12_227usize,
+                "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+                "repository_transition_notice",
+            ),
+            (
+                "conformance_2026_07_28_baseline",
+                "49103de6ed70804e940637bf3e9e29e4a3f54e64",
+                "4a93985763241755401a10678395303de4e720ba",
+                12_227usize,
+                "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+                "repository_transition_notice",
+            ),
+        ] {
+            let subject = format!("license_provenance.{id}");
+            let record = pointer_get(document, &format!("/license_provenance/{id}"), &subject)?
+                .as_table()
+                .ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject))?;
+            if record_string(record, "repository_revision", &subject)? != revision
+                || record_string(record, "git_blob_sha1", &subject)? != blob
+                || record_usize(record, "byte_length", &subject)? != byte_length
+                || record_string(record, "sha256", &subject)? != digest
+                || record_string(record, "declared_license", &subject)? != declared_license
+                || !record_string(record, "retrieval_url", &subject)?.contains(revision)
+            {
+                return Err(Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_core_conformance_sources(
+        document: &toml::Value,
+        admitted_files: &[LoadedFile],
+    ) -> VResult<CoreConformanceAcceptedBinding> {
         for (section, field, expected) in [
             ("core", "protocol_version", "2026-07-28"),
             ("core", "tag", "2026-07-28"),
@@ -76858,6 +77362,11 @@ activate = 1\n";
                 "core",
                 "commit_tree",
                 "8957e31e8ecd6fd7f52df82d44b3827cb44cecb1",
+            ),
+            (
+                "core",
+                "dated_spec_tree",
+                "db87fd4f40e51d80325f21c0d99bcdaf6f52b1b1",
             ),
             (
                 "core",
@@ -76886,9 +77395,20 @@ activate = 1\n";
                 "schema_2024_11_05_subtree",
                 "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d",
             ),
+            (
+                "core_2024_11_05",
+                "dated_tag_object",
+                "db349f740fad5a1cf44e248f07c9245064ff10ac",
+            ),
+            (
+                "core_2024_11_05",
+                "dated_tag_peeled_commit",
+                "0d63bea927001bedf3be3e59be735c979ba0aacb",
+            ),
         ] {
             core_conformance_authority_field(document, section, field, expected)?;
         }
+        validate_core_conformance_license_provenance(document)?;
         if pointer_get(document, "/verification/core_tag_command", "core-conformance-verification")?
         .as_str()
         != Some(
@@ -77042,6 +77562,7 @@ activate = 1\n";
             ));
         }
 
+        let mut admitted_artifacts = Vec::with_capacity(artifact_ids.len());
         for (id, path, byte_length, expected_sha256, git_tree, expected_git_blob_sha1) in [
             (
                 "core-schema-ts",
@@ -77075,6 +77596,38 @@ activate = 1\n";
                 "b7350c9071b01bc448ce641cf9f0cdeb0a2d522d",
                 "97a92f0cc292ed4c602f4ee121732cc8ad3be973",
             ),
+            (
+                "core-changelog",
+                "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx",
+                11_714usize,
+                "ba4d0ba299ff0b45d26c52111d41dc0c862dd04ef973f63f93570c2b020f3974",
+                "db87fd4f40e51d80325f21c0d99bcdaf6f52b1b1",
+                "dc5c9a9cf3e6895504534cf3f300514394d8c6ae",
+            ),
+            (
+                "conformance-package",
+                "evidence/fnd-01/vendor/core/conformance-package-49103de6.json",
+                1_972usize,
+                "2fd65cda83b8af49452198944e1924a9dc1a52ed4f56aba18e1d814922150149",
+                "699705222f144a15fb7fdcc1b4f0b0a62825aef0",
+                "e59d9f0411a9f7e9e11f2b57f45bdbcab65e1137",
+            ),
+            (
+                "conformance-enterprise-auth",
+                "evidence/fnd-01/vendor/core/conformance-enterprise-managed-authorization-49103de6.ts",
+                18_666usize,
+                "caec7e9a28f6de14678612682115cb5b6f3125d3e233f6a52250435f6a0383c2",
+                "84d79c0194b649917a7143022e6c920e686bff8e",
+                "eff5e255fac86344d2d212c5942454fa4664c731",
+            ),
+            (
+                "conformance-client-credentials",
+                "evidence/fnd-01/vendor/core/conformance-client-credentials-49103de6.ts",
+                13_961usize,
+                "fe9b9e2a0f62962d2eeecc772b3ed1ee8be9941a7bc792c19a9a29a8b452c3c4",
+                "84d79c0194b649917a7143022e6c920e686bff8e",
+                "d633f7a57fe3da3a3e9eaff28af213c3669beac9",
+            ),
         ] {
             let artifact = core_conformance_artifact(document, id)?;
             for (field, expected) in [
@@ -77090,24 +77643,33 @@ activate = 1\n";
             if record_usize(artifact, "byte_length", id)? != byte_length {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_AUTHORITY", id).at("byte_length"));
             }
-            let bytes = fs::read(root.join(path))
-                .map_err(|_| Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_IO", id).at(path))?;
+            let admitted = source_lookup(admitted_files, path)?;
+            let bytes = &admitted.bytes;
             if bytes.len() != byte_length {
                 return Err(
                     Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("byte_length")
                 );
             }
-            if lower_hex(&sha256(&bytes)) != expected_sha256 {
+            if lower_hex(&sha256(bytes)) != expected_sha256 {
                 return Err(
                     Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("sha256")
                 );
             }
-            if git_blob_sha1(&bytes) != expected_git_blob_sha1 {
+            if git_blob_sha1(bytes) != expected_git_blob_sha1 {
                 return Err(Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id)
                     .at("git_blob_sha1"));
             }
+            admitted_artifacts.push(admitted);
         }
-        Ok(())
+        let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)?;
+        Ok(CoreConformanceAcceptedBinding {
+            manifest_sha256: source_lookup(
+                admitted_files,
+                "evidence/fnd-01/core-conformance.toml",
+            )?
+            .digest,
+            artifact_tree_sha256,
+        })
     }
 
     /// Exact source-order authority inventory for `evidence/fnd-01/auth-standards.toml`.
@@ -77730,7 +78292,7 @@ activate = 1\n";
 
     fn validate_supplemental_contracts(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
         let core = parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")?;
-        validate_core_conformance_sources(&core, &repository_root())?;
+        validate_core_conformance_sources(&core, files)?;
 
         let jose = parse_source_toml(files, "evidence/fnd-01/jose-ring.toml")?;
         if parse_rs256_source_vectors(files)?.len() != RS256_SOURCE_REGISTRY.len() {
@@ -78016,13 +78578,30 @@ activate = 1\n";
         Ok(())
     }
 
+    fn sdk_validate_zero_credit_claims(
+        capability_credit: bool,
+        support_claim: bool,
+    ) -> VResult<()> {
+        if capability_credit || support_claim {
+            return Err(Diagnostic::error(
+                "E_SDK_PROOF_CLASS_INFLATION",
+                "SDK public receipt claims",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
     fn sdk_receipt_json(receipt: &SdkExecutionReceipt) -> VResult<String> {
+        let capability_credit = false;
+        let support_claim = false;
+        sdk_validate_zero_credit_claims(capability_credit, support_claim)?;
         let value = serde_json::json!({
             "format": "fastmcp-fnd01-sdk-batch-v3",
             "producer": "sdk-batch-run-json",
             "proof_class": "batch_execution",
-            "capability_credit": true,
-            "support_claim": false,
+            "capability_credit": capability_credit,
+            "support_claim": support_claim,
             "receipt": receipt,
         });
         serde_json::to_string(&value)
@@ -78051,6 +78630,7 @@ activate = 1\n";
         value
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn sdk_prepare_batch_inner() -> VResult<SdkBatchPlan> {
         let root = repository_root();
         let canonical = fs::canonicalize(&root)
@@ -78079,17 +78659,23 @@ activate = 1\n";
         })
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn sdk_prepare_batch() -> Result<SdkBatchPlan, String> {
         sdk_prepare_batch_inner().map_err(|diagnostic| {
             sdk_no_credit_json("sdk_batch_prepare_failed", &diagnostic.stable())
         })
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn sdk_admit_batch_inner(
         plan: SdkBatchPlan,
         body: SdkBatchReceiptBody,
     ) -> VResult<String> {
         let current = sdk_repository_runtime(&plan.root, &plan.static_evidence)?;
+        sdk_validate_rch_reopen(
+            &plan.producer_runtime.rch_receipt,
+            &current.rch_receipt,
+        )?;
         if current != plan.producer_runtime || !current.dirty_inventory.is_empty() {
             return Err(Diagnostic::error("E_SDK_RUNNER_DRIFT", "pre/post repository runtime"));
         }
@@ -78109,6 +78695,7 @@ activate = 1\n";
         sdk_receipt_json(&receipt)
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn sdk_admit_batch(
         plan: SdkBatchPlan,
         body: SdkBatchReceiptBody,
@@ -78118,6 +78705,7 @@ activate = 1\n";
         })
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn sdk_batch_failure_json(detail: &str) -> String {
         sdk_no_credit_json("sdk_batch_execution_failed", detail)
     }
@@ -84387,31 +84975,114 @@ original = "value"
         );
     }
 
-    fn core_conformance_test_document() -> toml::Value {
+    fn admitted_core_conformance_test_inputs() -> (Vec<LoadedFile>, [u8; 32]) {
         let root = repository_root();
-        let path = root.join("evidence/fnd-01/core-conformance.toml");
-        let bytes = fs::read(&path).expect("core conformance manifest must be readable");
-        parse_toml_document(
-            std::str::from_utf8(&bytes).expect("core conformance manifest must be UTF-8"),
-            "core conformance test manifest",
-        )
-        .expect("core conformance manifest must be TOML")
+        let (policy, _) =
+            read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let files = load_sources(&root, &policy)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let source_tree_sha256 = validate_source_tree(&files, &policy)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        (files, source_tree_sha256)
+    }
+
+    fn core_conformance_test_document(files: &[LoadedFile]) -> toml::Value {
+        parse_source_toml(files, "evidence/fnd-01/core-conformance.toml")
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+    }
+
+    fn assert_core_conformance_admitted_tree(
+        files: &[LoadedFile],
+        baseline_source_tree_sha256: [u8; 32],
+    ) {
+        let references = files.iter().collect::<Vec<_>>();
+        let (source_tree_sha256, _) = source_tree_digest_refs(&references)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(
+            source_tree_sha256, baseline_source_tree_sha256,
+            "virtual manifest plants retain the admitted source-tree digest"
+        );
+    }
+
+    fn assert_core_conformance_fresh_reacceptance(
+        baseline_binding: CoreConformanceAcceptedBinding,
+        baseline_source_tree_sha256: [u8; 32],
+    ) {
+        let (files, source_tree_sha256) = admitted_core_conformance_test_inputs();
+        assert_eq!(
+            source_tree_sha256, baseline_source_tree_sha256,
+            "fresh normal admission retains the complete source-tree digest"
+        );
+        let document = core_conformance_test_document(&files);
+        assert_eq!(
+            validate_core_conformance_sources(&document, &files)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
+            baseline_binding,
+            "fresh normal admission retains the accepted core binding"
+        );
     }
 
     #[test]
     fn fnd_01_core_conformance_sources_positive() {
-        let root = repository_root();
-        let document = core_conformance_test_document();
-        validate_core_conformance_sources(&document, &root)
+        let (files, _) = admitted_core_conformance_test_inputs();
+        let document = core_conformance_test_document(&files);
+        let accepted = validate_core_conformance_sources(&document, &files)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let manifest = source_lookup(&files, "evidence/fnd-01/core-conformance.toml")
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(
+            accepted.manifest_sha256,
+            sha256(&manifest.bytes),
+            "accepted manifest binding is the admitted manifest bytes"
+        );
+        let artifact_paths = [
+            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.ts",
+            "evidence/fnd-01/vendor/core/mcp-schema-2026-07-28-5f5440bb.json",
+            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts",
+            "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json",
+            "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx",
+            "evidence/fnd-01/vendor/core/conformance-package-49103de6.json",
+            "evidence/fnd-01/vendor/core/conformance-enterprise-managed-authorization-49103de6.ts",
+            "evidence/fnd-01/vendor/core/conformance-client-credentials-49103de6.ts",
+        ];
+        let admitted_artifacts = artifact_paths
+            .iter()
+            .map(|path| source_lookup(&files, path))
+            .collect::<VResult<Vec<_>>>()
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(admitted_artifacts.len(), 8, "exact core artifact count");
+        let (artifact_tree_sha256, _) = source_tree_digest_refs(&admitted_artifacts)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(
+            accepted.artifact_tree_sha256, artifact_tree_sha256,
+            "accepted artifact binding is the independently derived eight-artifact tree"
+        );
     }
 
     #[test]
     fn fnd_01_core_conformance_sources_planted_negative() {
-        let root = repository_root();
-        let baseline = core_conformance_test_document();
-        validate_core_conformance_sources(&baseline, &root)
+        let (files, baseline_source_tree_sha256) = admitted_core_conformance_test_inputs();
+        let baseline = core_conformance_test_document(&files);
+        let baseline_binding = validate_core_conformance_sources(&baseline, &files)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+        let mut license_drifted = baseline.clone();
+        set_pointer(
+            &mut license_drifted,
+            "/license_provenance/core_2024_11_05/declared_license",
+            toml::Value::String("Apache-2.0".to_owned()),
+            "core immutable license negative",
+        )
+        .expect("one immutable license replacement");
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        let error = validate_core_conformance_sources(&license_drifted, &files)
+            .expect_err("one immutable license mutation must reject");
+        assert_eq!(
+            error.stable(),
+            "FND01|Error|E_CORE_CONFORMANCE_LICENSE|license_provenance.core_2024_11_05"
+        );
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
 
         for (family, pointer, replacement, expected) in [
         ("missing artifact", "/artifacts/0/id", "missing", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT_INVENTORY|artifacts|0.id"),
@@ -84444,13 +85115,12 @@ original = "value"
         };
         set_pointer(&mut drifted, pointer, value, family)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let error = validate_core_conformance_sources(&drifted, &root)
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        let error = validate_core_conformance_sources(&drifted, &files)
             .expect_err("each registered core mutation must reject");
         assert_eq!(error.stable(), expected, "{family}");
-    }
-
-        validate_core_conformance_sources(&baseline, &root)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_core_conformance_admitted_tree(&files, baseline_source_tree_sha256);
+        assert_core_conformance_fresh_reacceptance(baseline_binding, baseline_source_tree_sha256);
     }
 
     fn auth_standards_test_document() -> toml::Value {
@@ -87143,6 +87813,199 @@ original = "value"
         assert_fresh_baseline();
     }
 
+    #[cfg(test)]
+    const SDK_TEST_EXPECTED_ADDITIONAL_TOOL_IDS: [(&str, &[&str]); 4] = [
+        ("typescript", &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "node", "perl", "sandbox-exec", "shasum"]),
+        ("python", &["awk", "basename", "cmp", "curl", "find", "install", "mktemp", "perl", "sandbox-exec", "sed", "shasum", "sort"]),
+        ("csharp", &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum"]),
+        ("go", &["awk", "cmp", "curl", "env", "install", "jq", "mktemp", "perl", "sandbox-exec", "shasum", "sort"]),
+    ];
+
+    #[cfg(test)]
+    fn sdk_test_owned_environment(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values.iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn sdk_test_child_environment_case(
+        sdk_id: &str,
+    ) -> (SdkPeerChildEnvironment, &'static str, Vec<(String, String)>, &'static str) {
+        match sdk_id {
+            "typescript" => (
+                SdkPeerChildEnvironment::TypeScript,
+                "/sdk/npm:/sdk/node:/sdk/jq:/usr/bin:/bin",
+                sdk_test_owned_environment(&[
+                    ("HOME", "/sdk/home"), ("LANG", "C"), ("LC_ALL", "C"),
+                    ("NO_COLOR", "1"), ("NPM_CONFIG_GLOBALCONFIG", "/dev/null"),
+                    ("NPM_CONFIG_USERCONFIG", "/dev/null"),
+                    ("PATH", "/sdk/npm:/sdk/node:/sdk/jq:/usr/bin:/bin"),
+                    ("TMPDIR", "/tmp"),
+                ]),
+                "NPM_CONFIG_USERCONFIG",
+            ),
+            "python" => (
+                SdkPeerChildEnvironment::Python,
+                "/sdk/python:/usr/bin:/bin",
+                sdk_test_owned_environment(&[
+                    ("HOME", "/sdk/home"), ("LANG", "C"), ("LC_ALL", "C"),
+                    ("NO_COLOR", "1"), ("PATH", "/sdk/python:/usr/bin:/bin"),
+                    ("PIP_CONFIG_FILE", "/dev/null"), ("PYTHONNOUSERSITE", "1"),
+                    ("TMPDIR", "/tmp"),
+                ]),
+                "PYTHONNOUSERSITE",
+            ),
+            "csharp" => (
+                SdkPeerChildEnvironment::Csharp {
+                    archive: "/sdk/dotnet.tar.gz".to_owned(),
+                    sdk: "/sdk/dotnet".to_owned(),
+                },
+                "/sdk/jq:/usr/bin:/bin",
+                sdk_test_owned_environment(&[
+                    ("DOTNET_ARCHIVE", "/sdk/dotnet.tar.gz"),
+                    ("DOTNET_ROOT", "/sdk/dotnet"), ("DOTNET_SDK", "/sdk/dotnet"),
+                    ("HOME", "/sdk/home"), ("LANG", "C"), ("LC_ALL", "C"),
+                    ("NO_COLOR", "1"), ("PATH", "/sdk/jq:/usr/bin:/bin"),
+                    ("TMPDIR", "/tmp"),
+                ]),
+                "DOTNET_ROOT",
+            ),
+            "go" => (
+                SdkPeerChildEnvironment::Go { root: "/sdk/go".to_owned() },
+                "/sdk/jq:/usr/bin:/bin",
+                sdk_test_owned_environment(&[
+                    ("GOENV", "off"), ("GOROOT", "/sdk/go"), ("GO_1_25", "/sdk/go"),
+                    ("HOME", "/sdk/home"), ("LANG", "C"), ("LC_ALL", "C"),
+                    ("NO_COLOR", "1"), ("PATH", "/sdk/jq:/usr/bin:/bin"),
+                    ("TMPDIR", "/tmp"),
+                ]),
+                "GOENV",
+            ),
+            _ => panic!("unknown SDK test environment: {sdk_id}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn sdk_test_binding(id: &str, path: &str) -> SdkExecutableBinding {
+        SdkExecutableBinding {
+            id: id.to_owned(),
+            path: path.to_owned(),
+            byte_length: 7,
+            sha256: "00".repeat(32),
+            version: "test".to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    fn sdk_test_transcript(raw: &[u8]) -> SdkTranscriptBinding {
+        SdkTranscriptBinding {
+            raw: raw.to_vec(),
+            byte_length: u64::try_from(raw.len()).unwrap_or(u64::MAX),
+            sha256: lower_hex(&sha256(raw)),
+        }
+    }
+
+    #[cfg(test)]
+    fn sdk_test_network_contract() -> (
+        SdkNetworkProbeBinding,
+        SdkExecutionProcessBinding,
+        SdkBatchReceiptBody,
+        SdkExecutableBinding,
+        SdkExecutableBinding,
+    ) {
+        let launcher = sdk_test_binding("sandbox-exec", "/usr/bin/sandbox-exec");
+        let target = sdk_test_binding("curl", "/usr/bin/curl");
+        let environment_sha256 = sdk_environment_sha256(&[]);
+        let process = SdkExecutionProcessBinding {
+            command_id: "typescript-sdk-reproduction".to_owned(),
+            argv: Vec::new(), argv_sha256: String::new(), cwd: "/repo".to_owned(),
+            environment: Vec::new(), environment_sha256: environment_sha256.clone(),
+            interpreter: sdk_test_binding("zsh", "/bin/zsh"),
+            primary_tool: sdk_test_binding("npm", "/sdk/npm"), additional_tools: Vec::new(),
+            reproduction_script_byte_length: 0, reproduction_script_sha256: String::new(),
+            composite_script_observer_sha256: String::new(),
+            stdout: sdk_test_transcript(&[]), stderr: sdk_test_transcript(&[]), exit_code: 0,
+            started_at_epoch_seconds: 15, finished_at_epoch_seconds: 20,
+            monotonic_started_ns: 150, monotonic_finished_ns: 200, elapsed_ns: 50,
+            runtime_paths: Vec::new(), complete_input_sha256: String::new(),
+        };
+        let probe = SdkNetworkProbeBinding {
+            argv: vec![
+                launcher.path.clone(), "-p".to_owned(),
+                "(version 1) (allow default) (deny network*)".to_owned(),
+                target.path.clone(), "--silent".to_owned(), "--show-error".to_owned(),
+                "--max-time".to_owned(), "2".to_owned(),
+                "https://registry.npmjs.org/".to_owned(),
+            ],
+            cwd: process.cwd.clone(), environment_sha256,
+            launcher: launcher.clone(), target_tool: target.clone(),
+            stdout: sdk_test_transcript(&[]),
+            stderr: sdk_test_transcript(
+                b"curl: (6) Could not resolve host: registry.npmjs.org\n",
+            ),
+            exit_code: 6, started_at_epoch_seconds: 20, finished_at_epoch_seconds: 21,
+            monotonic_started_ns: 201, monotonic_finished_ns: 211, elapsed_ns: 10,
+        };
+        let body = SdkBatchReceiptBody {
+            batch_started_at_epoch_seconds: 10, batch_finished_at_epoch_seconds: 30,
+            batch_monotonic_started_ns: 100, batch_monotonic_finished_ns: 300,
+            required: 0, discovered: 0, started: 0, passed: 0, first_attempt_passed: 0,
+            retries: 0, skipped: 0, stale: 0, mixed: 0, observations: Vec::new(),
+        };
+        (probe, process, body, launcher, target)
+    }
+
+    #[cfg(test)]
+    fn sdk_test_rch_bytes(run_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format": "fastmcp-rch-sdk-build-v1", "rch_version": "0.2.0",
+            "execution_location": "remote", "selected_worker": "worker-1", "run_id": run_id,
+            "source_revision": "0000000000000000000000000000000000000000",
+            "source_tree": "1111111111111111111111111111111111111111",
+            "dirty_inventory_byte_length": 0,
+            "dirty_inventory_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "rust_toolchain": "nightly-2026-07-11",
+            "rust_toolchain_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "cargo_lock_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "sdk_complete_input_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "cargo_profile": "dev", "target_triple": "aarch64-apple-darwin", "features": [],
+            "public_surface": "fastmcp-rust/example:fnd_01_evidence_harness:sdk-batch-run-json",
+            "cargo_command": ["cargo", "build", "--locked", "--jobs", "2", "--profile", "dev", "--target", "aarch64-apple-darwin", "-p", "fastmcp-rust", "--example", "fnd_01_evidence_harness"],
+            "verifier_source_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+            "harness_source_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+            "executable_byte_length": 7,
+            "executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "success": true,
+        })).expect("test RCH JSON")
+    }
+
+    #[cfg(test)]
+    fn sdk_test_rch_local(executable: &SdkExecutableBinding) -> SdkRchLocal<'_> {
+        SdkRchLocal {
+            source_revision: "0000000000000000000000000000000000000000",
+            source_tree: "1111111111111111111111111111111111111111",
+            dirty_inventory_byte_length: 0,
+            dirty_inventory_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            rust_toolchain_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+            cargo_lock_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+            sdk_complete_input_sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+            verifier_source_sha256: "6666666666666666666666666666666666666666666666666666666666666666",
+            harness_source_sha256: "7777777777777777777777777777777777777777777777777777777777777777",
+            executable,
+        }
+    }
+
+    #[cfg(test)]
+    fn sdk_test_rch_binding(path: &str, bytes: Vec<u8>) -> SdkRchReceiptBinding {
+        SdkRchReceiptBinding {
+            path: path.to_owned(),
+            byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: lower_hex(&sha256(&bytes)),
+            bytes,
+        }
+    }
+
     #[test]
     fn fnd_01_sdk_matrix_is_derived_from_locks_artifacts_and_execution_facts() {
         let root = repository_root();
@@ -87158,6 +88021,8 @@ original = "value"
         .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(validation.execution, ExecutionValidation::Unverified);
         assert!(!validation.support_claim);
+        sdk_validate_zero_credit_claims(false, false)
+            .expect("successful public receipt preserves zero credit and no support claim");
         assert_eq!(validation.static_evidence.peers.len(), 4);
         assert_eq!(
             validation
@@ -87225,6 +88090,48 @@ original = "value"
         )
         .expect("proof-class rejection leaves pristine static validation unchanged");
         assert_eq!(pristine, validation);
+
+        for (spec, (sdk_id, expected_ids)) in SDK_RUNTIME_SPECS.iter()
+            .zip(SDK_TEST_EXPECTED_ADDITIONAL_TOOL_IDS.iter())
+        {
+            assert_eq!(spec.id, *sdk_id, "independent SDK tool authority order");
+            assert_eq!(spec.additional_tool_ids, *expected_ids, "{sdk_id}");
+            let tools = expected_ids.iter()
+                .map(|id| sdk_test_binding(*id, &format!("/tools/{id}")))
+                .collect::<Vec<_>>();
+            sdk_validate_additional_tool_ids(&tools, spec.additional_tool_ids, "test")
+                .expect("exact external command closure");
+        }
+        for sdk_id in ["typescript", "python", "csharp", "go"] {
+            let (peer, path, expected_environment, _) =
+                sdk_test_child_environment_case(sdk_id);
+            let observed_environment = sdk_closed_child_environment(
+                "/sdk/home".to_owned(), path.to_owned(), peer,
+            );
+            assert_eq!(observed_environment, expected_environment, "{sdk_id}");
+            sdk_validate_closed_environment(
+                &observed_environment,
+                &sdk_environment_sha256(&observed_environment),
+                &expected_environment,
+                sdk_id,
+            ).expect("independent exact peer environment");
+        }
+        let executable = sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner");
+        let local = sdk_test_rch_local(&executable);
+        let rch_bytes = sdk_test_rch_bytes("run-1");
+        sdk_validate_rch_receipt(&rch_bytes, &local).expect("exact strict RCH receipt");
+        let frozen = sdk_test_rch_binding("/private/tmp/rch-receipt.json", rch_bytes);
+        let identical = frozen.clone();
+        sdk_validate_rch_reopen(&frozen, &identical).expect("identical RCH reopen");
+        let (probe, process, body, launcher, target) = sdk_test_network_contract();
+        sdk_validate_network_probe(
+            &probe,
+            &process,
+            &body,
+            &SDK_RUNTIME_SPECS[0],
+            &launcher,
+            &target,
+        ).expect("exact network frame");
     }
 
     #[test]
@@ -87491,6 +88398,183 @@ original = "value"
             .expect("pristine reacceptance");
             assert_eq!(reaccepted, accepted, "{}: pristine typed validation", plant.id);
         }
+
+        for (spec, (sdk_id, expected_ids)) in SDK_RUNTIME_SPECS.iter()
+            .zip(SDK_TEST_EXPECTED_ADDITIONAL_TOOL_IDS.iter())
+        {
+            assert_eq!(spec.id, *sdk_id, "independent SDK tool authority order");
+            assert_eq!(spec.additional_tool_ids, *expected_ids, "{sdk_id}");
+            let pristine = expected_ids.iter()
+                .map(|id| sdk_test_binding(*id, &format!("/tools/{id}")))
+                .collect::<Vec<_>>();
+            let mut candidate = pristine.clone();
+            let _ = candidate.pop();
+            let error = sdk_validate_additional_tool_ids(
+                &candidate, spec.additional_tool_ids, "tool-closure plant",
+            ).expect_err("one omitted external command must reject");
+            assert_eq!(error.code, "E_SDK_EXECUTION_FACTS", "{sdk_id}");
+            sdk_validate_additional_tool_ids(
+                &pristine, spec.additional_tool_ids, "tool-closure pristine",
+            ).expect("tool-closure pristine reacceptance");
+        }
+
+        let pristine_environment = [
+            ("PATH".to_owned(), "/sdk/npm:/sdk/node:/sdk/jq:/usr/bin:/bin".to_owned()),
+        ];
+        let mut candidate_environment = pristine_environment.clone();
+        candidate_environment[0].1 = "/sdk/node:/sdk/npm:/sdk/jq:/usr/bin:/bin".to_owned();
+        let candidate_environment_sha256 = sdk_environment_sha256(&candidate_environment);
+        let error = sdk_validate_closed_environment(
+            &candidate_environment,
+            &candidate_environment_sha256,
+            &pristine_environment,
+            "PATH-order plant",
+        ).expect_err("one reordered PATH entry must reject");
+        assert_eq!(error.code, "E_SDK_EXECUTION_FACTS");
+        sdk_validate_closed_environment(
+            &pristine_environment,
+            &sdk_environment_sha256(&pristine_environment),
+            &pristine_environment,
+            "PATH-order pristine",
+        ).expect("PATH-order pristine reacceptance");
+
+        for sdk_id in ["typescript", "python", "csharp", "go"] {
+            let (peer, path, expected_environment, plant_key) =
+                sdk_test_child_environment_case(sdk_id);
+            let pristine_environment = sdk_closed_child_environment(
+                "/sdk/home".to_owned(), path.to_owned(), peer,
+            );
+            assert_eq!(pristine_environment, expected_environment, "{sdk_id}");
+            let mut candidate_environment = pristine_environment.clone();
+            candidate_environment.iter_mut()
+                .find(|(name, _)| name.as_str() == plant_key)
+                .expect("peer-specific environment key")
+                .1
+                .push('x');
+            let candidate_sha256 = sdk_environment_sha256(&candidate_environment);
+            let error = sdk_validate_closed_environment(
+                &candidate_environment,
+                &candidate_sha256,
+                &expected_environment,
+                sdk_id,
+            ).expect_err("one changed peer-specific environment value must reject");
+            assert_eq!(error.code, "E_SDK_EXECUTION_FACTS", "{sdk_id}");
+            sdk_validate_closed_environment(
+                &pristine_environment,
+                &sdk_environment_sha256(&pristine_environment),
+                &expected_environment,
+                sdk_id,
+            ).expect("peer-specific environment pristine reacceptance");
+        }
+
+        assert_eq!(MAX_VERIFIER_BYTES, 4_194_304, "independent verifier source cap");
+        let error = sdk_validate_verifier_source_bound(4_194_305)
+            .expect_err("one byte over the verifier source cap must reject");
+        assert_eq!(error.code, "E_FILE_BOUND");
+        sdk_validate_verifier_source_bound(4_194_304)
+            .expect("exact verifier source cap pristine reacceptance");
+
+        let executable = sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner");
+        let local = sdk_test_rch_local(&executable);
+        let pristine_rch_bytes = sdk_test_rch_bytes("run-1");
+        let pristine_rch_json = serde_json::from_slice::<serde_json::Value>(&pristine_rch_bytes)
+            .expect("test RCH JSON");
+        let rch_plants = [
+            ("format", serde_json::json!("wrong")),
+            ("rch_version", serde_json::json!("")),
+            ("execution_location", serde_json::json!("local")),
+            ("selected_worker", serde_json::json!("")),
+            ("run_id", serde_json::json!("")),
+            ("source_revision", serde_json::json!("ffffffffffffffffffffffffffffffffffffffff")),
+            ("source_tree", serde_json::json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")),
+            ("dirty_inventory_byte_length", serde_json::json!(1)),
+            ("dirty_inventory_sha256", serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+            ("rust_toolchain", serde_json::json!("nightly-wrong")),
+            ("rust_toolchain_sha256", serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            ("cargo_lock_sha256", serde_json::json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")),
+            ("sdk_complete_input_sha256", serde_json::json!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")),
+            ("cargo_profile", serde_json::json!("release")),
+            ("target_triple", serde_json::json!("x86_64-apple-darwin")),
+            ("features", serde_json::json!(["unexpected"])),
+            ("public_surface", serde_json::json!("wrong")),
+            ("cargo_command", serde_json::json!(["cargo"])),
+            ("verifier_source_sha256", serde_json::json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")),
+            ("harness_source_sha256", serde_json::json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
+            ("executable_byte_length", serde_json::json!(8)),
+            ("executable_sha256", serde_json::json!("1111111111111111111111111111111111111111111111111111111111111111")),
+            ("success", serde_json::json!(false)),
+        ];
+        for (field, replacement) in rch_plants {
+            let mut candidate = pristine_rch_json.clone();
+            candidate.as_object_mut().expect("RCH object")
+                .insert(field.to_owned(), replacement);
+            let candidate_bytes = serde_json::to_vec(&candidate).expect("candidate RCH JSON");
+            let error = sdk_validate_rch_receipt(&candidate_bytes, &local)
+                .expect_err("one changed RCH field must reject");
+            assert_eq!(error.code, "E_SDK_RCH_RECEIPT", "{field}");
+            sdk_validate_rch_receipt(&pristine_rch_bytes, &local)
+                .expect("RCH pristine reacceptance");
+        }
+        let mut extra_field = pristine_rch_json.clone();
+        extra_field.as_object_mut().expect("RCH object")
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        let error = sdk_validate_rch_receipt(
+            &serde_json::to_vec(&extra_field).expect("extra-field RCH JSON"),
+            &local,
+        ).expect_err("one extra RCH field must reject");
+        assert_eq!(error.code, "E_SDK_RCH_RECEIPT");
+        sdk_validate_rch_receipt(&pristine_rch_bytes, &local)
+            .expect("exact-field RCH pristine reacceptance");
+
+        let frozen_rch = sdk_test_rch_binding(
+            "/private/tmp/rch-receipt.json", pristine_rch_bytes.clone(),
+        );
+        let reopened_bytes = sdk_test_rch_bytes("run-2");
+        sdk_validate_rch_receipt(&reopened_bytes, &local)
+            .expect("independently valid changed RCH receipt");
+        let reopened_rch = sdk_test_rch_binding(
+            "/private/tmp/rch-receipt.json", reopened_bytes,
+        );
+        let error = sdk_validate_rch_reopen(&frozen_rch, &reopened_rch)
+            .expect_err("one changed RCH byte stream must reject at reopen");
+        assert_eq!(error.code, "E_SDK_RCH_RECEIPT");
+        let identical_rch = frozen_rch.clone();
+        sdk_validate_rch_reopen(&frozen_rch, &identical_rch)
+            .expect("RCH reopen pristine reacceptance");
+
+        let (pristine_probe, process, body, launcher, target) = sdk_test_network_contract();
+        let network_plants: [(&str, fn(&mut SdkNetworkProbeBinding)); 13] = [
+            ("argv", |probe| probe.argv[8].push('?')),
+            ("cwd", |probe| probe.cwd.push('x')),
+            ("environment", |probe| probe.environment_sha256.push('x')),
+            ("launcher", |probe| probe.launcher.path.push('x')),
+            ("target", |probe| probe.target_tool.path.push('x')),
+            ("exit", |probe| probe.exit_code = 7),
+            ("stdout", |probe| probe.stdout = sdk_test_transcript(b"x")),
+            ("stderr", |probe| probe.stderr = sdk_test_transcript(b"wrong\n")),
+            ("wall-start", |probe| probe.started_at_epoch_seconds = 19),
+            ("wall-finish", |probe| probe.finished_at_epoch_seconds = 31),
+            ("monotonic-start", |probe| probe.monotonic_started_ns = 199),
+            ("monotonic-finish", |probe| probe.monotonic_finished_ns = 301),
+            ("elapsed", |probe| probe.elapsed_ns = 11),
+        ];
+        for (id, plant) in network_plants {
+            let mut candidate = pristine_probe.clone();
+            plant(&mut candidate);
+            let error = sdk_validate_network_probe(
+                &candidate, &process, &body, &SDK_RUNTIME_SPECS[0], &launcher, &target,
+            ).expect_err("one changed network field must reject");
+            assert_eq!(error.code, "E_SDK_NETWORK_PROBE", "{id}");
+            sdk_validate_network_probe(
+                &pristine_probe, &process, &body, &SDK_RUNTIME_SPECS[0], &launcher, &target,
+            ).expect("network pristine reacceptance");
+        }
+
+        let error = sdk_validate_zero_credit_claims(true, false)
+            .expect_err("one capability-credit inflation must reject");
+        assert_eq!(error.code, "E_SDK_PROOF_CLASS_INFLATION");
+        sdk_validate_zero_credit_claims(false, false)
+            .expect("zero-credit pristine claim reacceptance");
     }
 
     #[test]
@@ -98524,8 +99608,8 @@ fn fallible(value: Option<u8>) {
 #[cfg(fnd01_bootstrap)]
 pub use bootstrap::harness_main;
 #[cfg(not(fnd01_bootstrap))]
-pub use ordinary::{harness_main, sdk_batch_verify_json};
-#[cfg(not(fnd01_bootstrap))]
+pub use ordinary::harness_main;
+#[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub(crate) use ordinary::{
     SdkBatchPlan, SdkBatchReceiptBody, SdkExecutableBinding, SdkExecutionObservation,
     SdkExecutionProcessBinding, SdkNetworkProbeBinding, SdkTranscriptBinding,
