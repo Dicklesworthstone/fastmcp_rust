@@ -32013,7 +32013,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         fn phase_b_produce_acquisition_authority_matrix() {
             let SyntheticPhaseBInputs {
                 policy,
-                manifest,
+                manifest: _,
                 authoring_bytes,
                 marker,
                 arguments,
@@ -33286,7 +33286,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let baseline = supply.clone();
             let SyntheticPhaseBInputs {
                 policy,
-                manifest,
+                manifest: _,
                 authoring_bytes,
                 marker,
                 arguments,
