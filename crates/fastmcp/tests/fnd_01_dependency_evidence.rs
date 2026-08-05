@@ -850,8 +850,37 @@ mod trust_std {
         hasher.finalize()
     }
 
-    /// One row in the frozen native-tool descriptor registry shared by the
-    /// dependency-free bootstrap image and the ordinary verifier image.
+    pub fn environment_set_digest() -> TrustResult<[u8; 32]> {
+        const PROFILES: &[(&str, &[(&str, &str)])] = &[
+            ("acquisition", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{producer-cargo-home}"), ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"), ("CARGO_TARGET_DIR", "{producer-custom-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
+            ("offline", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-command-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
+            ("offline_control", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
+            ("offline_cross", &[("AR", "{target-tool-profile.ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"), ("CC", "{target-tool-profile.cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC"), ("{target-tool-profile.ar-env-key}", "{target-tool-profile.ar.path}"), ("{target-tool-profile.cc-env-key}", "{target-tool-profile.cc.path}"), ("{target-tool-profile.cflags-env-key}", "{target-tool-profile.cflags-exact}"), ("{target-tool-profile.linker-env-key}", "{target-tool-profile.linker.path}"), ("{target-tool-profile.rustflags-env-key}", "{target-tool-profile.rustflags-exact}")]),
+            ("tool_identity", &[("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("TZ", "UTC")]),
+            ("openssl", &[("LANG", "C"), ("LC_ALL", "C"), ("OPENSSL_CONF", "{exact-kat-openssl-config}"), ("PATH", "{closed-execution-bin}"), ("TZ", "UTC")]),
+        ];
+        fn append(output: &mut Vec<u8>, bytes: &[u8]) -> TrustResult<()> {
+            let length = u32::try_from(bytes.len()).map_err(|_| TrustError::new(
+                "E_PHASE_B_BOUND", "environment field length exceeds u32"))?;
+            output.try_reserve(4usize.saturating_add(bytes.len())).map_err(|_| TrustError::new(
+                "E_PHASE_B_ALLOCATION", "cannot reserve environment field"))?;
+            output.extend_from_slice(&length.to_be_bytes()); output.extend_from_slice(bytes); Ok(())
+        }
+        if PROFILES.len() != 6 { return Err(TrustError::new(
+            "E_PHASE_B_ENVIRONMENT_SET", "compiled environment profile count is not six")); }
+        let mut output = b"FND01BOOTSTRAPENVSv1\0".to_vec();
+        output.extend_from_slice(&u32::try_from(PROFILES.len()).map_err(|_| TrustError::new(
+            "E_PHASE_B_BOUND", "environment profile count exceeds u32"))?.to_be_bytes());
+        for (id, required) in PROFILES {
+            append(&mut output, id.as_bytes())?;
+            output.extend_from_slice(&u32::try_from(required.len()).map_err(|_| TrustError::new(
+                "E_PHASE_B_BOUND", "environment assignment count exceeds u32"))?.to_be_bytes());
+            for (key, value) in *required { append(&mut output, key.as_bytes())?; append(&mut output, value.as_bytes())?; }
+            output.extend_from_slice(&0u32.to_be_bytes());
+        }
+        sha256(&output)
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct NativeToolDescriptor {
         pub id: &'static str,
@@ -861,9 +890,6 @@ mod trust_std {
         pub parser: &'static str,
     }
 
-    /// The single compiled twenty-tool descriptor authority. Keeping this in
-    /// the always-compiled trust module prevents platform cfgs from silently
-    /// removing the pure half of ordinary pre-ledger admission.
     pub const NATIVE_TOOL_DESCRIPTORS: &[NativeToolDescriptor] = &[
         NativeToolDescriptor { id:"rustc", candidates:&["{pinned-toolchain-bin}/rustc"], version_argv:&["-Vv"], stream:"stdout", parser:"rustc-vv-pinned-1.99" },
         NativeToolDescriptor { id:"cargo", candidates:&["{pinned-toolchain-bin}/cargo"], version_argv:&["-Vv"], stream:"stdout", parser:"cargo-vv-pinned-1.99" },
@@ -887,8 +913,6 @@ mod trust_std {
         NativeToolDescriptor { id:"windows-lld-link", candidates:&["/usr/bin/lld-link-22","/usr/bin/lld-link","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
     ];
 
-    /// Pure identity of the one compiled twenty-tool descriptor registry.
-    /// This performs no filesystem access and starts no child process.
     pub fn compiled_native_tool_registry_identity(
     ) -> TrustResult<(usize, usize, [u8; 32])> {
         const PREFIX: &[u8] = b"FND01BOOTSTRAPNATIVETOOLSv1\0";
@@ -7359,11 +7383,6 @@ mod trust_std {
         Ok((line_count, sha256(&preimage)?))
     }
 
-    /// Joined Cargo build stream for control-ledger verification.
-    ///
-    /// build_stream_rule: penultimate matching control-bin compiler-artifact and
-    /// terminal build-finished must equal the embedded ledger records; message
-    /// count/digest must equal cargo_message_set over the same LF line preimage.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct JoinedControlBuildStream {
         pub message_count: u64,
@@ -7942,7 +7961,6 @@ mod trust_std {
         }))
     }
 
-    /// Port of phase_b `select_control_artifact` into trust_std for ledger join.
     pub fn join_control_build_stream(
         stdout: &[u8],
         package_root: &str,
@@ -14038,10 +14056,6 @@ mod trust_std {
         Ok(())
     }
 
-    /// Reopen every member only after the complete first pass has been retained.
-    ///
-    /// Per-file bookends close races during one stream. This second pass closes
-    /// the gap in which an earlier member can drift while a later member is read.
     pub fn revalidate_checked_snapshot_set<const N: usize>(
         root: &Path,
         canonical_paths: &[&str; N],
@@ -14631,37 +14645,13 @@ mod trust_std {
     fn ordinary_decode_run_id(
         value: &str,
     ) -> Result<[u8; 16], OrdinaryHandoffArgumentFailure> {
-        if value.len() != 32 {
-            return Err(OrdinaryHandoffArgumentFailure::RunIdLength(TrustError::new(
-                "E_HEX_LENGTH",
-                format!("bootstrap run ID: {} != 32", value.len()),
-            )));
-        }
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(OrdinaryHandoffArgumentFailure::RunIdFormat(TrustError::new(
-                "E_HEX_FORMAT",
-                "bootstrap run ID: lowercase hex required",
-            )));
-        }
-        let mut decoded = [0u8; 16];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let nibble = |byte| match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                _ => unreachable!("ordinary run ID format was checked before decoding"),
-            };
-            decoded[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
-        }
-        if decoded.iter().all(|byte| *byte == 0) {
-            return Err(OrdinaryHandoffArgumentFailure::RunIdNonzero(TrustError::new(
-                "E_BOOTSTRAP_RUN_ID",
-                "all-zero run ID is forbidden",
-            )));
-        }
-        Ok(decoded)
+        decode_run_id(value).map_err(|error| match error.code() {
+            "E_HEX_LENGTH" => OrdinaryHandoffArgumentFailure::RunIdLength(error),
+            "E_HEX_FORMAT" => OrdinaryHandoffArgumentFailure::RunIdFormat(error),
+            "E_BOOTSTRAP_RUN_ID" => OrdinaryHandoffArgumentFailure::RunIdNonzero(error),
+            "E_HEX_BOUND" => unreachable!("a sixteen-byte run id fits the decoder bound"),
+            code => unreachable!("unexpected run-id decoder code: {code}"),
+        })
     }
 
     fn ordinary_validate_absolute_lexical_path(
@@ -14739,53 +14729,22 @@ mod trust_std {
     fn ordinary_read_exact_environment(
         expected_names: &[&str],
     ) -> Result<BTreeMap<String, String>, OrdinaryHandoffEnvironmentFailure> {
-        let expected = expected_names.iter().copied().collect::<BTreeSet<_>>();
-        debug_assert_eq!(expected.len(), expected_names.len());
-        let mut actual = BTreeMap::new();
-        for (key, value) in std::env::vars_os() {
-            let key = key.into_string().map_err(|_| {
-                OrdinaryHandoffEnvironmentFailure::EnvironmentEncoding(TrustError::new(
-                    "E_ENV_ENCODING",
-                    "environment key must be UTF-8",
-                ))
-            })?;
-            let value = value.into_string().map_err(|_| {
-                OrdinaryHandoffEnvironmentFailure::EnvironmentEncoding(TrustError::new(
-                    "E_ENV_ENCODING",
-                    format!("{key}: environment value must be UTF-8"),
-                ))
-            })?;
-            if !expected.contains(key.as_str()) {
-                return Err(OrdinaryHandoffEnvironmentFailure::EnvironmentExtra(
-                    TrustError::new("E_ENV_EXTRA", format!("{key}: unrecognized environment key")),
-                ));
-            }
-            if actual.insert(key.clone(), value).is_some() {
-                return Err(OrdinaryHandoffEnvironmentFailure::EnvironmentDuplicate(
-                    TrustError::new("E_ENV_DUPLICATE", format!("{key}: duplicate environment entry")),
-                ));
-            }
-        }
-        for name in expected_names {
-            if !actual.contains_key(*name) {
-                return Err(OrdinaryHandoffEnvironmentFailure::EnvironmentMissing(
-                    TrustError::new("E_ENV_MISSING", format!("{name}: required environment key")),
-                ));
-            }
-        }
-        Ok(actual)
+        read_exact_environment(expected_names).map_err(|error| match error.code() {
+            "E_ENV_ENCODING" => OrdinaryHandoffEnvironmentFailure::EnvironmentEncoding(error),
+            "E_ENV_EXTRA" => OrdinaryHandoffEnvironmentFailure::EnvironmentExtra(error),
+            "E_ENV_DUPLICATE" => OrdinaryHandoffEnvironmentFailure::EnvironmentDuplicate(error),
+            "E_ENV_MISSING" => OrdinaryHandoffEnvironmentFailure::EnvironmentMissing(error),
+            "E_ENV_REGISTRY" => unreachable!("ordinary expected-environment registries are unique"),
+            code => unreachable!("unexpected exact-environment code: {code}"),
+        })
     }
 
     fn ordinary_required_environment_value<'a>(
         environment: &'a BTreeMap<String, String>,
         name: &str,
     ) -> Result<&'a str, OrdinaryHandoffEnvironmentFailure> {
-        environment.get(name).map(String::as_str).ok_or_else(|| {
-            OrdinaryHandoffEnvironmentFailure::EnvironmentMissing(TrustError::new(
-                "E_ENV_MISSING",
-                format!("{name}: required environment key"),
-            ))
-        })
+        required_environment_value(environment, name)
+            .map_err(OrdinaryHandoffEnvironmentFailure::EnvironmentMissing)
     }
 
     fn ordinary_validate_bootstrap_path(
@@ -15762,6 +15721,10 @@ mod trust_std {
         #[test]
         fn ordinary_handoff_argv_authority_rejects_every_mutated_position() {
             let run_id = "0123456789abcdef0123456789abcdef";
+            assert!(matches!(ordinary_decode_run_id("0"), Err(OrdinaryHandoffArgumentFailure::RunIdLength(_))));
+            assert!(matches!(ordinary_decode_run_id(&"g".repeat(32)), Err(OrdinaryHandoffArgumentFailure::RunIdFormat(_))));
+            assert!(matches!(ordinary_decode_run_id(&"0".repeat(32)), Err(OrdinaryHandoffArgumentFailure::RunIdNonzero(_))));
+            assert!(std::panic::catch_unwind(|| ordinary_read_exact_environment(&["A", "A"])).is_err());
             let executable = "/repo/target/control-harness";
             let produce = expected_ordinary_handoff_argv(
                 BootstrapMode::Produce,
@@ -17921,7 +17884,6 @@ mod phase_b_std {
     const TREE_PREFIX: &[u8] = b"FND01BOOTSTRAPTREEv1\0";
     const MESSAGE_SET_PREFIX: &[u8] = b"FND01CARGOMESSAGESv1\0";
     const TOOL_SET_PREFIX: &[u8] = b"FND01BOOTSTRAPTOOLSv1\0";
-    const ENVIRONMENT_SET_PREFIX: &[u8] = b"FND01BOOTSTRAPENVSv1\0";
     const DIRECT_PREFIX: &[u8] = b"FND01BOOTSTRAPDIRECTv1\0";
     const UNION_PREFIX: &[u8] = b"FND01BOOTSTRAPUNIONv1\0";
     const NATIVE_TOOL_PREFIX: &[u8] = b"FND01BOOTSTRAPNATIVETOOLSv1\0";
@@ -18164,8 +18126,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         acquisition_spool_path_formula: &'static str,
         materialization_root_formula: &'static str,
         tool_probe_working_directory: &'static str,
-        /// Digest of the canonical typed join over every acquisition-authority
-        /// value and exact policy block used before the dynamic input barrier.
         full_policy_join_sha256: [u8; 32],
     }
 
@@ -18837,9 +18797,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
-    /// Final pre-effect barrier for Produce acquisition. Re-encoding the typed
-    /// authority here prevents a copied digest, partially joined policy, or
-    /// mutated capability from creating scratch or starting Cargo.
     fn require_complete_produce_acquisition_policy_join(
         permit: &ProduceAcquisitionPermit,
     ) -> TrustResult<[u8; 32]> {
@@ -21745,7 +21702,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
-    /// Encode a supply bundle; reparse requires exact byte equality with parse.
     fn encode_supply_bundle(
         bootstrap_lock: &[u8],
         acquisition: &SupplyAcquisitionObservation,
@@ -21955,7 +21911,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         checksum: String,
     }
 
-    /// Independent FND01SUPPLYCLOSUREv1 recompute from lock + three entry kinds.
     fn recompute_supply_closure_bijection(
         bootstrap_lock: &[u8],
         entries: &[SupplyEntry],
@@ -23120,10 +23075,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )
     }
 
-    /// Independently reobserve the two directory trees carried by an ordinary
-    /// control ledger. Paths are derived only from the admitted role/run pair;
-    /// the supply bytes are reparsed and validated before they may describe the
-    /// exact materialized local-registry tree.
     pub(super) fn observe_ordinary_control_trees(
         repository_root: &Path,
         mode: BootstrapMode,
@@ -23172,10 +23123,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         ))
     }
 
-    /// Recompute the producer acquisition typed results from retained raw
-    /// command streams and the still-live acquisition CARGO_HOME after archive
-    /// validation. No child is launched: every path comes from the role/run
-    /// acquisition plan or a previously validated ledger binding.
     pub(super) fn revalidate_ordinary_producer_acquisition(
         repository_root: &Path,
         run_id: &str,
@@ -27331,10 +27278,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(binding)
     }
 
-    /// Focused Attest-fixture adapter.  It deliberately delegates every
-    /// supply parse, semantic validation, authority derivation, space check,
-    /// and tree write to the production implementation; tests only provide a
-    /// fresh root and an already-encoded SUPPLYv4 byte object.
     #[cfg(test)]
     pub(super) fn materialize_attest_fixture_supply(
         repository_root: &Path,
@@ -27730,7 +27673,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(())
     }
 
-    /// Build FND01SUPPLYv4 from an acquired Cargo home + bootstrap lock.
     fn inventory_supply_from_acquisition(
         acquisition_root: &Path,
         bootstrap_lock: &[u8],
@@ -28099,158 +28041,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         utf8_absolute(parent, "pinned-rust-sysroot")
     }
 
-    /// Environment-set preimage binds the six unexpanded policy templates only.
     fn encode_environment_set_digest() -> TrustResult<[u8; 32]> {
-        // Exact policy [[environment_profile]] order and template pairs.
-        const PROFILES: &[(&str, &[(&str, &str)])] = &[
-            (
-                "acquisition",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{producer-cargo-home}"),
-                    ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"),
-                    ("CARGO_TARGET_DIR", "{producer-custom-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-command-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline_control",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline_cross",
-                &[
-                    ("AR", "{target-tool-profile.ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"),
-                    ("CC", "{target-tool-profile.cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                    (
-                        "{target-tool-profile.ar-env-key}",
-                        "{target-tool-profile.ar.path}",
-                    ),
-                    (
-                        "{target-tool-profile.cc-env-key}",
-                        "{target-tool-profile.cc.path}",
-                    ),
-                    (
-                        "{target-tool-profile.cflags-env-key}",
-                        "{target-tool-profile.cflags-exact}",
-                    ),
-                    (
-                        "{target-tool-profile.linker-env-key}",
-                        "{target-tool-profile.linker.path}",
-                    ),
-                    (
-                        "{target-tool-profile.rustflags-env-key}",
-                        "{target-tool-profile.rustflags-exact}",
-                    ),
-                ],
-            ),
-            (
-                "tool_identity",
-                &[
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "openssl",
-                &[
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("OPENSSL_CONF", "{exact-kat-openssl-config}"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-        ];
-        if PROFILES.len() != 6 {
-            return Err(phase_b_error(
-                "E_PHASE_B_ENVIRONMENT_SET",
-                "compiled environment profile count is not six",
-            ));
-        }
-        let mut output = Vec::new();
-        output.extend_from_slice(ENVIRONMENT_SET_PREFIX);
-        output.extend_from_slice(&usize_u32(PROFILES.len(), "env profiles")?.to_be_bytes());
-        for (id, required) in PROFILES {
-            append_u32_bytes(&mut output, id.as_bytes(), "env profile id")?;
-            output.extend_from_slice(
-                &usize_u32(required.len(), "env required assignments")?.to_be_bytes(),
-            );
-            for (key, value) in *required {
-                append_u32_bytes(&mut output, key.as_bytes(), "env key")?;
-                append_u32_bytes(&mut output, value.as_bytes(), "env value")?;
-            }
-            // Every optional array is exactly empty (proxy_rule).
-            output.extend_from_slice(&0u32.to_be_bytes());
-        }
-        sha256(&output)
+        super::trust_std::environment_set_digest()
     }
 
     const CANDIDATE_ABSENT: u8 = 0x01;
@@ -28580,8 +28372,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &self.acquisition_tools
         }
 
-        /// Live dual-path cardinality: selected inventory rows must stay
-        /// bijective with the pure 20-row compiled descriptor table.
         pub(super) fn native_tool_count(&self) -> usize {
             self.selected_tools.len()
         }
@@ -29884,8 +29674,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(())
     }
 
-    /// Resolve all 20 native tools, materialize execution-bin, probe versions,
-    /// and return the tool/execution-bin digests together with selected finals.
     fn inventory_native_tools_with_admission(
         repository_root: &Path,
         closed_path: &str,
@@ -30369,11 +30157,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
-    /// Fresh, runtime-selected ordinary subject used by the qualified live
-    /// matrix.  Unlike ordinary handoff, this helper is only for preparing a
-    /// new disposable fixture: it creates the exact 20-link execution-bin
-    /// under the caller's fresh root and returns the same inventory type that
-    /// the production handoff later reopens with `RequireExisting`.
     #[cfg(test)]
     pub(super) fn inventory_fresh_native_tools(
         repository_root: &Path,
@@ -31330,11 +31113,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         ))
     }
 
-    /// Cargo 1.99 SummariesCache v3 (INDEX_V_MAX=2) admission for 0x03 payloads.
-    ///
-    /// Byte 0 == 3; bytes 1..5 LE u32 == 2; strict-UTF-8 (possibly empty)
-    /// index-file validator terminated by NUL; then one or more nonempty SemVer/JSON pairs each
-    /// terminated by NUL; final byte exactly NUL. No materialization.
     fn validate_summaries_cache_v3(payload: &[u8], relative: &str) -> TrustResult<()> {
         validate_sparse_cache_input_length(usize_u64(payload.len(), relative)?, relative)?;
         if payload.len() < 6 || payload[0] != 3 {
@@ -36629,10 +36407,6 @@ activate = 1\n";
         digest: [u8; 32],
     }
 
-    /// The checked, immutable 66-file mutation baseline.
-    ///
-    /// Mutation execution receives only shared access to this value.  A case can
-    /// therefore alter neither another case nor the checked source bytes.
     #[derive(Debug)]
     struct Corpus66<'a> {
         files: &'a [LoadedFile],
@@ -36641,8 +36415,6 @@ activate = 1\n";
         json_documents: BTreeMap<String, StrictJson>,
     }
 
-    /// The sole per-case virtual substitution.  It owns one replacement byte
-    /// vector and, when applicable, its strictly parsed structured view.
     #[derive(Debug)]
     struct Overlay<'a> {
         target_path: &'a str,
@@ -38639,11 +38411,6 @@ activate = 1\n";
             .map_err(|_| Diagnostic::error("E_TOML_SCHEMA", subject).at("strict typed parse"))
     }
 
-    /// Parse a complete TOML document into `toml::Value`.
-    ///
-    /// Prefer this over `text.parse::<toml::Value>()`: toml 1.1.x's `FromStr` for
-    /// `Value` rejects valid full documents (comments, array-of-tables), while
-    /// `toml::from_str` / typed deserialize accept them.
     fn parse_toml_document(text: &str, subject: &str) -> VResult<toml::Value> {
         toml::from_str(text).map_err(|_| Diagnostic::error("E_TOML_SYNTAX", subject))
     }
@@ -41330,8 +41097,6 @@ activate = 1\n";
         sha256: RECEIPT_CONTRACT_REGISTRY_SHA256,
     };
 
-    /// Canonically encode the complete raw `receipt_contract` table without using
-    /// TOML serialization or any policy-declared mirror identity.
     fn encode_receipt_contract_registry_unpinned(
         root: &toml::value::Table,
     ) -> VResult<(usize, Vec<u8>)> {
@@ -44391,6 +44156,22 @@ activate = 1\n";
             _ => return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)),
         }
         Ok(())
+    }
+
+    fn insert_pointer(
+        document: &mut toml::Value,
+        pointer: &str,
+        value: toml::Value,
+        subject: &str,
+    ) -> VResult<()> {
+        let (parent, component) = pointer_parent_mut(document, pointer, subject)?;
+        match parent {
+            toml::Value::Table(table) if !table.contains_key(&component) => {
+                table.insert(component, value);
+                Ok(())
+            }
+            _ => Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)),
+        }
     }
 
     fn remove_pointer(document: &mut toml::Value, pointer: &str, subject: &str) -> VResult<()> {
@@ -71782,7 +71563,7 @@ activate = 1\n";
         report: &mut Report,
     ) -> VResult<()> {
         let rs256_vectors = parse_rs256_source_vectors(source_files)?;
-        let tasks_apps_bundle = load_tasks_apps_source_bundle(root, source_files)?;
+        let tasks_apps_bundle = ta_load_bundle(root, source_files)?;
         let _tasks_apps_accepted = validate_tasks_apps_sources(&tasks_apps_bundle)?;
         // Bind caller-supplied execution facts before any absent or partial
         // integration tree can return the ordinary Pending report.  The
@@ -91287,7 +91068,6 @@ fn fallible(value: Option<u8>) {
         native_tool_count: usize,
     }
 
-    /// Single-use pre-ledger authority; deliberately not `Clone` or `Copy`.
     struct OrdinaryAttestAuthority {
         seal: IntegrationSeal,
         retained: RetainedSnapshotSet<6>,
@@ -91333,7 +91113,6 @@ fn fallible(value: Option<u8>) {
         acquisition_spool_binding: Option<FileBinding>,
     }
 
-    /// Single-use capability issued after non-tool inputs and opaque ledger retention.
     struct OrdinaryProbePermit {
         authority: OrdinaryPreLedgerAuthority,
         non_tool: OrdinaryNonToolExpectation,
@@ -93168,7 +92947,6 @@ fn fallible(value: Option<u8>) {
         ),
     ];
 
-    /// Frozen exact libtest IDs; filters and zero-test runs receive no credit.
     #[cfg(test)]
     const ORDINARY_B_REQUIRED_TEST_IDS: &[&str] = &[
         "ordinary::ordinary_b_r1_qualified_linux_dual_path_tool_reprobe",
@@ -94558,7 +94336,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Issues pre-ledger authority only after authoring, closed-PATH, and field joins.
     fn require_ordinary_execution_authority(
         repository_root: &Path,
         mode: BootstrapMode,
@@ -94694,7 +94471,6 @@ fn fallible(value: Option<u8>) {
         })
     }
 
-    /// Maps stable failure codes without parsing untrusted diagnostic detail.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum OrdinaryProductStage {
         Authority,
@@ -94994,7 +94770,6 @@ fn fallible(value: Option<u8>) {
         ];
     }
 
-    /// Stable production-site identifiers, independent of the public route registry.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum OrdinaryFailureSite {
         EntryArity,
@@ -95444,7 +95219,6 @@ fn fallible(value: Option<u8>) {
         ]
     }
 
-    /// Sole post-admission dispatch after permit, ledger, archive, and bookend joins.
     fn dispatch_ordinary_evidence(
         result: VResult<Report>,
     ) -> Result<(), OrdinaryEntryFailure> {
@@ -95489,7 +95263,6 @@ fn fallible(value: Option<u8>) {
         fn before_evidence_dispatch(&mut self) {}
     }
 
-    /// Same-PID fail-closed produce/attest handoff; success is stream-silent.
     fn ordinary_known_handoff_run_id(arguments: &[std::ffi::OsString]) -> Option<String> {
         let run_id = arguments.get(3)?.to_str()?;
         if arguments.len() != ORDINARY_HANDOFF_ARGV_ARITY
@@ -95634,7 +95407,6 @@ fn fallible(value: Option<u8>) {
         )
     }
 
-    /// Sole production continuation after the single-use permit is consumed.
     fn validate_ordinary_handoff_entry_with_effects(
         invocation: &OrdinaryHandoffArguments,
         environment: &BootstrapEnvironment,
@@ -96636,7 +96408,7 @@ fn fallible(value: Option<u8>) {
             );
             *binding = FileBinding {
                 byte_length,
-                sha256: ordinary_sha256(&bytes),
+                sha256: sha256(&bytes),
             };
         }
         let marker = AuthoringMarker {
@@ -96645,7 +96417,7 @@ fn fallible(value: Option<u8>) {
             harness: bindings[2],
             closure_sha256: [0; 32],
         };
-        let closure = ordinary_sha256(
+        let closure = sha256(
             &authoring_closure_preimage(&marker).expect("authoring closure preimage"),
         );
         format!(
@@ -97209,7 +96981,6 @@ fn fallible(value: Option<u8>) {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID, false);
     }
 
-    /// Independent substitutions leave the accepted baseline unchanged.
     #[test]
     fn ordinary_b_r2_sealed_field_desync_fails_closed() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -97404,7 +97175,6 @@ fn fallible(value: Option<u8>) {
         assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
     }
 
-    /// Unqualified hosts reject before any ledger or evidence access.
     #[derive(Default)]
     struct OrdinaryPlatformRefusalEffects {
         ledger_open_attempts: usize,
@@ -97932,162 +97702,9 @@ fn fallible(value: Option<u8>) {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID, false);
     }
 
-    fn ordinary_sha256(bytes: &[u8]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let digest = hasher.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&digest);
-        out
-    }
-
-    fn ordinary_append_u32_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-        let len = u32::try_from(bytes.len()).expect("ordinary length bound");
-        output.extend_from_slice(&len.to_be_bytes());
-        output.extend_from_slice(bytes);
-    }
-
     fn ordinary_environment_set_digest() -> [u8; 32] {
-        const PROFILES: &[(&str, &[(&str, &str)])] = &[
-            (
-                "acquisition",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{producer-cargo-home}"),
-                    ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"),
-                    ("CARGO_TARGET_DIR", "{producer-custom-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-command-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline_control",
-                &[
-                    ("AR", "{tool.host-ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"),
-                    ("CC", "{tool.host-cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RANLIB", "{tool.host-ranlib.path}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "offline_cross",
-                &[
-                    ("AR", "{target-tool-profile.ar.path}"),
-                    ("CARGO_HOME", "{fresh-role-cargo-home}"),
-                    ("CARGO_NET_OFFLINE", "true"),
-                    ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"),
-                    ("CC", "{target-tool-profile.cc.path}"),
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RUSTC", "{tool.rustc.path}"),
-                    ("RUSTDOC", "{tool.rustdoc.path}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("SOURCE_DATE_EPOCH", "0"),
-                    ("TZ", "UTC"),
-                    (
-                        "{target-tool-profile.ar-env-key}",
-                        "{target-tool-profile.ar.path}",
-                    ),
-                    (
-                        "{target-tool-profile.cc-env-key}",
-                        "{target-tool-profile.cc.path}",
-                    ),
-                    (
-                        "{target-tool-profile.cflags-env-key}",
-                        "{target-tool-profile.cflags-exact}",
-                    ),
-                    (
-                        "{target-tool-profile.linker-env-key}",
-                        "{target-tool-profile.linker.path}",
-                    ),
-                    (
-                        "{target-tool-profile.rustflags-env-key}",
-                        "{target-tool-profile.rustflags-exact}",
-                    ),
-                ],
-            ),
-            (
-                "tool_identity",
-                &[
-                    ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"),
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("RUSTFMT", "{tool.rustfmt.path}"),
-                    ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-            (
-                "openssl",
-                &[
-                    ("LANG", "C"),
-                    ("LC_ALL", "C"),
-                    ("OPENSSL_CONF", "{exact-kat-openssl-config}"),
-                    ("PATH", "{closed-execution-bin}"),
-                    ("TZ", "UTC"),
-                ],
-            ),
-        ];
-        let mut output = b"FND01BOOTSTRAPENVSv1\0".to_vec();
-        output.extend_from_slice(&6u32.to_be_bytes());
-        for (id, required) in PROFILES {
-            ordinary_append_u32_bytes(&mut output, id.as_bytes());
-            output.extend_from_slice(&(required.len() as u32).to_be_bytes());
-            for (key, value) in *required {
-                ordinary_append_u32_bytes(&mut output, key.as_bytes());
-                ordinary_append_u32_bytes(&mut output, value.as_bytes());
-            }
-            output.extend_from_slice(&0u32.to_be_bytes());
-        }
-        ordinary_sha256(&output)
+        super::trust_std::environment_set_digest()
+            .expect("compiled environment profile digest")
     }
 
     struct OrdinaryToolReprobe {
@@ -98715,1291 +98332,651 @@ fn fallible(value: Option<u8>) {
         }
     }
 
-    // The Tasks and Apps source evidence is intentionally verified as a separate
-    // immutable bundle.  The artifact expectations below are an independent
-    // compiled authority boundary, not a second manifest: the manifest remains the
-    // sole input inventory and this validator rejects drift from these frozen
-    // primary-source bindings before any product capability is credited.
-    const TASKS_APPS_MANIFEST_PATH: &str = "evidence/fnd-01/tasks-apps.toml";
-    const TASKS_APPS_VENDOR_PATHS: [&str; 13] = [
-        "evidence/fnd-01/vendor/tasks/conformance-wire-fields.ts",
-        "evidence/fnd-01/vendor/tasks/package-lock.json",
-        "evidence/fnd-01/vendor/tasks/schema.json",
-        "evidence/fnd-01/vendor/tasks/schema.ts",
-        "evidence/fnd-01/vendor/tasks/tasks.md",
-        "evidence/fnd-01/vendor/apps/app-bridge.ts",
-        "evidence/fnd-01/vendor/apps/app.ts",
-        "evidence/fnd-01/vendor/apps/apps.mdx",
-        "evidence/fnd-01/vendor/apps/generated-schema.json",
-        "evidence/fnd-01/vendor/apps/generated-schema.ts",
-        "evidence/fnd-01/vendor/apps/package-lock.json",
-        "evidence/fnd-01/vendor/apps/spec.types.ts",
-        "evidence/fnd-01/vendor/apps/types.ts",
-    ];
-    const TASKS_APPS_VENDOR_DIGEST: &str =
-        "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a";
-    const TASKS_APPS_BLOCKED_CANDIDATE_PATH: &str =
-        "evidence/fnd-01/vendor/apps/whatwg-html-source";
-    const TASKS_APPS_BLOCKED_CANDIDATE_READ_LIMIT: u64 = 8 * 1024 * 1024;
+    // Independent compiled boundary for the immutable Tasks/Apps source bundle; no capability credit.
+    const TA_MPATH: &str = "evidence/fnd-01/tasks-apps.toml";
+    const TA_VPATHS: [&str; 13] = ["evidence/fnd-01/vendor/tasks/conformance-wire-fields.ts", "evidence/fnd-01/vendor/tasks/package-lock.json", "evidence/fnd-01/vendor/tasks/schema.json", "evidence/fnd-01/vendor/tasks/schema.ts", "evidence/fnd-01/vendor/tasks/tasks.md", "evidence/fnd-01/vendor/apps/app-bridge.ts", "evidence/fnd-01/vendor/apps/app.ts", "evidence/fnd-01/vendor/apps/apps.mdx", "evidence/fnd-01/vendor/apps/generated-schema.json", "evidence/fnd-01/vendor/apps/generated-schema.ts", "evidence/fnd-01/vendor/apps/package-lock.json", "evidence/fnd-01/vendor/apps/spec.types.ts", "evidence/fnd-01/vendor/apps/types.ts"];
+    const TASKS_ARTIFACT_EXPECTATIONS: [(&str, usize); 4] = [("tasks-prose", 4), ("tasks-typescript-schema", 3), ("tasks-generated-json-schema", 2), ("tasks-package-lock", 1)];
+    const TASKS_CONFORMANCE_EXPECTATIONS: [(&str, usize); 1] = [("tasks-conformance-wire-fields", 0)];
+    const APPS_ARTIFACT_EXPECTATIONS: [(&str, usize); 8] = [("apps-stable-spec", 7), ("apps-source-spec-types", 11), ("apps-source-unions", 12), ("apps-view-implementation", 6), ("apps-host-bridge", 5), ("apps-generated-typescript-schema", 9), ("apps-generated-json-schema", 8), ("apps-package-lock", 10)];
+    const TA_VDIGEST: &str = "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a";
+    const TA_SOURCE_LIMIT: u64 = 1024 * 1024;
+    const TA_BLOCKED_PATH: &str = "evidence/fnd-01/vendor/apps/whatwg-html-source";
+    const TA_BLOCKED_LIMIT: u64 = 8 * 1024 * 1024;
+    const TA_OBS_DOMAIN: &str = "FND01TASKSAPPSOBSv1";
+    const TA_MANIFEST: &str = "E_TASKS_APPS_MANIFEST";
+    const TA_AUTH: &str = "E_TASKS_APPS_AUTHORITY_CLASSIFICATION";
+    const TA_OBS: &str = "E_TASKS_APPS_OBSERVATION";
+    const TASKS_SUBJECT: &str = "tasks";
+    const APPS_SUBJECT: &str = "apps";
+    const TASKS_STATUS_ORDER: [&str; 5] = ["working", "input_required", "completed", "failed", "cancelled"];
+    const TASKS_SOURCE_PRECEDENCE: [&str; 7] = ["final core 2026-07-28 for MCP envelopes, request metadata, and final error allocation", "the frozen FastMCP composed contract for explicit conflict resolutions", "Tasks prose for negotiated extension semantics, identifier, empty settings, and method behavior", "Tasks TypeScript schema for raw extension fields, unions, and old-SDK import inventory", "pinned Tasks conformance wire-fields scenario for its explicitly limited observable assertions", "lock-resolved SDK 1.29.0 only for pre-rebind compatibility shapes", "generated Tasks schema only for drift and partial validation"];
+    const TASKS_DIRECTIONS: [(&str, &str, &str); 4] = [("tasks/get", "request", "client_to_server"), ("tasks/update", "request", "client_to_server"), ("tasks/cancel", "request", "client_to_server"), ("notifications/tasks", "notification", "server_to_client")];
+    const APPS_SOURCE_PRECEDENCE: [&str; 8] = ["final core 2026-07-28 for MCP envelopes and rebound core symbols", "the frozen FastMCP composed contract for explicit conflict resolutions", "stable Apps prose for Apps-only normative security and behavior", "src/spec.types.ts for UI-specific interfaces it declares", "src/types.ts for standard-reuse union and root inventory", "src/app.ts and src/app-bridge.ts for sender/handler direction and physical SDK behavior", "lock-resolved SDK 1.29.0 for imported compatibility shapes before explicit rebind/projection", "generated schemas only for drift and partial validation"];
 
-    #[derive(Clone, Debug)]
-    struct TasksAppsSourceBundle {
-        manifest: toml::Value,
-        manifest_bytes: Vec<u8>,
-        vendor_bytes: BTreeMap<String, Vec<u8>>,
-        blocked_candidate_bytes: Vec<u8>,
-    }
+    #[derive(Clone, Debug, PartialEq)]
+    struct TaBundle { manifest: toml::Value, raw_manifest: Vec<u8>, loaded: Vec<String>, vendor: BTreeMap<String, Vec<u8>>, blocked: Vec<u8> }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct AcceptedTasksAppsState {
-        tasks_artifact_count: usize,
-        tasks_conformance_artifact_count: usize,
-        apps_artifact_count: usize,
-        admitted_vendor_input_count: usize,
-        admitted_vendor_input_total_bytes: usize,
-        admitted_vendor_digest: String,
-        blocked_candidate_byte_length: usize,
-        blocked_candidate_sha256: String,
-        required_test_ids: [String; 2],
-        apps_maturity: String,
-        composition_ids: Vec<String>,
-    }
+    struct TaAccepted { tasks_artifact_count: usize, tasks_conformance_artifact_count: usize, apps_artifact_count: usize, admitted_vendor_input_count: usize, admitted_vendor_input_total_bytes: usize, admitted_vendor_digest: String, blocked_candidate_byte_length: usize, blocked_candidate_sha256: String, required_test_ids: [String; 2], apps_maturity: String, composition_ids: Vec<String>, observation_domain: String, explicit_planted_mutation_count: usize, generated_planted_mutation_count: usize, total_planted_mutation_count: usize, generated_category_vector: [usize; 4], runtime_capability_credit: bool, remote_provenance_capability_credit: bool, whatwg_admitted_as_source_input: bool, subtree_digests: BTreeMap<String, String>, standard_reuse_count: usize, direct_import_count: usize, quarantine_count: usize }
 
-    #[derive(Clone, Copy)]
-    struct TasksAppsArtifactExpectation {
-        id: &'static str,
-        upstream_path: &'static str,
-        vendor_path: &'static str,
-        byte_length: usize,
-        sha256: &'static str,
-        authority_role: &'static str,
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TaOp { RemoveManifest, ReplaceManifest, AddManifest, RemoveTerminalByte, ReplaceVirtualInput, AddVirtualInput }
+
+    const TA_OPS: [(TaOp, &str, usize); 6] = [(TaOp::RemoveManifest, "remove-one-manifest-field", 4), (TaOp::ReplaceManifest, "replace-one-manifest-field", 5), (TaOp::AddManifest, "add-one-manifest-field", 5), (TaOp::RemoveTerminalByte, "remove-one-terminal-byte-from-one-virtual-input", 4), (TaOp::ReplaceVirtualInput, "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input", 5), (TaOp::AddVirtualInput, "add-one-virtual-input", 5)];
+
+    impl TaOp {
+        fn parse(value: &str, id: &str) -> VResult<Self> { TA_OPS.iter().find_map(|(operation, token, _)| (*token == value).then_some(*operation)).ok_or_else(|| ta_mut_err(id, "operation")) }
+        fn field_count(self) -> usize { TA_OPS.iter().find(|(operation, _, _)| *operation == self).expect("complete operation registry").2 }
+        fn token(self) -> &'static str { TA_OPS.iter().find(|(operation, _, _)| *operation == self).expect("complete operation registry").1 }
     }
 
     #[derive(Clone, Debug)]
-    struct TasksAppsPlantedMutation {
-        id: String,
-        operation: String,
-        target: String,
-        replacement: Option<toml::Value>,
-        replacement_input: Option<String>,
-        expected_diagnostic: String,
-    }
+    struct TaPlan { id: String, operation: TaOp, target: String, group: usize, replacement: Option<toml::Value>, input: Option<String>, diagnostic: String }
 
-    #[derive(Clone, Copy)]
-    enum TasksAppsMutationPayload {
-        None,
-        ReplacementText(&'static str),
-        ReplacementBool(bool),
-        ReplacementInteger(i64),
-        ReplacementInput(&'static str),
-    }
-
-    const TASKS_ARTIFACTS: [TasksAppsArtifactExpectation; 4] = [
-        TasksAppsArtifactExpectation {
-            id: "tasks-prose",
-            upstream_path: "specification/draft/tasks.md",
-            vendor_path: "evidence/fnd-01/vendor/tasks/tasks.md",
-            byte_length: 33_967,
-            sha256: "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11",
-            authority_role: "extension-prose-semantics-with-recorded-ambiguities",
-        },
-        TasksAppsArtifactExpectation {
-            id: "tasks-typescript-schema",
-            upstream_path: "schema/draft/schema.ts",
-            vendor_path: "evidence/fnd-01/vendor/tasks/schema.ts",
-            byte_length: 9_421,
-            sha256: "2203cc75469e32a92a60f4b7b4de949577e25f18fafff69aa92ec06773ab70f6",
-            authority_role: "raw-typescript-extension-fields-unions-and-old-sdk-import-shape",
-        },
-        TasksAppsArtifactExpectation {
-            id: "tasks-generated-json-schema",
-            upstream_path: "schema/draft/schema.json",
-            vendor_path: "evidence/fnd-01/vendor/tasks/schema.json",
-            byte_length: 46_903,
-            sha256: "b17cb4a2534379c214b17770bd5d3d54f69fde16a953bfb542c58235a61274bb",
-            authority_role: "generated-raw-schema-provenance-and-path-scoped-drift",
-        },
-        TasksAppsArtifactExpectation {
-            id: "tasks-package-lock",
-            upstream_path: "package-lock.json",
-            vendor_path: "evidence/fnd-01/vendor/tasks/package-lock.json",
-            byte_length: 237_713,
-            sha256: "c2a0d2e1d66ee2db1aca03a87127034998892e6584fece413437b312f4f908f7",
-            authority_role: "dependency-resolution-and-sdk-integrity",
-        },
+    const TA_SUBTREES: [(&str, &str); 19] = [
+        ("tasks_artifact", "b0937d811fef8b37e104eb48025445483d8df2f18fcbbceaa765da4ad4997b42"), ("tasks_conformance_artifact", "6b8e5ff0a8d078142ab1ae7e0e09d63e7f9b48c0f3d0350ffec2fde6b60dbc67"), ("tasks_license_provenance", "c65a95f01843af2d60c1617b8dea51ef51f6a8d246fd4cd61a6bc2a7f230dca5"), ("tasks_conformance_license_provenance", "c67c081143569c4dc3ff3a8ac6168341324a6e6c53842f790b84e23189ad0d85"), ("tasks_sdk_1_29_0", "02f5034dea56c3a706f91f74cc504e2d565e31c5f459c28e3335d4d1cbef2279"), ("tasks_import_binding", "fa05cba709a8b576f12b0b86ca2fa9e94913003ccb799e23152f797c0c0f21f8"), ("tasks_negotiated_settings_contract", "683999dfd9c98cfe580fdc3bd2d93dd0a7cac7ef6cf653ef4abcb898c2a3e382"), ("apps_artifact", "cfcb6b3ad6120aa96b158eb1a2d941560806f2dcb881d843ec1f6a6e93e82113"), ("apps_license_provenance", "c495b4a39e3989d082a1b87fd46ecd9bb27a2aafa38399f0ce132e92f5197fc1"), ("apps_sdk_1_29_0", "ab4540b2e74006f452504618e925da65a11e5b40171eed85925edc0a862ea87d"), ("apps_whatwg_html_validation", "b437ec599e331c8a4f878cff17697933aec1459b77c761816da1ab0d454465d8"), ("apps_product_composition_authority", "91097d46b97cc2823a8edc2d6c48506d570c3d908c19e8a975b494b6ccbd460e"), ("apps_source_union", "c8bc82927274f0150554ba16a5e026875efdf8cc1a13feef17324579fdbbe8fe"), ("apps_direction", "9c2f7d4a97ad085b5a1f853796e5c36f039d72e3298998329d0c9c281fe466dd"), ("apps_standard_reuse", "d182ed1a33e0c8cd79242f2eb1ccef876b553c24c0b7a1f26c25197170af6661"), ("apps_direct_import", "19023d6c59428e2b4aeac4527814d29b5d24bf69ff792d209b8b2781073ebf2a"), ("apps_quarantine", "a00810b2d70a447640b2cbdfc148b1ee31464da14dfcca2395eb7d304623a0b6"), ("apps_server_settings", "4f40ab390788bb075b18a807f65398f574a64f05bf7223d63c62dad7766b8a94"), ("apps_negotiated_settings_contract", "c79afa6b4700f641845dc0b6751251f5f100e0b7323e548712dcf78211d6e86c"),
     ];
 
-    const APPS_ARTIFACTS: [TasksAppsArtifactExpectation; 8] = [
-        TasksAppsArtifactExpectation {
-            id: "apps-stable-spec",
-            upstream_path: "specification/2026-01-26/apps.mdx",
-            vendor_path: "evidence/fnd-01/vendor/apps/apps.mdx",
-            byte_length: 59_181,
-            sha256: "ee452a7d1b9b7fb900acfeb4d6932d3963375b0f3f37d196a4b93eb80312af0e",
-            authority_role: "normative-apps-security-behavior-lifecycle-and-registered-settings",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-source-spec-types",
-            upstream_path: "src/spec.types.ts",
-            vendor_path: "evidence/fnd-01/vendor/apps/spec.types.ts",
-            byte_length: 29_516,
-            sha256: "2ae52b6156f0f1fd2387717f15a8de968501d264e200d5409f09055297f8bc24",
-            authority_role: "ui-specific-source-interface-shapes",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-source-unions",
-            upstream_path: "src/types.ts",
-            vendor_path: "evidence/fnd-01/vendor/apps/types.ts",
-            byte_length: 7_191,
-            sha256: "22c74e3be838481e5f58af8a7f6d3f516a7200b08d9c7eaa33a518c30f1c9b52",
-            authority_role: "standard-reuse-union-and-root-inventory",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-view-implementation",
-            upstream_path: "src/app.ts",
-            vendor_path: "evidence/fnd-01/vendor/apps/app.ts",
-            byte_length: 72_234,
-            sha256: "6909662619a7c35366096578d389ae58ef8a4841c4bea77e04c4bfc1774e0812",
-            authority_role: "view-emitter-handler-and-default-behavior-direction-evidence",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-host-bridge",
-            upstream_path: "src/app-bridge.ts",
-            vendor_path: "evidence/fnd-01/vendor/apps/app-bridge.ts",
-            byte_length: 69_035,
-            sha256: "72ee4695d536e3183f682c09614d64230847fd99d3f853a86914520428134e1f",
-            authority_role: "host-emitter-handler-and-bridge-direction-evidence",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-generated-typescript-schema",
-            upstream_path: "src/generated/schema.ts",
-            vendor_path: "evidence/fnd-01/vendor/apps/generated-schema.ts",
-            byte_length: 40_227,
-            sha256: "239277f079524bd457ffa3133728a0aa5573206b0cb6c57fc115c66deefef770",
-            authority_role: "generated-runtime-schema-drift-and-partial-validation",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-generated-json-schema",
-            upstream_path: "src/generated/schema.json",
-            vendor_path: "evidence/fnd-01/vendor/apps/generated-schema.json",
-            byte_length: 219_846,
-            sha256: "002db9178110e644499e781415ee1025e5fde1e54500d14986626ba4a7b5b331",
-            authority_role: "generated-json-schema-drift-and-partial-validation",
-        },
-        TasksAppsArtifactExpectation {
-            id: "apps-package-lock",
-            upstream_path: "package-lock.json",
-            vendor_path: "evidence/fnd-01/vendor/apps/package-lock.json",
-            byte_length: 338_858,
-            sha256: "ddeb690845d40ed20a7e1989aae8820d36253a73a33a2080e66c7e03d0229bec",
-            authority_role: "dependency-resolution-and-sdk-import-closure",
-        },
-    ];
+    const TA_GROUPS: [(&str, usize); 25] = [("tasks_artifact", 9), ("tasks_conformance_artifact", 2), ("apps_artifact", 8), ("tasks_authority_profile", 2), ("apps_authority_profile", 3), ("apps_whatwg_html_validation", 4), ("tasks_license_provenance", 1), ("tasks_conformance_license_provenance", 1), ("apps_license_provenance", 1), ("verification_contract", 1), ("executable_same_validator_contract", 1), ("tasks_negotiated_settings_contract", 2), ("apps_negotiated_settings_contract", 2), ("tasks_source_precedence", 1), ("tasks_status_union_order", 1), ("tasks_direction", 1), ("apps_source_union", 1), ("apps_direction", 1), ("tasks_sdk_1_29_0", 4), ("apps_sdk_1_29_0", 4), ("tasks_import_binding", 1), ("apps_direct_import", 1), ("apps_standard_reuse", 21), ("apps_quarantine", 10), ("apps_product_composition_authority", 5)];
+    const TA_CONTRACT_STRINGS: &[(&str, &str)] = &[("contract_id", "fnd-01-tasks-apps-source-integrity-v3"), ("shared_verifier_path", "crates/fastmcp/tests/fnd_01_dependency_evidence.rs"), ("production_validator_symbol", "validate_tasks_apps_sources"), ("required_enclosing_module", "ordinary::tests"), ("admitted_vendor_family_digest_sha256", TA_VDIGEST), ("receipt_or_manifest_self_hash", "forbidden"), ("observation_domain", TA_OBS_DOMAIN)];
+    const TA_VERIFY_COUNTS: &[(&str, usize)] = &[("tasks_extension_artifact_count", 4), ("tasks_conformance_artifact_count", 1), ("tasks_admitted_vendor_input_count", 5), ("apps_extension_artifact_count", 8), ("apps_admitted_vendor_input_count", 8), ("apps_admitted_external_authority_artifact_count", 0), ("apps_preserved_blocked_candidate_count", 1)];
+    const TA_TASKS_AUTHORITY: &[(&str, &str)] = &[("extension_identifier", "io.modelcontextprotocol/tasks"), ("client_settings_schema", "tasks-2026-07-28-empty-object-v1"), ("server_settings_schema", "tasks-2026-07-28-empty-object-v1")];
+    const TA_TASKS_BINDING: &[(&str, &str)] = &[("repository", "https://github.com/modelcontextprotocol/ext-tasks"), ("commit", "2c1425d9a288b9b1f489430fe1e00bb392b47e48"), ("commit_url", "https://github.com/modelcontextprotocol/ext-tasks/commit/2c1425d9a288b9b1f489430fe1e00bb392b47e48"), ("tree_url", "https://github.com/modelcontextprotocol/ext-tasks/tree/2c1425d9a288b9b1f489430fe1e00bb392b47e48"), ("tree", "21adc5de7a6ce0de1c81077de129e41f9a843035"), ("maturity_at_pin", "experimental"), ("tasks_contract_profile", "fastmcp-final-core-2026-07-28-tasks-2c1425d9-v1")];
+    const TA_APPS_BINDING: &[(&str, &str)] = &[("repository", "https://github.com/modelcontextprotocol/ext-apps"), ("commit", "92f46a574568a3ddac7600343b7d3c4c4ed7b588"), ("tree", "f6b62ab50fbb8297d458d9ba90c4c2cb67de4759"), ("package_name", "@modelcontextprotocol/ext-apps"), ("package_version", "1.7.5"), ("commit_url", "https://github.com/modelcontextprotocol/ext-apps/commit/92f46a574568a3ddac7600343b7d3c4c4ed7b588"), ("tree_url", "https://github.com/modelcontextprotocol/ext-apps/tree/92f46a574568a3ddac7600343b7d3c4c4ed7b588")];
+    const TA_APPS_AUTHORITY: &[(&str, &str)] = &[("extension_identifier", "io.modelcontextprotocol/ui"), ("apps_client_settings_schema", "apps-2026-01-26-client-mime-types-v1"), ("apps_server_settings_schema", "fastmcp-2026-07-28-apps-empty-server-marker-v1")];
+    const TA_APPS_SERVER: &[(&str, &str)] = &[("profile_id", "fastmcp-2026-07-28-apps-empty-server-marker-v1"), ("extension_name", "io.modelcontextprotocol/ui"), ("emit_condition", "local Apps runtime and frozen descriptor are both enabled"), ("absent_or_one_sided_disposition", "registered ordinary non-Apps fallback")];
+    const TA_WHATWG: &[(&str, &str)] = &[("candidate_source_url", "https://raw.githubusercontent.com/whatwg/html/24c5e48bf66ea61bc199ec6338c81258275ba9c6/source"), ("candidate_declared_license", "CC-BY-4.0; source-code portions BSD-3-Clause"), ("standard", "WHATWG HTML"), ("revision", "24c5e48bf66ea61bc199ec6338c81258275ba9c6"), ("tree", "53663806b56996a7a412ec87248de5657bed6ce7"), ("admission_status", "blocked"), ("candidate_preserved_path", TA_BLOCKED_PATH), ("candidate_sha256", "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa")];
 
-    fn tasks_apps_error(code: &str, subject: &str, field: &str) -> Diagnostic {
+    fn ta_err(code: &str, subject: &str, field: &str) -> Diagnostic {
         Diagnostic::error(code, subject).at(field)
     }
 
-    fn tasks_apps_table<'a>(
-        value: &'a toml::Value,
-        subject: &str,
-    ) -> VResult<&'a toml::map::Map<String, toml::Value>> {
-        value
-            .as_table()
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, "table"))
+    fn ta_mut_err(subject: &str, field: &str) -> Diagnostic {
+        ta_err("E_TASKS_APPS_MUTATION_SCHEMA", subject, field)
     }
 
-    fn tasks_apps_field<'a>(
-        table: &'a toml::map::Map<String, toml::Value>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a toml::Value> {
-        table
-            .get(field)
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+    macro_rules! ta_require {
+        ($condition:expr, $code:expr, $subject:expr, $field:expr) => {
+            if !$condition { return Err(ta_err($code, $subject, $field)); }
+        };
     }
 
-    fn tasks_apps_string<'a>(
-        table: &'a toml::map::Map<String, toml::Value>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<&'a str> {
-        tasks_apps_field(table, field, subject)?
-            .as_str()
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
+    fn ta_tbl<'a>(value: &'a toml::Value, subject: &str) -> VResult<&'a toml::map::Map<String, toml::Value>> { value.as_table().ok_or_else(|| ta_err("E_TASKS_APPS_MANIFEST", subject, "table")) }
+
+    fn ta_fld<'a>(table: &'a toml::map::Map<String, toml::Value>, field: &str, subject: &str) -> VResult<&'a toml::Value> { table.get(field).ok_or_else(|| ta_err("E_TASKS_APPS_MANIFEST", subject, field)) }
+
+    fn ta_arr<'a>(table: &'a toml::map::Map<String, toml::Value>, field: &str, code: &str, subject: &str) -> VResult<&'a [toml::Value]> { ta_fld(table, field, subject)?.as_array().map(Vec::as_slice).ok_or_else(|| ta_err(code, subject, field)) }
+
+    fn ta_str<'a>(table: &'a toml::map::Map<String, toml::Value>, field: &str, subject: &str) -> VResult<&'a str> { ta_fld(table, field, subject)?.as_str().ok_or_else(|| ta_err("E_TASKS_APPS_MANIFEST", subject, field)) }
+
+    fn ta_bool(table: &toml::map::Map<String, toml::Value>, field: &str, subject: &str) -> VResult<bool> { ta_fld(table, field, subject)?.as_bool().ok_or_else(|| ta_err("E_TASKS_APPS_MANIFEST", subject, field)) }
+
+    fn ta_usize(table: &toml::map::Map<String, toml::Value>, field: &str, subject: &str) -> VResult<usize> { usize::try_from(ta_fld(table, field, subject)?.as_integer().ok_or_else(|| ta_err("E_TASKS_APPS_MANIFEST", subject, field))?).map_err(|_| ta_err("E_TASKS_APPS_MANIFEST", subject, field)) }
+
+    fn ta_str_eq(table: &toml::map::Map<String, toml::Value>, field: &str, expected: &str, code: &str, subject: &str) -> VResult<()> { ta_require!(ta_str(table, field, subject)? == expected, code, subject, field); Ok(()) }
+
+    fn ta_usizes_eq(table: &toml::map::Map<String, toml::Value>, expected: &[(&str, usize)], code: &str, subject: &str) -> VResult<()> { for (field, value) in expected { ta_require!(ta_usize(table, field, subject)? == *value, code, subject, field); } Ok(()) }
+
+    fn ta_strings(table: &toml::map::Map<String, toml::Value>, code: &str, subject: &str, rows: &[(&str, &str)]) -> VResult<()> { for (field, expected) in rows { ta_str_eq(table, field, expected, code, subject)?; } Ok(()) }
+
+    fn ta_false(table: &toml::map::Map<String, toml::Value>, fields: &[&str], code: &str, subject: &str) -> VResult<()> { for field in fields { ta_require!(!ta_bool(table, field, subject)?, code, subject, field); } Ok(()) }
+
+    fn ta_arr_prefix(table: &toml::map::Map<String, toml::Value>, field: &str, len: usize, first: &str, code: &str, subject: &str) -> VResult<()> { let values = ta_arr(table, field, code, subject)?; ta_require!(values.len() == len && values.first().and_then(toml::Value::as_str) == Some(first), code, subject, field); Ok(()) }
+
+    fn ta_strs_eq(table: &toml::map::Map<String, toml::Value>, field: &str, expected: &[&str], code: &str, subject: &str) -> VResult<()> { let values = ta_arr(table, field, code, subject)?; ta_require!(values.len() == expected.len() && values.iter().zip(expected).all(|(actual, expected)| actual.as_str() == Some(*expected)), code, subject, field); Ok(()) }
+
+    fn ta_triplet_prefix(parent: &toml::map::Map<String, toml::Value>, field: &str, len: usize, first: (&str, &str, &str), code: &str, subject: &str) -> VResult<()> {
+        let rows = ta_fld(parent, field, subject)?.as_array().ok_or_else(|| ta_err(code, subject, field))?; let row = rows.first().and_then(toml::Value::as_table).ok_or_else(|| ta_err(code, subject, field))?;
+        if rows.len() != len || row.len() != 3 { return Err(ta_err(code, subject, field)); }
+        for (name, value) in [("method", first.0), ("role", first.1), ("direction", first.2)] { ta_str_eq(row, name, value, code, subject)?; } Ok(())
     }
 
-    fn tasks_apps_bool(
-        table: &toml::map::Map<String, toml::Value>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<bool> {
-        tasks_apps_field(table, field, subject)?
-            .as_bool()
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
-    }
+    fn ta_triplets_eq(parent: &toml::map::Map<String, toml::Value>, field: &str, expected: &[(&str, &str, &str)], code: &str, subject: &str) -> VResult<()> { let rows = ta_arr(parent, field, code, subject)?; ta_require!(rows.len() == expected.len(), code, subject, field); for (row, expected) in rows.iter().zip(expected) { let row = row.as_table().ok_or_else(|| ta_err(code, subject, field))?; ta_require!(row.len() == 3 && row.get("method").and_then(toml::Value::as_str) == Some(expected.0) && row.get("role").and_then(toml::Value::as_str) == Some(expected.1) && row.get("direction").and_then(toml::Value::as_str) == Some(expected.2), code, subject, field); } Ok(()) }
 
-    fn tasks_apps_usize(
-        table: &toml::map::Map<String, toml::Value>,
-        field: &str,
-        subject: &str,
-    ) -> VResult<usize> {
-        let value = tasks_apps_field(table, field, subject)?
-            .as_integer()
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))?;
-        usize::try_from(value)
-            .map_err(|_| tasks_apps_error("E_TASKS_APPS_MANIFEST", subject, field))
-    }
+    fn ta_empty_tbl(parent: &toml::map::Map<String, toml::Value>, field: &str, subject: &str) -> VResult<()> { if !ta_tbl(ta_fld(parent, field, subject)?, subject)?.is_empty() { return Err(ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, field)); } Ok(()) }
 
-    fn tasks_apps_expect_string(
-        table: &toml::map::Map<String, toml::Value>,
-        field: &str,
-        expected: &str,
-        code: &str,
-        subject: &str,
-    ) -> VResult<()> {
-        if tasks_apps_string(table, field, subject)? != expected {
-            return Err(tasks_apps_error(code, subject, field));
+    fn ta_obs_digest(path: &str, subtree: &toml::Value) -> VResult<String> { let mut observation = ObservationEncoder::new(8 * 1024 * 1024, path)?; observation.extend(TA_OBS_DOMAIN.as_bytes())?; observation.byte(0)?; observation.sized_u32(path.as_bytes())?; encode_toml_observation(Some(subtree), &mut observation)?; Ok(lower_hex(&sha256(&observation.bytes))) }
+
+    fn ta_subtree_digests(
+        root: &toml::map::Map<String, toml::Value>, contract: &toml::map::Map<String, toml::Value>, enforce_frozen: bool,
+    ) -> VResult<BTreeMap<String, String>> {
+        let subject = "executable_same_validator_contract.subtree_digest";
+        let digests = ta_tbl(ta_fld(contract, "subtree_digest", subject)?, subject)?;
+        ta_require!(!enforce_frozen || digests.len() == TA_SUBTREES.len(), TA_MANIFEST, subject, "exact entries");
+        let tasks = ta_tbl(ta_fld(root, "tasks", "manifest")?, "tasks")?;
+        let apps = ta_tbl(ta_fld(root, "apps", "manifest")?, "apps")?;
+        let closed_preimage = |parent: &toml::map::Map<String, toml::Value>, fields: &[&str], subject: &str| -> VResult<toml::Value> {
+            Ok(toml::Value::Table(fields.iter().map(|field| Ok(((*field).to_owned(), ta_fld(parent, field, subject)?.clone()))).collect::<VResult<_>>()?))
+        };
+        let tasks_settings = closed_preimage(tasks, &["extension_identifier", "client_settings_schema", "server_settings_schema", "client_settings", "server_settings", "settings_authority"], "tasks")?;
+        let apps_settings = closed_preimage(apps, &["extension_identifier", "apps_client_settings_schema", "apps_server_settings_schema", "client_settings", "server_settings"], "apps")?;
+        let mut accepted = BTreeMap::new();
+        for (name, digest) in &TA_SUBTREES {
+            if enforce_frozen { ta_str_eq(digests, name, digest, TA_MANIFEST, subject)?; }
+            let observed = match *name {
+                "tasks_negotiated_settings_contract" => ta_obs_digest("tasks.negotiated_settings_contract", &tasks_settings)?,
+                "apps_negotiated_settings_contract" => ta_obs_digest("apps.negotiated_settings_contract", &apps_settings)?,
+                _ => {
+                    let (prefix, field) = name.split_once('_').ok_or_else(|| ta_err(TA_OBS, subject, name))?;
+                    let parent = match prefix {
+                        "tasks" => tasks,
+                        "apps" => apps,
+                        _ => return Err(ta_err(TA_OBS, subject, name)),
+                    };
+                    ta_obs_digest(&format!("{prefix}.{field}"), ta_fld(parent, field, name)?)?
+                }
+            };
+            ta_require!(!enforce_frozen || observed == *digest, TA_OBS, subject, name);
+            accepted.insert((*name).to_owned(), observed);
         }
-        Ok(())
+        Ok(accepted)
     }
 
-    fn tasks_apps_expect_string_array(
-        table: &toml::map::Map<String, toml::Value>,
-        field: &str,
-        expected: &[&str],
-        code: &str,
-        subject: &str,
-    ) -> VResult<()> {
-        let actual = tasks_apps_field(table, field, subject)?
-            .as_array()
-            .ok_or_else(|| tasks_apps_error(code, subject, field))?;
-        if actual.len() != expected.len()
-            || actual
-                .iter()
-                .zip(expected)
-                .any(|(value, expected)| value.as_str() != Some(*expected))
-        {
-            return Err(tasks_apps_error(code, subject, field));
-        }
-        Ok(())
-    }
-
-    fn tasks_apps_expect_triplets(
-        parent: &toml::map::Map<String, toml::Value>, field: &str, expected: &[(&str, &str, &str)],
-        code: &str, subject: &str,
-    ) -> VResult<()> {
-        let rows = tasks_apps_field(parent, field, subject)?.as_array()
-            .ok_or_else(|| tasks_apps_error(code, subject, field))?;
-        if rows.len() != expected.len() { return Err(tasks_apps_error(code, subject, field)); }
-        for (row, (method, role, direction)) in rows.iter().zip(expected) {
-            let row = tasks_apps_table(row, subject)?;
-            if row.len() != 3 { return Err(tasks_apps_error(code, subject, field)); }
-            for (name, value) in [("method", *method), ("role", *role), ("direction", *direction)] {
-                tasks_apps_expect_string(row, name, value, code, subject)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn tasks_apps_vendor_digest(vendor_bytes: &BTreeMap<String, Vec<u8>>) -> VResult<[u8; 32]> {
-        if vendor_bytes.len() != TASKS_APPS_VENDOR_PATHS.len()
-            || TASKS_APPS_VENDOR_PATHS
-                .iter()
-                .any(|path| !vendor_bytes.contains_key(*path))
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                "vendor-inputs",
-                "paths",
-            ));
-        }
-        let mut ordered = vendor_bytes.iter().collect::<Vec<_>>();
+    fn ta_vendor_digest(vendor: &BTreeMap<String, Vec<u8>>) -> VResult<[u8; 32]> {
+        ta_require!(vendor.len() == TA_VPATHS.len() && TA_VPATHS.iter().all(|path| vendor.contains_key(*path)), "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "paths");
+        let mut ordered = vendor.iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
         let mut digest = Sha256::new();
         digest.update(b"FND01TASKSAPPSVENDORv1\0");
-        digest.update(
-            u32::try_from(ordered.len())
-                .unwrap_or(u32::MAX)
-                .to_be_bytes(),
-        );
+        digest.update(u32::try_from(ordered.len()).unwrap_or(u32::MAX).to_be_bytes());
         for (path, bytes) in ordered {
-            let path_length = u32::try_from(path.len()).map_err(|_| {
-                tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "path")
-            })?;
-            digest.update(path_length.to_be_bytes());
-            digest.update(path.as_bytes());
-            digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
-            digest.update(sha256(bytes));
+            digest.update(u32::try_from(path.len()).map_err(|_| ta_err("E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "path"))?.to_be_bytes()); digest.update(path.as_bytes()); digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes()); digest.update(sha256(bytes));
         }
         Ok(digest.finalize().into())
     }
 
-    fn load_tasks_apps_source_bundle(root: &Path, files: &[LoadedFile]) -> VResult<TasksAppsSourceBundle> {
-        let manifest_file = source_lookup(files, TASKS_APPS_MANIFEST_PATH)?;
-        let manifest = parse_source_toml(files, TASKS_APPS_MANIFEST_PATH)?;
-        let mut vendor_bytes = BTreeMap::new();
-        for path in TASKS_APPS_VENDOR_PATHS {
+    fn ta_load_bundle(root: &Path, files: &[LoadedFile]) -> VResult<TaBundle> {
+        let manifest_file = source_lookup(files, TA_MPATH)?;
+        let manifest = parse_source_toml(files, TA_MPATH)?;
+        let loaded = files.iter().map(|file| file.contract.path.clone()).collect(); let mut vendor = BTreeMap::new();
+        for path in TA_VPATHS {
             let file = source_lookup(files, path)?;
-            if vendor_bytes.insert(path.to_owned(), file.bytes.clone()).is_some() {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    "vendor-inputs",
-                    "duplicate path",
-                ));
-            }
+            ta_require!(vendor.insert(path.to_owned(), file.bytes.clone()).is_none(), "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "duplicate path");
         }
         // The preserved WHATWG source is intentionally outside normal LoadedFile
         // admission: its exact size proves it exceeds the one-MiB admission cap.
-        let blocked_candidate_path = resolve_safe(
-            root,
-            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
-            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
-        )?;
-        let blocked_candidate_bytes = read_bounded(
-            &blocked_candidate_path,
-            TASKS_APPS_BLOCKED_CANDIDATE_READ_LIMIT,
-            TASKS_APPS_BLOCKED_CANDIDATE_PATH,
-        )?;
-        Ok(TasksAppsSourceBundle {
-            manifest,
-            manifest_bytes: manifest_file.bytes.clone(),
-            vendor_bytes,
-            blocked_candidate_bytes,
-        })
+        let path = resolve_safe(root, TA_BLOCKED_PATH, TA_BLOCKED_PATH)?;
+        let blocked = read_bounded(&path, TA_BLOCKED_LIMIT, TA_BLOCKED_PATH)?;
+        Ok(TaBundle { manifest, raw_manifest: manifest_file.bytes.clone(), loaded, vendor, blocked })
     }
 
-    fn validate_tasks_apps_artifacts(
+    fn ta_load_frozen_bundle(root: &Path) -> VResult<TaBundle> {
+        let expected = TA_VPATHS.iter().copied().chain([TA_BLOCKED_PATH])
+            .map(str::to_owned).collect::<BTreeSet<_>>();
+        let excluded = BTreeSet::new();
+        let mut actual = BTreeSet::new();
+        for directory in ["evidence/fnd-01/vendor/tasks", "evidence/fnd-01/vendor/apps"] {
+            collect_tree_files(root, directory, &excluded, TA_MPATH, &expected, &mut actual, expected.len())?;
+        }
+        ta_require!(actual == expected, "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "closed paths");
+
+        let raw_manifest = read_bounded(&resolve_safe(root, TA_MPATH, TA_MPATH)?, TA_SOURCE_LIMIT, TA_MPATH)?;
+        let manifest = parse_toml_document(
+            std::str::from_utf8(&raw_manifest).map_err(|_| ta_err(TA_MANIFEST, "manifest", "utf8"))?,
+            TA_MPATH,
+        )?;
+        let mut loaded = vec![TA_MPATH.to_owned()];
+        let mut vendor = BTreeMap::new();
+        for path in TA_VPATHS {
+            let bytes = read_bounded(&resolve_safe(root, path, path)?, TA_SOURCE_LIMIT, path)?;
+            ta_require!(vendor.insert(path.to_owned(), bytes).is_none(), "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "duplicate path");
+            loaded.push(path.to_owned());
+        }
+        let blocked = read_bounded(&resolve_safe(root, TA_BLOCKED_PATH, TA_BLOCKED_PATH)?, TA_BLOCKED_LIMIT, TA_BLOCKED_PATH)?;
+        Ok(TaBundle { manifest, raw_manifest, loaded, vendor, blocked })
+    }
+
+    fn ta_artifacts<'a>(
         family: &str,
-        parent: &toml::map::Map<String, toml::Value>,
-        expected: &[TasksAppsArtifactExpectation],
-        repository: &str,
-        commit: &str,
-        bundle: &TasksAppsSourceBundle,
+        parent: &'a toml::map::Map<String, toml::Value>,
+        field: &str,
+        expected_artifacts: &[(&str, usize)],
+        width: usize,
+        bundle: &TaBundle,
+    ) -> VResult<&'a [toml::Value]> {
+        let rows = ta_arr(parent, field, "E_TASKS_APPS_ARTIFACT_INVENTORY", family)?;
+        ta_require!(rows.len() == expected_artifacts.len(), "E_TASKS_APPS_ARTIFACT_INVENTORY", family, &format!("{field} count"));
+        for (index, (value, (expected_id, path_index))) in rows.iter().zip(expected_artifacts).enumerate() {
+            let subject = format!("{family}.{field}[{index}]");
+            let row = ta_tbl(value, &subject)?;
+            let id = row.get("id").and_then(toml::Value::as_str).ok_or_else(|| ta_err("E_TASKS_APPS_ARTIFACT_INVENTORY", &subject, "id"))?;
+            ta_require!(id == *expected_id, "E_TASKS_APPS_ARTIFACT_INVENTORY", &subject, "id");
+            ta_require!(row.len() == width, "E_TASKS_APPS_ARTIFACT_INVENTORY", &subject, "closed tuple");
+            let expected_path = TA_VPATHS.get(*path_index).ok_or_else(|| ta_err("E_TASKS_APPS_ARTIFACT_INVENTORY", &subject, "vendor path index"))?;
+            let path = ta_str(row, "vendor_path", id)?;
+            ta_require!(path == *expected_path, "E_TASKS_APPS_ARTIFACT_BINDING", id, "vendor_path");
+            let bytes = bundle.vendor.get(*expected_path).ok_or_else(|| ta_err("E_TASKS_APPS_ARTIFACT_INVENTORY", id, "vendor_path"))?;
+            ta_require!(bytes.len() == ta_usize(row, "byte_length", id)? && lower_hex(&sha256(bytes)) == ta_str(row, "sha256", id)?, "E_TASKS_APPS_VENDOR_BYTES", id, "sha256");
+        }
+        Ok(rows)
+    }
+
+    fn ta_lock(
+        parent: &toml::map::Map<String, toml::Value>, bundle: &TaBundle,
+        path: &str, expected: &str, artifact: &str, subject: &str,
     ) -> VResult<()> {
-        let rows = tasks_apps_field(parent, "artifact", family)?
-            .as_array()
-            .ok_or_else(|| {
-                tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", family, "artifact")
-            })?;
-        if rows.len() != expected.len() {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                family,
-                "artifact count",
-            ));
-        }
-        for (index, (row, frozen)) in rows.iter().zip(expected).enumerate() {
-            let subject = format!("{family}.artifact[{index}]");
-            let row = tasks_apps_table(row, &subject)?;
-            // This check intentionally precedes every artifact binding so the
-            // required missing-ID negative has one stable diagnostic.
-            if row.get("id").and_then(toml::Value::as_str) != Some(frozen.id) {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    &subject,
-                    "id",
-                ));
-            }
-            tasks_apps_expect_string(
-                row,
-                "repository_commit",
-                commit,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                frozen.id,
-            )?;
-            tasks_apps_expect_string(
-                row,
-                "upstream_path",
-                frozen.upstream_path,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                frozen.id,
-            )?;
-            tasks_apps_expect_string(
-                row,
-                "vendor_path",
-                frozen.vendor_path,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                frozen.id,
-            )?;
-            let source_url = format!(
-                "https://raw.githubusercontent.com/{}/{}/{}",
-                repository.trim_start_matches("https://github.com/"),
-                commit,
-                frozen.upstream_path
-            );
-            tasks_apps_expect_string(
-                row,
-                "source_url",
-                &source_url,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                frozen.id,
-            )?;
-            if tasks_apps_usize(row, "byte_length", frozen.id)? != frozen.byte_length
-                || tasks_apps_string(row, "sha256", frozen.id)? != frozen.sha256
-                || tasks_apps_string(row, "authority_role", frozen.id)? != frozen.authority_role
-            {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_BINDING",
-                    frozen.id,
-                    "frozen fields",
-                ));
-            }
-            let bytes = bundle.vendor_bytes.get(frozen.vendor_path).ok_or_else(|| {
-                tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", frozen.id, "vendor_path")
-            })?;
-            if bytes.len() != frozen.byte_length || lower_hex(&sha256(bytes)) != frozen.sha256 {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_VENDOR_BYTES",
-                    frozen.id,
-                    "sha256",
-                ));
-            }
-        }
+        let bytes = bundle.vendor.get(path).ok_or_else(|| ta_err("E_TASKS_APPS_ARTIFACT_INVENTORY", subject, "package-lock"))?;
+        let lock: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ta_err("E_TASKS_APPS_LOCK_LICENSE", subject, "json"))?;
+        ta_require!(lock.pointer("/packages//license").and_then(serde_json::Value::as_str) == Some(expected), "E_TASKS_APPS_LOCK_LICENSE", subject, "packages[\"\"].license");
+        let sdk = ta_tbl(ta_fld(parent, "sdk_1_29_0", subject)?, subject)?;
+        let text = |pointer: &str| lock.pointer(pointer).and_then(serde_json::Value::as_str);
+        let node = |field| text(&format!("/packages/node_modules~1@modelcontextprotocol~1sdk/{field}"));
+        ta_require!(text("/packages//devDependencies/@modelcontextprotocol~1sdk") == Some("^1.29.0")
+            && node("version") == sdk.get("resolved_version").and_then(toml::Value::as_str)
+            && node("resolved") == sdk.get("resolved_url").and_then(toml::Value::as_str)
+            && node("integrity") == sdk.get("verified_integrity").and_then(toml::Value::as_str)
+            && node("license") == Some("MIT")
+            && sdk.get("resolved_from_artifact").and_then(toml::Value::as_str) == Some(artifact),
+            "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "sdk_1_29_0");
         Ok(())
     }
 
-    fn validate_tasks_apps_lock_license(
-        bundle: &TasksAppsSourceBundle,
-        path: &str,
-        expected: &str,
-        subject: &str,
+    fn ta_sdk(
+        parent: &toml::map::Map<String, toml::Value>, artifact: &str, subject: &str,
     ) -> VResult<()> {
-        let bytes = bundle.vendor_bytes.get(path).ok_or_else(|| {
-            tasks_apps_error("E_TASKS_APPS_ARTIFACT_INVENTORY", subject, "package-lock")
-        })?;
-        let lock: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|_| tasks_apps_error("E_TASKS_APPS_LOCK_LICENSE", subject, "json"))?;
-        if lock
-            .pointer("/packages//license")
-            .and_then(serde_json::Value::as_str)
-            != Some(expected)
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_LOCK_LICENSE",
-                subject,
-                "packages[\"\"].license",
-            ));
-        }
+        let sdk = ta_tbl(ta_fld(parent, "sdk_1_29_0", subject)?, subject)?;
+        let text = |field| sdk.get(field).and_then(toml::Value::as_str);
+        let strings = |field, len| sdk.get(field).and_then(toml::Value::as_array).is_some_and(|items| items.len() == len && items.iter().all(toml::Value::is_str));
+        let tasks = subject == "tasks";
+        ta_require!(sdk.len() == if tasks { 16 } else { 18 }
+            && text("package") == Some("@modelcontextprotocol/sdk")
+            && text("declared_range") == Some("^1.29.0")
+            && text("resolved_version") == Some("1.29.0")
+            && text("resolved_url") == Some("https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.29.0.tgz")
+            && text("sha256") == Some("1c51470eca288ae744a5d8bb48e217d3eab5869eb2cbaf587fc29f336d6b096c")
+            && ta_usize(sdk, "byte_length", subject)? == 572_539
+            && text("resolved_from_artifact") == Some(artifact)
+            && matches!(text("lock_integrity"), Some(value) if value.starts_with("sha512-"))
+            && text("lock_integrity") == text("verified_integrity")
+            && if tasks {
+                text("import_module") == Some("@modelcontextprotocol/sdk/types.js")
+                    && text("import_kind") == Some("type-only")
+                    && strings("ordered_imports", 10) && ta_usize(sdk, "import_count", subject)? == 10
+            } else {
+                text("direct_import_module") == Some("@modelcontextprotocol/sdk/types.js")
+                    && strings("direct_imports", 7) && strings("standard_reuse_imports", 21)
+                    && ta_usize(sdk, "direct_import_count", subject)? == 7
+                    && ta_usize(sdk, "standard_reuse_import_count", subject)? == 21
+                    && sdk.get("standard_reuse_closure").and_then(toml::Value::as_table)
+                        .and_then(|closure| closure.get("canonical_global_sha256"))
+                        .and_then(toml::Value::as_str)
+                        == Some("b1c4f93aa42749b3cf7561569ab8ff6fc0d47fe7283cde6eadcb0e773bf0f796")
+            }, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "sdk_1_29_0");
         Ok(())
     }
 
-    fn validate_tasks_apps_sdk(
-        parent: &toml::map::Map<String, toml::Value>,
-        artifact: &str,
-        subject: &str,
-    ) -> VResult<()> {
-        let sdk = tasks_apps_table(tasks_apps_field(parent, "sdk_1_29_0", subject)?, subject)?;
-        for (field, expected) in [
-            ("package", "@modelcontextprotocol/sdk"),
-            ("resolved_version", "1.29.0"),
-            (
-                "resolved_url",
-                "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.29.0.tgz",
-            ),
-            (
-                "sha256",
-                "1c51470eca288ae744a5d8bb48e217d3eab5869eb2cbaf587fc29f336d6b096c",
-            ),
-            ("resolved_from_artifact", artifact),
-        ] {
-            tasks_apps_expect_string(
-                sdk,
-                field,
-                expected,
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                subject,
-            )?;
-        }
-        if tasks_apps_usize(sdk, "byte_length", subject)? != 572_539
-            || !tasks_apps_string(sdk, "lock_integrity", subject)?.starts_with("sha512-")
-            || tasks_apps_string(sdk, "lock_integrity", subject)?
-                != tasks_apps_string(sdk, "verified_integrity", subject)?
-            || tasks_apps_bool(sdk, "final_core_authority", subject)?
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                subject,
-                "sdk_1_29_0",
-            ));
-        }
-        if subject == "tasks" {
-            tasks_apps_expect_string_array(sdk, "ordered_imports", &[
-                "CreateMessageRequest", "CreateMessageResult", "ElicitRequest", "ElicitResult",
-                "JSONRPCNotification", "JSONRPCRequest", "ListRootsRequest", "ListRootsResult",
-                "NotificationParams", "Result",
-            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
-            if tasks_apps_usize(sdk, "import_count", subject)? != 10 {
-                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "import_count"));
-            }
-        } else {
-            tasks_apps_expect_string_array(sdk, "direct_imports", &[
-                "CallToolResult", "ContentBlock", "EmbeddedResource", "Implementation", "RequestId", "ResourceLink", "Tool",
-            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
-            tasks_apps_expect_string_array(sdk, "standard_reuse_imports", &[
-                "CallToolRequest", "CallToolResult", "CreateMessageRequest", "CreateMessageResult", "CreateMessageResultWithTools", "EmptyResult", "ListPromptsRequest", "ListPromptsResult", "ListResourcesRequest", "ListResourcesResult", "ListResourceTemplatesRequest", "ListResourceTemplatesResult", "ListToolsRequest", "ListToolsResult", "LoggingMessageNotification", "PingRequest", "PromptListChangedNotification", "ReadResourceRequest", "ReadResourceResult", "ResourceListChangedNotification", "ToolListChangedNotification",
-            ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject)?;
-            if tasks_apps_usize(sdk, "direct_import_count", subject)? != 7
-                || tasks_apps_usize(sdk, "standard_reuse_import_count", subject)? != 21 {
-                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", subject, "import_count"));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_tasks_apps_license(
+    fn ta_license(
         parent: &toml::map::Map<String, toml::Value>,
         field: &str,
-        repository: &str,
-        revision: &str,
-        blob: &str,
-        byte_length: usize,
-        sha256_value: &str,
-        declared: &str,
+        subject: &str,
+        checked_field: &str,
+        expected: &str,
+        closed_tuple: bool,
     ) -> VResult<()> {
-        let subject = format!("{}.{}", if field.starts_with("conformance") { "tasks" } else if repository.ends_with("ext-apps") { "apps" } else { "tasks" }, field);
-        let row = tasks_apps_table(tasks_apps_field(parent, field, &subject)?, &subject)?;
-        for (name, value) in [
-            ("repository", repository), ("repository_revision", revision), ("upstream_path", "LICENSE"),
-            ("source_page_url", &format!("{repository}/blob/{revision}/LICENSE")),
-            ("source_url", &format!("https://raw.githubusercontent.com/{}/{revision}/LICENSE", repository.trim_start_matches("https://github.com/"))),
-            ("retrieved_on", "2026-08-04"), ("git_blob_sha1", blob), ("sha256", sha256_value),
-            ("declared_license", declared),
-        ] { tasks_apps_expect_string(row, name, value, "E_TASKS_APPS_LICENSE_PROVENANCE", &subject)?; }
-        if tasks_apps_usize(row, "byte_length", &subject)? != byte_length { return Err(tasks_apps_error("E_TASKS_APPS_LICENSE_PROVENANCE", &subject, "byte_length")); }
+        let row = ta_tbl(ta_fld(parent, field, subject)?, subject)?;
+        if row.len() != 11 || ta_str(row, checked_field, subject)? != expected {
+            return Err(ta_err("E_TASKS_APPS_LICENSE_PROVENANCE", subject, if closed_tuple { "closed tuple" } else { checked_field }));
+        }
         Ok(())
     }
 
-    fn validate_tasks_apps_planted_mutations(
+    fn ta_plans(
+        manifest: &toml::Value,
         contract: &toml::map::Map<String, toml::Value>,
-    ) -> VResult<Vec<TasksAppsPlantedMutation>> {
-        let mutations = tasks_apps_field(
-            contract,
-            "planted_mutation",
-            "executable_same_validator_contract",
-        )?
-        .as_array()
-        .ok_or_else(|| {
-            tasks_apps_error(
-                "E_TASKS_APPS_MUTATION_SCHEMA",
-                "executable_same_validator_contract",
-                "planted_mutation",
-            )
-        })?;
-        let expected = [
-            (
-                "missing-required-artifact-id",
-                "remove-one-manifest-field",
-                "tasks.artifact[0].id",
-                "FND01|Error|E_TASKS_APPS_ARTIFACT_INVENTORY|tasks.artifact[0]|id",
-                TasksAppsMutationPayload::None,
-            ),
-            (
-                "swapped-vendor-path",
-                "replace-one-manifest-field",
-                "tasks.artifact[0].vendor_path",
-                "FND01|Error|E_TASKS_APPS_ARTIFACT_BINDING|tasks-prose|vendor_path",
-                TasksAppsMutationPayload::ReplacementText("evidence/fnd-01/vendor/apps/apps.mdx"),
-            ),
-            (
-                "truncated-vendor-bytes",
-                "remove-one-terminal-byte-from-one-virtual-input",
-                "evidence/fnd-01/vendor/tasks/tasks.md",
-                "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256",
-                TasksAppsMutationPayload::None,
-            ),
-            (
-                "substituted-vendor-bytes",
-                "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input",
-                "evidence/fnd-01/vendor/tasks/tasks.md",
-                "FND01|Error|E_TASKS_APPS_VENDOR_BYTES|tasks-prose|sha256",
-                TasksAppsMutationPayload::ReplacementInput("evidence/fnd-01/vendor/apps/apps.mdx"),
-            ),
-            (
-                "tasks-authority-classification-promotion",
-                "replace-one-manifest-field",
-                "tasks.final_core_authority",
-                "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|tasks|final_core_authority",
-                TasksAppsMutationPayload::ReplacementBool(true),
-            ),
-            (
-                "apps-2025-authority-leakage",
-                "replace-one-manifest-field",
-                "apps.stable_spec_date",
-                "FND01|Error|E_TASKS_APPS_LEGACY_2025_AUTHORITY|apps|stable_spec_date",
-                TasksAppsMutationPayload::ReplacementText("2025-11-25"),
-            ),
-            (
-                "apps-maturity-classification-drift",
-                "replace-one-manifest-field",
-                "apps.maturity_at_pin",
-                "FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|apps|maturity_at_pin",
-                TasksAppsMutationPayload::ReplacementText("experimental"),
-            ),
-            (
-                "whatwg-blocked-admission-drift",
-                "replace-one-manifest-field",
-                "apps.whatwg_html_validation.admitted_as_source_input",
-                "FND01|Error|E_TASKS_APPS_ADMISSION|apps.whatwg_html_validation|admitted_as_source_input",
-                TasksAppsMutationPayload::ReplacementBool(true),
-            ),
-            (
-                "tasks-license-class-drift",
-                "replace-one-manifest-field",
-                "tasks.license_provenance.declared_license",
-                "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.license_provenance|declared_license",
-                TasksAppsMutationPayload::ReplacementText("repository_transition_notice"),
-            ),
-            (
-                "tasks-conformance-license-provenance-drift",
-                "replace-one-manifest-field",
-                "tasks.conformance_license_provenance.sha256",
-                "FND01|Error|E_TASKS_APPS_LICENSE_PROVENANCE|tasks.conformance_license_provenance|sha256",
-                TasksAppsMutationPayload::ReplacementText("1382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"),
-            ),
-            (
-                "inventory-classification-drift",
-                "replace-one-manifest-field",
-                "verification_contract.apps_preserved_blocked_candidate_count",
-                "FND01|Error|E_TASKS_APPS_INVENTORY_CLASSIFICATION|verification_contract|apps_preserved_blocked_candidate_count",
-                TasksAppsMutationPayload::ReplacementInteger(0),
-            ),
-            (
-                "required-test-id-drift",
-                "replace-one-manifest-field",
-                "executable_same_validator_contract.required_test_ids[0]",
-                "FND01|Error|E_TASKS_APPS_TEST_IDENTITY|executable_same_validator_contract|required_test_ids[0]",
-                TasksAppsMutationPayload::ReplacementText("tests::fnd_01_tasks_apps_sources_positive"),
-            ),
-        ];
-        if mutations.len() != expected.len() {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_MUTATION_SCHEMA",
-                "executable_same_validator_contract",
-                "generic planted_mutation count",
-            ));
-        }
-        let mut plans = Vec::with_capacity(expected.len());
-        for (row, (id, operation, target, diagnostic, payload)) in mutations.iter().zip(expected) {
-            let row = tasks_apps_table(row, id)?;
-            let mut allowed = vec!["id", "operation", "target", "expected_diagnostic"];
-            match payload {
-                TasksAppsMutationPayload::None => {}
-                TasksAppsMutationPayload::ReplacementText(_)
-                | TasksAppsMutationPayload::ReplacementBool(_)
-                | TasksAppsMutationPayload::ReplacementInteger(_) => {
-                    allowed.push("replacement");
-                }
-                TasksAppsMutationPayload::ReplacementInput(_) => allowed.push("replacement_input"),
-            }
-            if row.len() != allowed.len() || allowed.iter().any(|field| !row.contains_key(*field)) {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_MUTATION_SCHEMA",
-                    id,
-                    "fields",
-                ));
-            }
-            for (field, expected) in [
-                ("id", id),
-                ("operation", operation),
-                ("target", target),
-                ("expected_diagnostic", diagnostic),
-            ] {
-                tasks_apps_expect_string(row, field, expected, "E_TASKS_APPS_MUTATION_SCHEMA", id)?;
-            }
-            let (replacement, replacement_input) = match payload {
-                TasksAppsMutationPayload::None => (None, None),
-                TasksAppsMutationPayload::ReplacementText(expected) => {
-                    tasks_apps_expect_string(
-                        row,
-                        "replacement",
-                        expected,
-                        "E_TASKS_APPS_MUTATION_SCHEMA",
-                        id,
-                    )?;
-                    (Some(toml::Value::String(expected.to_owned())), None)
-                }
-                TasksAppsMutationPayload::ReplacementBool(expected) => {
-                    if tasks_apps_bool(row, "replacement", id)? != expected {
-                        return Err(tasks_apps_error(
-                            "E_TASKS_APPS_MUTATION_SCHEMA",
-                            id,
-                            "replacement",
-                        ));
-                    }
-                    (Some(toml::Value::Boolean(expected)), None)
-                }
-                TasksAppsMutationPayload::ReplacementInteger(expected) => {
-                    if tasks_apps_field(row, "replacement", id)?.as_integer() != Some(expected) {
-                        return Err(tasks_apps_error(
-                            "E_TASKS_APPS_MUTATION_SCHEMA",
-                            id,
-                            "replacement",
-                        ));
-                    }
-                    (Some(toml::Value::Integer(expected)), None)
-                }
-                TasksAppsMutationPayload::ReplacementInput(expected) => {
-                    tasks_apps_expect_string(
-                        row,
-                        "replacement_input",
-                        expected,
-                        "E_TASKS_APPS_MUTATION_SCHEMA",
-                        id,
-                    )?;
-                    (None, Some(expected.to_owned()))
-                }
+    ) -> VResult<Vec<TaPlan>> {
+        let subject = "executable_same_validator_contract";
+        let mutations = ta_fld(contract, "planted_mutation", subject)?
+            .as_array()
+            .ok_or_else(|| ta_mut_err(subject, "planted_mutation"))?;
+        let mut plans = Vec::with_capacity(mutations.len());
+        for value in mutations {
+            let row = ta_tbl(value, subject)?;
+            let id = ta_str(row, "id", subject)?;
+            let operation = TaOp::parse(ta_str(row, "operation", id)?, id)?;
+            let target = ta_str(row, "target", id)?;
+            let diagnostic = ta_str(row, "expected_diagnostic", id)?;
+            if row.len() != operation.field_count() { return Err(ta_mut_err(id, "fields")); }
+            let (replacement, input) = match operation {
+                TaOp::ReplaceManifest | TaOp::AddManifest | TaOp::AddVirtualInput => (Some(ta_fld(row, "replacement", id)?.clone()), None),
+                TaOp::ReplaceVirtualInput => (None, Some(ta_str(row, "replacement_input", id)?.to_owned())),
+                _ => (None, None),
             };
-            plans.push(TasksAppsPlantedMutation {
-                id: id.to_owned(),
-                operation: operation.to_owned(),
-                target: target.to_owned(),
-                replacement,
-                replacement_input,
-                expected_diagnostic: diagnostic.to_owned(),
+            if matches!(operation, TaOp::RemoveManifest | TaOp::ReplaceManifest | TaOp::AddManifest)
+            {
+                let pointer = ta_pointer(target)?;
+                let mut candidate = manifest.clone();
+                if operation == TaOp::AddManifest {
+                    insert_pointer(&mut candidate, pointer, replacement.clone().expect("validated addition"), id)
+                        .map_err(|_| ta_mut_err(id, "target"))?;
+                } else {
+                    let current = pointer_get_mut(&mut candidate, pointer, id)
+                        .map_err(|_| ta_mut_err(id, "target"))?;
+                    if operation == TaOp::ReplaceManifest {
+                        let replacement = replacement.as_ref().expect("validated replacement");
+                        if std::mem::discriminant(current) != std::mem::discriminant(replacement) || current == replacement {
+                            return Err(ta_mut_err(id, "replacement"));
+                        }
+                    }
+                }
+            } else if matches!(operation, TaOp::RemoveTerminalByte | TaOp::ReplaceVirtualInput) {
+                let path = ta_input_path(target)?;
+                if !TA_VPATHS.contains(&path.as_str()) {
+                    return Err(ta_mut_err(id, "target"));
+                }
+                if let Some(input) = input.as_deref() {
+                    let replacement = ta_input_path(input)?;
+                    if replacement == path || !TA_VPATHS.contains(&replacement.as_str()) {
+                        return Err(ta_mut_err(id, "replacement_input"));
+                    }
+                }
+            } else if operation == TaOp::AddVirtualInput {
+                let path = ta_input_path(target)?;
+                if path != TA_BLOCKED_PATH
+                    || replacement.as_ref() != Some(&toml::Value::Boolean(true)) {
+                    return Err(ta_mut_err(id, "target"));
+                }
+            }
+            let parts = diagnostic.split('|').collect::<Vec<_>>();
+            if parts.len() != 5 || parts[0] != "FND01" || parts[1] != "Error" || !parts[2].starts_with("E_TASKS_APPS_") || parts[3].is_empty() || parts[4].is_empty() {
+                return Err(ta_mut_err(id, "expected_diagnostic"));
+            }
+            plans.push(TaPlan {
+                id: id.to_owned(), operation, target: target.to_owned(),
+                group: ta_plan_group(operation, target)?,
+                replacement, input, diagnostic: diagnostic.to_owned(),
             });
+        }
+        let mut ids = BTreeSet::new(); let mut targets = BTreeSet::new(); let mut tuples = BTreeSet::new();
+        if plans.len() != 39 || plans.iter().any(|plan| !ids.insert(plan.id.as_str()) || !targets.insert((plan.operation.token(), plan.target.as_str())) || !tuples.insert((plan.operation.token(), plan.target.as_str(), plan.diagnostic.as_str()))) {
+            return Err(ta_mut_err(subject, "exact explicit catalogue"));
+        }
+        if ta_obs_digest("executable_same_validator_contract.planted_mutation", ta_fld(contract, "planted_mutation", subject)?)?
+            != "5d23e1fdb51b24b4ae284860a74d72bb5810a5070d85cf074a463afa2141fd42" {
+            return Err(ta_mut_err(subject, "exact explicit catalogue"));
         }
         Ok(plans)
     }
 
-    fn tasks_apps_manifest_pointer(target: &str) -> VResult<&'static str> {
-        match target {
-            "tasks.artifact[0].id" => Ok("/tasks/artifact/0/id"),
-            "tasks.artifact[0].vendor_path" => Ok("/tasks/artifact/0/vendor_path"),
-            "tasks.final_core_authority" => Ok("/tasks/final_core_authority"),
-            "apps.stable_spec_date" => Ok("/apps/stable_spec_date"),
-            "apps.maturity_at_pin" => Ok("/apps/maturity_at_pin"),
-            "apps.whatwg_html_validation.admitted_as_source_input" => {
-                Ok("/apps/whatwg_html_validation/admitted_as_source_input")
-            }
-            "tasks.license_provenance.declared_license" => {
-                Ok("/tasks/license_provenance/declared_license")
-            }
-            "tasks.conformance_license_provenance.sha256" => {
-                Ok("/tasks/conformance_license_provenance/sha256")
-            }
-            "verification_contract.apps_preserved_blocked_candidate_count" => {
-                Ok("/verification_contract/apps_preserved_blocked_candidate_count")
-            }
-            "executable_same_validator_contract.required_test_ids[0]" => {
-                Ok("/executable_same_validator_contract/required_test_ids/0")
-            }
-            _ => Err(tasks_apps_error(
-                "E_TASKS_APPS_MUTATION_SCHEMA",
-                "executable_same_validator_contract",
+    fn ta_decode_segment(segment: &str, subject: &str, target: &str, selector_rules: bool) -> VResult<String> {
+        if segment.is_empty() || selector_rules && (segment.contains('=') || segment.len() > 1 && segment.as_bytes().iter().all(u8::is_ascii_digit) && segment.starts_with('0')) {
+            return Err(ta_mut_err(subject, target));
+        }
+        let mut decoded = String::with_capacity(segment.len()); let mut chars = segment.chars();
+        while let Some(character) = chars.next() {
+            if character == '~' {
+                match chars.next() {
+                    Some('0') => decoded.push('~'),
+                    Some('1') => decoded.push('/'),
+                    _ => return Err(ta_mut_err(subject, target)),
+                }
+            } else { decoded.push(character); }
+        }
+        if decoded.replace('~', "~0").replace('/', "~1") != segment { return Err(ta_mut_err(subject, target)); }
+        Ok(decoded)
+    }
+
+    fn ta_input_path(target: &str) -> VResult<String> {
+        let token = target.strip_prefix("/admitted_vendor_input/").ok_or_else(|| ta_mut_err("admitted_vendor_input", target))?;
+        if token.contains('/') { return Err(ta_mut_err("admitted_vendor_input", target)); }
+        ta_decode_segment(token, "admitted_vendor_input", target, false)
+    }
+
+    fn ta_generated() -> Vec<TaPlan> {
+        let mut plans = Vec::with_capacity(49);
+        let mut add = |id: String, target: String, digest: &str| {
+            let group = ta_plan_group(TaOp::ReplaceManifest, &target)
+                .expect("fixed generated target group");
+            plans.push(TaPlan {
+                id,
+                operation: TaOp::ReplaceManifest,
                 target,
-            )),
+                group,
+                replacement: Some(toml::Value::String("2026-08-05-drift".to_owned())),
+                input: None,
+                diagnostic: format!(
+                    "FND01|Error|E_TASKS_APPS_OBSERVATION|executable_same_validator_contract.subtree_digest|{digest}"
+                ),
+            });
+        };
+        for (id, path, field, count, digest) in [
+            ("tasks-artifact-retrieval", "/manifest/tasks/artifact", "retrieved_on", 4, "tasks_artifact"),
+            ("tasks-conformance-retrieval", "/manifest/tasks/conformance_artifact", "retrieved_on", 1, "tasks_conformance_artifact"),
+            ("apps-artifact-retrieval", "/manifest/apps/artifact", "retrieved_on", 8, "apps_artifact"),
+            ("apps-standard-reuse", "/manifest/apps/standard_reuse", "canonical_closure_sha256", 21, "apps_standard_reuse"),
+            ("apps-quarantine", "/manifest/apps/quarantine", "composed_rule", 10, "apps_quarantine"),
+        ] {
+            for index in 0..count { add(format!("{id}-{index}"), format!("{path}/{index}/{field}"), digest); }
         }
+        for (index, &(target, subject, field)) in [
+            ("/manifest/apps/product_composition_authority/0/repository", "APP-03-apps-plus-host-mediated-sampling", "repository"),
+            ("/manifest/apps/product_composition_authority/0/authority_scope", "APP-03-apps-plus-host-mediated-sampling", "authority_scope"),
+            ("/manifest/apps/product_composition_authority/1/tasks_repository", "APP-04-apps-plus-tasks-mrtr", "tasks_repository"),
+            ("/manifest/apps/product_composition_authority/1/authority_scope", "APP-04-apps-plus-tasks-mrtr", "authority_scope"),
+            ("/manifest/apps/product_composition_authority/1/mrtr_repository", "APP-04-apps-plus-tasks-mrtr", "mrtr_repository"),
+        ].iter().enumerate() {
+            let target = (*target).to_owned();
+            plans.push(TaPlan {
+                id: format!("apps-composition-{index}"),
+                operation: TaOp::ReplaceManifest,
+                group: ta_plan_group(TaOp::ReplaceManifest, &target)
+                    .expect("fixed generated composition group"),
+                target,
+                replacement: Some(toml::Value::String("2026-08-05-drift".to_owned())),
+                input: None,
+                diagnostic: format!("FND01|Error|E_TASKS_APPS_AUTHORITY_CLASSIFICATION|{subject}|{field}"),
+            });
+        }
+        plans
     }
 
-    fn validate_tasks_apps_sources(bundle: &TasksAppsSourceBundle) -> VResult<AcceptedTasksAppsState> {
-        let root = tasks_apps_table(&bundle.manifest, "manifest")?;
-        tasks_apps_expect_string(
-            root,
-            "evidence_id",
-            "fnd-01-tasks-apps-2026-08-04-v7-admission-classified",
-            "E_TASKS_APPS_MANIFEST",
-            "manifest",
-        )?;
-        let contract = tasks_apps_table(
-            tasks_apps_field(root, "executable_same_validator_contract", "manifest")?,
-            "executable_same_validator_contract",
-        )?;
-        for (field, expected) in [
-            ("contract_id", "fnd-01-tasks-apps-source-integrity-v2"),
-            (
-                "shared_verifier_path",
-                "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
-            ),
-            ("production_validator_symbol", "validate_tasks_apps_sources"),
-            ("required_enclosing_module", "ordinary::tests"),
-            ("admitted_vendor_family_digest_sha256", TASKS_APPS_VENDOR_DIGEST),
-            ("receipt_or_manifest_self_hash", "forbidden"),
-        ] {
-            tasks_apps_expect_string(
-                contract,
-                field,
-                expected,
-                "E_TASKS_APPS_MANIFEST",
-                "executable_same_validator_contract",
-            )?;
+    fn ta_plan_group(operation: TaOp, target: &str) -> VResult<usize> {
+        match operation {
+            TaOp::RemoveTerminalByte | TaOp::ReplaceVirtualInput => return Ok(0),
+            TaOp::AddVirtualInput => return Ok(5),
+            _ => {}
         }
-        if tasks_apps_usize(
-            contract,
-            "admitted_vendor_input_count",
-            "executable_same_validator_contract",
-        )? != TASKS_APPS_VENDOR_PATHS.len()
-            || tasks_apps_usize(
-                contract,
-                "admitted_vendor_input_total_bytes",
-                "executable_same_validator_contract",
-            )? != 1_173_466
-            || tasks_apps_bool(
-                contract,
-                "runtime_capability_credit",
-                "executable_same_validator_contract",
-            )?
-            || tasks_apps_bool(
-                contract,
-                "remote_provenance_capability_credit",
-                "executable_same_validator_contract",
-            )?
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_MANIFEST",
-                "executable_same_validator_contract",
-                "capability boundary",
-            ));
-        }
-        let required_test_ids = [
-            "ordinary::tests::fnd_01_tasks_apps_sources_positive",
-            "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative",
-        ];
-        if tasks_apps_expect_string_array(
-            contract,
-            "required_test_ids",
-            &required_test_ids,
-            "E_TASKS_APPS_TEST_IDENTITY",
-            "executable_same_validator_contract",
+        let invalid = || ta_mut_err("executable_same_validator_contract", "target group");
+        let path = target.strip_prefix("/manifest/").ok_or_else(invalid)?;
+        let (family, tail) = path.split_once('/').ok_or_else(invalid)?;
+        let (field, nested) = tail.split_once('/').map_or((tail, false), |(field, _)| (field, true));
+        let name = match (family, field, nested) {
+            ("tasks", "final_core_authority" | "extension_identifier", false) => "tasks_authority_profile".to_owned(),
+            ("apps", "stable_spec_date" | "maturity_at_pin" | "extension_identifier", false) => "apps_authority_profile".to_owned(),
+            ("tasks", "client_settings" | "server_settings", false) => "tasks_negotiated_settings_contract".to_owned(),
+            ("apps", "client_settings", true) => "apps_negotiated_settings_contract".to_owned(),
+            ("apps", "server_settings", true) if tail == "server_settings/only_valid_value" => "apps_negotiated_settings_contract".to_owned(),
+            ("verification_contract", _, false) => "verification_contract".to_owned(),
+            ("executable_same_validator_contract", _, true) => "executable_same_validator_contract".to_owned(),
+            (family @ ("tasks" | "apps"), field, true) if !matches!(field, "authority_profile" | "negotiated_settings_contract") => format!("{family}_{field}"),
+            _ => return Err(invalid()),
+        };
+        TA_GROUPS.iter().position(|(candidate, _)| *candidate == name).ok_or_else(invalid)
+    }
+
+    fn ta_pointer(target: &str) -> VResult<&str> {
+        let pointer = target.strip_prefix("/manifest").filter(|value| value.starts_with('/'))
+            .ok_or_else(|| ta_mut_err("executable_same_validator_contract", target))?;
+        for segment in pointer.split('/').skip(1) { ta_decode_segment(segment, "executable_same_validator_contract", target, true)?; }
+        Ok(pointer)
+    }
+
+    fn validate_tasks_apps_sources(bundle: &TaBundle) -> VResult<TaAccepted> {
+        let root = ta_tbl(&bundle.manifest, "manifest")?;
+        ta_require!(!bundle.vendor.contains_key(TA_BLOCKED_PATH)
+            && !bundle.loaded.iter().any(|path| path == TA_BLOCKED_PATH),
+            "E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation", "admitted_as_source_input");
+        ta_require!(bundle.vendor.len() == TA_VPATHS.len()
+            && TA_VPATHS.iter().all(|path| bundle.vendor.contains_key(*path)),
+            "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "paths");
+        ta_str_eq(root, "evidence_id", "fnd-01-tasks-apps-2026-08-05-v8-closed-observation", "E_TASKS_APPS_MANIFEST", "manifest")?;
+        let contract = ta_tbl(ta_fld(root, "executable_same_validator_contract", "manifest")?, "executable_same_validator_contract")?;
+        let immutable_manifest: toml::Value = toml::from_str(
+            std::str::from_utf8(&bundle.raw_manifest)
+                .map_err(|_| ta_err("E_TASKS_APPS_MANIFEST", "manifest", "utf8"))?,
         )
-        .is_err()
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_TEST_IDENTITY",
-                "executable_same_validator_contract",
-                "required_test_ids",
-            ));
-        }
-        let validated_mutations = validate_tasks_apps_planted_mutations(contract)?;
-        if validated_mutations.len() != 12 {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_MUTATION_SCHEMA",
-                "executable_same_validator_contract",
-                "generic planted mutations",
-            ));
-        }
+        .map_err(|_| ta_err("E_TASKS_APPS_MANIFEST", "manifest", "toml"))?;
+        let explicit_plants = ta_plans(&immutable_manifest, contract)?;
+        ta_strings(contract, "E_TASKS_APPS_MANIFEST", "executable_same_validator_contract", TA_CONTRACT_STRINGS)?;
+        let runtime_capability_credit = ta_bool(contract, "runtime_capability_credit", "executable_same_validator_contract")?;
+        let remote_provenance_capability_credit = ta_bool(contract, "remote_provenance_capability_credit", "executable_same_validator_contract")?;
+        ta_require!(ta_usize(contract, "admitted_vendor_input_count", "executable_same_validator_contract")? == TA_VPATHS.len()
+            && ta_usize(contract, "admitted_vendor_input_total_bytes", "executable_same_validator_contract")? == 1_173_466
+            && !runtime_capability_credit && !remote_provenance_capability_credit,
+            "E_TASKS_APPS_MANIFEST", "executable_same_validator_contract", "capability boundary");
+        let required_test_ids = ["ordinary::tests::fnd_01_tasks_apps_sources_positive", "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative"];
+        let test_ids = ta_arr(contract, "required_test_ids", "E_TASKS_APPS_TEST_IDENTITY", "executable_same_validator_contract")?;
+        ta_require!(test_ids.len() == required_test_ids.len()
+            && test_ids.iter().zip(required_test_ids).all(|(actual, expected)| actual.as_str() == Some(expected)),
+            "E_TASKS_APPS_TEST_IDENTITY", "executable_same_validator_contract", "required_test_ids[0]");
+        let generated_mutations = ta_generated();
+        let explicit_count = explicit_plants.len();
+        let generated_count = generated_mutations.len();
+        let total_count = explicit_count + generated_count;
+        ta_require!(explicit_count == 39, "E_TASKS_APPS_MUTATION_SCHEMA",
+            "executable_same_validator_contract", "generic planted mutations");
+        ta_usizes_eq(contract, &[
+            ("explicit_planted_mutation_count", explicit_count),
+            ("generated_planted_mutation_count", generated_count),
+            ("total_planted_mutation_count", total_count),
+        ], "E_TASKS_APPS_MUTATION_SCHEMA", "executable_same_validator_contract")?;
+        let generated_categories = generated_mutations.iter().try_fold([0; 4], |mut counts, plan| {
+            let category = match plan.group { 0..=2 => 0, 22 => 1, 23 => 2, 24 => 3,
+                _ => return Err(ta_mut_err("executable_same_validator_contract", "generated target class")) };
+            counts[category] += 1;
+            Ok(counts)
+        })?;
+        ta_require!(generated_categories.into_iter().sum::<usize>() == generated_mutations.len()
+            && generated_count == 49
+            && generated_categories == [13, 21, 10, 5]
+            && total_count == 88,
+            "E_TASKS_APPS_MUTATION_SCHEMA", "executable_same_validator_contract", "generated category vector");
 
-        let verification = tasks_apps_table(
-            tasks_apps_field(root, "verification_contract", "manifest")?,
-            "verification_contract",
-        )?;
-        for (field, expected) in [
-            ("tasks_extension_artifact_count", 4usize),
-            ("tasks_conformance_artifact_count", 1),
-            ("tasks_admitted_vendor_input_count", 5),
-            ("apps_extension_artifact_count", 8),
-            ("apps_admitted_vendor_input_count", 8),
-            ("apps_admitted_external_authority_artifact_count", 0),
-            ("apps_preserved_blocked_candidate_count", 1),
+        let verification = ta_tbl(ta_fld(root, "verification_contract", "manifest")?, "verification_contract")?;
+        ta_usizes_eq(verification, TA_VERIFY_COUNTS, "E_TASKS_APPS_INVENTORY_CLASSIFICATION", "verification_contract")?;
+
+        let tasks = ta_tbl(ta_fld(root, "tasks", "manifest")?, "tasks")?;
+        ta_strings(tasks, TA_AUTH, TASKS_SUBJECT, TA_TASKS_AUTHORITY)?;
+        ta_empty_tbl(tasks, "client_settings", "tasks")?;
+        ta_empty_tbl(tasks, "server_settings", "tasks")?;
+        ta_strs_eq(tasks, "status_union_order", &TASKS_STATUS_ORDER, TA_AUTH, TASKS_SUBJECT)?;
+        ta_strs_eq(tasks, "source_precedence", &TASKS_SOURCE_PRECEDENCE, TA_AUTH, TASKS_SUBJECT)?;
+        ta_triplets_eq(tasks, "direction", &TASKS_DIRECTIONS, TA_AUTH, TASKS_SUBJECT)?;
+        ta_strings(tasks, "E_TASKS_APPS_ARTIFACT_BINDING", TASKS_SUBJECT, TA_TASKS_BINDING)?;
+        ta_false(tasks, &["final_core_authority", "whole_message_wire_oracle"], TA_AUTH, "tasks")?;
+        let _ = ta_artifacts("tasks", tasks, "artifact", &TASKS_ARTIFACT_EXPECTATIONS, 11, bundle)?;
+        ta_sdk(tasks, "tasks-package-lock", "tasks")?;
+        let import_bindings = ta_arr(tasks, "import_binding", TA_AUTH, "tasks")?;
+        let tasks_sdk = ta_tbl(ta_fld(tasks, "sdk_1_29_0", "tasks")?, "tasks")?;
+        let task_imports = ta_arr(tasks_sdk, "ordered_imports", TA_AUTH, "tasks")?;
+        let mut bound = Vec::new();
+        ta_require!(import_bindings.len() == 5, TA_AUTH, "tasks", "import_binding");
+        for (row, width) in import_bindings.iter().zip([3, 3, 1, 2, 1]) {
+            let row = ta_tbl(row, "tasks.import_binding")?;
+            if row.len() != 3 { return Err(ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks", "import_binding")); }
+            let symbols = row.get("symbols").and_then(toml::Value::as_array);
+            let Some(symbols) = symbols else { return Err(ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks", "import_binding")); };
+            ta_require!(symbols.len() == width, TA_AUTH, "tasks", "import_binding");
+            for symbol in symbols { let Some(symbol) = symbol.as_str() else { return Err(ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks", "import_binding")); }; bound.push(symbol); }
+        }
+        bound.sort_unstable();
+        let mut ordered = task_imports.iter().map(|item| item.as_str().ok_or_else(|| ta_err(TA_AUTH, "tasks", "import_binding"))).collect::<VResult<Vec<_>>>()?;
+        ordered.sort_unstable();
+        ta_require!(bound == ordered && !bound.windows(2).any(|pair| pair[0] == pair[1]), TA_AUTH, "tasks", "import_binding");
+        ta_require!(import_bindings.first().and_then(toml::Value::as_table).and_then(|row| row.get("raw_use")).and_then(toml::Value::as_str) == Some("InputRequest union"), TA_AUTH, "tasks", "import_binding");
+        ta_lock(tasks, bundle, "evidence/fnd-01/vendor/tasks/package-lock.json", "Apache-2.0", "tasks-package-lock", "tasks")?;
+        ta_license(tasks, "license_provenance", "tasks.license_provenance", "declared_license", "Apache-2.0", false)?;
+        ta_license(tasks, "conformance_license_provenance", "tasks.conformance_license_provenance", "sha256", "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a", false)?;
+
+        let conformance_rows = ta_artifacts("tasks", tasks, "conformance_artifact", &TASKS_CONFORMANCE_EXPECTATIONS, 21, bundle)?;
+
+        let apps = ta_tbl(ta_fld(root, "apps", "manifest")?, "apps")?;
+        ta_strings(apps, "E_TASKS_APPS_ARTIFACT_BINDING", APPS_SUBJECT, TA_APPS_BINDING)?;
+        ta_require!(ta_str(apps, "stable_spec_date", "apps")? == "2026-01-26", "E_TASKS_APPS_LEGACY_2025_AUTHORITY", "apps", "stable_spec_date"); ta_require!(ta_str(apps, "maturity_at_pin", "apps")? == "stable", TA_AUTH, "apps", "maturity_at_pin");
+        let any_false_flag_set = ["final_core_authority", "whole_message_wire_oracle", "apps_sampling_supported", "apps_tasks_result_bridge_supported", "apps_mrtr_result_bridge_supported", "apps_renderer_supported"].iter().try_fold(false, |set, field| -> VResult<bool> { Ok(set || ta_bool(apps, field, "apps")?) })?;
+        ta_require!(!any_false_flag_set, TA_AUTH, "apps", "final_core_authority");
+        ta_strs_eq(apps, "source_precedence", &APPS_SOURCE_PRECEDENCE, TA_AUTH, APPS_SUBJECT)?;
+        ta_strings(apps, TA_AUTH, APPS_SUBJECT, TA_APPS_AUTHORITY)?;
+        let apps_server_settings = ta_tbl(ta_fld(apps, "server_settings", "apps")?, "apps.server_settings")?;
+        ta_empty_tbl(apps_server_settings, "only_valid_value", "apps.server_settings")?;
+        ta_require!(apps_server_settings.len() == 7 && ta_bool(apps_server_settings, "missing_value_cannot_activate", "apps.server_settings")?, TA_AUTH, "apps.server_settings", "closed tuple");
+        ta_strings(apps_server_settings, TA_AUTH, "apps.server_settings", TA_APPS_SERVER)?;
+        ta_arr_prefix(apps_server_settings, "invalid_present_values", 4, "null", "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps.server_settings")?;
+        ta_triplet_prefix(apps, "direction", 29, ("ui/initialize", "request", "view_to_host"), "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?;
+        let unions = ta_arr(apps, "source_union", TA_AUTH, "apps")?;
+        let union_specs = [("AppRequest", 15, "McpUiInitializeRequest"), ("AppNotification", 14, "McpUiHostContextChangedNotification"), ("AppResult", 15, "McpUiInitializeResult")];
+        ta_require!(unions.len() == union_specs.len(), TA_AUTH, "apps", "source_union");
+        for (row, (name, count, first)) in unions.iter().zip(union_specs) {
+            let row = ta_tbl(row, "apps.source_union")?;
+            ta_require!(row.len() == 3 && ta_usize(row, "expected_count", "apps.source_union")? == count, TA_AUTH, "apps", "source_union");
+            ta_str_eq(row, "name", name, TA_AUTH, "apps").map_err(|_| ta_err(TA_AUTH, "apps", "source_union"))?;
+            ta_arr_prefix(row, "ordered_members", count, first, TA_AUTH, "apps").map_err(|_| ta_err(TA_AUTH, "apps", "source_union"))?;
+        }
+        let direct_imports = ta_arr(apps, "direct_import", TA_AUTH, "apps")?;
+        let apps_sdk = ta_tbl(ta_fld(apps, "sdk_1_29_0", "apps")?, "apps")?;
+        ta_require!(direct_imports.first().and_then(toml::Value::as_table).and_then(|row| row.get("composition")).and_then(toml::Value::as_str) == Some("rebind to final-core CallToolResult internally, then require complete SDK29 projection before Apps emission"), TA_AUTH, "apps", "direct_import");
+        for (rows, field, expected_len, subject, widths) in [
+            (direct_imports, "direct_imports", 7, "direct_import", &[3, 5, 3, 3, 3, 3, 3][..]),
+            (ta_fld(apps, "standard_reuse", "apps")?.as_array().ok_or_else(|| ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "standard_reuse"))?, "standard_reuse_imports", 21, "standard_reuse", &[10; 21][..]),
         ] {
-            if tasks_apps_usize(verification, field, "verification_contract")? != expected {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    "verification_contract",
-                    field,
-                ));
-            }
+            let sdk_symbols = ta_arr(apps_sdk, field, TA_AUTH, "apps").map_err(|_| ta_err(TA_AUTH, "apps", subject))?;
+            let symbols = rows.iter().zip(widths).map(|(row, width)| {
+                let row = ta_tbl(row, "apps")?;
+                ta_require!(row.len() == *width, TA_AUTH, "apps", subject);
+                row.get("symbol").and_then(toml::Value::as_str).ok_or_else(|| ta_err("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", subject))
+            }).collect::<VResult<Vec<_>>>()?;
+            ta_require!(rows.len() == expected_len && symbols.len() == expected_len
+                && symbols.iter().zip(sdk_symbols).all(|(symbol, sdk)| Some(*symbol) == sdk.as_str())
+                && !symbols.iter().enumerate().any(|(index, symbol)| symbols[..index].contains(symbol)), TA_AUTH, "apps", subject);
         }
+        let _ = ta_artifacts("apps", apps, "artifact", &APPS_ARTIFACT_EXPECTATIONS, 11, bundle)?;
+        ta_sdk(apps, "apps-package-lock", "apps")?;
+        ta_lock(apps, bundle, "evidence/fnd-01/vendor/apps/package-lock.json", "MIT", "apps-package-lock", "apps")?;
+        ta_license(apps, "license_provenance", "apps.license_provenance", "artifact_license_resolution", "The frozen Apps specification and source artifacts are recorded with the repository's immutable transition notice; the evidence does not infer one blanket license for unrelicensed historical contributions.", true)?;
 
-        let tasks = tasks_apps_table(tasks_apps_field(root, "tasks", "manifest")?, "tasks")?;
-        for (field, expected) in [("extension_identifier", "io.modelcontextprotocol/tasks"), ("client_settings_schema", "tasks-2026-07-28-empty-object-v1"), ("server_settings_schema", "tasks-2026-07-28-empty-object-v1"), ("settings_exact_value", "exact closed {}")] {
-            tasks_apps_expect_string(tasks, field, expected, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
+        let whatwg = ta_tbl(ta_fld(apps, "whatwg_html_validation", "apps")?, "apps.whatwg_html_validation")?;
+        for (field, expected) in TA_WHATWG {
+            ta_require!(whatwg.get(*field).and_then(toml::Value::as_str) == Some(*expected), "E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation", field);
         }
-        tasks_apps_expect_string_array(tasks, "status_union_order", &["working", "input_required", "completed", "failed", "cancelled"], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
-        tasks_apps_expect_string_array(tasks, "source_precedence", &["final core 2026-07-28 for MCP envelopes, request metadata, and final error allocation", "the frozen FastMCP composed contract for explicit conflict resolutions", "Tasks prose for negotiated extension semantics, identifier, empty settings, and method behavior", "Tasks TypeScript schema for raw extension fields, unions, and old-SDK import inventory", "pinned Tasks conformance wire-fields scenario for its explicitly limited observable assertions", "lock-resolved SDK 1.29.0 only for pre-rebind compatibility shapes", "generated Tasks schema only for drift and partial validation"], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
-        tasks_apps_expect_triplets(tasks, "direction", &[("tasks/get", "request", "client_to_server"), ("tasks/update", "request", "client_to_server"), ("tasks/cancel", "request", "client_to_server"), ("notifications/tasks", "notification", "server_to_client")], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "tasks")?;
-        tasks_apps_expect_string(
-            tasks,
-            "repository",
-            "https://github.com/modelcontextprotocol/ext-tasks",
-            "E_TASKS_APPS_ARTIFACT_BINDING",
-            "tasks",
-        )?;
-        let tasks_commit = "2c1425d9a288b9b1f489430fe1e00bb392b47e48";
-        tasks_apps_expect_string(
-            tasks,
-            "commit",
-            tasks_commit,
-            "E_TASKS_APPS_ARTIFACT_BINDING",
-            "tasks",
-        )?;
-        for (field, expected) in [
-        (
-            "commit_url",
-            "https://github.com/modelcontextprotocol/ext-tasks/commit/2c1425d9a288b9b1f489430fe1e00bb392b47e48",
-        ),
-        (
-            "tree_url",
-            "https://github.com/modelcontextprotocol/ext-tasks/tree/2c1425d9a288b9b1f489430fe1e00bb392b47e48",
-        ),
-    ] {
-        tasks_apps_expect_string(tasks, field, expected, "E_TASKS_APPS_ARTIFACT_BINDING", "tasks")?;
-    }
-        for (field, expected) in [
-            ("tree", "21adc5de7a6ce0de1c81077de129e41f9a843035"),
-            ("maturity_at_pin", "experimental"),
-            (
-                "tasks_contract_profile",
-                "fastmcp-final-core-2026-07-28-tasks-2c1425d9-v1",
-            ),
-        ] {
-            tasks_apps_expect_string(
-                tasks,
-                field,
-                expected,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                "tasks",
-            )?;
-        }
-        if tasks_apps_bool(tasks, "final_core_authority", "tasks")? {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "tasks",
-                "final_core_authority",
-            ));
-        }
-        if tasks_apps_bool(tasks, "whole_message_wire_oracle", "tasks")? {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "tasks",
-                "whole_message_wire_oracle",
-            ));
-        }
-        validate_tasks_apps_artifacts(
-            "tasks",
-            tasks,
-            &TASKS_ARTIFACTS,
-            "https://github.com/modelcontextprotocol/ext-tasks",
-            tasks_commit,
-            bundle,
-        )?;
-        validate_tasks_apps_sdk(tasks, "tasks-package-lock", "tasks")?;
-        validate_tasks_apps_lock_license(
-            bundle,
-            "evidence/fnd-01/vendor/tasks/package-lock.json",
-            "Apache-2.0",
-            "tasks",
-        )?;
-        validate_tasks_apps_license(tasks, "license_provenance", "https://github.com/modelcontextprotocol/ext-tasks", tasks_commit, "83721348b21415bc1cda345305f21d17b9de95e2", 10_786, "70559d215777f20bb14de53b336db2bb41fc58712f1d6f43e6a7dd2c82b1d6df", "Apache-2.0")?;
-        validate_tasks_apps_license(tasks, "conformance_license_provenance", "https://github.com/modelcontextprotocol/conformance", "49103de6ed70804e940637bf3e9e29e4a3f54e64", "4a93985763241755401a10678395303de4e720ba", 12_227, "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a", "repository_transition_notice")?;
+        let whatwg_admitted_as_source_input = ta_bool(whatwg, "admitted_as_source_input", "apps.whatwg_html_validation")?;
+        ta_require!(!whatwg_admitted_as_source_input && ta_usize(whatwg, "max_source_file_bytes", "apps.whatwg_html_validation")? == 1_048_576 && ta_usize(whatwg, "candidate_byte_length", "apps.whatwg_html_validation")? == bundle.blocked.len() && bundle.blocked.len() == 7_892_171 && lower_hex(&sha256(&bundle.blocked)) == ta_str(whatwg, "candidate_sha256", "apps.whatwg_html_validation")?, "E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation", "admitted_as_source_input");
 
-        let conformance_rows = tasks_apps_field(tasks, "conformance_artifact", "tasks")?
-            .as_array()
-            .ok_or_else(|| {
-                tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    "tasks",
-                    "conformance_artifact",
-                )
-            })?;
-        if conformance_rows.len() != 1 {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                "tasks",
-                "conformance_artifact count",
-            ));
-        }
-        let conformance = conformance_rows
-            .first()
-            .and_then(toml::Value::as_table)
-            .ok_or_else(|| {
-                tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    "tasks",
-                    "conformance_artifact",
-                )
-            })?;
-        for (field, expected) in [
-        ("id", "tasks-conformance-wire-fields"),
-        (
-            "repository",
-            "https://github.com/modelcontextprotocol/conformance",
-        ),
-        (
-            "repository_commit",
-            "49103de6ed70804e940637bf3e9e29e4a3f54e64",
-        ),
-        (
-            "repository_tree",
-            "699705222f144a15fb7fdcc1b4f0b0a62825aef0",
-        ),
-        ("git_blob", "73684a19c7d0004fc13445c0f3e59df159eb5b94"),
-        (
-            "commit_url",
-            "https://github.com/modelcontextprotocol/conformance/commit/49103de6ed70804e940637bf3e9e29e4a3f54e64",
-        ),
-        ("upstream_path", "src/scenarios/server/tasks/wire-fields.ts"),
-        (
-            "source_url",
-            "https://raw.githubusercontent.com/modelcontextprotocol/conformance/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/server/tasks/wire-fields.ts",
-        ),
-        (
-            "blob_url",
-            "https://github.com/modelcontextprotocol/conformance/blob/49103de6ed70804e940637bf3e9e29e4a3f54e64/src/scenarios/server/tasks/wire-fields.ts",
-        ),
-        (
-            "vendor_path",
-            "evidence/fnd-01/vendor/tasks/conformance-wire-fields.ts",
-        ),
-        (
-            "sha256",
-            "a729a7c6d9a0dce3b4aae691f856933f2d798af6c668a84716076ad03b696dca",
-        ),
-    ] {
-        tasks_apps_expect_string(
-            conformance,
-            field,
-            expected,
-            "E_TASKS_APPS_ARTIFACT_BINDING",
-            "tasks-conformance-wire-fields",
-        )?;
-    }
-        if tasks_apps_usize(conformance, "byte_length", "tasks-conformance-wire-fields")? != 9_374 {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                "tasks-conformance-wire-fields",
-                "frozen fields",
-            ));
-        }
-
-        let apps = tasks_apps_table(tasks_apps_field(root, "apps", "manifest")?, "apps")?;
-        tasks_apps_expect_string(
-            apps,
-            "repository",
-            "https://github.com/modelcontextprotocol/ext-apps",
-            "E_TASKS_APPS_ARTIFACT_BINDING",
-            "apps",
-        )?;
-        let apps_commit = "92f46a574568a3ddac7600343b7d3c4c4ed7b588";
-        tasks_apps_expect_string(
-            apps,
-            "commit",
-            apps_commit,
-            "E_TASKS_APPS_ARTIFACT_BINDING",
-            "apps",
-        )?;
-        for (field, expected) in [
-            ("tree", "f6b62ab50fbb8297d458d9ba90c4c2cb67de4759"),
-            ("package_name", "@modelcontextprotocol/ext-apps"),
-            ("package_version", "1.7.5"),
-        ] {
-            tasks_apps_expect_string(
-                apps,
-                field,
-                expected,
-                "E_TASKS_APPS_ARTIFACT_BINDING",
-                "apps",
-            )?;
-        }
-        for (field, expected) in [
-        (
-            "commit_url",
-            "https://github.com/modelcontextprotocol/ext-apps/commit/92f46a574568a3ddac7600343b7d3c4c4ed7b588",
-        ),
-        (
-            "tree_url",
-            "https://github.com/modelcontextprotocol/ext-apps/tree/92f46a574568a3ddac7600343b7d3c4c4ed7b588",
-        ),
-    ] {
-        tasks_apps_expect_string(apps, field, expected, "E_TASKS_APPS_ARTIFACT_BINDING", "apps")?;
-    }
-        if tasks_apps_string(apps, "stable_spec_date", "apps")? != "2026-01-26" {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_LEGACY_2025_AUTHORITY",
-                "apps",
-                "stable_spec_date",
-            ));
-        }
-        if tasks_apps_string(apps, "maturity_at_pin", "apps")? != "stable" {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "apps",
-                "maturity_at_pin",
-            ));
-        }
-        if tasks_apps_bool(apps, "final_core_authority", "apps")?
-            || tasks_apps_bool(apps, "whole_message_wire_oracle", "apps")?
-            || tasks_apps_bool(apps, "apps_sampling_supported", "apps")?
-            || tasks_apps_bool(apps, "apps_tasks_result_bridge_supported", "apps")?
-            || tasks_apps_bool(apps, "apps_mrtr_result_bridge_supported", "apps")?
-            || tasks_apps_bool(apps, "apps_renderer_supported", "apps")?
-        {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "apps",
-                "final_core_authority",
-            ));
-        }
-        let expected_precedence = [
-        "final core 2026-07-28 for MCP envelopes and rebound core symbols",
-        "the frozen FastMCP composed contract for explicit conflict resolutions",
-        "stable Apps prose for Apps-only normative security and behavior",
-        "src/spec.types.ts for UI-specific interfaces it declares",
-        "src/types.ts for standard-reuse union and root inventory",
-        "src/app.ts and src/app-bridge.ts for sender/handler direction and physical SDK behavior",
-        "lock-resolved SDK 1.29.0 for imported compatibility shapes before explicit rebind/projection",
-        "generated schemas only for drift and partial validation",
-    ];
-        tasks_apps_expect_string_array(apps, "source_precedence", &expected_precedence, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?;
-        for (field, expected) in [
-            ("extension_identifier", "io.modelcontextprotocol/ui"),
-            ("apps_client_settings_schema", "apps-2026-01-26-client-mime-types-v1"),
-            ("apps_server_settings_schema", "fastmcp-2026-07-28-apps-empty-server-marker-v1"),
-        ] { tasks_apps_expect_string(apps, field, expected, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?; }
-        tasks_apps_expect_triplets(apps, "direction", &[
-            ("ui/initialize", "request", "view_to_host"), ("ui/open-link", "request", "view_to_host"),
-            ("ui/download-file", "request", "view_to_host"), ("ui/message", "request", "view_to_host"),
-            ("ui/update-model-context", "request", "view_to_host"), ("ui/resource-teardown", "request", "host_to_view"),
-            ("ui/request-display-mode", "request", "view_to_host"), ("tools/call", "request", "bidirectional_by_capability"),
-            ("tools/list", "request", "host_to_view"), ("resources/list", "request", "view_to_host"),
-            ("resources/templates/list", "request", "view_to_host"), ("resources/read", "request", "view_to_host"),
-            ("prompts/list", "request", "view_to_host"), ("sampling/createMessage", "request", "view_to_host_raw_only_rejected"),
-            ("ping", "request", "bidirectional_inherited_control"),
-            ("ui/notifications/host-context-changed", "notification", "host_to_view"),
-            ("ui/notifications/tool-input", "notification", "host_to_view"), ("ui/notifications/tool-input-partial", "notification", "host_to_view"),
-            ("ui/notifications/tool-result", "notification", "host_to_view"), ("ui/notifications/tool-cancelled", "notification", "host_to_view"),
-            ("ui/notifications/sandbox-resource-ready", "notification", "host_to_sandbox_proxy"),
-            ("ui/notifications/initialized", "notification", "view_to_host"), ("ui/notifications/size-changed", "notification", "view_to_host"),
-            ("ui/notifications/sandbox-proxy-ready", "notification", "sandbox_proxy_to_host"), ("ui/notifications/request-teardown", "notification", "view_to_host"),
-            ("notifications/tools/list_changed", "notification", "bidirectional_by_capability"),
-            ("notifications/resources/list_changed", "notification", "host_to_view"), ("notifications/prompts/list_changed", "notification", "host_to_view"),
-            ("notifications/message", "notification", "view_to_host"),
-        ], "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps")?;
-        let unions = tasks_apps_field(apps, "source_union", "apps")?.as_array()
-            .ok_or_else(|| tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union"))?;
-        let union_specs: &[(&str, &[&str])] = &[
-            ("AppRequest", &["McpUiInitializeRequest", "McpUiOpenLinkRequest", "McpUiDownloadFileRequest", "McpUiMessageRequest", "McpUiUpdateModelContextRequest", "McpUiResourceTeardownRequest", "McpUiRequestDisplayModeRequest", "CallToolRequest", "ListToolsRequest", "ListResourcesRequest", "ListResourceTemplatesRequest", "ReadResourceRequest", "ListPromptsRequest", "CreateMessageRequest", "PingRequest"]),
-            ("AppNotification", &["McpUiHostContextChangedNotification", "McpUiToolInputNotification", "McpUiToolInputPartialNotification", "McpUiToolResultNotification", "McpUiToolCancelledNotification", "McpUiSandboxResourceReadyNotification", "ToolListChangedNotification", "ResourceListChangedNotification", "PromptListChangedNotification", "McpUiInitializedNotification", "McpUiSizeChangedNotification", "McpUiSandboxProxyReadyNotification", "McpUiRequestTeardownNotification", "LoggingMessageNotification"]),
-            ("AppResult", &["McpUiInitializeResult", "McpUiOpenLinkResult", "McpUiDownloadFileResult", "McpUiMessageResult", "McpUiResourceTeardownResult", "McpUiRequestDisplayModeResult", "CallToolResult", "ListToolsResult", "ListResourcesResult", "ListResourceTemplatesResult", "ReadResourceResult", "ListPromptsResult", "CreateMessageResult", "CreateMessageResultWithTools", "EmptyResult"]),
-        ];
-        if unions.len() != union_specs.len() { return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union")); }
-        for (row, (name, members)) in unions.iter().zip(union_specs) {
-            let row = tasks_apps_table(row, "apps.source_union")?;
-            if row.len() != 3 || tasks_apps_usize(row, "expected_count", "apps.source_union")? != members.len() {
-                return Err(tasks_apps_error("E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps", "source_union"));
-            }
-            tasks_apps_expect_string(row, "name", name, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps.source_union")?;
-            tasks_apps_expect_string_array(row, "ordered_members", members, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", "apps.source_union")?;
-        }
-        validate_tasks_apps_artifacts(
-            "apps",
-            apps,
-            &APPS_ARTIFACTS,
-            "https://github.com/modelcontextprotocol/ext-apps",
-            apps_commit,
-            bundle,
-        )?;
-        validate_tasks_apps_sdk(apps, "apps-package-lock", "apps")?;
-        validate_tasks_apps_lock_license(
-            bundle,
-            "evidence/fnd-01/vendor/apps/package-lock.json",
-            "MIT",
-            "apps",
-        )?;
-        validate_tasks_apps_license(apps, "license_provenance", "https://github.com/modelcontextprotocol/ext-apps", apps_commit, "4a93985763241755401a10678395303de4e720ba", 12_227, "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a", "repository_transition_notice")?;
-
-        let whatwg = tasks_apps_table(tasks_apps_field(apps, "whatwg_html_validation", "apps")?, "apps.whatwg_html_validation")?;
-        for (field, expected) in [("standard", "WHATWG HTML"), ("revision", "24c5e48bf66ea61bc199ec6338c81258275ba9c6"), ("tree", "53663806b56996a7a412ec87248de5657bed6ce7"), ("admission_status", "blocked"), ("candidate_preserved_path", TASKS_APPS_BLOCKED_CANDIDATE_PATH), ("candidate_sha256", "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa")] { tasks_apps_expect_string(whatwg, field, expected, "E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation")?; }
-        if tasks_apps_bool(whatwg, "admitted_as_source_input", "apps.whatwg_html_validation")? || tasks_apps_usize(whatwg, "max_source_file_bytes", "apps.whatwg_html_validation")? != 1_048_576 || tasks_apps_usize(whatwg, "candidate_byte_length", "apps.whatwg_html_validation")? != bundle.blocked_candidate_bytes.len() || bundle.blocked_candidate_bytes.len() != 7_892_171 || lower_hex(&sha256(&bundle.blocked_candidate_bytes)) != tasks_apps_string(whatwg, "candidate_sha256", "apps.whatwg_html_validation")? { return Err(tasks_apps_error("E_TASKS_APPS_ADMISSION", "apps.whatwg_html_validation", "admitted_as_source_input")); }
-
-        let compositions = tasks_apps_field(apps, "product_composition_authority", "apps")?
-            .as_array()
-            .ok_or_else(|| {
-                tasks_apps_error(
-                    "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                    "apps",
-                    "product_composition_authority",
-                )
-            })?;
-        let expected_compositions = [
-            ("APP-03-apps-plus-host-mediated-sampling", "MCP Apps plus host-mediated Sampling"),
-            ("APP-04-apps-plus-tasks-mrtr", "MCP Apps plus Tasks and MRTR"),
-        ];
-        if compositions.len() != expected_compositions.len() {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                "apps",
-                "product_composition_authority count",
-            ));
-        }
+        let compositions = ta_arr(apps, "product_composition_authority", "E_TASKS_APPS_ARTIFACT_INVENTORY", "apps")?;
+        let expected_compositions = [("APP-03-apps-plus-host-mediated-sampling", "MCP Apps plus host-mediated Sampling"), ("APP-04-apps-plus-tasks-mrtr", "MCP Apps plus Tasks and MRTR")];
+        ta_require!(compositions.len() == expected_compositions.len(), "E_TASKS_APPS_ARTIFACT_INVENTORY", "apps", "product_composition_authority count");
         let mut composition_ids = Vec::with_capacity(compositions.len());
         for (row, (id, composition)) in compositions.iter().zip(expected_compositions) {
-            let row = tasks_apps_table(row, id)?;
-            tasks_apps_expect_string(
-                row,
-                "id",
-                id,
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                "apps.product_composition_authority",
-            )?;
-            tasks_apps_expect_string(
-                row,
-                "composition",
-                composition,
-                "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                id,
-            )?;
-            if tasks_apps_bool(row, "apps_only_normative_claim", id)?
-                || tasks_apps_bool(row, "runtime_capability_credit", id)?
-            {
-                return Err(tasks_apps_error(
-                    "E_TASKS_APPS_AUTHORITY_CLASSIFICATION",
-                    id,
-                    "composition boundary",
-                ));
-            }
-            let pins: &[(&str, &str)] = match id {
-                "APP-03-apps-plus-host-mediated-sampling" => &[
-                    ("source_manifest", "evidence/fnd-01/core-conformance.toml"),
-                    ("source_artifact_id", "core-schema-ts"),
-                    ("repository_revision", "5f5440bb26a62e2cf3440b92da5a667efa03b267"),
-                    ("source_url", "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"),
-                    ("sha256", "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"),
-                ],
-                _ => &[
-                    ("tasks_source_artifact_id", "tasks-prose"),
-                    ("tasks_repository_revision", tasks_commit),
-                    ("tasks_source_url", "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/2c1425d9a288b9b1f489430fe1e00bb392b47e48/specification/draft/tasks.md"),
-                    ("tasks_sha256", "ae908a883d8489f1ebfee47496dd8818f182b467a4196c17df98b40a3d8b2b11"),
-                    ("mrtr_source_manifest", "evidence/fnd-01/core-conformance.toml"),
-                    ("mrtr_source_artifact_id", "core-schema-ts"),
-                    ("mrtr_repository_revision", "5f5440bb26a62e2cf3440b92da5a667efa03b267"),
-                    ("source_url", "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/5f5440bb26a62e2cf3440b92da5a667efa03b267/schema/2026-07-28/schema.ts"),
-                    ("mrtr_sha256", "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"),
-                ],
+            let row = ta_tbl(row, id)?;
+            ta_str_eq(row, "id", id, TA_AUTH, "apps.product_composition_authority")?;
+            ta_str_eq(row, "composition", composition, TA_AUTH, id)?;
+            ta_require!(!ta_bool(row, "apps_only_normative_claim", id)? && !ta_bool(row, "runtime_capability_credit", id)?, TA_AUTH, id, "composition boundary");
+            let generated_fields: &[(&str, &str)] = if id == "APP-03-apps-plus-host-mediated-sampling" {
+                &[("repository", "https://github.com/modelcontextprotocol/modelcontextprotocol"), ("authority_scope", "final-core Sampling request/result and embedded descriptor shapes used only when the product composes Apps with host-mediated Sampling")]
+            } else {
+                &[("tasks_repository", "https://github.com/modelcontextprotocol/ext-tasks"), ("mrtr_repository", "https://github.com/modelcontextprotocol/modelcontextprotocol"), ("authority_scope", "final-core MRTR descriptor/result shapes and pinned experimental Tasks semantics used only in the mandatory product composition")]
             };
-            for (field, value) in pins { tasks_apps_expect_string(row, field, value, "E_TASKS_APPS_AUTHORITY_CLASSIFICATION", id)?; }
+            for (field, expected) in generated_fields { ta_str_eq(row, field, expected, TA_AUTH, id)?; }
             composition_ids.push(id.to_owned());
         }
 
-        let digest = lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes)?);
-        if digest != TASKS_APPS_VENDOR_DIGEST {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_VENDOR_DIGEST",
-                "vendor-inputs",
-                "domain-separated-sha256",
-            ));
-        }
-        let total_bytes = bundle.vendor_bytes.values().map(Vec::len).sum::<usize>();
-        if total_bytes != 1_173_466 || bundle.manifest_bytes.is_empty() {
-            return Err(tasks_apps_error(
-                "E_TASKS_APPS_ARTIFACT_INVENTORY",
-                "vendor-inputs",
-                "bundle length",
-            ));
-        }
-        Ok(AcceptedTasksAppsState {
-            tasks_artifact_count: TASKS_ARTIFACTS.len(),
-            tasks_conformance_artifact_count: conformance_rows.len(),
-            apps_artifact_count: APPS_ARTIFACTS.len(),
-            admitted_vendor_input_count: bundle.vendor_bytes.len(),
-            admitted_vendor_input_total_bytes: total_bytes,
-            admitted_vendor_digest: digest,
-            blocked_candidate_byte_length: bundle.blocked_candidate_bytes.len(),
-            blocked_candidate_sha256: lower_hex(&sha256(&bundle.blocked_candidate_bytes)),
-            required_test_ids: required_test_ids.map(str::to_owned),
-            apps_maturity: tasks_apps_string(apps, "maturity_at_pin", "apps")?.to_owned(),
-            composition_ids,
+        let subtree_digests = ta_subtree_digests(root, contract, true)?;
+
+        let digest = lower_hex(&ta_vendor_digest(&bundle.vendor)?);
+        ta_require!(digest == TA_VDIGEST, "E_TASKS_APPS_VENDOR_DIGEST", "vendor-inputs", "domain-separated-sha256");
+        let total_bytes = bundle.vendor.values().map(Vec::len).sum::<usize>();
+        ta_require!(total_bytes == 1_173_466 && !bundle.raw_manifest.is_empty(), "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "bundle length");
+        let standard_reuse_count = ta_arr(apps, "standard_reuse", TA_AUTH, "apps")?.len();
+        let quarantine_count = ta_arr(apps, "quarantine", TA_AUTH, "apps")?.len();
+        ta_require!(standard_reuse_count == 21 && direct_imports.len() == 7 && quarantine_count == 10, TA_AUTH, "apps", "import inventory");
+        Ok(TaAccepted {
+            tasks_artifact_count: TASKS_ARTIFACT_EXPECTATIONS.len(), tasks_conformance_artifact_count: conformance_rows.len(),
+            apps_artifact_count: APPS_ARTIFACT_EXPECTATIONS.len(), admitted_vendor_input_count: bundle.vendor.len(),
+            admitted_vendor_input_total_bytes: total_bytes, admitted_vendor_digest: digest,
+            blocked_candidate_byte_length: bundle.blocked.len(), blocked_candidate_sha256: lower_hex(&sha256(&bundle.blocked)),
+            required_test_ids: required_test_ids.map(str::to_owned), apps_maturity: ta_str(apps, "maturity_at_pin", "apps")?.to_owned(),
+            composition_ids, observation_domain: TA_OBS_DOMAIN.to_owned(), explicit_planted_mutation_count: explicit_plants.len(),
+            generated_planted_mutation_count: generated_count, total_planted_mutation_count: total_count, generated_category_vector: generated_categories,
+            runtime_capability_credit, remote_provenance_capability_credit, whatwg_admitted_as_source_input, subtree_digests,
+            standard_reuse_count, direct_import_count: direct_imports.len(), quarantine_count,
         })
     }
 
@@ -100007,265 +98984,241 @@ fn fallible(value: Option<u8>) {
     mod tests {
         use super::*;
 
-        fn baseline_tasks_apps_bundle() -> TasksAppsSourceBundle {
+        fn baseline_tasks_apps_bundle() -> TaBundle {
             let root = repository_root();
-            let (policy, _) = read_policy(&root).expect("read source policy");
-            let files = load_sources(&root, &policy).expect("load admitted source files");
-            load_tasks_apps_source_bundle(&root, &files)
-                .expect("load immutable Tasks/Apps bundle")
+            ta_load_frozen_bundle(&root).expect("load immutable Tasks/Apps bundle")
         }
 
         fn assert_unchanged_non_target_inputs(
-            baseline: &TasksAppsSourceBundle,
-            candidate: &TasksAppsSourceBundle,
-            target: Option<&str>,
+            baseline: &TaBundle, candidate: &TaBundle,
+            vendor_target: Option<&str>, loaded_path_addition: Option<&str>,
         ) {
-            assert_eq!(
-                baseline.vendor_bytes.keys().collect::<Vec<_>>(),
-                candidate.vendor_bytes.keys().collect::<Vec<_>>()
-            );
-            for path in baseline.vendor_bytes.keys() {
-                if Some(path.as_str()) != target {
-                    let before = baseline.vendor_bytes.get(path).expect("baseline input");
-                    let after = candidate.vendor_bytes.get(path).expect("candidate input");
+            assert_eq!(candidate.raw_manifest, baseline.raw_manifest, "unchanged raw manifest bytes");
+            if loaded_path_addition.is_some() {
+                assert_eq!(candidate.vendor.len(), baseline.vendor.len() + 1);
+                assert!(baseline.vendor.keys().all(|path| candidate.vendor.contains_key(path)));
+                assert_eq!(candidate.vendor.get(TA_BLOCKED_PATH), Some(&baseline.blocked));
+                assert_eq!(candidate.loaded.len(), baseline.loaded.len() + 1);
+                assert_eq!(&candidate.loaded[..baseline.loaded.len()], baseline.loaded);
+                assert_eq!(candidate.loaded.last().map(String::as_str), loaded_path_addition);
+            } else {
+                assert_eq!(baseline.vendor.keys().collect::<Vec<_>>(), candidate.vendor.keys().collect::<Vec<_>>());
+                assert_eq!(candidate.loaded, baseline.loaded);
+            }
+            for path in baseline.vendor.keys() {
+                if Some(path.as_str()) != vendor_target {
+                    let before = &baseline.vendor[path]; let after = &candidate.vendor[path];
                     assert_eq!(before.len(), after.len(), "unchanged byte length: {path}");
                     assert_eq!(sha256(before), sha256(after), "unchanged sha256: {path}");
                 }
             }
-            assert_eq!(
-                baseline.blocked_candidate_bytes.len(),
-                candidate.blocked_candidate_bytes.len(),
-                "unchanged blocked candidate byte length"
-            );
-            assert_eq!(
-                sha256(&baseline.blocked_candidate_bytes),
-                sha256(&candidate.blocked_candidate_bytes),
-                "unchanged blocked candidate sha256"
-            );
+            assert_eq!(baseline.blocked.len(), candidate.blocked.len(), "unchanged blocked candidate byte length");
+            assert_eq!(sha256(&baseline.blocked), sha256(&candidate.blocked), "unchanged blocked candidate sha256");
         }
 
-        fn assert_stable_diagnostic(bundle: &TasksAppsSourceBundle, expected: &str) {
-            let diagnostic =
-                validate_tasks_apps_sources(bundle).expect_err("planted case must reject");
-            assert_eq!(diagnostic.stable(), expected);
+        fn assert_stable_diagnostic(bundle: &TaBundle, expected: &str) {
+            assert_eq!(validate_tasks_apps_sources(bundle).expect_err("planted case must reject").stable(), expected);
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct TaInputObs { loaded_count: usize, vendor: Option<(usize, [u8; 32])>, blocked: Option<(usize, [u8; 32])> }
+
+        #[derive(Debug, PartialEq)]
+        struct TaGroupObs { manifest: Vec<Option<toml::Value>>, inputs: Vec<(&'static str, TaInputObs)> }
+
+        fn ta_group_oracle(bundle: &TaBundle) -> Vec<(&'static str, TaGroupObs)> {
+            let root = ta_tbl(&bundle.manifest, "manifest").expect("oracle manifest"); let tasks = ta_tbl(ta_fld(root, "tasks", "manifest").expect("oracle tasks"), "tasks").expect("oracle tasks"); let apps = ta_tbl(ta_fld(root, "apps", "manifest").expect("oracle apps"), "apps").expect("oracle apps");
+            let take = |table: &toml::map::Map<String, toml::Value>, fields: &[&str]| fields.iter().map(|field| table.get(*field).cloned()).collect::<Vec<_>>();
+            let observe_inputs = |paths: &[&'static str], blocked: bool| paths.iter().map(|&path| {
+                let vendor = bundle.vendor.get(path).map(|bytes| (bytes.len(), sha256(bytes))); let blocked = blocked.then(|| (bundle.blocked.len(), sha256(&bundle.blocked)));
+                (path, TaInputObs { loaded_count: bundle.loaded.iter().filter(|loaded| loaded.as_str() == path).count(), vendor, blocked })
+            }).collect::<Vec<_>>();
+            let mut groups = Vec::with_capacity(25);
+            let mut add = |name: &'static str, table: &toml::map::Map<String, toml::Value>, fields: &[&str], paths: &[&'static str], blocked| { assert!(!groups.iter().any(|(existing, _)| *existing == name), "unique oracle group"); groups.push((name, TaGroupObs { manifest: take(table, fields), inputs: observe_inputs(paths, blocked) })); };
+            add("tasks_artifact", tasks, &["artifact"], &TA_VPATHS[1..5], false); add("tasks_conformance_artifact", tasks, &["conformance_artifact"], &TA_VPATHS[..1], false); add("apps_artifact", apps, &["artifact"], &TA_VPATHS[5..], false); add("tasks_authority_profile", tasks, &["final_core_authority", "extension_identifier"], &[], false); add("apps_authority_profile", apps, &["stable_spec_date", "maturity_at_pin", "extension_identifier"], &[], false); add("apps_whatwg_html_validation", apps, &["whatwg_html_validation"], &[TA_BLOCKED_PATH], true);
+            for (name, table, fields) in [("tasks_license_provenance", tasks, &["license_provenance"][..]), ("tasks_conformance_license_provenance", tasks, &["conformance_license_provenance"][..]), ("apps_license_provenance", apps, &["license_provenance"][..])] { add(name, table, fields, &[], false); }
+            add("verification_contract", root, &["verification_contract"], &[], false); add("executable_same_validator_contract", root, &["executable_same_validator_contract"], &[], false); add("tasks_negotiated_settings_contract", tasks, &["client_settings", "server_settings"], &[], false); add("apps_negotiated_settings_contract", apps, &["client_settings", "server_settings"], &[], false);
+            for (name, table, fields) in [("tasks_source_precedence", tasks, &["source_precedence"][..]), ("tasks_status_union_order", tasks, &["status_union_order"][..]), ("tasks_direction", tasks, &["direction"][..]), ("apps_source_union", apps, &["source_union"][..]), ("apps_direction", apps, &["direction"][..]), ("tasks_sdk_1_29_0", tasks, &["sdk_1_29_0"][..]), ("apps_sdk_1_29_0", apps, &["sdk_1_29_0"][..]), ("tasks_import_binding", tasks, &["import_binding"][..]), ("apps_direct_import", apps, &["direct_import"][..]), ("apps_standard_reuse", apps, &["standard_reuse"][..]), ("apps_quarantine", apps, &["quarantine"][..]), ("apps_product_composition_authority", apps, &["product_composition_authority"][..])] { add(name, table, fields, &[], false); }
+            assert_eq!(groups.iter().map(|(name, _)| *name).collect::<Vec<_>>(), TA_GROUPS.iter().map(|(name, _)| *name).collect::<Vec<_>>(), "exact independent ordered group keys");
+            groups
+        }
+
+        fn ta_diff_path(path: &str, segment: &str) -> String { format!("{path}/{}", segment.replace('~', "~0").replace('/', "~1")) }
+
+        #[derive(Debug, PartialEq)]
+        struct TaDelta { path: String, before: Option<toml::Value>, after: Option<toml::Value> }
+
+        fn ta_manifest_diffs(before: &toml::Value, after: &toml::Value, path: &str, target: &str, deltas: &mut Vec<TaDelta>) {
+            if path == target && before != after { deltas.push(TaDelta { path: path.to_owned(), before: Some(before.clone()), after: Some(after.clone()) }); return; }
+            match (before, after) {
+                (toml::Value::Table(before), toml::Value::Table(after)) => {
+                    for key in before.keys().chain(after.keys()).map(String::as_str).collect::<BTreeSet<_>>() {
+                        let path = ta_diff_path(path, key);
+                        match (before.get(key), after.get(key)) {
+                            (Some(before), Some(after)) => ta_manifest_diffs(before, after, &path, target, deltas),
+                            (Some(before), None) => deltas.push(TaDelta { path, before: Some(before.clone()), after: None }),
+                            (None, Some(after)) => deltas.push(TaDelta { path, before: None, after: Some(after.clone()) }),
+                            (None, None) => unreachable!("union key exists on one side"),
+                        }
+                    }
+                }
+                (toml::Value::Array(before), toml::Value::Array(after)) => {
+                    for index in 0..before.len().max(after.len()) {
+                        let path = format!("{path}/{index}");
+                        match (before.get(index), after.get(index)) {
+                            (Some(before), Some(after)) => ta_manifest_diffs(before, after, &path, target, deltas),
+                            (Some(before), None) => deltas.push(TaDelta { path, before: Some(before.clone()), after: None }),
+                            (None, Some(after)) => deltas.push(TaDelta { path, before: None, after: Some(after.clone()) }),
+                            (None, None) => unreachable!("bounded array index exists on one side"),
+                        }
+                    }
+                }
+                _ if before != after => deltas.push(TaDelta { path: path.to_owned(), before: Some(before.clone()), after: Some(after.clone()) }),
+                _ => {}
+            }
+        }
+
+        fn assert_tasks_apps_group_isolation(
+            baseline: &TaBundle, candidate: &TaBundle,
+            baseline_groups: &[(&'static str, TaGroupObs)],
+            plan: &TaPlan, changed_vendor: Option<&str>,
+        ) {
+            let after = ta_group_oracle(candidate); assert_eq!(baseline_groups.iter().map(|(name, _)| *name).collect::<Vec<_>>(), after.iter().map(|(name, _)| *name).collect::<Vec<_>>(), "identical ordered group keys");
+            let changed = baseline_groups.iter().zip(&after).filter_map(|((name, before), (_, after))| (before != after).then_some(*name)).collect::<Vec<_>>();
+            assert_eq!(changed, [TA_GROUPS[plan.group].0], "exactly declared independent group changes");
+            if !matches!(plan.operation, TaOp::RemoveManifest | TaOp::ReplaceManifest | TaOp::AddManifest) {
+                assert_eq!(candidate.manifest, baseline.manifest, "virtual plant preserves manifest");
+                if let Some(path) = changed_vendor { assert_ne!(candidate.vendor.get(path), baseline.vendor.get(path), "selected vendor changes"); }
+                return;
+            }
+            let mut deltas = Vec::new(); ta_manifest_diffs(&baseline.manifest, &candidate.manifest, "/manifest", &plan.target, &mut deltas);
+            assert_eq!(deltas.len(), 1, "one independently routed manifest target changes");
+            let delta = &deltas[0]; assert_eq!(delta.path, plan.target, "independent target path");
+            match plan.operation {
+                TaOp::RemoveManifest => assert!(delta.before.is_some() && delta.after.is_none() && plan.replacement.is_none(), "exact removal payload"),
+                TaOp::AddManifest => assert!(delta.before.is_none() && delta.after.as_ref() == plan.replacement.as_ref(), "exact addition payload"),
+                TaOp::ReplaceManifest => assert!(delta.before.is_some() && delta.before.as_ref() != delta.after.as_ref() && delta.after.as_ref() == plan.replacement.as_ref(), "exact replacement payload"),
+                _ => unreachable!("manifest operations selected above"),
+            }
+        }
+
+        fn ta_validate_groups(plans: &[TaPlan]) -> VResult<()> {
+            let mut counts = [0usize; 25];
+            let mut ids = BTreeSet::new(); let mut targets = BTreeSet::new(); let mut tuples = BTreeSet::new();
+            for plan in plans {
+                if plan.group >= TA_GROUPS.len()
+                    || ta_plan_group(plan.operation, &plan.target)? != plan.group
+                    || !ids.insert(plan.id.as_str())
+                    || !targets.insert((plan.operation.token(), plan.target.as_str()))
+                    || !tuples.insert((plan.operation.token(), plan.target.as_str(), plan.diagnostic.as_str())) {
+                    return Err(ta_mut_err("executable_same_validator_contract", "plan group tuple"));
+                }
+                counts[plan.group] += 1;
+            }
+            if plans.len() != 88 || counts.iter().zip(TA_GROUPS)
+                .any(|(actual, (_, expected))| *actual != expected) {
+                return Err(ta_mut_err("executable_same_validator_contract", "exact group cardinalities"));
+            }
+            let mut encoder = ObservationEncoder::new(64 * 1024, "tasks-apps-plan-catalogue")?;
+            encoder.extend(b"FND01TASKSAPPSPLANREGv1")?;
+            encoder.byte(0)?;
+            for plan in plans {
+                let group = TA_GROUPS[plan.group].0;
+                for value in [plan.id.as_str(), plan.operation.token(), plan.target.as_str(), group] {
+                    encoder.sized_u32(value.as_bytes())?;
+                }
+            }
+            if lower_hex(&sha256(&encoder.bytes)) != "9f5c96a4fa0added0b9f854581cc1f4d2eff105fc9f7274d7b3a1c227bd23eb7" {
+                return Err(ta_mut_err("executable_same_validator_contract", "exact plan catalogue"));
+            }
+            Ok(())
+        }
+
+        fn ta_apply_plan(baseline: &TaBundle, plan: &TaPlan) -> VResult<(TaBundle, Option<String>)> {
+            let mut candidate = baseline.clone(); let subject = plan.id.as_str(); let invalid = || ta_mut_err(subject, "application");
+            let vendor = match plan.operation {
+                TaOp::RemoveManifest => { let pointer = ta_pointer(&plan.target)?; if plan.replacement.is_some() || plan.input.is_some() { return Err(invalid()); } remove_pointer(&mut candidate.manifest, pointer, subject).map_err(|_| invalid())?; None }
+                TaOp::ReplaceManifest => { let pointer = ta_pointer(&plan.target)?; let replacement = plan.replacement.clone().ok_or_else(invalid)?; if plan.input.is_some() { return Err(invalid()); } set_pointer(&mut candidate.manifest, pointer, replacement, subject).map_err(|_| invalid())?; None }
+                TaOp::AddManifest => { let pointer = ta_pointer(&plan.target)?; insert_pointer(&mut candidate.manifest, pointer, plan.replacement.clone().ok_or_else(invalid)?, subject).map_err(|_| invalid())?; None }
+                TaOp::AddVirtualInput => { let path = ta_input_path(&plan.target)?; if plan.replacement != Some(toml::Value::Boolean(true)) || plan.input.is_some() { return Err(invalid()); } candidate.vendor.insert(path.clone(), baseline.blocked.clone()); candidate.loaded.push(path); None }
+                TaOp::RemoveTerminalByte => { let path = ta_input_path(&plan.target)?; if plan.replacement.is_some() || plan.input.is_some() { return Err(invalid()); } candidate.vendor.get_mut(&path).and_then(|bytes| bytes.pop()).ok_or_else(invalid)?; Some(path) }
+                TaOp::ReplaceVirtualInput => { let path = ta_input_path(&plan.target)?; if plan.replacement.is_some() { return Err(invalid()); } let replacement = ta_input_path(plan.input.as_deref().ok_or_else(invalid)?)?; candidate.vendor.insert(path.clone(), baseline.vendor.get(&replacement).cloned().ok_or_else(invalid)?); Some(path) }
+            }; Ok((candidate, vendor))
         }
 
         fn assert_live_baseline_reloads_unchanged(
-            baseline: &TasksAppsSourceBundle,
-            baseline_digest: [u8; 32],
-            accepted: &AcceptedTasksAppsState,
+            baseline: &TaBundle, baseline_digest: [u8; 32], accepted: &TaAccepted,
         ) {
             let live = baseline_tasks_apps_bundle();
-            assert_eq!(
-                validate_tasks_apps_sources(&live)
-                    .expect("untouched live baseline reaccepts after discarded virtual mutation"),
-                accepted.clone(),
-                "typed observable state persists after discarded virtual mutation",
-            );
-            assert_eq!(
-                live.manifest_bytes, baseline.manifest_bytes,
-                "manifest bytes persist unchanged"
-            );
-            assert_eq!(
-                live.vendor_bytes, baseline.vendor_bytes,
-                "all vendor bytes persist unchanged"
-            );
-            assert_eq!(live.blocked_candidate_bytes, baseline.blocked_candidate_bytes,
-                "blocked candidate bytes persist unchanged");
-            assert_eq!(
-                tasks_apps_vendor_digest(&live.vendor_bytes).expect("live baseline digest"),
-                baseline_digest,
-                "live baseline digest persists unchanged",
-            );
-            assert_eq!(
-                lower_hex(&baseline_digest),
-                TASKS_APPS_VENDOR_DIGEST,
-                "live baseline retains the exact domain-separated family digest",
-            );
-        }
-
-        fn assert_only_manifest_mutation(
-            baseline: &toml::Value,
-            candidate: &toml::Value,
-            pointer: &str,
-            replacement: Option<toml::Value>,
-            subject: &str,
-        ) {
-            let mut expected = baseline.clone();
-            match replacement {
-                Some(value) => set_pointer(&mut expected, pointer, value, subject),
-                None => remove_pointer(&mut expected, pointer, subject),
-            }
-            .expect("same one-field virtual mutation must be valid");
-            assert_eq!(
-                candidate, &expected,
-                "only the named manifest field changed"
-            );
+            assert_eq!(validate_tasks_apps_sources(&live).expect("untouched live baseline reaccepts after discarded virtual mutation"), accepted.clone(), "typed observable state persists after discarded virtual mutation");
+            assert_eq!(live, *baseline, "the live bundle persists unchanged");
+            assert_eq!(ta_vendor_digest(&live.vendor).expect("live baseline digest"), baseline_digest, "live baseline digest persists unchanged");
+            assert_eq!(lower_hex(&baseline_digest), TA_VDIGEST, "live baseline retains the exact domain-separated family digest");
         }
 
         #[test]
         fn fnd_01_tasks_apps_sources_positive() {
             let bundle = baseline_tasks_apps_bundle();
-            assert_eq!(
-                2 + bundle.vendor_bytes.len(),
-                15,
-                "one manifest plus thirteen admitted vendors plus one blocked candidate"
-            );
-            let accepted = validate_tasks_apps_sources(&bundle)
-                .expect("same production validator accepts baseline");
-            assert_eq!(accepted.tasks_artifact_count, 4);
-            assert_eq!(accepted.tasks_conformance_artifact_count, 1);
-            assert_eq!(accepted.apps_artifact_count, 8);
-            assert_eq!(accepted.admitted_vendor_input_count, 13);
-            assert_eq!(accepted.admitted_vendor_input_total_bytes, 1_173_466);
-            assert_eq!(accepted.admitted_vendor_digest, TASKS_APPS_VENDOR_DIGEST);
-            assert_eq!(accepted.blocked_candidate_byte_length, 7_892_171);
-            assert_eq!(accepted.blocked_candidate_sha256, "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa");
+            assert_eq!(2 + bundle.vendor.len(), 15, "one manifest plus thirteen admitted vendors plus one blocked candidate");
+            let accepted = validate_tasks_apps_sources(&bundle).expect("same production validator accepts baseline");
+            assert_eq!((accepted.tasks_artifact_count, accepted.tasks_conformance_artifact_count, accepted.apps_artifact_count), (4, 1, 8));
+            assert_eq!((accepted.admitted_vendor_input_count, accepted.admitted_vendor_input_total_bytes, accepted.admitted_vendor_digest.as_str()), (13, 1_173_466, TA_VDIGEST));
+            assert_eq!((accepted.blocked_candidate_byte_length, accepted.blocked_candidate_sha256.as_str()), (7_892_171, "b160c424aacc4116168174b90ae91b29df6a48af25be660ceac3862daef495fa"));
             assert_eq!(accepted.required_test_ids, ["ordinary::tests::fnd_01_tasks_apps_sources_positive", "ordinary::tests::fnd_01_tasks_apps_sources_planted_negative"]);
             assert_eq!(accepted.apps_maturity, "stable");
-            assert_eq!(
-                accepted.composition_ids,
-                [
-                    "APP-03-apps-plus-host-mediated-sampling",
-                    "APP-04-apps-plus-tasks-mrtr",
-                ],
-            );
-            assert_eq!(
-                lower_hex(&tasks_apps_vendor_digest(&bundle.vendor_bytes).expect("bundle digest")),
-                TASKS_APPS_VENDOR_DIGEST,
-                "domain-separated family digest",
-            );
+            assert_eq!(accepted.observation_domain, TA_OBS_DOMAIN);
+            assert_eq!((accepted.explicit_planted_mutation_count, accepted.generated_planted_mutation_count, accepted.total_planted_mutation_count), (39, 49, 88));
+            assert_eq!(accepted.generated_category_vector, [13, 21, 10, 5]);
+            assert!(!accepted.runtime_capability_credit);
+            assert!(!accepted.remote_provenance_capability_credit);
+            assert!(!accepted.whatwg_admitted_as_source_input);
+            assert_eq!((accepted.standard_reuse_count, accepted.direct_import_count, accepted.quarantine_count), (21, 7, 10));
+            assert_eq!(accepted.subtree_digests.get("tasks_negotiated_settings_contract").map(String::as_str), Some("683999dfd9c98cfe580fdc3bd2d93dd0a7cac7ef6cf653ef4abcb898c2a3e382"));
+            assert_eq!(accepted.subtree_digests.get("apps_negotiated_settings_contract").map(String::as_str), Some("c79afa6b4700f641845dc0b6751251f5f100e0b7323e548712dcf78211d6e86c"));
+            assert_eq!(accepted.composition_ids, ["APP-03-apps-plus-host-mediated-sampling", "APP-04-apps-plus-tasks-mrtr"]);
+            assert_eq!(lower_hex(&ta_vendor_digest(&bundle.vendor).expect("bundle digest")), TA_VDIGEST, "domain-separated family digest");
         }
 
         #[test]
         fn fnd_01_tasks_apps_sources_planted_negative() {
             let baseline = baseline_tasks_apps_bundle();
-            let accepted = validate_tasks_apps_sources(&baseline)
-                .expect("fresh baseline accepts before mutations");
-            let baseline_digest =
-                tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest");
-            let contract = tasks_apps_table(&baseline.manifest, "manifest")
-                .and_then(|manifest| {
-                    tasks_apps_field(manifest, "executable_same_validator_contract", "manifest")
-                })
-                .and_then(|value| tasks_apps_table(value, "executable_same_validator_contract"))
-                .expect("validated manifest contract");
-            let plans = validate_tasks_apps_planted_mutations(contract)
-                .expect("production validator's exact planted-mutation schema");
-            assert_eq!(plans.len(), 12, "all validated concrete plants are present");
+            let accepted = validate_tasks_apps_sources(&baseline).expect("fresh baseline accepts before mutations");
+            let baseline_digest = ta_vendor_digest(&baseline.vendor).expect("baseline digest");
+            let root = ta_tbl(&baseline.manifest, "manifest").expect("validated manifest");
+            let contract = ta_tbl(ta_fld(root, "executable_same_validator_contract", "manifest").expect("contract"), "executable_same_validator_contract").expect("validated manifest contract");
+            let mut plans = ta_plans(&baseline.manifest, contract).expect("production validator's exact planted-mutation schema");
+            assert_eq!(plans.len(), 39, "all validated explicit plants are present");
+            let generated = ta_generated();
+            assert_eq!(generated.len(), 49, "all generated plants are present");
+            plans.extend(generated);
+            assert_eq!(plans.len(), 88, "all explicit and generated plants execute");
+            ta_validate_groups(&plans).expect("frozen exact 88-plan group registry");
+            let baseline_groups = ta_group_oracle(&baseline);
 
-            for plan in plans {
-                let mut candidate = baseline.clone();
-                let changed_vendor = match plan.operation.as_str() {
-                    "remove-one-manifest-field" => {
-                        let pointer = tasks_apps_manifest_pointer(&plan.target)
-                            .expect("validated manifest target has a pointer");
-                        assert!(plan.replacement.is_none());
-                        assert!(plan.replacement_input.is_none());
-                        remove_pointer(&mut candidate.manifest, pointer, &plan.id)
-                            .expect("remove only the validated target field");
-                        assert_only_manifest_mutation(
-                            &baseline.manifest,
-                            &candidate.manifest,
-                            pointer,
-                            None,
-                            &plan.id,
-                        );
-                        None
+            for plan in &plans {
+                let (candidate, changed_vendor) = ta_apply_plan(&baseline, plan).expect("validated plan changes exactly one permitted surface");
+                assert_unchanged_non_target_inputs(
+                    &baseline,
+                    &candidate,
+                    changed_vendor.as_deref(),
+                    (plan.operation == TaOp::AddVirtualInput).then_some(TA_BLOCKED_PATH),
+                );
+                assert_tasks_apps_group_isolation(&baseline, &candidate, &baseline_groups, plan, changed_vendor.as_deref());
+                assert_stable_diagnostic(&candidate, &plan.diagnostic);
+                if plan.operation != TaOp::AddVirtualInput {
+                    let candidate_digest = ta_vendor_digest(&candidate.vendor).expect("candidate digest");
+                    if changed_vendor.is_some() {
+                        assert_ne!(candidate_digest, baseline_digest, "changed virtual vendor changes digest");
+                    } else {
+                        assert_eq!(candidate_digest, baseline_digest, "manifest-only plant preserves digest");
                     }
-                    "replace-one-manifest-field" => {
-                        let pointer = tasks_apps_manifest_pointer(&plan.target)
-                            .expect("validated manifest target has a pointer");
-                        let replacement = plan
-                            .replacement
-                            .clone()
-                            .expect("validated replacement payload");
-                        assert!(plan.replacement_input.is_none());
-                        set_pointer(
-                            &mut candidate.manifest,
-                            pointer,
-                            replacement.clone(),
-                            &plan.id,
-                        )
-                        .expect("replace only the validated target field");
-                        assert_only_manifest_mutation(
-                            &baseline.manifest,
-                            &candidate.manifest,
-                            pointer,
-                            Some(replacement),
-                            &plan.id,
-                        );
-                        None
-                    }
-                    "remove-one-terminal-byte-from-one-virtual-input" => {
-                        assert!(plan.replacement.is_none());
-                        assert!(plan.replacement_input.is_none());
-                        candidate
-                            .vendor_bytes
-                            .get_mut(&plan.target)
-                            .expect("validated target vendor")
-                            .pop()
-                            .expect("nonempty validated target vendor");
-                        assert_eq!(
-                            candidate.manifest, baseline.manifest,
-                            "no manifest field changed"
-                        );
-                        Some(plan.target.as_str())
-                    }
-                    "replace-one-virtual-input-with-the-complete-bytes-of-another-listed-input" => {
-                        assert!(plan.replacement.is_none());
-                        let replacement_input = plan
-                            .replacement_input
-                            .as_deref()
-                            .expect("validated replacement input payload");
-                        let replacement = baseline
-                            .vendor_bytes
-                            .get(replacement_input)
-                            .expect("validated listed replacement input")
-                            .clone();
-                        candidate
-                            .vendor_bytes
-                            .insert(plan.target.clone(), replacement);
-                        assert_eq!(
-                            candidate.manifest, baseline.manifest,
-                            "no manifest field changed"
-                        );
-                        Some(plan.target.as_str())
-                    }
-                    _ => panic!(
-                        "validated operation must have a concrete plant: {}",
-                        plan.operation
-                    ),
-                };
-                assert_unchanged_non_target_inputs(&baseline, &candidate, changed_vendor);
-                let candidate_digest =
-                    tasks_apps_vendor_digest(&candidate.vendor_bytes).expect("candidate digest");
-                if changed_vendor.is_some() {
-                    assert_ne!(
-                        candidate_digest, baseline_digest,
-                        "changed virtual vendor changes digest"
-                    );
-                } else {
-                    assert_eq!(
-                        candidate_digest, baseline_digest,
-                        "manifest-only plant preserves digest"
-                    );
                 }
-                assert_stable_diagnostic(&candidate, &plan.expected_diagnostic);
                 drop(candidate);
                 assert_live_baseline_reloads_unchanged(&baseline, baseline_digest, &accepted);
             }
 
-            assert_eq!(
-                validate_tasks_apps_sources(&baseline)
-                    .expect("fresh baseline reaccepts after every isolated mutation"),
-                accepted,
-                "fresh baseline reaccepts with the same typed observable state",
-            );
-            assert_eq!(
-                tasks_apps_vendor_digest(&baseline.vendor_bytes).expect("baseline digest"),
-                baseline_digest
-            );
+            assert_eq!(validate_tasks_apps_sources(&baseline).expect("fresh baseline reaccepts after every isolated mutation"), accepted, "fresh baseline reaccepts with the same typed observable state");
+            assert_eq!(ta_vendor_digest(&baseline.vendor).expect("baseline digest"), baseline_digest);
         }
     }
 } // mod ordinary
