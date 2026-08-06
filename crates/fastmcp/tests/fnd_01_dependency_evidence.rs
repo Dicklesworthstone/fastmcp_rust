@@ -6066,9 +6066,7 @@ mod trust_std {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AcquisitionCommandExpectation {
-        pub argv: Vec<String>,
-        pub environment: Vec<(String, String)>,
-        pub working_directory: String,
+        pub plan: AcquisitionCommandPlan,
         pub typed_result_sha256: [u8; 32],
     }
 
@@ -6100,9 +6098,7 @@ mod trust_std {
             typed_result_sha256: [u8; 32],
         ) -> AcquisitionCommandExpectation {
             AcquisitionCommandExpectation {
-                argv: self.argv.clone(),
-                environment: self.environment.clone(),
-                working_directory: self.working_directory.clone(),
+                plan: self.clone(),
                 typed_result_sha256,
             }
         }
@@ -6119,6 +6115,94 @@ mod trust_std {
         pub commands: [AcquisitionCommandPlan; 2],
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AcquisitionStaticCommand<'a> {
+        pub id: &'a str,
+        pub ordinal: u64,
+        pub argv_literals: &'a [&'a str],
+        pub working_directory_formula: &'a str,
+        pub typed_result_kind: &'a str,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AcquisitionEnvironmentSource<'a> {
+        CargoHome, CargoTarget, ExecutionBin, HostAr, HostCc, ClippyDriver,
+        HostRanlib, Rustc, Rustdoc, Rustfmt, Literal(&'a str),
+    }
+
+    impl<'a> AcquisitionEnvironmentSource<'a> {
+        pub fn join(self) -> (u8, &'a str) {
+            match self {
+                Self::CargoHome => (0, ""), Self::CargoTarget => (1, ""),
+                Self::ExecutionBin => (2, ""), Self::HostAr => (3, ""),
+                Self::HostCc => (4, ""), Self::ClippyDriver => (5, ""),
+                Self::HostRanlib => (6, ""), Self::Rustc => (7, ""),
+                Self::Rustdoc => (8, ""), Self::Rustfmt => (9, ""),
+                Self::Literal(value) => (10, value),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AcquisitionEnvironmentBinding<'a> {
+        pub key: &'a str,
+        pub source: AcquisitionEnvironmentSource<'a>,
+    }
+    use AcquisitionEnvironmentBinding as EB;
+    use AcquisitionEnvironmentSource as ES;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AcquisitionPlanAuthority<'a> {
+        pub run_root_formula: &'a str,
+        pub scratch_root_formula: &'a str,
+        pub manifest_formula: &'a str,
+        pub cargo_home_formula: &'a str,
+        pub cargo_target_formula: &'a str,
+        pub execution_bin_formula: &'a str,
+        pub environment: &'a [AcquisitionEnvironmentBinding<'a>],
+        pub commands: [AcquisitionStaticCommand<'a>; 2],
+    }
+
+    pub const ACQUISITION_PLAN_AUTHORITY: AcquisitionPlanAuthority<'static> = AcquisitionPlanAuthority {
+        run_root_formula: ".fnd01-run/<role>/<run-id>",
+        scratch_root_formula: ".fnd01-run/<role>/<run-id>/bootstrap-control-package",
+        manifest_formula: ".fnd01-run/<role>/<run-id>/bootstrap-control-package/Cargo.toml",
+        cargo_home_formula: ".fnd01-run/<role>/<run-id>/cargo-home/acquisition",
+        cargo_target_formula: ".fnd01-run/<role>/<run-id>/targets/acquisition",
+        execution_bin_formula: ".fnd01-run/<role>/<run-id>/execution-bin",
+        environment: &[
+            EB { key: "AR", source: ES::HostAr },
+            EB { key: "CARGO_HOME", source: ES::CargoHome },
+            EB { key: "CARGO_REGISTRIES_CRATES_IO_PROTOCOL", source: ES::Literal("sparse") },
+            EB { key: "CARGO_TARGET_DIR", source: ES::CargoTarget },
+            EB { key: "CC", source: ES::HostCc },
+            EB { key: "CLIPPY_DRIVER", source: ES::ClippyDriver },
+            EB { key: "LANG", source: ES::Literal("C") },
+            EB { key: "LC_ALL", source: ES::Literal("C") },
+            EB { key: "PATH", source: ES::ExecutionBin },
+            EB { key: "RANLIB", source: ES::HostRanlib },
+            EB { key: "RUSTC", source: ES::Rustc },
+            EB { key: "RUSTDOC", source: ES::Rustdoc },
+            EB { key: "RUSTFMT", source: ES::Rustfmt },
+            EB { key: "RUSTUP_TOOLCHAIN", source: ES::Literal("nightly-2026-07-11") },
+            EB { key: "SOURCE_DATE_EPOCH", source: ES::Literal("0") },
+            EB { key: "TZ", source: ES::Literal("UTC") },
+        ],
+        commands: [
+            AcquisitionStaticCommand { id: "bootstrap.resolve", ordinal: 0, argv_literals: &["metadata", "--format-version", "1", "--all-features", "--manifest-path"], working_directory_formula: ".fnd01-run/<role>/<run-id>", typed_result_kind: "strict-cargo-metadata-json-plus-union-lock" },
+            AcquisitionStaticCommand { id: "bootstrap.fetch", ordinal: 1, argv_literals: &["fetch", "--locked", "--manifest-path"], working_directory_formula: ".fnd01-run/<role>/<run-id>", typed_result_kind: "exit-and-cache-closure" },
+        ],
+    };
+
+    fn acquisition_formula(formula: &str, run_id: &str, subject: &str) -> TrustResult<String> {
+        let rendered = formula.replace("<role>", "integration-producer").replace("<run-id>", run_id);
+        validate_relative_path(&rendered, subject)?;
+        if rendered.contains('<') || rendered.contains('>') {
+            return Err(TrustError::new("E_ACQUISITION_PLAN", subject));
+        }
+        Ok(rendered)
+    }
+
     fn acquisition_plan_path(path: &Path, subject: &str) -> TrustResult<String> {
         let value = path.to_str().ok_or_else(|| {
             TrustError::new(
@@ -6130,10 +6214,19 @@ mod trust_std {
         Ok(value.to_owned())
     }
 
+    fn acquisition_authority_path(
+        repository_root: &Path, formula: &str, run_id: &str, subject: &str,
+    ) -> TrustResult<String> {
+        acquisition_plan_path(
+            &repository_root.join(acquisition_formula(formula, run_id, subject)?), subject,
+        )
+    }
+
     pub fn acquisition_plan(
         repository_root: &Path,
         run_id: &str,
         tools: &AcquisitionToolPaths,
+        authority: &AcquisitionPlanAuthority<'_>,
     ) -> TrustResult<AcquisitionPlan> {
         decode_run_id(run_id)?;
         acquisition_plan_path(repository_root, "acquisition repository root")?;
@@ -6153,91 +6246,47 @@ mod trust_std {
             )?;
         }
 
-        let role_root_path = repository_root
-            .join(".fnd01-run")
-            .join("integration-producer")
-            .join(run_id);
-        let package_root_path = role_root_path.join("bootstrap-control-package");
-        let manifest_path_buf = package_root_path.join("Cargo.toml");
-        let cargo_home_path = role_root_path.join("cargo-home/acquisition");
-        let cargo_target_path = role_root_path.join("targets/acquisition");
-        let execution_bin_path = role_root_path.join("execution-bin");
-        let role_root =
-            acquisition_plan_path(&role_root_path, "acquisition role root")?;
-        let package_root = acquisition_plan_path(
-            &package_root_path,
-            "acquisition package root",
-        )?;
-        let manifest_path = acquisition_plan_path(
-            &manifest_path_buf,
-            "acquisition manifest",
-        )?;
-        let cargo_home =
-            acquisition_plan_path(&cargo_home_path, "acquisition Cargo home")?;
-        let cargo_target_dir = acquisition_plan_path(
-            &cargo_target_path,
-            "acquisition Cargo target",
-        )?;
-        let execution_bin = acquisition_plan_path(
-            &execution_bin_path,
-            "acquisition execution-bin",
-        )?;
-        let environment = vec![
-            ("AR".to_owned(), tools.host_ar.clone()),
-            ("CARGO_HOME".to_owned(), cargo_home.clone()),
-            (
-                "CARGO_REGISTRIES_CRATES_IO_PROTOCOL".to_owned(),
-                "sparse".to_owned(),
-            ),
-            ("CARGO_TARGET_DIR".to_owned(), cargo_target_dir.clone()),
-            ("CC".to_owned(), tools.host_cc.clone()),
-            ("CLIPPY_DRIVER".to_owned(), tools.clippy_driver.clone()),
-            ("LANG".to_owned(), "C".to_owned()),
-            ("LC_ALL".to_owned(), "C".to_owned()),
-            ("PATH".to_owned(), execution_bin.clone()),
-            ("RANLIB".to_owned(), tools.host_ranlib.clone()),
-            ("RUSTC".to_owned(), tools.rustc.clone()),
-            ("RUSTDOC".to_owned(), tools.rustdoc.clone()),
-            ("RUSTFMT".to_owned(), tools.rustfmt.clone()),
-            (
-                "RUSTUP_TOOLCHAIN".to_owned(),
-                "nightly-2026-07-11".to_owned(),
-            ),
-            ("SOURCE_DATE_EPOCH".to_owned(), "0".to_owned()),
-            ("TZ".to_owned(), "UTC".to_owned()),
-        ];
+        let path = |formula, subject| acquisition_authority_path(
+            repository_root, formula, run_id, subject);
+        let role_root = path(authority.run_root_formula, "acquisition role root")?;
+        let package_root = path(authority.scratch_root_formula, "acquisition package root")?;
+        let manifest_path = path(authority.manifest_formula, "acquisition manifest")?;
+        let cargo_home = path(authority.cargo_home_formula, "acquisition Cargo home")?;
+        let cargo_target_dir = path(authority.cargo_target_formula, "acquisition target")?;
+        let execution_bin = path(authority.execution_bin_formula, "acquisition execution-bin")?;
+        let environment = authority.environment.iter().map(|binding| {
+            use AcquisitionEnvironmentSource as S;
+            let value = match binding.source {
+                S::CargoHome => cargo_home.clone(), S::CargoTarget => cargo_target_dir.clone(),
+                S::ExecutionBin => execution_bin.clone(), S::HostAr => tools.host_ar.clone(),
+                S::HostCc => tools.host_cc.clone(), S::ClippyDriver => tools.clippy_driver.clone(),
+                S::HostRanlib => tools.host_ranlib.clone(), S::Rustc => tools.rustc.clone(),
+                S::Rustdoc => tools.rustdoc.clone(), S::Rustfmt => tools.rustfmt.clone(),
+                S::Literal(value) => value.to_owned(),
+            };
+            (binding.key.to_owned(), value)
+        }).collect::<Vec<_>>();
         validate_environment_array(&environment, "acquisition plan")?;
 
         let resolve = AcquisitionCommandPlan {
-            id: "bootstrap.resolve".to_owned(),
-            ordinal: 0,
-            argv: vec![
-                tools.cargo.clone(),
-                "metadata".to_owned(),
-                "--format-version".to_owned(),
-                "1".to_owned(),
-                "--all-features".to_owned(),
-                "--manifest-path".to_owned(),
-                manifest_path.clone(),
-            ],
+            id: authority.commands[0].id.to_owned(),
+            ordinal: authority.commands[0].ordinal,
+            argv: std::iter::once(tools.cargo.clone())
+                .chain(authority.commands[0].argv_literals.iter().map(|value| (*value).to_owned()))
+                .chain(std::iter::once(manifest_path.clone())).collect(),
             environment: environment.clone(),
-            working_directory: role_root.clone(),
-            typed_result_kind:
-                "strict-cargo-metadata-json-plus-union-lock".to_owned(),
+            working_directory: path(authority.commands[0].working_directory_formula, "resolve CWD")?,
+            typed_result_kind: authority.commands[0].typed_result_kind.to_owned(),
         };
         let fetch = AcquisitionCommandPlan {
-            id: "bootstrap.fetch".to_owned(),
-            ordinal: 1,
-            argv: vec![
-                tools.cargo.clone(),
-                "fetch".to_owned(),
-                "--locked".to_owned(),
-                "--manifest-path".to_owned(),
-                manifest_path.clone(),
-            ],
+            id: authority.commands[1].id.to_owned(),
+            ordinal: authority.commands[1].ordinal,
+            argv: std::iter::once(tools.cargo.clone())
+                .chain(authority.commands[1].argv_literals.iter().map(|value| (*value).to_owned()))
+                .chain(std::iter::once(manifest_path.clone())).collect(),
             environment,
-            working_directory: role_root.clone(),
-            typed_result_kind: "exit-and-cache-closure".to_owned(),
+            working_directory: path(authority.commands[1].working_directory_formula, "fetch CWD")?,
+            typed_result_kind: authority.commands[1].typed_result_kind.to_owned(),
         };
         validate_argument_array(&resolve.argv, "bootstrap.resolve")?;
         validate_argument_array(&fetch.argv, "bootstrap.fetch")?;
@@ -6326,7 +6375,7 @@ mod trust_std {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TypedAcquisitionResult {
-        pub kind: &'static str,
+        pub kind: String,
         pub sha256: [u8; 32],
     }
 
@@ -6685,25 +6734,17 @@ mod trust_std {
         expected: &AcquisitionCommandPlan,
         ordinal: usize,
     ) -> TrustResult<StructurallyValidatedAcquisitionCommand> {
-        const IDS: [&str; 2] = ["bootstrap.resolve", "bootstrap.fetch"];
-        const KINDS: [&str; 2] = [
-            "strict-cargo-metadata-json-plus-union-lock",
-            "exit-and-cache-closure",
-        ];
         const STDOUT_MAXIMA: [u64; 2] = [16 * 1024 * 1024, 1024 * 1024];
         const STDERR_MAXIMA: [u64; 2] = [1024 * 1024, 4 * 1024 * 1024];
+        let ordinal_u64 = u64::try_from(ordinal).map_err(|_| {
+            TrustError::new("E_ACQUISITION_COMMAND", "ordinal conversion")
+        })?;
         if record.schema_id != "acquisition-spool-command"
-            || record.string("id")? != IDS[ordinal]
-            || expected.id != IDS[ordinal]
-            || record.unsigned("ordinal")? != u64::try_from(ordinal).map_err(|_| {
-                TrustError::new("E_ACQUISITION_COMMAND", "ordinal conversion")
-            })?
-            || expected.ordinal != u64::try_from(ordinal).map_err(|_| {
-                TrustError::new("E_ACQUISITION_COMMAND", "ordinal conversion")
-            })?
+            || record.string("id")? != expected.id
+            || record.unsigned("ordinal")? != ordinal_u64
+            || expected.ordinal != ordinal_u64
             || record.signed("exit_code")? != 0
-            || record.string("typed_result_kind")? != KINDS[ordinal]
-            || expected.typed_result_kind != KINDS[ordinal]
+            || record.string("typed_result_kind")? != expected.typed_result_kind
             || record.string("evidence_verdict")? != "Pass"
         {
             return Err(TrustError::new(
@@ -6713,8 +6754,8 @@ mod trust_std {
         }
         let argv = record.strings("argv")?;
         let environment = record.environment("environment")?;
-        validate_argument_array(argv, IDS[ordinal])?;
-        validate_environment_array(environment, IDS[ordinal])?;
+        validate_argument_array(argv, &expected.id)?;
+        validate_environment_array(environment, &expected.id)?;
         if argv != expected.argv.as_slice()
             || environment != expected.environment.as_slice()
             || record.string("working_directory")?
@@ -6739,13 +6780,10 @@ mod trust_std {
             STDERR_MAXIMA[ordinal],
             "acquisition stderr",
         )?;
-        let ordinal_u64 = u64::try_from(ordinal).map_err(|_| {
-            TrustError::new("E_ACQUISITION_COMMAND", "ordinal conversion")
-        })?;
         let parsed_preimage =
             acquisition_command_preimage(&AcquisitionCommandPreimageInput {
                 ordinal: ordinal_u64,
-                id: IDS[ordinal],
+                id: &expected.id,
                 argv,
                 environment,
                 working_directory: record.string("working_directory")?,
@@ -6758,12 +6796,12 @@ mod trust_std {
                     binding: stderr.binding,
                     bytes: &stderr.bytes,
                 },
-                typed_result_kind: KINDS[ordinal],
+                typed_result_kind: &expected.typed_result_kind,
                 typed_result_sha256,
                 evidence_verdict: "Pass",
             })?;
         Ok(StructurallyValidatedAcquisitionCommand {
-            id: IDS[ordinal].to_owned(),
+            id: expected.id.clone(),
             ordinal: ordinal_u64,
             argv: argv.to_vec(),
             environment: environment.to_vec(),
@@ -6771,7 +6809,7 @@ mod trust_std {
             exit_code: 0,
             stdout,
             stderr,
-            claimed_typed_result_kind: KINDS[ordinal].to_owned(),
+            claimed_typed_result_kind: expected.typed_result_kind.clone(),
             claimed_typed_result_sha256: typed_result_sha256,
             evidence_verdict: "Pass".to_owned(),
             claimed_preimage: parsed_preimage,
@@ -6863,7 +6901,7 @@ mod trust_std {
                     binding: structural.stderr.binding,
                     bytes: &structural.stderr.bytes,
                 },
-                typed_result_kind: independent.kind,
+                typed_result_kind: &independent.kind,
                 typed_result_sha256: independent.sha256,
                 evidence_verdict: &structural.evidence_verdict,
             })?;
@@ -6912,28 +6950,9 @@ mod trust_std {
         bytes: &[u8],
         expected: &AcquisitionSpoolExpectation,
     ) -> TrustResult<ValidatedAcquisitionSpool> {
-        const IDS: [&str; 2] = ["bootstrap.resolve", "bootstrap.fetch"];
-        const KINDS: [&str; 2] = [
-            "strict-cargo-metadata-json-plus-union-lock",
-            "exit-and-cache-closure",
-        ];
         let commands = [
-            AcquisitionCommandPlan {
-                id: IDS[0].to_owned(),
-                ordinal: 0,
-                argv: expected.commands[0].argv.clone(),
-                environment: expected.commands[0].environment.clone(),
-                working_directory: expected.commands[0].working_directory.clone(),
-                typed_result_kind: KINDS[0].to_owned(),
-            },
-            AcquisitionCommandPlan {
-                id: IDS[1].to_owned(),
-                ordinal: 1,
-                argv: expected.commands[1].argv.clone(),
-                environment: expected.commands[1].environment.clone(),
-                working_directory: expected.commands[1].working_directory.clone(),
-                typed_result_kind: KINDS[1].to_owned(),
-            },
+            expected.commands[0].plan.clone(),
+            expected.commands[1].plan.clone(),
         ];
         let structural = parse_acquisition_spool_structure(
             bytes,
@@ -6945,11 +6964,11 @@ mod trust_std {
             structural,
             &[
                 TypedAcquisitionResult {
-                    kind: KINDS[0],
+                    kind: commands[0].typed_result_kind.clone(),
                     sha256: expected.commands[0].typed_result_sha256,
                 },
                 TypedAcquisitionResult {
-                    kind: KINDS[1],
+                    kind: commands[1].typed_result_kind.clone(),
                     sha256: expected.commands[1].typed_result_sha256,
                 },
             ],
@@ -16258,6 +16277,7 @@ mod trust_std {
                 Path::new("/repo"),
                 ACQUISITION_FIXTURE_RUN_ID,
                 &acquisition_tool_paths_fixture(),
+                &ACQUISITION_PLAN_AUTHORITY,
             )
             .expect("compiled acquisition fixture plan");
             assert_eq!(
@@ -16479,6 +16499,7 @@ mod trust_std {
                 Path::new("/repo"),
                 ACQUISITION_FIXTURE_RUN_ID,
                 &acquisition_tool_paths_fixture(),
+                &ACQUISITION_PLAN_AUTHORITY,
             )
             .expect("compiled acquisition fixture plan");
             let bytes =
@@ -16498,11 +16519,11 @@ mod trust_std {
                 structural.clone(),
                 &[
                     TypedAcquisitionResult {
-                        kind: "strict-cargo-metadata-json-plus-union-lock",
+                        kind: "strict-cargo-metadata-json-plus-union-lock".to_owned(),
                         sha256: [0x44; 32],
                     },
                     TypedAcquisitionResult {
-                        kind: "exit-and-cache-closure",
+                        kind: "exit-and-cache-closure".to_owned(),
                         sha256: [0x33; 32],
                     },
                 ],
@@ -16514,11 +16535,11 @@ mod trust_std {
                 structural,
                 &[
                     TypedAcquisitionResult {
-                        kind: "strict-cargo-metadata-json-plus-union-lock",
+                        kind: "strict-cargo-metadata-json-plus-union-lock".to_owned(),
                         sha256: [0x22; 32],
                     },
                     TypedAcquisitionResult {
-                        kind: "exit-and-cache-closure",
+                        kind: "exit-and-cache-closure".to_owned(),
                         sha256: [0x33; 32],
                     },
                 ],
@@ -17890,9 +17911,9 @@ mod phase_b_std {
         RECORD_SET_PREFIX, sparse_index_fixture_corpus,
     };
     use super::trust_std::{
-        AcquisitionCommandExpectation, AcquisitionCommandPreimageInput,
-        AcquisitionCommandStreamPreimage,
-        AcquisitionToolPaths, AuthoringMarker, BootstrapArguments,
+        AcquisitionCommandPreimageInput,
+        AcquisitionCommandStreamPreimage, AcquisitionCommandPlan,
+        AcquisitionPlanAuthority, AcquisitionStaticCommand, AcquisitionToolPaths, AuthoringMarker, BootstrapArguments,
         BootstrapEnvironment, BootstrapMode, CheckedSnapshot, FileBinding, FilesystemUsage,
         IntegrationSeal, LinuxFileIdentity, PhaseBSpaceBudget,
         NativeToolDescriptor as NativeTool, NATIVE_TOOL_DESCRIPTORS as NATIVE_TOOLS,
@@ -17901,7 +17922,7 @@ mod phase_b_std {
         StreamingSha256, TypedAcquisitionResult,
         ValidatedDirectoryTreeBinding, ValidatedFileBinding,
         ValidatedTargetSnapshot,
-        ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
+        ACQUISITION_PLAN_AUTHORITY, ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
         MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES,
         MAX_SPARSE_CACHE_INPUT_BYTES, MAX_SUPPLY_BUNDLE_BYTES,
         acquisition_command_preimage, acquisition_plan,
@@ -18076,11 +18097,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     const MAX_MATERIALIZATION_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     const PRODUCE_POLICY_JOIN_PREFIX: &[u8] =
         b"FND01PHASEBPOLICYJOINv1\0";
-    const PRODUCE_POLICY_JOIN_BYTES: usize = 3698;
+    const JOIN_DRIFT: &str = "compiled acquisition join drifted before effects";
+    const PRODUCE_POLICY_JOIN_BYTES: usize = 4485;
     const PRODUCE_POLICY_JOIN_SHA256: [u8; 32] = [
-        0x4c, 0xc0, 0x35, 0x93, 0xc6, 0x26, 0xa2, 0xb7, 0xc8, 0x4a, 0xac, 0x94, 0xdf, 0x00,
-        0xea, 0xb6, 0xf2, 0x54, 0x56, 0xfe, 0x0d, 0x1e, 0x8c, 0x0f, 0x9a, 0x67, 0x76, 0x94,
-        0x31, 0xdb, 0x63, 0xb8,
+        0x30, 0xe6, 0x9c, 0xb2, 0x12, 0xe7, 0xf1, 0xb5, 0xed, 0x57, 0x07, 0x1c, 0x4f, 0x6d,
+        0xac, 0x19, 0x33, 0xb5, 0x73, 0xdc, 0xf7, 0xd2, 0x49, 0xbb, 0x4b, 0x74, 0x55, 0x1a,
+        0x10, 0xd6, 0xbf, 0x68,
     ];
 
     #[derive(Clone, Copy)]
@@ -18143,9 +18165,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct StaticChildAuthority {
-        id: &'static str,
-        ordinal: u64,
-        typed_result_kind: &'static str,
         timeout_seconds: u64,
         stdout_limit: usize,
         stderr_limit: usize,
@@ -18173,11 +18192,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         max_tree_regular_file_bytes: u64,
         max_tree_member_bytes: u64,
         space_budget: PhaseBSpaceBudget,
-        scratch_root_formula: &'static str,
+        plan: AcquisitionPlanAuthority<'static>,
         control_ledger_path_formula: &'static str,
         acquisition_spool_path_formula: &'static str,
         materialization_root_formula: &'static str,
         tool_probe_working_directory: &'static str,
+        marker_format: &'static str,
+        supply_format: &'static str,
+        cargo_discovery_requires_no_config: bool,
+        native_tool_count: usize,
         full_policy_join_sha256: [u8; 32],
     }
 
@@ -18185,18 +18208,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     ) -> ProduceAcquisitionAuthority {
         ProduceAcquisitionAuthority {
             resolve: StaticChildAuthority {
-                id: "bootstrap.resolve",
-                ordinal: 0,
-                typed_result_kind:
-                    "strict-cargo-metadata-json-plus-union-lock",
                 timeout_seconds: RESOLVE_TIMEOUT_SECONDS,
                 stdout_limit: RESOLVE_STDOUT_LIMIT,
                 stderr_limit: RESOLVE_STDERR_LIMIT,
             },
             fetch: StaticChildAuthority {
-                id: "bootstrap.fetch",
-                ordinal: 1,
-                typed_result_kind: "exit-and-cache-closure",
                 timeout_seconds: FETCH_TIMEOUT_SECONDS,
                 stdout_limit: FETCH_STDOUT_LIMIT,
                 stderr_limit: FETCH_STDERR_LIMIT,
@@ -18235,8 +18251,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 max_materialization_total_bytes:
                     MAX_MATERIALIZATION_TOTAL_BYTES,
             },
-            scratch_root_formula:
-                ".fnd01-run/<role>/<run-id>/bootstrap-control-package",
+            plan: ACQUISITION_PLAN_AUTHORITY,
             control_ledger_path_formula:
                 ".fnd01-run/<role>/<run-id>/control-ledger.bin",
             acquisition_spool_path_formula:
@@ -18244,6 +18259,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             materialization_root_formula:
                 ".fnd01-run/<role>/<run-id>/local-registry",
             tool_probe_working_directory: "/",
+            marker_format: "FND01AUTHORv2",
+            supply_format: "FND01SUPPLYv4",
+            cargo_discovery_requires_no_config: true,
+            native_tool_count: 20,
             full_policy_join_sha256: PRODUCE_POLICY_JOIN_SHA256,
         }
     }
@@ -18259,13 +18278,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
     fn append_static_child_authority(
         output: &mut Vec<u8>,
+        command: AcquisitionStaticCommand<'_>,
         child: StaticChildAuthority,
         policy_block: &[u8],
         subject: &str,
     ) -> TrustResult<()> {
-        append_u32_bytes(output, child.id.as_bytes(), subject)?;
-        output.extend_from_slice(&child.ordinal.to_be_bytes());
-        append_u32_bytes(output, child.typed_result_kind.as_bytes(), subject)?;
+        append_u32_bytes(output, command.id.as_bytes(), subject)?;
+        output.extend_from_slice(&command.ordinal.to_be_bytes());
+        append_u32_bytes(output, command.working_directory_formula.as_bytes(), subject)?;
+        append_u32_bytes(output, command.typed_result_kind.as_bytes(), subject)?;
         output.extend_from_slice(&child.timeout_seconds.to_be_bytes());
         append_policy_join_usize(output, child.stdout_limit, subject)?;
         append_policy_join_usize(output, child.stderr_limit, subject)?;
@@ -18278,12 +18299,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let mut output = PRODUCE_POLICY_JOIN_PREFIX.to_vec();
         append_static_child_authority(
             &mut output,
+            authority.plan.commands[0],
             authority.resolve,
             RESOLVE_COMMAND_POLICY,
             "Produce resolve policy join",
         )?;
         append_static_child_authority(
             &mut output,
+            authority.plan.commands[1],
             authority.fetch,
             FETCH_COMMAND_POLICY,
             "Produce fetch policy join",
@@ -18293,6 +18316,26 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ACQUISITION_ENVIRONMENT_POLICY,
             "Produce environment policy join",
         )?;
+        for binding in authority.plan.environment {
+            append_u32_bytes(&mut output, binding.key.as_bytes(), "Produce environment key")?;
+            let (source, literal) = binding.source.join();
+            output.push(source);
+            append_u32_bytes(&mut output, literal.as_bytes(), "Produce environment value")?;
+        }
+        for value in authority.plan.commands[0].argv_literals {
+            append_u32_bytes(&mut output, value.as_bytes(), "Produce resolve argv")?;
+        }
+        for value in authority.plan.commands[1].argv_literals {
+            append_u32_bytes(&mut output, value.as_bytes(), "Produce fetch argv")?;
+        }
+        for value in [authority.plan.run_root_formula, authority.plan.scratch_root_formula,
+            authority.plan.manifest_formula, authority.plan.cargo_home_formula,
+            authority.plan.cargo_target_formula, authority.plan.execution_bin_formula,
+            authority.marker_format, authority.supply_format] {
+            append_u32_bytes(&mut output, value.as_bytes(), "Produce typed policy field")?;
+        }
+        output.push(u8::from(authority.cargo_discovery_requires_no_config));
+        append_policy_join_usize(&mut output, authority.native_tool_count, "Produce native-tool count")?;
         for (count, byte_length, digest) in [
             (DIRECT.len(), DIRECT_BYTES, DIRECT_SHA256),
             (DIRECT.len() - 7, UNION_BYTES, UNION_SHA256),
@@ -18368,7 +18411,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             )?;
         }
         for value in [
-            authority.scratch_root_formula,
             authority.control_ledger_path_formula,
             authority.acquisition_spool_path_formula,
             authority.materialization_root_formula,
@@ -18399,26 +18441,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         native_tool_registry_binding: FileBinding,
         produce_acquisition: ProduceAcquisitionAuthority,
     }
-
-    #[derive(Debug)]
-    struct BoundedProduceAcquisition {
-        authority: ProduceAcquisitionAuthority,
-        manifest: Vec<u8>,
-        manifest_binding: FileBinding,
-        role_root: String,
-        package_root: String,
-        target_root: String,
-        local_registry: String,
-        control_ledger: String,
-        acquisition_spool: String,
-        acquisition_home: String,
-        acquisition_target: String,
-        offline_home: String,
-        execution_bin: String,
-    }
-
-    #[derive(Debug)]
-    struct ProduceAcquisitionPermit(BoundedProduceAcquisition);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PhaseBSpaceGroup {
@@ -18727,7 +18749,65 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         TrustError::new(code, detail)
     }
 
-    fn require_produce_acquisition_authority(
+    fn render_phase_b_relative(
+        formula: &str,
+        role: &str,
+        run_id: &str,
+        subject: &str,
+    ) -> TrustResult<String> {
+        let rendered = formula.replace("<role>", role).replace("<run-id>", run_id);
+        validate_relative_path(&rendered, subject)?;
+        if rendered.contains('<') || rendered.contains('>') {
+            return Err(phase_b_error("E_PHASE_B_ACQUISITION_AUTHORITY", subject));
+        }
+        Ok(rendered)
+    }
+
+    mod produce_acquisition_permit {
+        use super::*;
+
+        #[derive(Debug)]
+        pub(super) struct BoundedProduceAcquisition {
+            authority: ProduceAcquisitionAuthority,
+            manifest: Vec<u8>,
+            role_root: String,
+            package_root: String,
+            acquisition_home: String,
+            acquisition_target: String,
+            execution_bin: String,
+        }
+
+        impl BoundedProduceAcquisition {
+            pub(super) fn authority(&self) -> &ProduceAcquisitionAuthority { &self.authority }
+            pub(super) fn manifest(&self) -> &[u8] { &self.manifest }
+            pub(super) fn role_root(&self) -> &str { &self.role_root }
+            pub(super) fn package_root(&self) -> &str { &self.package_root }
+            pub(super) fn acquisition_home(&self) -> &str { &self.acquisition_home }
+            pub(super) fn acquisition_target(&self) -> &str { &self.acquisition_target }
+            pub(super) fn execution_bin(&self) -> &str { &self.execution_bin }
+        }
+
+        #[derive(Debug)]
+        struct ProduceAcquisitionPermit(BoundedProduceAcquisition);
+
+        #[derive(Debug)]
+        pub(super) struct ProducePostAcquisitionAuthority {
+            authority: ProduceAcquisitionAuthority,
+            role_root: String,
+            package_root: String,
+            execution_bin: String,
+            admitted: BootstrapInputAuthority,
+        }
+
+        impl ProducePostAcquisitionAuthority {
+            pub(super) fn authority(&self) -> &ProduceAcquisitionAuthority { &self.authority }
+            pub(super) fn role_root(&self) -> &str { &self.role_root }
+            pub(super) fn package_root(&self) -> &str { &self.package_root }
+            pub(super) fn execution_bin(&self) -> &str { &self.execution_bin }
+            pub(super) fn admitted(&self) -> &BootstrapInputAuthority { &self.admitted }
+        }
+
+    fn issue(
         authority: PhaseBAuthority,
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
@@ -18745,6 +18825,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             || environment.attester_outer_record_path.is_some()
             || environment.final_gate_seal.is_some()
             || integration_digest != [0; 32]
+            || !environment
+                .authoring_marker
+                .starts_with(authority.produce_acquisition.marker_format)
         {
             return Err(phase_b_error(
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
@@ -18768,11 +18851,18 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 error.to_string(),
             )
         })?;
-        let expected_run_root = arguments
-            .repository_root
-            .join(".fnd01-run")
-            .join("integration-producer")
-            .join(&arguments.run_id);
+        require_complete_produce_acquisition_policy_join(
+            &authority.produce_acquisition,
+        )?;
+        let render = |formula, subject| render_phase_b_relative(
+            formula, "integration-producer", &arguments.run_id, subject);
+        let plan = authority.produce_acquisition.plan;
+        let role_root = render(plan.run_root_formula, "Produce run root")?;
+        let package_root = render(plan.scratch_root_formula, "Produce package root")?;
+        let acquisition_home = render(plan.cargo_home_formula, "Produce Cargo home")?;
+        let acquisition_target = render(plan.cargo_target_formula, "Produce target")?;
+        let execution_bin = render(plan.execution_bin_formula, "Produce execution bin")?;
+        let expected_run_root = arguments.repository_root.join(&role_root);
         if arguments.run_root != expected_run_root
             || arguments.run_id_bytes.iter().all(|byte| *byte == 0)
             || decoded_run_id != arguments.run_id_bytes
@@ -18829,52 +18919,132 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "compiled or retained Produce acquisition authority mismatch",
             ));
         }
-        let role_root =
-            format!(".fnd01-run/integration-producer/{}", arguments.run_id);
         Ok(ProduceAcquisitionPermit(BoundedProduceAcquisition {
             authority: authority.produce_acquisition,
             manifest: authority.manifest,
-            manifest_binding: authority.manifest_binding,
-            package_root:
-                format!("{role_root}/bootstrap-control-package"),
-            target_root: format!("{role_root}/bootstrap-control-target"),
-            local_registry: format!("{role_root}/local-registry"),
-            control_ledger: format!("{role_root}/control-ledger.bin"),
-            acquisition_spool: format!(
-                ".fnd01-run/integration-producer/{}/acquisition-spool.bin",
-                arguments.run_id
-            ),
-            acquisition_home: format!("{role_root}/cargo-home/acquisition"),
-            acquisition_target: format!("{role_root}/targets/acquisition"),
-            offline_home: format!("{role_root}/cargo-home/offline"),
-            execution_bin: format!("{role_root}/execution-bin"),
+            package_root,
+            acquisition_home,
+            acquisition_target,
+            execution_bin,
             role_root,
         }))
     }
 
     fn require_complete_produce_acquisition_policy_join(
-        permit: &ProduceAcquisitionPermit,
+        authority: &ProduceAcquisitionAuthority,
     ) -> TrustResult<[u8; 32]> {
-        let preimage = encode_produce_acquisition_policy_join(&permit.0.authority)?;
+        let preimage = encode_produce_acquisition_policy_join(authority)?;
         let digest = sha256(&preimage)?;
         if preimage.len() != PRODUCE_POLICY_JOIN_BYTES
             || digest != PRODUCE_POLICY_JOIN_SHA256
-            || permit.0.authority.full_policy_join_sha256 != digest
+            || authority.full_policy_join_sha256 != digest
             || digest == [0; 32]
         {
             return Err(phase_b_error(
                 "E_PHASE_B_ACQUISITION_AUTHORITY",
-                "full compiled acquisition argv/environment/path/bound/rule join drifted; no Produce filesystem mutation or child is authorized",
+                JOIN_DRIFT,
             ));
         }
         Ok(digest)
     }
 
-    impl ProduceAcquisitionPermit {
-        fn consume(self) -> TrustResult<BoundedProduceAcquisition> {
-            require_complete_produce_acquisition_policy_join(&self)?;
-            Ok(self.0)
+    impl ProduceAcquisitionPermit { fn consume(self) -> TrustResult<BoundedProduceAcquisition> {
+        require_complete_produce_acquisition_policy_join(&self.0.authority)?; Ok(self.0)
+    } }
+
+    pub(super) fn authorize_later_effects(
+        acquisition: BoundedProduceAcquisition,
+        manifest_binding: FileBinding,
+        validated: &ValidatedSupplyBundle<'_>,
+    ) -> TrustResult<ProducePostAcquisitionAuthority> {
+        if binding_for_bytes(&acquisition.manifest)? != manifest_binding {
+            return Err(phase_b_error(
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+                "post-acquisition manifest differs from the consumed permit",
+            ));
         }
+        let admitted = require_root_frozen_bootstrap_input_authority(
+            &acquisition.manifest, manifest_binding, validated,
+        )?;
+        #[cfg(test)] super::POST_AUTHORITIES.set(super::POST_AUTHORITIES.get() + 1);
+        Ok(ProducePostAcquisitionAuthority { authority: acquisition.authority,
+            role_root: acquisition.role_root, package_root: acquisition.package_root,
+            execution_bin: acquisition.execution_bin, admitted })
+    }
+
+    fn run_with<F>(authority: PhaseBAuthority, arguments: &BootstrapArguments,
+        environment: &BootstrapEnvironment, authoring_marker: &AuthoringMarker,
+        integration_digest: [u8; 32], authoring_bytes: &[Vec<u8>; 3],
+        continue_with: F) -> TrustResult<()> where F: FnOnce(BoundedProduceAcquisition) -> TrustResult<()> {
+        let acquisition = issue(authority, arguments, environment, authoring_marker,
+            integration_digest, authoring_bytes)?.consume()?;
+        let space_guard = PhaseBSpaceGuard::new(&arguments.repository_root,
+            &arguments.run_id, acquisition.authority.space_budget)?;
+        ensure_repository_directory(
+            &arguments.repository_root, &acquisition.package_root, true,
+            &space_guard, PhaseBSpaceGroup::RunOnly,
+            "single-use bootstrap-control-package root",
+        )?;
+        continue_with(acquisition)
+    }
+
+    pub(super) fn run(authority: PhaseBAuthority, arguments: &BootstrapArguments,
+        environment: &BootstrapEnvironment, authoring_marker: &AuthoringMarker,
+        integration_digest: [u8; 32], authoring_bytes: &[Vec<u8>; 3]) -> TrustResult<()> {
+        run_with(authority, arguments, environment, authoring_marker, integration_digest,
+            authoring_bytes, |a| super::continue_produce_phase_b_control_plane(arguments,
+                environment, authoring_marker, integration_digest, authoring_bytes, a))
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_observation(
+        authority: PhaseBAuthority,
+        arguments: &BootstrapArguments,
+        environment: &BootstrapEnvironment,
+        marker: &AuthoringMarker,
+        authoring: &[Vec<u8>; 3],
+    ) -> TrustResult<(ProduceAcquisitionAuthority, String)> {
+        let acquisition = issue(authority, arguments, environment, marker,
+            [0; 32], authoring)?.consume()?;
+        Ok((acquisition.authority, acquisition.role_root))
+    }
+
+    #[cfg(test)]
+    pub(super) fn attempt_later_effects(
+        authority: PhaseBAuthority,
+        arguments: &BootstrapArguments,
+        environment: &BootstrapEnvironment,
+        marker: &AuthoringMarker,
+        authoring: &[Vec<u8>; 3],
+        manifest: &[u8],
+        validated: &ValidatedSupplyBundle<'_>,
+    ) -> TrustResult<()> {
+        let acquisition = issue(authority, arguments, environment, marker,
+            [0; 32], authoring)?.consume()?;
+        authorize_later_effects(acquisition, binding_for_bytes(manifest)?, validated).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(super) fn attempt_runner(authority: PhaseBAuthority,
+        arguments: &BootstrapArguments, environment: &BootstrapEnvironment,
+        marker: &AuthoringMarker, authoring: &[Vec<u8>; 3],
+        entered: &std::cell::Cell<usize>) -> TrustResult<()> {
+        run_with(authority, arguments, environment, marker, [0; 32], authoring, |acquisition| {
+            drop(acquisition); entered.set(entered.get() + 1); Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_single_use_type() {
+        trait AmbiguousIfClone<A> { fn check() {} }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct CloneMarker;
+        impl<T: ?Sized + Clone> AmbiguousIfClone<CloneMarker> for T {}
+        let _ = <ProduceAcquisitionPermit as AmbiguousIfClone<_>>::check;
+        let _ = <BoundedProduceAcquisition as AmbiguousIfClone<_>>::check;
+        let _: fn(ProduceAcquisitionPermit) -> TrustResult<BoundedProduceAcquisition> =
+            ProduceAcquisitionPermit::consume;
+    }
     }
 
     fn io_error(code: &'static str, subject: &str, error: &io::Error) -> TrustError {
@@ -19328,6 +19498,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             b"then bounded-wait/reap it, require child_reaped=true",
             "retained-Child daemon stop authority",
         )?;
+        find_once(policy, b"yields one non-Clone static acquisition capability", "Produce permit authority")?;
+        find_once(policy, b"it does not authorize a supply seal, acquisition spool, materialization, control build, ledger, retained publication, or handoff", "Produce permit boundary")?;
         let produce_acquisition =
             compiled_produce_acquisition_authority();
         produce_acquisition
@@ -23195,7 +23367,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         lock_binding: &ValidatedFileBinding,
         supply_binding: &ValidatedFileBinding,
     ) -> TrustResult<()> {
-        let plan = acquisition_plan(repository_root, run_id, tools)?;
+        let plan = acquisition_plan(
+            repository_root, run_id, tools,
+            &compiled_produce_acquisition_authority().plan,
+        )?;
         let expected_lock_path = Path::new(&plan.package_root).join("Cargo.lock");
         let expected_lock_path = expected_lock_path.to_str().ok_or_else(|| {
             phase_b_error(
@@ -23964,29 +24139,27 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         argv: &[String],
         environment: &[(String, String)],
         working_directory: &Path,
+        expected_acquisition: Option<&AcquisitionCommandPlan>,
         repository_root: &Path,
         execution_bin_relative: &str,
         selected_tools: &[SelectedTool],
         subject: &str,
     ) -> TrustResult<()> {
-        const ACQUISITION_KEYS: [&str; 16] = [
-            "AR",
-            "CARGO_HOME",
-            "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
-            "CARGO_TARGET_DIR",
-            "CC",
-            "CLIPPY_DRIVER",
-            "LANG",
-            "LC_ALL",
-            "PATH",
-            "RANLIB",
-            "RUSTC",
-            "RUSTDOC",
-            "RUSTFMT",
-            "RUSTUP_TOOLCHAIN",
-            "SOURCE_DATE_EPOCH",
-            "TZ",
-        ];
+        let working_directory =
+            utf8_absolute(working_directory, "Cargo child working directory")?;
+        if let Some(expected) = expected_acquisition {
+            if subject != expected.id
+                || argv != expected.argv
+                || environment != expected.environment
+                || working_directory != expected.working_directory
+            {
+                return Err(phase_b_error(
+                    "E_PHASE_B_ACQUISITION_PLAN",
+                    format!("{subject}: child invocation differs from the sole acquisition plan"),
+                ));
+            }
+            return Ok(());
+        }
         const OFFLINE_CONTROL_KEYS: [&str; 16] = [
             "AR",
             "CARGO_HOME",
@@ -24005,20 +24178,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "SOURCE_DATE_EPOCH",
             "TZ",
         ];
-        let expected_keys = match subject {
-            "bootstrap.resolve" | "bootstrap.fetch" => &ACQUISITION_KEYS[..],
-            "bootstrap-control.build" => &OFFLINE_CONTROL_KEYS[..],
-            _ => {
-                return Err(phase_b_error(
-                    "E_PHASE_B_CHILD_ENVIRONMENT",
-                    format!("{subject}: unknown Cargo environment profile"),
-                ));
-            }
-        };
-        if environment.len() != expected_keys.len()
+        if subject != "bootstrap-control.build"
+            || environment.len() != OFFLINE_CONTROL_KEYS.len()
             || environment
                 .iter()
-                .zip(expected_keys)
+                .zip(OFFLINE_CONTROL_KEYS)
                 .any(|((actual, _), expected)| actual != expected)
         {
             return Err(phase_b_error(
@@ -24068,125 +24232,43 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 format!("{subject}: argv[0] differs from selected Cargo"),
             ));
         }
-        let working_directory =
-            utf8_absolute(working_directory, "Cargo child working directory")?;
-        match subject {
-            "bootstrap.resolve" => {
-                let manifest =
-                    format!("{working_directory}/bootstrap-control-package/Cargo.toml");
-                let expected_argv = [
-                    cargo.as_str(),
-                    "metadata",
-                    "--format-version",
-                    "1",
-                    "--all-features",
-                    "--manifest-path",
-                    manifest.as_str(),
-                ];
-                if argv.iter().map(String::as_str).ne(expected_argv) {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_CHILD_ARGV",
-                        "bootstrap.resolve differs from compiled exact argv",
-                    ));
-                }
-                literal(
-                    "CARGO_HOME",
-                    &format!("{working_directory}/cargo-home/acquisition"),
-                )?;
-                literal(
-                    "CARGO_TARGET_DIR",
-                    &format!("{working_directory}/targets/acquisition"),
-                )?;
-                literal("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")?;
-            }
-            "bootstrap.fetch" => {
-                let manifest =
-                    format!("{working_directory}/bootstrap-control-package/Cargo.toml");
-                let expected_argv = [
-                    cargo.as_str(),
-                    "fetch",
-                    "--locked",
-                    "--manifest-path",
-                    manifest.as_str(),
-                ];
-                if argv.iter().map(String::as_str).ne(expected_argv) {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_CHILD_ARGV",
-                        "bootstrap.fetch differs from compiled exact argv",
-                    ));
-                }
-                literal(
-                    "CARGO_HOME",
-                    &format!("{working_directory}/cargo-home/acquisition"),
-                )?;
-                literal(
-                    "CARGO_TARGET_DIR",
-                    &format!("{working_directory}/targets/acquisition"),
-                )?;
-                literal("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")?;
-            }
-            "bootstrap-control.build" => {
-                let role_root = Path::new(&working_directory)
-                    .parent()
-                    .ok_or_else(|| {
-                        phase_b_error(
-                            "E_PHASE_B_CHILD_ENVIRONMENT",
-                            "control-build package root has no role parent",
-                        )
-                    })?;
-                let role_root =
-                    utf8_absolute(role_root, "control-build role root")?;
-                let manifest = format!("{working_directory}/Cargo.toml");
-                if argv.len() != 13
-                    || argv.get(1).map(String::as_str) != Some("build")
-                    || argv.get(2).map(String::as_str)
-                        != Some("--manifest-path")
-                    || argv.get(3).map(String::as_str)
-                        != Some(manifest.as_str())
-                    || argv.get(4).map(String::as_str) != Some("--bin")
-                    || argv.get(5).map(String::as_str)
-                        != Some("fnd_01_evidence_harness")
-                    || argv.get(6).map(String::as_str) != Some("--locked")
-                    || argv.get(7).map(String::as_str) != Some("--offline")
-                    || argv.get(8).map(String::as_str)
-                        != Some("--message-format=json")
-                    || argv.get(9).map(String::as_str)
-                        != Some("--target-dir")
-                    || argv.get(11).map(String::as_str) != Some("--config")
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_CHILD_ARGV",
-                        "control-build differs from compiled exact argv shape",
-                    ));
-                }
-                let target = argv.get(10).ok_or_else(|| {
-                    phase_b_error(
-                        "E_PHASE_B_CHILD_ARGV",
-                        "control-build target path missing",
-                    )
-                })?;
-                if utf8_absolute(Path::new(target), "control-build target")?
-                    != target.as_str()
-                {
-                    return Err(phase_b_error(
-                        "E_PHASE_B_CHILD_ARGV",
-                        "control-build target is not absolute lexical",
-                    ));
-                }
-                literal(
-                    "CARGO_HOME",
-                    &format!("{role_root}/cargo-home/offline"),
-                )?;
-                literal("CARGO_TARGET_DIR", target)?;
-                literal("CARGO_NET_OFFLINE", "true")?;
-            }
-            _ => {
-                return Err(phase_b_error(
-                    "E_PHASE_B_CHILD_ENVIRONMENT",
-                    format!("{subject}: unknown Cargo environment profile"),
-                ));
-            }
+        let role_root = Path::new(&working_directory).parent().ok_or_else(|| {
+            phase_b_error(
+                "E_PHASE_B_CHILD_ENVIRONMENT",
+                "control-build package root has no role parent",
+            )
+        })?;
+        let role_root = utf8_absolute(role_root, "control-build role root")?;
+        let manifest = format!("{working_directory}/Cargo.toml");
+        if argv.len() != 13
+            || argv.get(1).map(String::as_str) != Some("build")
+            || argv.get(2).map(String::as_str) != Some("--manifest-path")
+            || argv.get(3).map(String::as_str) != Some(manifest.as_str())
+            || argv.get(4).map(String::as_str) != Some("--bin")
+            || argv.get(5).map(String::as_str) != Some("fnd_01_evidence_harness")
+            || argv.get(6).map(String::as_str) != Some("--locked")
+            || argv.get(7).map(String::as_str) != Some("--offline")
+            || argv.get(8).map(String::as_str) != Some("--message-format=json")
+            || argv.get(9).map(String::as_str) != Some("--target-dir")
+            || argv.get(11).map(String::as_str) != Some("--config")
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_CHILD_ARGV",
+                "control-build differs from compiled exact argv shape",
+            ));
         }
+        let target = argv.get(10).ok_or_else(|| {
+            phase_b_error("E_PHASE_B_CHILD_ARGV", "control-build target path missing")
+        })?;
+        if utf8_absolute(Path::new(target), "control-build target")? != target.as_str() {
+            return Err(phase_b_error(
+                "E_PHASE_B_CHILD_ARGV",
+                "control-build target is not absolute lexical",
+            ));
+        }
+        literal("CARGO_HOME", &format!("{role_root}/cargo-home/offline"))?;
+        literal("CARGO_TARGET_DIR", target)?;
+        literal("CARGO_NET_OFFLINE", "true")?;
         Ok(())
     }
 
@@ -24194,7 +24276,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         argv: &[String],
         environment: &[(String, String)],
         working_directory: &Path,
+        expected_acquisition: Option<&AcquisitionCommandPlan>,
         expected_config: Option<&CargoConfigAuthority>,
+        requires_no_config: bool,
         repository_root: &Path,
         execution_bin_relative: &str,
         selected_tools: &[SelectedTool],
@@ -24208,11 +24292,18 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         direct_child_kill_wait_seconds: u64,
         subject: &str,
     ) -> TrustResult<ChildCapture> {
+        if requires_no_config != expected_config.is_none() {
+            return Err(phase_b_error(
+                "E_PHASE_B_CARGO_CONFIG_AUTHORITY",
+                format!("{subject}: Cargo discovery mode differs from authority"),
+            ));
+        }
         validate_cargo_config_argv(argv, expected_config, subject)?;
         validate_cargo_environment_profile(
             argv,
             environment,
             working_directory,
+            expected_acquisition,
             repository_root,
             execution_bin_relative,
             selected_tools,
@@ -26821,7 +26912,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &lock_union,
         )?;
         Ok(TypedAcquisitionResult {
-            kind: RESOLVE_TYPED_RESULT_KIND,
+            kind: RESOLVE_TYPED_RESULT_KIND.to_owned(),
             sha256: sha256(&preimage)?,
         })
     }
@@ -27030,7 +27121,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             closure,
         )?;
         Ok(TypedAcquisitionResult {
-            kind: FETCH_TYPED_RESULT_KIND,
+            kind: FETCH_TYPED_RESULT_KIND.to_owned(),
             sha256: sha256(&preimage)?,
         })
     }
@@ -27050,15 +27141,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     impl AcquisitionCommand {
-        fn expectation(&self) -> AcquisitionCommandExpectation {
-            AcquisitionCommandExpectation {
-                argv: self.argv.clone(),
-                environment: self.environment.clone(),
-                working_directory: self.working_directory.clone(),
-                typed_result_sha256: self.typed_result_sha256,
-            }
-        }
-
         fn preimage(&self) -> TrustResult<Vec<u8>> {
             acquisition_command_preimage(&AcquisitionCommandPreimageInput {
                 ordinal: self.ordinal,
@@ -27100,14 +27182,17 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     fn encode_acquisition_spool(
         run_id: &str,
         commands: &[AcquisitionCommand],
+        expected: &[AcquisitionCommandPlan; 2],
         supply_bundle: &BoundPath,
     ) -> TrustResult<Vec<u8>> {
-        if commands.len() != 2
-            || commands[0].id != "bootstrap.resolve"
-            || commands[0].ordinal != 0
-            || commands[1].id != "bootstrap.fetch"
-            || commands[1].ordinal != 1
-            || commands.iter().any(|command| command.exit_code != 0)
+        if commands.len() != expected.len()
+            || commands.iter().zip(expected).any(|(command, plan)| {
+                command.id != plan.id || command.ordinal != plan.ordinal
+                    || command.argv != plan.argv || command.environment != plan.environment
+                    || command.working_directory != plan.working_directory
+                    || command.typed_result_kind != plan.typed_result_kind
+                    || command.exit_code != 0
+            })
         {
             return Err(phase_b_error(
                 "E_PHASE_B_SPOOL_COMMANDS",
@@ -29744,7 +29829,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         space_guard: &PhaseBSpaceGuard<'_>,
         execution_bin_admission: ExecutionBinAdmission,
     ) -> TrustResult<([u8; 32], [u8; 32], Vec<SelectedTool>)> {
-        if NATIVE_TOOLS.len() != 20 {
+        if NATIVE_TOOLS.len() != authority.native_tool_count {
             return Err(phase_b_error(
                 "E_PHASE_B_TOOL_SET",
                 "compiled native tool count is not 20",
@@ -29900,10 +29985,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 ));
             }
         }
-        if entry_count != 20 {
+        if entry_count != authority.native_tool_count {
             return Err(phase_b_error(
                 "E_PHASE_B_EXECUTION_BIN",
-                format!("execution-bin entry count {entry_count} != 20"),
+                format!("execution-bin entry count {entry_count} != {}", authority.native_tool_count),
             ));
         }
 
@@ -30056,7 +30141,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "tool probe working directory",
         )?;
         output.extend_from_slice(&validated_probe_batch.tool_set_sha256);
-        output.extend_from_slice(&20u32.to_be_bytes());
+        output.extend_from_slice(&usize_u32(authority.native_tool_count, "native-tool count")?.to_be_bytes());
         for (ordinal, tool) in selected_tools.iter().enumerate() {
             output.extend_from_slice(&usize_u32(ordinal, "tool ordinal")?.to_be_bytes());
             append_u32_bytes(&mut output, tool.id.as_bytes(), "tool id")?;
@@ -30277,38 +30362,50 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         authoring_bytes: &[Vec<u8>; 3],
         authority: PhaseBAuthority,
     ) -> TrustResult<()> {
-        // The consumed permit covers acquisition only; the later authority
-        // still gates sealing, materialization, build, publication, and handoff.
-        let permit = require_produce_acquisition_authority(
+        produce_acquisition_permit::run(
             authority,
             arguments,
             environment,
             authoring_marker,
             integration_digest,
             authoring_bytes,
-        )?;
-        let acquisition = permit.consume()?;
+        )
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static POST_AUTHORITIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    fn reset_produce_effectful_continuation_entries() { PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.set(0); }
+
+    #[cfg(test)]
+    fn produce_effectful_continuation_entries() -> usize { PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.get() }
+
+    fn continue_produce_phase_b_control_plane(
+        arguments: &BootstrapArguments,
+        environment: &BootstrapEnvironment,
+        authoring_marker: &AuthoringMarker,
+        integration_digest: [u8; 32],
+        authoring_bytes: &[Vec<u8>; 3],
+        acquisition: produce_acquisition_permit::BoundedProduceAcquisition,
+    ) -> TrustResult<()> {
+        #[cfg(test)]
+        PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.set(PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.get() + 1);
         let permit = &acquisition;
+        let authority = permit.authority();
         let role = role_name(arguments.mode)?;
-        let role_root = permit.role_root.as_str();
-        let package_root = permit.package_root.as_str();
-        let target_root = permit.target_root.as_str();
-        let local_registry = permit.local_registry.as_str();
-        let control_ledger = permit.control_ledger.as_str();
-        let acquisition_spool = permit.acquisition_spool.as_str();
-        let acquisition_home = permit.acquisition_home.as_str();
-        let acquisition_target = permit.acquisition_target.as_str();
-        let offline_home = permit.offline_home.as_str();
-        let execution_bin = permit.execution_bin.as_str();
-        let manifest = permit.manifest.as_slice();
+        let role_root = permit.role_root();
+        let package_root = permit.package_root();
+        let acquisition_home = permit.acquisition_home();
+        let acquisition_target = permit.acquisition_target();
+        let execution_bin = permit.execution_bin();
+        let manifest = permit.manifest();
         if package_root.is_empty()
-            || target_root.is_empty()
-            || local_registry.is_empty()
-            || control_ledger.is_empty()
-            || acquisition_spool.is_empty()
             || acquisition_home.is_empty()
             || acquisition_target.is_empty()
-            || offline_home.is_empty()
             || execution_bin.is_empty()
             || authoring_bytes[0].is_empty()
             || authoring_bytes[1].is_empty()
@@ -30333,7 +30430,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })?;
         if binding_for_bytes(manifest)?.byte_length == 0
             || harness_len
-                > permit.authority.max_bootstrap_harness_bytes
+                > authority.max_bootstrap_harness_bytes
         {
             return Err(phase_b_error(
                 "E_PHASE_B_INPUT",
@@ -30344,7 +30441,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let space_guard = PhaseBSpaceGuard::new(
             repository_root,
             &arguments.run_id,
-            permit.authority.space_budget,
+            authority.space_budget,
         )?;
         space_guard.require_projected(
             PhaseBSpaceGroup::RunOnly,
@@ -30352,14 +30449,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "Phase-B Produce entry aggregate space",
         )?;
         directory_metadata(repository_root, "produce repository root")?;
-        ensure_repository_directory(
-            repository_root,
-            &package_root,
-            true,
-            &space_guard,
-            PhaseBSpaceGroup::RunOnly,
-            "fresh bootstrap-control-package root",
-        )?;
         ensure_repository_directory(
             repository_root,
             &format!("{package_root}/src"),
@@ -30388,7 +30477,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &format!("{package_root}/Cargo.toml"),
             manifest,
-            permit.authority.max_source_file_bytes,
+            authority.max_source_file_bytes,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
             "bootstrap Cargo.toml",
@@ -30397,7 +30486,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &format!("{package_root}/src/main.rs"),
             &authoring_bytes[2],
-            permit.authority.max_bootstrap_harness_bytes,
+            authority.max_bootstrap_harness_bytes,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
             "bootstrap harness copy",
@@ -30405,7 +30494,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let verifier_max = u64::try_from(authoring_bytes[1].len())
             .map_err(|_| phase_b_error("E_PHASE_B_INPUT", "verifier length"))?
             .max(1);
-        if verifier_max > permit.authority.max_verifier_test_bytes {
+        if verifier_max > authority.max_verifier_test_bytes {
             return Err(phase_b_error(
                 "E_PHASE_B_INPUT",
                 "verifier exceeds max_verifier_test_bytes authority",
@@ -30415,7 +30504,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
             &authoring_bytes[1],
-            permit.authority.max_verifier_test_bytes,
+            authority.max_verifier_test_bytes,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
             "bootstrap verifier copy",
@@ -30436,7 +30525,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &environment.closed_path,
             &execution_bin,
-            &permit.authority,
+            authority,
             &space_guard,
         )?;
         let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
@@ -30453,6 +30542,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &arguments.run_id,
             &acquisition_tools,
+            &authority.plan,
         )?;
         let expected_role_root = utf8_absolute(
             &repository_root.join(&role_root),
@@ -30489,20 +30579,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         let resolve_plan = &compiled_acquisition.commands[0];
         let fetch_plan = &compiled_acquisition.commands[1];
-        if resolve_plan.id != permit.authority.resolve.id
-            || resolve_plan.ordinal != permit.authority.resolve.ordinal
-            || resolve_plan.typed_result_kind
-                != permit.authority.resolve.typed_result_kind
-            || fetch_plan.id != permit.authority.fetch.id
-            || fetch_plan.ordinal != permit.authority.fetch.ordinal
-            || fetch_plan.typed_result_kind
-                != permit.authority.fetch.typed_result_kind
-        {
-            return Err(phase_b_error(
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-                "shared acquisition command identity differs from compiled authority",
-            ));
-        }
         require_empty_directory_tree(
             &repository_root.join(&acquisition_home),
             "fresh acquisition CARGO_HOME",
@@ -30511,18 +30587,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &resolve_plan.argv,
             &resolve_plan.environment,
             Path::new(&resolve_plan.working_directory),
+            Some(resolve_plan),
             None,
+            authority.cargo_discovery_requires_no_config,
             repository_root,
             &execution_bin,
             &selected_tools,
             execution_bin_sha256,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
-            permit.authority.resolve.stdout_limit,
-            permit.authority.resolve.stderr_limit,
-            permit.authority.resolve.timeout_seconds,
-            permit.authority.child_poll_interval_milliseconds,
-            permit.authority.direct_child_kill_wait_seconds,
+            authority.resolve.stdout_limit,
+            authority.resolve.stderr_limit,
+            authority.resolve.timeout_seconds,
+            authority.child_poll_interval_milliseconds,
+            authority.direct_child_kill_wait_seconds,
             "bootstrap.resolve",
         )?;
         if resolve.exit_code != 0 {
@@ -30535,7 +30613,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let (lock_snapshot, lock_bytes) = checked_read(
             repository_root,
             &lock_relative,
-            permit.authority.max_bootstrap_lock_bytes,
+            authority.max_bootstrap_lock_bytes,
             None,
         )?;
         if lock_snapshot.byte_length == 0 {
@@ -30554,18 +30632,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &fetch_plan.argv,
             &fetch_plan.environment,
             Path::new(&fetch_plan.working_directory),
+            Some(fetch_plan),
             None,
+            authority.cargo_discovery_requires_no_config,
             repository_root,
             &execution_bin,
             &selected_tools,
             execution_bin_sha256,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
-            permit.authority.fetch.stdout_limit,
-            permit.authority.fetch.stderr_limit,
-            permit.authority.fetch.timeout_seconds,
-            permit.authority.child_poll_interval_milliseconds,
-            permit.authority.direct_child_kill_wait_seconds,
+            authority.fetch.stdout_limit,
+            authority.fetch.stderr_limit,
+            authority.fetch.timeout_seconds,
+            authority.child_poll_interval_milliseconds,
+            authority.direct_child_kill_wait_seconds,
             "bootstrap.fetch",
         )?;
         if fetch.exit_code != 0 {
@@ -30577,10 +30657,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let acquisition_abs = PathBuf::from(&compiled_acquisition.cargo_home);
         let (supply_bytes, supply) =
             inventory_supply_from_acquisition(&acquisition_abs, &lock_bytes)?;
+        let supply_format = authority.supply_format.as_bytes();
+        if !supply_bytes.starts_with(supply_format)
+            || supply_bytes.get(supply_format.len()) != Some(&0)
+        {
+            return Err(phase_b_error(
+                "E_PHASE_B_ACQUISITION_AUTHORITY",
+                "acquired supply format differs from compiled authority",
+            ));
+        }
         let (_, rebound_manifest) = checked_read(
             repository_root,
             &format!("{package_root}/Cargo.toml"),
-            permit.authority.max_source_file_bytes,
+            authority.max_source_file_bytes,
             Some(sealed_manifest.binding),
         )?;
         if rebound_manifest != manifest {
@@ -30590,12 +30679,28 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ));
         }
         let validated_supply = validate_supply_bundle_value(&supply)?;
-        let admitted_bootstrap_input =
-            require_root_frozen_bootstrap_input_authority(
-                &rebound_manifest,
-                sealed_manifest.binding,
-                &validated_supply,
-            )?;
+        let post_acquisition = produce_acquisition_permit::authorize_later_effects(
+            acquisition, sealed_manifest.binding, &validated_supply,
+        )?;
+        let authority = post_acquisition.authority();
+        let role_root = post_acquisition.role_root();
+        let package_root = post_acquisition.package_root();
+        let execution_bin = post_acquisition.execution_bin();
+        let admitted_bootstrap_input = post_acquisition.admitted();
+        let target_root = format!("{role_root}/bootstrap-control-target");
+        let local_registry = render_phase_b_relative(
+            authority.materialization_root_formula, role, &arguments.run_id,
+            "Produce materialization-root formula",
+        )?;
+        let control_ledger = render_phase_b_relative(
+            authority.control_ledger_path_formula, role, &arguments.run_id,
+            "Produce control-ledger formula",
+        )?;
+        let acquisition_spool = render_phase_b_relative(
+            authority.acquisition_spool_path_formula, role, &arguments.run_id,
+            "Produce acquisition-spool formula",
+        )?;
+        let offline_home = format!("{role_root}/cargo-home/offline");
         let supply_relative = format!(
             ".fnd01-run/integration-producer/{}/supply-bundle.bin",
             arguments.run_id
@@ -30616,7 +30721,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &supply_relative,
             &supply_bytes,
-            1024 * 1024 * 1024,
+            authority.max_supply_bundle_bytes,
             &space_guard,
             PhaseBSpaceGroup::RunOnly,
             "producer pre-handoff supply bundle",
@@ -30624,7 +30729,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let (_, reopened_supply) = checked_read(
             repository_root,
             &supply_relative,
-            1024 * 1024 * 1024,
+            authority.max_supply_bundle_bytes,
             Some(supply_bound.binding),
         )?;
         if reopened_supply != supply_bytes {
@@ -30727,6 +30832,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let spool_bytes = encode_acquisition_spool(
             &arguments.run_id,
             &commands,
+            &compiled_acquisition.commands,
             &BoundPath {
                 path: supply_spool_binding.path.clone(),
                 binding: supply_spool_binding.binding,
@@ -30881,7 +30987,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &build_argv,
             &build_environment,
             Path::new(&package_abs),
+            None,
             Some(&config_authority),
+            false,
             repository_root,
             &execution_bin,
             &selected_tools,
@@ -30891,8 +30999,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             BUILD_STDOUT_LIMIT,
             BUILD_STDERR_LIMIT,
             CONTROL_BUILD_TIMEOUT_SECONDS,
-            permit.authority.child_poll_interval_milliseconds,
-            permit.authority.direct_child_kill_wait_seconds,
+            authority.child_poll_interval_milliseconds,
+            authority.direct_child_kill_wait_seconds,
             "bootstrap-control.build",
         )?;
         let registry_after_build = snapshot_materialized_supply_tree(
@@ -30928,23 +31036,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let scratch_paths = [
             (
                 format!("{package_root}/Cargo.toml"),
-                permit.authority.max_source_file_bytes,
+                authority.max_source_file_bytes,
             ),
             (
                 format!("{package_root}/Cargo.lock"),
-                permit.authority.max_bootstrap_lock_bytes,
+                authority.max_bootstrap_lock_bytes,
             ),
             (
                 format!("{package_root}/cargo-config.toml"),
-                permit.authority.max_source_file_bytes,
+                authority.max_source_file_bytes,
             ),
             (
                 format!("{package_root}/src/main.rs"),
-                permit.authority.max_bootstrap_harness_bytes,
+                authority.max_bootstrap_harness_bytes,
             ),
             (
                 format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
-                permit.authority.max_verifier_test_bytes,
+                authority.max_verifier_test_bytes,
             ),
         ];
         let mut scratch_bindings = Vec::new();
@@ -31362,6 +31470,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     #[cfg(test)]
     mod typed_result_tests {
         use super::*;
+        use super::produce_acquisition_permit::acquire_observation;
 
         const FROZEN_POLICY: &[u8] =
             include_bytes!("../../../evidence/fnd-01/dependency-verification.toml");
@@ -31479,6 +31588,26 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let error = validate_phase_b_authority(bytes)
                 .expect_err("policy byte drift must fail");
             assert_eq!(error.code(), "E_PHASE_B_POLICY_AUTHORITY");
+        }
+
+        fn assert_produce_rejected(
+            authority: PhaseBAuthority,
+            arguments: &BootstrapArguments,
+            environment: &BootstrapEnvironment,
+            marker: &AuthoringMarker,
+            digest: [u8; 32],
+            authoring: &[Vec<u8>; 3],
+        ) {
+            reset_produce_effectful_continuation_entries();
+            let error = produce_phase_b_control_plane(
+                arguments, environment, marker, digest, authoring, authority)
+                .expect_err("Produce authority drift must reject");
+            assert_eq!(error.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
+            assert_eq!(error.detail(), JOIN_DRIFT);
+            assert_eq!(
+                produce_effectful_continuation_entries(), 0,
+                "authority rejection crossed the repository/file/network/child/ledger/exec boundary",
+            );
         }
 
         #[test]
@@ -31616,10 +31745,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert_eq!(
                 actual.produce_acquisition.resolve,
                 StaticChildAuthority {
-                    id: "bootstrap.resolve",
-                    ordinal: 0,
-                    typed_result_kind:
-                        "strict-cargo-metadata-json-plus-union-lock",
                     timeout_seconds: 1_800,
                     stdout_limit: 16 * 1024 * 1024,
                     stderr_limit: 1024 * 1024,
@@ -31628,14 +31753,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert_eq!(
                 actual.produce_acquisition.fetch,
                 StaticChildAuthority {
-                    id: "bootstrap.fetch",
-                    ordinal: 1,
-                    typed_result_kind: "exit-and-cache-closure",
                     timeout_seconds: 3_600,
                     stdout_limit: 1024 * 1024,
                     stderr_limit: 4 * 1024 * 1024,
                 }
             );
+            assert_eq!(actual.produce_acquisition.plan, ACQUISITION_PLAN_AUTHORITY);
         }
 
         #[test]
@@ -31740,272 +31863,42 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(".fnd01-run")
                 .join("integration-producer")
                 .join(&run_id);
-            let mut permit = require_produce_acquisition_authority(
+            for family in ["environment", "argv", "CWD", "command", "bound", "deadline", "run-root", "marker", "bootstrap-control", "supply", "Cargo-discovery", "generated-path", "native-tool"] {
+                let mut rejected = synthetic_phase_b_authority(&policy, &manifest);
+                let authority = &mut rejected.produce_acquisition;
+                match family {
+                    "environment" => authority.plan.environment = &[],
+                    "argv" => authority.plan.commands[0].argv_literals = &["drift"],
+                    "CWD" => authority.plan.commands[0].working_directory_formula = "drift",
+                    "command" => authority.plan.commands[0].id = "drift",
+                    "bound" => authority.max_supply_bundle_bytes -= 1,
+                    "deadline" => authority.resolve.timeout_seconds -= 1,
+                    "run-root" => authority.plan.run_root_formula = "drift",
+                    "marker" => authority.marker_format = "FND01AUTHOR",
+                    "bootstrap-control" => authority.plan.scratch_root_formula = "drift",
+                    "supply" => authority.supply_format = "FND01SUPPLYv3",
+                    "Cargo-discovery" => authority.cargo_discovery_requires_no_config = false,
+                    "generated-path" => authority.acquisition_spool_path_formula = "drift",
+                    "native-tool" => authority.native_tool_count -= 1,
+                    _ => unreachable!("closed family matrix"),
+                }
+                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes);
+                assert!(!no_effect_root.exists(), "{family}");
+            }
+            let (observed, role_root) = acquire_observation(
                 synthetic_phase_b_authority(&policy, &manifest),
                 &arguments,
                 &environment,
                 &marker,
-                [0; 32],
                 &authoring_bytes,
             )
             .expect("exact Produce authority");
             assert_eq!(
-                permit.0.role_root,
+                role_root,
                 format!(".fnd01-run/integration-producer/{run_id}")
             );
-            assert_eq!(
-                permit.0.authority,
-                compiled_produce_acquisition_authority()
-            );
-            let joined = require_complete_produce_acquisition_policy_join(&permit)
-                .expect("complete typed policy join must authorize bounded acquisition");
-            assert_eq!(joined, PRODUCE_POLICY_JOIN_SHA256);
-            permit.0.authority.resolve.timeout_seconds -= 1;
-            let drift = require_complete_produce_acquisition_policy_join(&permit)
-                .expect_err("a mutated permit must stop before the first Produce effect");
-            assert_eq!(drift.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
-            assert_eq!(
-                drift.detail(),
-                "full compiled acquisition argv/environment/path/bound/rule join drifted; no Produce filesystem mutation or child is authorized",
-            );
-            let compiled_authority = compiled_produce_acquisition_authority();
-
-            permit.0.authority = compiled_authority;
-            permit.0.authority.fetch.typed_result_kind = "untyped-fetch";
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect_err("fetch typed-result drift must fail closed")
-                    .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            permit.0.authority = compiled_authority;
-            permit.0.authority.tool_probe_stdout_limit -= 1;
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect_err("tool-probe bound drift must fail closed")
-                    .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            permit.0.authority = compiled_authority;
-            permit.0.authority.space_budget.max_control_plane_total_bytes -= 1;
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect_err("aggregate space-bound drift must fail closed")
-                    .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            permit.0.authority = compiled_authority;
-            permit.0.authority.scratch_root_formula = ".fnd01-run/<run-id>/wrong-role";
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect_err("path-formula drift must fail closed")
-                    .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            permit.0.authority = compiled_authority;
-            permit.0.authority.full_policy_join_sha256[0] ^= 1;
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect_err("stored policy-join digest drift must fail closed")
-                    .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-            permit.0.authority = compiled_authority;
-
-            let mut wrong_direct =
-                synthetic_phase_b_authority(&policy, &manifest);
-            wrong_direct.direct_registry_binding =
-                binding_for_bytes(b"wrong direct registry")
-                    .expect("wrong direct binding");
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    wrong_direct,
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("a drifted direct registry cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_union =
-                synthetic_phase_b_authority(&policy, &manifest);
-            wrong_union.union_registry_binding =
-                binding_for_bytes(b"wrong union registry")
-                    .expect("wrong union binding");
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    wrong_union,
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("a drifted union registry cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_tools =
-                synthetic_phase_b_authority(&policy, &manifest);
-            wrong_tools.native_tool_registry_binding =
-                binding_for_bytes(b"wrong native-tool registry")
-                    .expect("wrong native-tool binding");
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    wrong_tools,
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err(
-                    "a drifted native-tool registry cannot obtain authority",
-                )
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_manifest = manifest.clone();
-            wrong_manifest[0] ^= 1;
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(
-                        &policy,
-                        &wrong_manifest,
-                    ),
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err(
-                    "a self-consistent but noncompiled manifest cannot obtain authority",
-                )
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut attest = arguments.clone();
-            attest.mode = BootstrapMode::Attest;
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &attest,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("Attest cannot obtain Produce authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_root = arguments.clone();
-            wrong_root.run_root = arguments.repository_root.join("wrong");
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &wrong_root,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("wrong run root cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_run_bytes = arguments.clone();
-            wrong_run_bytes.run_id_bytes[0] ^= 1;
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &wrong_run_bytes,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("run-id text/byte drift cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut wrong_marker_environment = environment.clone();
-            wrong_marker_environment.authoring_marker =
-                environment.authoring_marker.replacen("FND01AUTHORv2", "FND01AUTHORv1", 1);
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &arguments,
-                    &wrong_marker_environment,
-                    &marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("external authoring-marker drift cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut zero_closure_marker = marker.clone();
-            zero_closure_marker.closure_sha256 = [0; 32];
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &arguments,
-                    &environment,
-                    &zero_closure_marker,
-                    [0; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("zero authoring closure cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [1; 32],
-                    &authoring_bytes,
-                )
-                .expect_err("Produce integration digest must be zero")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
-
-            let mut drifted = authoring_bytes.clone();
-            drifted[2].push(b'!');
-            assert_eq!(
-                require_produce_acquisition_authority(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0; 32],
-                    &drifted,
-                )
-                .expect_err("authoring drift cannot obtain authority")
-                .code(),
-                "E_PHASE_B_ACQUISITION_AUTHORITY",
-            );
+            assert_eq!(observed, compiled_produce_acquisition_authority());
+            assert_eq!(observed.full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
             assert!(!no_effect_root.exists());
         }
 
@@ -32019,63 +31912,72 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 arguments,
                 environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x12);
-            let permit = require_produce_acquisition_authority(
+            let (authority, role_root) = acquire_observation(
                 validate_phase_b_authority(&policy)
                     .expect("independently validated frozen Phase-B policy"),
                 &arguments,
                 &environment,
                 &marker,
-                [0; 32],
                 &authoring_bytes,
             )
             .expect("independently constructed Produce authority");
-            assert_eq!(
-                require_complete_produce_acquisition_policy_join(&permit)
-                    .expect("complete Produce authority matrix"),
-                PRODUCE_POLICY_JOIN_SHA256,
-            );
-            let acquisition = permit.consume().expect("bounded acquisition");
-            assert_eq!(
-                acquisition.authority,
-                compiled_produce_acquisition_authority(),
-            );
+            assert_eq!(role_root, format!(".fnd01-run/integration-producer/{}", arguments.run_id));
+            assert_eq!(authority, compiled_produce_acquisition_authority());
+            assert_eq!(authority.full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
         }
 
         #[test]
         fn phase_b_produce_permit_is_single_use_and_bounded() {
-            trait AmbiguousIfClone<A> {
-                fn check() {}
-            }
-            impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-            struct CloneMarker;
-            impl<T: ?Sized + Clone> AmbiguousIfClone<CloneMarker> for T {}
-            let _ = <ProduceAcquisitionPermit as AmbiguousIfClone<_>>::check;
-            let _ = <BoundedProduceAcquisition as AmbiguousIfClone<_>>::check;
+            produce_acquisition_permit::assert_single_use_type();
+            find_once(
+                FROZEN_POLICY,
+                b"Produce returns E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING at that boundary",
+                "declared Produce authority successor",
+            ).expect("policy/executable Produce successor mapping");
 
             let SyntheticPhaseBInputs {
                 policy,
                 manifest,
                 authoring_bytes,
                 marker,
-                arguments,
+                mut arguments,
                 environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x13);
-            let permit = require_produce_acquisition_authority(
+            let claim_root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(
+                format!("phase-b-one-shot-{}", std::process::id()));
+            fs::create_dir_all(&claim_root).expect("one-shot test repository");
+            arguments.repository_root = claim_root;
+            arguments.run_root = arguments.repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id));
+            let entered = std::cell::Cell::new(0);
+            produce_acquisition_permit::attempt_runner(
+                synthetic_phase_b_authority(&policy, &manifest), &arguments,
+                &environment, &marker, &authoring_bytes, &entered)
+                .expect("first package-root claim");
+            assert_eq!(entered.get(), 1);
+            let package_root = arguments.run_root.join("bootstrap-control-package");
+            let before = fs_identity(&fs::metadata(&package_root).expect("claimed"));
+            assert!(fs::read_dir(&package_root).expect("empty").next().is_none());
+            assert_eq!(
+                produce_acquisition_permit::attempt_runner(
+                    synthetic_phase_b_authority(&policy, &manifest), &arguments,
+                    &environment, &marker, &authoring_bytes, &entered)
+                    .expect_err("same run cannot claim twice").code(),
+                "E_PHASE_B_FRESHNESS",
+            );
+            assert_eq!(entered.get(), 1);
+            assert_eq!(fs_identity(&fs::metadata(&package_root).expect("rejected")), before);
+            assert!(fs::read_dir(&package_root).expect("unchanged").next().is_none());
+            let (authority, _) = acquire_observation(
                 synthetic_phase_b_authority(&policy, &manifest),
                 &arguments,
                 &environment,
                 &marker,
-                [0; 32],
                 &authoring_bytes,
             )
             .expect("single-use Produce permit");
-            let consume: fn(
-                ProduceAcquisitionPermit,
-            ) -> TrustResult<BoundedProduceAcquisition> =
-                ProduceAcquisitionPermit::consume;
-            let acquisition = consume(permit).expect("one acquisition use");
             assert_eq!(
-                acquisition.authority.full_policy_join_sha256,
+                authority.full_policy_join_sha256,
                 PRODUCE_POLICY_JOIN_SHA256,
             );
 
@@ -32086,16 +31988,31 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let supply = synthetic_valid_supply(&archive);
             let validated = validate_supply_bundle_value(&supply)
                 .expect("validated bounded supply");
+            POST_AUTHORITIES.set(0);
+            let mut wrong_manifest = manifest.clone();
+            wrong_manifest[0] ^= 1;
             assert_eq!(
-                require_root_frozen_bootstrap_input_authority(
+                produce_acquisition_permit::attempt_later_effects(
+                    synthetic_phase_b_authority(&policy, &manifest), &arguments,
+                    &environment, &marker, &authoring_bytes, &wrong_manifest, &validated)
+                    .expect_err("foreign manifest cannot cross the consumed permit").code(),
+                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
+            );
+            assert_eq!(
+                produce_acquisition_permit::attempt_later_effects(
+                    synthetic_phase_b_authority(&policy, &manifest),
+                    &arguments,
+                    &environment,
+                    &marker,
+                    &authoring_bytes,
                     &manifest,
-                    binding_for_bytes(&manifest).expect("manifest binding"),
                     &validated,
                 )
                 .expect_err("acquisition cannot authorize later effects")
                 .code(),
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
             );
+            assert_eq!(POST_AUTHORITIES.get(), 0);
         }
 
         #[test]
@@ -33277,6 +33194,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         #[test]
         fn phase_b_attest_supply_archive_expansion_remains_fail_closed() {
+            find_once(
+                FROZEN_POLICY,
+                b"Attest returns E_PHASE_B_ATTEST_INPUT_AUTHORITY at that boundary",
+                "declared Attest authority successor",
+            )
+            .expect("policy/executable successor mapping");
             let mut archive = vec![
                 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0,
             ];
@@ -44066,60 +43989,97 @@ activate = 1\n";
         Ok(matches[0])
     }
 
-    fn pointer_get<'a>(
-        value: &'a toml::Value,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<&'a toml::Value> {
-        let components = parse_pointer(pointer, subject)?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                toml::Value::Table(table) => table
-                    .get(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                toml::Value::Array(array) => {
-                    let index = array_selector_index(array, &component, subject, pointer)?;
-                    array.get(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
+    macro_rules! define_pointer_walkers {
+        (
+            $get:ident, $get_mut:ident, $parent_mut:ident, $walk_mut:ident,
+            $ty:ty, $object:path, $array:path, $selector:path
+        ) => {
+            fn $get<'a>(
+                value: &'a $ty,
+                pointer: &str,
+                subject: &str,
+            ) -> VResult<&'a $ty> {
+                let mut current = value;
+                for component in parse_pointer(pointer, subject)? {
+                    current = match current {
+                        $object(object) => object.get(&component).ok_or_else(|| {
+                            Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
+                        })?,
+                        $array(array) => {
+                            let index = $selector(array, &component, subject, pointer)?;
+                            array.get(index).ok_or_else(|| {
+                                Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
+                            })?
+                        }
+                        _ => return Err(
+                            Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer),
+                        ),
+                    };
                 }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
+                Ok(current)
+            }
+
+            fn $walk_mut<'a>(
+                value: &'a mut $ty,
+                components: Vec<String>,
+                pointer: &str,
+                subject: &str,
+            ) -> VResult<&'a mut $ty> {
+                let mut current = value;
+                for component in components {
+                    current = match current {
+                        $object(object) => object.get_mut(&component).ok_or_else(|| {
+                            Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
+                        })?,
+                        $array(array) => {
+                            let index = $selector(array, &component, subject, pointer)?;
+                            array.get_mut(index).ok_or_else(|| {
+                                Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
+                            })?
+                        }
+                        _ => return Err(
+                            Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer),
+                        ),
+                    };
                 }
-            };
-        }
-        Ok(current)
+                Ok(current)
+            }
+
+            fn $get_mut<'a>(
+                value: &'a mut $ty,
+                pointer: &str,
+                subject: &str,
+            ) -> VResult<&'a mut $ty> {
+                $walk_mut(value, parse_pointer(pointer, subject)?, pointer, subject)
+            }
+
+            fn $parent_mut<'a>(
+                value: &'a mut $ty,
+                pointer: &str,
+                subject: &str,
+            ) -> VResult<(&'a mut $ty, String)> {
+                let mut components = parse_pointer(pointer, subject)?;
+                let final_component = components.pop().ok_or_else(|| {
+                    Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
+                })?;
+                Ok((
+                    $walk_mut(value, components, pointer, subject)?,
+                    final_component,
+                ))
+            }
+        };
     }
 
-    fn pointer_parent_mut<'a>(
-        value: &'a mut toml::Value,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<(&'a mut toml::Value, String)> {
-        let mut components = parse_pointer(pointer, subject)?;
-        let final_component = components
-            .pop()
-            .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                toml::Value::Table(table) => table
-                    .get_mut(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                toml::Value::Array(array) => {
-                    let index = array_selector_index(array, &component, subject, pointer)?;
-                    array.get_mut(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
-                }
-            };
-        }
-        Ok((current, final_component))
-    }
+    define_pointer_walkers!(
+        pointer_get,
+        pointer_get_mut,
+        pointer_parent_mut,
+        pointer_walk_mut,
+        toml::Value,
+        toml::Value::Table,
+        toml::Value::Array,
+        array_selector_index
+    );
 
     fn set_pointer(
         document: &mut toml::Value,
@@ -44183,32 +44143,6 @@ activate = 1\n";
         Ok(())
     }
 
-    fn pointer_get_mut<'a>(
-        value: &'a mut toml::Value,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<&'a mut toml::Value> {
-        let components = parse_pointer(pointer, subject)?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                toml::Value::Table(table) => table
-                    .get_mut(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                toml::Value::Array(array) => {
-                    let index = array_selector_index(array, &component, subject, pointer)?;
-                    array.get_mut(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
-                }
-            };
-        }
-        Ok(current)
-    }
-
     fn json_array_selector_index(
         array: &[StrictJson],
         component: &str,
@@ -44242,86 +44176,16 @@ activate = 1\n";
         Ok(matches[0])
     }
 
-    fn json_pointer_get<'a>(
-        value: &'a StrictJson,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<&'a StrictJson> {
-        let components = parse_pointer(pointer, subject)?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                StrictJson::Object(object) => object
-                    .get(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                StrictJson::Array(array) => {
-                    let index = json_array_selector_index(array, &component, subject, pointer)?;
-                    array.get(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
-                }
-            };
-        }
-        Ok(current)
-    }
-
-    fn json_pointer_parent_mut<'a>(
-        value: &'a mut StrictJson,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<(&'a mut StrictJson, String)> {
-        let mut components = parse_pointer(pointer, subject)?;
-        let final_component = components
-            .pop()
-            .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                StrictJson::Object(object) => object
-                    .get_mut(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                StrictJson::Array(array) => {
-                    let index = json_array_selector_index(array, &component, subject, pointer)?;
-                    array.get_mut(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
-                }
-            };
-        }
-        Ok((current, final_component))
-    }
-
-    fn json_pointer_get_mut<'a>(
-        value: &'a mut StrictJson,
-        pointer: &str,
-        subject: &str,
-    ) -> VResult<&'a mut StrictJson> {
-        let components = parse_pointer(pointer, subject)?;
-        let mut current = value;
-        for component in components {
-            current = match current {
-                StrictJson::Object(object) => object
-                    .get_mut(&component)
-                    .ok_or_else(|| Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer))?,
-                StrictJson::Array(array) => {
-                    let index = json_array_selector_index(array, &component, subject, pointer)?;
-                    array.get_mut(index).ok_or_else(|| {
-                        Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer)
-                    })?
-                }
-                _ => {
-                    return Err(Diagnostic::error("E_SEMANTIC_POINTER", subject).at(pointer));
-                }
-            };
-        }
-        Ok(current)
-    }
+    define_pointer_walkers!(
+        json_pointer_get,
+        json_pointer_get_mut,
+        json_pointer_parent_mut,
+        json_pointer_walk_mut,
+        StrictJson,
+        StrictJson::Object,
+        StrictJson::Array,
+        json_array_selector_index
+    );
 
     fn json_set_pointer(
         document: &mut StrictJson,
@@ -82067,254 +81931,254 @@ dependency_kinds = ["build", "normal"]
 
     #[test]
     fn fnd_01_compile_stream_parser_accounts_for_every_cargo_json_line() {
-        let root = repository_root();
-        let (policy, _) =
-            read_policy(&root).verified();
-        let valid = concat!(
-            r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/tmp/demo/build.rs","edition":"2024","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/tmp/target/debug/build/demo/build-script-build"],"executable":"/tmp/target/debug/build/demo/build-script-build","fresh":false}"#,
-            "\n",
-            r#"{"reason":"build-script-executed","package_id":"path+file:///tmp/demo#0.1.0","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[["DEMO","1"]],"out_dir":"/tmp/target/debug/build/demo/out"}"#,
-            "\n",
-            r#"{"reason":"compiler-message","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"message":{"$message_type":"diagnostic","message":"synthetic warning","code":null,"level":"warning","spans":[],"children":[],"rendered":"synthetic warning"}}"#,
-            "\n",
-            r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/tmp/target/debug/deps/libdemo.rmeta"],"executable":null,"fresh":false}"#,
-            "\n",
-            r#"{"reason":"build-finished","success":true}"#,
-            "\n",
-        );
-        let summary = parse_cargo_compile_stream(
-            valid.as_bytes(),
-            &policy.bounds,
-            "synthetic Cargo compile stream",
-        )
-        .verified();
-        assert_eq!(summary.crate_count, 1);
-        assert_eq!(summary.artifact_count, 2);
-        assert_eq!(summary.diagnostic_count, 1);
-        assert_eq!(summary.result_sha256, lower_hex(&sha256(valid.as_bytes())));
+let root = repository_root();
+let (policy, _) =
+read_policy(&root).verified();
+let valid = concat!(
+r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/tmp/demo/build.rs","edition":"2024","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/tmp/target/debug/build/demo/build-script-build"],"executable":"/tmp/target/debug/build/demo/build-script-build","fresh":false}"#,
+"\n",
+r#"{"reason":"build-script-executed","package_id":"path+file:///tmp/demo#0.1.0","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[["DEMO","1"]],"out_dir":"/tmp/target/debug/build/demo/out"}"#,
+"\n",
+r#"{"reason":"compiler-message","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"message":{"$message_type":"diagnostic","message":"synthetic warning","code":null,"level":"warning","spans":[],"children":[],"rendered":"synthetic warning"}}"#,
+"\n",
+r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/demo#0.1.0","manifest_path":"/tmp/demo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/tmp/target/debug/deps/libdemo.rmeta"],"executable":null,"fresh":false}"#,
+"\n",
+r#"{"reason":"build-finished","success":true}"#,
+"\n",
+);
+let summary = parse_cargo_compile_stream(
+valid.as_bytes(),
+&policy.bounds,
+"synthetic Cargo compile stream",
+)
+.verified();
+assert_eq!(summary.crate_count, 1);
+assert_eq!(summary.artifact_count, 2);
+assert_eq!(summary.diagnostic_count, 1);
+assert_eq!(summary.result_sha256, lower_hex(&sha256(valid.as_bytes())));
 
-        let metadata_stream = concat!(
-            r#"{"packages":[{"name":"demo","version":"0.1.0","id":"path+file:///tmp/demo#0.1.0","license":null,"license_file":null,"description":null,"source":null,"dependencies":[],"targets":[{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true}],"features":{},"manifest_path":"/tmp/demo/Cargo.toml","metadata":null,"publish":null,"authors":[],"categories":[],"keywords":[],"readme":null,"repository":null,"homepage":null,"documentation":null,"edition":"2024","links":null,"default_run":null,"rust_version":null}],"workspace_members":["path+file:///tmp/demo#0.1.0"],"workspace_default_members":["path+file:///tmp/demo#0.1.0"],"resolve":{"nodes":[{"id":"path+file:///tmp/demo#0.1.0","dependencies":[],"deps":[],"features":[]}],"root":"path+file:///tmp/demo#0.1.0"},"target_directory":"/tmp/metadata-target","build_directory":"/tmp/metadata-target","version":1,"workspace_root":"/tmp/demo","metadata":null}"#,
-            "\n",
-        );
-        let metadata = parse_cargo_metadata_stream(
-            metadata_stream.as_bytes(),
-            &policy.bounds,
-            "synthetic compile metadata",
-        )
-        .verified();
-        let host_debug_prefix = "/tmp/target/debug/";
-        let target_debug_prefix = "/tmp/target/aarch64-unknown-linux-gnu/debug/";
-        assert_eq!(
-            classify_cargo_artifact_output_role(
-                &summary.artifacts[0],
-                host_debug_prefix,
-                Some(target_debug_prefix),
-                "E_TEST_ARTIFACT_SCOPE",
-                "host custom-build artifact",
-            )
-            .expect("a custom-build artifact in the host subtree must pass"),
-            CargoCompileOutputRole::Host
-        );
-        let mut mixed_role_artifact = summary.artifacts[1].clone();
-        mixed_role_artifact
-            .filenames
-            .push(format!("{target_debug_prefix}deps/libdemo-target.rmeta"));
-        assert_eq!(
-            classify_cargo_artifact_output_role(
-                &mixed_role_artifact,
-                host_debug_prefix,
-                Some(target_debug_prefix),
-                "E_TEST_ARTIFACT_SCOPE",
-                "mixed-role artifact",
-            )
-            .expect_err("one artifact must not mix host and target outputs")
-            .code,
-            "E_TEST_ARTIFACT_SCOPE"
-        );
-        let mut target_custom_build = summary.artifacts[0].clone();
-        let target_custom_path = format!("{target_debug_prefix}build/demo/build-script-build");
-        target_custom_build.filenames = vec![target_custom_path.clone()];
-        target_custom_build.executable = Some(target_custom_path);
-        assert_eq!(
-            classify_cargo_artifact_output_role(
-                &target_custom_build,
-                host_debug_prefix,
-                Some(target_debug_prefix),
-                "E_TEST_ARTIFACT_SCOPE",
-                "target custom-build artifact",
-            )
-            .expect_err("a custom-build artifact must be classified as host")
-            .code,
-            "E_TEST_ARTIFACT_SCOPE"
-        );
-        let valid_build_script = CargoBuildScriptObservation {
-            package_id: summary.build_scripts[0].package_id.clone(),
-            out_dir: "/tmp/target/debug/build/demo-0123456789abcdef/out".to_owned(),
-        };
-        assert_eq!(
-            validate_cargo_build_script_out_dir(
-                &valid_build_script,
-                &metadata,
-                host_debug_prefix,
-                Some(target_debug_prefix),
-                "E_TEST_BUILD_SCRIPT_SCOPE",
-                "valid host build-script out_dir",
-            )
-            .expect("the exact legacy Cargo package-hash out_dir must pass"),
-            CargoCompileOutputRole::Host
-        );
-        let target_build_script = CargoBuildScriptObservation {
-            package_id: valid_build_script.package_id.clone(),
-            out_dir: format!("{target_debug_prefix}build/demo-fedcba9876543210/out"),
-        };
-        assert_eq!(
-            validate_cargo_build_script_out_dir(
-                &target_build_script,
-                &metadata,
-                host_debug_prefix,
-                Some(target_debug_prefix),
-                "E_TEST_BUILD_SCRIPT_SCOPE",
-                "valid target build-script out_dir",
-            )
-            .expect("a run-custom-build unit may have a target-layout out_dir"),
-            CargoCompileOutputRole::Target
-        );
-        for invalid_out_dir in [
-            "/tmp/target/debug/build/other-0123456789abcdef/out",
-            "/tmp/target/debug/build/demo-0123456789abcde/out",
-            "/tmp/target/debug/build/demo-0123456789abcdeF/out",
-            "/tmp/target/debug/build/demo-0123456789abcdef/nested/out",
-            "/tmp/target/debug/build/demo-0123456789abcdef",
-        ] {
-            let invalid = CargoBuildScriptObservation {
-                package_id: valid_build_script.package_id.clone(),
-                out_dir: invalid_out_dir.to_owned(),
-            };
-            assert_eq!(
-                validate_cargo_build_script_out_dir(
-                    &invalid,
-                    &metadata,
-                    host_debug_prefix,
-                    Some(target_debug_prefix),
-                    "E_TEST_BUILD_SCRIPT_SCOPE",
-                    invalid_out_dir,
-                )
-                .expect_err("an inexact Cargo build-script out_dir must fail")
-                .code,
-                "E_TEST_BUILD_SCRIPT_SCOPE"
-            );
-        }
-        assert_eq!(
-            classify_cargo_artifact_output_role(
-                &summary.artifacts[1],
-                "/tmp/other-target/debug/",
-                None,
-                "E_TEST_ARTIFACT_SCOPE",
-                "resolve/test target-root substitution",
-            )
-            .expect_err("a distinct metadata-command target root cannot scope test outputs")
-            .code,
-            "E_TEST_ARTIFACT_SCOPE"
-        );
+let metadata_stream = concat!(
+r#"{"packages":[{"name":"demo","version":"0.1.0","id":"path+file:///tmp/demo#0.1.0","license":null,"license_file":null,"description":null,"source":null,"dependencies":[],"targets":[{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/tmp/demo/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true}],"features":{},"manifest_path":"/tmp/demo/Cargo.toml","metadata":null,"publish":null,"authors":[],"categories":[],"keywords":[],"readme":null,"repository":null,"homepage":null,"documentation":null,"edition":"2024","links":null,"default_run":null,"rust_version":null}],"workspace_members":["path+file:///tmp/demo#0.1.0"],"workspace_default_members":["path+file:///tmp/demo#0.1.0"],"resolve":{"nodes":[{"id":"path+file:///tmp/demo#0.1.0","dependencies":[],"deps":[],"features":[]}],"root":"path+file:///tmp/demo#0.1.0"},"target_directory":"/tmp/metadata-target","build_directory":"/tmp/metadata-target","version":1,"workspace_root":"/tmp/demo","metadata":null}"#,
+"\n",
+);
+let metadata = parse_cargo_metadata_stream(
+metadata_stream.as_bytes(),
+&policy.bounds,
+"synthetic compile metadata",
+)
+.verified();
+let host_debug_prefix = "/tmp/target/debug/";
+let target_debug_prefix = "/tmp/target/aarch64-unknown-linux-gnu/debug/";
+assert_eq!(
+classify_cargo_artifact_output_role(
+&summary.artifacts[0],
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_ARTIFACT_SCOPE",
+"host custom-build artifact",
+)
+.expect("a custom-build artifact in the host subtree must pass"),
+CargoCompileOutputRole::Host
+);
+let mut mixed_role_artifact = summary.artifacts[1].clone();
+mixed_role_artifact
+.filenames
+.push(format!("{target_debug_prefix}deps/libdemo-target.rmeta"));
+assert_eq!(
+classify_cargo_artifact_output_role(
+&mixed_role_artifact,
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_ARTIFACT_SCOPE",
+"mixed-role artifact",
+)
+.expect_err("one artifact must not mix host and target outputs")
+.code,
+"E_TEST_ARTIFACT_SCOPE"
+);
+let mut target_custom_build = summary.artifacts[0].clone();
+let target_custom_path = format!("{target_debug_prefix}build/demo/build-script-build");
+target_custom_build.filenames = vec![target_custom_path.clone()];
+target_custom_build.executable = Some(target_custom_path);
+assert_eq!(
+classify_cargo_artifact_output_role(
+&target_custom_build,
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_ARTIFACT_SCOPE",
+"target custom-build artifact",
+)
+.expect_err("a custom-build artifact must be classified as host")
+.code,
+"E_TEST_ARTIFACT_SCOPE"
+);
+let valid_build_script = CargoBuildScriptObservation {
+package_id: summary.build_scripts[0].package_id.clone(),
+out_dir: "/tmp/target/debug/build/demo-0123456789abcdef/out".to_owned(),
+};
+assert_eq!(
+validate_cargo_build_script_out_dir(
+&valid_build_script,
+&metadata,
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_BUILD_SCRIPT_SCOPE",
+"valid host build-script out_dir",
+)
+.expect("the exact legacy Cargo package-hash out_dir must pass"),
+CargoCompileOutputRole::Host
+);
+let target_build_script = CargoBuildScriptObservation {
+package_id: valid_build_script.package_id.clone(),
+out_dir: format!("{target_debug_prefix}build/demo-fedcba9876543210/out"),
+};
+assert_eq!(
+validate_cargo_build_script_out_dir(
+&target_build_script,
+&metadata,
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_BUILD_SCRIPT_SCOPE",
+"valid target build-script out_dir",
+)
+.expect("a run-custom-build unit may have a target-layout out_dir"),
+CargoCompileOutputRole::Target
+);
+for invalid_out_dir in [
+"/tmp/target/debug/build/other-0123456789abcdef/out",
+"/tmp/target/debug/build/demo-0123456789abcde/out",
+"/tmp/target/debug/build/demo-0123456789abcdeF/out",
+"/tmp/target/debug/build/demo-0123456789abcdef/nested/out",
+"/tmp/target/debug/build/demo-0123456789abcdef",
+] {
+let invalid = CargoBuildScriptObservation {
+package_id: valid_build_script.package_id.clone(),
+out_dir: invalid_out_dir.to_owned(),
+};
+assert_eq!(
+validate_cargo_build_script_out_dir(
+&invalid,
+&metadata,
+host_debug_prefix,
+Some(target_debug_prefix),
+"E_TEST_BUILD_SCRIPT_SCOPE",
+invalid_out_dir,
+)
+.expect_err("an inexact Cargo build-script out_dir must fail")
+.code,
+"E_TEST_BUILD_SCRIPT_SCOPE"
+);
+}
+assert_eq!(
+classify_cargo_artifact_output_role(
+&summary.artifacts[1],
+"/tmp/other-target/debug/",
+None,
+"E_TEST_ARTIFACT_SCOPE",
+"resolve/test target-root substitution",
+)
+.expect_err("a distinct metadata-command target root cannot scope test outputs")
+.code,
+"E_TEST_ARTIFACT_SCOPE"
+);
 
-        let fresh = valid.replace(r#""fresh":false"#, r#""fresh":true"#);
-        assert_eq!(
-            parse_cargo_compile_stream(fresh.as_bytes(), &policy.bounds, "fresh artifact",)
-                .expect_err("a fresh artifact does not prove rustc execution")
-                .code,
-            "E_COMPILE_JSON_SCHEMA"
-        );
-        let missing_diagnostic_tag = valid.replace(r#""$message_type":"diagnostic","#, "");
-        assert_eq!(
-            parse_cargo_compile_stream(
-                missing_diagnostic_tag.as_bytes(),
-                &policy.bounds,
-                "missing rustc diagnostic tag",
-            )
-            .expect_err("a root rustc diagnostic must carry its pinned message tag")
-            .code,
-            "E_COMPILE_JSON_SCHEMA"
-        );
-        let null_root_rendered =
-            valid.replace(r#""rendered":"synthetic warning""#, r#""rendered":null"#);
-        assert_eq!(
-            parse_cargo_compile_stream(
-                null_root_rendered.as_bytes(),
-                &policy.bounds,
-                "null root rendered diagnostic",
-            )
-            .expect_err("rendered-ansi root diagnostics must retain rendered text")
-            .code,
-            "E_COMPILE_JSON_SCHEMA"
-        );
-        let impossible_target = valid.replacen(
-            r#""kind":["custom-build"],"crate_types":["bin"]"#,
-            r#""kind":["custom-build"],"crate_types":["lib"]"#,
-            1,
-        );
-        assert_eq!(
-            parse_cargo_compile_stream(
-                impossible_target.as_bytes(),
-                &policy.bounds,
-                "impossible Cargo target",
-            )
-            .expect_err("Cargo target kind and crate_types must agree")
-            .code,
-            "E_COMPILE_JSON_SCHEMA"
-        );
-        let unlisted_executable = valid.replacen(
-            "/tmp/target/debug/build/demo/build-script-build",
-            "/tmp/target/debug/build/demo/not-the-executable",
-            1,
-        );
-        assert_eq!(
-            parse_cargo_compile_stream(
-                unlisted_executable.as_bytes(),
-                &policy.bounds,
-                "unlisted artifact executable",
-            )
-            .expect_err("a nonnull artifact executable must occur in filenames")
-            .code,
-            "E_COMPILE_JSON_SCHEMA"
-        );
-        assert_eq!(
-            parse_cargo_compile_stream(
-                &valid.as_bytes()[..valid.len() - 1],
-                &policy.bounds,
-                "missing terminal LF",
-            )
-            .expect_err("a stream without its exact terminal LF must fail")
-            .code,
-            "E_COMPILE_STREAM_FRAMING"
-        );
-        let extra_terminal_lf = format!("{valid}\n");
-        assert_eq!(
-            parse_cargo_compile_stream(
-                extra_terminal_lf.as_bytes(),
-                &policy.bounds,
-                "extra terminal LF",
-            )
-            .expect_err("an empty terminal line must fail")
-            .code,
-            "E_COMPILE_STREAM_FRAMING"
-        );
-        let nonterminal_build_finished = concat!(
-            r#"{"reason":"build-finished","success":true}"#,
-            "\n",
-            r#"{"reason":"compiler-artifact"}"#,
-            "\n",
-        );
-        assert_eq!(
-            parse_cargo_compile_stream(
-                nonterminal_build_finished.as_bytes(),
-                &policy.bounds,
-                "nonterminal build-finished",
-            )
-            .expect_err("build-finished must be the sole terminal message")
-            .code,
-            "E_COMPILE_STREAM_TERMINAL"
-        );
+let fresh = valid.replace(r#""fresh":false"#, r#""fresh":true"#);
+assert_eq!(
+parse_cargo_compile_stream(fresh.as_bytes(), &policy.bounds, "fresh artifact",)
+.expect_err("a fresh artifact does not prove rustc execution")
+.code,
+"E_COMPILE_JSON_SCHEMA"
+);
+let missing_diagnostic_tag = valid.replace(r#""$message_type":"diagnostic","#, "");
+assert_eq!(
+parse_cargo_compile_stream(
+missing_diagnostic_tag.as_bytes(),
+&policy.bounds,
+"missing rustc diagnostic tag",
+)
+.expect_err("a root rustc diagnostic must carry its pinned message tag")
+.code,
+"E_COMPILE_JSON_SCHEMA"
+);
+let null_root_rendered =
+valid.replace(r#""rendered":"synthetic warning""#, r#""rendered":null"#);
+assert_eq!(
+parse_cargo_compile_stream(
+null_root_rendered.as_bytes(),
+&policy.bounds,
+"null root rendered diagnostic",
+)
+.expect_err("rendered-ansi root diagnostics must retain rendered text")
+.code,
+"E_COMPILE_JSON_SCHEMA"
+);
+let impossible_target = valid.replacen(
+r#""kind":["custom-build"],"crate_types":["bin"]"#,
+r#""kind":["custom-build"],"crate_types":["lib"]"#,
+1,
+);
+assert_eq!(
+parse_cargo_compile_stream(
+impossible_target.as_bytes(),
+&policy.bounds,
+"impossible Cargo target",
+)
+.expect_err("Cargo target kind and crate_types must agree")
+.code,
+"E_COMPILE_JSON_SCHEMA"
+);
+let unlisted_executable = valid.replacen(
+"/tmp/target/debug/build/demo/build-script-build",
+"/tmp/target/debug/build/demo/not-the-executable",
+1,
+);
+assert_eq!(
+parse_cargo_compile_stream(
+unlisted_executable.as_bytes(),
+&policy.bounds,
+"unlisted artifact executable",
+)
+.expect_err("a nonnull artifact executable must occur in filenames")
+.code,
+"E_COMPILE_JSON_SCHEMA"
+);
+assert_eq!(
+parse_cargo_compile_stream(
+&valid.as_bytes()[..valid.len() - 1],
+&policy.bounds,
+"missing terminal LF",
+)
+.expect_err("a stream without its exact terminal LF must fail")
+.code,
+"E_COMPILE_STREAM_FRAMING"
+);
+let extra_terminal_lf = format!("{valid}\n");
+assert_eq!(
+parse_cargo_compile_stream(
+extra_terminal_lf.as_bytes(),
+&policy.bounds,
+"extra terminal LF",
+)
+.expect_err("an empty terminal line must fail")
+.code,
+"E_COMPILE_STREAM_FRAMING"
+);
+let nonterminal_build_finished = concat!(
+r#"{"reason":"build-finished","success":true}"#,
+"\n",
+r#"{"reason":"compiler-artifact"}"#,
+"\n",
+);
+assert_eq!(
+parse_cargo_compile_stream(
+nonterminal_build_finished.as_bytes(),
+&policy.bounds,
+"nonterminal build-finished",
+)
+.expect_err("build-finished must be the sole terminal message")
+.code,
+"E_COMPILE_STREAM_TERMINAL"
+);
     }
 
     #[test]
@@ -83199,228 +83063,228 @@ dependency_kinds = ["build", "normal"]
 
     #[test]
     fn fnd_01_acquisition_anchor_bijection_joins_v4_header_and_exact_package_identity() {
-        let package = RegistryPackageTriple {
-            name: "demo".to_owned(),
-            version: "1.0.0".to_owned(),
-            checksum: "44".repeat(32),
-        };
-        let package_row = ParsedSupplyPackage {
-            package_id: "demo 1.0.0".to_owned(),
-            triple: package.clone(),
-            source_kind: "registry".to_owned(),
-            source_locator: CRATES_IO_SOURCE.to_owned(),
-            features: Vec::new(),
-            dependency_kinds: Vec::new(),
-        };
-        let sparse_path = format!("{ACQUISITION_SPARSE_CACHE_PREFIX}de/mo/demo");
-        let entries = vec![
-            ParsedSupplyEntry {
-                binding: ParsedSupplyEntryBinding {
-                    kind: 0x01,
-                    relative_path: "demo-1.0.0.crate".to_owned(),
-                    byte_length: 3,
-                    sha256: "44".repeat(32),
-                },
-                detail: ParsedSupplyEntryDetail::CrateArchive(ParsedSupplyCrateArchiveEntry {
-                    package_id: package_row.package_id.clone(),
-                    version: package.version.clone(),
-                    checksum_sha256: package.checksum.clone(),
-                    selected_index_line_sha256: "33".repeat(32),
-                    yanked: false,
-                }),
-            },
-            ParsedSupplyEntry {
-                binding: ParsedSupplyEntryBinding {
-                    kind: 0x02,
-                    relative_path: "index/de/mo/demo".to_owned(),
-                    byte_length: 4,
-                    sha256: "66".repeat(32),
-                },
-                detail: ParsedSupplyEntryDetail::DerivedIndex(ParsedSupplyDerivedIndexEntry {
-                    package_name: package.name.clone(),
-                    selected_versions: vec![package.version.clone()],
-                    derived_index_sha256: "66".repeat(32),
-                }),
-            },
-            ParsedSupplyEntry {
-                binding: ParsedSupplyEntryBinding {
-                    kind: 0x03,
-                    relative_path: format!("sparse-cache/{sparse_path}"),
-                    byte_length: 2,
-                    sha256: "22".repeat(32),
-                },
-                detail: ParsedSupplyEntryDetail::SparseCache(ParsedSupplySparseCacheEntry {
-                    cache_relative_path: sparse_path.clone(),
-                    validator: "etag".to_owned(),
-                    selected_versions: vec![package.version.clone()],
-                    selected_ordinals: vec![0],
-                    selected_sha256: vec!["33".repeat(32)],
-                }),
-            },
-        ];
-        let anchors = vec![
-            ParsedSupplyAcquisitionAnchor {
-                binding: ParsedSupplyAcquisitionAnchorBinding {
-                    path: ACQUISITION_SPARSE_CONFIG_PATH.to_owned(),
-                    byte_length: 1,
-                    sha256: "11".repeat(32),
-                },
-                detail: ParsedSupplyAcquisitionAnchorDetail::SparseConfig,
-            },
-            ParsedSupplyAcquisitionAnchor {
-                binding: ParsedSupplyAcquisitionAnchorBinding {
-                    path: sparse_path,
-                    byte_length: 2,
-                    sha256: "22".repeat(32),
-                },
-                detail: ParsedSupplyAcquisitionAnchorDetail::SparseCache(
-                    ParsedSupplyAcquisitionSparseCache {
-                        package_name: package.name.clone(),
-                        validator: "etag".to_owned(),
-                        selected_versions: vec![package.version.clone()],
-                        selected_ordinals: vec![0],
-                        selected_sha256: vec!["33".repeat(32)],
-                    },
-                ),
-            },
-            ParsedSupplyAcquisitionAnchor {
-                binding: ParsedSupplyAcquisitionAnchorBinding {
-                    path: format!("{ACQUISITION_CRATE_CACHE_PREFIX}demo-1.0.0.crate"),
-                    byte_length: 3,
-                    sha256: package.checksum.clone(),
-                },
-                detail: ParsedSupplyAcquisitionAnchorDetail::CrateCache(
-                    ParsedSupplyAcquisitionCrateCache {
-                        package_name: package.name.clone(),
-                        version: package.version.clone(),
-                    },
-                ),
-            },
-        ];
-        let mut bootstrap_packages = BTreeMap::new();
-        bootstrap_packages.insert(package.clone(), package_row);
-        let receipt = ParsedSupplyReceiptSummary {
-            bundle: ReceiptOutputBinding {
-                id: "supply-bundle".to_owned(),
-                path: "evidence/fnd-01/integration/supply-bundle.bin".to_owned(),
-                kind: "supply_bundle".to_owned(),
-                byte_length: 1,
-                sha256: "77".repeat(32),
-            },
-            producer_pre_handoff_bundle: ParsedFileBinding {
-                path: "producer-supply".to_owned(),
-                byte_length: 1,
-                sha256: "77".repeat(32),
-            },
-            returned_bundle: ParsedFileBinding {
-                path: "returned-supply".to_owned(),
-                byte_length: 1,
-                sha256: "77".repeat(32),
-            },
-            bootstrap_manifest: ParsedFileBinding {
-                path: "Cargo.toml".to_owned(),
-                byte_length: 1,
-                sha256: "88".repeat(32),
-            },
-            bootstrap_packages,
-            downstream_packages: BTreeMap::new(),
-            control_only_packages: BTreeMap::new(),
-            bootstrap_lock: ParsedFileBinding {
-                path: "Cargo.lock".to_owned(),
-                byte_length: 1,
-                sha256: "99".repeat(32),
-            },
-            embedded_bootstrap_lock_byte_length: 1,
-            embedded_bootstrap_lock_sha256: "99".repeat(32),
-            entry_count: entries.len(),
-            derived_index_file_count: 1,
-            crate_archive_count: 1,
-            sparse_cache_input_count: 1,
-            total_payload_bytes: 9,
-            inner_entry_set_sha256: "aa".repeat(32),
-            closure_bijection_sha256: "bb".repeat(32),
-            entries,
-            acquisition_anchors: anchors,
-            acquisition_root_set_sha256: "55".repeat(32),
-            sparse_parser_version: SPARSE_PARSER_VERSION.to_owned(),
-            entry_set_sha256: "cc".repeat(32),
-        };
-        let bundle = SupplyBundleSummary {
-            packages: BTreeSet::new(),
-            archives: BTreeMap::new(),
-            bootstrap_lock_byte_length: 1,
-            bootstrap_lock_sha256: [0x99; 32],
-            acquisition_root_entry_count: 4,
-            acquisition_root_total_regular_file_bytes: 9,
-            acquisition_root_set_sha256: [0x55; 32],
-            sparse_config_path: ACQUISITION_SPARSE_CONFIG_PATH.to_owned(),
-            sparse_config_byte_length: 1,
-            sparse_config_sha256: [0x11; 32],
-            entry_count: 0,
-            total_payload_bytes: 0,
-            inner_entry_set_sha256: [0; 32],
-            closure_bijection_sha256: [0; 32],
-            lock_triples: Vec::new(),
-            entries: Vec::new(),
-            closure_rows: Vec::new(),
-        };
-        validate_supply_acquisition_anchor_bijection(&receipt, &bundle)
-            .expect("exact v4 header, sparse, and crate anchors join");
+let package = RegistryPackageTriple {
+name: "demo".to_owned(),
+version: "1.0.0".to_owned(),
+checksum: "44".repeat(32),
+};
+let package_row = ParsedSupplyPackage {
+package_id: "demo 1.0.0".to_owned(),
+triple: package.clone(),
+source_kind: "registry".to_owned(),
+source_locator: CRATES_IO_SOURCE.to_owned(),
+features: Vec::new(),
+dependency_kinds: Vec::new(),
+};
+let sparse_path = format!("{ACQUISITION_SPARSE_CACHE_PREFIX}de/mo/demo");
+let entries = vec![
+ParsedSupplyEntry {
+binding: ParsedSupplyEntryBinding {
+kind: 0x01,
+relative_path: "demo-1.0.0.crate".to_owned(),
+byte_length: 3,
+sha256: "44".repeat(32),
+},
+detail: ParsedSupplyEntryDetail::CrateArchive(ParsedSupplyCrateArchiveEntry {
+package_id: package_row.package_id.clone(),
+version: package.version.clone(),
+checksum_sha256: package.checksum.clone(),
+selected_index_line_sha256: "33".repeat(32),
+yanked: false,
+}),
+},
+ParsedSupplyEntry {
+binding: ParsedSupplyEntryBinding {
+kind: 0x02,
+relative_path: "index/de/mo/demo".to_owned(),
+byte_length: 4,
+sha256: "66".repeat(32),
+},
+detail: ParsedSupplyEntryDetail::DerivedIndex(ParsedSupplyDerivedIndexEntry {
+package_name: package.name.clone(),
+selected_versions: vec![package.version.clone()],
+derived_index_sha256: "66".repeat(32),
+}),
+},
+ParsedSupplyEntry {
+binding: ParsedSupplyEntryBinding {
+kind: 0x03,
+relative_path: format!("sparse-cache/{sparse_path}"),
+byte_length: 2,
+sha256: "22".repeat(32),
+},
+detail: ParsedSupplyEntryDetail::SparseCache(ParsedSupplySparseCacheEntry {
+cache_relative_path: sparse_path.clone(),
+validator: "etag".to_owned(),
+selected_versions: vec![package.version.clone()],
+selected_ordinals: vec![0],
+selected_sha256: vec!["33".repeat(32)],
+}),
+},
+];
+let anchors = vec![
+ParsedSupplyAcquisitionAnchor {
+binding: ParsedSupplyAcquisitionAnchorBinding {
+path: ACQUISITION_SPARSE_CONFIG_PATH.to_owned(),
+byte_length: 1,
+sha256: "11".repeat(32),
+},
+detail: ParsedSupplyAcquisitionAnchorDetail::SparseConfig,
+},
+ParsedSupplyAcquisitionAnchor {
+binding: ParsedSupplyAcquisitionAnchorBinding {
+path: sparse_path,
+byte_length: 2,
+sha256: "22".repeat(32),
+},
+detail: ParsedSupplyAcquisitionAnchorDetail::SparseCache(
+ParsedSupplyAcquisitionSparseCache {
+package_name: package.name.clone(),
+validator: "etag".to_owned(),
+selected_versions: vec![package.version.clone()],
+selected_ordinals: vec![0],
+selected_sha256: vec!["33".repeat(32)],
+},
+),
+},
+ParsedSupplyAcquisitionAnchor {
+binding: ParsedSupplyAcquisitionAnchorBinding {
+path: format!("{ACQUISITION_CRATE_CACHE_PREFIX}demo-1.0.0.crate"),
+byte_length: 3,
+sha256: package.checksum.clone(),
+},
+detail: ParsedSupplyAcquisitionAnchorDetail::CrateCache(
+ParsedSupplyAcquisitionCrateCache {
+package_name: package.name.clone(),
+version: package.version.clone(),
+},
+),
+},
+];
+let mut bootstrap_packages = BTreeMap::new();
+bootstrap_packages.insert(package.clone(), package_row);
+let receipt = ParsedSupplyReceiptSummary {
+bundle: ReceiptOutputBinding {
+id: "supply-bundle".to_owned(),
+path: "evidence/fnd-01/integration/supply-bundle.bin".to_owned(),
+kind: "supply_bundle".to_owned(),
+byte_length: 1,
+sha256: "77".repeat(32),
+},
+producer_pre_handoff_bundle: ParsedFileBinding {
+path: "producer-supply".to_owned(),
+byte_length: 1,
+sha256: "77".repeat(32),
+},
+returned_bundle: ParsedFileBinding {
+path: "returned-supply".to_owned(),
+byte_length: 1,
+sha256: "77".repeat(32),
+},
+bootstrap_manifest: ParsedFileBinding {
+path: "Cargo.toml".to_owned(),
+byte_length: 1,
+sha256: "88".repeat(32),
+},
+bootstrap_packages,
+downstream_packages: BTreeMap::new(),
+control_only_packages: BTreeMap::new(),
+bootstrap_lock: ParsedFileBinding {
+path: "Cargo.lock".to_owned(),
+byte_length: 1,
+sha256: "99".repeat(32),
+},
+embedded_bootstrap_lock_byte_length: 1,
+embedded_bootstrap_lock_sha256: "99".repeat(32),
+entry_count: entries.len(),
+derived_index_file_count: 1,
+crate_archive_count: 1,
+sparse_cache_input_count: 1,
+total_payload_bytes: 9,
+inner_entry_set_sha256: "aa".repeat(32),
+closure_bijection_sha256: "bb".repeat(32),
+entries,
+acquisition_anchors: anchors,
+acquisition_root_set_sha256: "55".repeat(32),
+sparse_parser_version: SPARSE_PARSER_VERSION.to_owned(),
+entry_set_sha256: "cc".repeat(32),
+};
+let bundle = SupplyBundleSummary {
+packages: BTreeSet::new(),
+archives: BTreeMap::new(),
+bootstrap_lock_byte_length: 1,
+bootstrap_lock_sha256: [0x99; 32],
+acquisition_root_entry_count: 4,
+acquisition_root_total_regular_file_bytes: 9,
+acquisition_root_set_sha256: [0x55; 32],
+sparse_config_path: ACQUISITION_SPARSE_CONFIG_PATH.to_owned(),
+sparse_config_byte_length: 1,
+sparse_config_sha256: [0x11; 32],
+entry_count: 0,
+total_payload_bytes: 0,
+inner_entry_set_sha256: [0; 32],
+closure_bijection_sha256: [0; 32],
+lock_triples: Vec::new(),
+entries: Vec::new(),
+closure_rows: Vec::new(),
+};
+validate_supply_acquisition_anchor_bijection(&receipt, &bundle)
+.expect("exact v4 header, sparse, and crate anchors join");
 
-        let mut wrong_case = receipt.clone();
-        let ParsedSupplyAcquisitionAnchorDetail::SparseCache(detail) =
-            &mut wrong_case.acquisition_anchors[1].detail
-        else {
-            panic!("synthetic second acquisition anchor is sparse cache");
-        };
-        detail.package_name = "Demo".to_owned();
-        assert_eq!(
-            validate_supply_acquisition_anchor_bijection(&wrong_case, &bundle,)
-                .expect_err("case-folded path equality cannot replace package identity")
-                .code,
-            "E_SUPPLY_ACQUISITION_ANCHOR_SELECTION",
-        );
+let mut wrong_case = receipt.clone();
+let ParsedSupplyAcquisitionAnchorDetail::SparseCache(detail) =
+&mut wrong_case.acquisition_anchors[1].detail
+else {
+panic!("synthetic second acquisition anchor is sparse cache");
+};
+detail.package_name = "Demo".to_owned();
+assert_eq!(
+validate_supply_acquisition_anchor_bijection(&wrong_case, &bundle,)
+.expect_err("case-folded path equality cannot replace package identity")
+.code,
+"E_SUPPLY_ACQUISITION_ANCHOR_SELECTION",
+);
 
-        let mut wrong_config = receipt.clone();
-        wrong_config.acquisition_anchors[0].binding.sha256 = "12".repeat(32);
-        assert_eq!(
-            validate_supply_acquisition_anchor_bijection(&wrong_config, &bundle,)
-                .expect_err("config anchor must equal the v4 header")
-                .code,
-            "E_SUPPLY_ACQUISITION_CONFIG_JOIN",
-        );
+let mut wrong_config = receipt.clone();
+wrong_config.acquisition_anchors[0].binding.sha256 = "12".repeat(32);
+assert_eq!(
+validate_supply_acquisition_anchor_bijection(&wrong_config, &bundle,)
+.expect_err("config anchor must equal the v4 header")
+.code,
+"E_SUPPLY_ACQUISITION_CONFIG_JOIN",
+);
 
-        let mut wrong_root = receipt.clone();
-        wrong_root.acquisition_root_set_sha256 = "56".repeat(32);
-        assert_eq!(
-            validate_supply_acquisition_anchor_bijection(&wrong_root, &bundle,)
-                .expect_err("receipt root must equal the v4 header")
-                .code,
-            "E_SUPPLY_ACQUISITION_ROOT_JOIN",
-        );
+let mut wrong_root = receipt.clone();
+wrong_root.acquisition_root_set_sha256 = "56".repeat(32);
+assert_eq!(
+validate_supply_acquisition_anchor_bijection(&wrong_root, &bundle,)
+.expect_err("receipt root must equal the v4 header")
+.code,
+"E_SUPPLY_ACQUISITION_ROOT_JOIN",
+);
 
-        let mut wrong_ordinal = receipt.clone();
-        let ParsedSupplyAcquisitionAnchorDetail::SparseCache(detail) =
-            &mut wrong_ordinal.acquisition_anchors[1].detail
-        else {
-            panic!("synthetic second acquisition anchor is sparse cache");
-        };
-        detail.selected_ordinals[0] = 1;
-        assert_eq!(
-            validate_supply_acquisition_anchor_bijection(&wrong_ordinal, &bundle,)
-                .expect_err("selected ordinal drift must fail")
-                .code,
-            "E_SUPPLY_ACQUISITION_ANCHOR_SELECTION",
-        );
+let mut wrong_ordinal = receipt.clone();
+let ParsedSupplyAcquisitionAnchorDetail::SparseCache(detail) =
+&mut wrong_ordinal.acquisition_anchors[1].detail
+else {
+panic!("synthetic second acquisition anchor is sparse cache");
+};
+detail.selected_ordinals[0] = 1;
+assert_eq!(
+validate_supply_acquisition_anchor_bijection(&wrong_ordinal, &bundle,)
+.expect_err("selected ordinal drift must fail")
+.code,
+"E_SUPPLY_ACQUISITION_ANCHOR_SELECTION",
+);
 
-        let mut missing_anchor = receipt;
-        missing_anchor.acquisition_anchors.pop();
-        assert_eq!(
-            validate_supply_acquisition_anchor_bijection(&missing_anchor, &bundle,)
-                .expect_err("every archive needs one acquisition anchor")
-                .code,
-            "E_SUPPLY_ACQUISITION_ANCHOR_COUNT",
-        );
+let mut missing_anchor = receipt;
+missing_anchor.acquisition_anchors.pop();
+assert_eq!(
+validate_supply_acquisition_anchor_bijection(&missing_anchor, &bundle,)
+.expect_err("every archive needs one acquisition anchor")
+.code,
+"E_SUPPLY_ACQUISITION_ANCHOR_COUNT",
+);
     }
 
     #[test]
@@ -83491,32 +83355,32 @@ dependency_kinds = ["build", "normal"]
 
     #[test]
     fn fnd_01_variant_authority_rejects_wrong_and_unreachable_parent_sites() {
-        let root = repository_root();
-        let (mut wrong_parent, _) =
-            read_policy(&root).verified();
-        wrong_parent.record_variant_schema[0].parent_selector =
-            "receipt/supply_receipt/supply_receipt/bootstrap_package[]".to_owned();
-        assert_eq!(
-            build_variant_authority(&wrong_parent)
-                .expect_err("a variant cannot self-authorize an ordinary record-array parent")
-                .code,
-            "E_RECORD_VARIANT_PARENT_SITE"
-        );
+let root = repository_root();
+let (mut wrong_parent, _) =
+read_policy(&root).verified();
+wrong_parent.record_variant_schema[0].parent_selector =
+"receipt/supply_receipt/supply_receipt/bootstrap_package[]".to_owned();
+assert_eq!(
+build_variant_authority(&wrong_parent)
+.expect_err("a variant cannot self-authorize an ordinary record-array parent")
+.code,
+"E_RECORD_VARIANT_PARENT_SITE"
+);
 
-        let (policy, _) =
-            read_policy(&root).verified();
-        let authority = build_variant_authority(&policy).verified();
-        let reachable_nodes = authority
-            .sites
-            .values()
-            .map(|site| site.owner_root.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(),)
-                .expect_err("a compiled site that no recursive root reaches must fail")
-                .code,
-            "E_RECORD_VARIANT_PARENT_SITE"
-        );
+let (policy, _) =
+read_policy(&root).verified();
+let authority = build_variant_authority(&policy).verified();
+let reachable_nodes = authority
+.sites
+.values()
+.map(|site| site.owner_root.clone())
+.collect::<BTreeSet<_>>();
+assert_eq!(
+validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(),)
+.expect_err("a compiled site that no recursive root reaches must fail")
+.code,
+"E_RECORD_VARIANT_PARENT_SITE"
+);
     }
 
     #[test]
@@ -84300,6 +84164,61 @@ decision = "two"
             "synthetic.json",
         )
         .expect("named JSON object-array traversal must pass");
+    }
+
+    #[test]
+    fn generated_pointer_walkers_preserve_cross_format_semantics() {
+        let mut toml = toml::from_str::<toml::Value>(
+            "[root]\nname='root'\n[[root.items]]\nid='first'\ntag='same'\nvalue='one'\n[[root.items]]\nid='second'\ntag='same'\nvalue='two'\n[[root.items]]\nid=''\ntag='empty'\nvalue='empty'\n",
+        )
+        .unwrap();
+        let mut json = parse_strict_json(
+            br#"{"root":{"name":"root","items":[{"id":"first","tag":"same","value":"one"},{"id":"second","tag":"same","value":"two"},{"id":"","tag":"empty","value":"empty"}]}}"#,
+            "pointer",
+        )
+        .unwrap();
+        for pointer in ["/root/items/0/value", "/root/items/id=second/value"] {
+            let left = pointer_get(&toml, pointer, "TOML").unwrap().as_str();
+            let right = match json_pointer_get(&json, pointer, "JSON").unwrap() {
+                StrictJson::String(value) => Some(value.as_str()),
+                _ => None,
+            };
+            assert_eq!(left, right, "{pointer}");
+        }
+        let selected = "/root/items/id=second/value";
+        *pointer_get_mut(&mut toml, selected, "TOML").unwrap() =
+            toml::Value::String("changed".to_owned());
+        *json_pointer_get_mut(&mut json, selected, "JSON").unwrap() =
+            StrictJson::String("changed".to_owned());
+        assert_eq!(
+            pointer_parent_mut(&mut toml, selected, "TOML").unwrap().1,
+            json_pointer_parent_mut(&mut json, selected, "JSON").unwrap().1,
+        );
+        for pointer in [
+            "/root/missing",
+            "/root/name/tail",
+            "/root/items/3",
+            "/root/items/01",
+            "/root/items/id=absent",
+            "/root/items/tag=same",
+        ] {
+            for error in [
+                pointer_get(&toml, pointer, "TOML").unwrap_err(),
+                json_pointer_get(&json, pointer, "JSON").unwrap_err(),
+            ] {
+                assert_eq!(error.code, "E_SEMANTIC_POINTER", "{pointer}");
+            }
+        }
+        assert_eq!(
+            pointer_get(&toml, "/root/items/id=/value", "empty TOML selector")
+                .unwrap_err()
+                .code,
+            "E_SEMANTIC_POINTER",
+        );
+        assert!(matches!(
+            json_pointer_get(&json, "/root/items/id=/value", "empty JSON selector"),
+            Ok(StrictJson::String(value)) if value == "empty"
+        ));
     }
 
     #[test]
@@ -93389,45 +93308,46 @@ fn fallible(value: Option<u8>) {
             "frozen B-R manifest must contain no duplicate test IDs",
         );
         assert_eq!(ORDINARY_B_REQUIRED_TEST_IDS.len(), 21, "complete B-R1..B-R5 manifest");
-        let source = include_str!("fnd_01_dependency_evidence.rs");
-        for id in ORDINARY_B_REQUIRED_TEST_IDS {
-            let name = id
-                .rsplit("::")
-                .next()
-                .expect("qualified ordinary test ID");
-            assert!(
-                source.contains(&format!("fn {name}()")),
-                "frozen required ID must name one exact test function: {id}",
-            );
-        }
-        for (predecessor, successor) in ORDINARY_B_PREDECESSOR_SUCCESSORS {
-            assert!(
-                !ORDINARY_B_REQUIRED_TEST_IDS.contains(&predecessor),
-                "superseded test ID cannot remain required: {predecessor}",
-            );
-            assert!(
-                ORDINARY_B_REQUIRED_TEST_IDS.contains(&successor),
-                "successor test ID must remain required: {successor}",
-            );
-            let predecessor_name = predecessor
-                .rsplit("::")
-                .next()
-                .expect("qualified predecessor test ID");
-            assert!(
-                !source.contains(&format!("fn {predecessor_name}()")),
-                "superseded test function must be absent: {predecessor}",
-            );
-            let successor_name = successor
-                .rsplit("::")
-                .next()
-                .expect("qualified successor test ID");
+        assert_eq!(ORDINARY_B_PREDECESSOR_SUCCESSORS.len(), 6);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let executable = std::env::current_exe().expect("current libtest executable");
+            let list = |filter: Option<&str>, ignored: bool| {
+                let mut command = Command::new(&executable);
+                command.args(["--list", "--format", "terse"]);
+                command.arg(if ignored { "--ignored" } else { "--include-ignored" });
+                if let Some(filter) = filter { command.arg(filter); }
+                let output = command.output().expect("libtest discovery child");
+                assert!(output.status.success(), "libtest discovery failed: {}",
+                    String::from_utf8_lossy(&output.stderr));
+                String::from_utf8(output.stdout)
+                    .expect("libtest discovery UTF-8")
+                    .lines()
+                    .filter_map(|line| line.rsplit_once(": "))
+                    .map(|(id, kind)| {
+                        assert_eq!(kind, "test", "selected libtest entry kind: {id}");
+                        id.to_owned()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let selected = list(Some("ordinary::ordinary_b_"), false);
+            assert_eq!(selected.len(), ORDINARY_B_REQUIRED_TEST_IDS.len());
             assert_eq!(
-                source
-                    .match_indices(&format!("fn {successor_name}()"))
-                    .count(),
-                1,
-                "successor test function must occur exactly once: {successor}",
+                selected.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+                unique,
+                "actual focused libtest discovery must equal the frozen manifest",
             );
+            assert!(
+                list(Some("ordinary::ordinary_b_"), true).is_empty(),
+                "focused discovery must contain no ignored test",
+            );
+            let unfiltered = list(None, false);
+            for (predecessor, successor) in ORDINARY_B_PREDECESSOR_SUCCESSORS {
+                let count = |id: &str| unfiltered.iter()
+                    .filter(|actual| actual.as_str() == id).count();
+                assert_eq!(count(predecessor), 0, "stale predecessor discovered: {predecessor}");
+                assert_eq!(count(successor), 1, "successor discovery cardinality: {successor}");
+            }
         }
     }
 
