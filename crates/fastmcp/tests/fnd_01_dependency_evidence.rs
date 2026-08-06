@@ -98118,7 +98118,6 @@ fn fallible(value: Option<u8>) {
     const TASKS_CONFORMANCE_EXPECTATIONS: [(&str, usize); 1] = [("tasks-conformance-wire-fields", 0)];
     const APPS_ARTIFACT_EXPECTATIONS: [(&str, usize); 8] = [("apps-stable-spec", 7), ("apps-source-spec-types", 11), ("apps-source-unions", 12), ("apps-view-implementation", 6), ("apps-host-bridge", 5), ("apps-generated-typescript-schema", 9), ("apps-generated-json-schema", 8), ("apps-package-lock", 10)];
     const TA_VDIGEST: &str = "ecaace5e6d63951b490b8b4b94bff126ac156ecdcbb06569d10390d8f628151a";
-    const TA_SOURCE_LIMIT: u64 = 1024 * 1024;
     const TA_BLOCKED_PATH: &str = "evidence/fnd-01/vendor/apps/whatwg-html-source";
     const TA_BLOCKED_LIMIT: u64 = 8 * 1024 * 1024;
     const TA_OBS_DOMAIN: &str = "FND01TASKSAPPSOBSv1";
@@ -98277,32 +98276,6 @@ fn fallible(value: Option<u8>) {
         let path = resolve_safe(root, TA_BLOCKED_PATH, TA_BLOCKED_PATH)?;
         let blocked = read_bounded(&path, TA_BLOCKED_LIMIT, TA_BLOCKED_PATH)?;
         Ok(TaBundle { manifest, raw_manifest: manifest_file.bytes.clone(), loaded, vendor, blocked })
-    }
-
-    fn ta_load_frozen_bundle(root: &Path) -> VResult<TaBundle> {
-        let expected = TA_VPATHS.iter().copied().chain([TA_BLOCKED_PATH])
-            .map(str::to_owned).collect::<BTreeSet<_>>();
-        let excluded = BTreeSet::new();
-        let mut actual = BTreeSet::new();
-        for directory in ["evidence/fnd-01/vendor/tasks", "evidence/fnd-01/vendor/apps"] {
-            collect_tree_files(root, directory, &excluded, TA_MPATH, &expected, &mut actual, expected.len())?;
-        }
-        ta_require!(actual == expected, "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "closed paths");
-
-        let raw_manifest = read_bounded(&resolve_safe(root, TA_MPATH, TA_MPATH)?, TA_SOURCE_LIMIT, TA_MPATH)?;
-        let manifest = parse_toml_document(
-            std::str::from_utf8(&raw_manifest).map_err(|_| ta_err(TA_MANIFEST, "manifest", "utf8"))?,
-            TA_MPATH,
-        )?;
-        let mut loaded = vec![TA_MPATH.to_owned()];
-        let mut vendor = BTreeMap::new();
-        for path in TA_VPATHS {
-            let bytes = read_bounded(&resolve_safe(root, path, path)?, TA_SOURCE_LIMIT, path)?;
-            ta_require!(vendor.insert(path.to_owned(), bytes).is_none(), "E_TASKS_APPS_ARTIFACT_INVENTORY", "vendor-inputs", "duplicate path");
-            loaded.push(path.to_owned());
-        }
-        let blocked = read_bounded(&resolve_safe(root, TA_BLOCKED_PATH, TA_BLOCKED_PATH)?, TA_BLOCKED_LIMIT, TA_BLOCKED_PATH)?;
-        Ok(TaBundle { manifest, raw_manifest, loaded, vendor, blocked })
     }
 
     fn ta_artifacts<'a>(
@@ -98763,9 +98736,17 @@ fn fallible(value: Option<u8>) {
     mod tests {
         use super::*;
 
-        fn baseline_tasks_apps_bundle() -> TaBundle {
+        fn baseline_tasks_apps_bundle() -> (TaBundle, [u8; 32]) {
             let root = repository_root();
-            ta_load_frozen_bundle(&root).expect("load immutable Tasks/Apps bundle")
+            let (policy, _) = read_policy(&root)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            let files = load_sources(&root, &policy)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            let source_tree = validate_source_tree(&files, &policy)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            let bundle = ta_load_bundle(&root, &files)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            (bundle, source_tree)
         }
 
         fn assert_unchanged_non_target_inputs(
@@ -98926,9 +98907,11 @@ fn fallible(value: Option<u8>) {
         }
 
         fn assert_live_baseline_reloads_unchanged(
-            baseline: &TaBundle, baseline_digest: [u8; 32], accepted: &TaAccepted,
+            baseline: &TaBundle, baseline_digest: [u8; 32],
+            baseline_source_tree: [u8; 32], accepted: &TaAccepted,
         ) {
-            let live = baseline_tasks_apps_bundle();
+            let (live, source_tree) = baseline_tasks_apps_bundle();
+            assert_eq!(source_tree, baseline_source_tree, "pristine reload retains the admitted source tree");
             assert_eq!(validate_tasks_apps_sources(&live).expect("untouched live baseline reaccepts after discarded virtual mutation"), accepted.clone(), "typed observable state persists after discarded virtual mutation");
             assert_eq!(live, *baseline, "the live bundle persists unchanged");
             assert_eq!(ta_vendor_digest(&live.vendor).expect("live baseline digest"), baseline_digest, "live baseline digest persists unchanged");
@@ -98937,7 +98920,8 @@ fn fallible(value: Option<u8>) {
 
         #[test]
         fn fnd_01_tasks_apps_sources_positive() {
-            let bundle = baseline_tasks_apps_bundle();
+            let (bundle, source_tree) = baseline_tasks_apps_bundle();
+            assert_eq!(lower_hex(&source_tree), SOURCE_TREE_SHA256, "normal admission retains the frozen source tree");
             assert_eq!(2 + bundle.vendor.len(), 15, "one manifest plus thirteen admitted vendors plus one blocked candidate");
             let accepted = validate_tasks_apps_sources(&bundle).expect("same production validator accepts baseline");
             assert_eq!((accepted.tasks_artifact_count, accepted.tasks_conformance_artifact_count, accepted.apps_artifact_count), (4, 1, 8));
@@ -98960,7 +98944,7 @@ fn fallible(value: Option<u8>) {
 
         #[test]
         fn fnd_01_tasks_apps_sources_planted_negative() {
-            let baseline = baseline_tasks_apps_bundle();
+            let (baseline, baseline_source_tree) = baseline_tasks_apps_bundle();
             let accepted = validate_tasks_apps_sources(&baseline).expect("fresh baseline accepts before mutations");
             let baseline_digest = ta_vendor_digest(&baseline.vendor).expect("baseline digest");
             let root = ta_tbl(&baseline.manifest, "manifest").expect("validated manifest");
@@ -98993,7 +98977,7 @@ fn fallible(value: Option<u8>) {
                     }
                 }
                 drop(candidate);
-                assert_live_baseline_reloads_unchanged(&baseline, baseline_digest, &accepted);
+                assert_live_baseline_reloads_unchanged(&baseline, baseline_digest, baseline_source_tree, &accepted);
             }
 
             assert_eq!(validate_tasks_apps_sources(&baseline).expect("fresh baseline reaccepts after every isolated mutation"), accepted, "fresh baseline reaccepts with the same typed observable state");
