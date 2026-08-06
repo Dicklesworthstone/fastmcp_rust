@@ -31607,6 +31607,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
+        fn write_authoring(root: &Path, authoring_bytes: &[Vec<u8>; 3]) {
+            for (relative, bytes) in super::super::trust_std::AUTHORING_PATHS.iter().zip(authoring_bytes) {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("tree");
+                fs::write(path, bytes).expect("member");
+            }
+        }
+
         fn assert_policy_authority_rejected(bytes: &[u8]) {
             let error = validate_phase_b_authority(bytes)
                 .expect_err("policy byte drift must fail");
@@ -31622,20 +31630,17 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             authoring: &[Vec<u8>; 3],
             expected_code: &str,
         ) {
-            let entered = std::cell::Cell::new(0);
-            let error = produce_acquisition_permit::run_with(
-                authority, arguments, environment, marker, digest, authoring, |acquisition| {
-                    drop(acquisition);
-                    entered.set(entered.get() + 1);
-                    Ok(())
-                })
-                .expect_err("Produce authority drift must reject");
+            let error = produce_phase_b_control_plane(
+                arguments,
+                environment,
+                marker,
+                digest,
+                authoring,
+                authority,
+            )
+            .expect_err("authority drift");
             assert_eq!(error.code(), expected_code);
             assert_eq!(error.detail(), JOIN_DRIFT);
-            assert_eq!(
-                entered.get(), 0,
-                "authority rejection crossed the repository/file/network/child/ledger/exec boundary",
-            );
         }
 
         #[test]
@@ -31870,6 +31875,22 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
+        const PRODUCE_AUTHORITY_MATRIX: &[(&str, &str, &str)] = &[
+            ("environment", "environment_profile[acquisition].required", "plan.environment"),
+            ("argv", "command_template[bootstrap.resolve].argv_template", "plan.commands[0].argv_literals"),
+            ("CWD", "command_template[bootstrap.resolve].working_directory", "plan.commands[0].working_directory_formula"),
+            ("command", "command_template[bootstrap.resolve].template_id", "plan.commands[0].id"),
+            ("bound", "bounds.max_supply_bundle_bytes", "max_supply_bundle_bytes"),
+            ("deadline", "bootstrap_control_plane_contract.resolve_timeout_seconds", "resolve.timeout_seconds"),
+            ("run-root", "generated_path_contract.path_formulas[run-root]", "plan.run_root_formula"),
+            ("marker", "authoring_closure_contract.marker_exact_grammar", "marker_format"),
+            ("bootstrap-control", "bootstrap_control_plane_contract.scratch_root_formula", "plan.scratch_root_formula"),
+            ("supply", "supply_bundle_contract.format", "supply_format"),
+            ("Cargo-discovery", "cargo_config_discovery_contract.discovery_rule", "cargo_discovery_requires_no_config"),
+            ("generated-path", "bootstrap_control_plane_contract.acquisition_spool_path_formula", "acquisition_spool_path_formula"),
+            ("native-tool", "command_environment_profiles.native_tool_candidate_count", "native_tool_count"),
+        ];
+
         #[test]
         fn phase_b_authority_fails_before_side_effects() {
             let SyntheticPhaseBInputs {
@@ -31889,24 +31910,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(".fnd01-run")
                 .join("integration-producer")
                 .join(&run_id);
-            const CODE: &str = "E_PHASE_B_ACQUISITION_AUTHORITY";
-            let cases = [
-                ("environment", "environment_profile[acquisition].required", "plan.environment", CODE),
-                ("argv", "command_template[bootstrap.resolve].argv_template", "plan.commands[0].argv_literals", CODE),
-                ("CWD", "command_template[bootstrap.resolve].working_directory", "plan.commands[0].working_directory_formula", CODE),
-                ("command", "command_template[bootstrap.resolve].template_id", "plan.commands[0].id", CODE),
-                ("bound", "bounds.max_supply_bundle_bytes", "max_supply_bundle_bytes", CODE),
-                ("deadline", "bootstrap_control_plane_contract.resolve_timeout_seconds", "resolve.timeout_seconds", CODE),
-                ("run-root", "generated_path_contract.path_formulas[run-root]", "plan.run_root_formula", CODE),
-                ("marker", "authoring_closure_contract.marker_exact_grammar", "marker_format", CODE),
-                ("bootstrap-control", "bootstrap_control_plane_contract.scratch_root_formula", "plan.scratch_root_formula", CODE),
-                ("supply", "supply_bundle_contract.format", "supply_format", CODE),
-                ("Cargo-discovery", "cargo_config_discovery_contract.discovery_rule", "cargo_discovery_requires_no_config", CODE),
-                ("generated-path", "bootstrap_control_plane_contract.acquisition_spool_path_formula", "acquisition_spool_path_formula", CODE),
-                ("native-tool", "command_environment_profiles.native_tool_candidate_count", "native_tool_count", CODE),
-            ];
             let (mut families, mut rows, mut mutations) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
-            for (family, row, mutation, successor) in cases {
+            for &(family, row, mutation) in PRODUCE_AUTHORITY_MATRIX {
                 assert!(families.insert(family) && rows.insert(row) && mutations.insert(mutation),
                     "duplicate authority tuple for {family}");
                 let mut rejected = validate_phase_b_authority(&policy).expect("frozen authority baseline");
@@ -31927,7 +31932,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "native_tool_count" => authority.native_tool_count -= 1,
                     _ => unreachable!("closed family matrix"),
                 }
-                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, successor);
+                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, "E_PHASE_B_ACQUISITION_AUTHORITY");
                 assert!(!no_effect_root.exists(), "{family}");
                 let pristine = validate_phase_b_authority(&policy).expect("pristine authority reacceptance");
                 produce_acquisition_permit::require_complete_produce_acquisition_policy_join(
@@ -31944,11 +31949,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 ..
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x14);
             let repository_root = super::super::fresh_test_root("phase-b-entry");
-            for (relative, bytes) in super::super::trust_std::AUTHORING_PATHS.iter().zip(&authoring_bytes) {
-                let path = repository_root.join(relative);
-                fs::create_dir_all(path.parent().expect("parent")).expect("parent tree");
-                fs::write(path, bytes).expect("authoring member");
-            }
+            write_authoring(&repository_root, &authoring_bytes);
             arguments.run_root = repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
             arguments.repository_root = repository_root;
@@ -31970,30 +31971,66 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         #[test]
         fn phase_b_produce_acquisition_authority_matrix() {
-            let _: fn(Vec<OsString>) -> TrustResult<()> = super::super::bootstrap::run_role;
+            let _ = super::super::bootstrap::run_role;
             let SyntheticPhaseBInputs {
-                policy,
-                manifest: _,
                 authoring_bytes,
-                marker,
                 mut arguments,
+                mut environment,
+                ..
+            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x15);
+            let repository_root =
+                super::super::fresh_test_root("phase-b-role");
+            write_authoring(&repository_root, &authoring_bytes);
+            arguments.run_root = repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id
+            ));
+            arguments.repository_root = repository_root.clone();
+            environment.closed_path =
+                "/phase-b-tools/bin:/usr/bin:/bin".to_owned();
+            let error=super::super::bootstrap::run_role_with_inputs(
+                arguments.clone(),
                 environment,
-            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x12);
-            arguments.repository_root = super::super::fresh_test_root("phase-b-positive");
-            arguments.run_root = arguments.repository_root.join(format!(
-                ".fnd01-run/integration-producer/{}", arguments.run_id));
-            let entered = std::cell::Cell::new(0);
-            produce_acquisition_permit::run_with(
-                validate_phase_b_authority(&policy).expect("independent frozen authority"),
-                &arguments, &environment, &marker, [0; 32], &authoring_bytes, |bounded| {
-                    entered.set(entered.get() + 1);
-                    assert_eq!(bounded.role_root(), format!(".fnd01-run/integration-producer/{}", arguments.run_id));
-                    assert_eq!(bounded.authority(), &compiled_produce_acquisition_authority());
-                    assert_eq!(bounded.authority().full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
-                    Ok(())
-                },
-            ).expect("complete joined authority issues one bounded permit");
-            assert_eq!(entered.get(), 1);
+            )
+            .expect_err("role reaches tool admission");
+            assert_eq!(error.code(), "E_PHASE_B_TOOL_SET");
+            let (_, rows) = snapshot_tree_rows_with_profile(
+                &repository_root,
+                "Produce effects",
+                TreeReadProfile::Generic,
+            )
+            .expect("rows");
+            let observed=rows
+                .iter()
+                .map(|row| row.path.clone())
+                .filter(|path| path.starts_with(".fnd01-run/"))
+                .collect::<BTreeSet<_>>();
+            let run_root = format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id
+            );
+            let package_root = format!("{run_root}/bootstrap-control-package");
+            let expected = [
+                ".fnd01-run".to_owned(),
+                ".fnd01-run/integration-producer".to_owned(), run_root.clone(), package_root.clone(),
+                format!("{package_root}/Cargo.toml"), format!("{package_root}/src"),
+                format!("{package_root}/src/main.rs"), format!("{package_root}/tests"),
+                format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+                format!("{run_root}/cargo-home"), format!("{run_root}/cargo-home/acquisition"),
+                format!("{run_root}/targets"), format!("{run_root}/targets/acquisition"),
+            ].into_iter().collect::<BTreeSet<_>>();
+            assert_eq!(observed, expected);
+            for relative in [
+                "execution-bin",
+                "supply-bundle.bin",
+                "acquisition-spool.bin",
+                "local-registry",
+                "bootstrap-control-target",
+                "control-ledger.bin",
+            ] {
+                assert!(
+                    !arguments.run_root.join(relative).exists(),
+                    "tool admission precedes {relative}",
+                );
+            }
         }
 
         #[test]
@@ -33284,10 +33321,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let root = super::super::fresh_test_root(namespace);
             arguments.repository_root = root.clone();
             arguments.run_root = root.join(format!(".fnd01-run/independent-attester/{}", arguments.run_id));
-            for (relative, bytes) in super::super::trust_std::AUTHORING_PATHS.iter().zip(&authoring_bytes) {
-                let path = root.join(relative); fs::create_dir_all(path.parent().expect("authoring parent")).expect("authoring tree");
-                fs::write(path, bytes).expect("authoring member");
-            }
+            write_authoring(&root, &authoring_bytes);
             let (supply, lock, _) = synthetic_supply_fixture(archive);
             let rows = [lock, b"source snapshot\n".to_vec(), supply, b"workspace receipt\n".to_vec(), b"integration index\n".to_vec()];
             for (relative, bytes) in super::super::trust_std::INTEGRATION_SEAL_PATHS.iter().zip(&rows) {
@@ -33954,6 +33988,14 @@ mod bootstrap {
             ));
         }
         let environment = read_bootstrap_environment(&arguments)?;
+        run_role_with_inputs(arguments, environment)
+    }
+
+    #[cfg(any(fnd01_bootstrap, test))]
+    pub(super) fn run_role_with_inputs(
+        arguments: BootstrapArguments,
+        environment: BootstrapEnvironment,
+    ) -> TrustResult<()> {
         let authoring_marker = parse_authoring_marker(&environment.authoring_marker)?;
         let mut initial_authoring =
             retain_authoring_files(&arguments.repository_root, &authoring_marker)?;
