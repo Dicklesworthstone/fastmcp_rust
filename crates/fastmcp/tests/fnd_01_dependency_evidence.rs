@@ -72874,12 +72874,19 @@ activate = 1\n";
                     && string_sequence_is(
                         &record_string_array(lock, "required_tools", &subject)?,
                         &[
-                            "node v24.12.0",
-                            "npm 11.14.0",
+                            "zsh",
+                            "npm",
+                            "awk",
+                            "cmp",
+                            "curl",
+                            "env",
+                            "install",
                             "jq",
+                            "mktemp",
+                            "node",
+                            "perl",
+                            "sandbox-exec",
                             "shasum",
-                            "/usr/bin/sandbox-exec",
-                            "/usr/bin/curl",
                         ],
                     )
             }
@@ -72891,11 +72898,20 @@ activate = 1\n";
                     && string_sequence_is(
                         &record_string_array(lock, "required_tools", &subject)?,
                         &[
-                            "Python 3.14.4",
-                            "pip 26.1",
+                            "zsh",
+                            "python",
+                            "awk",
+                            "basename",
+                            "cmp",
+                            "curl",
+                            "find",
+                            "install",
+                            "mktemp",
+                            "perl",
+                            "sandbox-exec",
+                            "sed",
                             "shasum",
-                            "/usr/bin/sandbox-exec",
-                            "/usr/bin/curl",
+                            "sort",
                         ],
                     )
             }
@@ -72919,11 +72935,18 @@ activate = 1\n";
                     && string_sequence_is(
                         &record_string_array(lock, "required_tools", &subject)?,
                         &[
-                            ".NET SDK 10.0.100",
+                            "zsh",
+                            "dotnet",
+                            "awk",
+                            "cmp",
+                            "curl",
+                            "env",
+                            "install",
                             "jq",
+                            "mktemp",
+                            "perl",
+                            "sandbox-exec",
                             "shasum",
-                            "/usr/bin/sandbox-exec",
-                            "/usr/bin/curl",
                         ],
                     )
             }
@@ -72937,11 +72960,19 @@ activate = 1\n";
                     && string_sequence_is(
                         &record_string_array(lock, "required_tools", &subject)?,
                         &[
-                            "go1.25.0 darwin/arm64",
+                            "zsh",
+                            "go",
+                            "awk",
+                            "cmp",
+                            "curl",
+                            "env",
+                            "install",
                             "jq",
+                            "mktemp",
+                            "perl",
+                            "sandbox-exec",
                             "shasum",
-                            "/usr/bin/sandbox-exec",
-                            "/usr/bin/curl",
+                            "sort",
                         ],
                     )
             }
@@ -73546,10 +73577,11 @@ activate = 1\n";
         {
             return Err(sdk_json_error(subject, "target package order"));
         }
-        let expected_targets = parsed
+        let mut expected_targets = parsed
             .iter()
             .map(|(id, (_, version, _, _, _))| format!("{id}/{version}"))
             .collect::<Vec<_>>();
+        expected_targets.sort_unstable();
         if targets != expected_targets {
             return Err(sdk_json_error(subject, "target package join"));
         }
@@ -78568,6 +78600,27 @@ activate = 1\n";
         Ok(MediaDependencyBundle { files, security })
     }
 
+    fn media_semantic_digest(label: &str, value: &toml::Value) -> VResult<String> {
+        let mut observation = ObservationEncoder::new(2 * 1024 * 1024, label)?;
+        observation.extend(b"FND01MEDIASEMv1\0")?;
+        observation.sized_u32(label.as_bytes())?;
+        encode_toml_observation(Some(value), &mut observation)?;
+        Ok(lower_hex(&sha256(&observation.bytes)))
+    }
+
+    fn media_input_digest(files: &[LoadedFile]) -> VResult<String> {
+        let mut digest = Sha256::new();
+        digest.update(b"FND01MEDIAINPUTSv1\0");
+        for file in files {
+            let path = file.contract.path.as_bytes();
+            digest.update(u32::try_from(path.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
+            digest.update(path);
+            digest.update(u64::try_from(file.bytes.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
+            digest.update(&file.bytes);
+        }
+        Ok(lower_hex(&digest.finalize()))
+    }
+
     fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, corpus: &[LoadedFile], policy: &Policy) -> VResult<(String, usize, usize)> {
         const SUBJECT: &str = "media-svg-external-resource-policy-drift";
         const TARGET: &str = "/case/id=svg-external-use/expected";
@@ -78614,16 +78667,8 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_MEDIA_DECLARED_SURFACE", "media dependency bundle"));
         }
-        let mut digest = Sha256::new();
-        digest.update(b"FND01MEDIAINPUTSv1\0");
-        for file in &bundle.files {
-            let path = file.contract.path.as_bytes();
-            digest.update(u32::try_from(path.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
-            digest.update(path);
-            digest.update(u64::try_from(file.bytes.len()).map_err(|_| Diagnostic::error("E_MEDIA_INPUT_BOUND", &file.contract.path))?.to_be_bytes());
-            digest.update(&file.bytes);
-        }
-        Ok((lower_hex(&digest.finalize()), 3, cases.len()))
+        eprintln!("MEDIA SEM manifest={} graph={} security={}", media_semantic_digest("manifest", &manifest)?, media_semantic_digest("graph", &graph)?, media_semantic_digest("security", &bundle.security)?);
+        Ok((media_input_digest(&bundle.files)?, 3, cases.len()))
     }
 
     fn validate_supplemental_contracts(
@@ -85195,6 +85240,7 @@ original = "value"
     fn fnd_01_media_dependencies_planted_negative() {
         let (policy, files, bundle) = media_dependency_test_bundle();
         let accepted = validate_media_dependency_bundle(&bundle, &files, &policy).verified();
+        let baseline_security = bundle.security.clone();
         let mut planted = bundle.clone();
         set_pointer(
             &mut planted.security,
@@ -85202,11 +85248,16 @@ original = "value"
             toml::Value::String("admit_to_renderer_gate".to_owned()),
             "media planted negative",
         ).verified();
+        let rejected_security = planted.security.clone();
+        assert_eq!(media_input_digest(&planted.files).verified(), accepted.0);
         let error = validate_media_dependency_bundle(&planted, &files, &policy)
             .expect_err("external SVG use must fail before renderer admission");
         assert_eq!(error.stable(), "FND01|Error|E_MEDIA_SVG_EXTERNAL_RESOURCE|media-svg-external-resource-policy-drift|case[id=svg-external-use].expected");
+        assert_eq!(planted.security, rejected_security);
         assert_sdk_loaded_file_vectors_equal(&bundle.files, &planted.files, "media retained inputs").verified();
-        assert_eq!(validate_media_dependency_bundle(&bundle, &files, &policy).verified(), accepted);
+        set_pointer(&mut planted.security, "/case/id=svg-external-use/expected", toml::Value::String("reject_before_renderer_entry".to_owned()), "media planted restoration").verified();
+        assert_eq!(planted.security, baseline_security);
+        assert_eq!(validate_media_dependency_bundle(&planted, &files, &policy).verified(), accepted);
 
         let (fresh_policy, fresh_files, fresh) = media_dependency_test_bundle();
         assert_sdk_loaded_file_vectors_equal(&bundle.files, &fresh.files, "media fresh inputs").verified();
@@ -88900,7 +88951,7 @@ original = "value"
             assert_eq!(
                 error.stable(),
                 format!(
-                    "FND01|Error|{}|SDK matrix revision-6 dimensions",
+                    "FND01|Error|{}|SDK matrix revision-6 dimensions|",
                     plant.diagnostic,
                 ),
                 "{}: exact diagnostic excludes cotriggers",
@@ -88960,12 +89011,28 @@ original = "value"
         let pristine_snapshot = pristine_process.clone();
         let mut candidate_process = pristine_process.clone();
         candidate_process.tool_identity_after_sha256 = "22".repeat(32);
+        let candidate_snapshot = candidate_process.clone();
+        let mut restored_candidate = candidate_process.clone();
+        restored_candidate.tool_identity_after_sha256 =
+            pristine_process.tool_identity_after_sha256.clone();
+        assert_eq!(
+            restored_candidate, pristine_process,
+            "the temporal plant changes exactly the after digest",
+        );
         let error = sdk_validate_tool_identity_binding(
             &candidate_process,
             "tool-identity after-only plant",
         )
         .expect_err("one changed after digest must reject");
         assert_eq!(error.code, "E_SDK_TOOL_IDENTITY");
+        assert_eq!(
+            error.stable(),
+            "FND01|Error|E_SDK_TOOL_IDENTITY|tool-identity after-only plant|",
+        );
+        assert_eq!(
+            candidate_process, candidate_snapshot,
+            "rejection leaves the planted candidate unchanged",
+        );
         assert_eq!(pristine_process, pristine_snapshot, "plant leaves pristine state unchanged");
         assert_ne!(
             sdk_process_sha256(&candidate_process),
