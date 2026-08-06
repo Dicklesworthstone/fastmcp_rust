@@ -32020,7 +32020,7 @@ _ => unreachable!("closed family matrix"),
             let observed=rows
                 .iter()
                 .map(|row| row.path.clone())
-                .filter(|path| path.starts_with(".fnd01-run/"))
+                .filter(|path| path == ".fnd01-run" || path.starts_with(".fnd01-run/"))
                 .collect::<BTreeSet<_>>();
             let run_root = format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id
