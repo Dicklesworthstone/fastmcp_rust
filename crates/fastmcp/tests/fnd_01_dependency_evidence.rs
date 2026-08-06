@@ -31876,20 +31876,21 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         const AUTHORITY_REJECTION:&str="E_PHASE_B_ACQUISITION_AUTHORITY";
+        fn pinned_policy_row(a:&[u8],b:&[u8],h:&str){let i=FROZEN_POLICY.windows(a.len()).position(|v|v==a).unwrap();let j=i+FROZEN_POLICY[i..].windows(b.len()).position(|v|v==b).unwrap()+b.len();assert_eq!(encode_lower_hex(&sha256(&FROZEN_POLICY[i..j]).unwrap()),h)}
         const PRODUCE_AUTHORITY_MATRIX:&[(&str,&[u8],u8)]=&[
-            ("environment",ACQUISITION_ENVIRONMENT_POLICY,0),
-            ("argv",b"argv_template = [\"{tool.cargo.path}\", \"metadata\"",1),
-            ("CWD",b"working_directory = \"{run-root}\"\ntarget_scope = \"all-target, all-feature",2),
-            ("command",b"id_formula = \"bootstrap.resolve\"",3),
-            ("bound",b"max_supply_bundle_bytes =",4),
-            ("deadline",b"resolve_timeout_seconds =",5),
-            ("run-root",b"path_formulas = [\".fnd01-run/<role>/<run-id>\",",6),
-            ("marker",b"marker_exact_grammar =",7),
-            ("bootstrap-control",b"scratch_root_formula = \".fnd01-run/<role>/<run-id>/bootstrap-control",8),
-            ("supply",b"format = \"FND01SUPPLYv4\"",9),
-            ("Cargo-discovery",b"discovery_rule =",10),
-            ("generated-path",b"acquisition_spool_path_formula = \".fnd01-run",11),
-            ("native-tool",b"native_tool_candidate_count =",12),
+("environment",ACQUISITION_ENVIRONMENT_POLICY,0),
+("argv",b"argv_template = [\"{tool.cargo.path}\", \"metadata\", \"--format-version\", \"1\", \"--all-features\", \"--manifest-path\", \"{bootstrap-manifest}\"]",1),
+("CWD",RESOLVE_COMMAND_POLICY,2),
+("command",b"id_formula = \"bootstrap.resolve\"",3),
+("bound",b"max_supply_bundle_bytes = 1073741824",4),
+("deadline",b"resolve_timeout_seconds = 1800",5),
+("run-root",b"path_formulas =",6),
+("marker",b"marker_exact_grammar =",7),
+("bootstrap-control",b"scratch_root_formula = \".fnd01-run/<role>/<run-id>/bootstrap-control-package\"",8),
+("supply",b"format = \"FND01SUPPLYv4\"",9),
+("Cargo-discovery",b"[cargo_config_discovery_contract]",10),
+("generated-path",b"acquisition_spool_path_formula = \".fnd01-run/integration-producer/<run-id>/acquisition-spool.bin\"",11),
+("native-tool",b"native_tool_candidate_count = 20",12),
         ];
 
         #[test]
@@ -31913,25 +31914,26 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(&run_id);
             let(mut f,mut r,mut m)=(BTreeSet::new(),BTreeSet::new(),BTreeSet::new());
             for &(family, row, mutation) in PRODUCE_AUTHORITY_MATRIX {
+                match mutation {6=>pinned_policy_row(b"path_formulas =",b"\n","79ab3e69ddcbf0bd85c1dfa7fa1dca0ab72f254d5178f00e79d59dd09b939ef8"),7=>pinned_policy_row(b"marker_exact_grammar =",b"\n","dd40d7eedc165487d53db28bb8f75761706f07ee18f1dcf8c7f41793bae8c010"),10=>pinned_policy_row(b"[cargo_config_discovery_contract]",b"\n[publication_contract]",CARGO_CONFIG_POLICY_SHA256),_=>()}
                 find_once(FROZEN_POLICY,row,family).expect("row");
                 assert!(f.insert(family)&&r.insert(row)&&m.insert(mutation));
                 let mut rejected = validate_phase_b_authority(&policy).expect("base");
                 let authority = &mut rejected.produce_acquisition;
                 match mutation {
-                    0 => authority.plan.environment = &[],
-                    1 => authority.plan.commands[0].argv_literals = &["drift"],
-                    2 => authority.plan.commands[0].working_directory_formula = "drift",
-                    3 => authority.plan.commands[0].id = "drift",
-                    4 => authority.max_supply_bundle_bytes -= 1,
-                    5 => authority.resolve.timeout_seconds -= 1,
-                    6 => authority.plan.run_root_formula = "drift",
-                    7 => authority.marker_format = "FND01AUTHOR",
-                    8 => authority.plan.scratch_root_formula = "drift",
-                    9 => authority.supply_format = "FND01SUPPLYv3",
-                    10 => authority.cargo_discovery_requires_no_config = false,
-                    11 => authority.acquisition_spool_path_formula = "drift",
-                    12 => authority.native_tool_count -= 1,
-                    _ => unreachable!("closed family matrix"),
+0 => authority.plan.environment = &[],
+1 => authority.plan.commands[0].argv_literals = &["drift"],
+2 => authority.plan.commands[0].working_directory_formula = "drift",
+3 => authority.plan.commands[0].id = "drift",
+4 => authority.max_supply_bundle_bytes -= 1,
+5 => authority.resolve.timeout_seconds -= 1,
+6 => authority.plan.run_root_formula = "drift",
+7 => authority.marker_format = "FND01AUTHOR",
+8 => authority.plan.scratch_root_formula = "drift",
+9 => authority.supply_format = "FND01SUPPLYv3",
+10 => authority.cargo_discovery_requires_no_config = false,
+11 => authority.acquisition_spool_path_formula = "drift",
+12 => authority.native_tool_count -= 1,
+_ => unreachable!("closed family matrix"),
                 }
                 assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, AUTHORITY_REJECTION);
                 assert!(!no_effect_root.exists(), "{family}");
