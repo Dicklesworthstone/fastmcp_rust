@@ -32067,12 +32067,25 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
             environment.closed_path = "/phase-b-tools/bin:/usr/bin:/bin".to_owned();
+            let assert_no_later_effects = |arguments: &BootstrapArguments| {
+                for relative in ["supply-bundle.bin", "acquisition-spool.bin",
+                    "local-registry", "bootstrap-control-target", "control-ledger.bin",
+                ] {
+                    assert!(!arguments.run_root.join(relative).exists(), "{relative}");
+                }
+                for relative in [format!("target/debug/fnd-01/{}/return",arguments.run_id),
+                    format!(".fnd01-run/publication/{}",arguments.run_id),
+                    "evidence/fnd-01/integration".to_owned()] {
+                    assert!(!arguments.repository_root.join(relative).exists());
+                }
+            };
             assert_eq!(produce_acquisition_permit::run(
                 synthetic_phase_b_authority(&policy, &manifest), &arguments,
                 &environment, &marker, [0; 32], &authoring_bytes,
-            ).expect_err("real continuation reaches tool admission").code(), "E_PHASE_B_TOOL_SET");
+            ).expect_err("tool admission").code(), "E_PHASE_B_TOOL_SET");
             let package_root = arguments.run_root.join("bootstrap-control-package");
-            let before = fs_identity(&fs::metadata(&package_root).expect("claimed"));
+            let before = fs_identity(&fs::metadata(&package_root).expect("pkg"));
+            assert_no_later_effects(&arguments);
             assert_eq!(
                 produce_acquisition_permit::run(
                     synthetic_phase_b_authority(&policy, &manifest), &arguments,
@@ -32088,18 +32101,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let supply = synthetic_valid_supply(&archive);
             let validated = validate_supply_bundle_value(&supply)
                 .expect("validated bounded supply");
-            let assert_no_later_effects = |arguments: &BootstrapArguments| {
-                for relative in ["supply-bundle.bin", "acquisition-spool.bin",
-                    "local-registry", "bootstrap-control-target", "control-ledger.bin",
-                ] {
-                    assert!(!arguments.run_root.join(relative).exists(), "{relative}");
-                }
-                for relative in [format!("target/debug/fnd-01/{}/return",arguments.run_id),
-                    format!(".fnd01-run/publication/{}",arguments.run_id),
-                    "evidence/fnd-01/integration".to_owned()] {
-                    assert!(!arguments.repository_root.join(relative).exists());
-                }
-            };
             let mut wrong_manifest = manifest.clone();
             wrong_manifest[0] ^= 1;
             let before_authoring = authoring_bytes.clone();
