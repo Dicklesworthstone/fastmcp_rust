@@ -921,15 +921,16 @@ mod trust_std {
         hasher.finalize()
     }
 
-    pub fn environment_set_digest() -> TrustResult<[u8; 32]> {
-        const PROFILES: &[(&str, &[(&str, &str)])] = &[
+    pub const ENVIRONMENT_PROFILES: &[(&str, &[(&str, &str)])] = &[
             ("acquisition", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{producer-cargo-home}"), ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"), ("CARGO_TARGET_DIR", "{producer-custom-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
             ("offline", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-command-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
             ("offline_control", &[("AR", "{tool.host-ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-bootstrap-control-target}"), ("CC", "{tool.host-cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RANLIB", "{tool.host-ranlib.path}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC")]),
             ("offline_cross", &[("AR", "{target-tool-profile.ar.path}"), ("CARGO_HOME", "{fresh-role-cargo-home}"), ("CARGO_NET_OFFLINE", "true"), ("CARGO_TARGET_DIR", "{fresh-cross-check-target}"), ("CC", "{target-tool-profile.cc.path}"), ("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RUSTC", "{tool.rustc.path}"), ("RUSTDOC", "{tool.rustdoc.path}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("SOURCE_DATE_EPOCH", "0"), ("TZ", "UTC"), ("{target-tool-profile.ar-env-key}", "{target-tool-profile.ar.path}"), ("{target-tool-profile.cc-env-key}", "{target-tool-profile.cc.path}"), ("{target-tool-profile.cflags-env-key}", "{target-tool-profile.cflags-exact}"), ("{target-tool-profile.linker-env-key}", "{target-tool-profile.linker.path}"), ("{target-tool-profile.rustflags-env-key}", "{target-tool-profile.rustflags-exact}")]),
             ("tool_identity", &[("CLIPPY_DRIVER", "{tool.clippy-driver.path}"), ("LANG", "C"), ("LC_ALL", "C"), ("PATH", "{closed-execution-bin}"), ("RUSTFMT", "{tool.rustfmt.path}"), ("RUSTUP_TOOLCHAIN", "nightly-2026-07-11"), ("TZ", "UTC")]),
             ("openssl", &[("LANG", "C"), ("LC_ALL", "C"), ("OPENSSL_CONF", "{exact-kat-openssl-config}"), ("PATH", "{closed-execution-bin}"), ("TZ", "UTC")]),
-        ];
+    ];
+
+    pub fn environment_set_digest() -> TrustResult<[u8; 32]> {
         fn append(output: &mut Vec<u8>, bytes: &[u8]) -> TrustResult<()> {
             let length = u32::try_from(bytes.len()).map_err(|_| TrustError::new(
                 "E_PHASE_B_BOUND", "environment field length exceeds u32"))?;
@@ -937,12 +938,12 @@ mod trust_std {
                 "E_PHASE_B_ALLOCATION", "cannot reserve environment field"))?;
             output.extend_from_slice(&length.to_be_bytes()); output.extend_from_slice(bytes); Ok(())
         }
-        if PROFILES.len() != 6 { return Err(TrustError::new(
+        if ENVIRONMENT_PROFILES.len() != 6 { return Err(TrustError::new(
             "E_PHASE_B_ENVIRONMENT_SET", "compiled environment profile count is not six")); }
         let mut output = b"FND01BOOTSTRAPENVSv1\0".to_vec();
-        output.extend_from_slice(&u32::try_from(PROFILES.len()).map_err(|_| TrustError::new(
+        output.extend_from_slice(&u32::try_from(ENVIRONMENT_PROFILES.len()).map_err(|_| TrustError::new(
             "E_PHASE_B_BOUND", "environment profile count exceeds u32"))?.to_be_bytes());
-        for (id, required) in PROFILES {
+        for (id, required) in ENVIRONMENT_PROFILES {
             append(&mut output, id.as_bytes())?;
             output.extend_from_slice(&u32::try_from(required.len()).map_err(|_| TrustError::new(
                 "E_PHASE_B_BOUND", "environment assignment count exceeds u32"))?.to_be_bytes());
@@ -15800,6 +15801,47 @@ mod trust_std {
     }
 
     #[cfg(test)]
+    pub struct AttestFixtureIntegration {
+        pub producer_outer_bytes: Vec<u8>,
+        pub integration_marker: String,
+    }
+
+    #[cfg(test)]
+    pub fn attest_fixture_outer_and_integration(
+        run_id: &str,
+        authoring_marker: &str,
+        integration_records: [(&str, &[u8]); 5],
+    ) -> TrustResult<AttestFixtureIntegration> {
+        let authoring = parse_authoring_marker(authoring_marker)?;
+        let run_id_bytes = decode_lower_hex::<16>(run_id, "Attest fixture run ID")?;
+        if integration_records.iter().map(|row| row.0).ne(INTEGRATION_SEAL_PATHS) {
+            return Err(TrustError::new("E_ATTEST_FIXTURE", "integration path registry mismatch"));
+        }
+        let producer_outer_bytes = encode_outer_transport_record(
+            &outer_role_fixture(BootstrapMode::Produce, run_id, "producer", authoring_marker, None),
+            "Attest fixture producer outer",
+        )?;
+        let bind = |bytes: &[u8]| -> TrustResult<FileBinding> { Ok(FileBinding {
+            byte_length: u64::try_from(bytes.len()).map_err(|_| TrustError::new("E_ATTEST_FIXTURE", "fixture length exceeds u64"))?,
+            sha256: sha256(bytes)?,
+        }) };
+        let mut records = [FileBinding { byte_length: 0, sha256: [0; 32] }; 5];
+        for (binding, (_, bytes)) in records.iter_mut().zip(integration_records) {
+            *binding = bind(bytes)?;
+        }
+        let mut seal = IntegrationSeal {
+            run_id: run_id_bytes, records, outer_transport: bind(&producer_outer_bytes)?,
+            authoring_closure_sha256: authoring.closure_sha256, seal_sha256: [0; 32],
+        };
+        seal.seal_sha256 = sha256(&integration_seal_preimage(&seal)?)?;
+        let integration_marker = integration_seal_marker(&seal);
+        if parse_integration_seal(&integration_marker, &authoring.closure_sha256)? != seal {
+            return Err(TrustError::new("E_ATTEST_FIXTURE", "integration marker round trip"));
+        }
+        Ok(AttestFixtureIntegration { producer_outer_bytes, integration_marker })
+    }
+
+    #[cfg(test)]
     mod canonical_gate_tests {
         use super::*;
 
@@ -17942,7 +17984,9 @@ mod phase_b_std {
         ValidatedDirectoryTreeBinding, ValidatedFileBinding,
         ValidatedTargetSnapshot,
         ACQUISITION_PLAN_AUTHORITY, ACQUISITION_SPOOL_PREFIX, CONTROL_LEDGER_PREFIX,
+        ENVIRONMENT_PROFILES,
         MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES,
+        MAX_GATE_EXECUTABLE_BYTES,
         MAX_SPARSE_CACHE_INPUT_BYTES, MAX_SUPPLY_BUNDLE_BYTES,
         acquisition_command_preimage, acquisition_plan,
         authoring_closure_preimage, checked_disjoint_usage,
@@ -18114,14 +18158,43 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     const MAX_CONTROL_PLANE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
     const MAX_BOOTSTRAP_SCRATCH_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     const MAX_MATERIALIZATION_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    const PHASE_B_ROLES: &[&str] = &["integration-producer", "independent-attester"];
+    const FALLBACK_ROOTS: &[&str] = &["target/debug", "target/doc", "target/release", "target/.rustc_info.json", "target/CACHEDIR.TAG"];
+    const CONTROL_BUILD_ARGV: &[&str] = &["build", "--manifest-path", "{bootstrap-manifest}", "--bin", "fnd_01_evidence_harness", "--locked", "--offline", "--message-format=json", "--target-dir", "{fresh-bootstrap-control-target}", "--config", "{local-registry-config}"];
+    const CONTROL_SCRATCH_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", "cargo-config.toml", "src/main.rs", "tests/fnd_01_dependency_evidence.rs"];
+    const RUN_SCRATCH_ROOT: &str = ".fnd01-run";
+    const CONTROL_TARGET_SUFFIX: &str = "bootstrap-control-target";
+    const OFFLINE_HOME_SUFFIX: &str = "cargo-home/offline";
+    const SUPPLY_PATH_FORMULA: &str = ".fnd01-run/integration-producer/<run-id>/supply-bundle.bin";
+    const HANDOFF_LEDGER_FORMULA: &str = ".fnd01-run/<role>/<run-id>/control-ledger.bin";
+    const ACQUISITION_SPOOL_FORMULA: &str = ".fnd01-run/integration-producer/<run-id>/acquisition-spool.bin";
+    const MATERIALIZATION_ROOT_FORMULA: &str = ".fnd01-run/<role>/<run-id>/local-registry";
+    const PRODUCE_JOIN_TEXTS: &[(&str, &str)] = &[
+        ("cargo_registry_name", CARGO_REGISTRY_NAME), ("crate_cache_prefix", ACQUISITION_CRATE_CACHE_PREFIX),
+        ("sparse_cache_prefix", ACQUISITION_SPARSE_CACHE_PREFIX), ("sparse_config_path", ACQUISITION_SPARSE_CONFIG_PATH),
+        ("resolve_kind", RESOLVE_TYPED_RESULT_KIND), ("fetch_kind", FETCH_TYPED_RESULT_KIND),
+        ("cargo_config_sha256", CARGO_CONFIG_POLICY_SHA256), ("crates_io", CRATES_IO),
+        ("run_scratch_root", RUN_SCRATCH_ROOT), ("control_target_suffix", CONTROL_TARGET_SUFFIX),
+        ("offline_home_suffix", OFFLINE_HOME_SUFFIX), ("supply_path", SUPPLY_PATH_FORMULA),
+        ("control_config", "cargo-config.toml"), ("handoff_cwd", "."),
+        ("handoff_ledger", HANDOFF_LEDGER_FORMULA),
+    ];
+    const PRODUCE_JOIN_BYTES: &[(&str, &[u8])] = &[
+        ("control", CONTROL_PREFIX), ("spool", SPOOL_PREFIX), ("supply", SUPPLY_PREFIX),
+        ("supply_entry", SUPPLY_ENTRY_PREFIX), ("tree", TREE_PREFIX), ("message_set", MESSAGE_SET_PREFIX),
+        ("tool_set", TOOL_SET_PREFIX), ("direct", DIRECT_PREFIX), ("union", UNION_PREFIX),
+        ("native_tool", NATIVE_TOOL_PREFIX), ("resolve_typed", RESOLVE_TYPED_PREFIX),
+        ("fetch_typed", FETCH_TYPED_PREFIX), ("materialized", BOOTSTRAP_MATERIALIZED_PREFIX),
+        ("bootstrap_authority", BOOTSTRAP_AUTHORITY_PREFIX), ("lock_package_set", LOCK_PACKAGE_SET_PREFIX),
+    ];
     const PRODUCE_POLICY_JOIN_PREFIX: &[u8] =
         b"FND01PHASEBPOLICYJOINv1\0";
     const JOIN_DRIFT: &str = "compiled acquisition join drifted before effects";
-    const PRODUCE_POLICY_JOIN_BYTES: usize = 4485;
+    const PRODUCE_POLICY_JOIN_BYTES: usize = 21999;
     const PRODUCE_POLICY_JOIN_SHA256: [u8; 32] = [
-        0x30, 0xe6, 0x9c, 0xb2, 0x12, 0xe7, 0xf1, 0xb5, 0xed, 0x57, 0x07, 0x1c, 0x4f, 0x6d,
-        0xac, 0x19, 0x33, 0xb5, 0x73, 0xdc, 0xf7, 0xd2, 0x49, 0xbb, 0x4b, 0x74, 0x55, 0x1a,
-        0x10, 0xd6, 0xbf, 0x68,
+        0x4d, 0x92, 0xa9, 0x9b, 0x07, 0x06, 0xee, 0xe8, 0x62, 0xbe, 0x58, 0x7f, 0x21, 0x6c,
+        0xcd, 0x28, 0x02, 0xed, 0xfe, 0x3a, 0x3f, 0x89, 0xd1, 0x9a, 0x85, 0xda, 0xe9, 0xb1,
+        0x72, 0x5c, 0x8a, 0xf7,
     ];
 
     #[derive(Clone, Copy)]
@@ -18134,52 +18207,55 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         alias: &'static str,
     }
 
+    macro_rules! d { ($p:literal,$v:literal,$d:expr,$f:expr,$e:expr,$a:literal) => {
+        Direct { package:$p,version:$v,default_features:$d,features:$f,verifier:$e,alias:$a }
+    } }
     const DIRECT: &[Direct] = &[
-        Direct { package:"argon2", version:"0.5.3", default_features:false, features:&["alloc","password-hash","zeroize"], verifier:false, alias:"fnd01_union_8d6d3e60e1b38873acd93acb" },
-        Direct { package:"asupersync", version:"0.3.10", default_features:false, features:&["nightly-outcome-try","tls","tls-native-roots"], verifier:false, alias:"fnd01_union_744e5e837aaf669dfed6a2a2" },
-        Direct { package:"asupersync", version:"0.3.9", default_features:false, features:&["nightly-outcome-try","tls","tls-native-roots"], verifier:false, alias:"fnd01_union_e0a4c1206760e2342c1f0b16" },
-        Direct { package:"asupersync", version:"0.3.9", default_features:true, features:&["test-internals"], verifier:false, alias:"fnd01_union_c0aaef5d1949346f6b94fc83" },
-        Direct { package:"base64", version:"0.22.1", default_features:true, features:&[], verifier:false, alias:"fnd01_union_ae4c5062e9f1289b6a7a6a61" },
-        Direct { package:"cap-fs-ext", version:"4.0.2", default_features:false, features:&["std"], verifier:false, alias:"fnd01_union_196e86ae173e5402ae44e5ab" },
-        Direct { package:"cap-std", version:"4.0.2", default_features:false, features:&[], verifier:false, alias:"fnd01_union_4b32e5461b81bfd7949e4fcb" },
-        Direct { package:"chacha20poly1305", version:"0.11.0", default_features:false, features:&["alloc","zeroize"], verifier:false, alias:"fnd01_union_c335336dc8298300454b17c7" },
-        Direct { package:"chrono", version:"0.4.45", default_features:false, features:&["clock","std"], verifier:false, alias:"fnd01_union_9f2e925553aefca2df177c52" },
-        Direct { package:"clap", version:"4.6.4", default_features:true, features:&["derive","env","wrap_help"], verifier:false, alias:"fnd01_union_ec9b786d427d8430838a51e7" },
-        Direct { package:"console", version:"0.16.4", default_features:true, features:&[], verifier:false, alias:"fnd01_union_adb56ae01fd7d566754093c4" },
-        Direct { package:"dirs", version:"6.0.0", default_features:true, features:&[], verifier:false, alias:"fnd01_union_5ea959a7c14bded36529e7e9" },
-        Direct { package:"flate2", version:"1.1.9", default_features:true, features:&[], verifier:true, alias:"" },
-        Direct { package:"getrandom", version:"0.4.3", default_features:false, features:&[], verifier:false, alias:"fnd01_union_2eb6d0bbe4e219259d04ec0e" },
-        Direct { package:"glob", version:"0.3.4", default_features:true, features:&[], verifier:false, alias:"fnd01_union_9194df25b9536cdf5778fc3d" },
-        Direct { package:"hmac", version:"0.12.1", default_features:false, features:&[], verifier:false, alias:"fnd01_union_bf8664a2d8146a298d92f58d" },
-        Direct { package:"html5ever", version:"0.39.0", default_features:false, features:&[], verifier:false, alias:"fnd01_union_3048ea33aeee5fddec9a14c9" },
-        Direct { package:"image", version:"0.25.10", default_features:false, features:&["jpeg","png","webp"], verifier:false, alias:"fnd01_union_102f691181bb4ffc0da6bee4" },
-        Direct { package:"jsonschema", version:"0.49.2", default_features:false, features:&["arbitrary-precision"], verifier:false, alias:"fnd01_union_1bbab8557bac7c57f592f336" },
-        Direct { package:"log", version:"0.4.33", default_features:true, features:&[], verifier:false, alias:"fnd01_union_ad04f23ed9e16866140425c8" },
-        Direct { package:"log", version:"0.4.33", default_features:true, features:&["std"], verifier:false, alias:"fnd01_union_94be58810ff96963d3269b78" },
-        Direct { package:"notify", version:"8.2.0", default_features:true, features:&[], verifier:false, alias:"fnd01_union_23e6739563c65ff6ce570a0b" },
-        Direct { package:"proc-macro2", version:"1.0.107", default_features:false, features:&["span-locations"], verifier:false, alias:"fnd01_union_cedda45929e7fe0f20caabb1" },
-        Direct { package:"proc-macro2", version:"1.0.107", default_features:true, features:&[], verifier:false, alias:"fnd01_union_d1129ac3a83b159aeb94b150" },
-        Direct { package:"quote", version:"1.0.47", default_features:true, features:&[], verifier:false, alias:"fnd01_union_a4b83c71b227f98ab7568960" },
-        Direct { package:"redis", version:"1.4.1", default_features:false, features:&["acl","script"], verifier:false, alias:"fnd01_union_ddc6f4df48d2ed5b07ddbaa7" },
-        Direct { package:"regex", version:"1.13.1", default_features:true, features:&[], verifier:false, alias:"fnd01_union_c0c652551aba9f8b546fc483" },
-        Direct { package:"resvg", version:"0.47.0", default_features:false, features:&[], verifier:false, alias:"fnd01_union_d7492ccee6455f72a92aa966" },
-        Direct { package:"rich_rust", version:"0.2.2", default_features:true, features:&[], verifier:false, alias:"fnd01_union_1584dc12030d521fbb76446a" },
-        Direct { package:"ring", version:"0.17.14", default_features:false, features:&["alloc"], verifier:true, alias:"" },
-        Direct { package:"semver", version:"1.0.28", default_features:true, features:&[], verifier:true, alias:"" },
-        Direct { package:"serde", version:"1.0.229", default_features:true, features:&["derive"], verifier:true, alias:"" },
-        Direct { package:"serde_json", version:"1.0.151", default_features:true, features:&["arbitrary_precision"], verifier:true, alias:"" },
-        Direct { package:"serde_yaml", version:"0.9.34", default_features:true, features:&[], verifier:false, alias:"fnd01_union_f220315c417b696f5cf1985b" },
-        Direct { package:"sha2", version:"0.10.9", default_features:false, features:&[], verifier:true, alias:"" },
-        Direct { package:"strip-ansi-escapes", version:"0.2.1", default_features:true, features:&[], verifier:false, alias:"fnd01_union_906c399fb104a1ecaabdf2f3" },
-        Direct { package:"syn", version:"3.0.3", default_features:true, features:&["extra-traits","full","parsing"], verifier:false, alias:"fnd01_union_382b44ab7faf189a87c0913e" },
-        Direct { package:"tempfile", version:"3.27.0", default_features:true, features:&[], verifier:false, alias:"fnd01_union_8bf6067d3bbe6b703f857051" },
-        Direct { package:"time", version:"0.3.47", default_features:true, features:&["formatting","macros"], verifier:false, alias:"fnd01_union_9042d69f3e99024b93d0b011" },
-        Direct { package:"toml", version:"1.1.3", default_features:true, features:&[], verifier:true, alias:"" },
-        Direct { package:"tracing", version:"0.1.44", default_features:true, features:&[], verifier:false, alias:"fnd01_union_ce964634f02a69e35c2cbcb2" },
-        Direct { package:"tracing-subscriber", version:"0.3.23", default_features:true, features:&[], verifier:false, alias:"fnd01_union_5fa3986b8f69483eb72326c1" },
-        Direct { package:"trybuild", version:"1.0.118", default_features:false, features:&[], verifier:false, alias:"fnd01_union_b6e213e3378be43d1551f3b2" },
-        Direct { package:"url", version:"2.5.8", default_features:false, features:&["std"], verifier:false, alias:"fnd01_union_0dd1c2b43b5f0432630bc81b" },
-        Direct { package:"zeroize", version:"1.9.0", default_features:false, features:&["alloc","derive"], verifier:false, alias:"fnd01_union_d82a11d71f953bd4862293a7" },
+        d!("argon2","0.5.3",false,&["alloc","password-hash","zeroize"],false,"fnd01_union_8d6d3e60e1b38873acd93acb"),
+        d!("asupersync","0.3.10",false,&["nightly-outcome-try","tls","tls-native-roots"],false,"fnd01_union_744e5e837aaf669dfed6a2a2"),
+        d!("asupersync","0.3.9",false,&["nightly-outcome-try","tls","tls-native-roots"],false,"fnd01_union_e0a4c1206760e2342c1f0b16"),
+        d!("asupersync","0.3.9",true,&["test-internals"],false,"fnd01_union_c0aaef5d1949346f6b94fc83"),
+        d!("base64","0.22.1",true,&[],false,"fnd01_union_ae4c5062e9f1289b6a7a6a61"),
+        d!("cap-fs-ext","4.0.2",false,&["std"],false,"fnd01_union_196e86ae173e5402ae44e5ab"),
+        d!("cap-std","4.0.2",false,&[],false,"fnd01_union_4b32e5461b81bfd7949e4fcb"),
+        d!("chacha20poly1305","0.11.0",false,&["alloc","zeroize"],false,"fnd01_union_c335336dc8298300454b17c7"),
+        d!("chrono","0.4.45",false,&["clock","std"],false,"fnd01_union_9f2e925553aefca2df177c52"),
+        d!("clap","4.6.4",true,&["derive","env","wrap_help"],false,"fnd01_union_ec9b786d427d8430838a51e7"),
+        d!("console","0.16.4",true,&[],false,"fnd01_union_adb56ae01fd7d566754093c4"),
+        d!("dirs","6.0.0",true,&[],false,"fnd01_union_5ea959a7c14bded36529e7e9"),
+        d!("flate2","1.1.9",true,&[],true,""),
+        d!("getrandom","0.4.3",false,&[],false,"fnd01_union_2eb6d0bbe4e219259d04ec0e"),
+        d!("glob","0.3.4",true,&[],false,"fnd01_union_9194df25b9536cdf5778fc3d"),
+        d!("hmac","0.12.1",false,&[],false,"fnd01_union_bf8664a2d8146a298d92f58d"),
+        d!("html5ever","0.39.0",false,&[],false,"fnd01_union_3048ea33aeee5fddec9a14c9"),
+        d!("image","0.25.10",false,&["jpeg","png","webp"],false,"fnd01_union_102f691181bb4ffc0da6bee4"),
+        d!("jsonschema","0.49.2",false,&["arbitrary-precision"],false,"fnd01_union_1bbab8557bac7c57f592f336"),
+        d!("log","0.4.33",true,&[],false,"fnd01_union_ad04f23ed9e16866140425c8"),
+        d!("log","0.4.33",true,&["std"],false,"fnd01_union_94be58810ff96963d3269b78"),
+        d!("notify","8.2.0",true,&[],false,"fnd01_union_23e6739563c65ff6ce570a0b"),
+        d!("proc-macro2","1.0.107",false,&["span-locations"],false,"fnd01_union_cedda45929e7fe0f20caabb1"),
+        d!("proc-macro2","1.0.107",true,&[],false,"fnd01_union_d1129ac3a83b159aeb94b150"),
+        d!("quote","1.0.47",true,&[],false,"fnd01_union_a4b83c71b227f98ab7568960"),
+        d!("redis","1.4.1",false,&["acl","script"],false,"fnd01_union_ddc6f4df48d2ed5b07ddbaa7"),
+        d!("regex","1.13.1",true,&[],false,"fnd01_union_c0c652551aba9f8b546fc483"),
+        d!("resvg","0.47.0",false,&[],false,"fnd01_union_d7492ccee6455f72a92aa966"),
+        d!("rich_rust","0.2.2",true,&[],false,"fnd01_union_1584dc12030d521fbb76446a"),
+        d!("ring","0.17.14",false,&["alloc"],true,""),
+        d!("semver","1.0.28",true,&[],true,""),
+        d!("serde","1.0.229",true,&["derive"],true,""),
+        d!("serde_json","1.0.151",true,&["arbitrary_precision"],true,""),
+        d!("serde_yaml","0.9.34",true,&[],false,"fnd01_union_f220315c417b696f5cf1985b"),
+        d!("sha2","0.10.9",false,&[],true,""),
+        d!("strip-ansi-escapes","0.2.1",true,&[],false,"fnd01_union_906c399fb104a1ecaabdf2f3"),
+        d!("syn","3.0.3",true,&["extra-traits","full","parsing"],false,"fnd01_union_382b44ab7faf189a87c0913e"),
+        d!("tempfile","3.27.0",true,&[],false,"fnd01_union_8bf6067d3bbe6b703f857051"),
+        d!("time","0.3.47",true,&["formatting","macros"],false,"fnd01_union_9042d69f3e99024b93d0b011"),
+        d!("toml","1.1.3",true,&[],true,""),
+        d!("tracing","0.1.44",true,&[],false,"fnd01_union_ce964634f02a69e35c2cbcb2"),
+        d!("tracing-subscriber","0.3.23",true,&[],false,"fnd01_union_5fa3986b8f69483eb72326c1"),
+        d!("trybuild","1.0.118",false,&[],false,"fnd01_union_b6e213e3378be43d1551f3b2"),
+        d!("url","2.5.8",false,&["std"],false,"fnd01_union_0dd1c2b43b5f0432630bc81b"),
+        d!("zeroize","1.9.0",false,&["alloc","derive"],false,"fnd01_union_d82a11d71f953bd4862293a7"),
     ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18272,11 +18348,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             },
             plan: ACQUISITION_PLAN_AUTHORITY,
             control_ledger_path_formula:
-                ".fnd01-run/<role>/<run-id>/control-ledger.bin",
+                HANDOFF_LEDGER_FORMULA,
             acquisition_spool_path_formula:
-                ".fnd01-run/integration-producer/<run-id>/acquisition-spool.bin",
+                ACQUISITION_SPOOL_FORMULA,
             materialization_root_formula:
-                ".fnd01-run/<role>/<run-id>/local-registry",
+                MATERIALIZATION_ROOT_FORMULA,
             tool_probe_working_directory: "/",
             marker_format: "FND01AUTHORv2",
             supply_format: "FND01SUPPLYv4",
@@ -18447,6 +18523,40 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "Produce policy rule dispatch",
             )?;
         }
+        for (name, value) in PRODUCE_JOIN_TEXTS {
+            append_u32_bytes(&mut output, name.as_bytes(), "Produce static text name")?;
+            append_u32_bytes(&mut output, value.as_bytes(), "Produce static text value")?;
+        }
+        for (name, value) in PRODUCE_JOIN_BYTES {
+            append_u32_bytes(&mut output, name.as_bytes(), "Produce static byte name")?;
+            append_u32_bytes(&mut output, value, "Produce static byte value")?;
+        }
+        for values in [PHASE_B_ROLES, FALLBACK_ROOTS, CONTROL_BUILD_ARGV, CONTROL_SCRATCH_FILES] {
+            append_policy_join_usize(&mut output, values.len(), "Produce static list count")?;
+            for value in values { append_u32_bytes(&mut output, value.as_bytes(), "Produce static list value")?; }
+        }
+        for (id, values) in ENVIRONMENT_PROFILES {
+            append_u32_bytes(&mut output, id.as_bytes(), "Produce environment profile")?;
+            append_policy_join_usize(&mut output, values.len(), "Produce environment profile count")?;
+            for (key, value) in *values {
+                append_u32_bytes(&mut output, key.as_bytes(), "Produce environment key")?;
+                append_u32_bytes(&mut output, value.as_bytes(), "Produce environment value")?;
+            }
+        }
+        for bytes in [direct_registry(DIRECT_PREFIX, false)?, direct_registry(UNION_PREFIX, true)?, native_tool_registry()?] {
+            append_u32_bytes(&mut output, &bytes, "Produce compiled registry")?;
+        }
+        for value in [BUILD_STDOUT_LIMIT, BUILD_STDERR_LIMIT, CARGO_CONFIG_POLICY_BYTES, CANDIDATE_SYMLINK_HOP_CAP] {
+            append_policy_join_usize(&mut output, value, "Produce post-acquisition usize")?;
+        }
+        for value in [CONTROL_BUILD_TIMEOUT_SECONDS, MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES, MAX_GATE_EXECUTABLE_BYTES] {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        output.extend_from_slice(&[CANDIDATE_ABSENT, CANDIDATE_SELECTED, CANDIDATE_SHADOWED]);
+        for (left, right) in TOOL_ALIAS_ALLOWED_ROLE_PAIRS {
+            append_u32_bytes(&mut output, left.as_bytes(), "Produce native alias left")?;
+            append_u32_bytes(&mut output, right.as_bytes(), "Produce native alias right")?;
+        }
         Ok(output)
     }
 
@@ -18554,36 +18664,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         fn run_usage(&self) -> TrustResult<FilesystemUsage> {
             self.usage(
-                &[".fnd01-run".to_owned()],
+                &[RUN_SCRATCH_ROOT.to_owned()],
                 self.budget.max_run_scratch_total_bytes,
                 "Phase-B run scratch",
             )
         }
 
         fn fallback_usage(&self) -> TrustResult<FilesystemUsage> {
-            self.usage(
-                &[
-                    "target/debug".to_owned(),
-                    "target/doc".to_owned(),
-                    "target/release".to_owned(),
-                    "target/.rustc_info.json".to_owned(),
-                    "target/CACHEDIR.TAG".to_owned(),
-                ],
+            self.usage(&FALLBACK_ROOTS.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>(),
                 self.budget.max_fallback_target_total_bytes,
                 "Phase-B target fallback set",
             )
         }
 
         fn execution_usage(&self) -> TrustResult<FilesystemUsage> {
-            self.usage(
-                &[
-                    ".fnd01-run".to_owned(),
-                    "target/debug".to_owned(),
-                    "target/doc".to_owned(),
-                    "target/release".to_owned(),
-                    "target/.rustc_info.json".to_owned(),
-                    "target/CACHEDIR.TAG".to_owned(),
-                ],
+            let mut roots = vec![RUN_SCRATCH_ROOT.to_owned()];
+            roots.extend(FALLBACK_ROOTS.iter().map(|value| (*value).to_owned()));
+            self.usage(&roots,
                 self.budget.max_execution_footprint_total_bytes,
                 "combined Phase-B execution footprint",
             )
@@ -18591,13 +18688,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         fn bootstrap_usage(&self) -> TrustResult<FilesystemUsage> {
             let mut roots = Vec::new();
-            for role in ["integration-producer", "independent-attester"] {
+            for role in PHASE_B_ROLES {
                 roots.push(format!(
                     ".fnd01-run/{role}/{}/bootstrap-control-package",
                     self.run_id,
                 ));
                 roots.push(format!(
-                    ".fnd01-run/{role}/{}/bootstrap-control-target",
+                    ".fnd01-run/{role}/{}/{CONTROL_TARGET_SUFFIX}",
                     self.run_id,
                 ));
             }
@@ -18609,13 +18706,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         fn materialization_usage(&self) -> TrustResult<FilesystemUsage> {
-            let roots = ["integration-producer", "independent-attester"]
-                .iter()
+            let roots = PHASE_B_ROLES.iter()
                 .map(|role| {
-                    format!(
-                        ".fnd01-run/{role}/{}/local-registry",
-                        self.run_id,
-                    )
+                    MATERIALIZATION_ROOT_FORMULA.replace("<role>", role).replace("<run-id>", self.run_id)
                 })
                 .collect::<Vec<_>>();
             self.usage(
@@ -18628,18 +18721,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         fn control_plane_usage(&self) -> TrustResult<FilesystemUsage> {
             self.usage(
                 &[
-                    format!(
-                        ".fnd01-run/integration-producer/{}/control-ledger.bin",
-                        self.run_id,
-                    ),
-                    format!(
-                        ".fnd01-run/integration-producer/{}/acquisition-spool.bin",
-                        self.run_id,
-                    ),
-                    format!(
-                        ".fnd01-run/independent-attester/{}/control-ledger.bin",
-                        self.run_id,
-                    ),
+                    HANDOFF_LEDGER_FORMULA.replace("<role>", PHASE_B_ROLES[0]).replace("<run-id>", self.run_id),
+                    ACQUISITION_SPOOL_FORMULA.replace("<run-id>", self.run_id),
+                    HANDOFF_LEDGER_FORMULA.replace("<role>", PHASE_B_ROLES[1]).replace("<run-id>", self.run_id),
                 ],
                 self.budget.max_control_plane_total_bytes,
                 "collective Phase-B control plane",
@@ -18949,7 +19033,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }))
     }
 
-    fn require_complete_produce_acquisition_policy_join(
+    pub(super) fn require_complete_produce_acquisition_policy_join(
         authority: &ProduceAcquisitionAuthority,
     ) -> TrustResult<[u8; 32]> {
         let preimage = encode_produce_acquisition_policy_join(authority)?;
@@ -19012,19 +19096,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         run_with(authority, arguments, environment, authoring_marker, integration_digest,
             authoring_bytes, |a| super::continue_produce_phase_b_control_plane(arguments,
                 environment, authoring_marker, integration_digest, authoring_bytes, a))
-    }
-
-    #[cfg(test)]
-    pub(super) fn acquire_observation(
-        authority: PhaseBAuthority,
-        arguments: &BootstrapArguments,
-        environment: &BootstrapEnvironment,
-        marker: &AuthoringMarker,
-        authoring: &[Vec<u8>; 3],
-    ) -> TrustResult<(ProduceAcquisitionAuthority, String)> {
-        let acquisition = issue(authority, arguments, environment, marker,
-            [0; 32], authoring)?.consume()?;
-        Ok((acquisition.authority, acquisition.role_root))
     }
 
     #[cfg(test)]
@@ -27572,7 +27643,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             mode.to_owned(),
             ".".to_owned(),
             arguments.run_id.clone(),
-            format!(".fnd01-run/{role}/{}/control-ledger.bin", arguments.run_id),
+            HANDOFF_LEDGER_FORMULA.replace("<role>", role).replace("<run-id>", &arguments.run_id),
         ])
     }
 
@@ -30457,7 +30528,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         let sealed_manifest = create_sealed_file(
             repository_root,
-            &format!("{package_root}/Cargo.toml"),
+            &format!("{package_root}/{}", CONTROL_SCRATCH_FILES[0]),
             manifest,
             authority.max_source_file_bytes,
             &space_guard,
@@ -30466,7 +30537,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         let _harness_binding = create_sealed_file(
             repository_root,
-            &format!("{package_root}/src/main.rs"),
+            &format!("{package_root}/{}", CONTROL_SCRATCH_FILES[3]),
             &authoring_bytes[2],
             authority.max_bootstrap_harness_bytes,
             &space_guard,
@@ -30484,7 +30555,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         let _verifier_binding = create_sealed_file(
             repository_root,
-            &format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
+            &format!("{package_root}/{}", CONTROL_SCRATCH_FILES[4]),
             &authoring_bytes[1],
             authority.max_verifier_test_bytes,
             &space_guard,
@@ -30591,7 +30662,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 format!("bootstrap.resolve exit {}", resolve.exit_code),
             ));
         }
-        let lock_relative = format!("{package_root}/Cargo.lock");
+        let lock_relative = format!("{package_root}/{}", CONTROL_SCRATCH_FILES[1]);
         let (lock_snapshot, lock_bytes) = checked_read(
             repository_root,
             &lock_relative,
@@ -30650,7 +30721,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         let (_, rebound_manifest) = checked_read(
             repository_root,
-            &format!("{package_root}/Cargo.toml"),
+            &format!("{package_root}/{}", CONTROL_SCRATCH_FILES[0]),
             authority.max_source_file_bytes,
             Some(sealed_manifest.binding),
         )?;
@@ -30669,7 +30740,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let package_root = post_acquisition.package_root();
         let execution_bin = post_acquisition.execution_bin();
         let admitted_bootstrap_input = post_acquisition.admitted();
-        let target_root = format!("{role_root}/bootstrap-control-target");
+        let target_root = format!("{role_root}/{CONTROL_TARGET_SUFFIX}");
         let local_registry = render_phase_b_relative(
             authority.materialization_root_formula, role, &arguments.run_id,
             "Produce materialization-root formula",
@@ -30682,11 +30753,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             authority.acquisition_spool_path_formula, role, &arguments.run_id,
             "Produce acquisition-spool formula",
         )?;
-        let offline_home = format!("{role_root}/cargo-home/offline");
-        let supply_relative = format!(
-            ".fnd01-run/integration-producer/{}/supply-bundle.bin",
-            arguments.run_id
-        );
+        let offline_home = format!("{role_root}/{OFFLINE_HOME_SUFFIX}");
+        let supply_relative = SUPPLY_PATH_FORMULA.replace("<run-id>", &arguments.run_id);
         if let Some(parent) = Path::new(&supply_relative).parent() {
             if let Some(parent) = parent.to_str() {
                 ensure_repository_directory(
@@ -30747,9 +30815,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let cargo_config = render_sealed_local_registry_config(&registry_abs)?;
         let config_binding = create_sealed_file(
             repository_root,
-            &format!("{package_root}/cargo-config.toml"),
+            &format!("{package_root}/{}", CONTROL_SCRATCH_FILES[2]),
             &cargo_config,
-            1024 * 1024,
+            authority.max_source_file_bytes,
             &space_guard,
             PhaseBSpaceGroup::Bootstrap,
             "bootstrap cargo-config.toml",
@@ -30906,51 +30974,25 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let target_abs =
             utf8_absolute(&repository_root.join(&target_root), "target root absolute")?;
         let config_abs = config_authority.path.clone();
-        let build_argv = vec![
-            cargo.clone(),
-            "build".to_owned(),
-            "--manifest-path".to_owned(),
-            format!("{package_abs}/Cargo.toml"),
-            "--bin".to_owned(),
-            "fnd_01_evidence_harness".to_owned(),
-            "--locked".to_owned(),
-            "--offline".to_owned(),
-            "--message-format=json".to_owned(),
-            "--target-dir".to_owned(),
-            target_abs.clone(),
-            "--config".to_owned(),
-            config_abs.clone(),
-        ];
-        let build_environment = vec![
-            ("AR".to_owned(), acquisition_tools.host_ar.clone()),
-            (
-                "CARGO_HOME".to_owned(),
-                utf8_absolute(&repository_root.join(&offline_home), "offline home")?,
-            ),
-            ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
-            ("CARGO_TARGET_DIR".to_owned(), target_abs.clone()),
-            ("CC".to_owned(), acquisition_tools.host_cc.clone()),
-            (
-                "CLIPPY_DRIVER".to_owned(),
-                acquisition_tools.clippy_driver.clone(),
-            ),
-            ("LANG".to_owned(), "C".to_owned()),
-            ("LC_ALL".to_owned(), "C".to_owned()),
-            (
-                "PATH".to_owned(),
-                compiled_acquisition.execution_bin.clone(),
-            ),
-            (
-                "RANLIB".to_owned(),
-                acquisition_tools.host_ranlib.clone(),
-            ),
-            ("RUSTC".to_owned(), acquisition_tools.rustc.clone()),
-            ("RUSTDOC".to_owned(), acquisition_tools.rustdoc.clone()),
-            ("RUSTFMT".to_owned(), acquisition_tools.rustfmt.clone()),
-            ("RUSTUP_TOOLCHAIN".to_owned(), "nightly-2026-07-11".to_owned()),
-            ("SOURCE_DATE_EPOCH".to_owned(), "0".to_owned()),
-            ("TZ".to_owned(), "UTC".to_owned()),
-        ];
+        let build_argv = std::iter::once(Ok(cargo.clone())).chain(CONTROL_BUILD_ARGV.iter().map(|value| Ok(match *value {
+            "{bootstrap-manifest}" => format!("{package_abs}/Cargo.toml"),
+            "{fresh-bootstrap-control-target}" => target_abs.clone(),
+            "{local-registry-config}" => config_abs.clone(),
+            literal if !literal.contains('{') => literal.to_owned(),
+            _ => return Err(phase_b_error("E_PHASE_B_ACQUISITION_AUTHORITY", "unknown control-build argv authority")),
+        }))).collect::<TrustResult<Vec<_>>>()?;
+        let offline_home_abs = utf8_absolute(&repository_root.join(&offline_home), "offline home")?;
+        let (_, control_environment) = ENVIRONMENT_PROFILES.iter().find(|(id, _)| *id == "offline_control")
+            .ok_or_else(|| phase_b_error("E_PHASE_B_ACQUISITION_AUTHORITY", "offline_control environment is absent"))?;
+        let build_environment = control_environment.iter().map(|(key, value)| Ok(((*key).to_owned(), match *value {
+            "{tool.host-ar.path}" => acquisition_tools.host_ar.clone(), "{fresh-role-cargo-home}" => offline_home_abs.clone(),
+            "{fresh-bootstrap-control-target}" => target_abs.clone(), "{tool.host-cc.path}" => acquisition_tools.host_cc.clone(),
+            "{tool.clippy-driver.path}" => acquisition_tools.clippy_driver.clone(), "{closed-execution-bin}" => compiled_acquisition.execution_bin.clone(),
+            "{tool.host-ranlib.path}" => acquisition_tools.host_ranlib.clone(), "{tool.rustc.path}" => acquisition_tools.rustc.clone(),
+            "{tool.rustdoc.path}" => acquisition_tools.rustdoc.clone(), "{tool.rustfmt.path}" => acquisition_tools.rustfmt.clone(),
+            literal if !literal.contains('{') => literal.to_owned(),
+            _ => return Err(phase_b_error("E_PHASE_B_ACQUISITION_AUTHORITY", "unknown control-build environment authority")),
+        }))).collect::<TrustResult<Vec<_>>>()?;
         require_empty_directory_tree(
             &repository_root.join(&offline_home),
             "fresh offline CARGO_HOME",
@@ -31009,34 +31051,17 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let selected = bind_existing_file(
             repository_root,
             Path::new(&selection.artifact.executable),
-            256 * 1024 * 1024,
+            MAX_GATE_EXECUTABLE_BYTES,
             true,
             "selected control executable",
         )?;
         let handoff_argv_values = handoff_argv(arguments, &selected)?;
         let handoff_env_values = handoff_environment(arguments, environment)?;
-        let scratch_paths = [
-            (
-                format!("{package_root}/Cargo.toml"),
-                authority.max_source_file_bytes,
-            ),
-            (
-                format!("{package_root}/Cargo.lock"),
-                authority.max_bootstrap_lock_bytes,
-            ),
-            (
-                format!("{package_root}/cargo-config.toml"),
-                authority.max_source_file_bytes,
-            ),
-            (
-                format!("{package_root}/src/main.rs"),
-                authority.max_bootstrap_harness_bytes,
-            ),
-            (
-                format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
-                authority.max_verifier_test_bytes,
-            ),
-        ];
+        let maxima = [authority.max_source_file_bytes, authority.max_bootstrap_lock_bytes,
+            authority.max_source_file_bytes, authority.max_bootstrap_harness_bytes,
+            authority.max_verifier_test_bytes];
+        let scratch_paths = CONTROL_SCRATCH_FILES.iter().zip(maxima).map(|(suffix, maximum)|
+            (format!("{package_root}/{suffix}"), maximum)).collect::<Vec<_>>();
         let mut scratch_bindings = Vec::new();
         for (relative, maximum) in &scratch_paths {
             let (snapshot, _) = checked_read(
@@ -31150,14 +31175,31 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         supply: &SupplyBundle,
     ) -> TrustResult<()> {
         let manifest = authority.manifest.as_slice();
-        let _ = (
-            arguments,
-            environment,
-            authoring_marker,
-            integration_digest,
-            authoring_bytes,
-            manifest,
-        );
+        let outer = format!(".fnd01-run/controller/{}/producer-outer.bin", arguments.run_id);
+        let parsed_marker = parse_authoring_marker(&environment.authoring_marker)?;
+        if arguments.mode != BootstrapMode::Attest
+            || arguments.run_root != arguments.repository_root.join(format!(
+                ".fnd01-run/independent-attester/{}", arguments.run_id))
+            || arguments.producer_outer_record_path.as_deref() != Some(outer.as_str())
+            || arguments.final_attestation_path.is_some()
+            || arguments.attester_outer_record_path.is_some()
+            || arguments.gate_input_record_path.is_some()
+            || environment.integration_seal.is_none()
+            || environment.producer_outer_record_path.as_deref() != Some(outer.as_str())
+            || environment.attester_outer_record_path.is_some()
+            || environment.final_gate_seal.is_some()
+            || integration_digest == [0; 32]
+            || parsed_marker != *authoring_marker
+            || decode_lower_hex::<16>(&arguments.run_id, "Attest run ID")? != arguments.run_id_bytes
+            || pinned_toolchain_bin(&environment.closed_path).is_err()
+            || binding_for_bytes(&authoring_bytes[0])? != authority.policy_binding
+            || binding_for_bytes(&authoring_bytes[1])? != authoring_marker.verifier
+            || binding_for_bytes(&authoring_bytes[2])? != authoring_marker.harness
+            || authority.produce_acquisition != compiled_produce_acquisition_authority()
+        {
+            return Err(phase_b_error("E_PHASE_B_ATTEST_INPUT_AUTHORITY", "Attest role-entry authority mismatch"));
+        }
+        produce_acquisition_permit::require_complete_produce_acquisition_policy_join(&authority.produce_acquisition)?;
         if supply.bootstrap_lock.is_empty()
             || supply.bootstrap_lock_binding
                 != binding_for_bytes(&supply.bootstrap_lock)?
@@ -31452,7 +31494,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     #[cfg(test)]
     mod typed_result_tests {
         use super::*;
-        use super::produce_acquisition_permit::acquire_observation;
 
         const FROZEN_POLICY: &[u8] =
             include_bytes!("../../../evidence/fnd-01/dependency-verification.toml");
@@ -31579,6 +31620,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             marker: &AuthoringMarker,
             digest: [u8; 32],
             authoring: &[Vec<u8>; 3],
+            expected_code: &str,
         ) {
             let entered = std::cell::Cell::new(0);
             let error = produce_acquisition_permit::run_with(
@@ -31588,7 +31630,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     Ok(())
                 })
                 .expect_err("Produce authority drift must reject");
-            assert_eq!(error.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
+            assert_eq!(error.code(), expected_code);
             assert_eq!(error.detail(), JOIN_DRIFT);
             assert_eq!(
                 entered.get(), 0,
@@ -31832,7 +31874,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         fn phase_b_authority_fails_before_side_effects() {
             let SyntheticPhaseBInputs {
                 policy,
-                manifest,
+                manifest: _,
                 authoring_bytes,
                 marker,
                 mut arguments,
@@ -31847,42 +31889,51 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(".fnd01-run")
                 .join("integration-producer")
                 .join(&run_id);
-            for family in ["environment", "argv", "CWD", "command", "bound", "deadline", "run-root", "marker", "bootstrap-control", "supply", "Cargo-discovery", "generated-path", "native-tool"] {
-                let mut rejected = synthetic_phase_b_authority(&policy, &manifest);
+            const CODE: &str = "E_PHASE_B_ACQUISITION_AUTHORITY";
+            let cases = [
+                ("environment", "environment_profile[acquisition].required", "plan.environment", CODE),
+                ("argv", "command_template[bootstrap.resolve].argv_template", "plan.commands[0].argv_literals", CODE),
+                ("CWD", "command_template[bootstrap.resolve].working_directory", "plan.commands[0].working_directory_formula", CODE),
+                ("command", "command_template[bootstrap.resolve].template_id", "plan.commands[0].id", CODE),
+                ("bound", "bounds.max_supply_bundle_bytes", "max_supply_bundle_bytes", CODE),
+                ("deadline", "bootstrap_control_plane_contract.resolve_timeout_seconds", "resolve.timeout_seconds", CODE),
+                ("run-root", "generated_path_contract.path_formulas[run-root]", "plan.run_root_formula", CODE),
+                ("marker", "authoring_closure_contract.marker_exact_grammar", "marker_format", CODE),
+                ("bootstrap-control", "bootstrap_control_plane_contract.scratch_root_formula", "plan.scratch_root_formula", CODE),
+                ("supply", "supply_bundle_contract.format", "supply_format", CODE),
+                ("Cargo-discovery", "cargo_config_discovery_contract.discovery_rule", "cargo_discovery_requires_no_config", CODE),
+                ("generated-path", "bootstrap_control_plane_contract.acquisition_spool_path_formula", "acquisition_spool_path_formula", CODE),
+                ("native-tool", "command_environment_profiles.native_tool_candidate_count", "native_tool_count", CODE),
+            ];
+            let (mut families, mut rows, mut mutations) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            for (family, row, mutation, successor) in cases {
+                assert!(families.insert(family) && rows.insert(row) && mutations.insert(mutation),
+                    "duplicate authority tuple for {family}");
+                let mut rejected = validate_phase_b_authority(&policy).expect("frozen authority baseline");
                 let authority = &mut rejected.produce_acquisition;
-                match family {
-                    "environment" => authority.plan.environment = &[],
-                    "argv" => authority.plan.commands[0].argv_literals = &["drift"],
-                    "CWD" => authority.plan.commands[0].working_directory_formula = "drift",
-                    "command" => authority.plan.commands[0].id = "drift",
-                    "bound" => authority.max_supply_bundle_bytes -= 1,
-                    "deadline" => authority.resolve.timeout_seconds -= 1,
-                    "run-root" => authority.plan.run_root_formula = "drift",
-                    "marker" => authority.marker_format = "FND01AUTHOR",
-                    "bootstrap-control" => authority.plan.scratch_root_formula = "drift",
-                    "supply" => authority.supply_format = "FND01SUPPLYv3",
-                    "Cargo-discovery" => authority.cargo_discovery_requires_no_config = false,
-                    "generated-path" => authority.acquisition_spool_path_formula = "drift",
-                    "native-tool" => authority.native_tool_count -= 1,
+                match mutation {
+                    "plan.environment" => authority.plan.environment = &[],
+                    "plan.commands[0].argv_literals" => authority.plan.commands[0].argv_literals = &["drift"],
+                    "plan.commands[0].working_directory_formula" => authority.plan.commands[0].working_directory_formula = "drift",
+                    "plan.commands[0].id" => authority.plan.commands[0].id = "drift",
+                    "max_supply_bundle_bytes" => authority.max_supply_bundle_bytes -= 1,
+                    "resolve.timeout_seconds" => authority.resolve.timeout_seconds -= 1,
+                    "plan.run_root_formula" => authority.plan.run_root_formula = "drift",
+                    "marker_format" => authority.marker_format = "FND01AUTHOR",
+                    "plan.scratch_root_formula" => authority.plan.scratch_root_formula = "drift",
+                    "supply_format" => authority.supply_format = "FND01SUPPLYv3",
+                    "cargo_discovery_requires_no_config" => authority.cargo_discovery_requires_no_config = false,
+                    "acquisition_spool_path_formula" => authority.acquisition_spool_path_formula = "drift",
+                    "native_tool_count" => authority.native_tool_count -= 1,
                     _ => unreachable!("closed family matrix"),
                 }
-                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes);
+                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, successor);
                 assert!(!no_effect_root.exists(), "{family}");
+                let pristine = validate_phase_b_authority(&policy).expect("pristine authority reacceptance");
+                produce_acquisition_permit::require_complete_produce_acquisition_policy_join(
+                    &pristine.produce_acquisition).expect("pristine join reacceptance");
             }
-            let (observed, role_root) = acquire_observation(
-                synthetic_phase_b_authority(&policy, &manifest),
-                &arguments,
-                &environment,
-                &marker,
-                &authoring_bytes,
-            )
-            .expect("exact Produce authority");
-            assert_eq!(
-                role_root,
-                format!(".fnd01-run/integration-producer/{run_id}")
-            );
-            assert_eq!(observed, compiled_produce_acquisition_authority());
-            assert_eq!(observed.full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
+            assert_eq!((families.len(), rows.len(), mutations.len()), (13, 13, 13));
             assert!(!no_effect_root.exists());
 
             let SyntheticPhaseBInputs {
@@ -31904,11 +31955,16 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             environment.closed_path = "/definitely-missing-phase-b-path".to_owned();
             let mut retained = super::super::trust_std::retain_authoring_files(
                 &arguments.repository_root, &marker).expect("retained authoring set");
+            let before = snapshot_tree(&arguments.repository_root, "Produce entry unchanged")
+                .expect("Produce entry snapshot");
             assert!(!arguments.run_root.exists());
             let error = run_phase_b(&arguments, &environment, &marker, None,
                 &mut retained, None)
             .expect_err("Phase-B rejects unqualified PATH");
             assert_eq!(error.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
+            retained.revalidate_after_consumption().expect("unchanged retained authoring");
+            assert_eq!(snapshot_tree(&arguments.repository_root, "Produce entry unchanged")
+                .expect("Produce entry recheck"), before);
             assert!(!arguments.run_root.exists());
         }
 
@@ -31920,39 +31976,29 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 manifest: _,
                 authoring_bytes,
                 marker,
-                arguments,
+                mut arguments,
                 environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x12);
-            let (authority, role_root) = acquire_observation(
-                validate_phase_b_authority(&policy)
-                    .expect("independently validated frozen Phase-B policy"),
-                &arguments,
-                &environment,
-                &marker,
-                &authoring_bytes,
-            )
-            .expect("independently constructed Produce authority");
-            assert_eq!(role_root, format!(".fnd01-run/integration-producer/{}", arguments.run_id));
-            assert_eq!(authority, compiled_produce_acquisition_authority());
-            assert_eq!(authority.full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
+            arguments.repository_root = super::super::fresh_test_root("phase-b-positive");
+            arguments.run_root = arguments.repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id));
+            let entered = std::cell::Cell::new(0);
+            produce_acquisition_permit::run_with(
+                validate_phase_b_authority(&policy).expect("independent frozen authority"),
+                &arguments, &environment, &marker, [0; 32], &authoring_bytes, |bounded| {
+                    entered.set(entered.get() + 1);
+                    assert_eq!(bounded.role_root(), format!(".fnd01-run/integration-producer/{}", arguments.run_id));
+                    assert_eq!(bounded.authority(), &compiled_produce_acquisition_authority());
+                    assert_eq!(bounded.authority().full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
+                    Ok(())
+                },
+            ).expect("complete joined authority issues one bounded permit");
+            assert_eq!(entered.get(), 1);
         }
 
         #[test]
         fn phase_b_produce_permit_is_single_use_and_bounded() {
             produce_acquisition_permit::assert_single_use_type();
-            let body = super::super::ordinary::ordinary_function_body(
-                include_str!("fnd_01_dependency_evidence.rs"),
-                "continue_produce_phase_b_control_plane",
-            );
-            let barrier = body
-                .find("authorize_later_effects")
-                .expect("authority barrier");
-            for marker in ["let supply_bound", "materialize_supply", "let spool_bound",
-                "\"bootstrap-control.build\"", "let _ledger_bound", "exec_handoff"] {
-                let effect = body.find(marker).expect("effect marker");
-                assert_eq!(Some(effect), body.rfind(marker));
-                assert!(barrier < effect);
-            }
             find_once(
                 FROZEN_POLICY,
                 b"Produce returns E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING at that boundary",
@@ -31998,19 +32044,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert_eq!(entered.get(), 1);
             assert_eq!(fs_identity(&fs::metadata(&package_root).expect("rejected")), before);
             assert!(fs::read_dir(&package_root).expect("unchanged").next().is_none());
-            let (authority, _) = acquire_observation(
-                synthetic_phase_b_authority(&policy, &manifest),
-                &arguments,
-                &environment,
-                &marker,
-                &authoring_bytes,
-            )
-            .expect("single-use Produce permit");
-            assert_eq!(
-                authority.full_policy_join_sha256,
-                PRODUCE_POLICY_JOIN_SHA256,
-            );
-
             let archive = [
                 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0,
                 0, 0, 0, 0, 0,
@@ -33245,6 +33278,47 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
+        fn run_attest_archive_case(archive: Vec<u8>, namespace: &str) -> TrustError {
+            let SyntheticPhaseBInputs { authoring_bytes, marker, mut arguments, mut environment, .. } =
+                synthetic_phase_b_inputs(BootstrapMode::Attest, 0x22);
+            let root = super::super::fresh_test_root(namespace);
+            arguments.repository_root = root.clone();
+            arguments.run_root = root.join(format!(".fnd01-run/independent-attester/{}", arguments.run_id));
+            for (relative, bytes) in super::super::trust_std::AUTHORING_PATHS.iter().zip(&authoring_bytes) {
+                let path = root.join(relative); fs::create_dir_all(path.parent().expect("authoring parent")).expect("authoring tree");
+                fs::write(path, bytes).expect("authoring member");
+            }
+            let (supply, lock, _) = synthetic_supply_fixture(archive);
+            let rows = [lock, b"source snapshot\n".to_vec(), supply, b"workspace receipt\n".to_vec(), b"integration index\n".to_vec()];
+            for (relative, bytes) in super::super::trust_std::INTEGRATION_SEAL_PATHS.iter().zip(&rows) {
+                let path = root.join(relative); fs::create_dir_all(path.parent().expect("integration parent")).expect("integration tree");
+                fs::write(path, bytes).expect("integration member");
+            }
+            let integration_rows = std::array::from_fn(|index| (
+                super::super::trust_std::INTEGRATION_SEAL_PATHS[index], rows[index].as_slice()));
+            let fixture = super::super::trust_std::attest_fixture_outer_and_integration(
+                &arguments.run_id, &environment.authoring_marker, integration_rows).expect("coherent Attest seal");
+            let outer = format!(".fnd01-run/controller/{}/producer-outer.bin", arguments.run_id);
+            let outer_path = root.join(&outer); fs::create_dir_all(outer_path.parent().expect("outer parent")).expect("outer tree");
+            fs::write(&outer_path, &fixture.producer_outer_bytes).expect("producer outer");
+            arguments.producer_outer_record_path = Some(outer.clone());
+            environment.producer_outer_record_path = Some(outer.clone());
+            environment.integration_seal = Some(fixture.integration_marker.clone());
+            let seal = super::super::trust_std::parse_integration_seal(
+                &fixture.integration_marker, &marker.closure_sha256).expect("production seal parse");
+            let mut authoring = super::super::trust_std::retain_authoring_files(&root, &marker).expect("retained authoring");
+            let mut integration = super::super::trust_std::retain_integration_and_outer_files(&root, &seal, &outer).expect("retained integration");
+            let before = snapshot_tree(&root, "Attest unchanged tree").expect("Attest tree snapshot");
+            assert!(!arguments.run_root.exists());
+            let error = run_phase_b(&arguments, &environment, &marker, Some(&seal), &mut authoring, Some(&mut integration))
+                .expect_err("Attest remains fail closed");
+            authoring.revalidate_after_consumption().expect("unchanged authoring");
+            integration.revalidate_after_consumption().expect("unchanged integration");
+            assert_eq!(snapshot_tree(&root, "Attest unchanged tree").expect("Attest tree recheck"), before);
+            assert!(!arguments.run_root.exists());
+            error
+        }
+
         #[test]
         fn phase_b_attest_supply_archive_expansion_remains_fail_closed() {
             find_once(
@@ -33258,68 +33332,18 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ];
             archive.push(0x03);
             archive.extend_from_slice(&[0; 8]);
-            let supply = synthetic_valid_supply(&archive);
-            let baseline = supply.clone();
-            let SyntheticPhaseBInputs {
-                policy,
-                manifest: _,
-                authoring_bytes,
-                marker,
-                arguments,
-                environment,
-            } = synthetic_phase_b_inputs(BootstrapMode::Attest, 0x22);
-            let error = attest_phase_b_supply_validation(
-                &arguments,
-                &environment,
-                &marker,
-                [0x33; 32],
-                &authoring_bytes,
-                validate_phase_b_authority(&policy)
-                    .expect("frozen Attest authority"),
-                &supply,
-            )
-            .expect_err(
-                "std-only Attest must stop before materialization authority",
-            );
+            let error = run_attest_archive_case(archive.clone(), "phase-b-attest-pristine");
             assert_eq!(error.code(), "E_PHASE_B_ATTEST_INPUT_AUTHORITY");
             assert!(error.detail().contains("validated 1 crate archive framings"));
-            assert_eq!(supply, baseline);
 
-            let mut malformed_archive = archive;
+            let mut malformed_archive = archive.clone();
             malformed_archive[0] ^= 1;
-            let malformed = synthetic_valid_supply(&malformed_archive);
-            let malformed_baseline = malformed.clone();
-            let malformed_error = attest_phase_b_supply_validation(
-                &arguments,
-                &environment,
-                &marker,
-                [0x33; 32],
-                &authoring_bytes,
-                validate_phase_b_authority(&policy)
-                    .expect("frozen Attest authority"),
-                &malformed,
-            )
-            .expect_err("coherent one-byte archive framing drift must fail");
-            assert_eq!(
-                malformed_error.code(),
-                "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
-            );
-            assert_eq!(malformed, malformed_baseline);
-            assert_eq!(
-                attest_phase_b_supply_validation(
-                    &arguments,
-                    &environment,
-                    &marker,
-                    [0x33; 32],
-                    &authoring_bytes,
-                    validate_phase_b_authority(&policy)
-                        .expect("frozen Attest authority"),
-                    &supply,
-                )
-                .expect_err("pristine Attest boundary remains fail closed")
-                .code(),
-                "E_PHASE_B_ATTEST_INPUT_AUTHORITY",
-            );
+            assert_eq!(archive.iter().zip(&malformed_archive).filter(|(a, b)| a != b).count(), 1);
+            let malformed_error = run_attest_archive_case(malformed_archive, "phase-b-attest-negative");
+            assert_eq!(malformed_error.code(), "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION");
+            assert!(malformed_error.detail().contains("gzip deflate magic"));
+            assert_eq!(run_attest_archive_case(archive, "phase-b-attest-reaccept").code(),
+                "E_PHASE_B_ATTEST_INPUT_AUTHORITY");
         }
 
         #[test]
@@ -34050,7 +34074,7 @@ mod bootstrap {
     }
 }
 
-#[cfg(any(not(fnd01_bootstrap), test))]
+#[cfg(not(fnd01_bootstrap))]
 // This module intentionally contains frozen byte-level fixture records and
 // source-order guards.  Keep its existing layout stable; R4 edits below are
 // formatted manually rather than applying a whole-file formatter.
@@ -35339,57 +35363,34 @@ activate = 1\n";
 
     #[derive(Debug, Deserialize)]
     struct Policy {
-        format: String,
-        schema_version: u32,
-        policy_id: String,
-        protocol_version: String,
-        recorded_on: String,
-        hash_algorithm: String,
-        authoring_bead: String,
-        integration_producer_bead: String,
-        final_attester_bead: String,
-        source_input_count: usize,
-        source_input_total_bytes: u64,
-        negative_case_count: usize,
-        derived_output_count: usize,
-        derived_toml_count: usize,
-        derived_binary_count: usize,
-        derived_direct_parent_edge_count: usize,
-        deny_unknown_policy_fields: bool,
-        deny_unknown_receipt_fields: bool,
-        aggregate_support_claimed: bool,
-        paths: PolicyPaths,
-        bounds: Bounds,
-        source_tree: SourceTreeContract,
-        source_input_contract: SourceInputContract,
-        parse_inventory: ParseInventory,
-        negative_inventory: NegativeInventoryContract,
-        mutation_contract: MutationContract,
-        fixture_contract: FixtureContract,
-        assertion_contract: AssertionContract,
-        observation_typing: ObservationTyping,
+        format: String, schema_version: u32, policy_id: String,
+        protocol_version: String, recorded_on: String, hash_algorithm: String,
+        authoring_bead: String, integration_producer_bead: String,
+        final_attester_bead: String, source_input_count: usize,
+        source_input_total_bytes: u64, negative_case_count: usize,
+        derived_output_count: usize, derived_toml_count: usize,
+        derived_binary_count: usize, derived_direct_parent_edge_count: usize,
+        deny_unknown_policy_fields: bool, deny_unknown_receipt_fields: bool,
+        aggregate_support_claimed: bool, paths: PolicyPaths, bounds: Bounds,
+        source_tree: SourceTreeContract, source_input_contract: SourceInputContract,
+        parse_inventory: ParseInventory, negative_inventory: NegativeInventoryContract,
+        mutation_contract: MutationContract, fixture_contract: FixtureContract,
+        assertion_contract: AssertionContract, observation_typing: ObservationTyping,
         archive_parser_contract: ArchiveParserContract,
-        output_namespace: OutputNamespaceContract,
-        receipt_contract: ReceiptContract,
+        output_namespace: OutputNamespaceContract, receipt_contract: ReceiptContract,
         parent_contract: ParentContract,
         final_attestation_contract: FinalAttestationContract,
-        pending_contract: PendingContract,
-        nonpromotion_contract: NonpromotionContract,
-        source_family: Vec<SourceFamilyContract>,
-        negative_family: Vec<NegativeSourceContract>,
-        archive_contract: Vec<ArchiveContract>,
-        quarantine: Vec<QuarantineContract>,
-        projection: Vec<ProjectionContract>,
-        record_schema: Vec<RecordSchemaContract>,
+        pending_contract: PendingContract, nonpromotion_contract: NonpromotionContract,
+        source_family: Vec<SourceFamilyContract>, negative_family: Vec<NegativeSourceContract>,
+        archive_contract: Vec<ArchiveContract>, quarantine: Vec<QuarantineContract>,
+        projection: Vec<ProjectionContract>, record_schema: Vec<RecordSchemaContract>,
         record_variant_schema: Vec<RecordVariantSchemaContract>,
         receipt_schema: Vec<ReceiptSchemaContract>,
         command_template: Vec<CommandTemplateContract>,
         environment_profile: Vec<EnvironmentProfileContract>,
         target_tool_profile: Vec<TargetToolProfileContract>,
-        source_input: Vec<SourceFileContract>,
-        semantic_assertion: Vec<SemanticAssertion>,
-        negative_case: Vec<NegativeCase>,
-        mutation_fixture: Vec<MutationFixture>,
+        source_input: Vec<SourceFileContract>, semantic_assertion: Vec<SemanticAssertion>,
+        negative_case: Vec<NegativeCase>, mutation_fixture: Vec<MutationFixture>,
         derived_output: Vec<DerivedOutputContract>,
         #[serde(flatten)]
         _validated_unmodeled: BTreeMap<String, toml::Value>,
@@ -35398,117 +35399,60 @@ activate = 1\n";
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PolicyPaths {
-        repository_root_resolution: String,
-        repository_root_parent_count: usize,
-        ordinary_current_dir_allowed: bool,
-        role_entry_current_dir_required: bool,
-        role_entry_current_dir_read_count: usize,
-        role_entry_repository_token: String,
-        environment_path_search_allowed: bool,
-        ancestor_manifest_discovery_allowed: bool,
-        source_root: String,
-        policy_path: String,
-        verifier_test_path: String,
-        bootstrap_harness_path: String,
-        integration_root: String,
-        final_attestation_path: String,
-        run_scratch_root: String,
-        integration_is_flat: bool,
-        follow_symlinks: bool,
-        allow_absolute_paths: bool,
-        allow_backslashes: bool,
-        allow_empty_components: bool,
-        allow_dot_components: bool,
-        allow_dot_dot_components: bool,
-        allow_drive_prefixes: bool,
-        allow_nul: bool,
-        reject_hardlinks: bool,
-        reject_special_files: bool,
-        reject_ascii_case_collisions: bool,
-        reject_extra_files: bool,
-        reject_extra_directories: bool,
-        typed_path_scope_rule: String,
+        repository_root_resolution: String, repository_root_parent_count: usize,
+        ordinary_current_dir_allowed: bool, role_entry_current_dir_required: bool,
+        role_entry_current_dir_read_count: usize, role_entry_repository_token: String,
+        environment_path_search_allowed: bool, ancestor_manifest_discovery_allowed: bool,
+        source_root: String, policy_path: String, verifier_test_path: String,
+        bootstrap_harness_path: String, integration_root: String,
+        final_attestation_path: String, run_scratch_root: String,
+        integration_is_flat: bool, follow_symlinks: bool, allow_absolute_paths: bool,
+        allow_backslashes: bool, allow_empty_components: bool, allow_dot_components: bool,
+        allow_dot_dot_components: bool, allow_drive_prefixes: bool, allow_nul: bool,
+        reject_hardlinks: bool, reject_special_files: bool,
+        reject_ascii_case_collisions: bool, reject_extra_files: bool,
+        reject_extra_directories: bool, typed_path_scope_rule: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Bounds {
-        max_path_bytes: usize,
-        max_path_component_bytes: usize,
-        max_path_depth: usize,
-        max_id_bytes: usize,
-        max_selector_bytes: usize,
-        max_selector_depth: usize,
-        max_source_file_bytes: u64,
-        max_policy_bytes: u64,
-        max_verifier_test_bytes: u64,
-        max_bootstrap_harness_bytes: u64,
-        max_receipt_toml_bytes: u64,
-        max_supply_bundle_bytes: u64,
-        max_sparse_cache_input_bytes: u64,
-        max_advisory_database_bytes: u64,
-        max_command_stream_bundle_bytes: u64,
-        max_command_stream_expanded_bytes: u64,
-        max_package_artifact_bytes: u64,
-        max_final_attestation_bytes: u64,
-        max_integration_total_bytes: u64,
-        max_outer_transport_record_bytes: u64,
-        max_outer_transport_argv_items: usize,
-        max_outer_transport_assignments: usize,
-        max_outer_transport_argument_bytes: usize,
-        max_outer_transport_key_bytes: usize,
-        max_outer_transport_value_bytes: usize,
-        max_outer_transport_stdout_bytes: u64,
-        max_outer_transport_stderr_bytes: u64,
-        max_outer_transport_final_argv_items: usize,
-        max_outer_transport_cfg_entries: usize,
-        max_outer_transport_cfg_bytes: u64,
-        max_final_gate_stdout_bytes: u64,
-        max_final_gate_stderr_bytes: u64,
-        max_final_gate_input_bytes: u64,
-        max_final_gate_result_bytes: u64,
-        max_gate_executable_bytes: u64,
-        max_control_ledger_bytes: u64,
-        max_acquisition_spool_bytes: u64,
-        max_raw_stdout_bytes: u64,
-        max_raw_stderr_bytes: u64,
-        max_argv_items: usize,
-        max_argument_bytes: usize,
-        max_environment_items: usize,
-        max_environment_key_bytes: usize,
-        max_environment_value_bytes: usize,
-        max_parent_count: usize,
-        max_archive_compressed_bytes: u64,
-        max_archive_expanded_bytes: u64,
-        max_archive_member_count: usize,
-        max_archive_member_bytes: u64,
-        max_tree_entry_count: usize,
-        max_run_scratch_total_bytes: u64,
-        max_execution_footprint_total_bytes: u64,
-        max_fallback_target_total_bytes: u64,
-        max_transport_target_total_bytes: u64,
-        max_controller_scratch_total_bytes: u64,
-        max_control_plane_total_bytes: u64,
-        max_package_source_total_bytes: u64,
-        max_quarantine_total_bytes: u64,
-        max_return_tree_total_bytes: u64,
-        max_publication_staging_total_bytes: u64,
-        max_bootstrap_scratch_total_bytes: u64,
-        max_materialization_total_bytes: u64,
-        max_projection_tree_total_bytes: u64,
-        max_package_tree_total_bytes: u64,
-        max_consumer_tree_total_bytes: u64,
-        max_external_input_entry_count: usize,
-        max_external_input_member_bytes: u64,
-        max_external_input_total_bytes: u64,
-        max_record_depth: usize,
-        max_record_field_count: usize,
-        max_record_array_items: usize,
-        max_record_string_bytes: usize,
-        max_record_blob_bytes: u64,
-        max_record_total_bytes: u64,
-        max_record_registry_bytes: u64,
-        max_receipt_schema_registry_bytes: u64,
+        max_path_bytes: usize, max_path_component_bytes: usize, max_path_depth: usize,
+        max_id_bytes: usize, max_selector_bytes: usize, max_selector_depth: usize,
+        max_source_file_bytes: u64, max_policy_bytes: u64, max_verifier_test_bytes: u64,
+        max_bootstrap_harness_bytes: u64, max_receipt_toml_bytes: u64,
+        max_supply_bundle_bytes: u64, max_sparse_cache_input_bytes: u64,
+        max_advisory_database_bytes: u64, max_command_stream_bundle_bytes: u64,
+        max_command_stream_expanded_bytes: u64, max_package_artifact_bytes: u64,
+        max_final_attestation_bytes: u64, max_integration_total_bytes: u64,
+        max_outer_transport_record_bytes: u64, max_outer_transport_argv_items: usize,
+        max_outer_transport_assignments: usize, max_outer_transport_argument_bytes: usize,
+        max_outer_transport_key_bytes: usize, max_outer_transport_value_bytes: usize,
+        max_outer_transport_stdout_bytes: u64, max_outer_transport_stderr_bytes: u64,
+        max_outer_transport_final_argv_items: usize, max_outer_transport_cfg_entries: usize,
+        max_outer_transport_cfg_bytes: u64, max_final_gate_stdout_bytes: u64,
+        max_final_gate_stderr_bytes: u64, max_final_gate_input_bytes: u64,
+        max_final_gate_result_bytes: u64, max_gate_executable_bytes: u64,
+        max_control_ledger_bytes: u64, max_acquisition_spool_bytes: u64,
+        max_raw_stdout_bytes: u64, max_raw_stderr_bytes: u64, max_argv_items: usize,
+        max_argument_bytes: usize, max_environment_items: usize,
+        max_environment_key_bytes: usize, max_environment_value_bytes: usize,
+        max_parent_count: usize, max_archive_compressed_bytes: u64,
+        max_archive_expanded_bytes: u64, max_archive_member_count: usize,
+        max_archive_member_bytes: u64, max_tree_entry_count: usize,
+        max_run_scratch_total_bytes: u64, max_execution_footprint_total_bytes: u64,
+        max_fallback_target_total_bytes: u64, max_transport_target_total_bytes: u64,
+        max_controller_scratch_total_bytes: u64, max_control_plane_total_bytes: u64,
+        max_package_source_total_bytes: u64, max_quarantine_total_bytes: u64,
+        max_return_tree_total_bytes: u64, max_publication_staging_total_bytes: u64,
+        max_bootstrap_scratch_total_bytes: u64, max_materialization_total_bytes: u64,
+        max_projection_tree_total_bytes: u64, max_package_tree_total_bytes: u64,
+        max_consumer_tree_total_bytes: u64, max_external_input_entry_count: usize,
+        max_external_input_member_bytes: u64, max_external_input_total_bytes: u64,
+        max_record_depth: usize, max_record_field_count: usize,
+        max_record_array_items: usize, max_record_string_bytes: usize,
+        max_record_blob_bytes: u64, max_record_total_bytes: u64,
+        max_record_registry_bytes: u64, max_receipt_schema_registry_bytes: u64,
         max_policy_shape_registry_bytes: u64,
         exact_source_input_count: usize,
         exact_negative_case_count: usize,
@@ -35584,402 +35528,232 @@ activate = 1\n";
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SourceTreeContract {
-        format: String,
-        path_scope: String,
-        ordering: String,
-        record_encoding: String,
-        domain_prefix: String,
-        file_count: usize,
-        total_bytes: u64,
-        sha256: String,
-        excluded_exact_paths: Vec<String>,
-        excluded_exact_directory: String,
+        format: String, path_scope: String, ordering: String, record_encoding: String,
+        domain_prefix: String, file_count: usize, total_bytes: u64, sha256: String,
+        excluded_exact_paths: Vec<String>, excluded_exact_directory: String,
         wildcard_exclusions_allowed: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SourceInputContract {
-        all_rows_bytes_available: bool,
-        all_rows_rehash_mode: String,
-        all_rows_claim_ceiling: String,
-        all_rows_required: bool,
-        all_rows_source_tree_members: bool,
-        checked_in_archives_remain_local_exact_bytes: bool,
+        all_rows_bytes_available: bool, all_rows_rehash_mode: String,
+        all_rows_claim_ceiling: String, all_rows_required: bool,
+        all_rows_source_tree_members: bool, checked_in_archives_remain_local_exact_bytes: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ParseInventory {
-        toml: usize,
-        json: usize,
-        utf8_text: usize,
-        opaque_binary: usize,
-        gzip_tar: usize,
+        toml: usize, json: usize, utf8_text: usize, opaque_binary: usize, gzip_tar: usize,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct NegativeInventoryContract {
-        family_order: Vec<String>,
-        row_order_authoritative: bool,
-        canonical_order: String,
-        source_indices_must_be_contiguous_per_family: bool,
-        canonical_record: String,
-        count: usize,
-        canonical_bytes: usize,
-        sha256: String,
-        ids_globally_unique: bool,
-        one_recipe_per_id: bool,
-        anonymous_corpora_excluded: bool,
+        family_order: Vec<String>, row_order_authoritative: bool, canonical_order: String,
+        source_indices_must_be_contiguous_per_family: bool, canonical_record: String,
+        count: usize, canonical_bytes: usize, sha256: String, ids_globally_unique: bool,
+        one_recipe_per_id: bool, anonymous_corpora_excluded: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct MutationContract {
-        allowed_operations: Vec<String>,
-        allowed_integrity_modes: Vec<String>,
-        default_integrity_mode: String,
-        all_cases_must_rebind_virtual_hashes: bool,
-        selector_grammar: String,
-        require_target_path_exists: bool,
-        require_target_selector_resolves: bool,
-        require_non_noop_mutation: bool,
+        allowed_operations: Vec<String>, allowed_integrity_modes: Vec<String>,
+        default_integrity_mode: String, all_cases_must_rebind_virtual_hashes: bool,
+        selector_grammar: String, require_target_path_exists: bool,
+        require_target_selector_resolves: bool, require_non_noop_mutation: bool,
         remove_argument_forbidden_except_remove_exact_fixture: bool,
-        duplicate_argument_forbidden: bool,
-        swap_argument_forbidden: bool,
-        swap_secondary_selector_required: bool,
-        insert_argument_required: bool,
-        replace_argument_required: bool,
-        toggle_bool_argument_required: bool,
-        increment_argument_required: bool,
-        append_feature_argument_required: bool,
-        rename_key_argument_required: bool,
-        replace_bytes_argument_required: bool,
-        replace_bytes_argument_grammar: String,
-        non_swap_secondary_selector_forbidden: bool,
-        stable_diagnostic_format: String,
-        require_exact_one_primary_diagnostic: bool,
-        additional_diagnostic_rule: String,
-        require_literal_family_id_rule_and_path: bool,
-        forbid_negative_row_self_mutation: bool,
-        negative_case_rows_deny_unknown_fields: bool,
-        negative_case_exact_fields: Vec<String>,
-        assertion_registry_is_only_oracle_authority: bool,
-        forbid_result_field_mutation: bool,
-        forbid_verified_field_mutation: bool,
+        duplicate_argument_forbidden: bool, swap_argument_forbidden: bool,
+        swap_secondary_selector_required: bool, insert_argument_required: bool,
+        replace_argument_required: bool, toggle_bool_argument_required: bool,
+        increment_argument_required: bool, append_feature_argument_required: bool,
+        rename_key_argument_required: bool, replace_bytes_argument_required: bool,
+        replace_bytes_argument_grammar: String, non_swap_secondary_selector_forbidden: bool,
+        stable_diagnostic_format: String, require_exact_one_primary_diagnostic: bool,
+        additional_diagnostic_rule: String, require_literal_family_id_rule_and_path: bool,
+        forbid_negative_row_self_mutation: bool, negative_case_rows_deny_unknown_fields: bool,
+        negative_case_exact_fields: Vec<String>, assertion_registry_is_only_oracle_authority: bool,
+        forbid_result_field_mutation: bool, forbid_verified_field_mutation: bool,
         semantic_drift_meta_test_required: bool,
         semantic_drift_meta_test_rebinds_file_and_tree_hashes: bool,
-        mutation_execution_isolation: String,
-        quarantine_meta_test_exception: String,
-        structured_toml_mutation_allowed: bool,
-        structured_json_mutation_allowed: bool,
+        mutation_execution_isolation: String, quarantine_meta_test_exception: String,
+        structured_toml_mutation_allowed: bool, structured_json_mutation_allowed: bool,
         structured_json_duplicate_keys_rejected: bool,
         structured_json_reserved_number_member_name_rule: String,
         structured_json_depth_and_member_bounds_required: bool,
         structured_json_numbers_must_be_losslessly_classified: bool,
-        canonical_recipe_encoding: String,
-        canonical_recipe_order: String,
-        canonical_recipe_fields: Vec<String>,
-        canonical_recipe_string_encoding: String,
+        canonical_recipe_encoding: String, canonical_recipe_order: String,
+        canonical_recipe_fields: Vec<String>, canonical_recipe_string_encoding: String,
         canonical_recipe_source_index_encoding: String,
-        canonical_recipe_optional_string_encoding: String,
-        canonical_recipe_count: usize,
-        canonical_recipe_bytes: usize,
-        canonical_recipe_sha256: String,
+        canonical_recipe_optional_string_encoding: String, canonical_recipe_count: usize,
+        canonical_recipe_bytes: usize, canonical_recipe_sha256: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct FixtureContract {
-        reference_prefix: String,
-        exact_fixture_count: usize,
-        max_fixture_id_bytes: usize,
-        max_fixture_value_bytes: usize,
-        max_fixture_value_depth: usize,
-        max_fixture_value_members: usize,
-        allowed_applications: Vec<String>,
-        allowed_value_kinds: Vec<String>,
-        ids_must_be_unique: bool,
-        all_references_must_resolve: bool,
-        all_fixtures_must_be_referenced: bool,
-        application_must_match_operation: bool,
-        replace_operation_applications: Vec<String>,
-        remove_operation_applications: Vec<String>,
-        insert_operation_applications: Vec<String>,
-        swap_operation_applications: Vec<String>,
-        duplicate_operation_applications: Vec<String>,
+        reference_prefix: String, exact_fixture_count: usize, max_fixture_id_bytes: usize,
+        max_fixture_value_bytes: usize, max_fixture_value_depth: usize,
+        max_fixture_value_members: usize, allowed_applications: Vec<String>,
+        allowed_value_kinds: Vec<String>, ids_must_be_unique: bool,
+        all_references_must_resolve: bool, all_fixtures_must_be_referenced: bool,
+        application_must_match_operation: bool, replace_operation_applications: Vec<String>,
+        remove_operation_applications: Vec<String>, insert_operation_applications: Vec<String>,
+        swap_operation_applications: Vec<String>, duplicate_operation_applications: Vec<String>,
         toggle_bool_operation_applications: Vec<String>,
-        increment_operation_applications: Vec<String>,
-        append_feature_operation_applications: Vec<String>,
-        rename_key_operation_applications: Vec<String>,
-        replace_bytes_operation_applications: Vec<String>,
-        value_kind_must_match_value: bool,
-        payload_must_be_nonempty: bool,
-        payload_must_differ_from_canonical_target: bool,
-        target_type_compatibility_required: bool,
-        literal_fixture_reference_is_forbidden: bool,
-        toml_and_json_target_compatibility_required: bool,
+        increment_operation_applications: Vec<String>, append_feature_operation_applications: Vec<String>,
+        rename_key_operation_applications: Vec<String>, replace_bytes_operation_applications: Vec<String>,
+        value_kind_must_match_value: bool, payload_must_be_nonempty: bool,
+        payload_must_differ_from_canonical_target: bool, target_type_compatibility_required: bool,
+        literal_fixture_reference_is_forbidden: bool, toml_and_json_target_compatibility_required: bool,
         remove_exact_value_must_equal_selected_value: bool,
-        table_member_value_requires_exact_keys: Vec<String>,
-        table_member_relative_selector_grammar: String,
+        table_member_value_requires_exact_keys: Vec<String>, table_member_relative_selector_grammar: String,
         insert_table_member_relative_selector_component_count: usize,
-        table_member_key_collision_allowed_for_insert: bool,
-        insert_table_member_requires_absent_target: bool,
+        table_member_key_collision_allowed_for_insert: bool, insert_table_member_requires_absent_target: bool,
         replace_table_member_key_must_exist: bool,
         replace_table_member_requires_exact_single_resolution: bool,
         replace_table_member_identity_is_required_for_table_arrays: bool,
-        fixture_rows_deny_unknown_fields: bool,
-        value_digest_encoding: String,
-        canonical_record: String,
-        canonical_encoding: String,
-        canonical_count: usize,
-        canonical_bytes: usize,
-        canonical_sha256: String,
+        fixture_rows_deny_unknown_fields: bool, value_digest_encoding: String,
+        canonical_record: String, canonical_encoding: String, canonical_count: usize,
+        canonical_bytes: usize, canonical_sha256: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct AssertionContract {
-        exact_assertion_count: usize,
-        baseline_preflight_required: bool,
-        post_mutation_full_scan_required: bool,
-        observation_encoding: String,
-        header: String,
-        toml_kind_byte: u8,
-        json_kind_byte: u8,
-        raw_kind_byte: u8,
-        path_encoding: String,
-        selector_tuple_encoding: String,
-        value_sequence: String,
-        toml_domain: String,
-        json_domain: String,
-        raw_domain: String,
-        missing_tag: String,
-        json_null_tag: String,
-        boolean_tag: String,
-        toml_integer_tag: String,
-        toml_float_tag: String,
-        string_tag: String,
-        array_tag: String,
-        map_tag: String,
-        raw_bytes_tag: String,
-        toml_datetime_tag: String,
-        json_number_tag: String,
-        hash_algorithm: String,
-        digest_encoding: String,
-        allowed_observation_modes: Vec<String>,
-        allowed_violation_modes: Vec<String>,
+        exact_assertion_count: usize, baseline_preflight_required: bool,
+        post_mutation_full_scan_required: bool, observation_encoding: String,
+        header: String, toml_kind_byte: u8, json_kind_byte: u8, raw_kind_byte: u8,
+        path_encoding: String, selector_tuple_encoding: String, value_sequence: String,
+        toml_domain: String, json_domain: String, raw_domain: String, missing_tag: String,
+        json_null_tag: String, boolean_tag: String, toml_integer_tag: String,
+        toml_float_tag: String, string_tag: String, array_tag: String, map_tag: String,
+        raw_bytes_tag: String, toml_datetime_tag: String, json_number_tag: String,
+        hash_algorithm: String, digest_encoding: String,
+        allowed_observation_modes: Vec<String>, allowed_violation_modes: Vec<String>,
         swap_assertion_secondary_selector_required: bool,
         swap_assertion_secondary_selector_must_equal_recipe: bool,
         non_swap_assertion_secondary_selector_forbidden: bool,
-        single_selector_count: usize,
-        swap_selector_count: usize,
-        pointer_overlap: String,
-        baseline_preservation_scope: String,
-        observation_identity: String,
-        overlapping_non_target_rule: String,
-        default_expected_trigger_count: usize,
-        default_allowed_cotrigger_ids: Vec<String>,
-        default_suppressed_ids: Vec<String>,
-        finding_precedence: String,
-        reference_rule: String,
-        trigger_count_rule: String,
-        diagnostic_authority_rule: String,
-        reject_all_length_or_count_conversion_overflow: bool,
-        enforce_bounds_before_encoding: bool,
-        assertion_rows_deny_unknown_fields: bool,
-        canonical_encoding: String,
-        canonical_order: String,
-        canonical_fields: Vec<String>,
-        canonical_string_encoding: String,
-        canonical_optional_string_encoding: String,
+        single_selector_count: usize, swap_selector_count: usize, pointer_overlap: String,
+        baseline_preservation_scope: String, observation_identity: String,
+        overlapping_non_target_rule: String, default_expected_trigger_count: usize,
+        default_allowed_cotrigger_ids: Vec<String>, default_suppressed_ids: Vec<String>,
+        finding_precedence: String, reference_rule: String, trigger_count_rule: String,
+        diagnostic_authority_rule: String, reject_all_length_or_count_conversion_overflow: bool,
+        enforce_bounds_before_encoding: bool, assertion_rows_deny_unknown_fields: bool,
+        canonical_encoding: String, canonical_order: String, canonical_fields: Vec<String>,
+        canonical_string_encoding: String, canonical_optional_string_encoding: String,
         canonical_expected_trigger_count_encoding: String,
         canonical_allowed_cotrigger_ids_encoding: String,
-        canonical_suppressed_ids_encoding: String,
-        canonical_count: usize,
-        canonical_bytes: usize,
-        canonical_sha256: String,
+        canonical_suppressed_ids_encoding: String, canonical_count: usize,
+        canonical_bytes: usize, canonical_sha256: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ObservationTyping {
-        allowed_kinds: Vec<String>,
-        allowed_rehash_modes: Vec<String>,
-        remote_may_claim_local_bytes: bool,
-        local_cache_may_claim_checked_in_bytes: bool,
-        receipt_text_substitutes_for_bytes: bool,
-        missing_required_local_bytes_is_pass: bool,
+        allowed_kinds: Vec<String>, allowed_rehash_modes: Vec<String>,
+        remote_may_claim_local_bytes: bool, local_cache_may_claim_checked_in_bytes: bool,
+        receipt_text_substitutes_for_bytes: bool, missing_required_local_bytes_is_pass: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ArchiveParserContract {
-        gzip_member_count: usize,
-        gzip_trailing_bytes_allowed: bool,
+        gzip_member_count: usize, gzip_trailing_bytes_allowed: bool,
         tar_terminal_zero_block_count: usize,
         tar_trailing_bytes_after_terminal_blocks_allowed: bool,
-        allowed_tar_typeflags: Vec<String>,
-        path_encoding: String,
-        reject_invalid_utf8: bool,
-        reject_absolute_path: bool,
-        reject_backslash: bool,
-        reject_drive_prefix: bool,
-        reject_unc_prefix: bool,
-        reject_colon: bool,
-        reject_empty_component: bool,
-        reject_dot_component: bool,
-        reject_dot_dot_component: bool,
-        reject_percent_encoded_separator: bool,
-        reject_duplicate_path: bool,
-        reject_ascii_case_collision: bool,
-        require_exact_root_name_version: bool,
-        check_header_checksum: bool,
-        check_all_integer_conversions: bool,
-        check_all_offset_and_size_additions: bool,
-        filesystem_canonicalize_allowed: bool,
-        filesystem_follow_allowed: bool,
-        member_tree_record_encoding: String,
+        allowed_tar_typeflags: Vec<String>, path_encoding: String, reject_invalid_utf8: bool,
+        reject_absolute_path: bool, reject_backslash: bool, reject_drive_prefix: bool,
+        reject_unc_prefix: bool, reject_colon: bool, reject_empty_component: bool,
+        reject_dot_component: bool, reject_dot_dot_component: bool,
+        reject_percent_encoded_separator: bool, reject_duplicate_path: bool,
+        reject_ascii_case_collision: bool, require_exact_root_name_version: bool,
+        check_header_checksum: bool, check_all_integer_conversions: bool,
+        check_all_offset_and_size_additions: bool, filesystem_canonicalize_allowed: bool,
+        filesystem_follow_allowed: bool, member_tree_record_encoding: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct OutputNamespaceContract {
-        root: String,
-        flat: bool,
-        output_count: usize,
-        toml_count: usize,
-        binary_count: usize,
-        direct_parent_edge_count: usize,
-        integration_index_member_count: usize,
-        integration_index_may_hash_itself: bool,
-        final_attestation_in_namespace: bool,
-        output_ids: Vec<String>,
-        output_paths: Vec<String>,
-        output_kinds: Vec<String>,
-        id_path_kind_arrays_are_zipped: bool,
-        order_rule: String,
-        binary_ids: Vec<String>,
-        toml_ids: Vec<String>,
-        projections: Vec<String>,
+        root: String, flat: bool, output_count: usize, toml_count: usize,
+        binary_count: usize, direct_parent_edge_count: usize,
+        integration_index_member_count: usize, integration_index_may_hash_itself: bool,
+        final_attestation_in_namespace: bool, output_ids: Vec<String>,
+        output_paths: Vec<String>, output_kinds: Vec<String>,
+        id_path_kind_arrays_are_zipped: bool, order_rule: String,
+        binary_ids: Vec<String>, toml_ids: Vec<String>, projections: Vec<String>,
         publication_rule: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ReceiptContract {
-        format_literal: String,
-        schema_version_literal: u32,
-        toml_receipt_count: usize,
-        binary_output_count: usize,
-        schema_dispatch: String,
-        schema_registry_encoding: String,
-        schema_registry_count: usize,
-        schema_registry_bytes: usize,
-        schema_registry_sha256: String,
-        schema_registry_bound_rule: String,
-        schema_registry_verifier_authority_rule: String,
-        common_required_fields: Vec<String>,
-        common_field_rule: String,
-        exact_field_union_rule: String,
-        binary_rule: String,
-        candidate_rule: String,
-        digest_rule: String,
-        support_claim_must_be_false: bool,
+        format_literal: String, schema_version_literal: u32, toml_receipt_count: usize,
+        binary_output_count: usize, schema_dispatch: String,
+        schema_registry_encoding: String, schema_registry_count: usize,
+        schema_registry_bytes: usize, schema_registry_sha256: String,
+        schema_registry_bound_rule: String, schema_registry_verifier_authority_rule: String,
+        common_required_fields: Vec<String>, common_field_rule: String,
+        exact_field_union_rule: String, binary_rule: String, candidate_rule: String,
+        digest_rule: String, support_claim_must_be_false: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ParentContract {
-        edge_count: usize,
-        parent_binding_exact_fields: Vec<String>,
-        parent_order: String,
-        edge_semantics: String,
-        no_implicit_edges_rule: String,
-        binary_parent_rule: String,
-        binary_sidecar_rule: String,
-        package_edge_construction_rule: String,
-        rank_rule: String,
-        member_rank_counts_1_through_11: Vec<usize>,
-        member_rank_count_sum: usize,
-        integration_index_rank: u32,
-        all_output_rank_counts_1_through_12: Vec<usize>,
-        all_output_rank_count_sum: usize,
-        non_index_max_parent_count: usize,
-        index_parent_count: usize,
+        edge_count: usize, parent_binding_exact_fields: Vec<String>, parent_order: String,
+        edge_semantics: String, no_implicit_edges_rule: String, binary_parent_rule: String,
+        binary_sidecar_rule: String, package_edge_construction_rule: String,
+        rank_rule: String, member_rank_counts_1_through_11: Vec<usize>,
+        member_rank_count_sum: usize, integration_index_rank: u32,
+        all_output_rank_counts_1_through_12: Vec<usize>, all_output_rank_count_sum: usize,
+        non_index_max_parent_count: usize, index_parent_count: usize,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct FinalAttestationContract {
-        format: String,
-        schema_version: u32,
-        attestation_id_literal: String,
-        path: String,
-        role: String,
-        exact_fields: Vec<String>,
-        output_rule: String,
-        entry_rule: String,
-        rerun_rule: String,
-        return_rule: String,
-        self_exclusion_rule: String,
-        verdict_rule: String,
-        claim_ceiling: String,
+        format: String, schema_version: u32, attestation_id_literal: String,
+        path: String, role: String, exact_fields: Vec<String>, output_rule: String,
+        entry_rule: String, rerun_rule: String, return_rule: String,
+        self_exclusion_rule: String, verdict_rule: String, claim_ceiling: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PendingContract {
-        verdicts: Vec<String>,
-        gate_prefix: String,
-        gate_result_pending_code: String,
-        authoring_allowed_pending: Vec<String>,
-        post_authoring_allowed_pending: Vec<String>,
-        post_publication_allowed_pending: Vec<String>,
-        post_seal_allowed_pending: Vec<String>,
-        post_attestation_allowed_pending: Vec<String>,
-        final_allowed_pending: Vec<String>,
+        verdicts: Vec<String>, gate_prefix: String, gate_result_pending_code: String,
+        authoring_allowed_pending: Vec<String>, post_authoring_allowed_pending: Vec<String>,
+        post_publication_allowed_pending: Vec<String>, post_seal_allowed_pending: Vec<String>,
+        post_attestation_allowed_pending: Vec<String>, final_allowed_pending: Vec<String>,
         missing_frozen_source_is_pending: bool,
         missing_required_current_phase_output_is_pending: bool,
-        present_invalid_output_is_pending: bool,
-        extra_output_is_pending: bool,
-        failed_or_skipped_command_is_pending: bool,
-        rule: String,
+        present_invalid_output_is_pending: bool, extra_output_is_pending: bool,
+        failed_or_skipped_command_is_pending: bool, rule: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct NonpromotionContract {
-        aggregate_support_claimed: bool,
-        all_receipt_support_claims_false: bool,
-        resolver_domain: Vec<String>,
-        canonical_resolver: String,
-        resolver2_is_comparison_only: bool,
-        resolver2_to_3_delta_required: bool,
-        candidate_dispositions: Vec<String>,
-        candidate_evidence_rule: String,
-        fixed_candidates: Vec<String>,
-        jose_scope: String,
-        sdk_scope: String,
+        aggregate_support_claimed: bool, all_receipt_support_claims_false: bool,
+        resolver_domain: Vec<String>, canonical_resolver: String,
+        resolver2_is_comparison_only: bool, resolver2_to_3_delta_required: bool,
+        candidate_dispositions: Vec<String>, candidate_evidence_rule: String,
+        fixed_candidates: Vec<String>, jose_scope: String, sdk_scope: String,
         excluded_work: Vec<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SourceFileContract {
-        id: String,
-        family: String,
-        owner_bead: String,
-        path: String,
-        byte_length: u64,
-        sha256: String,
-        parse_kind: FileFamily,
-        observation_kind: ObservationKind,
-        bytes_available: bool,
-        rehash_mode: String,
-        claim_ceiling: String,
-        required: bool,
+        id: String, family: String, owner_bead: String, path: String,
+        byte_length: u64, sha256: String, parse_kind: FileFamily,
+        observation_kind: ObservationKind, bytes_available: bool,
+        rehash_mode: String, claim_ceiling: String, required: bool,
         source_tree_member: bool,
     }
 
@@ -36009,186 +35783,109 @@ activate = 1\n";
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SourceFamilyContract {
-        id: String,
-        owner_bead: String,
-        file_count: usize,
-        total_bytes: u64,
-        tree_sha256: String,
+        id: String, owner_bead: String, file_count: usize,
+        total_bytes: u64, tree_sha256: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct NegativeSourceContract {
-        id: String,
-        source_path: String,
-        source_array: String,
-        count: usize,
-        sha256: String,
+        id: String, source_path: String, source_array: String,
+        count: usize, sha256: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ArchiveContract {
-        id: String,
-        path: String,
-        expected_root: String,
-        member_count: usize,
-        regular_file_count: usize,
-        expanded_bytes: u64,
-        member_tree_sha256: String,
+        id: String, path: String, expected_root: String, member_count: usize,
+        regular_file_count: usize, expanded_bytes: u64, member_tree_sha256: String,
         allowed_entry_types: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct QuarantineContract {
-        id: String,
-        source_path: String,
-        source_selector: String,
-        expected_source_basename: Option<String>,
-        expected_vector_id: Option<String>,
-        expected_role: Option<String>,
-        expected_accepted_vector: Option<bool>,
-        expected_duplicate_of: Option<String>,
-        expected_negative_mutation_count: Option<usize>,
-        execution_allowed: bool,
-        mutation_allowed: bool,
-        promotion_allowed: bool,
+        id: String, source_path: String, source_selector: String,
+        expected_source_basename: Option<String>, expected_vector_id: Option<String>,
+        expected_role: Option<String>, expected_accepted_vector: Option<bool>,
+        expected_duplicate_of: Option<String>, expected_negative_mutation_count: Option<usize>,
+        execution_allowed: bool, mutation_allowed: bool, promotion_allowed: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ProjectionContract {
-        id: String,
-        disposition: String,
-        evidence_verdict: String,
-        support_claim: bool,
-        dependency_count: usize,
-        probe_sentinel: String,
+        id: String, disposition: String, evidence_verdict: String,
+        support_claim: bool, dependency_count: usize, probe_sentinel: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct DerivedOutputContract {
-        id: String,
-        path: String,
-        kind: String,
-        generation_rank: u32,
-        producer_bead: String,
-        pending_gate: String,
-        required_parent_ids: Vec<String>,
-        parent_purposes: Vec<String>,
-        min_bytes: u64,
-        max_bytes: u64,
+        id: String, path: String, kind: String, generation_rank: u32,
+        producer_bead: String, pending_gate: String, required_parent_ids: Vec<String>,
+        parent_purposes: Vec<String>, min_bytes: u64, max_bytes: u64,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RecordSchemaContract {
-        id: String,
-        selectors: Vec<String>,
-        exact_fields: Vec<String>,
-        child_fields: Vec<String>,
-        rule: String,
+        id: String, selectors: Vec<String>, exact_fields: Vec<String>,
+        child_fields: Vec<String>, rule: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RecordVariantSchemaContract {
-        id: String,
-        parent_selector: String,
-        discriminator_field: String,
-        discriminator_value: String,
-        required_fields: Vec<String>,
-        optional_fields: Vec<String>,
-        child_fields: Vec<String>,
-        rule: String,
+        id: String, parent_selector: String, discriminator_field: String,
+        discriminator_value: String, required_fields: Vec<String>,
+        optional_fields: Vec<String>, child_fields: Vec<String>, rule: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ReceiptSchemaContract {
-        kind: String,
-        receipt_id: String,
-        table_name: String,
-        exact_fields: Vec<String>,
-        cardinality_rule: String,
-        semantic_rule: String,
+        kind: String, receipt_id: String, table_name: String,
+        exact_fields: Vec<String>, cardinality_rule: String, semantic_rule: String,
         typed_result_owner_rule: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct CommandTemplateContract {
-        template_id: String,
-        group: String,
-        expansion_count: usize,
-        id_formula: String,
-        coordinate_domain: String,
-        executor: String,
-        argv_source: String,
-        argv_template: Vec<String>,
-        environment_profile: String,
-        working_directory: String,
-        target_scope: String,
-        execution_mode: String,
-        profile: String,
-        resolver: String,
-        network_mode: String,
-        exit_expectation: String,
-        stdout_limit: u64,
-        stderr_limit: u64,
-        typed_parser: String,
-        claim_ceiling: String,
+        template_id: String, group: String, expansion_count: usize,
+        id_formula: String, coordinate_domain: String, executor: String,
+        argv_source: String, argv_template: Vec<String>, environment_profile: String,
+        working_directory: String, target_scope: String, execution_mode: String,
+        profile: String, resolver: String, network_mode: String, exit_expectation: String,
+        stdout_limit: u64, stderr_limit: u64, typed_parser: String, claim_ceiling: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct EnvironmentProfileContract {
-        id: String,
-        required: Vec<Vec<String>>,
-        optional: Vec<String>,
+        id: String, required: Vec<Vec<String>>, optional: Vec<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct TargetToolProfileContract {
-        target: String,
-        cc_tool_id: String,
-        ar_tool_id: String,
-        linker_tool_id: String,
-        cc_env_key: String,
-        ar_env_key: String,
-        cflags_env_key: String,
-        linker_env_key: String,
-        rustflags_env_key: String,
-        cflags_exact: String,
-        rustflags_exact: String,
-        linker_flavor: String,
-        linker_args_exact: Vec<String>,
-        input_root_id: String,
-        sdk_binding: String,
-        rustlib_binding: String,
+        target: String, cc_tool_id: String, ar_tool_id: String, linker_tool_id: String,
+        cc_env_key: String, ar_env_key: String, cflags_env_key: String,
+        linker_env_key: String, rustflags_env_key: String, cflags_exact: String,
+        rustflags_exact: String, linker_flavor: String, linker_args_exact: Vec<String>,
+        input_root_id: String, sdk_binding: String, rustlib_binding: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SemanticAssertion {
-        id: String,
-        family: String,
-        source_path: String,
-        selector: String,
-        secondary_selector: Option<String>,
-        rule: String,
-        logical_path: String,
-        baseline_mode: String,
-        observation_mode: AssertionObservationMode,
-        baseline_observation_sha256: String,
-        violation_mode: AssertionViolationMode,
-        violating_observation_sha256: String,
-        expected_trigger_count: usize,
-        allowed_cotrigger_ids: Vec<String>,
-        suppressed_ids: Vec<String>,
+        id: String, family: String, source_path: String, selector: String,
+        secondary_selector: Option<String>, rule: String, logical_path: String,
+        baseline_mode: String, observation_mode: AssertionObservationMode,
+        baseline_observation_sha256: String, violation_mode: AssertionViolationMode,
+        violating_observation_sha256: String, expected_trigger_count: usize,
+        allowed_cotrigger_ids: Vec<String>, suppressed_ids: Vec<String>,
     }
 
     #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -36208,25 +35905,16 @@ activate = 1\n";
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct NegativeCase {
-        family: String,
-        id: String,
-        source_index: usize,
-        target_path: String,
-        target_selector: String,
-        operation: MutationKind,
-        argument: Option<String>,
-        secondary_selector: Option<String>,
-        integrity_mode: String,
-        validator: String,
+        family: String, id: String, source_index: usize, target_path: String,
+        target_selector: String, operation: MutationKind, argument: Option<String>,
+        secondary_selector: Option<String>, integrity_mode: String, validator: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct MutationFixture {
-        id: String,
-        application: FixtureApplication,
-        value_kind: FixtureValueKind,
-        value: toml::Value,
+        id: String, application: FixtureApplication,
+        value_kind: FixtureValueKind, value: toml::Value,
     }
 
     #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -36273,21 +35961,15 @@ activate = 1\n";
 
     #[derive(Debug)]
     struct Corpus<'a> {
-        files: &'a [LoadedFile],
-        by_path: BTreeMap<String, usize>,
-        toml_documents: BTreeMap<String, toml::Value>,
-        json_documents: BTreeMap<String, StrictJson>,
+        files: &'a [LoadedFile], by_path: BTreeMap<String, usize>,
+        toml_documents: BTreeMap<String, toml::Value>, json_documents: BTreeMap<String, StrictJson>,
     }
 
     #[derive(Debug)]
     struct Overlay<'a> {
-        target_path: &'a str,
-        bytes: Vec<u8>,
-        toml_document: Option<toml::Value>,
-        json_document: Option<StrictJson>,
-        file_binding: VirtualBinding,
-        family_binding: VirtualBinding,
-        tree_binding: VirtualBinding,
+        target_path: &'a str, bytes: Vec<u8>, toml_document: Option<toml::Value>,
+        json_document: Option<StrictJson>, file_binding: VirtualBinding,
+        family_binding: VirtualBinding, tree_binding: VirtualBinding,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36321,11 +36003,8 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct MutationFinding {
-        assertion_id: String,
-        rule: String,
-        logical_path: String,
-        diagnostic: String,
-        observation_sha256: String,
+        assertion_id: String, rule: String, logical_path: String,
+        diagnostic: String, observation_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36336,21 +36015,13 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ReceiptParentBinding {
-        id: String,
-        path: String,
-        kind: String,
-        byte_length: u64,
-        sha256: String,
-        purpose: String,
+        id: String, path: String, kind: String, byte_length: u64,
+        sha256: String, purpose: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ReceiptOutputBinding {
-        id: String,
-        path: String,
-        kind: String,
-        byte_length: u64,
-        sha256: String,
+        id: String, path: String, kind: String, byte_length: u64, sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36389,197 +36060,131 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedCommandResult {
-        id: String,
-        actual_worker_id: String,
-        argv: Vec<String>,
-        environment: Vec<(String, String)>,
-        working_directory: String,
-        target_scope: String,
-        stdout: StreamRegionBinding,
-        stderr: StreamRegionBinding,
+        id: String, actual_worker_id: String, argv: Vec<String>,
+        environment: Vec<(String, String)>, working_directory: String,
+        target_scope: String, stdout: StreamRegionBinding, stderr: StreamRegionBinding,
         typed_result_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedCompileCell {
-        projection_id: String,
-        target: String,
-        command_id: String,
-        crate_count: u64,
-        artifact_count: u64,
-        diagnostic_count: u64,
+        projection_id: String, target: String, command_id: String,
+        crate_count: u64, artifact_count: u64, diagnostic_count: u64,
         result_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CargoTargetIdentity {
-        kind: Vec<String>,
-        crate_types: Vec<String>,
-        name: String,
-        src_path: String,
-        edition: String,
-        required_features: Option<Vec<String>>,
-        doc: bool,
-        doctest: bool,
-        test: bool,
+        kind: Vec<String>, crate_types: Vec<String>, name: String,
+        src_path: String, edition: String, required_features: Option<Vec<String>>,
+        doc: bool, doctest: bool, test: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CargoArtifactIdentity {
-        package_id: String,
-        manifest_path: String,
-        target: CargoTargetIdentity,
+        package_id: String, manifest_path: String, target: CargoTargetIdentity,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoArtifactObservation {
-        identity: CargoArtifactIdentity,
-        profile: CargoProfileIdentity,
-        features: Vec<String>,
-        filenames: Vec<String>,
-        executable: Option<String>,
+        identity: CargoArtifactIdentity, profile: CargoProfileIdentity,
+        features: Vec<String>, filenames: Vec<String>, executable: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoProfileIdentity {
-        opt_level: String,
-        debuginfo: Option<String>,
-        debug_assertions: bool,
-        overflow_checks: bool,
-        test: bool,
+        opt_level: String, debuginfo: Option<String>, debug_assertions: bool,
+        overflow_checks: bool, test: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CargoBuildScriptObservation {
-        package_id: String,
-        out_dir: String,
+        package_id: String, out_dir: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoCompileSummary {
-        crate_count: u64,
-        artifact_count: u64,
-        diagnostic_count: u64,
-        result_sha256: String,
-        artifacts: Vec<CargoArtifactObservation>,
+        crate_count: u64, artifact_count: u64, diagnostic_count: u64,
+        result_sha256: String, artifacts: Vec<CargoArtifactObservation>,
         build_scripts: Vec<CargoBuildScriptObservation>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoMetadataPackage {
-        package_id: String,
-        name: String,
-        version: String,
-        source: Option<String>,
-        license: Option<String>,
-        license_file: Option<String>,
-        readme: Option<String>,
-        manifest_path: String,
-        targets: Vec<CargoTargetIdentity>,
+        package_id: String, name: String, version: String, source: Option<String>,
+        license: Option<String>, license_file: Option<String>, readme: Option<String>,
+        manifest_path: String, targets: Vec<CargoTargetIdentity>,
         declared_dependencies: Vec<CargoMetadataDependencyKindDeclaration>,
         declared_features: BTreeMap<String, Vec<String>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoMetadataDependencyKindDeclaration {
-        package_name: String,
-        dependency_name: String,
-        renamed: bool,
-        source: Option<String>,
-        requirement: String,
-        path: Option<String>,
-        kind: String,
-        target_condition: Option<String>,
-        optional: bool,
-        uses_default_features: bool,
+        package_name: String, dependency_name: String, renamed: bool,
+        source: Option<String>, requirement: String, path: Option<String>, kind: String,
+        target_condition: Option<String>, optional: bool, uses_default_features: bool,
         features: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CargoMetadataDependencyKind {
-        kind: String,
-        target_condition: Option<String>,
+        kind: String, target_condition: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoMetadataDependency {
-        name: String,
-        package_id: String,
-        kinds: Vec<CargoMetadataDependencyKind>,
+        name: String, package_id: String, kinds: Vec<CargoMetadataDependencyKind>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoMetadataNode {
-        package_id: String,
-        features: Vec<String>,
-        dependencies: Vec<CargoMetadataDependency>,
+        package_id: String, features: Vec<String>, dependencies: Vec<CargoMetadataDependency>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CanonicalMetadataGraphNode {
-        package_id: String,
-        name: String,
-        version: String,
-        source_kind: String,
-        source_locator: String,
-        features: Vec<String>,
-        target_kinds: Vec<String>,
+        package_id: String, name: String, version: String, source_kind: String,
+        source_locator: String, features: Vec<String>, target_kinds: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct CanonicalMetadataGraphEdge {
-        from_package_id: String,
-        to_package_id: String,
-        dependency_name: String,
-        dependency_kind: String,
-        target_condition: Option<String>,
-        version_requirement: String,
-        features: Vec<String>,
-        uses_default_features: bool,
+        from_package_id: String, to_package_id: String, dependency_name: String,
+        dependency_kind: String, target_condition: Option<String>,
+        version_requirement: String, features: Vec<String>, uses_default_features: bool,
         optional: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CanonicalMetadataGraph {
-        nodes: Vec<CanonicalMetadataGraphNode>,
-        edges: Vec<CanonicalMetadataGraphEdge>,
+        nodes: Vec<CanonicalMetadataGraphNode>, edges: Vec<CanonicalMetadataGraphEdge>,
         sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedTargetGraph {
-        projection_id: String,
-        target: String,
-        nodes: Vec<CanonicalMetadataGraphNode>,
-        edges: Vec<CanonicalMetadataGraphEdge>,
-        graph_sha256: String,
+        projection_id: String, target: String, nodes: Vec<CanonicalMetadataGraphNode>,
+        edges: Vec<CanonicalMetadataGraphEdge>, graph_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct ParsedResolverDeltaItem {
-        package_id: String,
-        change_kind: String,
-        resolver2_value: Option<String>,
+        package_id: String, change_kind: String, resolver2_value: Option<String>,
         resolver3_value: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedResolverDelta {
-        projection_id: String,
-        added: Vec<ParsedResolverDeltaItem>,
-        removed: Vec<ParsedResolverDeltaItem>,
-        changed: Vec<ParsedResolverDeltaItem>,
+        projection_id: String, added: Vec<ParsedResolverDeltaItem>,
+        removed: Vec<ParsedResolverDeltaItem>, changed: Vec<ParsedResolverDeltaItem>,
         delta_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedProjectionResult {
-        projection_id: String,
-        resolver3_graph_sha256: String,
-        resolver2_graph_sha256: String,
-        resolver_delta_sha256: String,
-        resolver3_manifest_utf8: String,
-        resolver2_manifest_utf8: String,
+        projection_id: String, resolver3_graph_sha256: String,
+        resolver2_graph_sha256: String, resolver_delta_sha256: String,
+        resolver3_manifest_utf8: String, resolver2_manifest_utf8: String,
         probe_source_utf8: String,
     }
 
@@ -36889,19 +36494,10 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SdkArtifactObservation {
-        sdk_id: String,
-        artifact_id: String,
-        source_selector: String,
-        ecosystem: String,
-        package_id: String,
-        version: String,
-        artifact_kind: String,
-        url: String,
-        byte_length: u64,
-        sha256_source_field: String,
-        sha256: String,
-        native_integrity: Vec<(String, String)>,
-        embedded_commit_source_field: String,
+        sdk_id: String, artifact_id: String, source_selector: String, ecosystem: String,
+        package_id: String, version: String, artifact_kind: String, url: String,
+        byte_length: u64, sha256_source_field: String, sha256: String,
+        native_integrity: Vec<(String, String)>, embedded_commit_source_field: String,
         embedded_commit: String,
     }
 
@@ -37032,48 +36628,33 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CargoMetadataSummary {
-        packages: BTreeMap<String, CargoMetadataPackage>,
-        nodes: BTreeMap<String, CargoMetadataNode>,
-        root: Option<String>,
-        workspace_members: Vec<String>,
-        workspace_default_members: Vec<String>,
-        target_directory: String,
-        build_directory: String,
-        workspace_root: String,
+        packages: BTreeMap<String, CargoMetadataPackage>, nodes: BTreeMap<String, CargoMetadataNode>,
+        root: Option<String>, workspace_members: Vec<String>,
+        workspace_default_members: Vec<String>, target_directory: String,
+        build_directory: String, workspace_root: String,
         canonical_graph: Option<CanonicalMetadataGraph>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CommandCoordinates {
-        global_ordinal: usize,
-        projection: Option<String>,
-        target: Option<String>,
-        package: Option<String>,
-        vector: Option<String>,
+        global_ordinal: usize, projection: Option<String>, target: Option<String>,
+        package: Option<String>, vector: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ObservedFileBinding {
-        path: String,
-        byte_length: u64,
-        sha256: String,
+        path: String, byte_length: u64, sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ObservedTool {
-        binding: ObservedFileBinding,
-        version: String,
-        typed_result_sha256: String,
+        binding: ObservedFileBinding, version: String, typed_result_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ExternalRootObservation {
-        path: String,
-        device: u64,
-        inode: u64,
-        entry_count: u64,
-        total_regular_file_bytes: u64,
-        tree_sha256: String,
+        path: String, device: u64, inode: u64, entry_count: u64,
+        total_regular_file_bytes: u64, tree_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37091,11 +36672,8 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ProducerEnvironmentSummary {
-        worker_id: String,
-        repository_root: String,
-        rustc_verbose_sha256: String,
-        cargo_verbose_sha256: String,
-        tools: BTreeMap<String, ObservedTool>,
+        worker_id: String, repository_root: String, rustc_verbose_sha256: String,
+        cargo_verbose_sha256: String, tools: BTreeMap<String, ObservedTool>,
         proxies: Vec<(String, String)>,
         target_tool_paths: BTreeMap<
             String,
@@ -37106,153 +36684,94 @@ activate = 1\n";
             ),
         >,
         external_roots: BTreeMap<String, ExternalRootObservation>,
-        advisory_database_source: AdvisoryDatabaseSourceObservation,
-        run_root: String,
-        acquisition_cargo_home: String,
-        offline_cargo_home: String,
-        acquisition_target_root: String,
-        execution_bin: String,
-        local_registry: String,
+        advisory_database_source: AdvisoryDatabaseSourceObservation, run_root: String,
+        acquisition_cargo_home: String, offline_cargo_home: String,
+        acquisition_target_root: String, execution_bin: String, local_registry: String,
         return_root: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPostcommandLock {
-        id: String,
-        producer_command_id: String,
-        path: String,
-        region: StreamRegionBinding,
-        package_set_sha256: String,
+        id: String, producer_command_id: String, path: String,
+        region: StreamRegionBinding, package_set_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageListRow {
-        package_id: String,
-        command_id: String,
-        origin: String,
-        raw_ordinal: u64,
-        raw_byte_length: u64,
-        raw_line_sha256: String,
-        path: String,
-        row_class: String,
+        package_id: String, command_id: String, origin: String, raw_ordinal: u64,
+        raw_byte_length: u64, raw_line_sha256: String, path: String, row_class: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageSourceRow {
-        package_id: String,
-        source_class: String,
-        origin_kind: String,
-        transformation_kind: String,
-        generated_rule_id: Option<String>,
-        raw_ordinal: u64,
-        raw_line_byte_length: u64,
-        raw_line_sha256: String,
-        list_path: String,
-        archive_relative_path: String,
-        workspace_path: String,
-        byte_length: u64,
-        sha256: String,
-        relocation_id: Option<String>,
+        package_id: String, source_class: String, origin_kind: String,
+        transformation_kind: String, generated_rule_id: Option<String>, raw_ordinal: u64,
+        raw_line_byte_length: u64, raw_line_sha256: String, list_path: String,
+        archive_relative_path: String, workspace_path: String, byte_length: u64,
+        sha256: String, relocation_id: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageListing {
-        package_id: String,
-        command_id: String,
-        raw_stdout_byte_length: u64,
-        raw_stdout_sha256: String,
-        raw_rows: Vec<ParsedPackageListRow>,
-        source_rows: Vec<ParsedPackageSourceRow>,
-        typed_result_sha256: String,
+        package_id: String, command_id: String, raw_stdout_byte_length: u64,
+        raw_stdout_sha256: String, raw_rows: Vec<ParsedPackageListRow>,
+        source_rows: Vec<ParsedPackageSourceRow>, typed_result_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageResult {
-        entry_id: String,
-        package_id: String,
-        a_path: String,
-        a_byte_length: u64,
-        a_sha256: String,
-        b_path: String,
-        b_byte_length: u64,
-        b_sha256: String,
-        canonical_member_byte_length: u64,
-        canonical_member_sha256: String,
-        archive_member_count: usize,
-        archive_member_set_sha256: String,
+        entry_id: String, package_id: String, a_path: String, a_byte_length: u64,
+        a_sha256: String, b_path: String, b_byte_length: u64, b_sha256: String,
+        canonical_member_byte_length: u64, canonical_member_sha256: String,
+        archive_member_count: usize, archive_member_set_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageArchiveMember {
-        path: String,
-        byte_length: u64,
-        sha256: String,
-        member_class: String,
-        mapping_rule_id: String,
-        workspace_source_path: String,
+        path: String, byte_length: u64, sha256: String, member_class: String,
+        mapping_rule_id: String, workspace_source_path: String,
         workspace_source_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageSourceListing {
-        package_id: String,
-        archive_root: String,
-        members: Vec<ParsedPackageArchiveMember>,
-        member_set_sha256: String,
+        package_id: String, archive_root: String,
+        members: Vec<ParsedPackageArchiveMember>, member_set_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedPackageReceiptSummary {
-        command_package_list_set_sha256: String,
-        package_results: Vec<ParsedPackageResult>,
-        source_listings: Vec<ParsedPackageSourceListing>,
-        a_command_id: String,
-        b_command_id: String,
-        a_feature_mode: String,
-        b_feature_mode: String,
+        command_package_list_set_sha256: String, package_results: Vec<ParsedPackageResult>,
+        source_listings: Vec<ParsedPackageSourceListing>, a_command_id: String,
+        b_command_id: String, a_feature_mode: String, b_feature_mode: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyPackage {
-        package_id: String,
-        triple: RegistryPackageTriple,
-        source_kind: String,
-        source_locator: String,
-        features: Vec<String>,
-        dependency_kinds: Vec<String>,
+        package_id: String, triple: RegistryPackageTriple, source_kind: String,
+        source_locator: String, features: Vec<String>, dependency_kinds: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyEntryBinding {
-        kind: u8,
-        relative_path: String,
-        byte_length: u64,
-        sha256: String,
+        kind: u8, relative_path: String, byte_length: u64, sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyCrateArchiveEntry {
-        package_id: String,
-        version: String,
-        checksum_sha256: String,
-        selected_index_line_sha256: String,
-        yanked: bool,
+        package_id: String, version: String, checksum_sha256: String,
+        selected_index_line_sha256: String, yanked: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyDerivedIndexEntry {
-        package_name: String,
-        selected_versions: Vec<String>,
-        derived_index_sha256: String,
+        package_name: String, selected_versions: Vec<String>, derived_index_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplySparseCacheEntry {
-        cache_relative_path: String,
-        validator: String,
-        selected_versions: Vec<String>,
-        selected_ordinals: Vec<u32>,
-        selected_sha256: Vec<String>,
+        cache_relative_path: String, validator: String, selected_versions: Vec<String>,
+        selected_ordinals: Vec<u32>, selected_sha256: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37270,24 +36789,18 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyAcquisitionAnchorBinding {
-        path: String,
-        byte_length: u64,
-        sha256: String,
+        path: String, byte_length: u64, sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyAcquisitionSparseCache {
-        package_name: String,
-        validator: String,
-        selected_versions: Vec<String>,
-        selected_ordinals: Vec<u32>,
-        selected_sha256: Vec<String>,
+        package_name: String, validator: String, selected_versions: Vec<String>,
+        selected_ordinals: Vec<u32>, selected_sha256: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyAcquisitionCrateCache {
-        package_name: String,
-        version: String,
+        package_name: String, version: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37305,27 +36818,18 @@ activate = 1\n";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedSupplyReceiptSummary {
-        bundle: ReceiptOutputBinding,
-        producer_pre_handoff_bundle: ParsedFileBinding,
-        returned_bundle: ParsedFileBinding,
-        bootstrap_manifest: ParsedFileBinding,
+        bundle: ReceiptOutputBinding, producer_pre_handoff_bundle: ParsedFileBinding,
+        returned_bundle: ParsedFileBinding, bootstrap_manifest: ParsedFileBinding,
         bootstrap_packages: BTreeMap<RegistryPackageTriple, ParsedSupplyPackage>,
         downstream_packages: BTreeMap<RegistryPackageTriple, ParsedSupplyPackage>,
         control_only_packages: BTreeMap<RegistryPackageTriple, ParsedSupplyPackage>,
-        bootstrap_lock: ParsedFileBinding,
-        embedded_bootstrap_lock_byte_length: u64,
-        embedded_bootstrap_lock_sha256: String,
-        entry_count: usize,
-        derived_index_file_count: usize,
-        crate_archive_count: usize,
-        sparse_cache_input_count: usize,
-        total_payload_bytes: u64,
-        inner_entry_set_sha256: String,
-        closure_bijection_sha256: String,
-        entries: Vec<ParsedSupplyEntry>,
-        acquisition_anchors: Vec<ParsedSupplyAcquisitionAnchor>,
-        acquisition_root_set_sha256: String,
-        sparse_parser_version: String,
+        bootstrap_lock: ParsedFileBinding, embedded_bootstrap_lock_byte_length: u64,
+        embedded_bootstrap_lock_sha256: String, entry_count: usize,
+        derived_index_file_count: usize, crate_archive_count: usize,
+        sparse_cache_input_count: usize, total_payload_bytes: u64,
+        inner_entry_set_sha256: String, closure_bijection_sha256: String,
+        entries: Vec<ParsedSupplyEntry>, acquisition_anchors: Vec<ParsedSupplyAcquisitionAnchor>,
+        acquisition_root_set_sha256: String, sparse_parser_version: String,
         entry_set_sha256: String,
     }
 
@@ -83830,7 +83334,7 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     #[derive(Debug, Clone, Copy)]
     enum SetWideSnapshotDrift {
         SameLengthContent,
@@ -83839,7 +83343,7 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
         Identity,
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn exercise_set_wide_snapshot_drift(drift: SetWideSnapshotDrift) {
         use super::trust_std::{
             checked_snapshot_set_with_hook, FileBinding, SnapshotStage, TrustError,
@@ -92277,102 +91781,6 @@ fn fallible(value: Option<u8>) {
         Ok((expectation, ledger_bytes, package_root, target_root))
     }
 
-    #[cfg(test)]
-    struct OrdinaryAttestFixtureIntegration {
-        producer_outer_bytes: Vec<u8>,
-        integration_marker: String,
-    }
-
-    #[cfg(test)]
-    fn ordinary_attest_fixture_outer_and_integration(
-        run_id: &str,
-        authoring_marker: &str,
-        integration_records: [(&str, &[u8]); 5],
-    ) -> Result<OrdinaryAttestFixtureIntegration, String> {
-        let authoring = super::trust_std::parse_authoring_marker(authoring_marker)
-            .map_err(|error| pending!("authoring marker: {error}"))?;
-        let run_id_bytes =
-            super::trust_std::decode_lower_hex::<16>(run_id, "ordinary Attest fixture run ID")
-                .map_err(|error| pending!("run ID: {error}"))?;
-        for ((path, _), expected_path) in integration_records
-            .iter()
-            .zip(super::trust_std::INTEGRATION_SEAL_PATHS)
-        {
-            if *path != expected_path {
-                return Err(pending!(
-                    "integration fixture registry path expected={expected_path} observed={path}"
-                ));
-            }
-        }
-
-        let producer_outer = super::trust_std::outer_role_fixture(
-            BootstrapMode::Produce,
-            run_id,
-            "producer",
-            authoring_marker,
-            None,
-        );
-        let producer_outer_bytes = super::trust_std::encode_outer_transport_record(
-            &producer_outer,
-            "ordinary Attest fixture producer outer",
-        )
-        .map_err(|error| pending!("producer outer: {error}"))?;
-        let mut records = [FileBinding {
-            byte_length: 0,
-            sha256: [0; 32],
-        }; 5];
-        for (index, (_, bytes)) in integration_records.iter().enumerate() {
-            records[index] = FileBinding {
-                byte_length: u64::try_from(bytes.len())
-                    .map_err(|_| "Attest fixture integration record length".to_owned())?,
-                sha256: trust_sha256(bytes).map_err(|error| {
-                    format!(
-                        "E_ORDINARY_ATTEST_FIXTURE: integration record {index} SHA-256: {}",
-                        error.detail()
-                    )
-                })?,
-            };
-        }
-        let mut seal = IntegrationSeal {
-            run_id: run_id_bytes,
-            records,
-            outer_transport: FileBinding {
-                byte_length: u64::try_from(producer_outer_bytes.len())
-                    .map_err(|_| "Attest fixture producer outer length".to_owned())?,
-                sha256: trust_sha256(&producer_outer_bytes).map_err(|error| {
-                    format!(
-                        "E_ORDINARY_ATTEST_FIXTURE: producer outer SHA-256: {}",
-                        error.detail()
-                    )
-                })?,
-            },
-            authoring_closure_sha256: authoring.closure_sha256,
-            seal_sha256: [0; 32],
-        };
-        seal.seal_sha256 = trust_sha256(
-            &super::trust_std::integration_seal_preimage(&seal).map_err(|error| {
-                pending!("integration preimage: {error}")
-            })?,
-        )
-        .map_err(|error| {
-            format!(
-                "E_ORDINARY_ATTEST_FIXTURE: integration seal SHA-256: {}",
-                error.detail()
-            )
-        })?;
-        let integration_marker = super::trust_std::integration_seal_marker(&seal);
-        let parsed = parse_integration_seal(&integration_marker, &authoring.closure_sha256)
-            .map_err(|error| pending!("integration marker: {error}"))?;
-        if parsed != seal {
-            return Err(pending!("integration marker round trip"));
-        }
-
-        Ok(OrdinaryAttestFixtureIntegration {
-            producer_outer_bytes,
-            integration_marker,
-        })
-    }
-
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUSTC_B64: &str = "cnVzdGMgMS45OS4wLW5pZ2h0bHkgKDM3NWIxNDMxYiAyMDI2LTA3LTEwKQpiaW5hcnk6IHJ1c3RjCmNvbW1pdC1oYXNoOiAzNzViMTQzMWI3ZDg5ZDFjMmUyYmMxNjhjMDExODQ4YWUxMmI3ZDE0CmNvbW1pdC1kYXRlOiAyMDI2LTA3LTEwCmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpMTFZNIHZlcnNpb246IDIyLjEuOAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -93705,11 +93113,11 @@ fn fallible(value: Option<u8>) {
         for (path, bytes) in integration_rows {
             ordinary_fixture_write_new(&root, path, bytes)?;
         }
-        let integration = ordinary_attest_fixture_outer_and_integration(
+        let integration = super::trust_std::attest_fixture_outer_and_integration(
             &run_id,
             &authoring_marker,
             integration_rows,
-        )?;
+        ).map_err(|error| pending!("Attest fixture integration: {error}"))?;
         let producer_outer_relative = format!(".fnd01-run/controller/{run_id}/producer-outer.bin");
         ordinary_fixture_write_new(
             &root,
