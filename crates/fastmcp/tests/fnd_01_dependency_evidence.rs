@@ -92801,6 +92801,10 @@ fn fallible(value: Option<u8>) {
         run_id: String,
     }
 
+    #[derive(PartialEq, Eq)]
+    enum OrdinaryPlant { None, ToolSet, SourceBinding }
+    const ORDINARY_CORE_SOURCE: &str = "evidence/fnd-01/core-conformance.toml";
+
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_fixture_write_new(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
         let path = root.join(relative);
@@ -92926,125 +92930,50 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    #[derive(Debug, PartialEq, Eq)]
-    struct OrdinaryFixtureNodeMetadata {
-        device: u64,
-        inode: u64,
-        mode: u32,
-        owner: u32,
-        group: u32,
-        link_count: u64,
-        byte_length: u64,
-    }
-
-    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    #[derive(Debug, PartialEq, Eq)]
-    enum OrdinaryFixtureNode {
-        Root {
-            metadata: OrdinaryFixtureNodeMetadata,
-        },
-        Directory {
-            relative: String,
-            metadata: OrdinaryFixtureNodeMetadata,
-        },
-        Regular {
-            relative: String,
-            metadata: OrdinaryFixtureNodeMetadata,
-            bytes: Vec<u8>,
-        },
-        Symlink {
-            relative: String,
-            metadata: OrdinaryFixtureNodeMetadata,
-            target_bytes: Vec<u8>,
-        },
-    }
+    type OrdinaryFixtureNode = (u8, String, (u64, u64, u32, u32, u32, u64, u64), Vec<u8>);
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_fixture_tree_state(root: &Path) -> Result<Vec<OrdinaryFixtureNode>, String> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
-
         fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
-            path.strip_prefix(root)
-                .map_err(|_| "E_HANDOFF_LEDGER: accepted fixture escapes root".to_owned())?
-                .to_str()
-                .ok_or_else(|| "E_HANDOFF_LEDGER: accepted fixture path is not UTF-8".to_owned())
-                .map(str::to_owned)
+            path.strip_prefix(root).map_err(|_| "E_HANDOFF_LEDGER: accepted fixture escapes root".to_owned())?
+                .to_str().ok_or_else(|| "E_HANDOFF_LEDGER: accepted fixture path is not UTF-8".to_owned()).map(str::to_owned)
         }
-
-        fn node_metadata(metadata: &fs::Metadata) -> OrdinaryFixtureNodeMetadata {
-            OrdinaryFixtureNodeMetadata {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                mode: metadata.mode(),
-                owner: metadata.uid(),
-                group: metadata.gid(),
-                link_count: metadata.nlink(),
-                byte_length: metadata.len(),
-            }
+        fn node_metadata(metadata: &fs::Metadata) -> (u64, u64, u32, u32, u32, u64, u64) {
+            (metadata.dev(), metadata.ino(), metadata.mode(), metadata.uid(), metadata.gid(), metadata.nlink(), metadata.len())
         }
-
-        fn visit(
-            root: &Path,
-            current: &Path,
-            state: &mut Vec<OrdinaryFixtureNode>,
-        ) -> Result<(), String> {
-            let entries = fs::read_dir(current).map_err(|error| {
-                format!("E_HANDOFF_LEDGER: enumerate accepted fixture: {error}")
-            })?;
-            let mut paths = entries
+        fn visit(root: &Path, current: &Path, state: &mut Vec<OrdinaryFixtureNode>) -> Result<(), String> {
+            let mut paths = fs::read_dir(current)
+                .map_err(|error| format!("E_HANDOFF_LEDGER: enumerate accepted fixture: {error}"))?
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("E_HANDOFF_LEDGER: enumerate accepted entry: {error}"))?;
             paths.sort();
             for path in paths {
-                let metadata = fs::symlink_metadata(&path)
-                    .map_err(|error| format!("E_HANDOFF_LEDGER: stat accepted fixture: {error}"))?;
+                let metadata = fs::symlink_metadata(&path).map_err(|error| format!("E_HANDOFF_LEDGER: stat accepted fixture: {error}"))?;
                 if metadata.file_type().is_symlink() {
                     let relative = relative_path(root, &path)?;
-                    let target = fs::read_link(&path).map_err(|error| {
-                        format!("E_HANDOFF_LEDGER: read accepted symlink {relative}: {error}")
-                    })?;
-                    state.push(OrdinaryFixtureNode::Symlink {
-                        relative,
-                        metadata: node_metadata(&metadata),
-                        target_bytes: target.as_os_str().as_bytes().to_vec(),
-                    });
+                    let target = fs::read_link(&path).map_err(|error| format!("E_HANDOFF_LEDGER: read accepted symlink {relative}: {error}"))?;
+                    state.push((3, relative, node_metadata(&metadata), target.as_os_str().as_bytes().to_vec()));
                 } else if metadata.is_dir() {
-                    state.push(OrdinaryFixtureNode::Directory {
-                        relative: relative_path(root, &path)?,
-                        metadata: node_metadata(&metadata),
-                    });
+                    state.push((1, relative_path(root, &path)?, node_metadata(&metadata), Vec::new()));
                     visit(root, &path, state)?;
                 } else if metadata.is_file() {
                     let relative = relative_path(root, &path)?;
-                    let bytes = fs::read(&path).map_err(|error| {
-                        format!("E_HANDOFF_LEDGER: read accepted {relative}: {error}")
-                    })?;
-                    state.push(OrdinaryFixtureNode::Regular {
-                        relative,
-                        metadata: node_metadata(&metadata),
-                        bytes,
-                    });
+                    let bytes = fs::read(&path).map_err(|error| format!("E_HANDOFF_LEDGER: read accepted {relative}: {error}"))?;
+                    state.push((2, relative, node_metadata(&metadata), bytes));
                 } else {
-                    return Err(
-                        "E_HANDOFF_LEDGER: accepted fixture contains non-file node".to_owned()
-                    );
+                    return Err("E_HANDOFF_LEDGER: accepted fixture contains non-file node".to_owned());
                 }
             }
             Ok(())
         }
-
-        let root_metadata = fs::symlink_metadata(root)
-            .map_err(|error| format!("E_HANDOFF_LEDGER: stat accepted fixture root: {error}"))?;
+        let root_metadata = fs::symlink_metadata(root).map_err(|error| format!("E_HANDOFF_LEDGER: stat accepted fixture root: {error}"))?;
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-            return Err(
-                "E_HANDOFF_LEDGER: accepted fixture root is not a real directory".to_owned(),
-            );
+            return Err("E_HANDOFF_LEDGER: accepted fixture root is not a real directory".to_owned());
         }
-        let mut state = vec![OrdinaryFixtureNode::Root {
-            metadata: node_metadata(&root_metadata),
-        }];
+        let mut state = vec![(0, String::new(), node_metadata(&root_metadata), Vec::new())];
         visit(root, root, &mut state)?;
         Ok(state)
     }
@@ -93092,11 +93021,13 @@ fn fallible(value: Option<u8>) {
                 .map_err(|error| pending!("read source authoring {path}: {error}"))?;
             ordinary_fixture_write_new(&root, path, &bytes)?;
         }
-        ordinary_fixture_write_new(
-            &root,
-            "Cargo.toml",
-            b"[workspace]\nmembers = []\nresolver = \"3\"\n",
-        )?;
+        let (policy, _) = read_policy(&source_root).map_err(|error| error.stable())?;
+        let sources = load_sources(&source_root, &policy).map_err(|error| error.stable())?;
+        for source in &sources { ordinary_fixture_write_new(&root, &source.contract.path, &source.bytes)?; }
+        for path in ["Cargo.toml", "rust-toolchain.toml"] {
+            let bytes = fs::read(source_root.join(path)).map_err(|error| error.to_string())?;
+            ordinary_fixture_write_new(&root, path, &bytes)?;
+        }
         let authoring_marker = live_authoring_marker_text(&root);
 
         let sysroot_output = Command::new("rustup")
@@ -93127,10 +93058,12 @@ fn fallible(value: Option<u8>) {
             0,
         )]));
         let supply_bytes = test_ordinary_supply_bundle(&[("attest-fixture-1.0.0.crate", &archive)]);
-        let integration_rows = [
+        let cargo_lock = fs::read(source_root.join(INTEGRATION_SEAL_PATHS[0]))
+            .map_err(|error| error.to_string())?;
+        let integration_rows: [(&str, &[u8]); 5] = [
             (
                 INTEGRATION_SEAL_PATHS[0],
-                b"# fixture Cargo.lock\n".as_slice(),
+                cargo_lock.as_slice(),
             ),
             (
                 INTEGRATION_SEAL_PATHS[1],
@@ -93146,9 +93079,7 @@ fn fallible(value: Option<u8>) {
                 b"fixture integration index\n".as_slice(),
             ),
         ];
-        for (path, bytes) in integration_rows {
-            ordinary_fixture_write_new(&root, path, bytes)?;
-        }
+        for &(path, bytes) in &integration_rows { ordinary_fixture_write_new(&root, path, bytes)?; }
         let integration = super::trust_std::attest_fixture_outer_and_integration(
             &run_id,
             &authoring_marker,
@@ -93309,7 +93240,7 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn run_ordinary_attest_self_reexec_child(
         child: OrdinaryAttestSelfReexecChild,
-        mutate_tool_set: bool,
+        plant: OrdinaryPlant,
     ) -> Result<(), String> {
         let OrdinaryAttestSelfReexecChild {
             repository_root,
@@ -93414,7 +93345,7 @@ fn fallible(value: Option<u8>) {
             &expectation.selected_executable.path,
         );
         let mut ledger_expectation = expectation.clone();
-        if mutate_tool_set {
+        if plant == OrdinaryPlant::ToolSet {
             ledger_expectation.tool_set_sha256[0] ^= 0x80;
         }
         let observed_tool_set_sha256 = ledger_expectation.tool_set_sha256;
@@ -93430,7 +93361,22 @@ fn fallible(value: Option<u8>) {
         drop(fresh_reprobe);
         drop(non_tool);
         drop(authority);
-        if mutate_tool_set {
+        let binding_digests = if plant == OrdinaryPlant::SourceBinding {
+            let path = invocation.repository_root.join(ORDINARY_CORE_SOURCE);
+            let mut bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            let expected = trust_sha256(&bytes).map_err(|error| error.to_string())?;
+            let first = bytes.first_mut()
+                .ok_or_else(|| "E_SHA256_MISMATCH: empty source plant".to_owned())?;
+            *first ^= 1;
+            fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+            let observed = trust_sha256(&bytes).map_err(|error| error.to_string())?;
+            Some((expected, observed))
+        } else if plant == OrdinaryPlant::ToolSet {
+            Some((expected_tool_set_sha256, observed_tool_set_sha256))
+        } else {
+            None
+        };
+        if let Some((expected, observed)) = binding_digests {
             let state = ordinary_fixture_tree_state(&invocation.repository_root)?;
             let state_sha256 = trust_sha256(format!("{state:?}").as_bytes())
                 .map_err(|error| format!("E_HANDOFF_LEDGER: baseline state digest: {error}"))?;
@@ -93439,8 +93385,8 @@ fn fallible(value: Option<u8>) {
                 stdout,
                 "FND01NEGSTATEv1|{}|{}|{}",
                 encode_lower_hex(&state_sha256),
-                encode_lower_hex(&expected_tool_set_sha256),
-                encode_lower_hex(&observed_tool_set_sha256),
+                encode_lower_hex(&expected),
+                encode_lower_hex(&observed),
             )
             .and_then(|()| stdout.flush())
             .map_err(|error| format!("E_HANDOFF_LEDGER: baseline state output: {error}"))?;
@@ -93461,7 +93407,7 @@ fn fallible(value: Option<u8>) {
     fn spawn_ordinary_attest_self_reexec(
         subject: &OrdinaryAttestSelfReexecSubject,
         test_id: &str,
-        mutate_tool_set: bool,
+        plant: OrdinaryPlant,
     ) {
         let output = Command::new(&subject.fixture_driver)
             .args(["--exact", test_id, "--nocapture"])
@@ -93491,26 +93437,23 @@ fn fallible(value: Option<u8>) {
         let stdout = stdout
             .strip_prefix("\nrunning 1 test\n")
             .expect("exact fixture-driver stdout prelude");
-        let stderr = stderr
-            .strip_suffix('\n')
-            .expect("public harness failure-frame terminal LF");
-        assert!(!stderr.contains('\n'), "one public harness failure frame");
-        assert_eq!(
-            output.status.code(),
-            Some(3),
-            "public harness terminal status: {:?}; stdout={stdout:?}; stderr={stderr:?}", output.status,
-        );
         let child_ran = subject.root.join(format!(
-            ".fnd01-run/independent-attester/{}/self-reexec-child-ran",
-            subject.run_id,
-        ));
+            ".fnd01-run/independent-attester/{}/self-reexec-child-ran", subject.run_id));
         assert_eq!(
             fs::read(&child_ran)
                 .unwrap_or_else(|error| panic!("Attest self-reexec child marker: {error}")),
             format!("child-ran={}\n", subject.run_id).as_bytes(),
             "Attest self-reexec exact child body did not run",
         );
-        if mutate_tool_set {
+        if plant == OrdinaryPlant::None {
+            assert_eq!(output.status.code(), Some(0));
+            assert!(stdout.is_empty() && stderr.is_empty());
+        } else {
+            let stderr = stderr
+                .strip_suffix('\n')
+                .expect("public harness failure-frame terminal LF");
+            assert!(!stderr.contains('\n'), "one public harness failure frame");
+            assert_eq!(output.status.code(), Some(3));
             let fields = stdout
                 .strip_suffix('\n')
                 .expect("negative state receipt terminal LF")
@@ -93522,58 +93465,49 @@ fn fallible(value: Option<u8>) {
                 assert_eq!(field.len(), 64, "negative receipt digest width");
                 assert!(field.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
             }
-            assert_ne!(fields[2], fields[3], "planted tool-set digest must differ");
-            let state = ordinary_fixture_tree_state(&subject.root)
-                .expect("public rejection fixture-state recheck");
+            assert_ne!(fields[2], fields[3], "planted binding digest must differ");
+            let state = ordinary_fixture_tree_state(&subject.root).expect("public rejection fixture-state recheck");
             let state_sha256 = trust_sha256(format!("{state:?}").as_bytes())
                 .expect("public rejection fixture-state digest");
-            assert_eq!(
-                encode_lower_hex(&state_sha256),
-                fields[1],
-                "public rejection leaves complete fixture state unchanged",
-            );
-            let nested = format!(
-                "E_CONTROL_AUTHORITY\\x7Ctool_set_sha256 expected={} observed={}",
-                fields[2], fields[3],
-            );
-            assert_eq!(
-                stderr,
-                format!(
-                    "FND01ENTRYv1|ledger|attest|E_HANDOFF_LEDGER|role=attest @ run_id={} @ expected=complete ControlLedgerExpectation @ observed=complete validator failed ({nested})",
-                    subject.run_id,
-                ),
-                "exact typed public ledger frame",
-            );
-        } else {
-            assert!(stdout.is_empty(), "positive public harness stdout must be empty");
-            assert!(
-                stderr.starts_with(&format!(
-                    "FND01ENTRYv1|evidence|attest|E_ORDINARY_EVIDENCE|role=attest @ run_id={} @ expected=accepted evidence report @ observed=FND01\\x7CError\\x7CE_SOURCE_EXACT_SET\\x7Csource inventory\\x7C",
-                    subject.run_id,
-                )),
-                "typed public evidence frame: {stderr}",
-            );
+            assert_eq!(encode_lower_hex(&state_sha256), fields[1],
+                "public rejection leaves complete fixture state unchanged");
+            if plant == OrdinaryPlant::ToolSet {
+                assert_eq!(stderr, format!(
+                    "FND01ENTRYv1|ledger|attest|E_HANDOFF_LEDGER|role=attest @ run_id={} @ expected=complete ControlLedgerExpectation @ observed=complete validator failed (E_CONTROL_AUTHORITY\\x7Ctool_set_sha256 expected={} observed={})",
+                    subject.run_id, fields[2], fields[3]));
+            } else {
+                assert_eq!(stderr, format!(
+                    "FND01ENTRYv1|evidence|attest|E_ORDINARY_EVIDENCE|role=attest @ run_id={} @ expected=accepted evidence report @ observed=FND01\\x7CError\\x7CE_SHA256_MISMATCH\\x7C{}\\x7C",
+                    subject.run_id, ORDINARY_CORE_SOURCE));
+                let path = subject.root.join(ORDINARY_CORE_SOURCE);
+                let pristine = fs::read(repository_root().join(ORDINARY_CORE_SOURCE)).expect("pristine source");
+                assert_eq!(fs::metadata(&path).expect("planted source").len(),
+                    u64::try_from(pristine.len()).expect("source length"));
+                fs::write(&path, pristine).expect("restore source");
+                let report = run_verifier_at(&subject.root).expect("restored source accepted");
+                assert!(!report.has_errors());
+            }
         }
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    fn assert_ordinary_attest_self_reexec(test_id: &str, mutate_tool_set: bool) {
+    fn assert_ordinary_attest_self_reexec(test_id: &str, plant: OrdinaryPlant) {
         match ordinary_attest_self_reexec_child() {
             Ok(Some(child)) => {
-                run_ordinary_attest_self_reexec_child(child, mutate_tool_set)
+                run_ordinary_attest_self_reexec_child(child, plant)
                     .unwrap_or_else(|error| panic!("Attest self-reexec child: {error}"));
             }
             Ok(None) => {
                 let subject = ordinary_attest_self_reexec_subject()
                     .unwrap_or_else(|error| panic!("Attest self-reexec subject: {error}"));
-                spawn_ordinary_attest_self_reexec(&subject, test_id, mutate_tool_set);
+                spawn_ordinary_attest_self_reexec(&subject, test_id, plant);
             }
             Err(error) => panic!("Attest self-reexec child admission: {error}"),
         }
     }
 
     #[cfg(not(all(test, target_os = "linux", target_arch = "x86_64")))]
-    fn assert_ordinary_attest_self_reexec(_test_id: &str, _mutate_tool_set: bool) {
+    fn assert_ordinary_attest_self_reexec(_test_id: &str, _plant: OrdinaryPlant) {
         panic!("ordinary Attest self-reexec fixture requires Linux x86_64");
     }
 
@@ -96760,7 +96694,8 @@ fn fallible(value: Option<u8>) {
                 trust_sha256(payload).expect("intended leaf digest"),
             );
         }
-        assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID, false);
+        assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID,
+            OrdinaryPlant::None);
     }
 
     #[test]
@@ -96799,7 +96734,8 @@ fn fallible(value: Option<u8>) {
                 "no rejected physical substitution earns an accepted binding",
             );
         }
-        assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID, true);
+        assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID,
+            OrdinaryPlant::ToolSet);
     }
 
     #[test]
@@ -97478,7 +97414,8 @@ fn fallible(value: Option<u8>) {
 
     #[test]
     fn ordinary_b_r5_post_consume_runtime_uses_evidence_code() {
-        assert_ordinary_attest_self_reexec(ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID, false);
+        assert_ordinary_attest_self_reexec(ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID,
+            OrdinaryPlant::SourceBinding);
     }
 
     fn ordinary_environment_set_digest() -> [u8; 32] {
