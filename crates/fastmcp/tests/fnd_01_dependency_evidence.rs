@@ -14,6 +14,25 @@ const FROZEN_POLICY_SHA256: &str =
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
+#[cfg(test)]
+fn fresh_test_root(namespace: &str) -> std::path::PathBuf {
+    static NEXT_ROOT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..1_024 {
+        let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "fastmcp-fnd01-{namespace}-{}-{sequence}",
+            std::process::id(),
+        ));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("fresh {namespace} test root: {error}"),
+        }
+    }
+    panic!("exhausted fresh {namespace} test-root attempts")
+}
+
 struct SparseIndexFixtureCorpus {
     checksum: &'static str,
     valid_v1: String,
@@ -18966,13 +18985,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let admitted = require_root_frozen_bootstrap_input_authority(
             &acquisition.manifest, manifest_binding, validated,
         )?;
-        #[cfg(test)] super::POST_AUTHORITIES.set(super::POST_AUTHORITIES.get() + 1);
         Ok(ProducePostAcquisitionAuthority { authority: acquisition.authority,
             role_root: acquisition.role_root, package_root: acquisition.package_root,
             execution_bin: acquisition.execution_bin, admitted })
     }
 
-    fn run_with<F>(authority: PhaseBAuthority, arguments: &BootstrapArguments,
+    pub(super) fn run_with<F>(authority: PhaseBAuthority, arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment, authoring_marker: &AuthoringMarker,
         integration_digest: [u8; 32], authoring_bytes: &[Vec<u8>; 3],
         continue_with: F) -> TrustResult<()> where F: FnOnce(BoundedProduceAcquisition) -> TrustResult<()> {
@@ -19007,31 +19025,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let acquisition = issue(authority, arguments, environment, marker,
             [0; 32], authoring)?.consume()?;
         Ok((acquisition.authority, acquisition.role_root))
-    }
-
-    #[cfg(test)]
-    pub(super) fn attempt_later_effects(
-        authority: PhaseBAuthority,
-        arguments: &BootstrapArguments,
-        environment: &BootstrapEnvironment,
-        marker: &AuthoringMarker,
-        authoring: &[Vec<u8>; 3],
-        manifest: &[u8],
-        validated: &ValidatedSupplyBundle<'_>,
-    ) -> TrustResult<()> {
-        let acquisition = issue(authority, arguments, environment, marker,
-            [0; 32], authoring)?.consume()?;
-        authorize_later_effects(acquisition, binding_for_bytes(manifest)?, validated).map(|_| ())
-    }
-
-    #[cfg(test)]
-    pub(super) fn attempt_runner(authority: PhaseBAuthority,
-        arguments: &BootstrapArguments, environment: &BootstrapEnvironment,
-        marker: &AuthoringMarker, authoring: &[Vec<u8>; 3],
-        entered: &std::cell::Cell<usize>) -> TrustResult<()> {
-        run_with(authority, arguments, environment, marker, [0; 32], authoring, |acquisition| {
-            drop(acquisition); entered.set(entered.get() + 1); Ok(())
-        })
     }
 
     #[cfg(test)]
@@ -30375,18 +30368,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )
     }
 
-    #[cfg(test)]
-    std::thread_local! {
-        static PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        static POST_AUTHORITIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    #[cfg(test)]
-    fn reset_produce_effectful_continuation_entries() { PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.set(0); }
-
-    #[cfg(test)]
-    fn produce_effectful_continuation_entries() -> usize { PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.get() }
-
     fn continue_produce_phase_b_control_plane(
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
@@ -30395,8 +30376,6 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         authoring_bytes: &[Vec<u8>; 3],
         acquisition: produce_acquisition_permit::BoundedProduceAcquisition,
     ) -> TrustResult<()> {
-        #[cfg(test)]
-        PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.set(PRODUCE_EFFECTFUL_CONTINUATION_ENTRIES.get() + 1);
         let permit = &acquisition;
         let authority = permit.authority();
         let role = role_name(arguments.mode)?;
@@ -31601,14 +31580,18 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             digest: [u8; 32],
             authoring: &[Vec<u8>; 3],
         ) {
-            reset_produce_effectful_continuation_entries();
-            let error = produce_phase_b_control_plane(
-                arguments, environment, marker, digest, authoring, authority)
+            let entered = std::cell::Cell::new(0);
+            let error = produce_acquisition_permit::run_with(
+                authority, arguments, environment, marker, digest, authoring, |acquisition| {
+                    drop(acquisition);
+                    entered.set(entered.get() + 1);
+                    Ok(())
+                })
                 .expect_err("Produce authority drift must reject");
             assert_eq!(error.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
             assert_eq!(error.detail(), JOIN_DRIFT);
             assert_eq!(
-                produce_effectful_continuation_entries(), 0,
+                entered.get(), 0,
                 "authority rejection crossed the repository/file/network/child/ledger/exec boundary",
             );
         }
@@ -31856,10 +31839,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x11);
             let run_id = arguments.run_id.clone();
-            let no_effect_root = std::env::temp_dir().join(format!(
-                "fastmcp-phase-b-no-effects-{}-{run_id}",
-                std::process::id(),
-            ));
+            let no_effect_root =
+                super::super::fresh_test_root("phase-b-no-effects").join("repository");
             assert!(!no_effect_root.exists());
             arguments.repository_root = no_effect_root.clone();
             arguments.run_root = no_effect_root
@@ -31903,10 +31884,37 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert_eq!(observed, compiled_produce_acquisition_authority());
             assert_eq!(observed.full_policy_join_sha256, PRODUCE_POLICY_JOIN_SHA256);
             assert!(!no_effect_root.exists());
+
+            let SyntheticPhaseBInputs {
+                authoring_bytes,
+                marker,
+                mut arguments,
+                mut environment,
+                ..
+            } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x14);
+            let repository_root = super::super::fresh_test_root("phase-b-entry");
+            for (relative, bytes) in super::super::trust_std::AUTHORING_PATHS.iter().zip(&authoring_bytes) {
+                let path = repository_root.join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("parent tree");
+                fs::write(path, bytes).expect("authoring member");
+            }
+            arguments.run_root = repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id));
+            arguments.repository_root = repository_root;
+            environment.closed_path = "/definitely-missing-phase-b-path".to_owned();
+            let mut retained = super::super::trust_std::retain_authoring_files(
+                &arguments.repository_root, &marker).expect("retained authoring set");
+            assert!(!arguments.run_root.exists());
+            let error = run_phase_b(&arguments, &environment, &marker, None,
+                &mut retained, None)
+            .expect_err("Phase-B rejects unqualified PATH");
+            assert_eq!(error.code(), "E_PHASE_B_ACQUISITION_AUTHORITY");
+            assert!(!arguments.run_root.exists());
         }
 
         #[test]
         fn phase_b_produce_acquisition_authority_matrix() {
+            let _: fn(Vec<OsString>) -> TrustResult<()> = super::super::bootstrap::run_role;
             let SyntheticPhaseBInputs {
                 policy,
                 manifest: _,
@@ -31932,6 +31940,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         #[test]
         fn phase_b_produce_permit_is_single_use_and_bounded() {
             produce_acquisition_permit::assert_single_use_type();
+            let body = super::super::ordinary::ordinary_function_body(
+                include_str!("fnd_01_dependency_evidence.rs"),
+                "continue_produce_phase_b_control_plane",
+            );
+            let barrier = body
+                .find("authorize_later_effects")
+                .expect("authority barrier");
+            for marker in ["let supply_bound", "materialize_supply", "let spool_bound",
+                "\"bootstrap-control.build\"", "let _ledger_bound", "exec_handoff"] {
+                let effect = body.find(marker).expect("effect marker");
+                assert_eq!(Some(effect), body.rfind(marker));
+                assert!(barrier < effect);
+            }
             find_once(
                 FROZEN_POLICY,
                 b"Produce returns E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING at that boundary",
@@ -31946,25 +31967,31 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 mut arguments,
                 environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x13);
-            let claim_root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(
-                format!("phase-b-one-shot-{}", std::process::id()));
-            fs::create_dir_all(&claim_root).expect("one-shot test repository");
+            let claim_root = super::super::fresh_test_root("phase-b-one-shot");
             arguments.repository_root = claim_root;
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
             let entered = std::cell::Cell::new(0);
-            produce_acquisition_permit::attempt_runner(
+            produce_acquisition_permit::run_with(
                 synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                &environment, &marker, &authoring_bytes, &entered)
+                &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
+                    drop(acquisition);
+                    entered.set(entered.get() + 1);
+                    Ok(())
+                })
                 .expect("first package-root claim");
             assert_eq!(entered.get(), 1);
             let package_root = arguments.run_root.join("bootstrap-control-package");
             let before = fs_identity(&fs::metadata(&package_root).expect("claimed"));
             assert!(fs::read_dir(&package_root).expect("empty").next().is_none());
             assert_eq!(
-                produce_acquisition_permit::attempt_runner(
+                produce_acquisition_permit::run_with(
                     synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                    &environment, &marker, &authoring_bytes, &entered)
+                    &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
+                        drop(acquisition);
+                        entered.set(entered.get() + 1);
+                        Ok(())
+                    })
                     .expect_err("same run cannot claim twice").code(),
                 "E_PHASE_B_FRESHNESS",
             );
@@ -31991,31 +32018,54 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let supply = synthetic_valid_supply(&archive);
             let validated = validate_supply_bundle_value(&supply)
                 .expect("validated bounded supply");
-            POST_AUTHORITIES.set(0);
+            let assert_no_later_effects = |arguments: &BootstrapArguments| {
+                for relative in ["supply-bundle.bin", "acquisition-spool.bin",
+                    "local-registry", "bootstrap-control-target", "control-ledger.bin"] {
+                    assert!(!arguments.run_root.join(relative).exists(), "{relative}");
+                }
+            };
             let mut wrong_manifest = manifest.clone();
             wrong_manifest[0] ^= 1;
+            let before_authoring = authoring_bytes.clone();
+            let before_supply = supply.clone();
+            let wrong_root = super::super::fresh_test_root("phase-b-wrong-authority");
+            arguments.repository_root = wrong_root;
+            arguments.run_root = arguments.repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id));
             assert_eq!(
-                produce_acquisition_permit::attempt_later_effects(
+                produce_acquisition_permit::run_with(
                     synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                    &environment, &marker, &authoring_bytes, &wrong_manifest, &validated)
+                    &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
+                        produce_acquisition_permit::authorize_later_effects(
+                            acquisition, binding_for_bytes(&wrong_manifest)?, &validated).map(|_| ())
+                    })
                     .expect_err("foreign manifest cannot cross the consumed permit").code(),
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
             );
+            assert_eq!(authoring_bytes, before_authoring);
+            assert_eq!(supply, before_supply);
+            assert_no_later_effects(&arguments);
+
+            let later_root = super::super::fresh_test_root("phase-b-later-authority");
+            arguments.repository_root = later_root;
+            arguments.run_root = arguments.repository_root.join(format!(
+                ".fnd01-run/integration-producer/{}", arguments.run_id));
             assert_eq!(
-                produce_acquisition_permit::attempt_later_effects(
-                    synthetic_phase_b_authority(&policy, &manifest),
-                    &arguments,
-                    &environment,
-                    &marker,
-                    &authoring_bytes,
-                    &manifest,
-                    &validated,
+                produce_acquisition_permit::run_with(
+                    synthetic_phase_b_authority(&policy, &manifest), &arguments,
+                    &environment, &marker, [0; 32], &authoring_bytes,
+                    |acquisition| {
+                        produce_acquisition_permit::authorize_later_effects(
+                            acquisition, binding_for_bytes(&manifest)?, &validated).map(|_| ())
+                    },
                 )
                 .expect_err("acquisition cannot authorize later effects")
                 .code(),
                 "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
             );
-            assert_eq!(POST_AUTHORITIES.get(), 0);
+            assert_eq!(authoring_bytes, before_authoring);
+            assert_eq!(supply, before_supply);
+            assert_no_later_effects(&arguments);
         }
 
         #[test]
@@ -33235,10 +33285,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert!(error.detail().contains("validated 1 crate archive framings"));
             assert_eq!(supply, baseline);
 
-            let mut no_archive = supply.clone();
-            no_archive.entries.retain(|entry| entry.kind != 0x01);
-            let no_archive_baseline = no_archive.clone();
-            let no_archive_error = attest_phase_b_supply_validation(
+            let mut malformed_archive = archive;
+            malformed_archive[0] ^= 1;
+            let malformed = synthetic_valid_supply(&malformed_archive);
+            let malformed_baseline = malformed.clone();
+            let malformed_error = attest_phase_b_supply_validation(
                 &arguments,
                 &environment,
                 &marker,
@@ -33246,14 +33297,29 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 &authoring_bytes,
                 validate_phase_b_authority(&policy)
                     .expect("frozen Attest authority"),
-                &no_archive,
+                &malformed,
             )
-            .expect_err("Attest requires at least one crate archive framing");
+            .expect_err("coherent one-byte archive framing drift must fail");
             assert_eq!(
-                no_archive_error.code(),
+                malformed_error.code(),
                 "E_PHASE_B_SUPPLY_ARCHIVE_VALIDATION",
             );
-            assert_eq!(no_archive, no_archive_baseline);
+            assert_eq!(malformed, malformed_baseline);
+            assert_eq!(
+                attest_phase_b_supply_validation(
+                    &arguments,
+                    &environment,
+                    &marker,
+                    [0x33; 32],
+                    &authoring_bytes,
+                    validate_phase_b_authority(&policy)
+                        .expect("frozen Attest authority"),
+                    &supply,
+                )
+                .expect_err("pristine Attest boundary remains fail closed")
+                .code(),
+                "E_PHASE_B_ATTEST_INPUT_AUTHORITY",
+            );
         }
 
         #[test]
@@ -33567,7 +33633,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
 #[rustfmt::skip]
 mod bootstrap {
-    #[cfg(fnd01_bootstrap)]
+    #[cfg(any(fnd01_bootstrap, test))]
     use super::phase_b_std::run_phase_b;
     use super::trust_std::{
         BootstrapMode, TrustError, TrustResult, build_gate_handshake,
@@ -33588,11 +33654,11 @@ mod bootstrap {
         MAX_PACKAGE_ARTIFACT_BYTES, MAX_RECEIPT_BYTES,
         MAX_SUPPLY_BUNDLE_BYTES,
     };
-    #[cfg(fnd01_bootstrap)]
+    #[cfg(any(fnd01_bootstrap, test))]
     use super::trust_std::{
         emit_entry_diagnostic, has_exact_gate_intent, parse_integration_seal,
     };
-    #[cfg(fnd01_bootstrap)]
+    #[cfg(any(fnd01_bootstrap, test))]
     use std::cell::Cell;
     use std::ffi::OsString;
 
@@ -33854,8 +33920,8 @@ mod bootstrap {
         emit_gate_handshake(&handshake)
     }
 
-    #[cfg(fnd01_bootstrap)]
-    fn run_role(arguments: Vec<OsString>) -> TrustResult<()> {
+    #[cfg(any(fnd01_bootstrap, test))]
+    pub(super) fn run_role(arguments: Vec<OsString>) -> TrustResult<()> {
         let arguments = parse_bootstrap_arguments(arguments)?;
         if arguments.mode == BootstrapMode::Gate {
             return Err(TrustError::new(
@@ -33916,7 +33982,7 @@ mod bootstrap {
         )
     }
 
-    #[cfg(fnd01_bootstrap)]
+    #[cfg(any(fnd01_bootstrap, test))]
     pub fn harness_main<I>(arguments: I) -> i32
     where
         I: IntoIterator<Item = OsString>,
@@ -33984,7 +34050,7 @@ mod bootstrap {
     }
 }
 
-#[cfg(not(fnd01_bootstrap))]
+#[cfg(any(not(fnd01_bootstrap), test))]
 // This module intentionally contains frozen byte-level fixture records and
 // source-order guards.  Keep its existing layout stable; R4 edits below are
 // formatted manually rather than applying a whole-file formatter.
@@ -83640,11 +83706,8 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
         };
         use std::fs::OpenOptions;
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
         #[derive(Debug, Clone, Copy)]
         enum Mutation {
@@ -83653,27 +83716,13 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
             InPlace,
         }
 
-        fn fresh_root(sequence: u64) -> PathBuf {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos();
-            let root = PathBuf::from("/tmp").join(format!(
-                "fastmcp-fnd01-snapshot-{}-{timestamp}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&root).expect("fresh snapshot test root");
-            root
-        }
-
         for stage in [
             SnapshotStage::PreOpen,
             SnapshotStage::PostOpenPreRead,
             SnapshotStage::PostReadPreFinalMetadata,
         ] {
             for mutation in [Mutation::Replace, Mutation::Relink, Mutation::InPlace] {
-                let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                let root = fresh_root(sequence);
+                let root = super::fresh_test_root("snapshot");
                 let leaf = root.join("sample.bin");
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -83797,21 +83846,7 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
         };
         use std::fs::OpenOptions;
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let root = PathBuf::from("/tmp").join(format!(
-            "fastmcp-fnd01-set-snapshot-{}-{timestamp}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("fresh set-wide snapshot test root");
+        let root = super::fresh_test_root("set-snapshot");
 
         let canonical_paths = ["member-0.bin", "member-1.bin", "member-2.bin"];
         let maximum_bytes = [64u64; 3];
@@ -83926,21 +83961,7 @@ validate_variant_site_reachability(&authority, &reachable_nodes, &BTreeSet::new(
             checked_snapshot_set_with_hook, FileBinding, SnapshotStage, TrustError,
         };
         use std::fs::OpenOptions;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let root = PathBuf::from("/tmp").join(format!(
-            "fastmcp-fnd01-stable-set-snapshot-{}-{timestamp}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("fresh stable set-wide snapshot test root");
+        let root = super::fresh_test_root("stable-set-snapshot");
         let canonical_paths = ["stable-0.bin", "stable-1.bin"];
         let maximum_bytes = [64u64; 2];
         let payloads: [&[u8]; 2] = [b"stable-zero", b"stable-one"];
@@ -96581,7 +96602,7 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    fn ordinary_function_body(source: &str, name: &str) -> String {
+    pub(super) fn ordinary_function_body(source: &str, name: &str) -> String {
         fn find(tokens: TokenStream, name: &str) -> Option<TokenStream> {
             let tokens = tokens.into_iter().collect::<Vec<_>>();
             for (index, token) in tokens.iter().enumerate() {
@@ -99537,9 +99558,9 @@ fn fallible(value: Option<u8>) {
     }
 } // mod ordinary
 
-#[cfg(fnd01_bootstrap)]
+#[cfg(any(fnd01_bootstrap, test))]
 pub use bootstrap::harness_main;
-#[cfg(not(fnd01_bootstrap))]
+#[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub use ordinary::harness_main;
 #[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub(crate) use ordinary::{
