@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 903_485;
+const FROZEN_POLICY_BYTES: usize = 903_983;
 const FROZEN_POLICY_SHA256: &str =
-    "b3803b7b7119bbcbb86d0587ff70ae92778c6669bd37f75ada20bfcfd75544a3";
+    "bfde2bae1bb0a5620cc4fe3c14b704d9fac2380d40f80328a0121a830fbcf21d";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -31875,20 +31875,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
-        const PRODUCE_AUTHORITY_MATRIX: &[(&str, &str, &str)] = &[
-            ("environment", "environment_profile[acquisition].required", "plan.environment"),
-            ("argv", "command_template[bootstrap.resolve].argv_template", "plan.commands[0].argv_literals"),
-            ("CWD", "command_template[bootstrap.resolve].working_directory", "plan.commands[0].working_directory_formula"),
-            ("command", "command_template[bootstrap.resolve].template_id", "plan.commands[0].id"),
-            ("bound", "bounds.max_supply_bundle_bytes", "max_supply_bundle_bytes"),
-            ("deadline", "bootstrap_control_plane_contract.resolve_timeout_seconds", "resolve.timeout_seconds"),
-            ("run-root", "generated_path_contract.path_formulas[run-root]", "plan.run_root_formula"),
-            ("marker", "authoring_closure_contract.marker_exact_grammar", "marker_format"),
-            ("bootstrap-control", "bootstrap_control_plane_contract.scratch_root_formula", "plan.scratch_root_formula"),
-            ("supply", "supply_bundle_contract.format", "supply_format"),
-            ("Cargo-discovery", "cargo_config_discovery_contract.discovery_rule", "cargo_discovery_requires_no_config"),
-            ("generated-path", "bootstrap_control_plane_contract.acquisition_spool_path_formula", "acquisition_spool_path_formula"),
-            ("native-tool", "command_environment_profiles.native_tool_candidate_count", "native_tool_count"),
+        const PRODUCE_AUTHORITY_MATRIX: &[(&str, &str)] = &[
+            ("environment", "plan.environment"), ("argv", "plan.commands[0].argv_literals"),
+            ("CWD", "plan.commands[0].working_directory_formula"), ("command", "plan.commands[0].id"),
+            ("bound", "max_supply_bundle_bytes"), ("deadline", "resolve.timeout_seconds"),
+            ("run-root", "plan.run_root_formula"), ("marker", "marker_format"),
+            ("bootstrap-control", "plan.scratch_root_formula"), ("supply", "supply_format"),
+            ("Cargo-discovery", "cargo_discovery_requires_no_config"),
+            ("generated-path", "acquisition_spool_path_formula"), ("native-tool", "native_tool_count"),
         ];
 
         #[test]
@@ -31910,11 +31904,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(".fnd01-run")
                 .join("integration-producer")
                 .join(&run_id);
-            let (mut families, mut rows, mut mutations) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
-            for &(family, row, mutation) in PRODUCE_AUTHORITY_MATRIX {
-                assert!(families.insert(family) && rows.insert(row) && mutations.insert(mutation),
-                    "duplicate authority tuple for {family}");
-                let mut rejected = validate_phase_b_authority(&policy).expect("frozen authority baseline");
+            let (mut families, mut mutations) = (BTreeSet::new(), BTreeSet::new());
+            let record=PRODUCE_AUTHORITY_MATRIX.iter().map(|(f,m)|format!("{f}={m}"))
+                .collect::<Vec<_>>().join(";");
+            find_once(FROZEN_POLICY,format!("Matrix: rejection=E_PHASE_B_ACQUISITION_AUTHORITY;{record}.").as_bytes(),"Matrix")
+                .expect("canonical Matrix");
+            for &(family, mutation) in PRODUCE_AUTHORITY_MATRIX {
+                assert!(families.insert(family)&&mutations.insert(mutation));
+                let mut rejected = validate_phase_b_authority(&policy).expect("baseline");
                 let authority = &mut rejected.produce_acquisition;
                 match mutation {
                     "plan.environment" => authority.plan.environment = &[],
@@ -31934,11 +31931,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 }
                 assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, "E_PHASE_B_ACQUISITION_AUTHORITY");
                 assert!(!no_effect_root.exists(), "{family}");
-                let pristine = validate_phase_b_authority(&policy).expect("pristine authority reacceptance");
+                let pristine = validate_phase_b_authority(&policy).expect("reacceptance");
                 produce_acquisition_permit::require_complete_produce_acquisition_policy_join(
-                    &pristine.produce_acquisition).expect("pristine join reacceptance");
+                    &pristine.produce_acquisition).expect("reaccept");
             }
-            assert_eq!((families.len(), rows.len(), mutations.len()), (13, 13, 13));
+            assert_eq!((families.len(), mutations.len()), (13, 13));
             assert!(!no_effect_root.exists());
 
             let SyntheticPhaseBInputs {
@@ -31971,7 +31968,16 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         #[test]
         fn phase_b_produce_acquisition_authority_matrix() {
-            let _ = super::super::bootstrap::run_role;
+            if std::env::var_os("FASTMCP_FND01_RUN_ID").is_some() {
+                let run_id = std::env::var("FASTMCP_FND01_RUN_ID")
+                    .expect("run ID");
+                let error = super::super::bootstrap::run_role(vec![
+                    OsString::from(format!("target/debug/fnd-01/{run_id}/bootstrap")),
+                    OsString::from("produce"), OsString::from("."), OsString::from(run_id),
+                ]).expect_err("tool admission");
+                assert_eq!(error.code(), "E_PHASE_B_TOOL_SET");
+                return;
+            }
             let SyntheticPhaseBInputs {
                 authoring_bytes,
                 mut arguments,
@@ -31985,14 +31991,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 ".fnd01-run/integration-producer/{}", arguments.run_id
             ));
             arguments.repository_root = repository_root.clone();
-            environment.closed_path =
-                "/phase-b-tools/bin:/usr/bin:/bin".to_owned();
-            let error=super::super::bootstrap::run_role_with_inputs(
-                arguments.clone(),
-                environment,
+            let tool_bin=repository_root.join("phase-b-tools/bin");
+            fs::create_dir_all(&tool_bin).expect("bin");
+            environment.closed_path=format!("{}:/usr/bin:/bin",tool_bin.display());
+            let child = std::process::Command::new(
+                std::env::current_exe().expect("exe"),
             )
-            .expect_err("role reaches tool admission");
-            assert_eq!(error.code(), "E_PHASE_B_TOOL_SET");
+            .args(["--exact", "phase_b_std::typed_result_tests::phase_b_produce_acquisition_authority_matrix", "--nocapture"])
+            .env_clear()
+            .env("FASTMCP_FND01_AUTHORING_CLOSURE", &environment.authoring_marker)
+            .env("FASTMCP_FND01_RUN_ID", &arguments.run_id)
+            .env("LANG", "C").env("LC_ALL", "C")
+            .env("PATH", &environment.closed_path).env("TZ", "UTC")
+            .current_dir(&repository_root).status().expect("child");
+            assert!(child.success());
             let (_, rows) = snapshot_tree_rows_with_profile(
                 &repository_root,
                 "Produce effects",
@@ -32048,39 +32060,27 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 authoring_bytes,
                 marker,
                 mut arguments,
-                environment,
+                mut environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x13);
             let claim_root = super::super::fresh_test_root("phase-b-one-shot");
             arguments.repository_root = claim_root;
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
-            let entered = std::cell::Cell::new(0);
-            produce_acquisition_permit::run_with(
+            environment.closed_path = "/phase-b-tools/bin:/usr/bin:/bin".to_owned();
+            assert_eq!(produce_acquisition_permit::run(
                 synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
-                    drop(acquisition);
-                    entered.set(entered.get() + 1);
-                    Ok(())
-                })
-                .expect("first package-root claim");
-            assert_eq!(entered.get(), 1);
+                &environment, &marker, [0; 32], &authoring_bytes,
+            ).expect_err("real continuation reaches tool admission").code(), "E_PHASE_B_TOOL_SET");
             let package_root = arguments.run_root.join("bootstrap-control-package");
             let before = fs_identity(&fs::metadata(&package_root).expect("claimed"));
-            assert!(fs::read_dir(&package_root).expect("empty").next().is_none());
             assert_eq!(
-                produce_acquisition_permit::run_with(
+                produce_acquisition_permit::run(
                     synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                    &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
-                        drop(acquisition);
-                        entered.set(entered.get() + 1);
-                        Ok(())
-                    })
-                    .expect_err("same run cannot claim twice").code(),
+                    &environment, &marker, [0; 32], &authoring_bytes,
+                ).expect_err("same run cannot claim twice").code(),
                 "E_PHASE_B_FRESHNESS",
             );
-            assert_eq!(entered.get(), 1);
             assert_eq!(fs_identity(&fs::metadata(&package_root).expect("rejected")), before);
-            assert!(fs::read_dir(&package_root).expect("unchanged").next().is_none());
             let archive = [
                 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0,
                 0, 0, 0, 0, 0,
@@ -32090,8 +32090,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .expect("validated bounded supply");
             let assert_no_later_effects = |arguments: &BootstrapArguments| {
                 for relative in ["supply-bundle.bin", "acquisition-spool.bin",
-                    "local-registry", "bootstrap-control-target", "control-ledger.bin"] {
+                    "local-registry", "bootstrap-control-target", "control-ledger.bin",
+                ] {
                     assert!(!arguments.run_root.join(relative).exists(), "{relative}");
+                }
+                for relative in [format!("target/debug/fnd-01/{}/return",arguments.run_id),
+                    format!(".fnd01-run/publication/{}",arguments.run_id),
+                    "evidence/fnd-01/integration".to_owned()] {
+                    assert!(!arguments.repository_root.join(relative).exists());
                 }
             };
             let mut wrong_manifest = manifest.clone();
@@ -33988,14 +33994,6 @@ mod bootstrap {
             ));
         }
         let environment = read_bootstrap_environment(&arguments)?;
-        run_role_with_inputs(arguments, environment)
-    }
-
-    #[cfg(any(fnd01_bootstrap, test))]
-    pub(super) fn run_role_with_inputs(
-        arguments: BootstrapArguments,
-        environment: BootstrapEnvironment,
-    ) -> TrustResult<()> {
         let authoring_marker = parse_authoring_marker(&environment.authoring_marker)?;
         let mut initial_authoring =
             retain_authoring_files(&arguments.repository_root, &authoring_marker)?;
