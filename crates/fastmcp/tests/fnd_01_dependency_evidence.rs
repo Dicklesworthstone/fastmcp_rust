@@ -14733,7 +14733,7 @@ mod trust_std {
         validate_absolute_lexical_path(value, subject).map_err(failure)
     }
 
-    fn ordinary_checked_current_repository_root(
+    pub(super) fn ordinary_checked_current_repository_root(
     ) -> Result<PathBuf, OrdinaryHandoffArgumentFailure> {
         let repository_value = std::env::current_dir()
             .map_err(|error| OrdinaryHandoffArgumentFailure::RepositoryCurrentDir(io_error(
@@ -28966,12 +28966,15 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         parser: &str,
         lines: StrictVersionLines<'_>,
         expected: &[&str],
-        field: &str,
+        tool: &str,
     ) -> TrustResult<()> {
-        if lines.len() != expected.len()
-            || !lines.iter().zip(expected).all(|(actual, expected)| actual == *expected)
+        if let Some(index) = lines
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != *expected)
+            .or((lines.len() != expected.len()).then_some(lines.len().min(expected.len())))
         {
-            return Err(tool_version_error(format!("{parser}: {field}")));
+            return Err(tool_version_error(format!("{parser}|{tool}: exact-line[{index}]")));
         }
         Ok(())
     }
@@ -29110,7 +29113,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "release: 1.99.0-nightly",
                     "LLVM version: 22.1.8",
                 ],
-                "rustc complete -Vv grammar",
+                tool_id,
             ),
             ("cargo-vv-pinned-1.99", "cargo") => require_exact_version_lines(
                 parser,
@@ -29126,20 +29129,20 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "ssl: OpenSSL 3.6.3 9 Jun 2026",
                     "os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
                 ],
-                "cargo complete -Vv grammar",
+                tool_id,
             ),
             ("rustdoc-pinned-1.99", "rustdoc") => require_exact_version_lines(
                 parser,
                 lines,
                 &["rustdoc 1.99.0-nightly (375b1431b 2026-07-10)"],
-                "rustdoc short commit/date grammar",
+                tool_id,
             ),
             ("rustfmt-pinned-nightly", "rustfmt" | "cargo-fmt") => {
                 require_exact_version_lines(
                     parser,
                     lines,
                     &["rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)"],
-                    "rustfmt pinned version/commit/date grammar",
+                    tool_id,
                 )
             }
             ("clippy-pinned-nightly", "cargo-clippy" | "clippy-driver") => {
@@ -29147,14 +29150,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     parser,
                     lines,
                     &["clippy 0.1.99 (375b1431b7 2026-07-10)"],
-                    "clippy pinned version/commit/date grammar",
+                    tool_id,
                 )
             }
             ("lld-gnu-version", "rust-lld") => require_exact_version_lines(
                 parser,
                 lines,
                 &["LLD 22.1.8 (/checkout/src/llvm-project/llvm a04c1eced55f2f3ea8dbd3d17db0b6df271c0809) (compatible with GNU linkers)"],
-                "rust-lld LLVM 22 GNU-driver grammar",
+                tool_id,
             ),
             ("llvm-version-family", "llvm-nm") => require_exact_version_lines(
                 parser,
@@ -29164,13 +29167,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "Ubuntu LLVM version 22.1.2",
                     "  Optimized build.",
                 ],
-                "llvm-nm LLVM 22 grammar",
+                tool_id,
             ),
             ("llvm-version-family", "apple-ar") => require_exact_version_lines(
                 parser,
                 lines,
                 &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
-                "llvm-ar LLVM 22 grammar",
+                tool_id,
             ),
             ("openssl-version-a", "openssl") => {
                 if lines.len() != 10
@@ -29235,7 +29238,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         parser,
                         lines,
                         &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
-                        "LLVM archiver 22 complete grammar",
+                        tool_id,
                     )
                 } else {
                     require_exact_version_lines(
@@ -29248,7 +29251,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                             "the GNU General Public License version 3 or (at your option) any later version.",
                             "This program has absolutely no warranty.",
                         ],
-                        "GNU ar complete grammar",
+                        tool_id,
                     )
                 }
             }
@@ -29261,7 +29264,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         parser,
                         lines,
                         &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
-                        "LLVM ranlib 22 complete grammar",
+                        tool_id,
                     )
                 } else {
                     require_exact_version_lines(
@@ -29274,7 +29277,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                             "the GNU General Public License version 3 or (at your option) any later version.",
                             "This program has absolutely no warranty.",
                         ],
-                        "GNU ranlib complete grammar",
+                        tool_id,
                     )
                 }
             }
@@ -29320,13 +29323,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "  /WX:no                  Don't treat warnings as errors (default)",
                     "  /WX                     Treat warnings as errors",
                 ],
-                "llvm-lib complete help grammar",
+                tool_id,
             ),
             ("lld-coff-version", "windows-lld-link") => require_exact_version_lines(
                 parser,
                 lines,
                 &["Ubuntu LLD 22.1.2"],
-                "lld-link LLVM 22 COFF-driver grammar",
+                tool_id,
             ),
             _ => Err(tool_version_error(format!(
                 "unknown version parser/role {parser}|{tool_id}"
@@ -91682,6 +91685,10 @@ fn fallible(value: Option<u8>) {
         }
     }
 
+    macro_rules! pending {
+        ($($arg:tt)*) => { format!("E_ORDINARY_HANDOFF_PENDING: {}", format_args!($($arg)*)) };
+    }
+
     fn ordinary_role_absolute_path(
         repository_root: &Path,
         role: &str,
@@ -91690,10 +91697,9 @@ fn fallible(value: Option<u8>) {
     ) -> Result<String, String> {
         let root = ordinary_utf8_path(repository_root, "repository root")?;
         if !root.starts_with('/') {
-            return Err(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation repository root must be absolute"
-                .to_owned(),
-        );
+            return Err(pending!(
+                "sealed ControlLedgerExpectation repository root must be absolute"
+            ));
         }
         let relative = if suffix.is_empty() {
             format!(".fnd01-run/{role}/{run_id}")
@@ -91701,10 +91707,9 @@ fn fallible(value: Option<u8>) {
             format!(".fnd01-run/{role}/{run_id}/{suffix}")
         };
         if relative.contains("//") || relative.contains("/./") || relative.contains("/../") {
-            return Err(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation role path grammar failed"
-                .to_owned(),
-        );
+            return Err(pending!(
+                "sealed ControlLedgerExpectation role path grammar failed"
+            ));
         }
         ordinary_utf8_path(&repository_root.join(relative), "role path")
     }
@@ -91725,53 +91730,41 @@ fn fallible(value: Option<u8>) {
             || control.native_tool_count != ORDINARY_NATIVE_TOOL_COUNT
             || control.handoff_argv_arity != ORDINARY_HANDOFF_ARGV_ARITY
         {
-            return Err(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation pure authority incomplete"
-                .to_owned(),
-        );
+            return Err(pending!(
+                "sealed ControlLedgerExpectation pure authority incomplete"
+            ));
         }
         let role = bootstrap_role_name(mode).map_err(|error| {
-        format!(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation mode/role incomplete ({error})"
-        )
-    })?;
+            pending!("sealed ControlLedgerExpectation mode/role incomplete ({error})")
+        })?;
         if control.role != role {
-            return Err(format!(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation role desync (expected {role}, observed {})",
-            control.role
-        ));
+            return Err(pending!(
+                "sealed ControlLedgerExpectation role desync (expected {role}, observed {})",
+                control.role
+            ));
         }
         if control.control_ledger_relative
             != format!(".fnd01-run/{role}/{}/control-ledger.bin", control.run_id)
         {
-            return Err(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation control-ledger relative desync"
-                .to_owned(),
-        );
+            return Err(pending!(
+                "sealed ControlLedgerExpectation control-ledger relative desync"
+            ));
         }
         if authoring_closure_sha256 == [0; 32] {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: sealed authoring_closure_sha256 must be nonzero"
-                    .to_owned(),
-            );
+            return Err(pending!("sealed authoring_closure_sha256 must be nonzero"));
         }
         if tool_set_sha256 == [0; 32] {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: sealed tool_set_sha256 must be nonzero".to_owned(),
-            );
+            return Err(pending!("sealed tool_set_sha256 must be nonzero"));
         }
         if cargo_executable.is_empty() || !cargo_executable.starts_with('/') {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: sealed cargo_executable must be absolute and nonempty"
-                    .to_owned(),
-            );
+            return Err(pending!(
+                "sealed cargo_executable must be absolute and nonempty"
+            ));
         }
         if bootstrap_environment.authoring_marker.is_empty()
             || bootstrap_environment.closed_path.is_empty()
         {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: sealed bootstrap environment incomplete".to_owned(),
-            );
+            return Err(pending!("sealed bootstrap environment incomplete"));
         }
 
         match mode {
@@ -91780,27 +91773,24 @@ fn fallible(value: Option<u8>) {
                     || bootstrap_environment.integration_seal.is_some()
                     || bootstrap_environment.producer_outer_record_path.is_some()
                 {
-                    return Err(
-                    "E_ORDINARY_HANDOFF_PENDING: Produce sealed expectation rejects Attest seal/spool authority"
-                        .to_owned(),
-                );
+                    return Err(pending!(
+                        "Produce sealed expectation rejects Attest seal/spool authority"
+                    ));
                 }
             }
             BootstrapMode::Attest => {
                 if integration_seal_sha256 == [0; 32]
                     || bootstrap_environment.integration_seal.is_none()
                 {
-                    return Err(
-                    "E_ORDINARY_HANDOFF_PENDING: Attest sealed expectation requires nonzero integration seal"
-                        .to_owned(),
-                );
+                    return Err(pending!(
+                        "Attest sealed expectation requires nonzero integration seal"
+                    ));
                 }
             }
             BootstrapMode::Gate => {
-                return Err(
-                "E_ORDINARY_HANDOFF_PENDING: Gate cannot carry a sealed ControlLedgerExpectation"
-                    .to_owned(),
-            );
+                return Err(pending!(
+                    "Gate cannot carry a sealed ControlLedgerExpectation"
+                ));
             }
         }
 
@@ -91906,26 +91896,23 @@ fn fallible(value: Option<u8>) {
             || target_snapshot.path.is_empty()
             || supply_bundle.binding.byte_length == 0
         {
-            return Err(
-            "E_ORDINARY_HANDOFF_PENDING: sealed ControlLedgerExpectation layout-derived field mismatch"
-                .to_owned(),
-        );
+            return Err(pending!(
+                "sealed ControlLedgerExpectation layout-derived field mismatch"
+            ));
         }
         match mode {
             BootstrapMode::Produce => {
                 if integration_seal_sha256 != [0; 32] || acquisition_spool_binding.is_none() {
-                    return Err(
-                    "E_ORDINARY_HANDOFF_PENDING: Produce sealed integration/spool expectation mismatch"
-                        .to_owned(),
-                );
+                    return Err(pending!(
+                        "Produce sealed integration/spool expectation mismatch"
+                    ));
                 }
             }
             BootstrapMode::Attest => {
                 if integration_seal_sha256 == [0; 32] || acquisition_spool_binding.is_some() {
-                    return Err(
-                    "E_ORDINARY_HANDOFF_PENDING: Attest sealed integration/spool expectation mismatch"
-                        .to_owned(),
-                );
+                    return Err(pending!(
+                        "Attest sealed integration/spool expectation mismatch"
+                    ));
                 }
             }
             BootstrapMode::Gate => unreachable!("Gate rejected above"),
@@ -92282,18 +92269,18 @@ fn fallible(value: Option<u8>) {
         integration_records: [(&str, &[u8]); 5],
     ) -> Result<OrdinaryAttestFixtureIntegration, String> {
         let authoring = super::trust_std::parse_authoring_marker(authoring_marker)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: authoring marker: {error}"))?;
+            .map_err(|error| pending!("authoring marker: {error}"))?;
         let run_id_bytes =
             super::trust_std::decode_lower_hex::<16>(run_id, "ordinary Attest fixture run ID")
-                .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: run ID: {error}"))?;
+                .map_err(|error| pending!("run ID: {error}"))?;
         for ((path, _), expected_path) in integration_records
             .iter()
             .zip(super::trust_std::INTEGRATION_SEAL_PATHS)
         {
             if *path != expected_path {
-                return Err(format!(
-                "E_ORDINARY_HANDOFF_PENDING: integration fixture registry path expected={expected_path} observed={path}"
-            ));
+                return Err(pending!(
+                    "integration fixture registry path expected={expected_path} observed={path}"
+                ));
             }
         }
 
@@ -92308,7 +92295,7 @@ fn fallible(value: Option<u8>) {
             &producer_outer,
             "ordinary Attest fixture producer outer",
         )
-        .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: producer outer: {error}"))?;
+        .map_err(|error| pending!("producer outer: {error}"))?;
         let mut records = [FileBinding {
             byte_length: 0,
             sha256: [0; 32],
@@ -92343,7 +92330,7 @@ fn fallible(value: Option<u8>) {
         };
         seal.seal_sha256 = trust_sha256(
             &super::trust_std::integration_seal_preimage(&seal).map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: integration preimage: {error}")
+                pending!("integration preimage: {error}")
             })?,
         )
         .map_err(|error| {
@@ -92354,9 +92341,9 @@ fn fallible(value: Option<u8>) {
         })?;
         let integration_marker = super::trust_std::integration_seal_marker(&seal);
         let parsed = parse_integration_seal(&integration_marker, &authoring.closure_sha256)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: integration marker: {error}"))?;
+            .map_err(|error| pending!("integration marker: {error}"))?;
         if parsed != seal {
-            return Err("E_ORDINARY_HANDOFF_PENDING: integration marker round trip".to_owned());
+            return Err(pending!("integration marker round trip"));
         }
 
         Ok(OrdinaryAttestFixtureIntegration {
@@ -92445,7 +92432,6 @@ fn fallible(value: Option<u8>) {
         tool_id: &'static str,
         parser_id: &'static str,
         selected_lexical: &'static str,
-        final_path: &'static str,
         argv_tail: &'static [&'static str],
         selected_stream: &'static str,
         raw_base64: &'static str,
@@ -92455,26 +92441,26 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_tool_probe_fixtures() -> [OrdinaryToolProbeFixture; 20] {
         [
-            OrdinaryToolProbeFixture { tool_id: "rustc", parser_id: "rustc-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustc", final_path: "/fixture/finals/rustc", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTC_B64, raw_sha256: "d2a0a4fa48442a6c214130f08b2e9041725872a05d74680d9fd803ff8cb99c04" },
-            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", final_path: "/fixture/finals/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "9f37a625adbcbf2fe66626c0a3a690432efba31c56de13e40cdd1fc1fe0f114d" },
-            OrdinaryToolProbeFixture { tool_id: "rustdoc", parser_id: "rustdoc-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustdoc", final_path: "/fixture/finals/rustdoc", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTDOC_B64, raw_sha256: "8b9d7c46d8dc09d41da9e1b590b12a6b3b82b1a00c866623067104618a7b1a88" },
-            OrdinaryToolProbeFixture { tool_id: "rustfmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustfmt", final_path: "/fixture/finals/rustfmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
-            OrdinaryToolProbeFixture { tool_id: "cargo-fmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-fmt", final_path: "/fixture/finals/cargo-fmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
-            OrdinaryToolProbeFixture { tool_id: "cargo-clippy", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-clippy", final_path: "/fixture/finals/cargo-clippy", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
-            OrdinaryToolProbeFixture { tool_id: "clippy-driver", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/clippy-driver", final_path: "/fixture/finals/clippy-driver", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
-            OrdinaryToolProbeFixture { tool_id: "rust-lld", parser_id: "lld-gnu-version", selected_lexical: "/fixture/sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld", final_path: "/fixture/finals/rust-lld", argv_tail: &["-flavor", "gnu", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUST_LLD_B64, raw_sha256: "cf7558b748e63be07ad8a4ea32997ff7315fe798159af4194065e4e852008bd3" },
-            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-nm-22", final_path: "/fixture/finals/llvm-nm", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a68721459737cfa09b9215344fed1aa8d05068472fc496b5ec1ba53fa9dff24b" },
-            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-version-a", selected_lexical: "/usr/bin/openssl", final_path: "/fixture/finals/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca" },
-            OrdinaryToolProbeFixture { tool_id: "host-cc", parser_id: "host-c-compiler-v", selected_lexical: "/usr/bin/clang-22", final_path: "/fixture/finals/host-cc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_HOST_CLANG_B64, raw_sha256: "fbab69bc31638e38b444a45b8a73635d8b6ccaa801e2d958dbd8948182c45964" },
-            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ar-22", final_path: "/fixture/finals/host-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
-            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ranlib-22", final_path: "/fixture/finals/host-ranlib", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
-            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-cc", parser_id: "aarch64-c-compiler-v", selected_lexical: "/usr/bin/aarch64-linux-gnu-gcc", final_path: "/fixture/finals/aarch64-linux-cc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_AARCH64_GCC_B64, raw_sha256: "20a5376b7b7e218a03789f05f3d4c29e49d31eb0e54c0356d20e2747629243ae" },
-            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", final_path: "/fixture/finals/aarch64-linux-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "43f5d0d9d22ba26ea2f3bf7843526d9397252213091aed88da1d21894008536e" },
-            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-version", selected_lexical: "/usr/bin/clang-22", final_path: "/fixture/finals/apple-clang", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "921c5adaf09212c716a5405f4c8e3142f73213575ee60d31811a04aa68f28f91" },
-            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-ar-22", final_path: "/fixture/finals/apple-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
-            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", final_path: "/fixture/finals/windows-clang-cl", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "4cf331bc93b25c3c6c31cc7654125723dadbdb9e8806571f56dd6354786beb76" },
-            OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-help", selected_lexical: "/usr/bin/llvm-lib-22", final_path: "/fixture/finals/windows-lib", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
-            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", final_path: "/fixture/finals/windows-lld-link", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "170a202b75f25f80cbb26fa3e6e3c7ec02e74a8a7f190aa861d31d59774ff8eb" },
+            OrdinaryToolProbeFixture { tool_id: "rustc", parser_id: "rustc-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustc", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTC_B64, raw_sha256: "d2a0a4fa48442a6c214130f08b2e9041725872a05d74680d9fd803ff8cb99c04" },
+            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "9f37a625adbcbf2fe66626c0a3a690432efba31c56de13e40cdd1fc1fe0f114d" },
+            OrdinaryToolProbeFixture { tool_id: "rustdoc", parser_id: "rustdoc-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustdoc", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTDOC_B64, raw_sha256: "8b9d7c46d8dc09d41da9e1b590b12a6b3b82b1a00c866623067104618a7b1a88" },
+            OrdinaryToolProbeFixture { tool_id: "rustfmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustfmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
+            OrdinaryToolProbeFixture { tool_id: "cargo-fmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-fmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
+            OrdinaryToolProbeFixture { tool_id: "cargo-clippy", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-clippy", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
+            OrdinaryToolProbeFixture { tool_id: "clippy-driver", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/clippy-driver", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
+            OrdinaryToolProbeFixture { tool_id: "rust-lld", parser_id: "lld-gnu-version", selected_lexical: "/fixture/sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld", argv_tail: &["-flavor", "gnu", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUST_LLD_B64, raw_sha256: "cf7558b748e63be07ad8a4ea32997ff7315fe798159af4194065e4e852008bd3" },
+            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-nm-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a68721459737cfa09b9215344fed1aa8d05068472fc496b5ec1ba53fa9dff24b" },
+            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-version-a", selected_lexical: "/usr/bin/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca" },
+            OrdinaryToolProbeFixture { tool_id: "host-cc", parser_id: "host-c-compiler-v", selected_lexical: "/usr/bin/clang-22", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_HOST_CLANG_B64, raw_sha256: "fbab69bc31638e38b444a45b8a73635d8b6ccaa801e2d958dbd8948182c45964" },
+            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ranlib-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-cc", parser_id: "aarch64-c-compiler-v", selected_lexical: "/usr/bin/aarch64-linux-gnu-gcc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_AARCH64_GCC_B64, raw_sha256: "20a5376b7b7e218a03789f05f3d4c29e49d31eb0e54c0356d20e2747629243ae" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "43f5d0d9d22ba26ea2f3bf7843526d9397252213091aed88da1d21894008536e" },
+            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-version", selected_lexical: "/usr/bin/clang-22", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "921c5adaf09212c716a5405f4c8e3142f73213575ee60d31811a04aa68f28f91" },
+            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "4cf331bc93b25c3c6c31cc7654125723dadbdb9e8806571f56dd6354786beb76" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-help", selected_lexical: "/usr/bin/llvm-lib-22", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "170a202b75f25f80cbb26fa3e6e3c7ec02e74a8a7f190aa861d31d59774ff8eb" },
         ]
     }
 
@@ -92492,6 +92478,7 @@ fn fallible(value: Option<u8>) {
                 "{} raw capture",
                 fixture.tool_id,
             );
+            let final_path = format!("/fixture/finals/{}", fixture.tool_id);
             let identity = ToolIdentity {
                 device: 7,
                 inode: 10_000 + u64::try_from(ordinal).expect("fixture ordinal"),
@@ -92511,7 +92498,7 @@ fn fallible(value: Option<u8>) {
                 tool_id: fixture.tool_id.to_owned(),
                 parser_id: fixture.parser_id.to_owned(),
                 selected_lexical: fixture.selected_lexical.to_owned(),
-                final_path: fixture.final_path.to_owned(),
+                final_path: final_path.clone(),
                 final_identity: identity.clone(),
                 final_sha256,
                 argv: argv.clone(),
@@ -92527,7 +92514,7 @@ fn fallible(value: Option<u8>) {
                 tool_id: fixture.tool_id.to_owned(),
                 parser_id: fixture.parser_id.to_owned(),
                 selected_lexical: fixture.selected_lexical.to_owned(),
-                final_path: fixture.final_path.to_owned(),
+                final_path,
                 final_identity: identity,
                 final_sha256,
                 argv,
@@ -92546,37 +92533,37 @@ fn fallible(value: Option<u8>) {
         (
             "rustc-vv-pinned-1.99",
             "rustc",
-            "rustc-vv-pinned-1.99: rustc complete -Vv grammar",
+            "rustc-vv-pinned-1.99|rustc: exact-line[6]",
         ),
         (
             "cargo-vv-pinned-1.99",
             "cargo",
-            "cargo-vv-pinned-1.99: cargo complete -Vv grammar",
+            "cargo-vv-pinned-1.99|cargo: exact-line[8]",
         ),
         (
             "rustdoc-pinned-1.99",
             "rustdoc",
-            "rustdoc-pinned-1.99: rustdoc short commit/date grammar",
+            "rustdoc-pinned-1.99|rustdoc: exact-line[0]",
         ),
         (
             "rustfmt-pinned-nightly",
             "rustfmt",
-            "rustfmt-pinned-nightly: rustfmt pinned version/commit/date grammar",
+            "rustfmt-pinned-nightly|rustfmt: exact-line[0]",
         ),
         (
             "clippy-pinned-nightly",
             "cargo-clippy",
-            "clippy-pinned-nightly: clippy pinned version/commit/date grammar",
+            "clippy-pinned-nightly|cargo-clippy: exact-line[0]",
         ),
         (
             "lld-gnu-version",
             "rust-lld",
-            "lld-gnu-version: rust-lld LLVM 22 GNU-driver grammar",
+            "lld-gnu-version|rust-lld: exact-line[0]",
         ),
         (
             "llvm-version-family",
             "llvm-nm",
-            "llvm-version-family: llvm-nm LLVM 22 grammar",
+            "llvm-version-family|llvm-nm: exact-line[1]",
         ),
         (
             "openssl-version-a",
@@ -92591,7 +92578,7 @@ fn fallible(value: Option<u8>) {
         (
             "archiver-version",
             "host-ar",
-            "archiver-version: LLVM archiver 22 complete grammar",
+            "archiver-version|host-ar: exact-line[0]",
         ),
         (
             "aarch64-c-compiler-v",
@@ -92611,12 +92598,12 @@ fn fallible(value: Option<u8>) {
         (
             "llvm-lib-help",
             "windows-lib",
-            "llvm-lib-help: llvm-lib complete help grammar",
+            "llvm-lib-help|windows-lib: exact-line[0]",
         ),
         (
             "lld-coff-version",
             "windows-lld-link",
-            "lld-coff-version: lld-link LLVM 22 COFF-driver grammar",
+            "lld-coff-version|windows-lld-link: exact-line[0]",
         ),
     ];
 
@@ -92868,7 +92855,7 @@ fn fallible(value: Option<u8>) {
             ORDINARY_PROBE_LLVM_TOOL_B64,
             b"22.1.2",
             b"22.1.3",
-            "llvm-version-family: llvm-ar LLVM 22 grammar",
+            "llvm-version-family|apple-ar: exact-line[0]",
         );
         supplementary_role_grammars += 1;
         ordinary_assert_parser_role_variant(
@@ -92878,7 +92865,7 @@ fn fallible(value: Option<u8>) {
             ORDINARY_PROBE_GNU_AR_B64,
             b"2.46",
             b"2.47",
-            "archiver-version: GNU ar complete grammar",
+            "archiver-version|aarch64-linux-ar: exact-line[0]",
         );
         supplementary_role_grammars += 1;
         ordinary_assert_parser_role_variant(
@@ -92888,7 +92875,7 @@ fn fallible(value: Option<u8>) {
             ORDINARY_PROBE_GNU_RANLIB_B64,
             b"2.46",
             b"2.47",
-            "archiver-version: GNU ranlib complete grammar",
+            "archiver-version|host-ranlib: exact-line[0]",
         );
         supplementary_role_grammars += 1;
         assert_eq!(
@@ -93352,20 +93339,20 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_fixture_write_new(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
         let path = root.join(relative);
-        let parent = path.parent().ok_or_else(|| {
-            format!("E_ORDINARY_HANDOFF_PENDING: fixture parent missing for {relative}")
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| pending!("fixture parent missing for {relative}"))?;
         fs::create_dir_all(parent)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: create {relative}: {error}"))?;
+            .map_err(|error| pending!("create {relative}: {error}"))?;
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&path)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: create {relative}: {error}"))?;
+            .map_err(|error| pending!("create {relative}: {error}"))?;
         file.write_all(bytes)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: write {relative}: {error}"))?;
+            .map_err(|error| pending!("write {relative}: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: sync {relative}: {error}"))
+            .map_err(|error| pending!("sync {relative}: {error}"))
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -93373,38 +93360,30 @@ fn fallible(value: Option<u8>) {
         source: &Path,
         destination: &Path,
     ) -> Result<u64, String> {
-        let source_metadata = fs::symlink_metadata(source).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: source executable metadata: {error}")
-        })?;
+        let source_metadata = fs::symlink_metadata(source)
+            .map_err(|error| pending!("source executable metadata: {error}"))?;
         let debug_input_maximum = MAX_GATE_EXECUTABLE_BYTES
             .checked_mul(2)
-            .ok_or_else(|| {
-                "E_ORDINARY_HANDOFF_PENDING: debug executable input cap overflow".to_owned()
-            })?;
+            .ok_or_else(|| pending!("debug executable input cap overflow"))?;
         if source_metadata.file_type().is_symlink()
             || !source_metadata.is_file()
             || source_metadata.len() == 0
             || source_metadata.len() > debug_input_maximum
         {
-            return Err(format!(
-                "E_ORDINARY_HANDOFF_PENDING: debug executable length {} outside 1..={debug_input_maximum}",
+            return Err(pending!(
+                "debug executable length {} outside 1..={debug_input_maximum}",
                 source_metadata.len(),
             ));
         }
         if source_metadata.len() <= MAX_GATE_EXECUTABLE_BYTES {
-            fs::copy(source, destination).map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: copy selected executable: {error}")
-            })?;
+            fs::copy(source, destination)
+                .map_err(|error| pending!("copy selected executable: {error}"))?;
         } else {
             let strip = Path::new("/usr/bin/strip");
-            let strip_metadata = fs::metadata(strip).map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: strip fixture tool metadata: {error}")
-            })?;
+            let strip_metadata = fs::metadata(strip)
+                .map_err(|error| pending!("strip fixture tool metadata: {error}"))?;
             if !strip_metadata.is_file() || strip_metadata.mode() & 0o111 == 0 {
-                return Err(
-                    "E_ORDINARY_HANDOFF_PENDING: strip fixture tool is not executable"
-                        .to_owned(),
-                );
+                return Err(pending!("strip fixture tool is not executable"));
             }
             let status = Command::new(strip)
                 .arg("--strip-debug")
@@ -93419,26 +93398,23 @@ fn fallible(value: Option<u8>) {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .map_err(|error| {
-                    format!("E_ORDINARY_HANDOFF_PENDING: strip debug executable: {error}")
-                })?;
+                .map_err(|error| pending!("strip debug executable: {error}"))?;
             if !status.success() {
-                return Err(format!(
-                    "E_ORDINARY_HANDOFF_PENDING: strip debug executable exit {:?}",
+                return Err(pending!(
+                    "strip debug executable exit {:?}",
                     status.code(),
                 ));
             }
         }
-        let output_metadata = fs::symlink_metadata(destination).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: selected executable metadata: {error}")
-        })?;
+        let output_metadata = fs::symlink_metadata(destination)
+            .map_err(|error| pending!("selected executable metadata: {error}"))?;
         if output_metadata.file_type().is_symlink()
             || !output_metadata.is_file()
             || output_metadata.len() == 0
             || output_metadata.len() > MAX_GATE_EXECUTABLE_BYTES
         {
-            return Err(format!(
-                "E_ORDINARY_HANDOFF_PENDING: selected executable length {} outside 1..={MAX_GATE_EXECUTABLE_BYTES}",
+            return Err(pending!(
+                "selected executable length {} outside 1..={MAX_GATE_EXECUTABLE_BYTES}",
                 output_metadata.len(),
             ));
         }
@@ -93447,48 +93423,39 @@ fn fallible(value: Option<u8>) {
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_fixture_install_executable(source: &Path, destination: &Path) -> Result<(), String> {
-        let parent = destination.parent().ok_or_else(|| {
-            "E_ORDINARY_HANDOFF_PENDING: selected executable parent missing".to_owned()
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: create selected executable parent: {error}")
-        })?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| pending!("selected executable parent missing"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| pending!("create selected executable parent: {error}"))?;
         if destination.exists() {
-            return Err("E_ORDINARY_HANDOFF_PENDING: selected executable already exists".to_owned());
+            return Err(pending!("selected executable already exists"));
         }
         let copied = ordinary_fixture_copy_bounded_executable(source, destination)?;
         if copied == 0 {
-            return Err("E_ORDINARY_HANDOFF_PENDING: copied executable is empty".to_owned());
+            return Err(pending!("copied executable is empty"));
         }
         let mut permissions = fs::metadata(destination)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: selected metadata: {error}"))?
+            .map_err(|error| pending!("selected metadata: {error}"))?
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(destination, permissions).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: selected executable chmod: {error}")
-        })?;
+        fs::set_permissions(destination, permissions)
+            .map_err(|error| pending!("selected executable chmod: {error}"))?;
         File::open(destination)
             .and_then(|file| file.sync_all())
-            .map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: selected executable sync: {error}")
-            })?;
+            .map_err(|error| pending!("selected executable sync: {error}"))?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: selected executable parent sync: {error}")
-            })?;
-        let metadata = fs::symlink_metadata(destination).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: selected executable recheck: {error}")
-        })?;
+            .map_err(|error| pending!("selected executable parent sync: {error}"))?;
+        let metadata = fs::symlink_metadata(destination)
+            .map_err(|error| pending!("selected executable recheck: {error}"))?;
         if !metadata.is_file()
             || metadata.nlink() != 1
             || metadata.mode() & 0o100 == 0
             || metadata.len() != copied
             || metadata.len() > MAX_GATE_EXECUTABLE_BYTES
         {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: selected executable identity is not sealed".to_owned(),
-            );
+            return Err(pending!("selected executable identity is not sealed"));
         }
         Ok(())
     }
@@ -93628,7 +93595,7 @@ fn fallible(value: Option<u8>) {
         let sequence = NEXT_SUBJECT.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: fixture clock: {error}"))?
+            .map_err(|error| pending!("fixture clock: {error}"))?
             .as_nanos();
         let mut fresh = None;
         for retry in 0..64u64 {
@@ -93647,21 +93614,17 @@ fn fallible(value: Option<u8>) {
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
-                    return Err(format!(
-                        "E_ORDINARY_HANDOFF_PENDING: create fresh root: {error}"
-                    ));
+                    return Err(pending!("create fresh root: {error}"));
                 }
             }
         }
-        let (run_id, root) = fresh.ok_or_else(|| {
-            "E_ORDINARY_HANDOFF_PENDING: collision-safe fresh root allocation exhausted".to_owned()
-        })?;
+        let (run_id, root) =
+            fresh.ok_or_else(|| pending!("collision-safe fresh root allocation exhausted"))?;
 
         let source_root = repository_root();
         for path in AUTHORING_PATHS {
-            let bytes = fs::read(source_root.join(path)).map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: read source authoring {path}: {error}")
-            })?;
+            let bytes = fs::read(source_root.join(path))
+                .map_err(|error| pending!("read source authoring {path}: {error}"))?;
             ordinary_fixture_write_new(&root, path, &bytes)?;
         }
         ordinary_fixture_write_new(
@@ -93674,23 +93637,23 @@ fn fallible(value: Option<u8>) {
         let sysroot_output = Command::new("rustup")
             .args(["run", "nightly-2026-07-11", "rustc", "--print", "sysroot"])
             .output()
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: query rust sysroot: {error}"))?;
+            .map_err(|error| pending!("query rust sysroot: {error}"))?;
         if !sysroot_output.status.success() {
-            return Err(format!(
-                "E_ORDINARY_HANDOFF_PENDING: query rust sysroot exit {:?}",
+            return Err(pending!(
+                "query rust sysroot exit {:?}",
                 sysroot_output.status.code(),
             ));
         }
         let sysroot = std::str::from_utf8(&sysroot_output.stdout)
-            .map_err(|_| "E_ORDINARY_HANDOFF_PENDING: rust sysroot is not UTF-8".to_owned())?
+            .map_err(|_| pending!("rust sysroot is not UTF-8"))?
             .strip_suffix('\n')
-            .ok_or_else(|| "E_ORDINARY_HANDOFF_PENDING: rust sysroot newline missing".to_owned())?;
+            .ok_or_else(|| pending!("rust sysroot newline missing"))?;
         let toolchain_bin = Path::new(sysroot).join("bin");
         let closed_path = format!(
             "{}:/usr/bin:/bin",
-            toolchain_bin.to_str().ok_or_else(|| {
-                "E_ORDINARY_HANDOFF_PENDING: rust toolchain bin is not UTF-8".to_owned()
-            })?,
+            toolchain_bin
+                .to_str()
+                .ok_or_else(|| pending!("rust toolchain bin is not UTF-8"))?,
         );
 
         let archive = test_gzip(&test_tar(&[(
@@ -93733,9 +93696,7 @@ fn fallible(value: Option<u8>) {
             &integration.producer_outer_bytes,
         )?;
         super::phase_b_std::materialize_attest_fixture_supply(&root, &run_id, &supply_bytes)
-            .map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: materialize Attest supply: {error}")
-            })?;
+            .map_err(|error| pending!("materialize Attest supply: {error}"))?;
 
         let package_root =
             format!(".fnd01-run/independent-attester/{run_id}/bootstrap-control-package");
@@ -93762,20 +93723,36 @@ fn fallible(value: Option<u8>) {
         let selected_executable = root.join(&selected_relative);
         let public_harness = std::env::var_os("FASTMCP_FND01_PUBLIC_HARNESS_BIN")
             .map(PathBuf::from)
-            .ok_or_else(|| {
-                "E_ORDINARY_HANDOFF_PENDING: FASTMCP_FND01_PUBLIC_HARNESS_BIN is required"
-                    .to_owned()
-            })?;
+            .ok_or_else(|| pending!("FASTMCP_FND01_PUBLIC_HARNESS_BIN is required"))?;
         if !public_harness.is_absolute() {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: public harness path must be absolute".to_owned(),
-            );
+            return Err(pending!("public harness path must be absolute"));
         }
+        let public_relative = public_harness
+            .strip_prefix(&source_root)
+            .map_err(|_| pending!("public harness must be inside the repository"))?
+            .to_str()
+            .ok_or_else(|| pending!("public harness path must be UTF-8"))?;
+        let (_, public_binding) = ordinary_checked_file_binding(
+            &source_root,
+            public_relative,
+            MAX_GATE_EXECUTABLE_BYTES,
+            None,
+            "public harness source",
+        )?;
         ordinary_fixture_install_executable(&public_harness, &selected_executable)?;
+        let (_, installed_binding) = ordinary_checked_file_binding(
+            &root,
+            &selected_relative,
+            MAX_GATE_EXECUTABLE_BYTES,
+            None,
+            "installed public harness",
+        )?;
+        if public_binding.binding != installed_binding.binding {
+            return Err(pending!("installed public harness bytes differ"));
+        }
 
-        let fixture_driver_source = std::env::current_exe().map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: current test executable: {error}")
-        })?;
+        let fixture_driver_source =
+            std::env::current_exe().map_err(|error| pending!("current test executable: {error}"))?;
         let fixture_driver = selected_executable.with_file_name("fnd_01_evidence_fixture_driver");
         ordinary_fixture_install_executable(&fixture_driver_source, &fixture_driver)?;
 
@@ -93873,29 +93850,32 @@ fn fallible(value: Option<u8>) {
             repository_root,
             run_id,
         } = child;
+        let current_root = super::trust_std::ordinary_checked_current_repository_root()
+            .map_err(|error| format!("E_HANDOFF_ARGUMENTS: child root: {error}"))?;
+        if current_root != repository_root {
+            return Err("E_HANDOFF_ARGUMENTS: child root differs from executable formula".to_owned());
+        }
         let public_harness = repository_root.join(format!(
             ".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
         ));
-        let arguments = [
-            public_harness.clone().into_os_string(),
-            std::ffi::OsString::from("attest"),
-            std::ffi::OsString::from("."),
-            std::ffi::OsString::from(&run_id),
-            std::ffi::OsString::from(format!(
-                ".fnd01-run/independent-attester/{}/control-ledger.bin",
-                run_id,
+        let run_id_bytes = super::trust_std::decode_lower_hex::<16>(&run_id, "fixture run ID")
+            .map_err(|error| format!("E_HANDOFF_ARGUMENTS: {error}"))?;
+        if run_id_bytes == [0; 16] {
+            return Err("E_HANDOFF_ARGUMENTS: all-zero fixture run ID".to_owned());
+        }
+        let invocation = OrdinaryHandoffArguments {
+            mode: BootstrapMode::Attest,
+            executable_path: public_harness.clone(),
+            repository_root: repository_root.clone(),
+            run_root: repository_root.join(format!(
+                ".fnd01-run/independent-attester/{run_id}"
             )),
-        ];
-        let invocation = parse_ordinary_handoff_arguments(arguments)
-            .map_err(|error| format!("E_HANDOFF_ARGUMENTS: child parse: {error}"))?;
-        if invocation.repository_root != repository_root {
-            return Err(
-                "E_HANDOFF_PATH: parser role root differs from executable formula".to_owned(),
-            );
-        }
-        if invocation.mode != BootstrapMode::Attest || invocation.run_id != run_id {
-            return Err("E_HANDOFF_ARGUMENTS: child Attest role/run drift".to_owned());
-        }
+            run_id: run_id.clone(),
+            run_id_bytes,
+            control_ledger_path: format!(
+                ".fnd01-run/independent-attester/{run_id}/control-ledger.bin"
+            ),
+        };
         ordinary_fixture_write_new(
             &invocation.repository_root,
             &format!(
@@ -94041,11 +94021,19 @@ fn fallible(value: Option<u8>) {
             .current_dir(&subject.root)
             .output()
             .unwrap_or_else(|error| panic!("Attest self-reexec spawn: {error}"));
+        let stdout = String::from_utf8(output.stdout).expect("public harness stdout UTF-8");
+        let stderr = String::from_utf8(output.stderr).expect("public harness stderr UTF-8");
+        let stdout = stdout
+            .strip_prefix("\nrunning 1 test\n")
+            .expect("exact fixture-driver stdout prelude");
+        let stderr = stderr
+            .strip_suffix('\n')
+            .expect("public harness failure-frame terminal LF");
+        assert!(!stderr.contains('\n'), "one public harness failure frame");
         assert_eq!(
             output.status.code(),
             Some(3),
-            "public harness terminal status: {:?}",
-            output.status,
+            "public harness terminal status: {:?}; stdout={stdout:?}; stderr={stderr:?}", output.status,
         );
         let child_ran = subject.root.join(format!(
             ".fnd01-run/independent-attester/{}/self-reexec-child-ran",
@@ -94057,11 +94045,12 @@ fn fallible(value: Option<u8>) {
             format!("child-ran={}\n", subject.run_id).as_bytes(),
             "Attest self-reexec exact child body did not run",
         );
-        let stdout = String::from_utf8(output.stdout).expect("public harness stdout UTF-8");
-        let stderr = String::from_utf8(output.stderr).expect("public harness stderr UTF-8");
-        assert_eq!(stderr.lines().count(), 1, "one public harness failure frame");
         if mutate_tool_set {
-            let fields = stdout.trim_end().split('|').collect::<Vec<_>>();
+            let fields = stdout
+                .strip_suffix('\n')
+                .expect("negative state receipt terminal LF")
+                .split('|')
+                .collect::<Vec<_>>();
             assert_eq!(fields.len(), 4, "negative state receipt field count");
             assert_eq!(fields[0], "FND01NEGSTATEv1");
             for field in &fields[1..] {
@@ -94079,23 +94068,22 @@ fn fallible(value: Option<u8>) {
                 "public rejection leaves complete fixture state unchanged",
             );
             let nested = format!(
-                "E_CONTROL_AUTHORITY|tool_set_sha256 expected={} observed={}",
+                "E_CONTROL_AUTHORITY\\x7Ctool_set_sha256 expected={} observed={}",
                 fields[2], fields[3],
             );
-            assert!(
-                stderr.starts_with(&format!(
-                    "FND01ENTRYv1|ledger|attest|E_HANDOFF_LEDGER|role=attest @ run_id={} @ expected=complete ControlLedgerExpectation @ observed=",
+            assert_eq!(
+                stderr,
+                format!(
+                    "FND01ENTRYv1|ledger|attest|E_HANDOFF_LEDGER|role=attest @ run_id={} @ expected=complete ControlLedgerExpectation @ observed=complete validator failed ({nested})",
                     subject.run_id,
-                )),
-                "typed public ledger frame: {stderr}",
+                ),
+                "exact typed public ledger frame",
             );
-            assert!(stderr.contains(&nested), "public frame digest context: {stderr}");
-            assert!(!stderr.contains("E_ORDINARY_EVIDENCE"));
         } else {
             assert!(stdout.is_empty(), "positive public harness stdout must be empty");
             assert!(
                 stderr.starts_with(&format!(
-                    "FND01ENTRYv1|evidence|attest|E_ORDINARY_EVIDENCE|role=attest @ run_id={} @ expected=accepted evidence report @ observed=FND01|Error|E_SOURCE_EXACT_SET|source inventory|",
+                    "FND01ENTRYv1|evidence|attest|E_ORDINARY_EVIDENCE|role=attest @ run_id={} @ expected=accepted evidence report @ observed=FND01\\x7CError\\x7CE_SOURCE_EXACT_SET\\x7Csource inventory\\x7C",
                     subject.run_id,
                 )),
                 "typed public evidence frame: {stderr}",
