@@ -31914,7 +31914,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(&run_id);
             let(mut f,mut r,mut m)=(BTreeSet::new(),BTreeSet::new(),BTreeSet::new());
             for &(family, row, mutation) in PRODUCE_AUTHORITY_MATRIX {
-                match mutation {6=>pinned_policy_row(b"path_formulas =",b"\n","59196bd52b5f1d49abe5e8f14bd598cc5914d9ae8d32626b5d1a687bd356b3e6"),7=>pinned_policy_row(b"marker_exact_grammar = \"literal FND01AUTHORv2",b"\n","eab48b6abc7b7815676bf4b55f37ae57d56e0c107c0efef3b69001689ead9a31"),10=>pinned_policy_row(b"[cargo_config_discovery_contract]",b"\n[publication_contract]",CARGO_CONFIG_POLICY_SHA256),_=>()}
+                match mutation {6=>pinned_policy_row(b"path_formulas =",b"\n","59196bd52b5f1d49abe5e8f14bd598cc5914d9ae8d32626b5d1a687bd356b3e6"),7=>pinned_policy_row(b"marker_exact_grammar = \"literal FND01AUTHORv2",b"\n","eab48b6abc7b7815676bf4b55f37ae57d56e0c107c0efef3b69001689ead9a31"),10=>pinned_policy_row(b"[cargo_config_discovery_contract]",b"[publication_contract]",CARGO_CONFIG_POLICY_SHA256),_=>()}
                 find_once(FROZEN_POLICY,row,family).expect("row");
                 assert!(f.insert(family)&&r.insert(row)&&m.insert(mutation));
                 let mut rejected = validate_phase_b_authority(&policy).expect("base");
