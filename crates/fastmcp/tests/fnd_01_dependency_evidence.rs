@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 903_983;
+const FROZEN_POLICY_BYTES: usize = 903_485;
 const FROZEN_POLICY_SHA256: &str =
-    "bfde2bae1bb0a5620cc4fe3c14b704d9fac2380d40f80328a0121a830fbcf21d";
+    "b3803b7b7119bbcbb86d0587ff70ae92778c6669bd37f75ada20bfcfd75544a3";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -18891,7 +18891,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         #[derive(Debug)]
-        struct ProduceAcquisitionPermit(BoundedProduceAcquisition);
+        pub(super) struct ProduceAcquisitionPermit(BoundedProduceAcquisition);
 
         #[derive(Debug)]
         pub(super) struct ProducePostAcquisitionAuthority {
@@ -18910,7 +18910,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             pub(super) fn admitted(&self) -> &BootstrapInputAuthority { &self.admitted }
         }
 
-    fn issue(
+    pub(super) fn issue(
         authority: PhaseBAuthority,
         arguments: &BootstrapArguments,
         environment: &BootstrapEnvironment,
@@ -19051,7 +19051,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(digest)
     }
 
-    impl ProduceAcquisitionPermit { fn consume(self) -> TrustResult<BoundedProduceAcquisition> {
+    impl ProduceAcquisitionPermit { pub(super) fn consume(self) -> TrustResult<BoundedProduceAcquisition> {
         require_complete_produce_acquisition_policy_join(&self.0.authority)?; Ok(self.0)
     } }
 
@@ -31875,14 +31875,21 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             }
         }
 
-        const PRODUCE_AUTHORITY_MATRIX: &[(&str, &str)] = &[
-            ("environment", "plan.environment"), ("argv", "plan.commands[0].argv_literals"),
-            ("CWD", "plan.commands[0].working_directory_formula"), ("command", "plan.commands[0].id"),
-            ("bound", "max_supply_bundle_bytes"), ("deadline", "resolve.timeout_seconds"),
-            ("run-root", "plan.run_root_formula"), ("marker", "marker_format"),
-            ("bootstrap-control", "plan.scratch_root_formula"), ("supply", "supply_format"),
-            ("Cargo-discovery", "cargo_discovery_requires_no_config"),
-            ("generated-path", "acquisition_spool_path_formula"), ("native-tool", "native_tool_count"),
+        const AUTHORITY_REJECTION:&str="E_PHASE_B_ACQUISITION_AUTHORITY";
+        const PRODUCE_AUTHORITY_MATRIX:&[(&str,&[u8],u8)]=&[
+            ("environment",ACQUISITION_ENVIRONMENT_POLICY,0),
+            ("argv",b"argv_template = [\"{tool.cargo.path}\", \"metadata\"",1),
+            ("CWD",b"working_directory = \"{run-root}\"\ntarget_scope = \"all-target, all-feature",2),
+            ("command",b"id_formula = \"bootstrap.resolve\"",3),
+            ("bound",b"max_supply_bundle_bytes =",4),
+            ("deadline",b"resolve_timeout_seconds =",5),
+            ("run-root",b"path_formulas = [\".fnd01-run/<role>/<run-id>\",",6),
+            ("marker",b"marker_exact_grammar =",7),
+            ("bootstrap-control",b"scratch_root_formula = \".fnd01-run/<role>/<run-id>/bootstrap-control",8),
+            ("supply",b"format = \"FND01SUPPLYv4\"",9),
+            ("Cargo-discovery",b"discovery_rule =",10),
+            ("generated-path",b"acquisition_spool_path_formula = \".fnd01-run",11),
+            ("native-tool",b"native_tool_candidate_count =",12),
         ];
 
         #[test]
@@ -31904,38 +31911,35 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .join(".fnd01-run")
                 .join("integration-producer")
                 .join(&run_id);
-            let (mut families, mut mutations) = (BTreeSet::new(), BTreeSet::new());
-            let record=PRODUCE_AUTHORITY_MATRIX.iter().map(|(f,m)|format!("{f}={m}"))
-                .collect::<Vec<_>>().join(";");
-            find_once(FROZEN_POLICY,format!("Matrix: rejection=E_PHASE_B_ACQUISITION_AUTHORITY;{record}.").as_bytes(),"Matrix")
-                .expect("canonical Matrix");
-            for &(family, mutation) in PRODUCE_AUTHORITY_MATRIX {
-                assert!(families.insert(family)&&mutations.insert(mutation));
-                let mut rejected = validate_phase_b_authority(&policy).expect("baseline");
+            let(mut f,mut r,mut m)=(BTreeSet::new(),BTreeSet::new(),BTreeSet::new());
+            for &(family, row, mutation) in PRODUCE_AUTHORITY_MATRIX {
+                find_once(FROZEN_POLICY,row,family).expect("row");
+                assert!(f.insert(family)&&r.insert(row)&&m.insert(mutation));
+                let mut rejected = validate_phase_b_authority(&policy).expect("base");
                 let authority = &mut rejected.produce_acquisition;
                 match mutation {
-                    "plan.environment" => authority.plan.environment = &[],
-                    "plan.commands[0].argv_literals" => authority.plan.commands[0].argv_literals = &["drift"],
-                    "plan.commands[0].working_directory_formula" => authority.plan.commands[0].working_directory_formula = "drift",
-                    "plan.commands[0].id" => authority.plan.commands[0].id = "drift",
-                    "max_supply_bundle_bytes" => authority.max_supply_bundle_bytes -= 1,
-                    "resolve.timeout_seconds" => authority.resolve.timeout_seconds -= 1,
-                    "plan.run_root_formula" => authority.plan.run_root_formula = "drift",
-                    "marker_format" => authority.marker_format = "FND01AUTHOR",
-                    "plan.scratch_root_formula" => authority.plan.scratch_root_formula = "drift",
-                    "supply_format" => authority.supply_format = "FND01SUPPLYv3",
-                    "cargo_discovery_requires_no_config" => authority.cargo_discovery_requires_no_config = false,
-                    "acquisition_spool_path_formula" => authority.acquisition_spool_path_formula = "drift",
-                    "native_tool_count" => authority.native_tool_count -= 1,
+                    0 => authority.plan.environment = &[],
+                    1 => authority.plan.commands[0].argv_literals = &["drift"],
+                    2 => authority.plan.commands[0].working_directory_formula = "drift",
+                    3 => authority.plan.commands[0].id = "drift",
+                    4 => authority.max_supply_bundle_bytes -= 1,
+                    5 => authority.resolve.timeout_seconds -= 1,
+                    6 => authority.plan.run_root_formula = "drift",
+                    7 => authority.marker_format = "FND01AUTHOR",
+                    8 => authority.plan.scratch_root_formula = "drift",
+                    9 => authority.supply_format = "FND01SUPPLYv3",
+                    10 => authority.cargo_discovery_requires_no_config = false,
+                    11 => authority.acquisition_spool_path_formula = "drift",
+                    12 => authority.native_tool_count -= 1,
                     _ => unreachable!("closed family matrix"),
                 }
-                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, "E_PHASE_B_ACQUISITION_AUTHORITY");
+                assert_produce_rejected(rejected, &arguments, &environment, &marker, [0; 32], &authoring_bytes, AUTHORITY_REJECTION);
                 assert!(!no_effect_root.exists(), "{family}");
-                let pristine = validate_phase_b_authority(&policy).expect("reacceptance");
+                let pristine = validate_phase_b_authority(&policy).expect("reaccept");
                 produce_acquisition_permit::require_complete_produce_acquisition_policy_join(
                     &pristine.produce_acquisition).expect("reaccept");
             }
-            assert_eq!((families.len(), mutations.len()), (13, 13));
+            assert_eq!((f.len(),r.len(),m.len()),(13,13,13));
             assert!(!no_effect_root.exists());
 
             let SyntheticPhaseBInputs {
@@ -32109,16 +32113,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             arguments.repository_root = wrong_root;
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
-            assert_eq!(
-                produce_acquisition_permit::run_with(
-                    synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                    &environment, &marker, [0; 32], &authoring_bytes, |acquisition| {
-                        produce_acquisition_permit::authorize_later_effects(
-                            acquisition, binding_for_bytes(&wrong_manifest)?, &validated).map(|_| ())
-                    })
-                    .expect_err("foreign manifest cannot cross the consumed permit").code(),
-                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY",
-            );
+            let acquisition=produce_acquisition_permit::issue(
+                synthetic_phase_b_authority(&policy,&manifest),&arguments,&environment,
+                &marker,[0;32],&authoring_bytes).expect("issue").consume().expect("consume");
+            assert_eq!(produce_acquisition_permit::authorize_later_effects(
+                acquisition,binding_for_bytes(&wrong_manifest).expect("binding"),&validated,
+            ).expect_err("foreign manifest").code(),"E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY");
             assert_eq!(authoring_bytes, before_authoring);
             assert_eq!(supply, before_supply);
             assert_no_later_effects(&arguments);
@@ -32127,19 +32127,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             arguments.repository_root = later_root;
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
-            assert_eq!(
-                produce_acquisition_permit::run_with(
-                    synthetic_phase_b_authority(&policy, &manifest), &arguments,
-                    &environment, &marker, [0; 32], &authoring_bytes,
-                    |acquisition| {
-                        produce_acquisition_permit::authorize_later_effects(
-                            acquisition, binding_for_bytes(&manifest)?, &validated).map(|_| ())
-                    },
-                )
-                .expect_err("acquisition cannot authorize later effects")
-                .code(),
-                "E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING",
-            );
+            let acquisition=produce_acquisition_permit::issue(
+                synthetic_phase_b_authority(&policy,&manifest),&arguments,&environment,
+                &marker,[0;32],&authoring_bytes).expect("issue").consume().expect("consume");
+            assert_eq!(produce_acquisition_permit::authorize_later_effects(
+                acquisition,binding_for_bytes(&manifest).expect("binding"),&validated,
+            ).expect_err("later effects").code(),"E_PHASE_B_BOOTSTRAP_INPUT_AUTHORITY_PENDING");
             assert_eq!(authoring_bytes, before_authoring);
             assert_eq!(supply, before_supply);
             assert_no_later_effects(&arguments);
