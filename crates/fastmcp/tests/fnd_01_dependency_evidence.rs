@@ -34960,58 +34960,10 @@ activate = 1\n";
         reproduction_script_sha256: &'static str,
     }
     const SDK_PEER_EXPECTATIONS: [SdkPeerExpectation; 4] = [
-        SdkPeerExpectation {
-            id: "typescript", display_name: "TypeScript", ecosystem: "npm",
-            repository_slug: "typescript-sdk", version: "2.0.0",
-            source_commit: "cc4b41617ce3601b1290d67216ea0b194a3cd9ac",
-            capability_path: "packages/core-internal/src/shared/protocolEras.ts",
-            capability_byte_length: 2300,
-            capability_sha256: "cf1a910994701c5d3d1924720844c406f95e5482217a8d809580266a45e4866f",
-            legacy_wire_era: "legacy initialize-handshake",
-            modern_wire_era: "modern server/discover plus per-request _meta envelope",
-            legacy_evidence: "The source classifies 2025-11-25 and earlier as the legacy initialize-handshake era; 2024-11-05 is in that earlier set.",
-            modern_evidence: "The source declares 2026-07-28 the first modern version, negotiable through server/discover with an envelope on every request.",
-            reproduction_script_sha256: "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9",
-        },
-        SdkPeerExpectation {
-            id: "python", display_name: "Python", ecosystem: "PyPI",
-            repository_slug: "python-sdk", version: "2.0.0",
-            source_commit: "6f69a3758ebf2ee55ce050f58b470ce11af71133",
-            capability_path: "src/mcp-types/mcp_types/version.py",
-            capability_byte_length: 2785,
-            capability_sha256: "e244c0bb0dda774b50af4a2f1a2145be6511794fdfd63e6a6c7afe60ee62e51e",
-            legacy_wire_era: "legacy initialize-handshake",
-            modern_wire_era: "modern server/discover plus per-request metadata",
-            legacy_evidence: "The exact known-version registry includes 2024-11-05, and its handshake-version registry includes that version.",
-            modern_evidence: "The exact known-version registry includes 2026-07-28 as the sole modern version and documents its per-request-envelope path.",
-            reproduction_script_sha256: "9c733d9399c77ab8411662ab39f12bf5755a306817250fb8523f10b56057291d",
-        },
-        SdkPeerExpectation {
-            id: "csharp", display_name: "C#", ecosystem: "NuGet",
-            repository_slug: "csharp-sdk", version: "2.0.0",
-            source_commit: "15f8b2da110b574a1c20a35a8c629cea4095c7be",
-            capability_path: "src/Common/McpProtocolVersions.cs",
-            capability_byte_length: 5360,
-            capability_sha256: "394b012e4f53bac0e0d6fa46652b099727d58ce02c074f2bcac79ad333f7d628",
-            legacy_wire_era: "legacy initialize-handshake",
-            modern_wire_era: "per-request metadata without initialize",
-            legacy_evidence: "The exact supported-version array includes November2024ProtocolVersion in its initialize-handshake subset.",
-            modern_evidence: "The exact supported-version array includes July2026ProtocolVersion in its per-request-metadata subset.",
-            reproduction_script_sha256: "a5b3c164dde83de2edb27027eb413d7979f71bfd95b99517bfc38cf76af4f19c",
-        },
-        SdkPeerExpectation {
-            id: "go", display_name: "Go", ecosystem: "Go modules",
-            repository_slug: "go-sdk", version: "v1.7.0",
-            source_commit: "bc72835f62eb94d0fb484439f886b6885b075f36",
-            capability_path: "README.md",
-            capability_byte_length: 6182,
-            capability_sha256: "b139b8fe162c6b79a160d4b0c10ab73b56ed9ae437a7ef21c6d184d7e2e38bab",
-            legacy_wire_era: "legacy initialize-handshake",
-            modern_wire_era: "modern stateless/per-request metadata",
-            legacy_evidence: "The v1.7.0+ compatibility table lists 2024-11-05 among all supported MCP specifications.",
-            modern_evidence: "The v1.7.0+ compatibility table lists 2026-07-28 as latest and supported.",
-            reproduction_script_sha256: "f493691b8fce43938bcfa4fd27ec834fac970a3e863f86bcfbf0948e48dddebf",
-        },
+        SdkPeerExpectation { id: "typescript", display_name: "TypeScript", ecosystem: "npm", repository_slug: "typescript-sdk", version: "2.0.0", source_commit: "cc4b41617ce3601b1290d67216ea0b194a3cd9ac", capability_path: "packages/core-internal/src/shared/protocolEras.ts", capability_byte_length: 2300, capability_sha256: "cf1a910994701c5d3d1924720844c406f95e5482217a8d809580266a45e4866f", legacy_wire_era: "legacy initialize-handshake", modern_wire_era: "modern server/discover plus per-request _meta envelope", legacy_evidence: "The source classifies 2025-11-25 and earlier as the legacy initialize-handshake era; 2024-11-05 is in that earlier set.", modern_evidence: "The source declares 2026-07-28 the first modern version, negotiable through server/discover with an envelope on every request.", reproduction_script_sha256: "e74789371421f203c4b83f43a56acb7b71045ae4792d63cee5fbfeb2d2ef6ba9" },
+        SdkPeerExpectation { id: "python", display_name: "Python", ecosystem: "PyPI", repository_slug: "python-sdk", version: "2.0.0", source_commit: "6f69a3758ebf2ee55ce050f58b470ce11af71133", capability_path: "src/mcp-types/mcp_types/version.py", capability_byte_length: 2785, capability_sha256: "e244c0bb0dda774b50af4a2f1a2145be6511794fdfd63e6a6c7afe60ee62e51e", legacy_wire_era: "legacy initialize-handshake", modern_wire_era: "modern server/discover plus per-request metadata", legacy_evidence: "The exact known-version registry includes 2024-11-05, and its handshake-version registry includes that version.", modern_evidence: "The exact known-version registry includes 2026-07-28 as the sole modern version and documents its per-request-envelope path.", reproduction_script_sha256: "9c733d9399c77ab8411662ab39f12bf5755a306817250fb8523f10b56057291d" },
+        SdkPeerExpectation { id: "csharp", display_name: "C#", ecosystem: "NuGet", repository_slug: "csharp-sdk", version: "2.0.0", source_commit: "15f8b2da110b574a1c20a35a8c629cea4095c7be", capability_path: "src/Common/McpProtocolVersions.cs", capability_byte_length: 5360, capability_sha256: "394b012e4f53bac0e0d6fa46652b099727d58ce02c074f2bcac79ad333f7d628", legacy_wire_era: "legacy initialize-handshake", modern_wire_era: "per-request metadata without initialize", legacy_evidence: "The exact supported-version array includes November2024ProtocolVersion in its initialize-handshake subset.", modern_evidence: "The exact supported-version array includes July2026ProtocolVersion in its per-request-metadata subset.", reproduction_script_sha256: "a5b3c164dde83de2edb27027eb413d7979f71bfd95b99517bfc38cf76af4f19c" },
+        SdkPeerExpectation { id: "go", display_name: "Go", ecosystem: "Go modules", repository_slug: "go-sdk", version: "v1.7.0", source_commit: "bc72835f62eb94d0fb484439f886b6885b075f36", capability_path: "README.md", capability_byte_length: 6182, capability_sha256: "b139b8fe162c6b79a160d4b0c10ab73b56ed9ae437a7ef21c6d184d7e2e38bab", legacy_wire_era: "legacy initialize-handshake", modern_wire_era: "modern stateless/per-request metadata", legacy_evidence: "The v1.7.0+ compatibility table lists 2024-11-05 among all supported MCP specifications.", modern_evidence: "The v1.7.0+ compatibility table lists 2026-07-28 as latest and supported.", reproduction_script_sha256: "f493691b8fce43938bcfa4fd27ec834fac970a3e863f86bcfbf0948e48dddebf" },
     ];
     const SDK_VENDORED_EXPECTATIONS: [(&str, &str, u64, &str); 13] = [
         ("sdk-tier-catalog", "evidence/fnd-01/sdk-locks/sdk-tier-catalog-2026-07-28.mdx", 4330, "c1020988e736d0aeb078dfc8ff8afbe560f6e09793cb19a940e11c8f14df6d77"),
@@ -35063,11 +35015,7 @@ activate = 1\n";
         "rand_xoshiro",
     ];
     const SDK_LOCK_BLUEPRINT_IDENTITIES: [(&str, &str, &str); 12] = [
-        (
-            "typescript",
-            "typescript-consumer-manifest",
-            "consumer-manifest",
-        ),
+        ("typescript", "typescript-consumer-manifest", "consumer-manifest"),
         ("typescript", "typescript-package-lock", "consumer-lock"),
         ("python", "python-requirements-lock", "consumer-lock"),
         ("csharp", "csharp-consumer-project", "consumer-manifest"),
@@ -35078,85 +35026,21 @@ activate = 1\n";
         ("go", "go-consumer-resolved-modules-lock", "offline-closure"),
         ("go", "go-module-file", "upstream-manifest"),
         ("go", "go-sum-file", "upstream-lock"),
-        (
-            "go",
-            "go-publisher-context-modules",
-            "publisher-context-only",
-        ),
+        ("go", "go-publisher-context-modules", "publisher-context-only"),
     ];
     const SDK_LOCK_SOURCE_FIELDS: [(&str, &str, &str, &str); 12] = [
-        (
-            "typescript-consumer-manifest",
-            "consumer_manifest_path",
-            "consumer_manifest_byte_length",
-            "consumer_manifest_sha256",
-        ),
-        (
-            "typescript-package-lock",
-            "lock_path",
-            "lock_byte_length",
-            "lock_sha256",
-        ),
-        (
-            "python-requirements-lock",
-            "lock_path",
-            "lock_byte_length",
-            "lock_sha256",
-        ),
-        (
-            "csharp-consumer-project",
-            "consumer_project_path",
-            "consumer_project_byte_length",
-            "consumer_project_sha256",
-        ),
-        (
-            "csharp-packages-lock",
-            "lock_path",
-            "lock_byte_length",
-            "lock_sha256",
-        ),
-        (
-            "csharp-project-assets-closure",
-            "project_assets_projection_path",
-            "project_assets_projection_byte_length",
-            "project_assets_projection_sha256",
-        ),
-        (
-            "go-consumer-module",
-            "consumer_module_path",
-            "consumer_module_byte_length",
-            "consumer_module_sha256",
-        ),
-        (
-            "go-consumer-sum",
-            "consumer_sum_path",
-            "consumer_sum_byte_length",
-            "consumer_sum_sha256",
-        ),
-        (
-            "go-consumer-resolved-modules-lock",
-            "consumer_resolved_module_lock_path",
-            "consumer_resolved_module_lock_byte_length",
-            "consumer_resolved_module_lock_sha256",
-        ),
-        (
-            "go-module-file",
-            "publisher_module_path",
-            "publisher_module_byte_length",
-            "publisher_module_sha256",
-        ),
-        (
-            "go-sum-file",
-            "publisher_sum_path",
-            "publisher_sum_byte_length",
-            "publisher_sum_sha256",
-        ),
-        (
-            "go-publisher-context-modules",
-            "publisher_context_projection_path",
-            "publisher_context_projection_byte_length",
-            "publisher_context_projection_sha256",
-        ),
+        ("typescript-consumer-manifest", "consumer_manifest_path", "consumer_manifest_byte_length", "consumer_manifest_sha256"),
+        ("typescript-package-lock", "lock_path", "lock_byte_length", "lock_sha256"),
+        ("python-requirements-lock", "lock_path", "lock_byte_length", "lock_sha256"),
+        ("csharp-consumer-project", "consumer_project_path", "consumer_project_byte_length", "consumer_project_sha256"),
+        ("csharp-packages-lock", "lock_path", "lock_byte_length", "lock_sha256"),
+        ("csharp-project-assets-closure", "project_assets_projection_path", "project_assets_projection_byte_length", "project_assets_projection_sha256"),
+        ("go-consumer-module", "consumer_module_path", "consumer_module_byte_length", "consumer_module_sha256"),
+        ("go-consumer-sum", "consumer_sum_path", "consumer_sum_byte_length", "consumer_sum_sha256"),
+        ("go-consumer-resolved-modules-lock", "consumer_resolved_module_lock_path", "consumer_resolved_module_lock_byte_length", "consumer_resolved_module_lock_sha256"),
+        ("go-module-file", "publisher_module_path", "publisher_module_byte_length", "publisher_module_sha256"),
+        ("go-sum-file", "publisher_sum_path", "publisher_sum_byte_length", "publisher_sum_sha256"),
+        ("go-publisher-context-modules", "publisher_context_projection_path", "publisher_context_projection_byte_length", "publisher_context_projection_sha256"),
     ];
 
     const PACKAGE_IDS: &[&str] = &[
@@ -77554,17 +77438,22 @@ activate = 1\n";
             } else {
                 FileFamily::Utf8Text
             };
+            let byte_length_u64 = u64::try_from(byte_length)
+                .map_err(|_| Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("byte_length"))?;
+            let digest = sha256(bytes);
             if admitted.contract.family != "core"
                 || admitted.contract.owner_bead != "bd-mcp-2026-07-28-support-ahet.1.2"
                 || admitted.contract.path != path
                 || admitted.contract.parse_kind != expected_parse_kind
                 || bytes.len() != byte_length
+                || admitted.contract.byte_length != byte_length_u64
+                || admitted.digest != digest
             {
                 return Err(
                     Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("byte_length")
                 );
             }
-            if lower_hex(&sha256(bytes)) != expected_sha256 {
+            if admitted.contract.sha256 != expected_sha256 || lower_hex(&digest) != expected_sha256 {
                 return Err(
                     Diagnostic::error("E_CORE_CONFORMANCE_SOURCE_INTEGRITY", id).at("sha256")
                 );
@@ -78595,7 +78484,11 @@ activate = 1\n";
     struct MediaDependencyBundle { files: Vec<LoadedFile>, security: toml::Value }
 
     fn media_dependency_bundle(files: &[LoadedFile]) -> VResult<MediaDependencyBundle> {
-        let files = MEDIA_INPUT_PATHS.iter().map(|path| source_lookup(files, path).cloned()).collect::<VResult<Vec<_>>>()?;
+        let selected = files.iter().filter(|file| file.contract.family == "media").collect::<Vec<_>>();
+        if selected.len() != MEDIA_INPUT_PATHS.len() || selected.iter().zip(MEDIA_INPUT_PATHS).any(|(file, path)| file.contract.path != *path) {
+            return Err(Diagnostic::error("E_MEDIA_INPUT_SET", "media dependency loader"));
+        }
+        let files = selected.into_iter().cloned().collect::<Vec<_>>();
         let security = parse_source_toml(&files, MEDIA_INPUT_PATHS[4])?;
         Ok(MediaDependencyBundle { files, security })
     }
@@ -78621,7 +78514,7 @@ activate = 1\n";
         Ok(lower_hex(&digest.finalize()))
     }
 
-    fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, corpus: &[LoadedFile], policy: &Policy) -> VResult<(String, usize, usize)> {
+    fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, _corpus: &[LoadedFile], _policy: &Policy) -> VResult<(String, usize, usize)> {
         const SUBJECT: &str = "media-svg-external-resource-policy-drift";
         const TARGET: &str = "/case/id=svg-external-use/expected";
         if bundle.files.len() != MEDIA_INPUT_PATHS.len()
@@ -78632,8 +78525,6 @@ activate = 1\n";
         if pointer_get(&bundle.security, TARGET, SUBJECT)?.as_str() != Some("reject_before_renderer_entry") {
             return Err(Diagnostic::error("E_MEDIA_SVG_EXTERNAL_RESOURCE", SUBJECT).at("case[id=svg-external-use].expected"));
         }
-        validate_negative_inventory(corpus, policy)?;
-        validate_mutation_dispatch(corpus, policy)?;
         if bundle.security != parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[4])? {
             return Err(Diagnostic::error("E_MEDIA_DOCUMENT", MEDIA_INPUT_PATHS[4]));
         }
@@ -78656,6 +78547,22 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_MEDIA_MANIFEST", "media dependency bundle"));
         }
+        for (name, version, license, msrv, checksum, features) in [
+            ("html5ever", "0.39.0", "MIT OR Apache-2.0", "1.71.0", "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8", &[][..]),
+            ("image", "0.25.10", "MIT OR Apache-2.0", "1.88.0", "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104", &["jpeg", "png", "webp"][..]),
+            ("resvg", "0.47.0", "Apache-2.0 OR MIT", "1.87.0", "9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81", &[][..]),
+        ] {
+            let base = format!("/crate/name={name}");
+            if pointer_get(&manifest, &format!("{base}/version"), name)?.as_str() != Some(version)
+                || pointer_get(&manifest, &format!("{base}/license"), name)?.as_str() != Some(license)
+                || pointer_get(&manifest, &format!("{base}/rust_version"), name)?.as_str() != Some(msrv)
+                || pointer_get(&manifest, &format!("{base}/checksum_sha256"), name)?.as_str() != Some(checksum)
+                || pointer_get(&manifest, &format!("{base}/default_features"), name)?.as_bool() != Some(false)
+                || !string_sequence_is(&string_array(&manifest, &format!("{base}/requested_features"), name)?, features)
+            {
+                return Err(Diagnostic::error("E_MEDIA_ROOT_SELECTION", name));
+            }
+        }
         let graph = parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[1])?;
         let cases = pointer_get(&bundle.security, "/case", "media security cases")?.as_array()
             .ok_or_else(|| Diagnostic::error("E_TOML_SCHEMA", "media security cases"))?;
@@ -78667,7 +78574,15 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_MEDIA_DECLARED_SURFACE", "media dependency bundle"));
         }
-        eprintln!("MEDIA SEM manifest={} graph={} security={}", media_semantic_digest("manifest", &manifest)?, media_semantic_digest("graph", &graph)?, media_semantic_digest("security", &bundle.security)?);
+        for (label, value, expected) in [
+            ("manifest", &manifest, "a73c0c767b326380de3ac0a2149a96004bca8b42af5c52c007c70b49e0994f21"),
+            ("graph", &graph, "8e0b4ff40d2e2a56d53806c66e81ec359fb4759a4c86ca179997b194017a3988"),
+            ("security", &bundle.security, "1fa773447e22acad1af1a886be77d1a0958b2b0477309fc42200c775d23df370"),
+        ] {
+            if media_semantic_digest(label, value)? != expected {
+                return Err(Diagnostic::error("E_MEDIA_SEMANTIC_DOCUMENT", label));
+            }
+        }
         Ok((media_input_digest(&bundle.files)?, 3, cases.len()))
     }
 
@@ -93425,7 +93340,7 @@ fn fallible(value: Option<u8>) {
         authoring_marker: String,
         integration_marker: String,
         closed_path: String,
-        selected_executable: PathBuf,
+        fixture_driver: PathBuf,
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -93528,6 +93443,54 @@ fn fallible(value: Option<u8>) {
             ));
         }
         Ok(output_metadata.len())
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_fixture_install_executable(source: &Path, destination: &Path) -> Result<(), String> {
+        let parent = destination.parent().ok_or_else(|| {
+            "E_ORDINARY_HANDOFF_PENDING: selected executable parent missing".to_owned()
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: create selected executable parent: {error}")
+        })?;
+        if destination.exists() {
+            return Err("E_ORDINARY_HANDOFF_PENDING: selected executable already exists".to_owned());
+        }
+        let copied = ordinary_fixture_copy_bounded_executable(source, destination)?;
+        if copied == 0 {
+            return Err("E_ORDINARY_HANDOFF_PENDING: copied executable is empty".to_owned());
+        }
+        let mut permissions = fs::metadata(destination)
+            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: selected metadata: {error}"))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(destination, permissions).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: selected executable chmod: {error}")
+        })?;
+        File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: selected executable sync: {error}")
+            })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!("E_ORDINARY_HANDOFF_PENDING: selected executable parent sync: {error}")
+            })?;
+        let metadata = fs::symlink_metadata(destination).map_err(|error| {
+            format!("E_ORDINARY_HANDOFF_PENDING: selected executable recheck: {error}")
+        })?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o100 == 0
+            || metadata.len() != copied
+            || metadata.len() > MAX_GATE_EXECUTABLE_BYTES
+        {
+            return Err(
+                "E_ORDINARY_HANDOFF_PENDING: selected executable identity is not sealed".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -93797,57 +93760,24 @@ fn fallible(value: Option<u8>) {
         ".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
     );
         let selected_executable = root.join(&selected_relative);
-        let selected_parent = selected_executable.parent().ok_or_else(|| {
-            "E_ORDINARY_HANDOFF_PENDING: selected executable parent missing".to_owned()
-        })?;
-        fs::create_dir_all(selected_parent).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: create selected executable parent: {error}")
-        })?;
-        if selected_executable.exists() {
+        let public_harness = std::env::var_os("FASTMCP_FND01_PUBLIC_HARNESS_BIN")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                "E_ORDINARY_HANDOFF_PENDING: FASTMCP_FND01_PUBLIC_HARNESS_BIN is required"
+                    .to_owned()
+            })?;
+        if !public_harness.is_absolute() {
             return Err(
-                "E_ORDINARY_HANDOFF_PENDING: selected executable already exists".to_owned(),
+                "E_ORDINARY_HANDOFF_PENDING: public harness path must be absolute".to_owned(),
             );
         }
-        let source_executable = std::env::current_exe().map_err(|error| {
+        ordinary_fixture_install_executable(&public_harness, &selected_executable)?;
+
+        let fixture_driver_source = std::env::current_exe().map_err(|error| {
             format!("E_ORDINARY_HANDOFF_PENDING: current test executable: {error}")
         })?;
-        let copied = ordinary_fixture_copy_bounded_executable(
-            &source_executable,
-            &selected_executable,
-        )?;
-        if copied == 0 {
-            return Err("E_ORDINARY_HANDOFF_PENDING: copied executable is empty".to_owned());
-        }
-        let mut permissions = fs::metadata(&selected_executable)
-            .map_err(|error| format!("E_ORDINARY_HANDOFF_PENDING: selected metadata: {error}"))?
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&selected_executable, permissions).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: selected executable chmod: {error}")
-        })?;
-        File::open(&selected_executable)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: selected executable sync: {error}")
-            })?;
-        File::open(selected_parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                format!("E_ORDINARY_HANDOFF_PENDING: selected executable parent sync: {error}")
-            })?;
-        let selected_metadata = fs::symlink_metadata(&selected_executable).map_err(|error| {
-            format!("E_ORDINARY_HANDOFF_PENDING: selected executable recheck: {error}")
-        })?;
-        if !selected_metadata.is_file()
-            || selected_metadata.nlink() != 1
-            || selected_metadata.mode() & 0o100 == 0
-            || selected_metadata.len() != copied
-            || selected_metadata.len() > MAX_GATE_EXECUTABLE_BYTES
-        {
-            return Err(
-                "E_ORDINARY_HANDOFF_PENDING: selected executable identity is not sealed".to_owned(),
-            );
-        }
+        let fixture_driver = selected_executable.with_file_name("fnd_01_evidence_fixture_driver");
+        ordinary_fixture_install_executable(&fixture_driver_source, &fixture_driver)?;
 
         Ok(OrdinaryAttestSelfReexecSubject {
             root,
@@ -93855,7 +93785,7 @@ fn fallible(value: Option<u8>) {
             authoring_marker,
             integration_marker: integration.integration_marker,
             closed_path,
-            selected_executable,
+            fixture_driver,
         })
     }
 
@@ -93915,7 +93845,7 @@ fn fallible(value: Option<u8>) {
             .to_str()
             .ok_or_else(|| "E_HANDOFF_EXECUTABLE: child current_exe must be UTF-8".to_owned())?;
         let suffix = format!(
-        "/.fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
+        "/.fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_fixture_driver"
     );
         let root = executable.strip_suffix(&suffix).ok_or_else(|| {
             "E_HANDOFF_EXECUTABLE: child executable does not match rigid Attest formula".to_owned()
@@ -93943,10 +93873,11 @@ fn fallible(value: Option<u8>) {
             repository_root,
             run_id,
         } = child;
-        let current_executable = std::env::current_exe()
-            .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe: {error}"))?;
+        let public_harness = repository_root.join(format!(
+            ".fnd01-run/independent-attester/{run_id}/bootstrap-control-target/debug/fnd_01_evidence_harness"
+        ));
         let arguments = [
-            current_executable.into_os_string(),
+            public_harness.clone().into_os_string(),
             std::ffi::OsString::from("attest"),
             std::ffi::OsString::from("."),
             std::ffi::OsString::from(&run_id),
@@ -93975,10 +93906,8 @@ fn fallible(value: Option<u8>) {
         )?;
         let environment = read_ordinary_handoff_environment(&invocation)
             .map_err(|error| format!("E_HANDOFF_ENVIRONMENT: child environment: {error}"))?;
-        let current_executable = std::env::current_exe()
-            .map_err(|error| format!("E_HANDOFF_EXECUTABLE: child current_exe recheck: {error}"))?;
 
-        // The child alone seals the PID-bound ledger before re-entry.
+        // The fixture driver alone seals the PID-bound ledger before same-PID exec replacement.
         let mut authority = require_ordinary_execution_authority(
             &invocation.repository_root,
             invocation.mode,
@@ -93990,7 +93919,7 @@ fn fallible(value: Option<u8>) {
             &mut authority,
             &invocation,
             &environment,
-            &current_executable,
+            &public_harness,
         )
         .map_err(|error| error.to_string())?;
         let fresh_inventory = super::phase_b_std::inventory_fresh_native_tools(
@@ -94053,80 +93982,43 @@ fn fallible(value: Option<u8>) {
             &invocation.control_ledger_path,
             &ledger_bytes,
         )?;
-        let accepted_state = if mutate_tool_set {
-            ordinary_fixture_tree_state(&invocation.repository_root)?
-        } else {
-            Vec::new()
-        };
         drop(fresh_reprobe);
         drop(non_tool);
         drop(authority);
-
-        let mut effects = OrdinaryPlatformRefusalEffects::default();
-        let error = validate_ordinary_handoff_entry_with_effects(
-            &invocation,
-            &environment,
-            true,
-            &mut effects,
-        )
-        .expect_err("the self-reexec entry must fail closed at its asserted terminal stage");
-        let expected_effects = if mutate_tool_set { (1, 0) } else { (1, 1) };
-        if (
-            effects.ledger_open_attempts,
-            effects.evidence_dispatch_attempts,
-        ) != expected_effects
-        {
-            return Err(format!(
-            "E_ORDINARY_EVIDENCE: expected ledger/evidence effects {:?}, observed ledger={} evidence={}",
-            expected_effects,
-            effects.ledger_open_attempts,
-            effects.evidence_dispatch_attempts,
-        ));
-        }
         if mutate_tool_set {
-            if error.code() != "E_HANDOFF_LEDGER"
-                || error.route().stage() != OrdinaryProductStage::Ledger
-                || error.observed.contains("E_ORDINARY_EVIDENCE")
-            {
-                return Err(format!(
-                "E_HANDOFF_LEDGER: mutated bound tool-set must stop before archive/evidence, observed {error}"
-            ));
-            }
-            let nested = format!(
-                "E_CONTROL_AUTHORITY|tool_set_sha256 expected={} observed={}",
+            let state = ordinary_fixture_tree_state(&invocation.repository_root)?;
+            let state_sha256 = trust_sha256(format!("{state:?}").as_bytes())
+                .map_err(|error| format!("E_HANDOFF_LEDGER: baseline state digest: {error}"))?;
+            let mut stdout = io::stdout().lock();
+            writeln!(
+                stdout,
+                "FND01NEGSTATEv1|{}|{}|{}",
+                encode_lower_hex(&state_sha256),
                 encode_lower_hex(&expected_tool_set_sha256),
                 encode_lower_hex(&observed_tool_set_sha256),
-            );
-            if !error.observed.contains(&nested) {
-                return Err(format!(
-                "E_HANDOFF_LEDGER: bound tool-set mismatch must retain nested digest proof {nested}, observed {error}"
-            ));
-            }
-            let actual_state = ordinary_fixture_tree_state(&invocation.repository_root)?;
-            if actual_state != accepted_state {
-                return Err(
-                    "E_HANDOFF_LEDGER: rejected tool-set mutation changed accepted fixture state"
-                        .to_owned(),
-                );
-            }
-        } else {
-            let expected = "FND01|Error|E_SOURCE_EXACT_SET|source inventory|";
-            if error.code() != "E_ORDINARY_EVIDENCE"
-                || error.site != OrdinaryFailureSite::EvidenceDispatch
-                || error.route() != OrdinaryFailureRoute::Evidence
-                || !error.observed.starts_with(expected)
-            {
-                return Err(format!(
-                "E_ORDINARY_EVIDENCE: child must reach fresh-root verifier E_SOURCE_EXACT_SET source inventory, expected prefix {expected}, observed {error}"
-            ));
-            }
+            )
+            .and_then(|()| stdout.flush())
+            .map_err(|error| format!("E_HANDOFF_LEDGER: baseline state output: {error}"))?;
         }
-        Ok(())
+        use std::os::unix::process::CommandExt;
+        let error = Command::new(&public_harness)
+            .arg("attest")
+            .arg(".")
+            .arg(&run_id)
+            .arg(&invocation.control_ledger_path)
+            .exec();
+        Err(format!(
+            "E_HANDOFF_EXECUTABLE: same-PID public harness exec failed: {error}"
+        ))
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    fn spawn_ordinary_attest_self_reexec(subject: &OrdinaryAttestSelfReexecSubject, test_id: &str) {
-        let status = Command::new(&subject.selected_executable)
+    fn spawn_ordinary_attest_self_reexec(
+        subject: &OrdinaryAttestSelfReexecSubject,
+        test_id: &str,
+        mutate_tool_set: bool,
+    ) {
+        let output = Command::new(&subject.fixture_driver)
             .args(["--exact", test_id, "--nocapture"])
             .env_clear()
             .env("FASTMCP_FND01_AUTHORING_CLOSURE", &subject.authoring_marker)
@@ -94147,11 +94039,13 @@ fn fallible(value: Option<u8>) {
             .env("PATH", &subject.closed_path)
             .env("TZ", "UTC")
             .current_dir(&subject.root)
-            .status()
+            .output()
             .unwrap_or_else(|error| panic!("Attest self-reexec spawn: {error}"));
-        assert!(
-            status.success(),
-            "Attest self-reexec child status: {status}"
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "public harness terminal status: {:?}",
+            output.status,
         );
         let child_ran = subject.root.join(format!(
             ".fnd01-run/independent-attester/{}/self-reexec-child-ran",
@@ -94163,6 +94057,50 @@ fn fallible(value: Option<u8>) {
             format!("child-ran={}\n", subject.run_id).as_bytes(),
             "Attest self-reexec exact child body did not run",
         );
+        let stdout = String::from_utf8(output.stdout).expect("public harness stdout UTF-8");
+        let stderr = String::from_utf8(output.stderr).expect("public harness stderr UTF-8");
+        assert_eq!(stderr.lines().count(), 1, "one public harness failure frame");
+        if mutate_tool_set {
+            let fields = stdout.trim_end().split('|').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 4, "negative state receipt field count");
+            assert_eq!(fields[0], "FND01NEGSTATEv1");
+            for field in &fields[1..] {
+                assert_eq!(field.len(), 64, "negative receipt digest width");
+                assert!(field.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+            }
+            assert_ne!(fields[2], fields[3], "planted tool-set digest must differ");
+            let state = ordinary_fixture_tree_state(&subject.root)
+                .expect("public rejection fixture-state recheck");
+            let state_sha256 = trust_sha256(format!("{state:?}").as_bytes())
+                .expect("public rejection fixture-state digest");
+            assert_eq!(
+                encode_lower_hex(&state_sha256),
+                fields[1],
+                "public rejection leaves complete fixture state unchanged",
+            );
+            let nested = format!(
+                "E_CONTROL_AUTHORITY|tool_set_sha256 expected={} observed={}",
+                fields[2], fields[3],
+            );
+            assert!(
+                stderr.starts_with(&format!(
+                    "FND01ENTRYv1|ledger|attest|E_HANDOFF_LEDGER|role=attest @ run_id={} @ expected=complete ControlLedgerExpectation @ observed=",
+                    subject.run_id,
+                )),
+                "typed public ledger frame: {stderr}",
+            );
+            assert!(stderr.contains(&nested), "public frame digest context: {stderr}");
+            assert!(!stderr.contains("E_ORDINARY_EVIDENCE"));
+        } else {
+            assert!(stdout.is_empty(), "positive public harness stdout must be empty");
+            assert!(
+                stderr.starts_with(&format!(
+                    "FND01ENTRYv1|evidence|attest|E_ORDINARY_EVIDENCE|role=attest @ run_id={} @ expected=accepted evidence report @ observed=FND01|Error|E_SOURCE_EXACT_SET|source inventory|",
+                    subject.run_id,
+                )),
+                "typed public evidence frame: {stderr}",
+            );
+        }
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -94175,7 +94113,7 @@ fn fallible(value: Option<u8>) {
             Ok(None) => {
                 let subject = ordinary_attest_self_reexec_subject()
                     .unwrap_or_else(|error| panic!("Attest self-reexec subject: {error}"));
-                spawn_ordinary_attest_self_reexec(&subject, test_id);
+                spawn_ordinary_attest_self_reexec(&subject, test_id, mutate_tool_set);
             }
             Err(error) => panic!("Attest self-reexec child admission: {error}"),
         }
