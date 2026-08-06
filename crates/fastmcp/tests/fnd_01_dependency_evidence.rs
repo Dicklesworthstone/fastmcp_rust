@@ -36463,7 +36463,7 @@ activate = 1\n";
     #[rustfmt::skip]
     sdk_record!(SdkRchReceiptBinding { path: String, byte_length: u64, sha256: String, bytes: Vec<u8> });
     #[rustfmt::skip]
-    sdk_record!(SdkRepositoryRuntimeBinding { repository_root: String, head_commit: String, head_tree: String, dirty_inventory: Vec<String>, dirty_inventory_byte_length: u64, dirty_inventory_sha256: String, cargo_lock_sha256: String, rust_toolchain_sha256: String, sdk_complete_input_sha256: String, cargo_profile: String, target_triple: String, features: Vec<String>, rch_receipt: SdkRchReceiptBinding, platform: String, verifier_executable: SdkExecutableBinding });
+    sdk_record!(SdkRepositoryRuntimeBinding { repository_root: String, head_commit: String, head_tree: String, dirty_inventory: Vec<String>, dirty_inventory_byte_length: u64, dirty_inventory_sha256: String, cargo_lock_sha256: String, rust_toolchain_sha256: String, sdk_complete_input_sha256: String, cargo_profile: String, target_triple: String, features: Vec<String>, rch_receipt: SdkRchReceiptBinding, platform: String, runner_executable: SdkExecutableBinding });
     #[rustfmt::skip]
     sdk_record!(SdkNetworkProbeBinding { argv: Vec<String>, cwd: String, environment_sha256: String, launcher: SdkExecutableBinding, target_tool: SdkExecutableBinding, stdout: SdkTranscriptBinding, stderr: SdkTranscriptBinding, exit_code: i64, started_at_epoch_seconds: u64, finished_at_epoch_seconds: u64, monotonic_started_ns: u64, monotonic_finished_ns: u64, elapsed_ns: u64 });
     #[rustfmt::skip]
@@ -74274,7 +74274,7 @@ activate = 1\n";
         cargo_lock_sha256: &'a str,
         sdk_complete_input_sha256: &'a str,
         verifier_source_sha256: &'a str,
-        harness_source_sha256: &'a str,
+        runner_source_sha256: &'a str,
         executable: &'a SdkExecutableBinding,
     }
 
@@ -74321,13 +74321,13 @@ activate = 1\n";
             "dirty_inventory_sha256", "rust_toolchain", "rust_toolchain_sha256",
             "cargo_lock_sha256", "sdk_complete_input_sha256", "cargo_profile",
             "target_triple", "features", "public_surface", "cargo_command",
-            "verifier_source_sha256", "harness_source_sha256", "executable_byte_length",
+            "verifier_source_sha256", "runner_source_sha256", "executable_byte_length",
             "executable_sha256", "success",
         ];
         const CARGO_COMMAND: &[&str] = &[
             "cargo", "build", "--locked", "--jobs", "2", "--profile", "dev", "--target",
             "aarch64-apple-darwin", "-p", "fastmcp-rust", "--example",
-            "fnd_01_evidence_harness",
+            "fnd_01_sdk_batch",
         ];
         let value = parse_strict_json(bytes, "RCH SDK build receipt")
             .map_err(|_| sdk_rch_error("strict JSON"))?;
@@ -74339,13 +74339,13 @@ activate = 1\n";
             .map_err(|_| sdk_rch_error("success"))?;
         for field in [
             "dirty_inventory_sha256", "rust_toolchain_sha256", "cargo_lock_sha256",
-            "sdk_complete_input_sha256", "verifier_source_sha256", "harness_source_sha256",
+            "sdk_complete_input_sha256", "verifier_source_sha256", "runner_source_sha256",
             "executable_sha256",
         ] {
             validate_sha256(sdk_rch_string(object, field)?, "RCH SDK build receipt")
                 .map_err(|_| sdk_rch_error(field))?;
         }
-        if sdk_rch_string(object, "format")? != "fastmcp-rch-sdk-build-v1"
+        if sdk_rch_string(object, "format")? != "fastmcp-rch-sdk-build-v2"
             || sdk_rch_string(object, "execution_location")? != "remote"
             || !sdk_identifier(sdk_rch_string(object, "rch_version")?)
             || !sdk_identifier(sdk_rch_string(object, "selected_worker")?)
@@ -74365,11 +74365,11 @@ activate = 1\n";
             || sdk_rch_string(object, "cargo_profile")? != "dev"
             || sdk_rch_string(object, "target_triple")? != "aarch64-apple-darwin"
             || sdk_rch_string(object, "public_surface")?
-                != "fastmcp-rust/example:fnd_01_evidence_harness:sdk-batch-run-json"
+                != "fastmcp-rust/example:fnd_01_sdk_batch:sdk-batch-run-json"
             || sdk_rch_string(object, "verifier_source_sha256")?
                 != local.verifier_source_sha256
-            || sdk_rch_string(object, "harness_source_sha256")?
-                != local.harness_source_sha256
+            || sdk_rch_string(object, "runner_source_sha256")?
+                != local.runner_source_sha256
             || sdk_rch_u64(object, "executable_byte_length")? != local.executable.byte_length
             || sdk_rch_string(object, "executable_sha256")?
                 != local.executable.sha256.as_str()
@@ -74501,7 +74501,7 @@ activate = 1\n";
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let current_executable = std::env::current_exe()
             .map_err(|_| Diagnostic::error("E_SDK_EXECUTION_FACTS", subject).at("current exe"))?;
-        let verifier_executable = sdk_executable_binding(
+        let runner_executable = sdk_executable_binding(
             "fnd01-sdk-runner", &current_executable, "v3", subject,
         )?;
         let dirty_inventory_byte_length = u64::try_from(dirty_bytes.len()).unwrap_or(u64::MAX);
@@ -74516,13 +74516,13 @@ activate = 1\n";
         sdk_validate_verifier_source_bound(
             u64::try_from(verifier_source.len()).unwrap_or(u64::MAX),
         )?;
-        let harness_source = read_bounded(
-            &root.join("crates/fastmcp/examples/fnd_01_evidence_harness.rs"),
+        let runner_source = read_bounded(
+            &root.join("crates/fastmcp/examples/fnd_01_sdk_batch.rs"),
             1_048_576,
             subject,
         )?;
         let verifier_source_sha256 = lower_hex(&sha256(&verifier_source));
-        let harness_source_sha256 = lower_hex(&sha256(&harness_source));
+        let runner_source_sha256 = lower_hex(&sha256(&runner_source));
         let local = SdkRchLocal {
             source_revision: &head_commit,
             source_tree: &head_tree,
@@ -74532,8 +74532,8 @@ activate = 1\n";
             cargo_lock_sha256: &cargo_lock_sha256,
             sdk_complete_input_sha256: &static_evidence.complete_input_sha256,
             verifier_source_sha256: &verifier_source_sha256,
-            harness_source_sha256: &harness_source_sha256,
-            executable: &verifier_executable,
+            runner_source_sha256: &runner_source_sha256,
+            executable: &runner_executable,
         };
         let rch_receipt = sdk_rch_receipt_binding(root, &local)?;
         Ok(SdkRepositoryRuntimeBinding {
@@ -74551,7 +74551,7 @@ activate = 1\n";
             features,
             rch_receipt,
             platform,
-            verifier_executable,
+            runner_executable,
         })
     }
 
@@ -88025,7 +88025,7 @@ original = "value"
     #[cfg(test)]
     fn sdk_test_rch_bytes(run_id: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "format": "fastmcp-rch-sdk-build-v1", "rch_version": "0.2.0",
+            "format": "fastmcp-rch-sdk-build-v2", "rch_version": "0.2.0",
             "execution_location": "remote", "selected_worker": "worker-1", "run_id": run_id,
             "source_revision": "0000000000000000000000000000000000000000",
             "source_tree": "1111111111111111111111111111111111111111",
@@ -88036,10 +88036,10 @@ original = "value"
             "cargo_lock_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
             "sdk_complete_input_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
             "cargo_profile": "dev", "target_triple": "aarch64-apple-darwin", "features": [],
-            "public_surface": "fastmcp-rust/example:fnd_01_evidence_harness:sdk-batch-run-json",
-            "cargo_command": ["cargo", "build", "--locked", "--jobs", "2", "--profile", "dev", "--target", "aarch64-apple-darwin", "-p", "fastmcp-rust", "--example", "fnd_01_evidence_harness"],
+            "public_surface": "fastmcp-rust/example:fnd_01_sdk_batch:sdk-batch-run-json",
+            "cargo_command": ["cargo", "build", "--locked", "--jobs", "2", "--profile", "dev", "--target", "aarch64-apple-darwin", "-p", "fastmcp-rust", "--example", "fnd_01_sdk_batch"],
             "verifier_source_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
-            "harness_source_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+            "runner_source_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
             "executable_byte_length": 7,
             "executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "success": true,
@@ -88057,7 +88057,7 @@ original = "value"
             cargo_lock_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
             sdk_complete_input_sha256: "5555555555555555555555555555555555555555555555555555555555555555",
             verifier_source_sha256: "6666666666666666666666666666666666666666666666666666666666666666",
-            harness_source_sha256: "7777777777777777777777777777777777777777777777777777777777777777",
+            runner_source_sha256: "7777777777777777777777777777777777777777777777777777777777777777",
             executable,
         }
     }
@@ -88602,7 +88602,7 @@ original = "value"
             ("public_surface", serde_json::json!("wrong")),
             ("cargo_command", serde_json::json!(["cargo"])),
             ("verifier_source_sha256", serde_json::json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")),
-            ("harness_source_sha256", serde_json::json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
+            ("runner_source_sha256", serde_json::json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
             ("executable_byte_length", serde_json::json!(8)),
             ("executable_sha256", serde_json::json!("1111111111111111111111111111111111111111111111111111111111111111")),
             ("success", serde_json::json!(false)),
