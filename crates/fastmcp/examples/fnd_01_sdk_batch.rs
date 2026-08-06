@@ -112,9 +112,7 @@ mod sdk_producer {
     }
 
     fn retain_capture<T>(result: Result<T>, capture: &Capture) -> Result<T> {
-        result.map_err(|failure| {
-            failure_with_streams(failure, &capture.stdout, &capture.stderr)
-        })
+        result.map_err(|failure| failure_with_streams(failure, &capture.stdout, &capture.stderr))
     }
 
     fn retain_capture_and_probe<T>(
@@ -227,8 +225,8 @@ mod sdk_producer {
         let lexical = path
             .to_str()
             .ok_or_else(|| err("E_SDK_TOOL_IDENTITY", subject))?;
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
         if metadata.file_type().is_symlink()
             || !is_executable_file(&metadata)
             || canonical_utf8(path, subject)? != lexical
@@ -295,18 +293,15 @@ mod sdk_producer {
 
     fn configured_directory(name: &str, subject: &str) -> Result<String> {
         let configured = required_environment(name, subject)?;
-        if configured.ends_with('/')
-            || configured.ends_with("/.")
-            || configured.ends_with("/..")
-        {
+        if configured.ends_with('/') || configured.ends_with("/.") || configured.ends_with("/..") {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", subject));
         }
         let path = Path::new(&configured);
         if !path.is_absolute() {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", name));
         }
-        let configured_metadata = fs::symlink_metadata(path)
-            .map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", subject))?;
+        let configured_metadata =
+            fs::symlink_metadata(path).map_err(|_| err("E_SDK_RUNNER_CONFIGURATION", subject))?;
         if configured_metadata.file_type().is_symlink() {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", subject));
         }
@@ -438,7 +433,10 @@ mod sdk_producer {
     fn resolve_path_program(paths: &[PathBuf], program: &str) -> Result<String> {
         if program.is_empty()
             || program.contains('/')
-            || program.as_bytes().iter().any(|byte| byte.is_ascii_control())
+            || program
+                .as_bytes()
+                .iter()
+                .any(|byte| byte.is_ascii_control())
         {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", "PATH program"));
         }
@@ -496,8 +494,8 @@ mod sdk_producer {
         binding: &evidence::SdkExecutableBinding,
         subject: &str,
     ) -> Result<ToolFileIdentity> {
-        let metadata = fs::symlink_metadata(&binding.path)
-            .map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
+        let metadata =
+            fs::symlink_metadata(&binding.path).map_err(|_| err("E_SDK_TOOL_IDENTITY", subject))?;
         if metadata.file_type().is_symlink()
             || !is_executable_file(&metadata)
             || metadata.len() != binding.byte_length
@@ -571,9 +569,8 @@ mod sdk_producer {
         if tools.identities.len() != 2usize.saturating_add(tools.additional.len()) {
             return Err(err("E_SDK_TOOL_IDENTITY", subject));
         }
-        let mut values = Vec::with_capacity(
-            1usize.saturating_add(tools.identities.len().saturating_mul(8)),
-        );
+        let mut values =
+            Vec::with_capacity(1usize.saturating_add(tools.identities.len().saturating_mul(8)));
         values.push(tools.identities.len().to_string());
         for (binding, expected_identity) in bindings.zip(&tools.identities) {
             let observed_binding = executable(
@@ -682,10 +679,8 @@ mod sdk_producer {
                 let mut latch_failure = |failure: String| {
                     if first_failure.is_none() {
                         first_failure = Some(failure);
-                        failure_drain = Some(Box::pin(time::sleep(
-                            cx.now(),
-                            CHILD_FAILURE_DRAIN_TIMEOUT,
-                        )));
+                        failure_drain =
+                            Some(Box::pin(time::sleep(cx.now(), CHILD_FAILURE_DRAIN_TIMEOUT)));
                     }
                 };
 
@@ -709,10 +704,7 @@ mod sdk_producer {
                         Poll::Ready(Ok(length)) => {
                             stdout_done = Some(length);
                             if length > CHILD_STREAM_LIMIT {
-                                latch_failure(err(
-                                    "E_SDK_CHILD_STREAM",
-                                    "stdout bound exceeded",
-                                ));
+                                latch_failure(err("E_SDK_CHILD_STREAM", "stdout bound exceeded"));
                             }
                         }
                         Poll::Ready(Err(_)) => {
@@ -727,10 +719,7 @@ mod sdk_producer {
                         Poll::Ready(Ok(length)) => {
                             stderr_done = Some(length);
                             if length > CHILD_STREAM_LIMIT {
-                                latch_failure(err(
-                                    "E_SDK_CHILD_STREAM",
-                                    "stderr bound exceeded",
-                                ));
+                                latch_failure(err("E_SDK_CHILD_STREAM", "stderr bound exceeded"));
                             }
                         }
                         Poll::Ready(Err(_)) => {
@@ -812,7 +801,9 @@ mod sdk_producer {
             || argv.len() > 32
             || timeout.is_zero()
             || environment.len() > 64
-            || environment.windows(2).any(|window| window[0].0 >= window[1].0)
+            || environment
+                .windows(2)
+                .any(|window| window[0].0 >= window[1].0)
         {
             return Err(err("E_SDK_CHILD_CONTRACT", subject));
         }
@@ -910,17 +901,12 @@ mod sdk_producer {
         let finished_at_epoch_seconds = match epoch_seconds(subject) {
             Ok(value) => value,
             Err(failure) => {
-                let failure = failure_with_streams(
-                    failure,
-                    &stdout_capture,
-                    &stderr_capture,
-                );
+                let failure = failure_with_streams(failure, &stdout_capture, &stderr_capture);
                 return Err(append_post_home_failure(environment, subject, failure));
             }
         };
-        validate_observed_home(environment, subject).map_err(|failure| {
-            failure_with_streams(failure, &stdout_capture, &stderr_capture)
-        })?;
+        validate_observed_home(environment, subject)
+            .map_err(|failure| failure_with_streams(failure, &stdout_capture, &stderr_capture))?;
         Ok(Capture {
             exit_code,
             stdout: stdout_capture,
@@ -1056,7 +1042,10 @@ mod sdk_producer {
             _ => return Err(err("E_SDK_RUNNER_CONFIGURATION", sdk_id)),
         };
         additional.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        if additional.windows(2).any(|window| window[0].id == window[1].id) {
+        if additional
+            .windows(2)
+            .any(|window| window[0].id == window[1].id)
+        {
             return Err(err("E_SDK_RUNNER_CONFIGURATION", "duplicate tool"));
         }
         let mut path_directories = Vec::new();
@@ -1155,12 +1144,16 @@ mod sdk_producer {
         let prefixes = tmp_prefixes(sdk_id)?;
         if paths.len() != prefixes.len()
             || prefixes.iter().any(|prefix| {
-                paths.iter().filter(|path| {
-                    Path::new(path)
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .is_some_and(|name| name.starts_with(prefix))
-                }).count() != 1
+                paths
+                    .iter()
+                    .filter(|path| {
+                        Path::new(path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .is_some_and(|name| name.starts_with(prefix))
+                    })
+                    .count()
+                    != 1
             })
         {
             return Err(err("E_SDK_RUNTIME_PATH", "exact created set"));
@@ -1225,7 +1218,11 @@ mod sdk_producer {
         let mut digests = Vec::with_capacity(raw_paths.len());
         for path in raw_paths {
             let canonical = canonical_utf8(&path, sdk_id)?;
-            digests.push(sha256(&read_bounded(Path::new(&canonical), 16_777_216, sdk_id)?));
+            digests.push(sha256(&read_bounded(
+                Path::new(&canonical),
+                16_777_216,
+                sdk_id,
+            )?));
             output_paths.push(canonical);
         }
         Ok(Outputs {
@@ -1363,7 +1360,10 @@ mod sdk_producer {
                 .ne(expected_digests)
         {
             return Err(failure_with_streams(
-                format!("E_SDK_EXECUTION_ATTEMPT: {sdk_id}: exit={}", capture.exit_code),
+                format!(
+                    "E_SDK_EXECUTION_ATTEMPT: {sdk_id}: exit={}",
+                    capture.exit_code
+                ),
                 &capture.stdout,
                 &capture.stderr,
             ));
@@ -1425,11 +1425,7 @@ mod sdk_producer {
             &capture,
             &network_probe,
         )?;
-        let cwd = retain_capture_and_probe(
-            canonical_utf8(root, sdk_id),
-            &capture,
-            &network_probe,
-        )?;
+        let cwd = retain_capture_and_probe(canonical_utf8(root, sdk_id), &capture, &network_probe)?;
         let stream_detail = format!(
             "reproduction_{}; network_probe_{}",
             failure_stream_detail(&capture.stdout, &capture.stderr),
@@ -1590,13 +1586,14 @@ fn run_sdk_batch_planted_negative() -> i32 {
     );
     let mut candidate = pristine.clone();
     let typescript_index = {
-        let mut indices = candidate
-            .observations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, observation)| {
-                (observation.sdk_id == "typescript").then_some(index)
-            });
+        let mut indices =
+            candidate
+                .observations
+                .iter()
+                .enumerate()
+                .filter_map(|(index, observation)| {
+                    (observation.sdk_id == "typescript").then_some(index)
+                });
         match (indices.next(), indices.next()) {
             (Some(index), None) => index,
             _ => {
