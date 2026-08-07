@@ -528,7 +528,6 @@ impl RequestId {
     }
 
     /// Produces the canonical key used by request registries and correlation.
-    #[must_use]
     pub fn correlation_key(&self) -> Result<CorrelationKey, &'static str> {
         self.validate()?;
         match self {
