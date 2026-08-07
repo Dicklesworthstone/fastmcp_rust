@@ -1669,12 +1669,13 @@ impl StreamableHttpResponseStream {
     /// further work or writes.
     #[must_use]
     pub fn for_request(&self, request_id: RequestId) -> StreamableHttpRequestResponseStream {
+        let cancellation_request_id = request_id.clone();
         StreamableHttpRequestResponseStream {
             responses: self.clone(),
             request_id,
             cancellation: StreamableHttpRequestCancellation {
                 state: Arc::new(StreamableHttpRequestCancellationState {
-                    request_id: request_id.clone(),
+                    request_id: cancellation_request_id,
                     cancelled: AtomicBool::new(false),
                     response_commit_gate: Mutex::new(()),
                 }),
