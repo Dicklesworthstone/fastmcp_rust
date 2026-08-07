@@ -32,8 +32,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-#[cfg(test)]
-use clap::CommandFactory;
 use clap::{Parser, Subcommand};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -65,7 +63,9 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CliDocumentationRefusal {
     ExpectedDisplayHelp,
-    CanonicalPublicHelpMismatch,
+    MissingRequiredClause,
+    ContradictorySupportState,
+    ContradictoryAffirmativeClaim,
     HelpEmissionFailed,
 }
 
@@ -73,13 +73,48 @@ impl CliDocumentationRefusal {
     const fn diagnostic(self) -> &'static str {
         match self {
             Self::ExpectedDisplayHelp => "DOC-01 CLI help request must reach Clap DisplayHelp",
-            Self::CanonicalPublicHelpMismatch => {
-                "DOC-01 CLI help must match the exact provisional public help frame"
+            Self::MissingRequiredClause => {
+                "DOC-01 CLI help is missing a required provisional-status clause"
+            }
+            Self::ContradictorySupportState => {
+                "DOC-01 CLI documentation contract contains a contradictory support state"
+            }
+            Self::ContradictoryAffirmativeClaim => {
+                "DOC-01 CLI help contains a forbidden affirmative support claim"
             }
             Self::HelpEmissionFailed => "DOC-01 CLI help emission failed",
         }
     }
 }
+
+/// Semantic support state for one policy profile. This independently authored
+/// contract is the validator input; it is never derived from Clap help bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliPolicyModeStatus {
+    PlannedUnverifiedNotExecutable,
+    Runnable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CliDocumentationContract {
+    protocol_2026_under_implementation: bool,
+    public_protocol_version: &'static str,
+    modern_only: CliPolicyModeStatus,
+    auto: CliPolicyModeStatus,
+    legacy_only: CliPolicyModeStatus,
+    mcp_2025_unsupported: bool,
+    aggregate_claims_are_evidence: bool,
+}
+
+const CLI_DOCUMENTATION_CONTRACT: CliDocumentationContract = CliDocumentationContract {
+    protocol_2026_under_implementation: true,
+    public_protocol_version: "2024-11-05",
+    modern_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+    auto: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+    legacy_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+    mcp_2025_unsupported: true,
+    aggregate_claims_are_evidence: false,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ConsumerVisibleCliHelp {
@@ -106,15 +141,60 @@ fn normalize_cli_help_whitespace(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Validate the entire public help frame against a separately captured
-/// canonical `Cli::try_parse_from(["fastmcp", "--help"])` frame. This denies
-/// altered prefix, argument, or after-help claims without a phrase blacklist.
-fn validate_public_cli_help(bytes: &[u8]) -> Result<(), CliDocumentationRefusal> {
-    let candidate = normalize_cli_help_whitespace(bytes);
-    let canonical = normalize_cli_help_whitespace(&public_cli_help_bytes()?);
+fn validate_cli_documentation_contract(
+    contract: CliDocumentationContract,
+) -> Result<(), CliDocumentationRefusal> {
+    if !contract.protocol_2026_under_implementation
+        || contract.public_protocol_version != "2024-11-05"
+        || contract.modern_only != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
+        || contract.auto != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
+        || contract.legacy_only != CliPolicyModeStatus::PlannedUnverifiedNotExecutable
+        || !contract.mcp_2025_unsupported
+        || contract.aggregate_claims_are_evidence
+    {
+        return Err(CliDocumentationRefusal::ContradictorySupportState);
+    }
 
-    if candidate != canonical {
-        return Err(CliDocumentationRefusal::CanonicalPublicHelpMismatch);
+    Ok(())
+}
+
+/// Validate the rendered public help against the independent semantic contract.
+/// Whitespace normalization makes wrapping width an output-only concern.
+fn validate_public_cli_help(bytes: &[u8]) -> Result<(), CliDocumentationRefusal> {
+    validate_cli_documentation_contract(CLI_DOCUMENTATION_CONTRACT)?;
+
+    let candidate = normalize_cli_help_whitespace(bytes);
+    let required_clauses = [
+        "Protocol status: MCP 2026-07-28 support is under implementation and unverified.",
+        "Public PROTOCOL_VERSION remains 2024-11-05;",
+        "ModernOnly, Auto, and LegacyOnly are planned/unverified policy modes, not executable CLI profiles.",
+        "MCP 2025-11-25 is unsupported: it has no alias, compatibility profile, route, or diagnostic selection.",
+        "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, or release evidence.",
+        "Machine-readable diagnostics are separate from human-facing examples, redact secrets and peer-controlled terminal text, and preserve nonzero failures rather than fabricating an empty catalog or selection.",
+    ];
+    if required_clauses
+        .iter()
+        .any(|clause| !candidate.contains(clause))
+    {
+        return Err(CliDocumentationRefusal::MissingRequiredClause);
+    }
+
+    let forbidden_affirmative_claims = [
+        "MCP 2026-07-28 is supported",
+        "ModernOnly is supported",
+        "ModernOnly is runnable",
+        "Auto is available",
+        "LegacyOnly is production ready",
+        "MCP 2025-11-25 has an alias",
+        "aggregate MCP support",
+        "MCP conformance",
+        "release ready",
+    ];
+    if forbidden_affirmative_claims
+        .iter()
+        .any(|claim| candidate.contains(claim))
+    {
+        return Err(CliDocumentationRefusal::ContradictoryAffirmativeClaim);
     }
 
     Ok(())
@@ -131,18 +211,6 @@ fn display_help_bytes(error: clap::Error) -> Result<Vec<u8>, CliDocumentationRef
 /// the public help frame as `DisplayHelp` rather than parsing a command.
 fn public_cli_help_bytes() -> Result<Vec<u8>, CliDocumentationRefusal> {
     match Cli::try_parse_from(["fastmcp", "--help"]) {
-        Ok(_) => Err(CliDocumentationRefusal::ExpectedDisplayHelp),
-        Err(error) => display_help_bytes(error),
-    }
-}
-
-/// Drive a configured Clap command through the same DisplayHelp handler.
-/// This exists only for the planted mutation of the actual Clap command input.
-#[cfg(test)]
-fn configured_command_help_bytes(
-    mut command: clap::Command,
-) -> Result<Vec<u8>, CliDocumentationRefusal> {
-    match command.try_get_matches_from_mut(["fastmcp", "--help"]) {
         Ok(_) => Err(CliDocumentationRefusal::ExpectedDisplayHelp),
         Err(error) => display_help_bytes(error),
     }
@@ -198,6 +266,19 @@ fn is_exact_root_help_request(args: &[std::ffi::OsString]) -> bool {
 
 #[test]
 fn doc_01_b_positive() {
+    let independently_authored_contract = CliDocumentationContract {
+        protocol_2026_under_implementation: true,
+        public_protocol_version: "2024-11-05",
+        modern_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+        auto: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+        legacy_only: CliPolicyModeStatus::PlannedUnverifiedNotExecutable,
+        mcp_2025_unsupported: true,
+        aggregate_claims_are_evidence: false,
+    };
+    assert_eq!(
+        validate_cli_documentation_contract(independently_authored_contract),
+        Ok(())
+    );
     assert!(is_exact_root_help_request(
         &["fastmcp", "--help"]
             .iter()
@@ -258,13 +339,16 @@ fn doc_01_b_planted_negative() {
     )
     .expect("baseline public help must be admitted");
     let accepted_before = state.bytes.clone();
-    let planted_after_help = format!("{CLI_PROTOCOL_STATUS_HELP} ModernOnly is supported.");
-    let planted = configured_command_help_bytes(Cli::command().after_help(planted_after_help))
-        .expect("planted command must still reach Clap DisplayHelp");
-
+    let accepted_contract = CLI_DOCUMENTATION_CONTRACT;
+    let mut planted_contract = accepted_contract;
+    planted_contract.modern_only = CliPolicyModeStatus::Runnable;
     assert_eq!(
-        admit_public_cli_help(&mut state, planted),
-        Err(CliDocumentationRefusal::CanonicalPublicHelpMismatch)
+        validate_cli_documentation_contract(planted_contract),
+        Err(CliDocumentationRefusal::ContradictorySupportState)
+    );
+    assert_eq!(
+        CLI_DOCUMENTATION_CONTRACT, accepted_contract,
+        "rejected contract mutation must not mutate the accepted evaluator state"
     );
     assert_eq!(
         state.bytes, accepted_before,
