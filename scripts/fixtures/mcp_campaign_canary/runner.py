@@ -271,8 +271,11 @@ def retains_revision(value: Any, revision: str) -> bool:
     return revision in json.dumps(value, sort_keys=True)
 
 
-def valid_reason() -> str:
-    return "commit: canary-subject run: isolated-canary evidence: receipt incident: none"
+def valid_reason(runner: Runner) -> str:
+    return (
+        f"commit:{runner.subject_revision} run:{runner.current_case} "
+        f"evidence:receipt-{runner.current_case} incident:canary-{runner.current_case}"
+    )
 
 
 def run_case(runner: Runner, case: dict[str, str]) -> None:
@@ -302,7 +305,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             )
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.close_if_fresh(
-                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(),
+                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(runner),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
@@ -315,7 +318,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
         elif case_id == "canary_direct_close_rejected":
             issue_id = runner.create_subject(case_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "open-to-closed close rejects without changing issue state"
@@ -334,7 +337,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", WORKER)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=WORKER, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=WORKER, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "claimant cannot self-close after in-progress"
@@ -343,7 +346,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "unchecked acceptance rejects without state mutation"
@@ -370,7 +373,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(), attributed=False)
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner), attributed=False)
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "missing tier-one attribution rejects"
@@ -378,7 +381,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "review issue without batch_verify PASS rejects"
@@ -387,7 +390,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
             passed = attempt.returncode == 0 and ("impostor", "pass") in statuses
@@ -401,7 +404,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             for provider, _status in sorted(set(provider_statuses(ledger_before))):
                 runner.report_gate(issue_id, provider, "fail", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
+            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 attempt.returncode != 0
@@ -420,7 +423,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 and retains_revision(ledger_before, runner.subject_revision)
             )
             attempt = runner.close_if_fresh(
-                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(),
+                issue_id, ledger=ledger_before, actor=ORCHESTRATOR, reason=valid_reason(runner),
             ) if fresh and statuses == [("batch_verify", "pass")] else None
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt is not None and attempt.returncode == 0
