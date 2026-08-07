@@ -1,0 +1,90 @@
+# Hard execution gate for the MCP 2026-07-28 + 2024-11-05 campaign.
+#
+# Consumer: CreamLotus, the campaign batch-verification orchestrator.
+# Gate: no executable Bead can close outside review -> closed after the
+#       batch_verify gate has a pass and the orchestrator has scrubbed every
+#       non-orchestrator provider verdict. br 0.2.16 does not authorize gate
+#       providers, so provider identity is audited operationally.
+# Observed defect: self-certified/partial closes, hidden verification debt,
+#                  and tracker hierarchy deadlock during the prior campaign.
+# Retirement: only after GATE-ALL-MCP-READY and its release evidence close;
+#             the policy may then be reviewed, never silently removed.
+
+allow_bypass: false
+
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 40
+  require_acceptance_criteria_satisfied:
+    enabled: true
+  forbid_self_close_after_in_progress:
+    enabled: true
+  forbid_close_with_deferred_dependents:
+    enabled: true
+  require_typed_references:
+    enabled: true
+    required_kinds:
+      - commit
+      - run
+      - evidence
+      - incident
+  attribution:
+    tier: capture
+    fields:
+      - agent_name
+      - harness
+      - model
+
+workflow:
+  strict: true
+  statuses:
+    - open
+    - in_progress
+    - review
+    - blocked
+    - deferred
+    - closed
+  transitions:
+    initial:
+      - open
+    open:
+      - in_progress
+      - deferred
+    in_progress:
+      - review
+      - open
+      - blocked
+      - deferred
+    review:
+      - closed
+      - open
+    blocked:
+      - open
+      - in_progress
+      - deferred
+    deferred:
+      - open
+    closed:
+      - open
+  gates:
+    # br 0.2.16 does not apply workflow.transitions inside `br close`, so
+    # poison every non-review close path explicitly.
+    "open -> closed":
+      require_all:
+        - never_direct_close
+    "in_progress -> closed":
+      require_all:
+        - never_direct_close
+    "blocked -> closed":
+      require_all:
+        - never_direct_close
+    "deferred -> closed":
+      require_all:
+        - never_direct_close
+    "review -> closed":
+      require_all:
+        - batch_verify
+  status_groups:
+    ready:
+      - open
