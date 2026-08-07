@@ -6602,7 +6602,14 @@ mod tests {
             .expect("test clock must admit the fixed retention interval");
         registry.tombstones.extend(
             (0..MAX_RESPONSE_CORRELATIONS)
-                .map(|id| (RequestId::String(format!("retired-{id}")), expires_at)),
+                .map(|id| {
+                    (
+                        RequestId::String(format!("retired-{id}"))
+                            .correlation_key()
+                            .expect("test IDs are valid"),
+                        expires_at,
+                    )
+                }),
         );
 
         let error = registry
@@ -6621,7 +6628,14 @@ mod tests {
         let mut registry = ResponseRegistry::new();
         registry.tombstones.extend(
             (0..MAX_RESPONSE_CORRELATIONS)
-                .map(|id| (RequestId::String(format!("expired-{id}")), Instant::now())),
+                .map(|id| {
+                    (
+                        RequestId::String(format!("expired-{id}"))
+                            .correlation_key()
+                            .expect("test IDs are valid"),
+                        Instant::now(),
+                    )
+                }),
         );
 
         let waiter = registry
@@ -6679,7 +6693,12 @@ mod tests {
         let expired_id = RequestId::String("expired-control".to_string());
         registry
             .cancellation_controls
-            .insert(expired_id.clone(), Instant::now());
+            .insert(
+                expired_id
+                    .correlation_key()
+                    .expect("test ID is valid"),
+                Instant::now(),
+            );
         assert!(
             registry
                 .claim_cancellation_control(&expired_id)
