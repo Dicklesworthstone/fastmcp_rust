@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 
-use crate::{protocol_version::FINAL_PROTOCOL_VERSION, ServerInfo};
+use crate::{ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION};
 
 /// The exact JSON-RPC method for final server discovery.
 pub const SERVER_DISCOVER_METHOD: &str = "server/discover";

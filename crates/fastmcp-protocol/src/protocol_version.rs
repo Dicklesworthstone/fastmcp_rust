@@ -5,7 +5,7 @@
 //! `io.modelcontextprotocol/protocolVersion` value. Transport code owns HTTP
 //! header parsing and supplies the already-decoded field value here.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The final protocol version implemented by this narrow modern surface.
 pub const FINAL_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -340,37 +340,31 @@ pub fn validate_final_protocol_version(
 pub fn admit_final_request(
     metadata: RequestVersionMetadata<'_>,
 ) -> Result<FinalRequestAdmission, RequestAdmissionError> {
-    let header_version = metadata.header_version.ok_or(RequestAdmissionError::HeaderMismatch(
-        HeaderMismatchError {
+    let header_version = metadata
+        .header_version
+        .ok_or(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
             reason: HeaderMismatchReason::MissingHeader,
-        },
-    ))?;
-    let body_version = metadata.body_version.ok_or(RequestAdmissionError::HeaderMismatch(
-        HeaderMismatchError {
+        }))?;
+    let body_version = metadata
+        .body_version
+        .ok_or(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
             reason: HeaderMismatchReason::MissingBodyVersion,
-        },
-    ))?;
+        }))?;
 
     if header_version.is_empty() {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError {
-                reason: HeaderMismatchReason::EmptyHeader,
-            },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: HeaderMismatchReason::EmptyHeader,
+        }));
     }
     if body_version.is_empty() {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError {
-                reason: HeaderMismatchReason::EmptyBodyVersion,
-            },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: HeaderMismatchReason::EmptyBodyVersion,
+        }));
     }
     if header_version != body_version {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError {
-                reason: HeaderMismatchReason::HeaderBodyVersionMismatch,
-            },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: HeaderMismatchReason::HeaderBodyVersionMismatch,
+        }));
     }
     if header_version != FINAL_PROTOCOL_VERSION {
         return Err(RequestAdmissionError::UnsupportedProtocolVersion(
@@ -434,23 +428,19 @@ fn exact_nonempty_mirror<'a>(
         reason: missing_body,
     }))?;
     if header.is_empty() {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError {
-                reason: empty_header,
-            },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: empty_header,
+        }));
     }
     if body.is_empty() {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError {
-                reason: empty_body,
-            },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: empty_body,
+        }));
     }
     if header != body {
-        return Err(RequestAdmissionError::HeaderMismatch(
-            HeaderMismatchError { reason: mismatch },
-        ));
+        return Err(RequestAdmissionError::HeaderMismatch(HeaderMismatchError {
+            reason: mismatch,
+        }));
     }
     Ok(header)
 }
@@ -477,7 +467,10 @@ mod tests {
         })
         .expect("matching final standard headers and body values must be admitted");
 
-        assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            admission.protocol_version().as_str(),
+            FINAL_PROTOCOL_VERSION
+        );
         assert_eq!(MCP_PROTOCOL_VERSION_HEADER, "MCP-Protocol-Version");
     }
 
@@ -548,7 +541,10 @@ mod tests {
         })
         .expect("matching supported header and body versions must admit the request");
 
-        assert_eq!(admission.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            admission.protocol_version().as_str(),
+            FINAL_PROTOCOL_VERSION
+        );
         assert_eq!(SUPPORTED_FINAL_PROTOCOL_VERSIONS, [FINAL_PROTOCOL_VERSION]);
     }
 
@@ -587,7 +583,10 @@ mod tests {
         };
         assert_eq!(error.requested(), "2025-11-25");
         assert_eq!(error.supported_versions(), [FINAL_PROTOCOL_VERSION]);
-        assert_eq!(error.jsonrpc_error_code(), UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE);
+        assert_eq!(
+            error.jsonrpc_error_code(),
+            UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE
+        );
         assert_eq!(error.http_status(), 400);
     }
 
