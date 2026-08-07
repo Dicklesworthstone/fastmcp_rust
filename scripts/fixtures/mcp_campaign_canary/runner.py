@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -67,7 +68,8 @@ def json_value(text: str) -> Any:
 class Runner:
     def __init__(self, output: Path, subject_revision: str) -> None:
         self.output = output
-        self.db = output / "canary.db"
+        self.workspace = output / "workspace"
+        self.db = self.workspace / ".beads" / "canary.db"
         self.events: list[dict[str, Any]] = []
         self.commands: list[dict[str, Any]] = []
         self.subject_revision = subject_revision
@@ -99,7 +101,24 @@ class Runner:
         argv = ["br", *args, "--db", str(self.db), "--json"]
         if actor:
             argv.extend(["--actor", actor])
-        return self.run(argv, actor=actor)
+        completed = subprocess.run(
+            argv, cwd=self.workspace, text=True, capture_output=True, check=False
+        )
+        self.commands.append(
+            {
+                "case_id": self.current_case, "actor": actor, "argv": argv,
+                "exit_code": completed.returncode,
+                "stdout_sha256": sha256_bytes(completed.stdout.encode()),
+                "stderr_sha256": sha256_bytes(completed.stderr.encode()),
+                "stdout": json_value(completed.stdout), "stderr": completed.stderr,
+            }
+        )
+        return completed
+
+    def initialize_isolated_tracker(self) -> subprocess.CompletedProcess[str]:
+        (self.workspace / ".beads").mkdir(parents=True, exist_ok=False)
+        shutil.copyfile(POLICY, self.workspace / ".beads" / "policy.yaml")
+        return self.br("init", "--prefix", "canary", actor=ORCHESTRATOR)
 
     def issue(self, issue_id: str) -> Any:
         completed = self.br("show", issue_id, actor=ORCHESTRATOR)
@@ -305,10 +324,14 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
             for provider, _status in sorted(set(provider_statuses(ledger_before))):
                 runner.report_gate(issue_id, provider, "fail", ORCHESTRATOR)
-            ledger_after = runner.ledger(issue_id)
+            before, ledger_before = runner.issue(issue_id), runner.ledger(issue_id)
             attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason())
-            after = runner.issue(issue_id)
-            passed = attempt.returncode != 0 and not any(status == "pass" for _, status in provider_statuses(ledger_after))
+            after, ledger_after = runner.issue(issue_id), runner.ledger(issue_id)
+            passed = (
+                attempt.returncode != 0
+                and same(before, after)
+                and not any(status == "pass" for _, status in provider_statuses(ledger_after))
+            )
             detail = "all observed providers are overwritten to FAIL and cannot close"
         elif case_id == POSITIVE_ID:
             issue_id = runner.create_subject(case_id)
@@ -337,8 +360,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="retained receipt directory (default: preserved temporary directory)")
     parser.add_argument("--subject-revision", default=None, help="revision being certified; defaults to current HEAD")
     args = parser.parse_args()
-    output = args.output or Path(tempfile.mkdtemp(prefix="mcp-campaign-canary-"))
-    output.mkdir(parents=True, exist_ok=False) if args.output else None
+    if args.output:
+        output = args.output.resolve()
+        if ROOT not in output.parents:
+            raise SystemExit("--output must be inside the repository for br path validation")
+        output.mkdir(parents=True, exist_ok=False)
+    else:
+        output = Path(tempfile.mkdtemp(prefix="run-", dir=FIXTURE.parent))
     cases = json_value(FIXTURE.read_text())
     if not isinstance(cases, list):
         raise SystemExit("frozen canary fixture must be a JSON array")
@@ -367,11 +395,12 @@ def main() -> int:
         "dirty_inventory": runner.run(["git", "status", "--porcelain=v1", "--untracked-files=all"]).stdout.splitlines(),
     }
     if tracked:
-        initialized = runner.br("init", "--prefix", "canary", actor=ORCHESTRATOR)
+        initialized = runner.initialize_isolated_tracker()
         if initialized.returncode == 0:
             with sqlite3.connect(runner.db) as connection:
                 rows = connection.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
             preflight["tracker_schema_sha256"] = sha256_bytes(json.dumps(rows, sort_keys=True).encode())
+            preflight["isolated_policy_sha256"] = digest_path(runner.workspace / ".beads" / "policy.yaml")
             for case in cases:
                 run_case(runner, case)
         else:
